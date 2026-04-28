@@ -1,0 +1,116 @@
+[workspace]
+members = [
+    "crates/zinder-core",
+    "crates/zinder-client",
+    "crates/zinder-proto",
+    "crates/zinder-runtime",
+    "crates/zinder-source",
+    "crates/zinder-store",
+    "crates/zinder-testkit",
+    "services/zinder-compat-lightwalletd",
+    "services/zinder-ingest",
+    "services/zinder-query",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/gustavovalverde/zinder"
+rust-version = "1.91"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22.1"
+bytes = "1.11.0"
+clap = "4.6.1"
+color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
+config = { version = "0.15.22", default-features = false, features = ["toml"] }
+eyre = "0.6.12"
+hex = "0.4.3"
+hmac = "0.12.1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client"] }
+metrics = "0.24.4"
+metrics-exporter-prometheus = { version = "0.18.2", default-features = false }
+parking_lot = "0.12.5"
+prost = "0.14.3"
+prost-build = "0.14.3"
+rust-rocksdb = { version = "0.47.0", features = ["multi-threaded-cf"] }
+secrecy = "0.10.3"
+serde = "1.0.228"
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
+toml = "1.1.2"
+tonic = "0.14.5"
+tonic-health = "0.14.5"
+tonic-prost = "0.14.5"
+tonic-prost-build = "0.14.5"
+tonic-reflection = "0.14.5"
+tonic-types = "0.14.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
+zebra-chain = "6.0.2"
+zinder-core = { path = "crates/zinder-core" }
+zinder-client = { path = "crates/zinder-client" }
+zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
+zinder-ingest = { path = "services/zinder-ingest" }
+zinder-proto = { path = "crates/zinder-proto" }
+zinder-query = { path = "services/zinder-query" }
+zinder-runtime = { path = "crates/zinder-runtime" }
+zinder-source = { path = "crates/zinder-source" }
+zinder-store = { path = "crates/zinder-store" }
+zinder-testkit = { path = "crates/zinder-testkit" }
+
+[patch.crates-io]
+# Zebra 6.0.2 still resolves through equihash 0.2.2, whose core2 0.3.x
+# dependency was yanked on crates.io. Pin the last published core2 source
+# commit until Zebra or equihash publishes a crates.io-only resolution path.
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "7bf2611" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+missing_docs = "deny"
+unnameable_types = "deny"
+unreachable_pub = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_compatibility = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+missing_const_for_fn = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+redundant_pub_crate = "allow"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+wildcard_enum_match_arm = "deny"

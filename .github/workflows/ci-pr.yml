@@ -1,0 +1,190 @@
+name: ci-pr
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.19.4"
+  CARGO_LLVM_COV_VERSION: "0.8.5"
+  CARGO_MACHETE_VERSION: "0.9.2"
+  CARGO_MUTANTS_VERSION: "27.0.0"
+  CARGO_NEXTEST_VERSION: "0.9.116"
+  PROTOC_VERSION: "29.3"
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test (unit + integration)
+        run: cargo nextest run --profile=ci
+
+      - name: Test (perf)
+        run: cargo nextest run --profile=ci-perf
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
+
+      - name: Diff hygiene
+        run: git diff --check
+
+  dependencies:
+    name: dependency hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version "${CARGO_DENY_VERSION}"
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked --version "${CARGO_MACHETE_VERSION}"
+
+      - name: Deny
+        run: cargo deny check
+
+      - name: Machete
+        run: cargo machete
+
+  vendored-proto:
+    name: vendored proto drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify lightwalletd protocol pin
+        run: |
+          set -euo pipefail
+          upstream_commit="$(cat crates/zinder-proto/proto/compat/lightwalletd/COMMIT)"
+          upstream_base="https://raw.githubusercontent.com/zcash/lightwallet-protocol/${upstream_commit}/walletrpc"
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "${tempdir}"' EXIT
+
+          for proto in compact_formats.proto service.proto; do
+            perl -pe 's/[ \t]+$//' \
+              "crates/zinder-proto/proto/compat/lightwalletd/${proto}" \
+              > "${tempdir}/${proto}.local"
+            curl -fsSL "${upstream_base}/${proto}" \
+              | perl -pe 's/[ \t]+$//' \
+              > "${tempdir}/${proto}.upstream"
+            diff -u "${tempdir}/${proto}.local" "${tempdir}/${proto}.upstream"
+          done
+
+  coverage:
+    name: coverage
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version "${CARGO_LLVM_COV_VERSION}"
+
+      - name: Coverage
+        run: cargo llvm-cov --workspace --all-features --no-report
+
+  mutation:
+    name: mutation
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version "${CARGO_MUTANTS_VERSION}"
+
+      - name: Mutate critical contracts
+        run: |
+          cargo mutants \
+            --workspace \
+            --all-features \
+            --jobs 3 \
+            --timeout 180 \
+            --file crates/zinder-store/src/chain_store.rs \
+            --file crates/zinder-store/src/chain_store/validation.rs \
+            --file crates/zinder-store/src/format/stream_cursor.rs \
+            --file crates/zinder-source/src/source_block.rs \
+            --file services/zinder-ingest/src/artifact_builder.rs \
+            --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix'

@@ -1,0 +1,32 @@
+[package]
+name = "zinder-client"
+version = "0.1.0"
+description = "Typed Rust client surface for Zinder chain-index consumers"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "client"]
+categories = ["api-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic = { workspace = true, features = ["transport"] }
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-store.workspace = true
+
+[dev-dependencies]
+eyre.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["server", "transport"] }
+zinder-query.workspace = true
+zinder-testkit.workspace = true
+
+[lints]
+workspace = true

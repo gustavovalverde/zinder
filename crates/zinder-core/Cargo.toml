@@ -1,0 +1,16 @@
+[package]
+name = "zinder-core"
+version = "0.1.0"
+description = "Core Zinder chain epoch and artifact domain values"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "zinder"]
+categories = ["database"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

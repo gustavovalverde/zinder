@@ -1,0 +1,30 @@
+[package]
+name = "zinder-proto"
+version = "0.1.0"
+description = "Zinder-owned generated protocol modules"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "protocol"]
+categories = ["network-programming"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[package.metadata.cargo-machete]
+# The generated modules included from OUT_DIR reference these crates directly.
+ignored = ["prost", "tonic", "tonic-prost"]
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+eyre.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "zinder-testkit"
+version = "0.1.0"
+description = "Deterministic chain, store, and node fixtures for Zinder tests"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "testkit", "fixtures"]
+categories = ["development-tools::testing"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+color-eyre.workspace = true
+eyre.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing-subscriber.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-source.workspace = true
+zinder-store.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

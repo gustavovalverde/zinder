@@ -1,0 +1,480 @@
+syntax = "proto3";
+
+package zinder.v1.wallet;
+
+// A visible, internally consistent chain snapshot used to answer a wallet
+// query.
+message ChainEpoch {
+  // Monotonic Zinder chain epoch identifier.
+  uint64 chain_epoch_id = 1;
+
+  // Stable public network name, such as "zcash-regtest".
+  string network_name = 2;
+
+  // Best visible tip height for this chain epoch.
+  uint32 tip_height = 3;
+
+  // Best visible tip hash for this chain epoch.
+  bytes tip_hash = 4;
+
+  // Finalized height for this chain epoch.
+  uint32 finalized_height = 5;
+
+  // Finalized block hash for this chain epoch.
+  bytes finalized_hash = 6;
+
+  // Durable artifact schema version used by artifacts in this chain epoch.
+  uint32 artifact_schema_version = 7;
+
+  // Zinder wall-clock creation time for this chain epoch.
+  uint64 created_at_millis = 8;
+
+  // Sapling note commitment tree size at the visible tip. Wallets use this to
+  // derive completed subtree counts without decoding compact-block payloads.
+  uint32 sapling_commitment_tree_size = 9;
+
+  // Orchard note commitment tree size at the visible tip.
+  uint32 orchard_commitment_tree_size = 10;
+}
+
+// Metadata for one block.
+message BlockMetadata {
+  // Height of the block.
+  uint32 height = 1;
+
+  // Hash of the block.
+  bytes block_hash = 2;
+}
+
+// Latest visible block metadata response bound to one chain epoch.
+message LatestBlockResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Latest visible block in this chain epoch.
+  BlockMetadata latest_block = 2;
+}
+
+// Latest visible block metadata request.
+message LatestBlockRequest {
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 1;
+}
+
+// A wallet-facing compact block payload from one chain epoch.
+message CompactBlock {
+  // Height of the source block.
+  uint32 height = 1;
+
+  // Hash of the full block this compact block was built from.
+  bytes block_hash = 2;
+
+  // Encoded compact block payload bytes.
+  bytes payload_bytes = 3;
+}
+
+// Inclusive compact block range request.
+message CompactBlockRangeRequest {
+  // First requested block height.
+  uint32 start_height = 1;
+
+  // Last requested block height.
+  uint32 end_height = 2;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 3;
+}
+
+// Single compact block request.
+message CompactBlockRequest {
+  // Requested block height.
+  uint32 height = 1;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Single compact block response bound to one chain epoch.
+message CompactBlockResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Compact block at the requested height.
+  CompactBlock compact_block = 2;
+}
+
+// Single transaction request.
+message TransactionRequest {
+  // Transaction identifier in canonical 32-byte order.
+  bytes transaction_id = 1;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Indexed transaction artifact.
+message Transaction {
+  // Transaction identifier.
+  bytes transaction_id = 1;
+
+  // Height of the containing block.
+  uint32 block_height = 2;
+
+  // Hash of the containing block.
+  bytes block_hash = 3;
+
+  // Serialized transaction payload bytes.
+  bytes payload_bytes = 4;
+}
+
+// Single transaction response bound to one chain epoch.
+message TransactionResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Transaction artifact at the requested transaction id.
+  Transaction transaction = 2;
+}
+
+// Streamed compact block range chunk bound to one chain epoch.
+message CompactBlockRangeChunk {
+  // Chain epoch used for this compact block.
+  ChainEpoch chain_epoch = 1;
+
+  // Compact block at the next requested height.
+  CompactBlock compact_block = 2;
+}
+
+// Tree-state request by block height.
+message TreeStateRequest {
+  // Requested block height.
+  uint32 height = 1;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Latest tree-state request.
+message LatestTreeStateRequest {
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 1;
+}
+
+// Tree-state response bound to one chain epoch.
+message TreeStateResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Height this tree state belongs to.
+  uint32 height = 2;
+
+  // Hash of the block this tree state belongs to.
+  bytes block_hash = 3;
+
+  // Encoded tree-state payload bytes.
+  bytes payload_bytes = 4;
+}
+
+// Shielded note commitment protocol for subtree roots.
+enum ShieldedProtocol {
+  // Protocol was not specified.
+  SHIELDED_PROTOCOL_UNSPECIFIED = 0;
+
+  // Sapling note commitment tree.
+  SHIELDED_PROTOCOL_SAPLING = 1;
+
+  // Orchard note commitment tree.
+  SHIELDED_PROTOCOL_ORCHARD = 2;
+}
+
+// Inclusive-start bounded subtree-root request.
+message SubtreeRootsRequest {
+  // Shielded protocol to read.
+  ShieldedProtocol shielded_protocol = 1;
+
+  // First requested subtree-root index.
+  uint32 start_index = 2;
+
+  // Maximum number of subtree-root entries to return.
+  uint32 max_entries = 3;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 4;
+}
+
+// A complete shielded subtree root.
+message SubtreeRoot {
+  // Subtree index within the requested shielded protocol.
+  uint32 subtree_index = 1;
+
+  // The 32-byte Merkle root of the subtree.
+  bytes root_hash = 2;
+
+  // Hash of the block that completed this subtree.
+  bytes completing_block_hash = 3;
+
+  // Height of the block that completed this subtree.
+  uint32 completing_block_height = 4;
+}
+
+// Subtree-root range response bound to one chain epoch.
+message SubtreeRootsResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Shielded protocol returned.
+  ShieldedProtocol shielded_protocol = 2;
+
+  // First requested subtree-root index.
+  uint32 start_index = 3;
+
+  // Subtree roots in ascending index order.
+  repeated SubtreeRoot subtree_roots = 4;
+}
+
+// Raw transaction broadcast request.
+message BroadcastTransactionRequest {
+  // Serialized transaction bytes submitted by the wallet.
+  bytes raw_transaction = 1;
+}
+
+// Accepted transaction broadcast details.
+message BroadcastAccepted {
+  // Transaction identifier reported by the node.
+  bytes transaction_id = 1;
+}
+
+// Duplicate transaction broadcast details.
+message BroadcastDuplicate {
+  // Node error code when one was supplied.
+  optional int64 error_code = 1;
+
+  // Operator-facing node message.
+  string message = 2;
+}
+
+// Invalid transaction encoding details.
+message BroadcastInvalidEncoding {
+  // Node error code when one was supplied.
+  optional int64 error_code = 1;
+
+  // Operator-facing node message.
+  string message = 2;
+}
+
+// Rejected transaction broadcast details.
+message BroadcastRejected {
+  // Node error code when one was supplied.
+  optional int64 error_code = 1;
+
+  // Operator-facing node message.
+  string message = 2;
+}
+
+// Unclassified transaction broadcast details.
+message BroadcastUnknown {
+  // Node error code when one was supplied.
+  optional int64 error_code = 1;
+
+  // Operator-facing node message.
+  string message = 2;
+}
+
+// Typed transaction broadcast outcome.
+message BroadcastTransactionResponse {
+  oneof outcome {
+    BroadcastAccepted accepted = 1;
+    BroadcastDuplicate duplicate = 2;
+    BroadcastInvalidEncoding invalid_encoding = 3;
+    BroadcastRejected rejected = 4;
+    BroadcastUnknown unknown = 5;
+  }
+}
+
+// Chain-event stream family. Tip receives every chain event. Finalized
+// receives only finalized commits and never reorg events.
+enum ChainEventStreamFamily {
+  CHAIN_EVENT_STREAM_FAMILY_TIP = 0;
+  CHAIN_EVENT_STREAM_FAMILY_FINALIZED = 1;
+}
+
+// Replayable chain-event stream request.
+message ChainEventsRequest {
+  // Empty starts at the earliest retained event. Non-empty resumes strictly
+  // after the supplied opaque cursor.
+  bytes from_cursor = 1;
+
+  // Stream family for an empty cursor. When from_cursor is non-empty, the
+  // cursor's encoded family is authoritative.
+  ChainEventStreamFamily family = 2;
+}
+
+// Durable range committed by one chain event.
+message ChainEpochCommitted {
+  // Chain epoch visible after the commit.
+  ChainEpoch chain_epoch = 1;
+
+  // First committed block height.
+  uint32 start_height = 2;
+
+  // Last committed block height.
+  uint32 end_height = 3;
+}
+
+// Durable range reverted by one chain event.
+message ChainRangeReverted {
+  // Chain epoch that contained the reverted range.
+  ChainEpoch chain_epoch = 1;
+
+  // First reverted block height.
+  uint32 start_height = 2;
+
+  // Last reverted block height.
+  uint32 end_height = 3;
+}
+
+// Pure commit chain event.
+message ChainCommitted {
+  ChainEpochCommitted committed = 1;
+}
+
+// Reorg chain event: a non-finalized range was replaced.
+message ChainReorged {
+  ChainRangeReverted reverted = 1;
+  ChainEpochCommitted committed = 2;
+}
+
+// Cursor-bound chain event envelope.
+message ChainEventEnvelope {
+  // Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
+  bytes cursor = 1;
+
+  // Monotonic sequence in the chain-event stream.
+  uint64 event_sequence = 2;
+
+  // Chain epoch visible after this event.
+  ChainEpoch chain_epoch = 3;
+
+  // Finalized height that was true for this event.
+  uint32 finalized_height = 4;
+
+  oneof event {
+    ChainCommitted committed = 10;
+    ChainReorged reorged = 11;
+  }
+}
+
+// Server capability descriptor advertised to clients per the M2 capability
+// descriptor contract.
+message ServerCapabilities {
+  // Network identifier: "zcash-mainnet", "zcash-testnet", "zcash-regtest".
+  string network = 1;
+
+  // Semver of the running zinder binary.
+  string service_version = 2;
+
+  // Vendored lightwalletd protocol commit served by this deployment.
+  string lightwalletd_protocol_commit = 3;
+
+  // Canonical artifact schema version.
+  uint32 schema_version = 4;
+
+  // Configured non-finalized window depth, in blocks.
+  uint32 reorg_window_blocks = 5;
+
+  // Chain-event retention window in seconds. 0 indicates unbounded retention
+  // (development mode; rejected by --print-config in production).
+  uint64 chain_event_retention_seconds = 6;
+
+  // Mempool-event retention windows. 0 indicates the corresponding event
+  // family is not retained on this deployment.
+  uint64 mempool_mined_retention_seconds = 7;
+  uint64 mempool_invalidated_retention_seconds = 8;
+
+  // Active capability strings. Exact-match. Order is not significant.
+  repeated string capabilities = 9;
+
+  // Capabilities scheduled for removal in a future version.
+  repeated DeprecatedCapability deprecated_capabilities = 10;
+
+  // Upstream node capabilities detected by zinder-source.
+  NodeCapabilitiesDescriptor node = 11;
+
+  // Operator MCP server endpoint. Reserved for descriptor-shape stability and
+  // unset in v1.
+  optional string mcp_endpoint = 12;
+}
+
+// Deprecation entry for a capability scheduled for removal.
+message DeprecatedCapability {
+  // The deprecated capability string.
+  string capability = 1;
+
+  // Replacement capability, if any.
+  optional string replaced_by = 2;
+
+  // Minimum semver at which removal may happen.
+  string earliest_removal_version = 3;
+
+  // Operator-facing deprecation message.
+  string deprecation_notice = 4;
+}
+
+// Upstream node capability descriptor mirroring zinder-source detection.
+message NodeCapabilitiesDescriptor {
+  // Node-reported semantic version, when available.
+  optional string version = 1;
+
+  // Node-side capability strings ("node.streaming_source",
+  // "node.spending_tx_lookup", "node.openrpc_discovery",
+  // "node.json_rpc").
+  repeated string capabilities = 2;
+}
+
+// Server capability descriptor request.
+message ServerInfoRequest {}
+
+// Server capability descriptor response.
+message ServerInfoResponse {
+  ServerCapabilities capabilities = 1;
+}
+
+// Native Zinder wallet and wallet-like application query service.
+service WalletQuery {
+  // Return latest visible block metadata.
+  rpc LatestBlock(LatestBlockRequest) returns (LatestBlockResponse);
+
+  // Return one compact block at a given height.
+  rpc CompactBlock(CompactBlockRequest) returns (CompactBlockResponse);
+
+  // Stream compact blocks for an inclusive height range.
+  rpc CompactBlockRange(CompactBlockRangeRequest) returns (stream CompactBlockRangeChunk);
+
+  // Return one indexed transaction by transaction id.
+  rpc Transaction(TransactionRequest) returns (TransactionResponse);
+
+  // Return tree state at one block height.
+  rpc TreeState(TreeStateRequest) returns (TreeStateResponse);
+
+  // Return tree state for the latest visible block.
+  rpc LatestTreeState(LatestTreeStateRequest) returns (TreeStateResponse);
+
+  // Return shielded subtree roots.
+  rpc SubtreeRoots(SubtreeRootsRequest) returns (SubtreeRootsResponse);
+
+  // Broadcast a raw transaction.
+  rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
+
+  // Stream replayable chain events.
+  rpc ChainEvents(ChainEventsRequest) returns (stream ChainEventEnvelope);
+
+  // Return the server capability descriptor.
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+}

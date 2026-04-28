@@ -1,0 +1,14 @@
+version: v2
+
+modules:
+  - path: crates/zinder-proto/proto
+    excludes:
+      - crates/zinder-proto/proto/compat
+
+lint:
+  use:
+    - BASIC
+
+breaking:
+  use:
+    - PACKAGE

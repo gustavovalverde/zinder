@@ -1,0 +1,209 @@
+//! [`TransactionBroadcaster`] fakes for tests.
+//!
+//! [`TransactionBroadcaster`]: zinder_source::TransactionBroadcaster
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use zinder_core::{
+    BroadcastAccepted, RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+};
+use zinder_source::{SourceError, TransactionBroadcaster};
+
+/// A configurable [`TransactionBroadcaster`] fake.
+///
+/// Construct with one of the named constructors below; the broadcaster
+/// returns the same outcome for every call. Every call's raw transaction
+/// bytes are captured automatically and can be inspected via
+/// [`MockTransactionBroadcaster::captured_calls`].
+#[derive(Clone, Debug)]
+pub struct MockTransactionBroadcaster {
+    outcome: BroadcastOutcome,
+    captured_calls: Arc<Mutex<Vec<RawTransactionBytes>>>,
+}
+
+#[derive(Clone, Debug)]
+enum BroadcastOutcome {
+    Result(TransactionBroadcastResult),
+    SourceError(MockSourceError),
+}
+
+/// A reproducible [`SourceError`] shape used by [`MockTransactionBroadcaster`].
+///
+/// `SourceError` itself is `non_exhaustive` and not `Clone`, so the mock
+/// stores a structural representation and rebuilds the error per call.
+#[derive(Clone, Debug)]
+enum MockSourceError {
+    BroadcastDisabled,
+    NodeUnavailable { reason: String, is_retryable: bool },
+}
+
+impl MockSourceError {
+    fn as_source_error(&self) -> SourceError {
+        match self {
+            Self::BroadcastDisabled => SourceError::TransactionBroadcastDisabled,
+            Self::NodeUnavailable {
+                reason,
+                is_retryable,
+            } => SourceError::NodeUnavailable {
+                reason: reason.clone(),
+                is_retryable: *is_retryable,
+            },
+        }
+    }
+}
+
+impl MockTransactionBroadcaster {
+    /// Returns a broadcaster that accepts every call and reports
+    /// `transaction_id` as the node's accepted id.
+    #[must_use]
+    pub fn accepted(transaction_id: TransactionId) -> Self {
+        Self::with_outcome(BroadcastOutcome::Result(
+            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }),
+        ))
+    }
+
+    /// Returns a broadcaster that returns the given
+    /// [`TransactionBroadcastResult`] verbatim for every call.
+    #[must_use]
+    pub fn returning(broadcast_result: TransactionBroadcastResult) -> Self {
+        Self::with_outcome(BroadcastOutcome::Result(broadcast_result))
+    }
+
+    /// Returns a broadcaster that fails every call with
+    /// [`SourceError::TransactionBroadcastDisabled`].
+    #[must_use]
+    pub fn broadcast_disabled() -> Self {
+        Self::with_outcome(BroadcastOutcome::SourceError(
+            MockSourceError::BroadcastDisabled,
+        ))
+    }
+
+    /// Returns a broadcaster that fails every call with
+    /// [`SourceError::NodeUnavailable`] using the supplied reason and
+    /// retryability.
+    #[must_use]
+    pub fn node_unavailable(reason: impl Into<String>, is_retryable: bool) -> Self {
+        Self::with_outcome(BroadcastOutcome::SourceError(
+            MockSourceError::NodeUnavailable {
+                reason: reason.into(),
+                is_retryable,
+            },
+        ))
+    }
+
+    /// Returns the raw-transaction byte arguments captured by every call to
+    /// this broadcaster, in call order.
+    #[must_use]
+    pub fn captured_calls(&self) -> Vec<RawTransactionBytes> {
+        self.captured_calls.lock().clone()
+    }
+
+    /// Returns the count of calls captured so far.
+    #[must_use]
+    pub fn call_count(&self) -> usize {
+        self.captured_calls.lock().len()
+    }
+
+    fn with_outcome(outcome: BroadcastOutcome) -> Self {
+        Self {
+            outcome,
+            captured_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl TransactionBroadcaster for MockTransactionBroadcaster {
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastResult, SourceError> {
+        self.captured_calls.lock().push(raw_transaction);
+        match &self.outcome {
+            BroadcastOutcome::Result(broadcast_result) => Ok(broadcast_result.clone()),
+            BroadcastOutcome::SourceError(mock_source_error) => {
+                Err(mock_source_error.as_source_error())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::MockTransactionBroadcaster;
+    use zinder_core::{
+        BroadcastAccepted, RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+    };
+    use zinder_source::{SourceError, TransactionBroadcaster};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_returns_supplied_transaction_id() -> Result<(), Box<dyn Error>> {
+        let broadcaster =
+            MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x42; 32]));
+        let outcome = broadcaster
+            .broadcast_transaction(RawTransactionBytes::new(vec![1, 2, 3]))
+            .await?;
+        assert!(matches!(
+            outcome,
+            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+                if transaction_id == TransactionId::from_bytes([0x42; 32])
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn captured_calls_records_every_call_in_order() -> Result<(), Box<dyn Error>> {
+        let broadcaster =
+            MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x42; 32]));
+        broadcaster
+            .broadcast_transaction(RawTransactionBytes::new(vec![1, 2, 3]))
+            .await?;
+        broadcaster
+            .broadcast_transaction(RawTransactionBytes::new(vec![4, 5, 6]))
+            .await?;
+
+        let captured_calls = broadcaster.captured_calls();
+        assert_eq!(captured_calls.len(), 2);
+        assert_eq!(captured_calls[0].as_slice(), &[1, 2, 3]);
+        assert_eq!(captured_calls[1].as_slice(), &[4, 5, 6]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broadcast_disabled_returns_typed_error() -> Result<(), Box<dyn Error>> {
+        let broadcaster = MockTransactionBroadcaster::broadcast_disabled();
+        let outcome = broadcaster
+            .broadcast_transaction(RawTransactionBytes::new(vec![1, 2, 3]))
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(SourceError::TransactionBroadcastDisabled)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_unavailable_propagates_reason_and_retry_flag() -> Result<(), Box<dyn Error>> {
+        let broadcaster = MockTransactionBroadcaster::node_unavailable("planned outage", false);
+        let outcome = broadcaster
+            .broadcast_transaction(RawTransactionBytes::new(vec![1, 2, 3]))
+            .await;
+        match outcome {
+            Err(SourceError::NodeUnavailable {
+                reason,
+                is_retryable,
+            }) => {
+                assert_eq!(reason, "planned outage");
+                assert!(!is_retryable);
+            }
+            other => {
+                return Err(format!("expected NodeUnavailable, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+}

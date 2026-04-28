@@ -1,0 +1,50 @@
+[package]
+name = "zinder-compat-lightwalletd"
+version = "0.1.0"
+description = "lightwalletd-compatible gRPC adapter over Zinder wallet query data"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "lightwalletd", "grpc"]
+categories = ["network-programming"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+config.workspace = true
+hex.workspace = true
+prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["server", "transport"] }
+tracing.workspace = true
+zebra-chain.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-query.workspace = true
+zinder-runtime.workspace = true
+zinder-source.workspace = true
+zinder-store.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+eyre.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+zinder-ingest.workspace = true
+zinder-store.workspace = true
+zinder-testkit.workspace = true
+
+[[bin]]
+name = "zinder-compat-lightwalletd"
+path = "src/bin/zinder-compat-lightwalletd/main.rs"
+
+[lints]
+workspace = true

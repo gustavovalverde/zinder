@@ -1,0 +1,28 @@
+msrv = "1.91"
+
+cognitive-complexity-threshold = 25
+type-complexity-threshold = 250
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 80
+
+pass-by-value-size-limit = 256
+array-size-threshold = 16384
+
+allow-dbg-in-tests = false
+allow-expect-in-tests = false
+allow-unwrap-in-tests = false
+allow-print-in-tests = false
+
+avoid-breaking-exported-api = true
+check-private-items = true
+
+disallowed-names = [
+  "data",
+  "info",
+  "item",
+  "result",
+  "stuff",
+  "thing",
+  "tmp",
+  "value",
+]

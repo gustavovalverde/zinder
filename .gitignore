@@ -1,0 +1,13 @@
+target/
+.tmp/
+mutants.out/
+mutants.out.old/
+
+# Local RocksDB stores and fixture scratch data.
+*.rocksdb/
+*.zinder-store/
+
+# Local coverage output.
+coverage/
+*.profraw
+lcov.info

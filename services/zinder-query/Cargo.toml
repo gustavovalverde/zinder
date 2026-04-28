@@ -1,0 +1,52 @@
+[package]
+name = "zinder-query"
+version = "0.1.0"
+description = "Zinder wallet and application query boundary"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "query"]
+categories = ["api-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
+config.workspace = true
+metrics.workspace = true
+prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["server", "transport"] }
+tonic-health.workspace = true
+tonic-reflection.workspace = true
+tonic-types.workspace = true
+tracing.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-runtime.workspace = true
+zinder-source.workspace = true
+zinder-store.workspace = true
+
+[[bin]]
+name = "zinder-query"
+path = "src/bin/zinder-query/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+eyre.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["transport"] }
+zinder-testkit.workspace = true

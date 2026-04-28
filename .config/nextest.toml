@@ -1,0 +1,50 @@
+# Workspace nextest profiles. See ADR-0012 §Test runner: nextest and the
+# matching architecture doc at docs/architecture/service-operations.md
+# §Validation Tiers.
+#
+# Tiers:
+#   T0 unit         -> #[cfg(test)] mod tests in src/   (default-filter)
+#   T1 integration  -> tests/integration/               (default-filter)
+#   T2 perf         -> tests/perf/                      (ci-perf profile)
+#   T3 live         -> tests/live/                      (ci-live profile)
+#
+# default-filter is the structural boundary between tiers; #[ignore] is the
+# libtest-fallback safety net for `cargo test` users without nextest. Both
+# must remain in place; either alone is insufficient.
+
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 2 }
+fail-fast = false
+default-filter = "not test(/^live::/) and not test(/^perf::/)"
+
+[profile.ci]
+inherits = "default"
+retries = { count = 1, backoff = "exponential", delay = "1s" }
+final-status-level = "fail"
+junit = { path = "target/nextest/junit.xml" }
+
+[profile.ci-perf]
+default-filter = "test(/^perf::/)"
+slow-timeout = { period = "5m", terminate-after = 1 }
+junit = { path = "target/nextest/perf.xml" }
+
+[profile.ci-live]
+default-filter = "test(/^live::/)"
+retries = { count = 2, backoff = "exponential", delay = "5s" }
+slow-timeout = { period = "60s", terminate-after = 1 }
+junit = { path = "target/nextest/live.xml" }
+
+# Live tests that mutate node state share a single Docker container.
+# Read-only live tests (capability probes, tip fetches, broadcast-rejection
+# classification) run in parallel under the default group; only mutators join
+# this group via per-test override below.
+[test-groups]
+node-mutating = { max-threads = 1 }
+
+[[profile.ci-live.overrides]]
+filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli)"
+test-group = "node-mutating"
+
+[[profile.ci-live.overrides]]
+filter = "test(backfills_last_1000_blocks_from_checkpoint)"
+slow-timeout = { period = "5m", terminate-after = 1 }

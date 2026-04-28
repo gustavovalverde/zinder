@@ -1,0 +1,179 @@
+name: live-tests
+
+# T3 (live) tests under tests/live/, double-gated by #[ignore] and
+# require_live(). Per ADR-0012:
+#   - regtest runs nightly against a Dockerized Zebra service container
+#   - testnet runs weekly against a hosted testnet node
+#   - mainnet is workflow_dispatch-only until the open infrastructure
+#     questions in ADR-0012 §Open mainnet infrastructure questions resolve.
+# CI secrets mirror the env-var schema: NODE_<NETWORK>_JSON_RPC_ADDR etc.
+
+on:
+  schedule:
+    # Nightly regtest at 02:17 UTC.
+    - cron: "17 2 * * *"
+    # Weekly testnet on Mondays at 03:17 UTC.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Network to test against"
+        required: true
+        default: zcash-regtest
+        type: choice
+        options:
+          - zcash-regtest
+          - zcash-testnet
+          - zcash-mainnet
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NEXTEST_VERSION: "0.9.116"
+  PROTOC_VERSION: "29.3"
+
+jobs:
+  regtest:
+    name: live regtest
+    if: |
+      github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-regtest'
+        || (github.event_name == 'schedule' && github.event.schedule == '17 2 * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      zebra:
+        image: zfnd/zebra:latest
+        ports:
+          - 39232:39232
+        env:
+          ZEBRA_NETWORK: Regtest
+        options: >-
+          --health-cmd "wget -q -O- http://localhost:39232 || true"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      - name: Run T3 live tests against regtest
+        env:
+          ZINDER_TEST_LIVE: "1"
+          ZINDER_NETWORK: zcash-regtest
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_REGTEST_JSON_RPC_ADDR || 'http://127.0.0.1:39232' }}
+          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
+          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
+          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
+        # Run every live test except mainnet-only ones. Regtest is the only
+        # network where deep_chain and latency fit in CI budgets without
+        # checkpoint backfill (docs/plans/backfill-from-checkpoint.md).
+        # Mainnet-only tests are excluded by explicit behavior name because
+        # ADR-0012 keeps network labels out of new live test names.
+        run: |
+          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+            -E 'test(/^live::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint)'
+
+  testnet:
+    name: live testnet
+    if: |
+      github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-testnet'
+        || (github.event_name == 'schedule' && github.event.schedule == '17 3 * * 1')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      - name: Run T3 live tests against testnet
+        env:
+          ZINDER_TEST_LIVE: "1"
+          ZINDER_NETWORK: zcash-testnet
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_TESTNET_JSON_RPC_ADDR }}
+          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
+          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
+          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
+        # Filter out tests scoped to other networks. Tests under deep_chain
+        # and latency need checkpoint backfill before they fit in hosted-
+        # network CI budgets. Network-constrained tests are excluded by
+        # explicit behavior name because ADR-0012 keeps network labels out of
+        # new live test names.
+        run: |
+          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+            -E 'test(/^live::/) and not test(_on_regtest) and not test(mainnet) and not test(backfills_from_checkpoint) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(deep_chain) and not test(latency)'
+
+  mainnet:
+    name: live mainnet
+    # Per ADR-0012 §Open mainnet infrastructure questions, T3 mainnet is
+    # workflow_dispatch-only until the runner topology, on-call, and trigger
+    # model are answered. Tests that target mainnet must opt in via
+    # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
+    if: github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-mainnet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      - name: Run T3 live tests against mainnet
+        env:
+          ZINDER_TEST_LIVE: "1"
+          ZINDER_NETWORK: zcash-mainnet
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_MAINNET_JSON_RPC_ADDR }}
+          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_MAINNET_AUTH_METHOD }}
+          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_MAINNET_AUTH_USERNAME }}
+          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
+        # Mainnet runs only tests that explicitly opt in via
+        # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
+        # Keep this allowlist explicit because live test names intentionally
+        # avoid network names unless they predate ADR-0012's naming rule.
+        run: |
+          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint)'

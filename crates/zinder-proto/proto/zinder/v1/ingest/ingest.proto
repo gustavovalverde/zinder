@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package zinder.v1.ingest;
+
+import "zinder/v1/wallet/wallet.proto";
+
+// Private ingest control-plane request for the writer's latest committed
+// chain epoch.
+message WriterStatusRequest {}
+
+// Private ingest control-plane response used by colocated secondary readers
+// to compute RocksDB-secondary replica lag.
+message WriterStatusResponse {
+  // Stable public network name, such as "zcash-regtest".
+  string network_name = 1;
+
+  // Latest chain epoch committed by the primary writer, when one is visible.
+  optional uint64 latest_writer_chain_epoch_id = 2;
+
+  // Writer's visible tip height for latest_writer_chain_epoch_id.
+  optional uint32 latest_writer_tip_height = 3;
+
+  // Writer's finalized height for latest_writer_chain_epoch_id.
+  optional uint32 latest_writer_finalized_height = 4;
+}
+
+// Private ingest control-plane RPCs for colocated read replicas.
+service IngestControl {
+  // Returns the writer's latest committed chain epoch.
+  rpc WriterStatus(WriterStatusRequest) returns (WriterStatusResponse);
+
+  // Streams chain-event history from the ingest writer's primary store.
+  rpc ChainEvents(zinder.v1.wallet.ChainEventsRequest) returns (stream zinder.v1.wallet.ChainEventEnvelope);
+}

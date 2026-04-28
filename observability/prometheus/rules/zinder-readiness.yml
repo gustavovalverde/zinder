@@ -1,0 +1,74 @@
+groups:
+  - name: zinder-readiness
+    rules:
+      - alert: ZinderTargetDown
+        expr: up{stack="zinder-local"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zinder scrape target is down"
+          description: "{{ $labels.service }} has not been scrapeable for 30 seconds."
+
+      - alert: ZinderServiceNotReady
+        expr: zinder_readiness_state{cause!="ready"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder service is not ready"
+          description: "{{ $labels.service }} reports readiness cause {{ $labels.cause }}."
+
+      - alert: ZinderReplicaLag
+        expr: max by (service) (zinder_readiness_replica_lag_chain_epochs) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder secondary replica lag"
+          description: "{{ $labels.service }} has a non-zero secondary replica lag."
+
+      - alert: ZinderNodeRpcErrors
+        expr: sum by (service, method, error_class) (rate(zinder_node_request_total{status!="ok"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder node RPC errors"
+          description: "{{ $labels.service }} sees {{ $labels.error_class }} errors from {{ $labels.method }}."
+
+      - alert: ZinderWalletQueryP95High
+        expr: histogram_quantile(0.95, sum by (service, operation, le) (rate(zinder_query_request_duration_seconds_bucket[5m]))) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder wallet query p95 is high"
+          description: "{{ $labels.service }} {{ $labels.operation }} p95 is above 250ms."
+
+      - alert: ZinderStoreReadP95High
+        expr: histogram_quantile(0.95, sum by (service, table, operation, le) (rate(zinder_store_read_duration_seconds_bucket[5m]))) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder store read p95 is high"
+          description: "{{ $labels.service }} {{ $labels.table }}/{{ $labels.operation }} p95 is above 50ms."
+
+      - alert: ZinderRocksDbCompactionPressure
+        expr: max by (service, cf) (zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"}) > 268435456
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder RocksDB compaction pressure"
+          description: "{{ $labels.service }} {{ $labels.cf }} has more than 256MiB pending compaction bytes."
+
+      - alert: ZinderRocksDbCompactionRunningTooLong
+        expr: max by (service, cf) (zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"}) > 4
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder RocksDB compaction is running for too long"
+          description: "{{ $labels.service }} {{ $labels.cf }} reports more than four running compactions for 15 minutes."
