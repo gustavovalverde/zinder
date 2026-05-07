@@ -200,6 +200,36 @@ impl RocksChainStore {
         scan_outcome
     }
 
+    pub(crate) fn scan_forward(
+        &self,
+        table: StorageTable,
+        start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            let column_family = self.column_family(table)?;
+            let mut iterator = self.db.raw_iterator_cf(&column_family);
+
+            iterator.seek(start_key.as_bytes());
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.next();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(table, started_at, &scan_outcome);
+
+        scan_outcome
+    }
+
     pub(crate) fn write(&self, puts: Vec<StoragePut>) -> Result<(), StoreError> {
         self.write_batch(puts, Vec::new())
     }
@@ -335,6 +365,13 @@ pub(crate) trait RocksChainStoreRead {
         prefix: &StoreKey,
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError>;
+
+    fn scan_forward(
+        &self,
+        table: StorageTable,
+        start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError>;
 }
 
 pub(crate) enum PrefixScanControl {
@@ -371,6 +408,15 @@ impl RocksChainStoreRead for RocksChainStore {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
         Self::scan_prefix(self, table, prefix, visit)
+    }
+
+    fn scan_forward(
+        &self,
+        table: StorageTable,
+        start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        Self::scan_forward(self, table, start_key, visit)
     }
 }
 
@@ -424,6 +470,18 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_prefix(table, prefix, visit),
             Self::Direct(store) => store.scan_prefix(table, prefix, visit),
+        }
+    }
+
+    fn scan_forward(
+        &self,
+        table: StorageTable,
+        start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.scan_forward(table, start_key, visit),
+            Self::Direct(store) => store.scan_forward(table, start_key, visit),
         }
     }
 }
@@ -511,6 +569,35 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
                 if !key.starts_with(prefix.as_bytes()) {
                     break;
                 }
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.next();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(table, started_at, &scan_outcome);
+
+        scan_outcome
+    }
+
+    fn scan_forward(
+        &self,
+        table: StorageTable,
+        start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            let column_family = self.store.column_family(table)?;
+            let mut iterator = self.snapshot.raw_iterator_cf(&column_family);
+            iterator.seek(start_key.as_bytes());
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
                 if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
                     break;
                 }

@@ -102,19 +102,28 @@ impl IndexerError {
                     resource: "artifact",
                 }
             }
-            StoreError::EventCursorInvalid { reason }
+            StoreError::ChainEventCursorInvalid { reason }
+            | StoreError::MempoolEventCursorInvalid { reason }
             | StoreError::InvalidChainEpochArtifacts { reason }
             | StoreError::InvalidChainStoreOptions { reason }
             | StoreError::ArtifactCorrupt { reason, .. }
             | StoreError::Unsupported { feature: reason } => Self::InvalidRequest {
                 reason: reason.to_owned(),
             },
-            StoreError::EventCursorExpired {
+            StoreError::ChainEventCursorExpired {
                 event_sequence,
                 oldest_retained_sequence,
             } => Self::FailedPrecondition {
                 reason: format!(
-                    "event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
+                    "chain event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
+                ),
+            },
+            StoreError::MempoolEventCursorExpired {
+                event_sequence,
+                oldest_retained_sequence,
+            } => Self::FailedPrecondition {
+                reason: format!(
+                    "mempool event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
                 ),
             },
             StoreError::StorageUnavailable { .. }

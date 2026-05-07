@@ -31,6 +31,8 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0006: Test tiers and unified live-test config](adrs/0006-test-tiers-and-live-config.md)
 - [ADR-0007: Multi-process storage access](adrs/0007-multi-process-storage-access.md)
 - [ADR-0008: Consumer-neutral wallet data plane](adrs/0008-consumer-neutral-wallet-data-plane.md)
+- [ADR-0009: IngestControl transport security](adrs/0009-ingest-control-transport-security.md)
+- [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md)
 
 ## Reference
 
@@ -39,12 +41,13 @@ Living external references that constrain Zinder's design. Refreshed as the upst
 - [Lessons from Zaino](reference/lessons-from-zaino.md): prior-art lessons from Zaino's public tracker and how they inform Zinder's product guarantees.
 - [Serving Zebra and Zallet](reference/serving-zebra-and-zallet.md): the integration audit between the upstream node and full-node wallet.
 - [Findings from Android wallet integration](reference/android-wallet-integration-findings.md): observed behavior of `zcash-android-wallet-sdk` against `zinder-compat-lightwalletd`.
+- [Serving public lightwalletd clients](reference/serving-public-lightwalletd-clients.md): operator gap analysis vs. community-run servers like `zec.rocks` and the deployment recipe to match them.
 
 ## Specs (in flight)
 
 Mutable working documents for un-shipped multi-PR work. When a spec's work lands, its locked decisions promote to one or more ADRs and the spec is deleted.
 
-- [M3 mempool](specs/m3-mempool.md): mempool source hydration, live index, event log, native wallet API, lightwalletd compatibility, typed Rust client, and product validation gates.
+No specs are currently in flight. The most recent spec to land was M3 mempool; its locked decisions live in [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
 
 ## Vocabulary and naming rules
 

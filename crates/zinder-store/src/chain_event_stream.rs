@@ -34,7 +34,13 @@ pub async fn run_chain_event_stream<ReadPage, ReadPageFuture>(
 
         match read_page(cursor.clone()).await {
             Ok(event_envelopes) if event_envelopes.is_empty() => {
-                tokio::time::sleep(CHAIN_EVENT_IDLE_POLL_INTERVAL).await;
+                // Same pattern as `stream_mempool_events`: race the polling
+                // sleep against receiver closure so the task exits cleanly
+                // on server shutdown when no further events are produced.
+                tokio::select! {
+                    () = tokio::time::sleep(CHAIN_EVENT_IDLE_POLL_INTERVAL) => {}
+                    () = event_sender.closed() => return,
+                }
             }
             Ok(event_envelopes) => {
                 queued_events = event_envelopes.into();

@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
-use zinder_core::{BlockHash, BlockHeight, Network};
+use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 
 /// Fixed byte length of a [`StreamCursorTokenV1`].
 pub const STREAM_CURSOR_TOKEN_V1_LEN: usize = 82;
@@ -45,6 +45,52 @@ impl ChainEventStreamFamily {
             _ => None,
         }
     }
+}
+
+/// Mempool-event stream family encoded in the low nibble of a cursor flags
+/// byte.
+///
+/// Mempool cursors share the [`StreamCursorTokenV1`] envelope but carry a
+/// different body shape (sequence + last transaction id rather than
+/// sequence + last height/hash). The flags byte at offset 49 distinguishes
+/// the two; chain-event decoders reject mempool cursors with
+/// [`StreamCursorError::StreamFamilyMismatch`] and vice versa.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MempoolEventStreamFamily {
+    /// Single mempool event family (flag `0x2`). Reserved nibble values
+    /// `0x3..0xF` are available for future M3 extensions (e.g. a
+    /// transparent-only mempool family).
+    Mempool,
+}
+
+impl MempoolEventStreamFamily {
+    pub(crate) const fn flags(self) -> u8 {
+        match self {
+            Self::Mempool => 0x2,
+        }
+    }
+
+    const fn from_flags(flags: u8) -> Option<Self> {
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
+            return None;
+        }
+        match flags & STREAM_FAMILY_MASK {
+            0x2 => Some(Self::Mempool),
+            _ => None,
+        }
+    }
+}
+
+/// Cursor payload decoded from a mempool-event stream cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolEventCursorPayload {
+    /// Stream family encoded in the cursor flags byte.
+    pub family: MempoolEventStreamFamily,
+    /// Mempool event sequence carried by the cursor.
+    pub event_sequence: u64,
+    /// Identifier of the mempool transaction last delivered before this
+    /// cursor was issued.
+    pub last_transaction_id: TransactionId,
 }
 
 /// Cursor payload decoded from a chain-event stream cursor.
@@ -140,6 +186,79 @@ impl StreamCursorTokenV1 {
             event_sequence: read_u64_be(&self.0, 5)?,
             last_height: BlockHeight::new(read_u32_be(&self.0, 13)?),
             last_hash: BlockHash::from_bytes(hash_bytes),
+        })
+    }
+
+    /// Builds a mempool-event cursor token.
+    pub fn mempool_event(
+        network: Network,
+        family: MempoolEventStreamFamily,
+        event_sequence: u64,
+        last_transaction_id: TransactionId,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<Self, StreamCursorError> {
+        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
+        cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
+        cursor_bytes.extend_from_slice(&network.id().to_be_bytes());
+        cursor_bytes.extend_from_slice(&event_sequence.to_be_bytes());
+        cursor_bytes.extend_from_slice(&last_transaction_id.as_bytes());
+        // Reserved padding to keep the body 50 bytes long (1 + 4 + 8 + 32 +
+        // 4 + 1) so chain and mempool cursors share the on-the-wire length.
+        cursor_bytes.extend_from_slice(&[0u8; 4]);
+        cursor_bytes.push(family.flags());
+
+        let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
+        cursor_bytes.extend_from_slice(&auth_tag);
+
+        Ok(Self(cursor_bytes))
+    }
+
+    /// Decodes a mempool-event cursor token.
+    pub fn decode_mempool_event(
+        &self,
+        expected_network: Network,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<MempoolEventCursorPayload, StreamCursorError> {
+        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
+            return Err(StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            });
+        }
+
+        if self.0[0] != STREAM_CURSOR_SCHEMA_VERSION {
+            return Err(StreamCursorError::UnsupportedSchemaVersion { version: self.0[0] });
+        }
+
+        let network_id = read_u32_be(&self.0, 1)?;
+        let network =
+            Network::from_id(network_id).ok_or(StreamCursorError::UnknownNetwork { network_id })?;
+        if network != expected_network {
+            return Err(StreamCursorError::NetworkMismatch {
+                expected: expected_network,
+                actual: network,
+            });
+        }
+
+        let flags = self.0[49];
+        let family = MempoolEventStreamFamily::from_flags(flags)
+            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+
+        verify_auth_tag(
+            cursor_auth_key,
+            &self.0[..CURSOR_BODY_LEN],
+            &self.0[CURSOR_BODY_LEN..],
+        )?;
+
+        let transaction_id_bytes = <[u8; 32]>::try_from(&self.0[13..45]).map_err(|_| {
+            StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            }
+        })?;
+
+        Ok(MempoolEventCursorPayload {
+            family,
+            event_sequence: read_u64_be(&self.0, 5)?,
+            last_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
         })
     }
 

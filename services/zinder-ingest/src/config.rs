@@ -8,11 +8,13 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
     BackfillConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-    IngestError, NodeSourceKind, TipFollowConfig,
+    IngestError, MempoolEventRetentionWorkerConfig, NodeSourceKind, TipFollowConfig,
 };
 use zinder_runtime::{
-    ConfigError, path_to_config_string, require_string, zinder_environment_source,
+    BearerToken, BearerTokenError, ConfigError, path_to_config_string, require_string,
+    zinder_environment_source,
 };
+use zinder_store::MempoolEventRetentionConfig;
 
 use crate::cli::parse::{
     parse_commit_batch_blocks, parse_max_response_bytes, parse_network, parse_node_source,
@@ -32,6 +34,12 @@ const DEFAULT_INGEST_CONTROL_LISTEN_ADDR: &str = "127.0.0.1:9100";
 const DEFAULT_CHAIN_EVENT_RETENTION_HOURS: u64 = 168;
 const DEFAULT_CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_CURSOR_AT_RISK_WARNING_HOURS: u64 = 24;
+const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
+const DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS: u64 = 24;
+const DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 30_000;
+// Per ADR-0010 the default warning fires at 80% of the shorter window.
+// 20% of `DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES` (60) is 12 minutes.
+const DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES: u64 = 12;
 
 /// Fully loaded command configuration for `zinder-ingest backfill`.
 #[derive(Debug)]
@@ -92,7 +100,10 @@ impl BackfillCoverage {
 pub(crate) struct TipFollowCommandConfig {
     pub(crate) tip_follow: TipFollowConfig,
     pub(crate) ingest_control_listen_addr: SocketAddr,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) chain_event_retention: ChainEventRetentionConfig,
+    pub(crate) mempool_event_retention: MempoolEventRetentionWorkerConfig,
 }
 
 /// Fully loaded command configuration for `zinder-ingest backup`.
@@ -140,6 +151,7 @@ pub(crate) struct TipFollowConfigOverrides {
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
 }
 
 /// Command-line overrides for the backup command.
@@ -179,6 +191,10 @@ pub(crate) enum IngestConfigError {
         #[source]
         source: tonic::transport::Error,
     },
+
+    /// Loading the ingest-control bearer token failed.
+    #[error("invalid ingest-control bearer token: {0}")]
+    BearerToken(#[from] BearerTokenError),
 }
 
 /// Loads and validates backfill configuration from defaults, file, environment, and CLI overrides.
@@ -252,6 +268,26 @@ pub(crate) fn load_tip_follow_config(
         .set_default(
             "ingest.retention.cursor_at_risk_warning_hours",
             DEFAULT_CURSOR_AT_RISK_WARNING_HOURS,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "ingest.retention.mempool_mined_retention_minutes",
+            DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "ingest.retention.mempool_invalidated_retention_hours",
+            DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "ingest.retention.mempool_event_retention_check_interval_ms",
+            DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "ingest.retention.mempool_cursor_at_risk_warning_minutes",
+            DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES,
         )
         .map_err(ConfigError::load)?;
 
@@ -344,6 +380,7 @@ struct NetworkConfig {
 struct NodeConfig {
     source: Option<String>,
     json_rpc_addr: Option<String>,
+    indexer_grpc_addr: Option<String>,
     request_timeout_secs: Option<u64>,
     max_response_bytes: Option<u64>,
     auth: NodeAuthConfig,
@@ -377,6 +414,7 @@ struct IngestSectionConfig {
 #[serde(default, deny_unknown_fields)]
 struct IngestControlSectionConfig {
     listen_addr: Option<String>,
+    token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -385,6 +423,10 @@ struct IngestRetentionSectionConfig {
     chain_event_retention_hours: Option<u64>,
     chain_event_retention_check_interval_ms: Option<u64>,
     cursor_at_risk_warning_hours: Option<u64>,
+    mempool_mined_retention_minutes: Option<u64>,
+    mempool_invalidated_retention_hours: Option<u64>,
+    mempool_event_retention_check_interval_ms: Option<u64>,
+    mempool_cursor_at_risk_warning_minutes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -582,6 +624,14 @@ fn apply_tip_follow_overrides(
             )
             .map_err(ConfigError::load)?;
     }
+    if let Some(token_path) = overrides.ingest_control_token_path {
+        builder = builder
+            .set_override(
+                "ingest.control.token_path",
+                path_to_config_string(token_path, "ingest.control.token_path")?,
+            )
+            .map_err(ConfigError::load)?;
+    }
     Ok(builder)
 }
 
@@ -672,7 +722,8 @@ fn resolve_backfill_config(
             node_auth,
             Duration::from_secs(request_timeout_secs),
             parse_max_response_bytes(max_response_bytes)?,
-        ),
+        )
+        .with_indexer_grpc_addr(config.node.indexer_grpc_addr),
         node_source,
         storage_path,
         from_height,
@@ -761,6 +812,11 @@ fn resolve_tip_follow_config(
                     "ingest.control.listen_addr {ingest_control_listen_addr_string} is not a socket address: {source}"
                 ))
             })?;
+    let ingest_control_token_path = config.ingest.control.token_path.clone();
+    let ingest_control_bearer_token = ingest_control_token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
     let chain_event_retention_hours = require_u64(
         config.ingest.retention.chain_event_retention_hours,
         "ingest.retention.chain_event_retention_hours",
@@ -776,9 +832,37 @@ fn resolve_tip_follow_config(
         config.ingest.retention.cursor_at_risk_warning_hours,
         "ingest.retention.cursor_at_risk_warning_hours",
     )?;
+    let mempool_mined_retention_minutes = require_u64(
+        config.ingest.retention.mempool_mined_retention_minutes,
+        "ingest.retention.mempool_mined_retention_minutes",
+    )?;
+    let mempool_invalidated_retention_hours = require_u64(
+        config.ingest.retention.mempool_invalidated_retention_hours,
+        "ingest.retention.mempool_invalidated_retention_hours",
+    )?;
+    let mempool_event_retention_check_interval_ms = require_u64(
+        config
+            .ingest
+            .retention
+            .mempool_event_retention_check_interval_ms,
+        "ingest.retention.mempool_event_retention_check_interval_ms",
+    )?;
+    let mempool_cursor_at_risk_warning_minutes = require_u64(
+        config
+            .ingest
+            .retention
+            .mempool_cursor_at_risk_warning_minutes,
+        "ingest.retention.mempool_cursor_at_risk_warning_minutes",
+    )?;
     if chain_event_retention_check_interval_ms == 0 {
         return Err(ConfigError::invalid(
             "ingest.retention.chain_event_retention_check_interval_ms must be greater than zero",
+        )
+        .into());
+    }
+    if mempool_event_retention_check_interval_ms == 0 {
+        return Err(ConfigError::invalid(
+            "ingest.retention.mempool_event_retention_check_interval_ms must be greater than zero",
         )
         .into());
     }
@@ -786,6 +870,18 @@ fn resolve_tip_follow_config(
     {
         return Err(ConfigError::invalid(
             "ingest.retention.cursor_at_risk_warning_hours must be less than or equal to ingest.retention.chain_event_retention_hours",
+        )
+        .into());
+    }
+    let shortest_mempool_window_minutes = shortest_mempool_window_minutes_from(
+        mempool_mined_retention_minutes,
+        mempool_invalidated_retention_hours,
+    );
+    if let Some(shortest) = shortest_mempool_window_minutes
+        && mempool_cursor_at_risk_warning_minutes > shortest
+    {
+        return Err(ConfigError::invalid(
+            "ingest.retention.mempool_cursor_at_risk_warning_minutes must be less than or equal to the shortest configured mempool retention window",
         )
         .into());
     }
@@ -800,7 +896,8 @@ fn resolve_tip_follow_config(
                 node_auth,
                 Duration::from_secs(request_timeout_secs),
                 parse_max_response_bytes(max_response_bytes)?,
-            ),
+            )
+            .with_indexer_grpc_addr(config.node.indexer_grpc_addr),
             node_source,
             storage_path,
             reorg_window_blocks: parse_reorg_window_blocks(reorg_window_blocks)?,
@@ -809,6 +906,8 @@ fn resolve_tip_follow_config(
             lag_threshold_blocks,
         },
         ingest_control_listen_addr,
+        ingest_control_token_path,
+        ingest_control_bearer_token,
         chain_event_retention: ChainEventRetentionConfig {
             retention_window: (chain_event_retention_hours > 0)
                 .then(|| Duration::from_secs(chain_event_retention_hours.saturating_mul(3_600))),
@@ -817,7 +916,31 @@ fn resolve_tip_follow_config(
                 cursor_at_risk_warning_hours.saturating_mul(3_600),
             ),
         },
+        mempool_event_retention: MempoolEventRetentionWorkerConfig {
+            retention: MempoolEventRetentionConfig::new(
+                (mempool_mined_retention_minutes > 0).then(|| {
+                    Duration::from_secs(mempool_mined_retention_minutes.saturating_mul(60))
+                }),
+                (mempool_invalidated_retention_hours > 0).then(|| {
+                    Duration::from_secs(mempool_invalidated_retention_hours.saturating_mul(3_600))
+                }),
+            ),
+            check_interval: Duration::from_millis(mempool_event_retention_check_interval_ms),
+            cursor_at_risk_warning: Duration::from_secs(
+                mempool_cursor_at_risk_warning_minutes.saturating_mul(60),
+            ),
+        },
     })
+}
+
+fn shortest_mempool_window_minutes_from(mined_minutes: u64, invalidated_hours: u64) -> Option<u64> {
+    let mined = (mined_minutes > 0).then_some(mined_minutes);
+    let invalidated = (invalidated_hours > 0).then_some(invalidated_hours.saturating_mul(60));
+    match (mined, invalidated) {
+        (Some(mined), Some(invalidated)) => Some(mined.min(invalidated)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
 fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
@@ -927,6 +1050,7 @@ impl RedactedBackfillConfigToml {
             node: NodeToml {
                 source: node_source_name(config.node_source),
                 json_rpc_addr: config.node.json_rpc_addr.clone(),
+                indexer_grpc_addr: config.node.indexer_grpc_addr.clone(),
                 request_timeout_secs: config.node.request_timeout.as_secs(),
                 max_response_bytes: config.node.max_response_bytes.get(),
                 auth: NodeAuthToml::from_node_auth(&config.node.node_auth),
@@ -964,6 +1088,7 @@ impl RedactedTipFollowConfigToml {
             node: NodeToml {
                 source: node_source_name(config.tip_follow.node_source),
                 json_rpc_addr: config.tip_follow.node.json_rpc_addr.clone(),
+                indexer_grpc_addr: config.tip_follow.node.indexer_grpc_addr.clone(),
                 request_timeout_secs: config.tip_follow.node.request_timeout.as_secs(),
                 max_response_bytes: config.tip_follow.node.max_response_bytes.get(),
                 auth: NodeAuthToml::from_node_auth(&config.tip_follow.node.node_auth),
@@ -976,9 +1101,14 @@ impl RedactedTipFollowConfigToml {
                 commit_batch_blocks: config.tip_follow.commit_batch_blocks.get(),
                 control: Some(IngestControlToml {
                     listen_addr: config.ingest_control_listen_addr.to_string(),
+                    token_path: config
+                        .ingest_control_token_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
                 }),
-                retention: Some(IngestRetentionToml::from_chain_event_retention(
+                retention: Some(IngestRetentionToml::from_retention(
                     config.chain_event_retention,
+                    config.mempool_event_retention,
                 )),
             },
             tip_follow: TipFollowToml {
@@ -1014,6 +1144,8 @@ struct NetworkToml {
 struct NodeToml {
     source: &'static str,
     json_rpc_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexer_grpc_addr: Option<String>,
     request_timeout_secs: u64,
     max_response_bytes: u64,
     auth: NodeAuthToml,
@@ -1074,6 +1206,8 @@ struct IngestToml {
 #[derive(Serialize)]
 struct IngestControlToml {
     listen_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1081,14 +1215,33 @@ struct IngestRetentionToml {
     chain_event_retention_hours: u64,
     chain_event_retention_check_interval_ms: u64,
     cursor_at_risk_warning_hours: u64,
+    mempool_mined_retention_minutes: u64,
+    mempool_invalidated_retention_hours: u64,
+    mempool_event_retention_check_interval_ms: u64,
+    mempool_cursor_at_risk_warning_minutes: u64,
 }
 
 impl IngestRetentionToml {
-    fn from_chain_event_retention(config: ChainEventRetentionConfig) -> Self {
+    fn from_retention(
+        chain: ChainEventRetentionConfig,
+        mempool: MempoolEventRetentionWorkerConfig,
+    ) -> Self {
         Self {
-            chain_event_retention_hours: config.retention_window.map_or(0, duration_hours),
-            chain_event_retention_check_interval_ms: duration_millis(config.check_interval),
-            cursor_at_risk_warning_hours: duration_hours(config.cursor_at_risk_warning),
+            chain_event_retention_hours: chain.retention_window.map_or(0, duration_hours),
+            chain_event_retention_check_interval_ms: duration_millis(chain.check_interval),
+            cursor_at_risk_warning_hours: duration_hours(chain.cursor_at_risk_warning),
+            mempool_mined_retention_minutes: mempool
+                .retention
+                .mined_retention
+                .map_or(0, duration_minutes),
+            mempool_invalidated_retention_hours: mempool
+                .retention
+                .invalidated_retention
+                .map_or(0, duration_hours),
+            mempool_event_retention_check_interval_ms: duration_millis(mempool.check_interval),
+            mempool_cursor_at_risk_warning_minutes: duration_minutes(
+                mempool.cursor_at_risk_warning,
+            ),
         }
     }
 }
@@ -1121,4 +1274,8 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn duration_hours(duration: Duration) -> u64 {
     duration.as_secs() / 3_600
+}
+
+fn duration_minutes(duration: Duration) -> u64 {
+    duration.as_secs() / 60
 }

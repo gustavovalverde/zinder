@@ -11,8 +11,10 @@ mod local;
 mod remote;
 
 pub use chain_index::{
-    CHAIN_INDEX_CAPABILITIES, ChainEpochCommitted, ChainEvent, ChainEventCursor,
-    ChainEventEnvelope, ChainEventStream, ChainIndex, ChainRangeReverted, IndexStream, TxStatus,
+    ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventStream,
+    ChainIndex, ChainRangeReverted, IndexStream, MempoolEvent, MempoolEventCursor,
+    MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest,
+    MempoolSnapshotView, TxStatus,
 };
 pub use error::IndexerError;
 pub use local::{LocalChainIndex, LocalOpenOptions};
@@ -20,9 +22,12 @@ pub use remote::{RemoteChainIndex, RemoteOpenOptions};
 pub use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, BlockId, BroadcastAccepted,
     BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
-    TransactionBroadcastResult, TransactionId, TreeStateArtifact,
+    ChainEpochId, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TreeStateArtifact,
 };
+pub use zinder_proto::ZINDER_CAPABILITIES;
 pub use zinder_proto::v1::wallet::ServerCapabilities;
 pub use zinder_store::ChainEventStreamFamily;

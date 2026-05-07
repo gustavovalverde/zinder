@@ -37,9 +37,19 @@ struct Cli {
     /// Private `zinder-ingest` control gRPC endpoint.
     #[arg(long = "ingest-control-addr")]
     ingest_control_addr: Option<String>,
+    /// Path to a file containing the shared-secret bearer token used by the
+    /// `IngestControl` writer. Required when the writer enforces auth.
+    #[arg(long = "ingest-control-token-path")]
+    ingest_control_token_path: Option<PathBuf>,
     /// Chain-event retention window in hours, advertised through `ServerInfo`.
     #[arg(long = "chain-event-retention-hours")]
     chain_event_retention_hours: Option<u64>,
+    /// Mined mempool-event retention window in minutes, advertised through `ServerInfo`.
+    #[arg(long = "mempool-mined-retention-minutes")]
+    mempool_mined_retention_minutes: Option<u64>,
+    /// Invalidated mempool-event retention window in hours, advertised through `ServerInfo`.
+    #[arg(long = "mempool-invalidated-retention-hours")]
+    mempool_invalidated_retention_hours: Option<u64>,
     /// Native wallet query gRPC listen address, such as 127.0.0.1:9101.
     #[arg(long = "listen-addr")]
     listen_addr: Option<SocketAddr>,
@@ -116,13 +126,21 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         network: query_config.network.name().to_owned(),
         transaction_broadcast_enabled,
         chain_event_retention_seconds: query_config.chain_event_retention_seconds,
+        mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds,
+        mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds,
         ..zinder_query::ServerInfoSettings::default()
     };
-    let grpc_adapter = zinder_query::WalletQueryGrpcAdapter::with_chain_events_proxy(
-        wallet_query,
-        server_info,
-        query_config.ingest_control_addr.clone(),
-    );
+    let grpc_adapter = {
+        let mut adapter = zinder_query::WalletQueryGrpcAdapter::with_ingest_control_proxy(
+            wallet_query,
+            server_info,
+            query_config.ingest_control_addr.clone(),
+        );
+        if let Some(token) = query_config.ingest_control_bearer_token.clone() {
+            adapter = adapter.with_ingest_control_bearer_token(token);
+        }
+        adapter
+    };
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
@@ -134,6 +152,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             writer_status: Some(zinder_query::WriterStatusConfig {
                 endpoint: query_config.ingest_control_addr.clone(),
                 network: query_config.network,
+                bearer_token: query_config.ingest_control_bearer_token.clone(),
             }),
         },
         cancel.clone(),
@@ -285,7 +304,10 @@ impl From<Cli> for QueryConfigOverrides {
             storage_path: cli.storage_path,
             secondary_path: cli.secondary_path,
             ingest_control_addr: cli.ingest_control_addr,
+            ingest_control_token_path: cli.ingest_control_token_path,
             chain_event_retention_hours: cli.chain_event_retention_hours,
+            mempool_mined_retention_minutes: cli.mempool_mined_retention_minutes,
+            mempool_invalidated_retention_hours: cli.mempool_invalidated_retention_hours,
             listen_addr: cli.listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
         }

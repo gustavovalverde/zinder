@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 hex.workspace = true
@@ -35,9 +36,11 @@ zinder-store.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 eyre.workspace = true
+parking_lot.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio-stream.workspace = true
 zinder-ingest.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

@@ -5,28 +5,16 @@ use std::{pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact, RawTransactionBytes,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId, TreeStateArtifact,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact, MempoolEntry,
+    MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TreeStateArtifact,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
 
 use crate::IndexerError;
-
-/// Capability strings covered by the typed [`ChainIndex`] surface.
-pub const CHAIN_INDEX_CAPABILITIES: &[&str] = &[
-    "wallet.read.latest_block_v1",
-    "wallet.read.compact_block_at_v1",
-    "wallet.read.compact_block_range_v1",
-    "wallet.read.tree_state_at_v1",
-    "wallet.read.latest_tree_state_v1",
-    "wallet.read.subtree_roots_in_range_v1",
-    "wallet.read.transaction_by_id_v1",
-    "wallet.read.server_info_v1",
-    "wallet.broadcast.transaction_v1",
-    "wallet.events.chain_v1",
-];
 
 /// Typed stream returned by chain-index methods.
 pub type IndexStream<T> = Pin<Box<dyn Stream<Item = Result<T, IndexerError>> + Send + 'static>>;
@@ -104,18 +92,145 @@ pub struct ChainRangeReverted {
 }
 
 /// Transaction lookup status.
+///
+/// Returned by [`ChainIndex::transaction_by_id`]. The plain (non-`at_epoch`)
+/// variant consults the live mempool when the canonical chain does not
+/// contain the transaction; the `at_epoch` variant binds strictly to the
+/// requested chain epoch and never consults mempool state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "InMempool carries the full hydrated MempoolEntry by design so consumers (Zallet, Zashi/Zodl) can drop the string-matching tx-status workaround they currently use against zaino. Boxing would push allocation cost into every consumer's pattern match."
+)]
 pub enum TxStatus {
     /// Transaction is mined in the canonical chain.
     Mined(TransactionArtifact),
     /// Transaction is not indexed in the visible canonical chain.
     NotFound,
     /// Transaction is known to be in the mempool.
-    InMempool,
+    ///
+    /// Carries the hydrated [`MempoolEntry`] so consumers correlating
+    /// pending state (transparent UTXO overlays, rebroadcast decisions,
+    /// transaction lifecycle UI) do not need to follow up with
+    /// [`ChainIndex::transparent_mempool_outputs_by_address`] or
+    /// [`ChainIndex::transparent_mempool_spend_by_outpoint`] to obtain
+    /// the same state.
+    InMempool(MempoolEntry),
     /// Transaction conflicts with the visible canonical chain.
     ConflictingChain,
 }
+
+/// Opaque mempool-event cursor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MempoolEventCursor(StreamCursorTokenV1);
+
+impl MempoolEventCursor {
+    /// Creates a cursor from bytes previously returned by Zinder.
+    #[must_use]
+    pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
+        Self(StreamCursorTokenV1::from_bytes(cursor_bytes))
+    }
+
+    /// Returns the opaque cursor bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// Bounded snapshot request for [`ChainIndex::mempool_snapshot`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MempoolSnapshotRequest {
+    /// Server-enforced maximum entry count.
+    pub max_entries: u32,
+    /// Optional next-page cursor returned by a previous paged snapshot.
+    pub from_cursor: Option<MempoolSnapshotCursor>,
+}
+
+/// Opaque next-page cursor for paged mempool snapshots.
+///
+/// Reserved for future paged implementations. Today's in-memory snapshot
+/// returns the head of the live index in one response and ignores
+/// supplied cursors; persistent storage will populate this on the
+/// follow-up implementation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MempoolSnapshotCursor(Vec<u8>);
+
+impl MempoolSnapshotCursor {
+    /// Creates a snapshot cursor from bytes returned by Zinder.
+    #[must_use]
+    pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
+        Self(cursor_bytes.into())
+    }
+
+    /// Returns the opaque cursor bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Snapshot view returned by [`ChainIndex::mempool_snapshot`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MempoolSnapshotView {
+    /// Chain epoch visible at snapshot time.
+    pub chain_epoch: ChainEpoch,
+    /// Monotonic snapshot sequence reported by the server.
+    pub snapshot_sequence: u64,
+    /// Snapshot age in milliseconds when the response was constructed.
+    pub snapshot_age_millis: u64,
+    /// Hydrated mempool entries.
+    pub entries: Vec<MempoolEntry>,
+    /// Next-page cursor when the response was truncated.
+    pub next_cursor: Option<MempoolSnapshotCursor>,
+}
+
+/// Cursor-bound mempool source-event delivered to resumable consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MempoolEventEnvelope {
+    /// Cursor for resuming strictly after this event.
+    pub cursor: MempoolEventCursor,
+    /// Monotonic sequence in the mempool-event stream. Independent from
+    /// the chain-event sequence space.
+    pub event_sequence: u64,
+    /// Wall-clock time when the indexer observed the source change.
+    pub source_observed_unix_millis: u64,
+    /// Source transition observed by the indexer.
+    pub event: MempoolEvent,
+}
+
+/// Mempool source transition delivered to consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Added carries the full hydrated MempoolEntry by design; consumers replay state from the event log without a follow-up snapshot call."
+)]
+pub enum MempoolEvent {
+    /// Mempool transaction observed.
+    Added {
+        /// Hydrated entry observed by the indexer.
+        entry: MempoolEntry,
+    },
+    /// Mempool transaction removed without being mined.
+    Invalidated {
+        /// Identifier of the invalidated transaction.
+        transaction_id: TransactionId,
+        /// Source-classified eviction reason.
+        reason: MempoolEvictionReason,
+    },
+    /// Mempool transaction observed mined into a block.
+    Mined {
+        /// Identifier of the mined transaction.
+        transaction_id: TransactionId,
+        /// Height at which the source observed the mining.
+        mined_height: BlockHeight,
+    },
+}
+
+/// Mempool-event stream returned by [`ChainIndex::mempool_events`].
+pub type MempoolEventStream = IndexStream<MempoolEventEnvelope>;
 
 /// Typed chain-index contract consumed by wallets and applications.
 #[async_trait]
@@ -226,6 +341,38 @@ pub trait ChainIndex: Send + Sync + 'static {
         from_cursor: Option<ChainEventCursor>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEventStream, IndexerError>;
+
+    /// Returns a bounded snapshot of the live mempool index.
+    async fn mempool_snapshot(
+        &self,
+        request: MempoolSnapshotRequest,
+    ) -> Result<MempoolSnapshotView, IndexerError>;
+
+    /// Streams replayable mempool events.
+    async fn mempool_events(
+        &self,
+        from_cursor: Option<MempoolEventCursor>,
+    ) -> Result<MempoolEventStream, IndexerError>;
+
+    /// Returns whether `transaction_id` is currently visible in the live
+    /// mempool index.
+    async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
+
+    /// Returns transparent mempool outputs tied to one address.
+    ///
+    /// Bounded by the request's `max_entries`; values larger than the
+    /// server's configured cap are silently clamped to that cap.
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        request: TransparentMempoolOutputsRequest,
+    ) -> Result<Vec<TransparentMempoolOutput>, IndexerError>;
+
+    /// Returns the mempool spend that consumes `outpoint`, when one is
+    /// present.
+    async fn transparent_mempool_spend_by_outpoint(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<TransparentMempoolSpend>, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

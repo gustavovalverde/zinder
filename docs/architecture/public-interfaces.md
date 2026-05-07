@@ -191,7 +191,7 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 
 A cursor whose `last_visible_block_hash` is no longer present at its `epoch_id`'s tip indicates the client missed a reorg. The server emits a synthetic `ChainReorged` envelope describing the divergence before resuming the stream. Clients never see "silent" branch changes.
 
-`MempoolStreamCursorV1` is reserved for M3. It uses the reserved `family = Mempool` code with mempool-specific position fields, defined in [M3 Mempool](../specs/m3-mempool.md). It is not an active M2 cursor type.
+`MempoolStreamCursorV1` uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
 
 ### Field naming
 
@@ -650,5 +650,5 @@ If the answer is unclear, the boundary is not ready.
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the chain-event subscription wire shape.
 - [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape) — typed Rust client surface.
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows and pruning.
-- [M3 Mempool](../specs/m3-mempool.md) — reserved mempool index, event log, and protocol surface.
+- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — mempool topology, retention windows, and protocol surface.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — `ServerInfo` shape and deprecation rules.

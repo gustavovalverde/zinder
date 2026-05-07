@@ -125,7 +125,7 @@ Version strings may be logged and included in diagnostics, but they are not the 
 
 ## Mempool Source Adapter
 
-`zinder-source` produces `MempoolSourceEvent` values consumed by `zinder-ingest` in M3 (see [M3 Mempool](../specs/m3-mempool.md)). Two backends are planned, selected by capability discovery:
+`zinder-source` produces `MempoolSourceEvent` values consumed by `zinder-ingest` (see [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)). Two backends are supported, selected by capability discovery:
 
 - **Streaming backend** (preferred): consumes Zebra's `MempoolChange` gRPC stream. Requires `node.streaming_source`. Maps `ADDED` → `Added`, `INVALIDATED` → `Invalidated`, `MINED` → `Mined`. Sub-second latency.
 - **Polling backend** (fallback): calls `getrawmempool` on `[mempool] poll_interval_ms` (default 10000) and diffs successive responses to synthesize `Added` and `Invalidated` events. `Mined` events are inferred from chain commits, not from `getrawmempool`. Default-second latency.

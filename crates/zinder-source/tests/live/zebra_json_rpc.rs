@@ -6,11 +6,12 @@
 use eyre::{Result, eyre};
 use zinder_core::{
     BlockHeight, ChainTipMetadata, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, TransactionBroadcastResult,
+    SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
-    NodeCapability, NodeSource, TransactionBroadcaster, ZebraJsonRpcSource,
-    ZebraJsonRpcSourceOptions,
+    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceBackend,
+    NodeCapability, NodeSource, TransactionBroadcaster, UpstreamTransactionLookup,
+    ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_testkit::live::{init, require_live, require_live_mainnet};
 
@@ -83,7 +84,7 @@ async fn capability_probe_discovers_zebra_methods() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn mainnet_tip_id_advances_above_one_million() -> Result<()> {
+async fn tip_id_advances_above_one_million() -> Result<()> {
     let _guard = init();
     let env = require_live_mainnet()?;
     let source = zebra_source(&env)?;
@@ -91,7 +92,7 @@ async fn mainnet_tip_id_advances_above_one_million() -> Result<()> {
 
     assert!(
         tip.height.value() > 1_000_000,
-        "mainnet tip height should be well above 1,000,000; got {tip:?}"
+        "tip height should be well above 1,000,000; got {tip:?}"
     );
     Ok(())
 }
@@ -169,4 +170,130 @@ fn zebra_source(env: &zinder_testkit::live::LiveTestEnv) -> Result<ZebraJsonRpcS
             max_response_bytes: env.target.max_response_bytes,
         },
     )?)
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn fetch_raw_mempool_transaction_ids_returns_typed_list() -> Result<()> {
+    let _guard = init();
+    let env = require_live()?;
+    let source = zebra_source(&env)?;
+    // The shape of the response (Vec<TransactionId>) is the contract;
+    // the regtest mempool may be empty or carry whatever the running
+    // Zaino/Zallet sidecar is currently broadcasting. Either way, the
+    // call must succeed and return a typed list.
+    let mempool_ids = source.fetch_raw_mempool_transaction_ids().await?;
+    for transaction_id in &mempool_ids {
+        assert_eq!(transaction_id.as_bytes().len(), 32);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn upstream_transaction_lookup_resolves_mined_coinbase() -> Result<()> {
+    let _guard = init();
+    let env = require_live()?;
+    let source = zebra_source(&env)?;
+    let tip_height = source.tip_id().await?.height;
+    let mined_transaction_id = parse_coinbase_transaction_id(&source, tip_height).await?;
+
+    let lookup = source
+        .fetch_upstream_transaction_lookup(mined_transaction_id)
+        .await?;
+
+    assert!(matches!(lookup, UpstreamTransactionLookup::Mined(_)));
+    if let UpstreamTransactionLookup::Mined(observed_height) = lookup {
+        assert_eq!(observed_height, tip_height);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn json_rpc_mempool_source_runs_one_poll_cycle_without_panic() -> Result<()> {
+    let _guard = init();
+    let env = require_live()?;
+    let json_rpc = zebra_source(&env)?;
+    let mempool_source = JsonRpcMempoolSource::with_options(
+        json_rpc,
+        JsonRpcMempoolSourceOptions {
+            poll_interval: std::time::Duration::from_millis(100),
+            event_channel_capacity: 16,
+        },
+    );
+    assert_eq!(
+        mempool_source.capabilities().backend,
+        MempoolSourceBackend::Polling
+    );
+
+    let mut event_stream = mempool_source.events().await?;
+    // The polling loop runs in a background task. Wait long enough for
+    // the first iteration to complete (poll_interval=100ms with one
+    // round-trip to Zebra). Empty regtest mempool yields no events; a
+    // populated mempool would yield Added envelopes here. Either way,
+    // the loop must remain alive and the stream must not error out.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio_stream::StreamExt::next(&mut event_stream),
+    )
+    .await;
+    match outcome {
+        Ok(Some(Ok(_event))) => {} // Mempool had a transaction; that is fine.
+        Ok(Some(Err(error))) => {
+            return Err(eyre!("polling source emitted error item: {error}"));
+        }
+        Ok(None) => {
+            return Err(eyre!("polling source closed unexpectedly"));
+        }
+        Err(_elapsed) => {} // Empty mempool, no events; loop is alive.
+    }
+    Ok(())
+}
+
+async fn parse_coinbase_transaction_id(
+    source: &ZebraJsonRpcSource,
+    height: BlockHeight,
+) -> Result<TransactionId> {
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    let source_block = source.fetch_block_by_height(height).await?;
+    let parsed_block: zebra_chain::block::Block = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()
+        .map_err(|error| eyre!("zebra-chain block parse failed: {error}"))?;
+    let coinbase_transaction = parsed_block
+        .transactions
+        .first()
+        .ok_or_else(|| eyre!("block has no coinbase transaction"))?;
+    let transaction_hash_bytes = coinbase_transaction.hash().0;
+    Ok(TransactionId::from_bytes(transaction_hash_bytes))
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn upstream_transaction_lookup_returns_not_found_for_unknown_txid() -> Result<()> {
+    let _guard = init();
+    let env = require_live()?;
+    let source = zebra_source(&env)?;
+    let unknown_transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let lookup = source
+        .fetch_upstream_transaction_lookup(unknown_transaction_id)
+        .await?;
+    assert!(matches!(lookup, UpstreamTransactionLookup::NotFound));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn fetch_raw_transaction_bytes_returns_none_for_unknown_txid() -> Result<()> {
+    let _guard = init();
+    let env = require_live()?;
+    let source = zebra_source(&env)?;
+    let unknown_transaction_id = TransactionId::from_bytes([0xCD; 32]);
+    let bytes = source
+        .fetch_raw_transaction_bytes(unknown_transaction_id)
+        .await?;
+    assert!(bytes.is_none());
+    Ok(())
 }

@@ -56,11 +56,59 @@ pub enum ReadinessCause {
         /// Configured retention window, rounded down to whole hours.
         retention_hours: u64,
     },
+    /// Mempool retained-event history is approaching the configured retention
+    /// window. Mempool retention is shorter than chain-event retention, so
+    /// this signal is reported in minutes rather than hours.
+    MempoolCursorAtRisk {
+        /// Age of the oldest retained mempool event, rounded down to whole
+        /// minutes.
+        oldest_retained_age_minutes: u64,
+        /// Shortest configured mempool retention window, rounded down to
+        /// whole minutes.
+        retention_minutes: u64,
+    },
+    /// Mempool source observation is unavailable. The writer cannot hydrate
+    /// `Added` events without an upstream mempool stream.
+    MempoolSourceUnavailable,
+    /// Mempool source hydration is falling behind the source's emission rate.
+    MempoolHydrationLagging {
+        /// Total hydration failures observed since startup.
+        ///
+        /// Diagnostic only; operators should compare against
+        /// `zinder_mempool_hydration_failures_total` for a rate.
+        recent_hydration_failures: u64,
+    },
     /// Service is shutting down and no longer accepting new traffic.
     ShuttingDown,
 }
 
 impl ReadinessCause {
+    /// Every Prometheus label `metric_label` may return, in declaration order.
+    ///
+    /// `ops_endpoint::record_readiness_metrics` iterates this slice every
+    /// scrape to zero out the gauges for inactive causes. The unit test
+    /// `metric_label_is_listed_in_all_metric_labels` enforces that every
+    /// `ReadinessCause` variant is represented; combined with the exhaustive
+    /// `match` in [`Self::metric_label`], adding a new variant without
+    /// extending this table fails CI.
+    pub const ALL_METRIC_LABELS: &'static [&'static str] = &[
+        "starting",
+        "syncing",
+        "ready",
+        "node_unavailable",
+        "node_capability_missing",
+        "storage_unavailable",
+        "schema_mismatch",
+        "reorg_window_exceeded",
+        "replica_lagging",
+        "writer_status_unavailable",
+        "cursor_at_risk",
+        "mempool_cursor_at_risk",
+        "mempool_source_unavailable",
+        "mempool_hydration_lagging",
+        "shutting_down",
+    ];
+
     /// Stable Prometheus label for this readiness cause.
     #[must_use]
     pub const fn metric_label(&self) -> &'static str {
@@ -76,6 +124,9 @@ impl ReadinessCause {
             Self::ReplicaLagging { .. } => "replica_lagging",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
+            Self::MempoolCursorAtRisk { .. } => "mempool_cursor_at_risk",
+            Self::MempoolSourceUnavailable => "mempool_source_unavailable",
+            Self::MempoolHydrationLagging { .. } => "mempool_hydration_lagging",
             Self::ShuttingDown => "shutting_down",
         }
     }
@@ -273,6 +324,48 @@ impl ReadinessState {
             target_height: current_height,
         }
     }
+
+    /// Returns a mempool-cursor-at-risk state for the mempool event log.
+    #[must_use]
+    pub const fn mempool_cursor_at_risk(
+        oldest_retained_age_minutes: u64,
+        retention_minutes: u64,
+        current_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::MempoolCursorAtRisk {
+                oldest_retained_age_minutes,
+                retention_minutes,
+            },
+            current_height,
+            target_height: current_height,
+        }
+    }
+
+    /// Returns a state reporting the mempool source is unavailable.
+    #[must_use]
+    pub const fn mempool_source_unavailable(current_height: Option<u32>) -> Self {
+        Self {
+            cause: ReadinessCause::MempoolSourceUnavailable,
+            current_height,
+            target_height: current_height,
+        }
+    }
+
+    /// Returns a state reporting that mempool hydration is failing.
+    #[must_use]
+    pub const fn mempool_hydration_lagging(
+        recent_hydration_failures: u64,
+        current_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::MempoolHydrationLagging {
+                recent_hydration_failures,
+            },
+            current_height,
+            target_height: current_height,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +448,55 @@ mod tests {
         ));
         assert_eq!(report.current_height, Some(100));
         assert_eq!(report.target_height, Some(100));
+    }
+
+    #[test]
+    fn metric_label_is_listed_in_all_metric_labels() {
+        // Every constructed variant's metric_label must appear in
+        // ALL_METRIC_LABELS, and the table cardinality must equal the
+        // variant count so a new variant cannot silently drop a gauge.
+        let every_cause: &[ReadinessCause] = &[
+            ReadinessCause::Starting,
+            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Ready,
+            ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeCapabilityMissing { capability: "test" },
+            ReadinessCause::StorageUnavailable,
+            ReadinessCause::SchemaMismatch,
+            ReadinessCause::ReorgWindowExceeded {
+                depth: 0,
+                configured: 0,
+            },
+            ReadinessCause::ReplicaLagging {
+                lag_chain_epochs: 0,
+            },
+            ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::CursorAtRisk {
+                oldest_retained_age_hours: 0,
+                retention_hours: 0,
+            },
+            ReadinessCause::MempoolCursorAtRisk {
+                oldest_retained_age_minutes: 0,
+                retention_minutes: 0,
+            },
+            ReadinessCause::MempoolSourceUnavailable,
+            ReadinessCause::MempoolHydrationLagging {
+                recent_hydration_failures: 0,
+            },
+            ReadinessCause::ShuttingDown,
+        ];
+        for cause in every_cause {
+            let label = cause.metric_label();
+            assert!(
+                ReadinessCause::ALL_METRIC_LABELS.contains(&label),
+                "metric_label {label} for {cause:?} missing from ALL_METRIC_LABELS",
+            );
+        }
+        assert_eq!(
+            every_cause.len(),
+            ReadinessCause::ALL_METRIC_LABELS.len(),
+            "ALL_METRIC_LABELS cardinality must equal ReadinessCause variant count",
+        );
     }
 
     #[test]

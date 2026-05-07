@@ -18,6 +18,7 @@ pub(crate) enum StorageTable {
     TransparentUtxoSpend,
     ReorgWindow,
     ChainEvent,
+    MempoolEvent,
 }
 
 impl StorageTable {
@@ -34,10 +35,11 @@ impl StorageTable {
             Self::TransparentUtxoSpend => "transparent_utxo_spend",
             Self::ReorgWindow => "reorg_window",
             Self::ChainEvent => "chain_event",
+            Self::MempoolEvent => "mempool_event",
         }
     }
 
-    pub(crate) const fn all() -> [Self; 11] {
+    pub(crate) const fn all() -> [Self; 12] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
@@ -50,6 +52,7 @@ impl StorageTable {
             Self::TransparentUtxoSpend,
             Self::ReorgWindow,
             Self::ChainEvent,
+            Self::MempoolEvent,
         ]
     }
 }

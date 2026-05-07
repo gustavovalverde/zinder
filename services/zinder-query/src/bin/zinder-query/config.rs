@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    ConfigError, path_to_config_string, require_string, zinder_environment_source,
+    BearerToken, BearerTokenError, ConfigError, path_to_config_string, require_string,
+    zinder_environment_source,
 };
 use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget};
 use zinder_store::StoreError;
@@ -15,6 +16,9 @@ use zinder_store::StoreError;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get();
 const DEFAULT_INGEST_CONTROL_ADDR: &str = "http://127.0.0.1:9100";
+const DEFAULT_CHAIN_EVENT_RETENTION_HOURS: u64 = 168;
+const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
+const DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS: u64 = 24;
 
 /// Resolved query runtime configuration.
 #[derive(Clone, Debug)]
@@ -25,7 +29,11 @@ pub(crate) struct QueryConfig {
     pub(crate) secondary_catchup_interval: Duration,
     pub(crate) secondary_replica_lag_threshold_chain_epochs: u64,
     pub(crate) ingest_control_addr: String,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) chain_event_retention_seconds: u64,
+    pub(crate) mempool_mined_retention_seconds: u64,
+    pub(crate) mempool_invalidated_retention_seconds: u64,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) grpc: QueryGrpcConfig,
     /// Optional node broadcaster. Network must match `QueryConfig.network`
@@ -40,6 +48,13 @@ pub(crate) struct QueryGrpcConfig {
     pub(crate) enable_health: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetentionAdvertisementSeconds {
+    chain_event: u64,
+    mempool_mined: u64,
+    mempool_invalidated: u64,
+}
+
 /// Command-line overrides for the query command.
 #[derive(Debug, Default)]
 pub(crate) struct QueryConfigOverrides {
@@ -47,7 +62,10 @@ pub(crate) struct QueryConfigOverrides {
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) secondary_path: Option<PathBuf>,
     pub(crate) ingest_control_addr: Option<String>,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
     pub(crate) chain_event_retention_hours: Option<u64>,
+    pub(crate) mempool_mined_retention_minutes: Option<u64>,
+    pub(crate) mempool_invalidated_retention_hours: Option<u64>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) node_json_rpc_addr: Option<String>,
 }
@@ -69,6 +87,9 @@ pub(crate) enum QueryConfigError {
 
     #[error("gRPC reflection initialization failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
+
+    #[error("invalid ingest-control bearer token: {0}")]
+    BearerToken(#[from] BearerTokenError),
 }
 
 /// Loads and validates query configuration from defaults, file, environment, and CLI overrides.
@@ -87,7 +108,20 @@ pub(crate) fn load_query_config(
         .map_err(ConfigError::load)?
         .set_default("node.max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
         .map_err(ConfigError::load)?
-        .set_default("storage.chain_event_retention_hours", 168_u64)
+        .set_default(
+            "storage.chain_event_retention_hours",
+            DEFAULT_CHAIN_EVENT_RETENTION_HOURS,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "storage.mempool_mined_retention_minutes",
+            DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES,
+        )
+        .map_err(ConfigError::load)?
+        .set_default(
+            "storage.mempool_invalidated_retention_hours",
+            DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS,
+        )
         .map_err(ConfigError::load)?;
 
     if let Some(path) = config_path {
@@ -103,7 +137,7 @@ pub(crate) fn load_query_config(
         .try_deserialize()
         .map_err(ConfigError::load)?;
 
-    Ok(resolve_query_config(raw_config)?)
+    resolve_query_config(raw_config)
 }
 
 /// Renders the effective query configuration in the accepted TOML shape.
@@ -136,7 +170,10 @@ struct StorageSection {
     secondary_catchup_interval_ms: Option<u64>,
     secondary_replica_lag_threshold_chain_epochs: Option<u64>,
     ingest_control_addr: Option<String>,
+    ingest_control_token_path: Option<PathBuf>,
     chain_event_retention_hours: Option<u64>,
+    mempool_mined_retention_minutes: Option<u64>,
+    mempool_invalidated_retention_hours: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +194,7 @@ struct QueryGrpcSection {
 #[serde(default, deny_unknown_fields)]
 struct NodeSection {
     json_rpc_addr: Option<String>,
+    indexer_grpc_addr: Option<String>,
     request_timeout_secs: Option<u64>,
     max_response_bytes: Option<u64>,
     auth: NodeAuthSection,
@@ -200,11 +238,36 @@ fn apply_query_overrides(
             .set_override("storage.ingest_control_addr", ingest_control_addr)
             .map_err(ConfigError::load)?;
     }
+    if let Some(token_path) = overrides.ingest_control_token_path {
+        builder = builder
+            .set_override(
+                "storage.ingest_control_token_path",
+                path_to_config_string(token_path, "storage.ingest_control_token_path")?,
+            )
+            .map_err(ConfigError::load)?;
+    }
     if let Some(chain_event_retention_hours) = overrides.chain_event_retention_hours {
         builder = builder
             .set_override(
                 "storage.chain_event_retention_hours",
                 chain_event_retention_hours,
+            )
+            .map_err(ConfigError::load)?;
+    }
+    if let Some(mempool_mined_retention_minutes) = overrides.mempool_mined_retention_minutes {
+        builder = builder
+            .set_override(
+                "storage.mempool_mined_retention_minutes",
+                mempool_mined_retention_minutes,
+            )
+            .map_err(ConfigError::load)?;
+    }
+    if let Some(mempool_invalidated_retention_hours) = overrides.mempool_invalidated_retention_hours
+    {
+        builder = builder
+            .set_override(
+                "storage.mempool_invalidated_retention_hours",
+                mempool_invalidated_retention_hours,
             )
             .map_err(ConfigError::load)?;
     }
@@ -222,8 +285,9 @@ fn apply_query_overrides(
     Ok(builder)
 }
 
-fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, ConfigError> {
+fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
     let network_name = require_string(config.network.name, "network.name")?;
+    let retention_advertisement = resolve_retention_advertisement(&config.storage);
     let storage_path = config
         .storage
         .path
@@ -236,7 +300,8 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, ConfigErr
     if secondary_catchup_interval_ms == 0 {
         return Err(ConfigError::invalid(
             "storage.secondary_catchup_interval_ms must be greater than zero",
-        ));
+        )
+        .into());
     }
     let secondary_replica_lag_threshold_chain_epochs = config
         .storage
@@ -251,8 +316,11 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, ConfigErr
             "storage.ingest_control_addr {ingest_control_addr} is not a tonic endpoint: {source}"
         ))
     })?;
-    let chain_event_retention_hours = config.storage.chain_event_retention_hours.unwrap_or(168);
-    let chain_event_retention_seconds = chain_event_retention_hours.saturating_mul(3_600);
+    let ingest_control_token_path = config.storage.ingest_control_token_path;
+    let ingest_control_bearer_token = ingest_control_token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
     let listen_addr_string = require_string(config.query.listen_addr, "query.listen_addr")?;
     let network = Network::from_name(&network_name)
         .ok_or_else(|| ConfigError::invalid(format!("unknown network: {network_name}")))?;
@@ -280,7 +348,11 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, ConfigErr
         secondary_catchup_interval: Duration::from_millis(secondary_catchup_interval_ms),
         secondary_replica_lag_threshold_chain_epochs,
         ingest_control_addr,
-        chain_event_retention_seconds,
+        ingest_control_token_path,
+        ingest_control_bearer_token,
+        chain_event_retention_seconds: retention_advertisement.chain_event,
+        mempool_mined_retention_seconds: retention_advertisement.mempool_mined,
+        mempool_invalidated_retention_seconds: retention_advertisement.mempool_invalidated,
         listen_addr,
         grpc: QueryGrpcConfig {
             enable_reflection,
@@ -288,6 +360,24 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, ConfigErr
         },
         broadcaster,
     })
+}
+
+fn resolve_retention_advertisement(storage: &StorageSection) -> RetentionAdvertisementSeconds {
+    let chain_event_retention_hours = storage
+        .chain_event_retention_hours
+        .unwrap_or(DEFAULT_CHAIN_EVENT_RETENTION_HOURS);
+    let mempool_mined_retention_minutes = storage
+        .mempool_mined_retention_minutes
+        .unwrap_or(DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES);
+    let mempool_invalidated_retention_hours = storage
+        .mempool_invalidated_retention_hours
+        .unwrap_or(DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS);
+
+    RetentionAdvertisementSeconds {
+        chain_event: chain_event_retention_hours.saturating_mul(3_600),
+        mempool_mined: mempool_mined_retention_minutes.saturating_mul(60),
+        mempool_invalidated: mempool_invalidated_retention_hours.saturating_mul(3_600),
+    }
 }
 
 fn resolve_broadcaster_config(
@@ -309,13 +399,16 @@ fn resolve_broadcaster_config(
         .ok_or_else(|| ConfigError::invalid("node.max_response_bytes must be greater than zero"))?;
     let node_auth = resolve_node_auth(section.auth)?;
 
-    Ok(Some(NodeTarget::new(
-        network,
-        json_rpc_addr,
-        node_auth,
-        request_timeout,
-        max_response_bytes,
-    )))
+    Ok(Some(
+        NodeTarget::new(
+            network,
+            json_rpc_addr,
+            node_auth,
+            request_timeout,
+            max_response_bytes,
+        )
+        .with_indexer_grpc_addr(section.indexer_grpc_addr),
+    ))
 }
 
 #[allow(
@@ -363,7 +456,14 @@ impl QueryConfigToml {
                 secondary_replica_lag_threshold_chain_epochs: config
                     .secondary_replica_lag_threshold_chain_epochs,
                 ingest_control_addr: config.ingest_control_addr.clone(),
+                ingest_control_token_path: config
+                    .ingest_control_token_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 chain_event_retention_hours: config.chain_event_retention_seconds / 3_600,
+                mempool_mined_retention_minutes: config.mempool_mined_retention_seconds / 60,
+                mempool_invalidated_retention_hours: config.mempool_invalidated_retention_seconds
+                    / 3_600,
             },
             query: QueryToml {
                 listen_addr: config.listen_addr.to_string(),
@@ -389,7 +489,11 @@ struct StorageToml {
     secondary_catchup_interval_ms: u64,
     secondary_replica_lag_threshold_chain_epochs: u64,
     ingest_control_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingest_control_token_path: Option<String>,
     chain_event_retention_hours: u64,
+    mempool_mined_retention_minutes: u64,
+    mempool_invalidated_retention_hours: u64,
 }
 
 #[derive(Serialize)]
@@ -407,6 +511,8 @@ struct QueryGrpcToml {
 #[derive(Serialize)]
 struct NodeToml {
     json_rpc_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexer_grpc_addr: Option<String>,
     request_timeout_secs: u64,
     max_response_bytes: u64,
     auth: NodeAuthToml,
@@ -416,6 +522,7 @@ impl From<&NodeTarget> for NodeToml {
     fn from(target: &NodeTarget) -> Self {
         Self {
             json_rpc_addr: target.json_rpc_addr.clone(),
+            indexer_grpc_addr: target.indexer_grpc_addr.clone(),
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
             auth: NodeAuthToml::from(&target.node_auth),

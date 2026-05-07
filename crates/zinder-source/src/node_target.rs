@@ -14,6 +14,7 @@
 //! | ------- | ----- |
 //! | `ZINDER_NETWORK` | resolved separately (each binary owns its `[network]`) |
 //! | `ZINDER_NODE__JSON_RPC_ADDR` | [`NodeTarget::json_rpc_addr`] |
+//! | `ZINDER_NODE__INDEXER_GRPC_ADDR` | [`NodeTarget::indexer_grpc_addr`] |
 //! | `ZINDER_NODE__AUTH__METHOD` | `none` / `basic` / `cookie` |
 //! | `ZINDER_NODE__AUTH__USERNAME` | Basic-auth username |
 //! | `ZINDER_NODE__AUTH__PASSWORD` | Basic-auth password |
@@ -40,6 +41,13 @@ pub struct NodeTarget {
     pub network: Network,
     /// Node JSON-RPC base URL.
     pub json_rpc_addr: String,
+    /// Optional Zebra indexer gRPC endpoint URL.
+    ///
+    /// When set, enables the streaming
+    /// [`ZebraIndexerMempoolSource`](crate::ZebraIndexerMempoolSource)
+    /// backend instead of the polling fallback. Zebra exposes this port
+    /// when started with `ZEBRA_RPC__INDEXER_LISTEN_ADDR`.
+    pub indexer_grpc_addr: Option<String>,
     /// Node authentication.
     pub node_auth: NodeAuth,
     /// Per-RPC request timeout.
@@ -49,7 +57,9 @@ pub struct NodeTarget {
 }
 
 impl NodeTarget {
-    /// Builds a [`NodeTarget`] from already-resolved field values.
+    /// Builds a [`NodeTarget`] from already-resolved required fields. The
+    /// optional [`NodeTarget::indexer_grpc_addr`] defaults to `None`; opt
+    /// in to streaming with [`NodeTarget::with_indexer_grpc_addr`].
     #[must_use]
     pub const fn new(
         network: Network,
@@ -61,10 +71,19 @@ impl NodeTarget {
         Self {
             network,
             json_rpc_addr,
+            indexer_grpc_addr: None,
             node_auth,
             request_timeout,
             max_response_bytes,
         }
+    }
+
+    /// Returns a new [`NodeTarget`] with [`NodeTarget::indexer_grpc_addr`]
+    /// replaced by `indexer_grpc_addr`.
+    #[must_use]
+    pub fn with_indexer_grpc_addr(mut self, indexer_grpc_addr: Option<String>) -> Self {
+        self.indexer_grpc_addr = indexer_grpc_addr;
+        self
     }
 
     /// Resolves a [`NodeTarget`] from a deserialized [`NodeSection`].
@@ -95,7 +114,8 @@ impl NodeTarget {
             node_auth,
             request_timeout,
             max_response_bytes,
-        ))
+        )
+        .with_indexer_grpc_addr(section.indexer_grpc_addr))
     }
 
     /// Resolves a [`NodeTarget`] directly from the unified env-var schema.
@@ -112,6 +132,7 @@ impl NodeTarget {
 
         let section = NodeSection {
             json_rpc_addr: read_optional("ZINDER_NODE__JSON_RPC_ADDR"),
+            indexer_grpc_addr: read_optional("ZINDER_NODE__INDEXER_GRPC_ADDR"),
             request_timeout_secs: read_optional_parsed::<u64>(
                 "ZINDER_NODE__REQUEST_TIMEOUT_SECS",
                 "node.request_timeout_secs",
@@ -139,6 +160,11 @@ impl NodeTarget {
 pub struct NodeSection {
     /// Node JSON-RPC base URL.
     pub json_rpc_addr: Option<String>,
+    /// Zebra indexer gRPC endpoint URL.
+    ///
+    /// When set, enables the streaming mempool source backend. Omit to fall
+    /// back to JSON-RPC polling.
+    pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
     pub request_timeout_secs: Option<u64>,
     /// Maximum JSON-RPC response body size accepted from the node.
@@ -284,6 +310,7 @@ mod tests {
     fn resolve_basic_auth_round_trip() -> Result<(), NodeConfigError> {
         let section = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: Some("http://127.0.0.1:8155".to_owned()),
             request_timeout_secs: Some(15),
             max_response_bytes: None,
             auth: NodeAuthSection {
@@ -297,8 +324,32 @@ mod tests {
 
         assert_eq!(target.network, Network::ZcashRegtest);
         assert_eq!(target.json_rpc_addr, "http://127.0.0.1:8232");
+        assert_eq!(
+            target.indexer_grpc_addr.as_deref(),
+            Some("http://127.0.0.1:8155")
+        );
         assert_eq!(target.request_timeout, Duration::from_secs(15));
         assert_eq!(target.node_auth.scheme_name(), "basic");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_omits_indexer_grpc_addr_when_unset() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("none".to_owned()),
+                username: None,
+                password: None,
+                path: None,
+            },
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+
+        assert!(target.indexer_grpc_addr.is_none());
         Ok(())
     }
 
@@ -319,6 +370,7 @@ mod tests {
     fn resolve_rejects_basic_auth_with_path() {
         let section = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
             auth: NodeAuthSection {
@@ -343,6 +395,7 @@ mod tests {
     fn resolve_rejects_unknown_auth_method() {
         let section = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
             auth: NodeAuthSection {

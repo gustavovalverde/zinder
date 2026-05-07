@@ -13,6 +13,8 @@ mod chain_store;
 mod format;
 mod grpc_status;
 mod kv;
+mod mempool_event;
+mod mempool_event_store;
 mod proto_codec;
 mod store_error;
 mod subtree_root;
@@ -35,10 +37,20 @@ pub use chain_store::{
     SecondaryChainStore,
 };
 pub use format::{
-    ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
+    ChainEventStreamFamily, MempoolEventCursorPayload, MempoolEventStreamFamily,
+    STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
 };
 pub use grpc_status::status_from_store_error;
-pub use proto_codec::{ChainEventEncodeError, chain_epoch_message, chain_event_envelope_message};
+pub use mempool_event::{MempoolEvent, MempoolEventEnvelope};
+pub use mempool_event_store::{
+    DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest,
+    MempoolEventRetentionConfig, MempoolEventRetentionReport,
+};
+pub use proto_codec::{
+    ChainEventEncodeError, MempoolDecodeError, chain_epoch_from_message, chain_epoch_message,
+    chain_event_envelope_message, mempool_entry_from_message, mempool_entry_message,
+    mempool_event_envelope_from_message, mempool_event_envelope_message,
+};
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::TransactionArtifactStore;

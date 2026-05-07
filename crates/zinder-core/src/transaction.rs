@@ -20,6 +20,29 @@ impl TransactionId {
     }
 }
 
+/// ZIP-244 transaction authorization digest bytes.
+///
+/// Populated for v5+ transactions. The legacy v1-v4 transactions have no
+/// distinct authorization digest because their txid already covers their
+/// witness data; on those source observations the mempool entry's
+/// authorization digest is `None`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AuthDigest([u8; 32]);
+
+impl AuthDigest {
+    /// Creates an authorization digest from canonical 32-byte material.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the authorization digest bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Raw serialized Zcash transaction bytes submitted by a wallet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawTransactionBytes(Vec<u8>);

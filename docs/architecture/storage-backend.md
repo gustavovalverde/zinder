@@ -64,7 +64,7 @@ The first RocksDB layout should use separate column families only when tuning, i
 
 | Family | Purpose |
 | ------ | ------- |
-| `storage_control` | Visible epoch pointer, event sequence pointer, cursor secret, schema version, store identity, and network anchor. Also holds `oldest_retained_chain_event_sequence` for M2 and reserves `oldest_retained_mempool_event_sequence` for M3. |
+| `storage_control` | Visible epoch pointer, event sequence pointer, cursor secret, schema version, store identity, and network anchor. Also holds `oldest_retained_chain_event_sequence` and `oldest_retained_mempool_event_sequence`. |
 | `chain_epoch` | Epoch metadata, including `ChainTipMetadata` |
 | `finalized_block` | Finalized block metadata and links |
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
@@ -72,9 +72,9 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
 | `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable non-finalized links |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
-| `mempool_event` | M3 durable mempool-event log per [M3 Mempool](../specs/m3-mempool.md); retained per kind after M3 lands (default 60 minutes for `Mined`, 24 hours for `Invalidated`) |
+| `mempool_event` | Durable mempool-event log per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
 
-Mempool state is split between in-memory and persistent storage in M3 per [M3 Mempool](../specs/m3-mempool.md). The live `MempoolIndex` lives in `zinder-ingest` as in-process state, not in canonical RocksDB. The `mempool_event` column family persists the typed event log for retention-dependent queries (rebroadcast detection, audit) and cursor resume on `WalletQuery.MempoolEvents`. Reads from the mempool event log go through `MempoolEventReadApi`, parallel to but distinct from `ChainEpochReadApi`; live snapshots and live stream tailing still require the ingest-owned private control surface because secondary RocksDB readers cannot observe the live in-process index. Mempool events do not participate in `commit_ingest_batch`; they are written by `zinder-ingest` as each `MempoolSourceEvent` arrives.
+Mempool state is split between in-memory and persistent storage. The live `MempoolIndex` lives in `zinder-ingest` as in-process state, not in canonical RocksDB. The `mempool_event` column family persists the typed event log for retention-dependent queries (rebroadcast detection, audit) and cursor resume on `WalletQuery.MempoolEvents`. Reads from the mempool event log go through `MempoolEventReadApi`, parallel to but distinct from `ChainEpochReadApi`; live snapshots and live stream tailing still require the ingest-owned private control surface because secondary RocksDB readers cannot observe the live in-process index. Mempool events do not participate in `commit_ingest_batch`; they are written by `zinder-ingest` as each `MempoolSourceEvent` arrives.
 
 ## Visibility Index Lifecycle
 

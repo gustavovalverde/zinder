@@ -1,5 +1,7 @@
 //! Store key byte contract.
 
+use std::mem::size_of;
+
 use zinder_core::{
     BlockHeight, ChainEpochId, Network, ShieldedProtocol, SubtreeRootIndex, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint,
@@ -17,7 +19,8 @@ const TREE_STATE_KEY_KIND: u8 = 4;
 const SUBTREE_ROOT_KEY_KIND: u8 = 5;
 const TRANSPARENT_ADDRESS_UTXO_KEY_KIND: u8 = 6;
 const TRANSPARENT_UTXO_SPEND_KEY_KIND: u8 = 7;
-// Key kinds 8..=32 are reserved for future artifact families; visibility keys start at 33.
+const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
+// Key kinds 9..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -39,6 +42,14 @@ const SUBTREE_ROOT_VISIBILITY_PREFIX_LEN: usize =
     STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + SHIELDED_PROTOCOL_LEN + SUBTREE_ROOT_INDEX_LEN;
 
 impl StoreKey {
+    /// Wraps an iterator-supplied key slice in a [`StoreKey`].
+    ///
+    /// Used by scan visitors that need to reattach the raw key bytes for
+    /// error reporting; never used to construct keys for writes.
+    pub(crate) fn from_raw_bytes(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
     pub(crate) fn visible_chain_epoch_pointer() -> Self {
         Self(vec![KEY_VERSION, 1])
     }
@@ -57,6 +68,14 @@ impl StoreKey {
 
     pub(crate) fn store_metadata() -> Self {
         Self(vec![KEY_VERSION, 12])
+    }
+
+    pub(crate) fn mempool_event_sequence_pointer() -> Self {
+        Self(vec![KEY_VERSION, 13])
+    }
+
+    pub(crate) fn oldest_retained_mempool_event_sequence() -> Self {
+        Self(vec![KEY_VERSION, 14])
     }
 
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
@@ -171,6 +190,27 @@ impl StoreKey {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&event_sequence.to_be_bytes());
         Self(key)
+    }
+
+    pub(crate) fn mempool_event(event_sequence: u64) -> Self {
+        let mut key = vec![KEY_VERSION, MEMPOOL_EVENT_KEY_KIND];
+        key.extend_from_slice(&event_sequence.to_be_bytes());
+        Self(key)
+    }
+
+    /// Extracts the event sequence from a raw `MempoolEvent` column-family
+    /// key. Returns `None` when the key has the wrong length, version
+    /// prefix, or kind byte.
+    pub(crate) fn mempool_event_sequence_from_key(key_bytes: &[u8]) -> Option<u64> {
+        if key_bytes.len() != STORE_KEY_HEADER_LEN + size_of::<u64>()
+            || key_bytes[0] != KEY_VERSION
+            || key_bytes[1] != MEMPOOL_EVENT_KEY_KIND
+        {
+            return None;
+        }
+        let mut sequence_bytes = [0_u8; size_of::<u64>()];
+        sequence_bytes.copy_from_slice(&key_bytes[STORE_KEY_HEADER_LEN..]);
+        Some(u64::from_be_bytes(sequence_bytes))
     }
 
     pub(crate) fn visible_block_epoch_prefix(network: Network, height: BlockHeight) -> Self {
@@ -414,13 +454,16 @@ mod tests {
             StoreKey::visible_chain_epoch_pointer(),
             StoreKey::chain_event_sequence_pointer(),
             StoreKey::cursor_auth_key(),
+            StoreKey::oldest_retained_chain_event_sequence(),
             StoreKey::store_metadata(),
+            StoreKey::mempool_event_sequence_pointer(),
+            StoreKey::oldest_retained_mempool_event_sequence(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 4);
+        assert_eq!(storage_control_keys.len(), 7);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),
@@ -432,6 +475,10 @@ mod tests {
             assert!(
                 !storage_control_keys
                     .contains(&StoreKey::chain_event(chain_epoch.value()).into_bytes())
+            );
+            assert!(
+                !storage_control_keys
+                    .contains(&StoreKey::mempool_event(chain_epoch.value()).into_bytes())
             );
         }
     }

@@ -20,6 +20,7 @@ use crate::chain_ingest::{
     fetch_block_with_retry, next_chain_epoch_id_after, next_chain_epoch_id_from,
     populate_subtree_root_artifacts, record_commit_outcome, select_best_chain,
 };
+use crate::mempool::MempoolReadyGate;
 
 /// Default lag threshold (in blocks) below which tip-follow reports `Ready`.
 pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
@@ -63,7 +64,7 @@ where
     validate_tip_follow_config(config)?;
 
     let store = open_tip_follow_store(config)?;
-    tip_follow_with_primary_store(config, source, store, readiness, cancel).await
+    tip_follow_with_primary_store(config, source, store, readiness, None, cancel).await
 }
 
 /// Opens the primary store with the tip-follow reorg-window policy.
@@ -82,11 +83,23 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 ///
 /// This is the same loop as [`tip_follow`], but it avoids opening the primary
 /// twice when the runtime needs the store for colocated control-plane RPCs.
+///
+/// `mempool_ready_gate` is consulted when the lag-based computation would
+/// otherwise flip readiness to `Ready`. While the gate is unprimed, the
+/// readiness state stays in `Syncing` so consumers do not observe a
+/// "ready" writer that has not yet rebuilt its in-process mempool index
+/// (per ADR-0010 §Implementation). Pass `None` for callers that do not
+/// run the mempool orchestrator (tests, backfill).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tip-follow's caller-owned dependencies are deliberately exposed as positional parameters; bundling them into an orchestration struct adds one indirection without changing the binding count callers must make."
+)]
 pub async fn tip_follow_with_primary_store<Source>(
     config: &TipFollowConfig,
     source: &Source,
     store: PrimaryChainStore,
     readiness: &Readiness,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
     cancel: CancellationToken,
 ) -> Result<(), IngestError>
 where
@@ -106,20 +119,40 @@ where
 
         let lag_state =
             compute_tip_follow_readiness_state(&store, iteration.observed_tip_id.height, config)?;
-        set_tip_follow_readiness(readiness, lag_state);
+        set_tip_follow_readiness(readiness, lag_state, mempool_ready_gate);
     }
 }
 
-fn set_tip_follow_readiness(readiness: &Readiness, lag_state: ReadinessState) {
+fn set_tip_follow_readiness(
+    readiness: &Readiness,
+    lag_state: ReadinessState,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
+) {
+    let gated_state = if matches!(lag_state.cause, ReadinessCause::Ready)
+        && mempool_ready_gate.is_some_and(|gate| !gate.is_primed())
+    {
+        ReadinessState::syncing(None, lag_state.current_height, lag_state.target_height)
+    } else {
+        lag_state
+    };
+
+    let current_cause = readiness.report().cause;
+    // Don't override retention-driven warning states with the lag-derived
+    // Ready: the retention task owns the cursor-at-risk lifecycle and the
+    // orchestrator owns mempool source/hydration causes. Leaving those in
+    // place keeps each subsystem the source of truth for its own causes.
     if matches!(
-        readiness.report().cause,
+        current_cause,
         ReadinessCause::CursorAtRisk { .. }
-    ) && matches!(lag_state.cause, ReadinessCause::Ready)
+            | ReadinessCause::MempoolCursorAtRisk { .. }
+            | ReadinessCause::MempoolSourceUnavailable
+            | ReadinessCause::MempoolHydrationLagging { .. }
+    ) && matches!(gated_state.cause, ReadinessCause::Ready)
     {
         return;
     }
 
-    readiness.set(lag_state);
+    readiness.set(gated_state);
 }
 
 fn compute_tip_follow_readiness_state(

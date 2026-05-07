@@ -24,6 +24,18 @@ pub enum SourceError {
         source: hex::FromHexError,
     },
 
+    /// Raw transaction hex returned by the node could not be decoded.
+    ///
+    /// Distinct from [`Self::InvalidRawBlockHex`] because the metric class
+    /// label aggregates by error variant; mempool hydration failures must
+    /// not be charged to the block-decode counter.
+    #[error("raw transaction is not valid hex")]
+    InvalidRawTransactionHex {
+        /// Hex decoding failure.
+        #[source]
+        source: hex::FromHexError,
+    },
+
     /// Display-order block hash decoded to the wrong byte length.
     #[error("block hash must be 32 bytes, got {byte_count}")]
     InvalidBlockHashLength {
@@ -156,6 +168,38 @@ pub enum SourceError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// The upstream mempool source stream closed or failed.
+    ///
+    /// Returned when the gRPC `MempoolChange` stream terminates with a
+    /// transport error or with `RecvError::Lagged`. Adapters that wrap a
+    /// [`crate::MempoolSource`] for durable consumption must reconnect and
+    /// snapshot the mempool state because lagged events are not replayed.
+    #[error("upstream mempool source stream is unavailable: {reason}")]
+    MempoolStreamUnavailable {
+        /// Stream or transport failure reason.
+        reason: String,
+        /// Whether reconnecting can reasonably succeed later.
+        is_retryable: bool,
+    },
+
+    /// Hydrating an `Added` mempool observation failed.
+    ///
+    /// Returned when fetching the raw transaction bytes for an
+    /// `ADDED` source change fails (e.g. JSON-RPC `getrawtransaction`
+    /// returns an error). The adapter increments
+    /// `zinder_mempool_hydration_failures_total` before yielding this
+    /// error.
+    #[error("mempool transaction hydration failed: {reason}")]
+    MempoolHydrationFailed {
+        /// Identifier of the unhydrated transaction.
+        transaction_id: zinder_core::TransactionId,
+        /// Hydration failure reason.
+        reason: String,
+        /// Whether retrying the same hydration request can reasonably
+        /// succeed later.
+        is_retryable: bool,
+    },
 }
 
 impl SourceError {
@@ -165,9 +209,12 @@ impl SourceError {
         match self {
             Self::NodeUnavailable { is_retryable, .. }
             | Self::BlockUnavailable { is_retryable, .. }
-            | Self::SubtreeRootsUnavailable { is_retryable, .. } => *is_retryable,
+            | Self::SubtreeRootsUnavailable { is_retryable, .. }
+            | Self::MempoolStreamUnavailable { is_retryable, .. }
+            | Self::MempoolHydrationFailed { is_retryable, .. } => *is_retryable,
             Self::InvalidBlockHashHex { .. }
             | Self::InvalidRawBlockHex { .. }
+            | Self::InvalidRawTransactionHex { .. }
             | Self::InvalidBlockHashLength { .. }
             | Self::InvalidTransactionIdHex { .. }
             | Self::InvalidTransactionIdLength { .. }

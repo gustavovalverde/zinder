@@ -3,21 +3,23 @@
 use bytes::Bytes;
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionArtifact, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    ArtifactSchemaVersion, AuthDigest, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, MempoolEntry,
+    MempoolEvictionReason, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, TransactionArtifact, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentUtxoSpendArtifact, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 
 use crate::{
     ArtifactFamily, ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainRangeReverted,
-    StoreError, StreamCursorTokenV1,
+    MempoolEvent, MempoolEventEnvelope, StoreError, StreamCursorTokenV1,
 };
 
 use super::{
     ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, ChainEventCursorAnchor,
-    ChainEventStreamFamily, PayloadFormat, StoreKey,
+    ChainEventStreamFamily, MempoolEventStreamFamily, PayloadFormat, StoreKey,
 };
 
 pub(crate) fn encode_chain_epoch(chain_epoch: &ChainEpoch) -> Vec<u8> {
@@ -100,6 +102,399 @@ pub(crate) fn decode_chain_event_envelope(
         BlockHeight::new(record.finalized_height),
         event,
     ))
+}
+
+pub(crate) fn encode_mempool_event_envelope(event_envelope: &MempoolEventEnvelope) -> Vec<u8> {
+    MempoolEventEnvelopeRecord {
+        event_sequence: event_envelope.event_sequence,
+        source_observed_unix_millis: event_envelope.source_observed_unix_millis,
+        event: Some(mempool_event_record(&event_envelope.event)),
+    }
+    .encode_to_vec()
+}
+
+pub(crate) fn decode_mempool_event_envelope(
+    key: &StoreKey,
+    record_bytes: &[u8],
+    network: Network,
+    cursor_auth_key: [u8; 32],
+) -> Result<MempoolEventEnvelope, StoreError> {
+    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event envelope record is not valid protobuf",
+        }
+    })?;
+    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event envelope is missing event",
+    })?;
+    let event = decode_mempool_event_record(key, event_record)?;
+    let cursor = StreamCursorTokenV1::mempool_event(
+        network,
+        MempoolEventStreamFamily::Mempool,
+        record.event_sequence,
+        event.transaction_id(),
+        cursor_auth_key,
+    )
+    .map_err(|_| StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event cursor could not be reconstructed",
+    })?;
+
+    Ok(MempoolEventEnvelope {
+        cursor,
+        event_sequence: record.event_sequence,
+        source_observed_unix_millis: record.source_observed_unix_millis,
+        event,
+    })
+}
+
+pub(crate) fn decode_mempool_event_observed_at(
+    key: &StoreKey,
+    record_bytes: &[u8],
+) -> Result<UnixTimestampMillis, StoreError> {
+    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event envelope record is not valid protobuf",
+        }
+    })?;
+    Ok(UnixTimestampMillis::new(record.source_observed_unix_millis))
+}
+
+pub(crate) fn decode_mempool_event_kind(
+    key: &StoreKey,
+    record_bytes: &[u8],
+) -> Result<MempoolEventKind, StoreError> {
+    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event envelope record is not valid protobuf",
+        }
+    })?;
+    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event envelope is missing event",
+    })?;
+    MempoolEventKind::from_kind(event_record.event_kind).ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event kind is unknown",
+    })
+}
+
+/// Coarse classification of a persisted mempool event used by retention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MempoolEventKind {
+    Added,
+    Invalidated,
+    Mined,
+}
+
+impl MempoolEventKind {
+    const fn from_kind(kind: u32) -> Option<Self> {
+        match kind {
+            MEMPOOL_EVENT_KIND_ADDED => Some(Self::Added),
+            MEMPOOL_EVENT_KIND_INVALIDATED => Some(Self::Invalidated),
+            MEMPOOL_EVENT_KIND_MINED => Some(Self::Mined),
+            _ => None,
+        }
+    }
+}
+
+fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
+    match event {
+        MempoolEvent::Added { entry } => MempoolEventRecord {
+            event_kind: MEMPOOL_EVENT_KIND_ADDED,
+            added: Some(mempool_entry_record(entry)),
+            invalidated: None,
+            mined: None,
+        },
+        MempoolEvent::Invalidated {
+            transaction_id,
+            reason,
+        } => MempoolEventRecord {
+            event_kind: MEMPOOL_EVENT_KIND_INVALIDATED,
+            added: None,
+            invalidated: Some(MempoolInvalidatedRecord {
+                transaction_id: transaction_id.as_bytes().to_vec(),
+                reason_id: mempool_eviction_reason_id(*reason),
+            }),
+            mined: None,
+        },
+        MempoolEvent::Mined {
+            transaction_id,
+            mined_height,
+        } => MempoolEventRecord {
+            event_kind: MEMPOOL_EVENT_KIND_MINED,
+            added: None,
+            invalidated: None,
+            mined: Some(MempoolMinedRecord {
+                transaction_id: transaction_id.as_bytes().to_vec(),
+                mined_height: mined_height.value(),
+            }),
+        },
+        // The Rust enum is `#[non_exhaustive]`; future variants force a
+        // build error in this match because the encoder is not behind
+        // `unreachable_patterns`.
+    }
+}
+
+fn decode_mempool_event_record(
+    key: &StoreKey,
+    record: MempoolEventRecord,
+) -> Result<MempoolEvent, StoreError> {
+    match MempoolEventKind::from_kind(record.event_kind).ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event kind is unknown",
+    })? {
+        MempoolEventKind::Added => {
+            let entry_record = record.added.ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "added mempool event is missing entry",
+            })?;
+            let entry = decode_mempool_entry_record(key, entry_record)?;
+            Ok(MempoolEvent::Added { entry })
+        }
+        MempoolEventKind::Invalidated => {
+            let invalidated = record.invalidated.ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "invalidated mempool event is missing payload",
+            })?;
+            Ok(MempoolEvent::Invalidated {
+                transaction_id: decode_transaction_id_for_family(
+                    ArtifactFamily::MempoolEvent,
+                    key,
+                    &invalidated.transaction_id,
+                )?,
+                reason: mempool_eviction_reason_from_id(invalidated.reason_id).ok_or(
+                    StoreError::ArtifactCorrupt {
+                        family: ArtifactFamily::MempoolEvent,
+                        key: key.clone().into(),
+                        reason: "mempool eviction reason id is unknown",
+                    },
+                )?,
+            })
+        }
+        MempoolEventKind::Mined => {
+            let mined = record.mined.ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "mined mempool event is missing payload",
+            })?;
+            Ok(MempoolEvent::Mined {
+                transaction_id: decode_transaction_id_for_family(
+                    ArtifactFamily::MempoolEvent,
+                    key,
+                    &mined.transaction_id,
+                )?,
+                mined_height: BlockHeight::new(mined.mined_height),
+            })
+        }
+    }
+}
+
+fn mempool_entry_record(entry: &MempoolEntry) -> MempoolEntryRecord {
+    MempoolEntryRecord {
+        transaction_id: entry.transaction_id.as_bytes().to_vec(),
+        auth_digest: entry
+            .auth_digest
+            .map_or_else(Vec::new, |digest| digest.as_bytes().to_vec()),
+        raw_transaction_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
+        compact_transaction_bytes: entry.compact_transaction_bytes.clone(),
+        first_seen_unix_millis: entry.first_seen_unix_millis.value(),
+        first_seen_chain_epoch: Some(chain_epoch_record(&entry.first_seen_chain_epoch)),
+        transparent_outputs: entry
+            .transparent_outputs
+            .iter()
+            .map(transparent_mempool_output_record)
+            .collect(),
+        transparent_spends: entry
+            .transparent_spends
+            .iter()
+            .map(transparent_mempool_spend_record)
+            .collect(),
+    }
+}
+
+fn decode_mempool_entry_record(
+    key: &StoreKey,
+    record: MempoolEntryRecord,
+) -> Result<MempoolEntry, StoreError> {
+    let chain_epoch_record = record
+        .first_seen_chain_epoch
+        .ok_or(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool entry record is missing first-seen chain epoch",
+        })?;
+    let auth_digest = if record.auth_digest.is_empty() {
+        None
+    } else {
+        let auth_digest_bytes =
+            <[u8; 32]>::try_from(record.auth_digest.as_slice()).map_err(|_| {
+                StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::MempoolEvent,
+                    key: key.clone().into(),
+                    reason: "auth digest must be 32 bytes",
+                }
+            })?;
+        Some(AuthDigest::from_bytes(auth_digest_bytes))
+    };
+
+    Ok(MempoolEntry {
+        transaction_id: decode_transaction_id_for_family(
+            ArtifactFamily::MempoolEvent,
+            key,
+            &record.transaction_id,
+        )?,
+        auth_digest,
+        raw_transaction_bytes: RawTransactionBytes::new(record.raw_transaction_bytes),
+        compact_transaction_bytes: record.compact_transaction_bytes,
+        first_seen_unix_millis: UnixTimestampMillis::new(record.first_seen_unix_millis),
+        first_seen_chain_epoch: decode_chain_epoch_record(
+            ArtifactFamily::MempoolEvent,
+            key,
+            &chain_epoch_record,
+        )?,
+        transparent_outputs: record
+            .transparent_outputs
+            .iter()
+            .map(|record| decode_transparent_mempool_output_record(key, record))
+            .collect::<Result<Vec<_>, _>>()?,
+        transparent_spends: record
+            .transparent_spends
+            .iter()
+            .map(|record| decode_transparent_mempool_spend_record(key, record))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn transparent_mempool_output_record(
+    transparent_output: &TransparentMempoolOutput,
+) -> TransparentMempoolOutputRecord {
+    TransparentMempoolOutputRecord {
+        address_script_hash: transparent_output.address_script_hash.as_bytes().to_vec(),
+        script_pub_key: transparent_output.script_pub_key.clone(),
+        spending_transaction_id: transparent_output
+            .outpoint
+            .transaction_id
+            .as_bytes()
+            .to_vec(),
+        output_index: transparent_output.outpoint.output_index,
+        value_zat: transparent_output.value_zat,
+    }
+}
+
+fn decode_transparent_mempool_output_record(
+    key: &StoreKey,
+    record: &TransparentMempoolOutputRecord,
+) -> Result<TransparentMempoolOutput, StoreError> {
+    Ok(TransparentMempoolOutput {
+        address_script_hash: decode_transparent_address_script_hash_for_family(
+            ArtifactFamily::MempoolEvent,
+            key,
+            &record.address_script_hash,
+        )?,
+        script_pub_key: record.script_pub_key.clone(),
+        outpoint: TransparentOutPoint::new(
+            decode_transaction_id_for_family(
+                ArtifactFamily::MempoolEvent,
+                key,
+                &record.spending_transaction_id,
+            )?,
+            record.output_index,
+        ),
+        value_zat: record.value_zat,
+    })
+}
+
+fn transparent_mempool_spend_record(
+    transparent_spend: &TransparentMempoolSpend,
+) -> TransparentMempoolSpendRecord {
+    TransparentMempoolSpendRecord {
+        spent_transaction_id: transparent_spend
+            .spent_outpoint
+            .transaction_id
+            .as_bytes()
+            .to_vec(),
+        spent_output_index: transparent_spend.spent_outpoint.output_index,
+        spending_transaction_id: transparent_spend
+            .spending_transaction_id
+            .as_bytes()
+            .to_vec(),
+    }
+}
+
+fn decode_transparent_mempool_spend_record(
+    key: &StoreKey,
+    record: &TransparentMempoolSpendRecord,
+) -> Result<TransparentMempoolSpend, StoreError> {
+    Ok(TransparentMempoolSpend {
+        spent_outpoint: TransparentOutPoint::new(
+            decode_transaction_id_for_family(
+                ArtifactFamily::MempoolEvent,
+                key,
+                &record.spent_transaction_id,
+            )?,
+            record.spent_output_index,
+        ),
+        spending_transaction_id: decode_transaction_id_for_family(
+            ArtifactFamily::MempoolEvent,
+            key,
+            &record.spending_transaction_id,
+        )?,
+    })
+}
+
+#[allow(
+    clippy::match_same_arms,
+    reason = "MempoolEvictionReason is #[non_exhaustive]; the wildcard arm intentionally projects future variants onto the Unknown id so storage stays forward-compatible."
+)]
+const fn mempool_eviction_reason_id(reason: MempoolEvictionReason) -> u32 {
+    match reason {
+        MempoolEvictionReason::Conflict => 1,
+        MempoolEvictionReason::Expired => 2,
+        MempoolEvictionReason::LowFee => 3,
+        MempoolEvictionReason::NodeRejected => 4,
+        MempoolEvictionReason::Unknown => 5,
+        _ => 5,
+    }
+}
+
+const fn mempool_eviction_reason_from_id(reason_id: u32) -> Option<MempoolEvictionReason> {
+    match reason_id {
+        1 => Some(MempoolEvictionReason::Conflict),
+        2 => Some(MempoolEvictionReason::Expired),
+        3 => Some(MempoolEvictionReason::LowFee),
+        4 => Some(MempoolEvictionReason::NodeRejected),
+        5 => Some(MempoolEvictionReason::Unknown),
+        _ => None,
+    }
+}
+
+fn decode_transparent_address_script_hash_for_family(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    hash_bytes: &[u8],
+) -> Result<TransparentAddressScriptHash, StoreError> {
+    let hash_bytes = <[u8; 32]>::try_from(hash_bytes).map_err(|_| StoreError::ArtifactCorrupt {
+        family,
+        key: key.clone().into(),
+        reason: "transparent address script hash must be 32 bytes",
+    })?;
+
+    Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
 }
 
 pub(crate) fn encode_block_artifact(block: BlockArtifact) -> Result<Vec<u8>, StoreError> {
@@ -896,4 +1291,90 @@ struct TransparentUtxoSpendArtifactRecord {
     block_height: u32,
     #[prost(bytes, tag = "4")]
     block_hash: Vec<u8>,
+}
+
+const MEMPOOL_EVENT_KIND_ADDED: u32 = 1;
+const MEMPOOL_EVENT_KIND_INVALIDATED: u32 = 2;
+const MEMPOOL_EVENT_KIND_MINED: u32 = 3;
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolEventEnvelopeRecord {
+    #[prost(uint64, tag = "1")]
+    event_sequence: u64,
+    #[prost(uint64, tag = "2")]
+    source_observed_unix_millis: u64,
+    #[prost(message, optional, tag = "3")]
+    event: Option<MempoolEventRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolEventRecord {
+    #[prost(uint32, tag = "1")]
+    event_kind: u32,
+    #[prost(message, optional, tag = "2")]
+    added: Option<MempoolEntryRecord>,
+    #[prost(message, optional, tag = "3")]
+    invalidated: Option<MempoolInvalidatedRecord>,
+    #[prost(message, optional, tag = "4")]
+    mined: Option<MempoolMinedRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolEntryRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(bytes, tag = "2")]
+    auth_digest: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    raw_transaction_bytes: Vec<u8>,
+    #[prost(bytes, tag = "4")]
+    compact_transaction_bytes: Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    first_seen_unix_millis: u64,
+    #[prost(message, optional, tag = "6")]
+    first_seen_chain_epoch: Option<ChainEpochRecord>,
+    #[prost(message, repeated, tag = "7")]
+    transparent_outputs: Vec<TransparentMempoolOutputRecord>,
+    #[prost(message, repeated, tag = "8")]
+    transparent_spends: Vec<TransparentMempoolSpendRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolInvalidatedRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    reason_id: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolMinedRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    mined_height: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentMempoolOutputRecord {
+    #[prost(bytes, tag = "1")]
+    address_script_hash: Vec<u8>,
+    #[prost(bytes, tag = "2")]
+    script_pub_key: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    spending_transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    output_index: u32,
+    #[prost(uint64, tag = "5")]
+    value_zat: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentMempoolSpendRecord {
+    #[prost(bytes, tag = "1")]
+    spent_transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    spent_output_index: u32,
+    #[prost(bytes, tag = "3")]
+    spending_transaction_id: Vec<u8>,
 }

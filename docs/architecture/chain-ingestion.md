@@ -31,7 +31,7 @@ Required artifact families:
 - `CompactBlockArtifact`: wallet-oriented compact block representation.
 - `TreeStateArtifact`: tree state data required by wallet sync APIs.
 - `TransactionArtifact`: transaction lookup material needed by APIs.
-- M3 `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`.
+- `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` alongside `tip-follow`. The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of `tip-follow` in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
 
 Each artifact must include:
 

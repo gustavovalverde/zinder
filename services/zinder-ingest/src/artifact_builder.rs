@@ -470,7 +470,12 @@ fn compact_transactions(
     Ok((compact_transactions, tree_size_additions))
 }
 
-fn compact_transaction(
+/// Builds a lightwalletd-compatible compact transaction from a parsed
+/// Zebra transaction.
+///
+/// `index` is the position of the transaction within its containing block;
+/// mempool callers that hydrate a single unmined transaction supply `0`.
+pub(crate) fn compact_transaction(
     index: u64,
     transaction: &ZebraTransaction,
 ) -> Result<CompactTx, ArtifactDeriveError> {
@@ -601,7 +606,11 @@ fn transparent_utxo_artifacts(
     Ok((transparent_address_utxos, transparent_utxo_spends))
 }
 
-fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
+/// Hashes a transparent `scriptPubKey` into the canonical
+/// [`TransparentAddressScriptHash`] used for index lookups.
+pub(crate) fn transparent_address_script_hash(
+    script_pub_key: &[u8],
+) -> TransparentAddressScriptHash {
     let mut hasher = Sha256::new();
     hasher.update(script_pub_key);
     TransparentAddressScriptHash::from_bytes(hasher.finalize().into())

@@ -17,11 +17,16 @@
 //!
 //! It deliberately exposes no domain types.
 
+mod auth;
 mod config;
 mod metrics;
 mod ops_endpoint;
 mod readiness;
 
+pub use auth::{
+    AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
+    BearerTokenError, BearerTokenServerInterceptor, connect_authenticated_channel,
+};
 pub use config::{ConfigError, path_to_config_string, require_string, zinder_environment_source};
 pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{

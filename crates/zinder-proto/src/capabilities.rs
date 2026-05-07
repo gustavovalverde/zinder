@@ -29,6 +29,8 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     "wallet.read.server_info_v1",
     "wallet.broadcast.transaction_v1",
     "wallet.events.chain_v1",
+    "wallet.snapshot.mempool_v1",
+    "wallet.events.mempool_v1",
 ];
 
 /// Helpers for client-side capability discovery.

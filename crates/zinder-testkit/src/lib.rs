@@ -25,15 +25,34 @@
 //! vocabulary. Each helper has a small hand-rolled builder API; importing it
 //! should never require knowing the layout of any internal struct field.
 //!
+//! # Boundary contract
+//!
+//! Every consumer must list `zinder-testkit` under `[dev-dependencies]` only.
+//! Items in this crate (notably [`TransparentTestKey`], which uses
+//! `zcash_primitives::transaction::builder::Builder::mock_build`) are
+//! unsuitable for production signing or production transaction handling, and
+//! the dev-dep-only rule is what keeps them out of release binaries. The CI
+//! workspace gate (`cargo deny check`) enforces no production crate links
+//! against this one.
+//!
 //! [`PrimaryChainStore`]: zinder_store::PrimaryChainStore
 
 pub mod chain_fixture;
 pub mod live;
+pub mod mock_mempool_source;
 pub mod mock_node_source;
 pub mod mock_transaction_broadcaster;
 pub mod store_fixture;
+pub mod transparent_signer;
 
 pub use chain_fixture::{ChainFixture, FixtureBlock};
+pub use mock_mempool_source::{
+    MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,
+};
 pub use mock_node_source::{MockNodeSource, NodeFailureScript};
 pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
 pub use store_fixture::StoreFixture;
+pub use transparent_signer::{
+    LocalNetwork, P2pkhSpendArgs, TransparentAddress, TransparentSignerError, TransparentTestKey,
+    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, regtest_local_network,
+};

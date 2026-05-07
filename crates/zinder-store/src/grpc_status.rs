@@ -14,12 +14,13 @@ use crate::StoreError;
 pub fn status_from_store_error(error: &StoreError) -> Status {
     let message = error.to_string();
     match error {
-        StoreError::EventCursorInvalid { reason } => Status::with_error_details(
+        StoreError::ChainEventCursorInvalid { reason }
+        | StoreError::MempoolEventCursorInvalid { reason } => Status::with_error_details(
             Code::InvalidArgument,
             message,
             ErrorDetails::with_bad_request(vec![FieldViolation::new("from_cursor", *reason)]),
         ),
-        StoreError::EventCursorExpired {
+        StoreError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence,
         } => Status::with_error_details(
@@ -29,6 +30,18 @@ pub fn status_from_store_error(error: &StoreError) -> Status {
                 "CHAIN_EVENT_CURSOR_EXPIRED",
                 format!("chain_event:{event_sequence}"),
                 format!("oldest retained chain event sequence is {oldest_retained_sequence}"),
+            )]),
+        ),
+        StoreError::MempoolEventCursorExpired {
+            event_sequence,
+            oldest_retained_sequence,
+        } => Status::with_error_details(
+            Code::FailedPrecondition,
+            message,
+            ErrorDetails::with_precondition_failure(vec![PreconditionViolation::new(
+                "MEMPOOL_EVENT_CURSOR_EXPIRED",
+                format!("mempool_event:{event_sequence}"),
+                format!("oldest retained mempool event sequence is {oldest_retained_sequence}"),
             )]),
         ),
         StoreError::SchemaMismatch { .. } | StoreError::SchemaTooNew { .. } => {

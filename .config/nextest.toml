@@ -42,7 +42,13 @@ junit = { path = "target/nextest/live.xml" }
 node-mutating = { max-threads = 1 }
 
 [[profile.ci-live.overrides]]
-filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli)"
+# Tests that share or contend on the upstream node's process state must
+# serialize through `node-mutating`. The Zebra indexer gRPC port is a single
+# upstream resource: any test that opens an indexer stream races with the
+# destructive container-restart test, so all indexer consumers join here.
+# `ingest_control_tip_change_publisher_fires_when_zebra_mines_block` mutates
+# regtest chain state via `generate`, so it joins too.
+filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block)"
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]

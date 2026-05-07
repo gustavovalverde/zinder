@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::config::{
@@ -12,23 +12,33 @@ use crate::config::{
     TipFollowConfigOverrides,
 };
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
+
 use zinder_ingest::{
-    BackfillOutcome, IngestControlGrpcAdapter, IngestError, NodeSourceKind, backfill,
-    open_tip_follow_store, spawn_chain_event_retention_task, tip_follow_with_primary_store,
+    BackfillOutcome, IngestControlGrpcAdapter, IngestError, MempoolIndex,
+    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill,
+    mempool_ready_channel, open_tip_follow_store, run_mempool_orchestrator,
+    spawn_chain_event_retention_task, spawn_mempool_event_retention_task,
+    tip_follow_with_primary_store,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServer, Readiness, ReadinessState, cancel_on_ctrl_c,
+    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, cancel_on_ctrl_c,
     install_tracing_subscriber, spawn_ops_endpoint,
 };
-use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{
+    JsonRpcMempoolSource, MempoolSource, NodeTarget, ZebraIndexerMempoolSource,
+    ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
 mod cli;
 mod config;
+
+const MEMPOOL_ORCHESTRATOR_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(Parser)]
 #[command(name = "zinder-ingest")]
@@ -153,6 +163,11 @@ struct TipFollowArgs {
     /// Private ingest-control gRPC listen address used by secondary readers and subscribers.
     #[arg(long = "ingest-control-listen-addr")]
     ingest_control_listen_addr: Option<SocketAddr>,
+    /// Path to a file containing the shared-secret bearer token enforced by
+    /// the ingest-control endpoint. When unset, the endpoint accepts every
+    /// caller (the localhost-only default).
+    #[arg(long = "ingest-control-token-path")]
+    ingest_control_token_path: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -388,6 +403,10 @@ fn zebra_json_rpc_source_for_target(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "tip-follow startup composes the readiness, ops, ingest-control, retention, mempool source, and orchestrator subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
+)]
 async fn run_tip_follow(
     config_path: Option<PathBuf>,
     args: TipFollowArgs,
@@ -408,17 +427,36 @@ async fn run_tip_follow(
         zebra_json_rpc_source_for_target(tip_follow_config.node_source, &tip_follow_config.node)?;
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
-    let ingest_control_handle = spawn_ingest_control_endpoint(
-        command_config.ingest_control_listen_addr,
-        tip_follow_config.node.network,
-        store.clone(),
-        cancel.clone(),
-    )
+    let mempool_index = MempoolIndex::new();
+    let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
+        listen_addr: command_config.ingest_control_listen_addr,
+        network: tip_follow_config.node.network,
+        store: store.clone(),
+        mempool_index: mempool_index.clone(),
+        bearer_token: command_config.ingest_control_bearer_token.clone(),
+        cancel: cancel.clone(),
+    })
     .await?;
     let _retention_handle = spawn_chain_event_retention_task(
         store.clone(),
         readiness.clone(),
         command_config.chain_event_retention,
+        cancel.clone(),
+    );
+    let _mempool_retention_handle = spawn_mempool_event_retention_task(
+        store.clone(),
+        readiness.clone(),
+        command_config.mempool_event_retention,
+        cancel.clone(),
+    );
+    let mempool_source = build_mempool_source(&tip_follow_config.node, &source);
+    let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
+    let _mempool_orchestrator_handle = spawn_mempool_orchestrator(
+        mempool_source,
+        store.clone(),
+        mempool_index,
+        readiness.clone(),
+        mempool_ready_signal,
         cancel.clone(),
     );
 
@@ -455,6 +493,7 @@ async fn run_tip_follow(
         &source,
         store,
         &readiness,
+        Some(&mempool_ready_gate),
         cancel.clone(),
     )
     .await;
@@ -533,12 +572,19 @@ impl IngestControlEndpointHandle {
     }
 }
 
-async fn spawn_ingest_control_endpoint(
+struct IngestControlEndpointSpec {
     listen_addr: SocketAddr,
     network: zinder_core::Network,
     store: PrimaryChainStore,
+    mempool_index: MempoolIndex,
+    bearer_token: Option<zinder_runtime::BearerToken>,
     cancel: CancellationToken,
+}
+
+async fn spawn_ingest_control_endpoint(
+    spec: IngestControlEndpointSpec,
 ) -> Result<IngestControlEndpointHandle, IngestConfigError> {
+    let listen_addr = spec.listen_addr;
     let listener = TcpListener::bind(listen_addr).await.map_err(|source| {
         IngestConfigError::IngestControlBind {
             listen_addr,
@@ -548,8 +594,15 @@ async fn spawn_ingest_control_endpoint(
     let incoming = TcpListenerStream::new(listener);
     let endpoint_cancel = CancellationToken::new();
     let endpoint_cancel_for_task = endpoint_cancel.clone();
-    let shutdown_cancel = cancel.clone();
-    let adapter = IngestControlGrpcAdapter::new(network, store);
+    let shutdown_cancel = spec.cancel.clone();
+    let adapter = {
+        let mut adapter = IngestControlGrpcAdapter::new(spec.network, spec.store)
+            .with_mempool(spec.mempool_index);
+        if let Some(bearer_token) = spec.bearer_token {
+            adapter = adapter.with_bearer_token(bearer_token);
+        }
+        adapter
+    };
     let join = tokio::spawn(async move {
         tracing::info!(
             target: "zinder::ingest",
@@ -578,6 +631,167 @@ async fn spawn_ingest_control_endpoint(
         cancel: endpoint_cancel,
         join,
     })
+}
+
+fn build_mempool_source(
+    node_target: &NodeTarget,
+    json_rpc: &ZebraJsonRpcSource,
+) -> Arc<dyn MempoolSource> {
+    node_target.indexer_grpc_addr.as_ref().map_or_else(
+        || {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "mempool_source_selected",
+                backend = "zebra-json-rpc-polling",
+                "selected polling mempool source"
+            );
+            Arc::new(JsonRpcMempoolSource::new(json_rpc.clone())) as Arc<dyn MempoolSource>
+        },
+        |indexer_endpoint| {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "mempool_source_selected",
+                backend = "zebra-indexer-grpc",
+                indexer_endpoint = %indexer_endpoint,
+                "selected streaming mempool source"
+            );
+            let indexer_target = ZebraIndexerSourceTarget::new(indexer_endpoint.clone());
+            Arc::new(ZebraIndexerMempoolSource::new(
+                indexer_target,
+                json_rpc.clone(),
+            )) as Arc<dyn MempoolSource>
+        },
+    )
+}
+
+/// Threshold above which `MempoolHydrationLagging` is reported.
+///
+/// Hydration failures are typically a single-tx race (the mempool source
+/// observed an `Added` for a transaction the upstream node has already
+/// dropped). Surfacing one or two of those as a readiness regression would
+/// be noisy. Five within a single source session is a sustained pattern
+/// worth alerting on.
+const MEMPOOL_HYDRATION_LAGGING_THRESHOLD: u64 = 5;
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "spawn_mempool_orchestrator threads the source, store, live index, readiness, prime signal, and cancel through the orchestrator's spawn loop; bundling them into a struct adds indirection without changing the binding count callers must make."
+)]
+#[must_use = "drop the handle to detach the orchestrator or await it for symmetric shutdown"]
+fn spawn_mempool_orchestrator(
+    mempool_source: Arc<dyn MempoolSource>,
+    store: PrimaryChainStore,
+    mempool_index: MempoolIndex,
+    readiness: Readiness,
+    mempool_ready_signal: MempoolReadySignal,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let mut hydration_failures: u64 = 0;
+            let outcome_callback = {
+                let readiness = readiness.clone();
+                let store = store.clone();
+                let signal = mempool_ready_signal.clone();
+                move |outcome: MempoolOrchestratorEventOutcome| {
+                    if matches!(outcome, MempoolOrchestratorEventOutcome::SourceStreamOpened) {
+                        signal.set_primed();
+                        clear_mempool_orchestrator_readiness(&readiness, &store);
+                    } else if matches!(outcome, MempoolOrchestratorEventOutcome::HydrationFailed) {
+                        hydration_failures = hydration_failures.saturating_add(1);
+                        if hydration_failures >= MEMPOOL_HYDRATION_LAGGING_THRESHOLD {
+                            set_mempool_hydration_lagging(&readiness, &store, hydration_failures);
+                        }
+                    }
+                }
+            };
+            let orchestrator = run_mempool_orchestrator(
+                Arc::clone(&mempool_source),
+                store.clone(),
+                mempool_index.clone(),
+                outcome_callback,
+            );
+            tokio::pin!(orchestrator);
+            tokio::select! {
+                outcome = &mut orchestrator => {
+                    match outcome {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "zinder::ingest",
+                                event = "mempool_orchestrator_stream_closed",
+                                "mempool source stream ended; reconnecting"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "zinder::ingest",
+                                event = "mempool_orchestrator_failed",
+                                error = %error,
+                                "mempool orchestrator returned an error; reconnecting"
+                            );
+                            set_mempool_source_unavailable(&readiness, &store);
+                        }
+                    }
+                }
+                () = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "zinder::ingest",
+                        event = "mempool_orchestrator_cancelled",
+                        "mempool orchestrator cancelled"
+                    );
+                    return;
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(MEMPOOL_ORCHESTRATOR_RECONNECT_BACKOFF) => {}
+                () = cancel.cancelled() => return,
+            }
+        }
+    })
+}
+
+fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
+    store
+        .current_chain_epoch()
+        .ok()
+        .flatten()
+        .map(|chain_epoch| chain_epoch.tip_height.value())
+}
+
+fn clear_mempool_orchestrator_readiness(readiness: &Readiness, store: &PrimaryChainStore) {
+    let cause = readiness.report().cause;
+    if matches!(
+        cause,
+        ReadinessCause::MempoolSourceUnavailable | ReadinessCause::MempoolHydrationLagging { .. }
+    ) {
+        readiness.set(ReadinessState::ready(current_chain_height(store)));
+    }
+}
+
+fn set_mempool_source_unavailable(readiness: &Readiness, store: &PrimaryChainStore) {
+    let cause = readiness.report().cause;
+    if !matches!(cause, ReadinessCause::ReorgWindowExceeded { .. }) {
+        readiness.set(ReadinessState::mempool_source_unavailable(
+            current_chain_height(store),
+        ));
+    }
+}
+
+fn set_mempool_hydration_lagging(
+    readiness: &Readiness,
+    store: &PrimaryChainStore,
+    recent_hydration_failures: u64,
+) {
+    let cause = readiness.report().cause;
+    if matches!(
+        cause,
+        ReadinessCause::Ready | ReadinessCause::MempoolHydrationLagging { .. }
+    ) {
+        readiness.set(ReadinessState::mempool_hydration_lagging(
+            recent_hydration_failures,
+            current_chain_height(store),
+        ));
+    }
 }
 
 fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), IngestConfigError> {
@@ -646,6 +860,7 @@ fn ingest_config_error_class(error: Option<&IngestConfigError>) -> &'static str 
         Some(IngestConfigError::Ingest(_)) => "ingest",
         Some(IngestConfigError::IngestControlBind { .. }) => "ingest_control_bind",
         Some(IngestConfigError::IngestControlTransport { .. }) => "ingest_control_transport",
+        Some(IngestConfigError::BearerToken(_)) => "bearer_token",
     }
 }
 
@@ -734,6 +949,7 @@ impl From<TipFollowArgs> for TipFollowConfigOverrides {
             poll_interval_ms: args.poll_interval_ms,
             lag_threshold_blocks: args.lag_threshold_blocks,
             ingest_control_listen_addr: args.ingest_control_listen_addr,
+            ingest_control_token_path: args.ingest_control_token_path,
         }
     }
 }

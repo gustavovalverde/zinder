@@ -1,11 +1,12 @@
-//! Private ingest control-plane adapter for writer status and chain events.
+//! Private ingest control-plane adapter for writer status, chain events,
+//! and mempool surfaces.
 
 use std::{pin::Pin, time::Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status};
-use zinder_core::{ChainEpoch, Network};
+use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use zinder_core::{ChainEpoch, Network, TransactionId, UnixTimestampMillis};
 use zinder_proto::v1::{
     ingest::{
         WriterStatusRequest, WriterStatusResponse,
@@ -13,39 +14,102 @@ use zinder_proto::v1::{
     },
     wallet,
 };
+use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
-    ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily, PrimaryChainStore,
-    StreamCursorTokenV1, chain_event_envelope_message, run_chain_event_stream,
-    status_from_store_error,
+    ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
+    DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
+    StreamCursorTokenV1, chain_event_envelope_message, mempool_entry_message,
+    mempool_event_envelope_message, run_chain_event_stream, status_from_store_error,
 };
+
+use crate::mempool::MempoolIndex;
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
+type MempoolEventsStream = IngestControlStream<wallet::MempoolEventEnvelope>;
+
+/// Default page size for mempool snapshot reads when the request omits one.
+const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
+
+/// Maximum entries returned by a single `MempoolSnapshot` response.
+///
+/// The native and compat surfaces enforce this cap so a single read cannot
+/// exhaust the writer's memory budget; clients requesting larger pages
+/// receive a truncated page plus a cursor for the next call.
+pub const MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
+
+const MEMPOOL_SNAPSHOT_CURSOR_LEN: usize = 40;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MempoolSnapshotCursor {
+    after_transaction_id: TransactionId,
+}
 
 /// Tonic adapter for the private ingest control service.
 #[derive(Clone)]
 pub struct IngestControlGrpcAdapter {
     network: Network,
     store: PrimaryChainStore,
+    mempool_index: Option<MempoolIndex>,
+    bearer_token: Option<BearerToken>,
 }
 
 impl IngestControlGrpcAdapter {
     /// Creates an ingest-control adapter over the primary store handle.
+    ///
+    /// The returned adapter does not advertise mempool surfaces; pair the
+    /// adapter with [`IngestControlGrpcAdapter::with_mempool`] to expose
+    /// `MempoolSnapshot` and `MempoolEvents` once the writer wires the
+    /// live `MempoolIndex`.
     #[must_use]
     pub fn new(network: Network, store: PrimaryChainStore) -> Self {
-        Self { network, store }
+        Self {
+            network,
+            store,
+            mempool_index: None,
+            bearer_token: None,
+        }
     }
 
-    /// Converts this adapter into a generated tonic server.
+    /// Wires the live mempool surfaces into the ingest-control adapter.
+    ///
+    /// Mempool events are read directly from the underlying chain store; only
+    /// the in-memory snapshot index needs to be passed in.
     #[must_use]
-    pub fn into_server(self) -> IngestControlServer<Self> {
-        IngestControlServer::new(self)
+    pub fn with_mempool(mut self, mempool_index: MempoolIndex) -> Self {
+        self.mempool_index = Some(mempool_index);
+        self
+    }
+
+    /// Wires a shared-secret bearer token into the ingest-control adapter.
+    ///
+    /// When set, every gRPC request must carry an `authorization: Bearer
+    /// <token>` metadata header that matches `bearer_token`. When unset,
+    /// the adapter advertises an open control plane (the default for
+    /// localhost-only deployments).
+    #[must_use]
+    pub fn with_bearer_token(mut self, bearer_token: BearerToken) -> Self {
+        self.bearer_token = Some(bearer_token);
+        self
+    }
+
+    /// Converts this adapter into a tonic service, wrapping it with the
+    /// bearer-token interceptor. When no token is configured, the
+    /// interceptor passes every request through unchanged so localhost
+    /// deployments behave as before.
+    #[must_use]
+    pub fn into_server(
+        self,
+    ) -> InterceptedService<IngestControlServer<Self>, BearerTokenServerInterceptor> {
+        let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
+        IngestControlServer::with_interceptor(self, interceptor)
     }
 }
 
 #[tonic::async_trait]
 impl IngestControl for IngestControlGrpcAdapter {
     type ChainEventsStream = ChainEventsStream;
+    type MempoolEventsStream = MempoolEventsStream;
 
     async fn writer_status(
         &self,
@@ -91,6 +155,199 @@ impl IngestControl for IngestControlGrpcAdapter {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
     }
+
+    async fn mempool_snapshot(
+        &self,
+        request: Request<wallet::MempoolSnapshotRequest>,
+    ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        let mempool_index = self
+            .mempool_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
+        let request = request.into_inner();
+        let max_entries = bounded_snapshot_page_size(request.max_entries);
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+        let snapshot_sequence = self
+            .store
+            .mempool_event_retention_report()
+            .map(|report| report.current_event_sequence)
+            .map_err(|error| status_from_store_error(&error))?;
+        let snapshot_cursor =
+            decode_mempool_snapshot_cursor(&request.from_cursor, snapshot_sequence)?;
+        let snapshot_page = mempool_index.snapshot_page(
+            max_entries,
+            snapshot_cursor.map(|cursor| cursor.after_transaction_id),
+        );
+        let snapshot_age_millis = UnixTimestampMillis::now()
+            .value()
+            .saturating_sub(snapshot_page.last_updated_at.value());
+        let entries = snapshot_page
+            .entries
+            .iter()
+            .map(|entry| mempool_entry_message(entry.as_ref()))
+            .collect();
+        let next_cursor = snapshot_page
+            .next_after_transaction_id
+            .map_or_else(Vec::new, |transaction_id| {
+                encode_mempool_snapshot_cursor(snapshot_sequence, transaction_id)
+            });
+        record_mempool_snapshot_age_seconds(snapshot_age_millis);
+        Ok(Response::new(wallet::MempoolSnapshotResponse {
+            chain_epoch: Some(zinder_store::chain_epoch_message(chain_epoch)),
+            snapshot_sequence,
+            snapshot_age_millis,
+            entries,
+            next_cursor,
+        }))
+    }
+
+    async fn mempool_events(
+        &self,
+        request: Request<wallet::MempoolEventsRequest>,
+    ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        if self.mempool_index.is_none() {
+            return Err(Status::unavailable("mempool surface is not configured"));
+        }
+        let store = self.store.clone();
+        let request = request.into_inner();
+        let from_cursor = cursor_from_request(request.from_cursor);
+        let (event_sender, event_receiver) = mpsc::channel(16);
+        tokio::spawn(stream_mempool_events(store, from_cursor, event_sender));
+        Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
+    }
+}
+
+async fn stream_mempool_events(
+    store: PrimaryChainStore,
+    mut from_cursor: Option<StreamCursorTokenV1>,
+    event_sender: mpsc::Sender<Result<wallet::MempoolEventEnvelope, Status>>,
+) {
+    loop {
+        // RocksDB reads are synchronous; offload off the runtime worker so
+        // the orchestrator and other async tasks keep making progress.
+        let page_store = store.clone();
+        let page_cursor = from_cursor.clone();
+        let page_outcome = match tokio::task::spawn_blocking(move || {
+            let request = MempoolEventHistoryRequest::new(
+                page_cursor.as_ref(),
+                DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS,
+            );
+            page_store.mempool_event_history(request)
+        })
+        .await
+        {
+            Ok(page_outcome) => page_outcome,
+            Err(join_error) => {
+                let _ = event_sender
+                    .send(Err(Status::unavailable(join_error.to_string())))
+                    .await;
+                return;
+            }
+        };
+        match page_outcome {
+            Ok(envelopes) => {
+                let truncated = u32::try_from(envelopes.len())
+                    .is_ok_and(|count| count >= DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS.get());
+                for envelope in envelopes {
+                    let proto_outcome = mempool_event_envelope_message(&envelope);
+                    let send_outcome = match proto_outcome {
+                        Ok(message) => {
+                            from_cursor = Some(envelope.cursor.clone());
+                            event_sender.send(Ok(message)).await
+                        }
+                        Err(error) => {
+                            event_sender
+                                .send(Err(status_from_chain_event_encode_error(error)))
+                                .await
+                        }
+                    };
+                    if send_outcome.is_err() {
+                        return;
+                    }
+                }
+                if !truncated {
+                    // Exit immediately when the receiver drops so server
+                    // shutdown does not have to wait out the poll interval.
+                    tokio::select! {
+                        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                        () = event_sender.closed() => return,
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = event_sender
+                    .send(Err(status_from_store_error(&error)))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+fn record_mempool_snapshot_age_seconds(snapshot_age_millis: u64) {
+    let elapsed_seconds = duration_seconds_from_millis(snapshot_age_millis);
+    metrics::gauge!("zinder_mempool_snapshot_age_seconds").set(elapsed_seconds);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 samples; snapshot age is diagnostic"
+)]
+fn duration_seconds_from_millis(millis: u64) -> f64 {
+    (millis as f64) / 1_000.0
+}
+
+const fn bounded_snapshot_page_size(requested: u32) -> u32 {
+    if requested == 0 {
+        DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE
+    } else if requested > MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE {
+        MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE
+    } else {
+        requested
+    }
+}
+
+fn decode_mempool_snapshot_cursor(
+    cursor_bytes: &[u8],
+    current_snapshot_sequence: u64,
+) -> Result<Option<MempoolSnapshotCursor>, Status> {
+    if cursor_bytes.is_empty() {
+        return Ok(None);
+    }
+    if cursor_bytes.len() != MEMPOOL_SNAPSHOT_CURSOR_LEN {
+        return Err(Status::invalid_argument(
+            "mempool snapshot cursor is invalid",
+        ));
+    }
+
+    let mut sequence_bytes = [0u8; 8];
+    sequence_bytes.copy_from_slice(&cursor_bytes[..8]);
+    let snapshot_sequence = u64::from_be_bytes(sequence_bytes);
+    if snapshot_sequence > current_snapshot_sequence {
+        return Err(Status::invalid_argument(
+            "mempool snapshot cursor is ahead of retained history",
+        ));
+    }
+
+    let mut transaction_id_bytes = [0u8; 32];
+    transaction_id_bytes.copy_from_slice(&cursor_bytes[8..]);
+    Ok(Some(MempoolSnapshotCursor {
+        after_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
+    }))
+}
+
+fn encode_mempool_snapshot_cursor(
+    snapshot_sequence: u64,
+    after_transaction_id: TransactionId,
+) -> Vec<u8> {
+    let mut cursor_bytes = Vec::with_capacity(MEMPOOL_SNAPSHOT_CURSOR_LEN);
+    cursor_bytes.extend_from_slice(&snapshot_sequence.to_be_bytes());
+    cursor_bytes.extend_from_slice(&after_transaction_id.as_bytes());
+    cursor_bytes
 }
 
 async fn read_chain_event_page(

@@ -137,6 +137,18 @@ impl UnixTimestampMillis {
         Self(timestamp_millis)
     }
 
+    /// Returns the wall-clock Unix millisecond timestamp.
+    ///
+    /// Infallible: clocks before [`std::time::UNIX_EPOCH`] saturate to 0,
+    /// and millisecond counts past `u64::MAX` saturate to `u64::MAX`.
+    #[must_use]
+    pub fn now() -> Self {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO);
+        Self(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// Returns the Unix millisecond timestamp.
     #[must_use]
     pub const fn value(self) -> u64 {

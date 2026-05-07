@@ -114,7 +114,7 @@ The current native network service exposes Zinder concepts:
 - `TreeState`, `LatestTreeState`, `SubtreeRoots`
 - `ServerInfo`
 
-M2 adds `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) and [§D2](../public-interfaces.md). M3 adds `MempoolEvents` and `MempoolSnapshot` per [M3 Mempool](../specs/m3-mempool.md).
+M2 adds `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) and [§D2](../public-interfaces.md). M3 adds `MempoolEvents` and `MempoolSnapshot` per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
 
 Native M2 read requests that depend on canonical chain state carry an optional
 `at_epoch` field. When it is absent, the server answers from the visible epoch

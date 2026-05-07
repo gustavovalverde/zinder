@@ -195,21 +195,6 @@ struct MetricsState {
     metrics: MetricsHandle,
 }
 
-const READINESS_CAUSE_LABELS: [&str; 12] = [
-    "starting",
-    "syncing",
-    "ready",
-    "node_unavailable",
-    "node_capability_missing",
-    "storage_unavailable",
-    "schema_mismatch",
-    "reorg_window_exceeded",
-    "replica_lagging",
-    "writer_status_unavailable",
-    "cursor_at_risk",
-    "shutting_down",
-];
-
 async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
 }
@@ -260,14 +245,14 @@ fn metrics_handler(state: &MetricsState) -> (StatusCode, String) {
 fn record_readiness_metrics(state: &MetricsState) {
     let report = state.readiness.report();
     let active_cause = report.cause.metric_label();
-    for cause in READINESS_CAUSE_LABELS {
+    for cause in crate::ReadinessCause::ALL_METRIC_LABELS {
         metrics::gauge!(
             "zinder_readiness_state",
             "service" => state.service_name,
             "network" => state.network_name,
-            "cause" => cause
+            "cause" => *cause
         )
-        .set(if cause == active_cause { 1.0 } else { 0.0 });
+        .set(if *cause == active_cause { 1.0 } else { 0.0 });
     }
 
     metrics::gauge!(
@@ -301,6 +286,9 @@ fn readiness_sync_lag_blocks(cause: crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::ReplicaLagging { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::CursorAtRisk { .. }
+        | crate::ReadinessCause::MempoolCursorAtRisk { .. }
+        | crate::ReadinessCause::MempoolSourceUnavailable
+        | crate::ReadinessCause::MempoolHydrationLagging { .. }
         | crate::ReadinessCause::ShuttingDown => 0.0,
     }
 }
@@ -318,6 +306,9 @@ fn readiness_replica_lag_chain_epochs(cause: crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::ReorgWindowExceeded { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::CursorAtRisk { .. }
+        | crate::ReadinessCause::MempoolCursorAtRisk { .. }
+        | crate::ReadinessCause::MempoolSourceUnavailable
+        | crate::ReadinessCause::MempoolHydrationLagging { .. }
         | crate::ReadinessCause::ShuttingDown => 0.0,
     }
 }

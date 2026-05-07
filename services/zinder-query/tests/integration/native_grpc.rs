@@ -371,7 +371,7 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
         spawn_ingest_control_server(StaticIngestControl::new(proxied_event.clone())).await?;
     let store_fixture = StoreFixture::open()?;
     let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
-    let grpc_adapter = WalletQueryGrpcAdapter::with_chain_events_proxy(
+    let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
         wallet_query,
         ServerInfoSettings::default(),
         format!("http://{ingest_control_addr}"),
@@ -647,6 +647,9 @@ impl StaticIngestControl {
 #[tonic::async_trait]
 impl IngestControl for StaticIngestControl {
     type ChainEventsStream = StaticChainEventsStream;
+    type MempoolEventsStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>,
+    >;
 
     async fn writer_status(
         &self,
@@ -667,6 +670,24 @@ impl IngestControl for StaticIngestControl {
         Ok(Response::new(Box::pin(tokio_stream::iter([Ok(self
             .event
             .clone())]))))
+    }
+
+    async fn mempool_snapshot(
+        &self,
+        _request: Request<wallet::MempoolSnapshotRequest>,
+    ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        Err(Status::unimplemented(
+            "test scaffold does not stub MempoolSnapshot",
+        ))
+    }
+
+    async fn mempool_events(
+        &self,
+        _request: Request<wallet::MempoolEventsRequest>,
+    ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "test scaffold does not stub MempoolEvents",
+        ))
     }
 }
 

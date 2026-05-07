@@ -27,6 +27,11 @@ use zinder_query::{
     SubtreeRoots, TransparentAddressUtxos, TransparentAddressUtxosRequest, TreeState,
     WalletQueryApi, status_from_query_error,
 };
+use zinder_store::MempoolEvent;
+
+use crate::mempool::{
+    MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcherError,
+};
 
 type GrpcStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -35,6 +40,8 @@ type GrpcStream<T> =
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 /// Default maximum transparent UTXOs returned when lightwalletd requests "all entries".
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+/// Page size used to drain the native mempool snapshot for lightwalletd.
+const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 
 // Intentionally unimplemented until the owning milestones land:
 // transparent history and balance wait for the full transparent-address surface;
@@ -63,14 +70,33 @@ impl Default for LightwalletdCompatibilityOptions {
 }
 
 /// gRPC adapter from [`WalletQueryApi`] to lightwalletd `CompactTxStreamer`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     options: LightwalletdCompatibilityOptions,
+    mempool_surface: Option<SharedMempoolSurface>,
+    tip_change_watcher: Option<SharedTipChangeWatcher>,
+}
+
+impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<QueryApi> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LightwalletdGrpcAdapter")
+            .field("query_api", &self.query_api)
+            .field("options", &self.options)
+            .field("mempool_surface", &self.mempool_surface.is_some())
+            .field("tip_change_watcher", &self.tip_change_watcher.is_some())
+            .finish()
+    }
 }
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// Creates a lightwalletd-compatible gRPC adapter.
+    ///
+    /// The returned adapter does not advertise mempool surfaces. Pair the
+    /// adapter with [`LightwalletdGrpcAdapter::with_mempool_surface`] to
+    /// expose `GetMempoolStream` and `GetMempoolTx`; without one, both
+    /// methods return `Status::unavailable`.
     #[must_use]
     pub fn new(query_api: QueryApi) -> Self {
         Self::with_options(query_api, LightwalletdCompatibilityOptions::default())
@@ -82,7 +108,28 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         query_api: QueryApi,
         options: LightwalletdCompatibilityOptions,
     ) -> Self {
-        Self { query_api, options }
+        Self {
+            query_api,
+            options,
+            mempool_surface: None,
+            tip_change_watcher: None,
+        }
+    }
+
+    /// Wires a mempool read surface into the adapter.
+    #[must_use]
+    pub fn with_mempool_surface(mut self, mempool_surface: SharedMempoolSurface) -> Self {
+        self.mempool_surface = Some(mempool_surface);
+        self
+    }
+
+    /// Wires a tip-change watcher into the adapter so `GetMempoolStream`
+    /// closes cleanly on each best-chain tip change, preserving the
+    /// lightwalletd Go server's de-facto contract.
+    #[must_use]
+    pub fn with_tip_change_watcher(mut self, watcher: SharedTipChangeWatcher) -> Self {
+        self.tip_change_watcher = Some(watcher);
+        self
     }
 
     /// Wraps this adapter in the generated tonic server type.
@@ -328,11 +375,43 @@ where
 
     async fn get_mempool_tx(
         &self,
-        _request: Request<lightwalletd::GetMempoolTxRequest>,
+        request: Request<lightwalletd::GetMempoolTxRequest>,
     ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-        Err(Status::unimplemented(
-            "GetMempoolTx is outside the mempool surface",
-        ))
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        let exclude_txid_suffixes = request.into_inner().exclude_txid_suffixes;
+        let mut compact_messages = Vec::new();
+        let mut next_cursor = None;
+        loop {
+            let snapshot_page = mempool_surface
+                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, next_cursor)
+                .await
+                .map_err(status_from_mempool_surface_error)?;
+            for entry in snapshot_page.entries {
+                if txid_matches_excluded_suffix(
+                    &entry.transaction_id.as_bytes(),
+                    &exclude_txid_suffixes,
+                ) {
+                    continue;
+                }
+                let compact_message =
+                    lightwalletd::CompactTx::decode(entry.compact_transaction_bytes.as_slice())
+                        .map_err(|error| {
+                            Status::data_loss(format!(
+                                "stored compact transaction bytes failed to decode: {error}"
+                            ))
+                        })?;
+                compact_messages.push(Ok(compact_message));
+            }
+            if snapshot_page.next_cursor.is_none() {
+                break;
+            }
+            next_cursor = snapshot_page.next_cursor;
+        }
+        Ok(Response::new(Box::pin(stream::iter(compact_messages))))
     }
 
     type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -341,9 +420,34 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        Err(Status::unimplemented(
-            "GetMempoolStream is outside the mempool surface",
-        ))
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        let live_tail_sequence = mempool_surface
+            .mempool_snapshot_page(1, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?
+            .snapshot_sequence;
+        let event_stream = mempool_surface
+            .mempool_events(None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let raw_transaction_stream = stream::StreamExt::filter_map(event_stream, move |event| {
+            project_added_after_sequence_to_raw_transaction(event, live_tail_sequence)
+        });
+
+        let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
+            if let Some(watcher) = self.tip_change_watcher.clone() {
+                Box::pin(close_mempool_stream_on_tip_change(
+                    raw_transaction_stream,
+                    watcher,
+                ))
+            } else {
+                Box::pin(raw_transaction_stream)
+            };
+        Ok(Response::new(bounded_stream))
     }
 
     async fn get_tree_state(
@@ -907,5 +1011,101 @@ fn zebra_network(network: Network) -> Result<ZebraNetwork, Status> {
         _ => Err(Status::failed_precondition(
             "network is not supported by lightwalletd compatibility",
         )),
+    }
+}
+
+fn close_mempool_stream_on_tip_change<S>(
+    raw_transaction_stream: S,
+    watcher: SharedTipChangeWatcher,
+) -> tokio_stream::wrappers::ReceiverStream<Result<lightwalletd::RawTransaction, Status>>
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<lightwalletd::RawTransaction, Status>>
+        + Send
+        + 'static,
+{
+    let (output_sender, output_receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        tokio::pin!(raw_transaction_stream);
+        let mut tip_change_signal = Box::pin(watcher.await_tip_change());
+        loop {
+            tokio::select! {
+                outcome = tonic::codegen::tokio_stream::StreamExt::next(&mut raw_transaction_stream) => {
+                    match outcome {
+                        Some(raw_transaction_outcome) => {
+                            if output_sender.send(raw_transaction_outcome).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => {
+                            // Underlying mempool source ended; let the
+                            // gRPC stream end naturally.
+                            return;
+                        }
+                    }
+                }
+                tip_change_outcome = &mut tip_change_signal => {
+                    match tip_change_outcome {
+                        Ok(()) => {
+                            tracing::debug!(
+                                target: "zinder::compat_lightwalletd",
+                                event = "mempool_stream_close_on_tip_change",
+                                "GetMempoolStream closing on observed best-chain tip change"
+                            );
+                        }
+                        Err(error @ TipChangeWatcherError::SignalClosed) => {
+                            tracing::warn!(
+                                target: "zinder::compat_lightwalletd",
+                                event = "mempool_stream_tip_signal_closed",
+                                error = %error,
+                                "tip-change signal source closed; GetMempoolStream will end"
+                            );
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(output_receiver)
+}
+
+fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
+    match error {
+        MempoolSurfaceError::Unavailable { reason } => Status::unavailable(reason),
+        MempoolSurfaceError::CursorInvalid => Status::invalid_argument("mempool cursor is invalid"),
+        MempoolSurfaceError::CursorExpired => Status::failed_precondition("mempool cursor expired"),
+    }
+}
+
+fn txid_matches_excluded_suffix(transaction_id: &[u8; 32], exclude_suffixes: &[Vec<u8>]) -> bool {
+    exclude_suffixes
+        .iter()
+        .any(|suffix| !suffix.is_empty() && transaction_id.ends_with(suffix))
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so all current and future non-Added variants are filtered out of the GetMempoolStream projection."
+)]
+fn project_added_after_sequence_to_raw_transaction(
+    event_outcome: Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>,
+    after_event_sequence: u64,
+) -> Option<Result<lightwalletd::RawTransaction, Status>> {
+    match event_outcome {
+        Ok(envelope) if envelope.event_sequence <= after_event_sequence => None,
+        Ok(envelope) => match envelope.event {
+            MempoolEvent::Added { entry } => Some(Ok(lightwalletd::RawTransaction {
+                data: entry.raw_transaction_bytes.as_slice().to_vec(),
+                // Lightwalletd contract: the height field on a mempool
+                // raw transaction is "the latest block height" at the
+                // moment the transaction was observed. The Android SDK
+                // ignores the value and uses GetLatestBlock for tip
+                // tracking; Zinder reports the chain epoch's tip height
+                // recorded on the entry.
+                height: u64::from(entry.first_seen_chain_epoch.tip_height.value()),
+            })),
+            _ => None,
+        },
+        Err(error) => Some(Err(status_from_mempool_surface_error(error))),
     }
 }

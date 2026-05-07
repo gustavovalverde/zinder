@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 jsonrpsee.workspace = true
 metrics.workspace = true
@@ -21,14 +22,18 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
+zinder-proto.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 zinder-testkit = { path = "../zinder-testkit" }
 
 [lints]

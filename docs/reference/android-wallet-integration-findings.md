@@ -42,6 +42,64 @@ The Zashi UI advanced from `Restoring Wallet • 0.0% Complete` (stuck for hours
 
 For wallet-serving deployments the takeaway is the simplest possible operator gesture: pass `--wallet-serving` to `zinder-ingest backfill` and let the upstream node's activation heights pick the floor. Manual `--checkpoint-height` selection for serving is no longer needed.
 
+**Send path failure under tip-follow lag (2026-05-07).** With 1.000 TAZ available in the wallet (received in block 3,990,802 on May 1), driving Zashi's Send flow surfaced a new operational class of failure that has nothing to do with the original frictions: when `tip-follow` is far behind the upstream node, sends are silently broken even though every other surface looks healthy.
+
+The wallet constructed a 0.010 TAZ shielded transfer correctly. `OutboundTransactionManagerImpl.submit()` reached compat. Compat relayed `sendrawtransaction` to Zebra. Zebra rejected with consensus error:
+
+```text
+the transaction will be rejected from the mempool until the next chain tip block:
+transaction did not pass consensus validation: transaction must not be mined at a
+block Height(4000340) greater than its expiry Height(3994739),
+failing transaction transaction::Hash("2a0370b73e91137b7c09a6221a0e932916b392a324bf5c8010b516c14fba850e")
+```
+
+Decoding what happened, ground truth from each layer at submit time:
+
+| Layer | Reported tip | Source |
+| --- | --- | --- |
+| Zebra (validator) | 4,000,340 | `getblockcount` |
+| zinder compat (`GetLightdInfo`) | 3,994,775 | what wallet sees |
+| Lag | 5,565 blocks (~90 min of testnet) | difference |
+
+The wallet computed `expiry_height = anchor + delta = 3,994,739` based on zinder's `chainTipHeight`. Zebra checked the tx against its own tip (4,000,340) and saw the expiry as 5,600 blocks in the past, so it consensus-rejected. The wallet retried submission via `resubmitUnminedTransactions` for the next several seconds, hit the same consensus rejection each time, then expired the unmined tx locally and restored the spent note to `available`. No funds lost; balance returned to 1.000 TAZ.
+
+Root cause: `tip-follow` had crashed at 13:40 the previous day with a stale Zebra cookie (Zebra rotates its `/var/run/auth/.cookie` on every container restart) and was offline overnight. After restart it began processing one block per `chain_committed` event at ~1 block/sec, recovering at ~80× testnet's real-time rate. But it accumulates lag while down, and during that catch-up window every `chainTipHeight` it reports is stale by the size of the gap.
+
+`backfill` already has the right shape: `--commit-batch-blocks 200` chews through history at ~1300 blocks/sec on a release build (47m17s for 3.7M blocks in our earlier test). `tip-follow` does not appear to enter a comparable bulk mode when it discovers a large gap on startup, so the catch-up rate is dominated by per-block overhead instead of throughput.
+
+**Operator-visible symptoms when this happens:**
+
+- Reads keep working: `GetLightdInfo`, `GetBlock`, `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos` all serve from the existing store correctly.
+- Sync looks healthy from the wallet: `scanProgress = 1.0`, `fullyScannedHeight = chainTipHeight` (because the wallet trusts zinder's view of "the chain").
+- Sends fail with `transaction must not be mined at a block Height(...) greater than its expiry Height(...)` until the gap closes.
+- The wallet's UI shows "Sending failed", but the recorded failure is at the consensus layer, not at the transport layer the user typically suspects.
+
+**Where the time goes (data-driven, not speculation).** zinder's `/metrics` endpoint already exposes per-operation latencies that pinpoint the bottleneck. After a rebuild against the same store and a 30-second sample at `poll_interval_ms = 1000`:
+
+| Operation | p50 latency | p99 latency | Cost per block |
+| --- | --- | --- | --- |
+| `zinder_ingest_source_request_duration_seconds{operation="fetch_block"}` | 2.97 ms | 6.49 ms | ~6 ms |
+| `zinder_store_write_batch_latency_seconds` | 0.12 ms | 0.49 ms | ~0.3 ms |
+| Active per-block work | | | **~7–10 ms** |
+| Observed catch-up rate at `poll_interval_ms = 1000` | | | **~1 block/sec** |
+
+`zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"}` is `0` for every column family during catch-up, and `estimate-pending-compaction-bytes` is also `0`. RocksDB is not the bottleneck. Validator RPCs are not the bottleneck. The remaining ~990 ms per block is the sleep in `tip-follow`'s poll loop. Confirmed by lowering `poll_interval_ms` to `100` on the same hardware: catch-up rate jumped from ~1 block/sec to **8.08 blocks/sec**, an 8× speedup. The 8/sec figure is 80 % of the theoretical 10/sec ceiling at that poll interval, with the remaining ~20 ms per block accounted for by the measured work latencies.
+
+**Suggestions for upstream:**
+
+- Surface the indexer-vs-validator lag in `GetLightdInfo` (e.g., a `validator_tip_height` field alongside the current `block_height`), so wallets can refuse to send when the gap is larger than the tx-expiry window. The Android SDK already reads `block_height` and `estimated_height` from this RPC; an explicit lag field would let it gate sends. zinder's own `/readyz` endpoint already produces exactly this signal: `{"status":"not_ready","cause":{"syncing":{"lag_blocks":3430}},"current_height":3996948,"target_height":4000378}`. The data is already computed; it just needs to flow through the wallet-facing surface.
+- Bulk-catchup mode for `tip-follow`: when starting up and discovering a gap larger than some threshold (e.g., 100 blocks), commit in batches the way `backfill` does, until within the reorg window. The current `lag_threshold_blocks = 2` knob exists but does not appear to engage a fast path: at lag 3,000+ the loop still committed one block per `poll_interval_ms` cycle. Either engage backfill-style batching above the threshold, or document `lag_threshold_blocks` semantics so operators know what it actually does.
+- Operator alert on lag drift: a metric like `tip_follow_lag_blocks` exposed alongside the existing `zinder_ingest_writer_tip_height` and `zinder_ingest_writer_finalized_height` gauges, with a meaningful default warn threshold (e.g., 40 = roughly the SDK's expiry buffer). Operators monitoring zinder don't currently have a single-glance signal for "send is broken" without computing the gap themselves.
+
+**Send path validated end-to-end (2026-05-07).** After the catch-up window closed (lag = 0 against zebra tip 4,000,389), Zashi's Send flow worked through every layer: tx construction → `OutboundTransactionManagerImpl.submit` → compat broadcast → Zebra `sendrawtransaction` → mempool acceptance → mining → wallet scan-back. Tx hash `5e1029ddc34600d9143dd627e6596dbfefbbfc18823a78801493a9a2b7522e3a` mined in block 4,000,394, and the wallet correctly attributed only the fee (`-0.00025 ZEC`) to the user-visible Activity entry, since the recipient was one of the wallet's own diversified UAs. Balance settled at `0.99975 ZEC = 99,975,000 zatoshi` after confirmation, exactly `1.000 - fee`.
+
+**Mempool surface validated end-to-end (2026-05-07).** The compat binary used through the rest of this doc was built on Apr 29 and predated the mempool-surface implementation; calls to `GetMempoolTx` and `GetMempoolStream` returned `Status::unimplemented("...is outside the mempool surface")` until the binary was rebuilt against the current source. After rebuilding both `zinder-ingest` and `zinder-compat-lightwalletd` from the May 7 source (with `[validator]` config sections renamed to `[node]` to match the current schema), both methods became reachable and produced byte-shape-correct responses for an in-flight self-send tx (hash `77f96783ff0517632b7e7d32fe5189c0374c029d6e375fb32f9a2e95da9b9400`):
+
+- `GetMempoolTx({})` returned a `CompactTx` with the canonical shape: 32-byte txid, two Orchard actions (recipient note + change note), each with the expected `nullifier` (32 bytes), `cmx` (32 bytes), `ephemeralKey` (32 bytes), and the 52-byte compact-note `ciphertext` prefix.
+- `GetMempoolStream({})` opened a server-streaming subscription, emitted a `RawTransaction { data: <full raw tx bytes>, height: 4000448 }` for the in-flight tx, kept the stream open while the tx sat in mempool, and closed cleanly with `Response trailers received: (empty)` and `Sent 1 request and received 1 response` when the tx mined into block 4,000,449. This matches the lightwalletd proto contract verbatim: "This will keep the output stream open while there are mempool transactions. It will close the returned stream when a new block is mined."
+
+This retires the last "still cold" wire-shape question against the compat surface. The mempool surface needs an `IngestControlMempoolSurface` configured (already wired by default in `services/zinder-compat-lightwalletd/src/bin/zinder-compat-lightwalletd/main.rs`); when that surface is `None`, calls return `Status::unavailable("mempool surface is not configured")` rather than `unimplemented`, so future operators have a way to differentiate "feature off" from "feature missing".
+
 **Related.** [Wallet data plane](../architecture/wallet-data-plane.md), [Protocol boundary](../architecture/protocol-boundary.md), [Chain ingestion](../architecture/chain-ingestion.md), [Service boundaries](../architecture/service-boundaries.md), [PRD-0001](../prd-0001-zinder-indexer.md), [Lessons from Zaino](lessons-from-zaino.md).
 
 ## Purpose

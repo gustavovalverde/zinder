@@ -55,7 +55,7 @@ This channel is sufficient for views that derive from chain transitions: balance
 
 ### Channel B — `MempoolEvents` subscription
 
-For views that include unconfirmed activity after M3 lands. A `zinder-derive` consumer subscribes to `WalletQuery.MempoolEvents` (defined in [M3 Mempool](../specs/m3-mempool.md)) with a persisted `MempoolStreamCursorV1` cursor.
+For views that include unconfirmed activity. A `zinder-derive` consumer subscribes to `WalletQuery.MempoolEvents` (defined in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)) with a persisted `MempoolStreamCursorV1` cursor.
 
 Combine with Channel A when the view needs both chain and mempool perspectives (e.g. explorer dashboards showing pending transactions alongside confirmed activity). The two streams have independent cursors and independent retention; consumers handle cross-stream ordering.
 
@@ -178,6 +178,6 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 - [Chain Events](chain-events.md) — the event vocabulary the derive plane consumes.
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the subscription contract.
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows that bound derive-consumer downtime tolerance.
-- [M3 Mempool](../specs/m3-mempool.md) — the second event stream available to the derive plane after M3.
+- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — the capability protocol derive consumers must implement.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions that derive consumers inherit.

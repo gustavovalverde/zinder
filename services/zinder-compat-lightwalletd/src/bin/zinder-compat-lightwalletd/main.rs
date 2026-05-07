@@ -1,10 +1,12 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+use zinder_compat_lightwalletd::{
+    IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
+};
 use zinder_runtime::{
     OpsServer, Readiness, cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
 };
@@ -39,6 +41,10 @@ struct Cli {
     /// Private `zinder-ingest` control gRPC endpoint.
     #[arg(long = "ingest-control-addr")]
     ingest_control_addr: Option<String>,
+    /// Path to a file containing the shared-secret bearer token used by the
+    /// `IngestControl` writer. Required when the writer enforces auth.
+    #[arg(long = "ingest-control-token-path")]
+    ingest_control_token_path: Option<PathBuf>,
     /// Lightwalletd-compatible gRPC listen address, such as 127.0.0.1:9067.
     #[arg(long = "listen-addr")]
     listen_addr: Option<SocketAddr>,
@@ -87,6 +93,10 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "lightwalletd bootstrap composes the readiness, ops, store, broadcaster, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
+)]
 async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let config_path = cli.config_path.clone();
     let ops_listen_addr = cli.ops_listen_addr;
@@ -109,9 +119,24 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.broadcaster.as_ref(),
     )?;
     let wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query);
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    let mempool_surface = Arc::new({
+        let mut surface =
+            IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
+        if let Some(token) = lightwalletd_config.ingest_control_bearer_token.clone() {
+            surface = surface.with_bearer_token(token);
+        }
+        surface
+    });
+    let (tip_change_watcher, tip_publisher_handle) = spawn_ingest_control_tip_change_publisher(
+        lightwalletd_config.ingest_control_addr.clone(),
+        lightwalletd_config.ingest_control_bearer_token.clone(),
+        cancel.clone(),
+    );
+    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query)
+        .with_mempool_surface(mempool_surface)
+        .with_tip_change_watcher(tip_change_watcher);
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
         store,
         readiness.clone(),
@@ -122,6 +147,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             writer_status: Some(zinder_query::WriterStatusConfig {
                 endpoint: lightwalletd_config.ingest_control_addr.clone(),
                 network: lightwalletd_config.network,
+                bearer_token: lightwalletd_config.ingest_control_bearer_token.clone(),
             }),
         },
         cancel.clone(),
@@ -149,6 +175,25 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
+    }
+
+    // Drain the tip-change publisher so a panic in its task surfaces in
+    // the operator's log instead of vanishing silently. The publisher's
+    // run loop exits when `cancel` fires, so the join completes promptly.
+    match tip_publisher_handle.await {
+        Ok(()) => {}
+        Err(join_error) if join_error.is_panic() => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "tip_change_publisher_panic",
+            error = %join_error,
+            "tip-change publisher task panicked",
+        ),
+        Err(join_error) => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "tip_change_publisher_join_failed",
+            error = %join_error,
+            "tip-change publisher task did not exit cleanly",
+        ),
     }
 
     server_result.map_err(LightwalletdConfigError::Transport)
@@ -220,6 +265,7 @@ impl From<Cli> for LightwalletdConfigOverrides {
             storage_path: cli.storage_path,
             secondary_path: cli.secondary_path,
             ingest_control_addr: cli.ingest_control_addr,
+            ingest_control_token_path: cli.ingest_control_token_path,
             listen_addr: cli.listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
         }

@@ -1,4 +1,4 @@
-//! Chain-event retention task owned by the ingest writer.
+//! Chain-event and mempool-event retention tasks owned by the ingest writer.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,13 +7,27 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::UnixTimestampMillis;
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
-use zinder_store::{ChainEventRetentionReport, PrimaryChainStore, StoreError};
+use zinder_store::{
+    ChainEventRetentionReport, MempoolEventRetentionConfig, MempoolEventRetentionReport,
+    PrimaryChainStore, StoreError,
+};
 
 /// Runtime configuration for chain-event retention pruning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainEventRetentionConfig {
     /// Retention window for chain-event rows. `None` means unbounded retention.
     pub retention_window: Option<Duration>,
+    /// Interval between retention checks.
+    pub check_interval: Duration,
+    /// Warning window before retention expiry.
+    pub cursor_at_risk_warning: Duration,
+}
+
+/// Runtime configuration for mempool-event retention pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolEventRetentionWorkerConfig {
+    /// Retention windows applied per event variant.
+    pub retention: MempoolEventRetentionConfig,
     /// Interval between retention checks.
     pub check_interval: Duration,
     /// Warning window before retention expiry.
@@ -39,6 +53,33 @@ pub fn spawn_chain_event_retention_task(
                             event = "chain_event_retention_failed",
                             error = %error,
                             "chain-event retention pass failed"
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Spawns the ingest-owned mempool-event retention task.
+#[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
+pub fn spawn_mempool_event_retention_task(
+    store: PrimaryChainStore,
+    readiness: Readiness,
+    config: MempoolEventRetentionWorkerConfig,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(config.check_interval) => {
+                    if let Err(error) = run_mempool_event_retention_once(&store, &readiness, config) {
+                        tracing::warn!(
+                            target: "zinder::ingest",
+                            event = "mempool_event_retention_failed",
+                            error = %error,
+                            "mempool-event retention pass failed"
                         );
                     }
                 }
@@ -161,6 +202,106 @@ fn current_unix_millis() -> Result<UnixTimestampMillis, ChainEventRetentionError
         .map_err(|_| ChainEventRetentionError::TimestampTooLarge)?;
 
     Ok(UnixTimestampMillis::new(millis))
+}
+
+fn run_mempool_event_retention_once(
+    store: &PrimaryChainStore,
+    readiness: &Readiness,
+    config: MempoolEventRetentionWorkerConfig,
+) -> Result<(), ChainEventRetentionError> {
+    let now = current_unix_millis()?;
+    let report = if config.retention.is_unbounded() {
+        store.mempool_event_retention_report()?
+    } else {
+        store.prune_mempool_events_before(now, config.retention)?
+    };
+    record_mempool_oldest_retained_age(now, report);
+    update_mempool_retention_readiness(store, readiness, config, now, report)?;
+
+    Ok(())
+}
+
+fn update_mempool_retention_readiness(
+    store: &PrimaryChainStore,
+    readiness: &Readiness,
+    config: MempoolEventRetentionWorkerConfig,
+    now: UnixTimestampMillis,
+    report: MempoolEventRetentionReport,
+) -> Result<(), StoreError> {
+    let current_height = store
+        .current_chain_epoch()?
+        .map(|chain_epoch| chain_epoch.tip_height.value());
+    let is_at_risk = is_mempool_cursor_at_risk(config, now, report);
+    let current_cause = readiness.report().cause;
+
+    if is_at_risk
+        && matches!(
+            current_cause,
+            ReadinessCause::Ready | ReadinessCause::MempoolCursorAtRisk { .. }
+        )
+    {
+        let Some(retention_window) = shortest_mempool_retention_window(config.retention) else {
+            return Ok(());
+        };
+        let oldest_retained_age_minutes = report
+            .oldest_retained_observed_at
+            .map_or(0, |observed_at| age_minutes(now, observed_at));
+        readiness.set(ReadinessState::mempool_cursor_at_risk(
+            oldest_retained_age_minutes,
+            duration_minutes(retention_window),
+            current_height,
+        ));
+    } else if !is_at_risk && matches!(current_cause, ReadinessCause::MempoolCursorAtRisk { .. }) {
+        readiness.set(ReadinessState::ready(current_height));
+    }
+
+    Ok(())
+}
+
+fn is_mempool_cursor_at_risk(
+    config: MempoolEventRetentionWorkerConfig,
+    now: UnixTimestampMillis,
+    report: MempoolEventRetentionReport,
+) -> bool {
+    let Some(retention_window) = shortest_mempool_retention_window(config.retention) else {
+        return false;
+    };
+    let Some(oldest_retained_observed_at) = report.oldest_retained_observed_at else {
+        return false;
+    };
+    let warning_threshold = retention_window.saturating_sub(config.cursor_at_risk_warning);
+    age_duration(now, oldest_retained_observed_at) > warning_threshold
+}
+
+fn shortest_mempool_retention_window(retention: MempoolEventRetentionConfig) -> Option<Duration> {
+    let candidates = [
+        retention.added_retention,
+        retention.mined_retention,
+        retention.invalidated_retention,
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(std::time::Duration::as_secs)
+}
+
+fn record_mempool_oldest_retained_age(
+    now: UnixTimestampMillis,
+    report: MempoolEventRetentionReport,
+) {
+    let oldest_age_seconds = report
+        .oldest_retained_observed_at
+        .map_or(0, |observed_at| age_duration(now, observed_at).as_secs());
+    metrics::gauge!("zinder_mempool_event_retention_oldest_age_seconds")
+        .set(u64_to_f64(oldest_age_seconds));
+}
+
+fn age_minutes(now: UnixTimestampMillis, observed_at: UnixTimestampMillis) -> u64 {
+    age_duration(now, observed_at).as_secs() / 60
+}
+
+fn duration_minutes(duration: Duration) -> u64 {
+    duration.as_secs() / 60
 }
 
 #[allow(

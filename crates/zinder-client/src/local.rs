@@ -342,6 +342,48 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
+    async fn mempool_snapshot(
+        &self,
+        request: crate::MempoolSnapshotRequest,
+    ) -> Result<crate::MempoolSnapshotView, IndexerError> {
+        self.remote("mempool_snapshot")?
+            .mempool_snapshot(request)
+            .await
+    }
+
+    async fn mempool_events(
+        &self,
+        from_cursor: Option<crate::MempoolEventCursor>,
+    ) -> Result<crate::MempoolEventStream, IndexerError> {
+        self.remote("mempool_events")?
+            .mempool_events(from_cursor)
+            .await
+    }
+
+    async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError> {
+        self.remote("is_in_mempool")?
+            .is_in_mempool(transaction_id)
+            .await
+    }
+
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        request: zinder_core::TransparentMempoolOutputsRequest,
+    ) -> Result<Vec<zinder_core::TransparentMempoolOutput>, IndexerError> {
+        self.remote("transparent_mempool_outputs_by_address")?
+            .transparent_mempool_outputs_by_address(request)
+            .await
+    }
+
+    async fn transparent_mempool_spend_by_outpoint(
+        &self,
+        outpoint: zinder_core::TransparentOutPoint,
+    ) -> Result<Option<zinder_core::TransparentMempoolSpend>, IndexerError> {
+        self.remote("transparent_mempool_spend_by_outpoint")?
+            .transparent_mempool_spend_by_outpoint(outpoint)
+            .await
+    }
+
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
     }
@@ -409,17 +451,35 @@ impl LocalChainIndex {
         transaction_id: TransactionId,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TxStatus, IndexerError> {
-        self.read_from_epoch(at_epoch, move |reader| {
-            let Some(transaction) = reader
-                .transaction_by_id(transaction_id)
-                .map_err(IndexerError::from_store_error)?
-            else {
-                return Ok(TxStatus::NotFound);
-            };
+        let mined_outcome = self
+            .read_from_epoch(at_epoch, move |reader| {
+                let Some(transaction) = reader
+                    .transaction_by_id(transaction_id)
+                    .map_err(IndexerError::from_store_error)?
+                else {
+                    return Ok(TxStatus::NotFound);
+                };
+                Ok(TxStatus::Mined(transaction))
+            })
+            .await?;
 
-            Ok(TxStatus::Mined(transaction))
-        })
-        .await
+        if !matches!(mined_outcome, TxStatus::NotFound) || at_epoch.is_some() {
+            // Found mined, OR caller bound the read to a specific epoch
+            // (mempool state is non-canonical and is not part of any
+            // chain epoch). Either way, return the canonical answer.
+            return Ok(mined_outcome);
+        }
+
+        // Canonical chain has no record. Delegate to the remote endpoint
+        // to consult the live mempool index. Local secondary readers
+        // cannot observe the writer's in-process mempool state, so this
+        // path is skipped (NotFound is returned) when no remote endpoint
+        // is wired.
+        match self.remote("transaction_by_id_mempool_fallback") {
+            Ok(remote) => remote.transaction_by_id(transaction_id).await,
+            Err(IndexerError::RemoteEndpointUnconfigured { .. }) => Ok(TxStatus::NotFound),
+            Err(error) => Err(error),
+        }
     }
 }
 

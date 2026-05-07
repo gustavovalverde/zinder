@@ -446,6 +446,166 @@ message ServerInfoResponse {
   ServerCapabilities capabilities = 1;
 }
 
+// Reason a mempool transaction was removed without being mined.
+enum MempoolEvictionReason {
+  MEMPOOL_EVICTION_REASON_UNSPECIFIED = 0;
+  MEMPOOL_EVICTION_REASON_CONFLICT = 1;
+  MEMPOOL_EVICTION_REASON_EXPIRED = 2;
+  MEMPOOL_EVICTION_REASON_LOW_FEE = 3;
+  MEMPOOL_EVICTION_REASON_NODE_REJECTED = 4;
+  MEMPOOL_EVICTION_REASON_UNKNOWN = 5;
+}
+
+// Transparent output visible in the live mempool index.
+message TransparentMempoolOutput {
+  // SHA-256 of the transparent address scriptPubKey.
+  bytes address_script_hash = 1;
+
+  // Raw scriptPubKey bytes.
+  bytes script_pub_key = 2;
+
+  // Identifier of the mempool transaction that creates this output.
+  bytes spending_transaction_id = 3;
+
+  // Output index within the mempool transaction.
+  uint32 output_index = 4;
+
+  // Output value in zatoshis.
+  uint64 value_zat = 5;
+}
+
+// Transparent input visible in the live mempool index.
+message TransparentMempoolSpend {
+  // Identifier of the previously-known transaction whose output is spent.
+  bytes spent_transaction_id = 1;
+
+  // Output index within the previously-known transaction.
+  uint32 spent_output_index = 2;
+
+  // Identifier of the mempool transaction that consumes the outpoint.
+  bytes spending_transaction_id = 3;
+}
+
+// Hydrated record describing a mempool transaction observed by the indexer.
+message MempoolEntry {
+  // Transaction identifier reported by the source.
+  bytes transaction_id = 1;
+
+  // ZIP-244 authorization digest (v5+ transactions). Empty for v1-v4.
+  bytes auth_digest = 2;
+
+  // Raw serialized transaction bytes hydrated from the source.
+  bytes raw_transaction_bytes = 3;
+
+  // Lightwalletd-compatible compact transaction bytes derived from the raw
+  // transaction. Pre-built so the lightwalletd compatibility adapter does
+  // not parse raw bytes on the read path.
+  bytes compact_transaction_bytes = 4;
+
+  // Wall-clock time when the indexer first observed this entry.
+  uint64 first_seen_unix_millis = 5;
+
+  // Chain epoch visible to ingest when this entry was first observed.
+  ChainEpoch first_seen_chain_epoch = 6;
+
+  // Transparent outputs created by this mempool transaction.
+  repeated TransparentMempoolOutput transparent_outputs = 7;
+
+  // Transparent inputs that spend previously-known outpoints.
+  repeated TransparentMempoolSpend transparent_spends = 8;
+}
+
+// Bounded request for a snapshot of the live mempool.
+message MempoolSnapshotRequest {
+  // Server-enforced maximum number of entries the response may carry. The
+  // server may further bound this; an unbounded "return the whole mempool"
+  // request is forbidden.
+  uint32 max_entries = 1;
+
+  // Optional next-page cursor returned by a previous paged request.
+  bytes from_cursor = 2;
+}
+
+// Snapshot response bound to one chain epoch.
+message MempoolSnapshotResponse {
+  // Chain epoch visible at snapshot time.
+  ChainEpoch chain_epoch = 1;
+
+  // Monotonic snapshot sequence reported by the server.
+  uint64 snapshot_sequence = 2;
+
+  // Snapshot age in milliseconds when the response was constructed.
+  uint64 snapshot_age_millis = 3;
+
+  // Hydrated mempool entries.
+  repeated MempoolEntry entries = 4;
+
+  // Next-page cursor when the response was truncated.
+  bytes next_cursor = 5;
+}
+
+// Mempool-event stream family. Reserved for future extensions; today only
+// MEMPOOL_EVENT_STREAM_FAMILY_MEMPOOL is populated.
+enum MempoolEventStreamFamily {
+  MEMPOOL_EVENT_STREAM_FAMILY_UNSPECIFIED = 0;
+  MEMPOOL_EVENT_STREAM_FAMILY_MEMPOOL = 1;
+}
+
+// Replayable mempool-event stream request.
+message MempoolEventsRequest {
+  // Empty starts at the earliest retained mempool event. Non-empty resumes
+  // strictly after the supplied opaque cursor.
+  bytes from_cursor = 1;
+
+  // Stream family for an empty cursor. When from_cursor is non-empty, the
+  // cursor's encoded family is authoritative.
+  MempoolEventStreamFamily family = 2;
+}
+
+// New mempool transaction observed.
+message MempoolAddedEvent {
+  // Hydrated entry observed by the indexer.
+  MempoolEntry entry = 1;
+}
+
+// Mempool transaction removed without being mined.
+message MempoolInvalidatedEvent {
+  // Identifier of the invalidated transaction.
+  bytes transaction_id = 1;
+
+  // Source-classified eviction reason.
+  MempoolEvictionReason reason = 2;
+}
+
+// Mempool transaction observed mined into a block.
+message MempoolMinedEvent {
+  // Identifier of the mined transaction.
+  bytes transaction_id = 1;
+
+  // Height of the block that mined the transaction, as reported by the
+  // upstream node.
+  uint32 mined_height = 2;
+}
+
+// Cursor-bound mempool event envelope.
+message MempoolEventEnvelope {
+  // Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
+  bytes cursor = 1;
+
+  // Monotonic sequence in the mempool-event stream. Independent of the
+  // chain-event sequence space.
+  uint64 event_sequence = 2;
+
+  // Wall-clock time when the indexer observed the source change.
+  uint64 source_observed_unix_millis = 3;
+
+  oneof event {
+    MempoolAddedEvent added = 10;
+    MempoolInvalidatedEvent invalidated = 11;
+    MempoolMinedEvent mined = 12;
+  }
+}
+
 // Native Zinder wallet and wallet-like application query service.
 service WalletQuery {
   // Return latest visible block metadata.
@@ -474,6 +634,12 @@ service WalletQuery {
 
   // Stream replayable chain events.
   rpc ChainEvents(ChainEventsRequest) returns (stream ChainEventEnvelope);
+
+  // Return a bounded snapshot of the live mempool index.
+  rpc MempoolSnapshot(MempoolSnapshotRequest) returns (MempoolSnapshotResponse);
+
+  // Stream replayable mempool events.
+  rpc MempoolEvents(MempoolEventsRequest) returns (stream MempoolEventEnvelope);
 
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);

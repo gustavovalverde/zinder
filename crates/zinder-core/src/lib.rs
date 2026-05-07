@@ -10,6 +10,7 @@ compile_error!("Zinder supports only 32-bit and wider targets.");
 mod block_artifact;
 mod block_id;
 mod chain_epoch;
+mod mempool;
 mod subtree_root;
 mod transaction;
 mod transparent_utxo;
@@ -21,12 +22,16 @@ pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
     ChainEpoch, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
 };
+pub use mempool::{
+    MempoolEntry, MempoolEvictionReason, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+};
 pub use subtree_root::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
     SubtreeRootRange, SubtreeRootRangeIter,
 };
 pub use transaction::{
-    BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
+    AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
     BroadcastUnknown, RawTransactionBytes, TransactionArtifact, TransactionBroadcastResult,
     TransactionId,
 };

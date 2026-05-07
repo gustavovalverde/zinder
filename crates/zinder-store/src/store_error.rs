@@ -41,6 +41,8 @@ pub enum ArtifactFamily {
     TransparentAddressUtxo,
     /// Transparent UTXO spend artifact.
     TransparentUtxoSpend,
+    /// Mempool event envelope.
+    MempoolEvent,
 }
 
 /// Opaque storage-key bytes included in diagnostic storage errors.
@@ -188,20 +190,38 @@ pub enum StoreError {
         finalized_height: BlockHeight,
     },
 
-    /// Event cursor points before retained event history.
+    /// Chain event cursor points before retained chain-event history.
     #[error(
-        "event cursor expired: event sequence {event_sequence}, oldest retained {oldest_retained_sequence}"
+        "chain event cursor expired: event sequence {event_sequence}, oldest retained {oldest_retained_sequence}"
     )]
-    EventCursorExpired {
+    ChainEventCursorExpired {
         /// Cursor event sequence.
         event_sequence: u64,
-        /// Oldest retained event sequence.
+        /// Oldest retained chain event sequence.
         oldest_retained_sequence: u64,
     },
 
-    /// Event cursor failed validation.
-    #[error("event cursor is invalid: {reason}")]
-    EventCursorInvalid {
+    /// Chain event cursor failed validation.
+    #[error("chain event cursor is invalid: {reason}")]
+    ChainEventCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Mempool event cursor points before retained mempool-event history.
+    #[error(
+        "mempool event cursor expired: event sequence {event_sequence}, oldest retained {oldest_retained_sequence}"
+    )]
+    MempoolEventCursorExpired {
+        /// Cursor event sequence.
+        event_sequence: u64,
+        /// Oldest retained mempool event sequence.
+        oldest_retained_sequence: u64,
+    },
+
+    /// Mempool event cursor failed validation.
+    #[error("mempool event cursor is invalid: {reason}")]
+    MempoolEventCursorInvalid {
         /// Cursor validation failure reason.
         reason: &'static str,
     },
@@ -209,6 +229,10 @@ pub enum StoreError {
     /// Chain event sequence reached the maximum representable value.
     #[error("chain event sequence overflow")]
     ChainEventSequenceOverflow,
+
+    /// Mempool event sequence reached the maximum representable value.
+    #[error("mempool event sequence overflow")]
+    MempoolEventSequenceOverflow,
 
     /// Chain epoch id reached the maximum representable value.
     #[error("chain epoch sequence overflow")]

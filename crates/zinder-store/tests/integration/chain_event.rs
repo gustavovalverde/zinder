@@ -129,7 +129,7 @@ fn chain_event_retention_prunes_prefix_and_expires_stale_cursors() -> eyre::Resu
 
     assert!(matches!(
         error,
-        StoreError::EventCursorExpired {
+        StoreError::ChainEventCursorExpired {
             event_sequence: 1,
             oldest_retained_sequence: 3,
         }
@@ -245,7 +245,7 @@ fn tampered_chain_event_cursor_is_rejected() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(error, StoreError::EventCursorInvalid { .. }));
+    assert!(matches!(error, StoreError::ChainEventCursorInvalid { .. }));
 
     Ok(())
 }
@@ -282,7 +282,7 @@ fn cursor_from_another_store_is_rejected() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(error, StoreError::EventCursorInvalid { .. }));
+    assert!(matches!(error, StoreError::ChainEventCursorInvalid { .. }));
 
     Ok(())
 }
@@ -316,7 +316,7 @@ fn cursor_before_any_commits_is_rejected() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(error, StoreError::EventCursorInvalid { .. }));
+    assert!(matches!(error, StoreError::ChainEventCursorInvalid { .. }));
 
     Ok(())
 }

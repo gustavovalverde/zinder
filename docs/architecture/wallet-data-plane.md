@@ -24,7 +24,7 @@ It should provide:
   once the stored transparent UTXO artifact family lands.
 - Transaction broadcast.
 - Chain-event subscription per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription).
-- Mempool snapshot and mempool-event subscription in M3 per [M3 Mempool](../specs/m3-mempool.md).
+- Mempool snapshot and mempool-event subscription per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
 - `ServerInfo` capability descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery).
 - Optional compatibility endpoints for lightwalletd clients.
 
@@ -100,7 +100,7 @@ The lightwalletd compatibility shim does not expose this subscription. The vendo
 
 ## Mempool Snapshot and Subscription (M3)
 
-Mempool surfaces are M3. [M3 Mempool](../specs/m3-mempool.md) owns the source, live index, event-log, API, compatibility, and validation plan; M2 only reserved vocabulary and capability strings so it would not invent conflicting names.
+Mempool surfaces are owned by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes. M2 reserved the vocabulary and capability strings so M3 would not invent conflicting names.
 
 M3 is the unconfirmed-transaction contract for several Zcash ecosystem
 products, but each product consumes a different boundary. This table is the

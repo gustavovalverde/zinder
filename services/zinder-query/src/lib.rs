@@ -783,8 +783,10 @@ fn map_broadcast_source_error(error: SourceError) -> QueryError {
 )]
 fn map_chain_event_store_error(error: StoreError) -> QueryError {
     match error {
-        StoreError::EventCursorInvalid { reason } => QueryError::ChainEventCursorInvalid { reason },
-        StoreError::EventCursorExpired {
+        StoreError::ChainEventCursorInvalid { reason } => {
+            QueryError::ChainEventCursorInvalid { reason }
+        }
+        StoreError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence,
         } => QueryError::ChainEventCursorExpired {

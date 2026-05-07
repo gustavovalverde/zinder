@@ -146,6 +146,7 @@ async fn secondary_catchup_marks_replica_lagging_from_writer_status() -> eyre::R
             writer_status: Some(WriterStatusConfig {
                 endpoint: format!("http://{writer_status_addr}"),
                 network: Network::ZcashRegtest,
+                bearer_token: None,
             }),
         },
         cancel.clone(),
@@ -197,6 +198,7 @@ async fn secondary_catchup_marks_writer_status_unavailable_when_method_is_unimpl
             writer_status: Some(WriterStatusConfig {
                 endpoint: format!("http://{wrong_service_addr}"),
                 network: Network::ZcashRegtest,
+                bearer_token: None,
             }),
         },
         cancel.clone(),
@@ -310,6 +312,8 @@ impl SharedWriterStatus {
 impl IngestControl for SharedWriterStatus {
     type ChainEventsStream =
         Pin<Box<dyn Stream<Item = Result<wallet::ChainEventEnvelope, Status>> + Send>>;
+    type MempoolEventsStream =
+        Pin<Box<dyn Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>>;
 
     async fn writer_status(
         &self,
@@ -323,6 +327,24 @@ impl IngestControl for SharedWriterStatus {
         _request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
         Ok(Response::new(Box::pin(tokio_stream::empty())))
+    }
+
+    async fn mempool_snapshot(
+        &self,
+        _request: Request<wallet::MempoolSnapshotRequest>,
+    ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement MempoolSnapshot",
+        ))
+    }
+
+    async fn mempool_events(
+        &self,
+        _request: Request<wallet::MempoolEventsRequest>,
+    ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement MempoolEvents",
+        ))
     }
 }
 

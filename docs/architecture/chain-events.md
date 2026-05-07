@@ -177,4 +177,4 @@ Avoid `event_service`, `reorg_manager`, `notification_handler`, `source_processo
 ## Cross-References
 
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) defines the public wire surface (`WalletQuery.ChainEvents`, `ChainEventEnvelope`, `ChainCommitted`, `ChainReorged`).
-- [M3 Mempool](../specs/m3-mempool.md) defines the parallel mempool event stream and its `MempoolStreamCursorV1` cursor body.
+- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) defines the parallel mempool event stream and its `MempoolStreamCursorV1` cursor body.

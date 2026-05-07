@@ -12,11 +12,15 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint};
 use zinder_core::{BlockHeight, ChainEpochId, Network};
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
-use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
+use zinder_runtime::{
+    AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenError, Readiness,
+    ReadinessCause, ReadinessState, connect_authenticated_channel,
+};
 use zinder_store::{PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, StoreError};
+
+type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 /// Default interval between readiness refresh polls.
 ///
@@ -34,16 +38,19 @@ const WRITER_STATUS_METHOD: &str = "zinder.v1.ingest.IngestControl/WriterStatus"
 const WRITER_STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Private writer-status upstream used by secondary readers to compute replica lag.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct WriterStatusConfig {
     /// HTTP/2 endpoint for `zinder-ingest`'s private ingest control-plane gRPC server.
     pub endpoint: String,
     /// Expected writer network. A response for any other network is rejected.
     pub network: Network,
+    /// Shared-secret bearer token attached to every writer-status request.
+    /// `None` matches an open writer (the localhost-only deployment).
+    pub bearer_token: Option<BearerToken>,
 }
 
 /// Runtime options for the secondary catchup task.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SecondaryCatchupOptions {
     /// Delay between secondary `RocksDB` catchup attempts.
     pub interval: Duration,
@@ -120,7 +127,8 @@ struct WriterStatusSnapshot {
 struct WriterStatusUpstream {
     endpoint: String,
     network: Network,
-    client: Option<IngestControlClient<Channel>>,
+    bearer_token: Option<BearerToken>,
+    client: Option<AuthenticatedIngestControlClient>,
     last_snapshot: Option<WriterStatusSnapshot>,
     last_fetched_at: Option<Instant>,
 }
@@ -137,6 +145,7 @@ impl WriterStatusUpstream {
         Self {
             endpoint: config.endpoint,
             network: config.network,
+            bearer_token: config.bearer_token,
             client: None,
             last_snapshot: None,
             last_fetched_at: None,
@@ -145,20 +154,9 @@ impl WriterStatusUpstream {
 
     async fn fetch_snapshot(&mut self) -> Result<WriterStatusSnapshot, WriterStatusFetchError> {
         if self.client.is_none() {
-            let endpoint = Endpoint::from_shared(self.endpoint.clone()).map_err(|source| {
-                WriterStatusFetchError::InvalidEndpoint {
-                    endpoint: self.endpoint.clone(),
-                    source,
-                }
-            })?;
-            let channel =
-                endpoint
-                    .connect()
-                    .await
-                    .map_err(|source| WriterStatusFetchError::Connect {
-                        endpoint: self.endpoint.clone(),
-                        source,
-                    })?;
+            let channel = connect_authenticated_channel(&self.endpoint, self.bearer_token.as_ref())
+                .await
+                .map_err(|error| writer_status_connect_error(error, self.endpoint.clone()))?;
             self.client = Some(IngestControlClient::new(channel));
         }
 
@@ -240,6 +238,8 @@ enum WriterStatusFetchError {
     },
     #[error("writer-status client was not initialized")]
     ClientMissing,
+    #[error("invalid bearer token configuration: {0}")]
+    BearerToken(BearerTokenError),
     #[error("writer-status RPC {method} at {endpoint} failed: {source}")]
     Rpc {
         endpoint: String,
@@ -527,9 +527,12 @@ fn store_error_class(error: Option<&StoreError>) -> &'static str {
         Some(StoreError::SecondaryCatchupFailed { .. }) => "secondary_catchup_failed",
         Some(StoreError::CheckpointUnavailable { .. }) => "checkpoint_unavailable",
         Some(StoreError::ReorgWindowExceeded { .. }) => "reorg_window_exceeded",
-        Some(StoreError::EventCursorExpired { .. }) => "event_cursor_expired",
-        Some(StoreError::EventCursorInvalid { .. }) => "event_cursor_invalid",
+        Some(StoreError::ChainEventCursorExpired { .. }) => "chain_event_cursor_expired",
+        Some(StoreError::ChainEventCursorInvalid { .. }) => "chain_event_cursor_invalid",
+        Some(StoreError::MempoolEventCursorExpired { .. }) => "mempool_event_cursor_expired",
+        Some(StoreError::MempoolEventCursorInvalid { .. }) => "mempool_event_cursor_invalid",
         Some(StoreError::ChainEventSequenceOverflow) => "chain_event_sequence_overflow",
+        Some(StoreError::MempoolEventSequenceOverflow) => "mempool_event_sequence_overflow",
         Some(StoreError::ChainEpochSequenceOverflow) => "chain_epoch_sequence_overflow",
         Some(StoreError::InvalidChainEpochArtifacts { .. }) => "invalid_chain_epoch_artifacts",
         Some(StoreError::ArtifactPayloadTooLarge { .. }) => "artifact_payload_too_large",
@@ -549,6 +552,22 @@ fn writer_status_error_class(error: Option<&WriterStatusFetchError>) -> &'static
         Some(WriterStatusFetchError::ClientMissing) => "client_missing",
         Some(WriterStatusFetchError::Rpc { .. }) => "rpc",
         Some(WriterStatusFetchError::NetworkMismatch { .. }) => "network_mismatch",
+        Some(WriterStatusFetchError::BearerToken(_)) => "bearer_token",
+    }
+}
+
+fn writer_status_connect_error(
+    error: BearerTokenConnectError,
+    endpoint: String,
+) -> WriterStatusFetchError {
+    match error {
+        BearerTokenConnectError::InvalidEndpoint(source) => {
+            WriterStatusFetchError::InvalidEndpoint { endpoint, source }
+        }
+        BearerTokenConnectError::Transport(source) => {
+            WriterStatusFetchError::Connect { endpoint, source }
+        }
+        BearerTokenConnectError::Token(source) => WriterStatusFetchError::BearerToken(source),
     }
 }
 
@@ -559,16 +578,17 @@ impl WriterStatusFetchError {
             | Self::Connect { endpoint, .. }
             | Self::Rpc { endpoint, .. }
             | Self::NetworkMismatch { endpoint, .. } => endpoint,
-            Self::ClientMissing => "unknown",
+            Self::ClientMissing | Self::BearerToken(_) => "unknown",
         }
     }
 
     const fn method(&self) -> &'static str {
         match self {
             Self::Rpc { method, .. } | Self::NetworkMismatch { method, .. } => method,
-            Self::InvalidEndpoint { .. } | Self::Connect { .. } | Self::ClientMissing => {
-                WRITER_STATUS_METHOD
-            }
+            Self::InvalidEndpoint { .. }
+            | Self::Connect { .. }
+            | Self::ClientMissing
+            | Self::BearerToken(_) => WRITER_STATUS_METHOD,
         }
     }
 }

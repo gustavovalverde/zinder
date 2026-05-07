@@ -38,6 +38,7 @@ pub mod v1 {
             clippy::derive_partial_eq_without_eq,
             clippy::disallowed_names,
             clippy::doc_markdown,
+            clippy::large_enum_variant,
             clippy::missing_fields_in_debug,
             clippy::must_use_candidate,
             clippy::too_many_lines,
@@ -71,5 +72,33 @@ pub mod compat {
         pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = env!("LIGHTWALLETD_PROTOCOL_COMMIT");
 
         include!(concat!(env!("OUT_DIR"), "/cash.z.wallet.sdk.rpc.rs"));
+    }
+}
+
+/// Vendored upstream protocol modules consumed by Zinder source adapters.
+pub mod external {
+    /// Vendored Zebra indexer client protocol.
+    ///
+    /// The mempool change stream and chain-tip notification stream from a
+    /// Zebra deployment built with `--features indexer`. Zinder consumes
+    /// these as a client; the adapter implementation lives in
+    /// `zinder-source`.
+    pub mod zebra_indexer_rpc {
+        #![allow(
+            clippy::allow_attributes_without_reason,
+            clippy::default_trait_access,
+            clippy::derive_partial_eq_without_eq,
+            clippy::doc_markdown,
+            clippy::disallowed_names,
+            clippy::must_use_candidate,
+            clippy::too_many_lines,
+            missing_docs,
+            reason = "Generated protobuf code mirrors vendored schemas."
+        )]
+
+        /// Upstream Zebra commit served by this vendored proto pin.
+        pub const ZEBRA_INDEXER_PROTOCOL_COMMIT: &str = env!("ZEBRA_INDEXER_PROTOCOL_COMMIT");
+
+        include!(concat!(env!("OUT_DIR"), "/zebra.indexer.rpc.rs"));
     }
 }

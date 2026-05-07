@@ -6,15 +6,19 @@ use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionId, UnixTimestampMillis,
+    BlockHeight, BlockHeightRange, ChainEpoch, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId,
 };
 use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
     wallet::{self, wallet_query_server},
 };
-use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1, run_chain_event_stream};
+use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
+use zinder_store::{
+    ChainEventStreamFamily, StreamCursorTokenV1, chain_epoch_from_message, run_chain_event_stream,
+};
+
+type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::WalletQueryApi;
 
@@ -28,13 +32,22 @@ use super::status_from_query_error;
 
 type WalletGrpcStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = WalletGrpcStream<wallet::ChainEventEnvelope>;
+type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
+///
+/// Wallet queries that touch in-process state owned by the ingest writer
+/// (`ChainEvents` retained replay, the live mempool index, and the mempool
+/// event log) are proxied through the colocated `IngestControl` private
+/// gRPC endpoint when one is wired. Direct (in-process) handling remains
+/// available for development/test deployments that compose ingest and
+/// query in one binary.
 #[derive(Clone, Debug)]
 pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     server_info: ServerInfoSettings,
-    chain_events_proxy_endpoint: Option<String>,
+    ingest_control_proxy_endpoint: Option<String>,
+    ingest_control_bearer_token: Option<BearerToken>,
 }
 
 impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
@@ -45,23 +58,38 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
-            chain_events_proxy_endpoint: None,
+            ingest_control_proxy_endpoint: None,
+            ingest_control_bearer_token: None,
         }
     }
 
-    /// Creates a gRPC adapter that proxies `ChainEvents` to the ingest-owned
-    /// private control endpoint.
+    /// Creates a gRPC adapter that proxies in-process ingest-owned reads
+    /// through `IngestControl`.
+    ///
+    /// The same endpoint serves `ChainEvents`, `MempoolSnapshot`, and
+    /// `MempoolEvents`; secondary readers cannot observe the live writer
+    /// state otherwise.
     #[must_use]
-    pub fn with_chain_events_proxy(
+    pub fn with_ingest_control_proxy(
         query_api: QueryApi,
         server_info: ServerInfoSettings,
-        chain_events_proxy_endpoint: String,
+        ingest_control_proxy_endpoint: String,
     ) -> Self {
         Self {
             query_api,
             server_info,
-            chain_events_proxy_endpoint: Some(chain_events_proxy_endpoint),
+            ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
+            ingest_control_bearer_token: None,
         }
+    }
+
+    /// Attaches a shared-secret bearer token to every proxied request.
+    /// Required when the `IngestControl` writer is configured with a token;
+    /// no-op when the writer is open.
+    #[must_use]
+    pub fn with_ingest_control_bearer_token(mut self, bearer_token: BearerToken) -> Self {
+        self.ingest_control_bearer_token = Some(bearer_token);
+        self
     }
 
     /// Wraps this adapter in the generated tonic server type.
@@ -81,6 +109,7 @@ where
 {
     type CompactBlockRangeStream = WalletGrpcStream<wallet::CompactBlockRangeChunk>;
     type ChainEventsStream = ChainEventsStream;
+    type MempoolEventsStream = MempoolEventsStream;
 
     async fn latest_block(
         &self,
@@ -223,8 +252,13 @@ where
         &self,
         request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
-        if let Some(endpoint) = &self.chain_events_proxy_endpoint {
-            return proxy_chain_events(endpoint.clone(), request).await;
+        if let Some(endpoint) = &self.ingest_control_proxy_endpoint {
+            return proxy_chain_events(
+                endpoint.clone(),
+                self.ingest_control_bearer_token.clone(),
+                request,
+            )
+            .await;
         }
 
         let request = request.into_inner();
@@ -248,6 +282,38 @@ where
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
     }
 
+    async fn mempool_snapshot(
+        &self,
+        request: Request<wallet::MempoolSnapshotRequest>,
+    ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        let endpoint = self
+            .ingest_control_proxy_endpoint
+            .as_ref()
+            .ok_or_else(|| {
+                Status::unavailable(
+                    "MempoolSnapshot requires the ingest-control proxy; configure the writer endpoint",
+                )
+            })?
+            .clone();
+        proxy_mempool_snapshot(endpoint, self.ingest_control_bearer_token.clone(), request).await
+    }
+
+    async fn mempool_events(
+        &self,
+        request: Request<wallet::MempoolEventsRequest>,
+    ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        let endpoint = self
+            .ingest_control_proxy_endpoint
+            .as_ref()
+            .ok_or_else(|| {
+                Status::unavailable(
+                    "MempoolEvents requires the ingest-control proxy; configure the writer endpoint",
+                )
+            })?
+            .clone();
+        proxy_mempool_events(endpoint, self.ingest_control_bearer_token.clone(), request).await
+    }
+
     async fn server_info(
         &self,
         _request: Request<wallet::ServerInfoRequest>,
@@ -260,14 +326,42 @@ where
 
 async fn proxy_chain_events(
     endpoint: String,
+    bearer_token: Option<BearerToken>,
     request: Request<wallet::ChainEventsRequest>,
 ) -> Result<Response<ChainEventsStream>, Status> {
-    let mut client = IngestControlClient::connect(endpoint)
-        .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
+    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
     let response = client.chain_events(request).await?;
 
     Ok(Response::new(Box::pin(response.into_inner())))
+}
+
+async fn proxy_mempool_snapshot(
+    endpoint: String,
+    bearer_token: Option<BearerToken>,
+    request: Request<wallet::MempoolSnapshotRequest>,
+) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
+    client.mempool_snapshot(request).await
+}
+
+async fn proxy_mempool_events(
+    endpoint: String,
+    bearer_token: Option<BearerToken>,
+    request: Request<wallet::MempoolEventsRequest>,
+) -> Result<Response<MempoolEventsStream>, Status> {
+    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
+    let response = client.mempool_events(request).await?;
+    Ok(Response::new(Box::pin(response.into_inner())))
+}
+
+async fn connect_authenticated_proxy(
+    endpoint: &str,
+    bearer_token: Option<&BearerToken>,
+) -> Result<AuthenticatedIngestControlClient, Status> {
+    let channel = connect_authenticated_channel(endpoint, bearer_token)
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    Ok(IngestControlClient::new(channel))
 }
 
 fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<TransactionId, Status> {
@@ -280,38 +374,12 @@ fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<Transactio
 fn chain_epoch_from_request(
     at_epoch: Option<wallet::ChainEpoch>,
 ) -> Result<Option<ChainEpoch>, Status> {
-    at_epoch.map(chain_epoch_from_message).transpose()
-}
-
-fn chain_epoch_from_message(message: wallet::ChainEpoch) -> Result<ChainEpoch, Status> {
-    let Some(network) = Network::from_name(&message.network_name) else {
-        return Err(Status::invalid_argument("at_epoch.network_name is unknown"));
-    };
-    let artifact_schema_version = u16::try_from(message.artifact_schema_version)
-        .map_err(|_| Status::invalid_argument("at_epoch.artifact_schema_version exceeds u16"))?;
-
-    Ok(ChainEpoch {
-        id: ChainEpochId::new(message.chain_epoch_id),
-        network,
-        tip_height: BlockHeight::new(message.tip_height),
-        tip_hash: block_hash_from_message("at_epoch.tip_hash", message.tip_hash)?,
-        finalized_height: BlockHeight::new(message.finalized_height),
-        finalized_hash: block_hash_from_message("at_epoch.finalized_hash", message.finalized_hash)?,
-        artifact_schema_version: ArtifactSchemaVersion::new(artifact_schema_version),
-        created_at: UnixTimestampMillis::new(message.created_at_millis),
-        tip_metadata: ChainTipMetadata::new(
-            message.sapling_commitment_tree_size,
-            message.orchard_commitment_tree_size,
-        ),
-    })
-}
-
-fn block_hash_from_message(field: &'static str, bytes: Vec<u8>) -> Result<BlockHash, Status> {
-    let len = bytes.len();
-    let bytes = bytes
-        .try_into()
-        .map_err(|_| Status::invalid_argument(format!("{field} must be 32 bytes, got {len}")))?;
-    Ok(BlockHash::from_bytes(bytes))
+    at_epoch
+        .map(|message| {
+            chain_epoch_from_message(message)
+                .map_err(|error| Status::invalid_argument(error.to_string()))
+        })
+        .transpose()
 }
 
 fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Status> {

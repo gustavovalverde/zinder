@@ -3,6 +3,8 @@
 mod validation;
 
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Instant};
+
+use parking_lot::RwLock;
 use zinder_core::{
     ArtifactSchemaVersion, BlockArtifact, BlockHeightRange, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionArtifact,
@@ -12,16 +14,22 @@ use zinder_core::{
 
 use crate::{
     ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
-    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, ReorgWindowChange,
-    StoreError, StreamCursorTokenV1,
+    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
+    MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
+    MempoolEventRetentionReport, ReorgWindowChange, StoreError, StreamCursorTokenV1,
     format::{
-        ChainEventCursorAnchor, ChainEventStreamFamily, StoreKey, decode_chain_epoch,
-        decode_chain_event_envelope, encode_block_artifact, encode_chain_epoch,
-        encode_chain_event_envelope, encode_compact_block_artifact, encode_subtree_root_artifact,
-        encode_transaction_artifact, encode_transparent_address_utxo_artifact,
-        encode_transparent_utxo_spend_artifact, encode_tree_state_artifact,
+        ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
+        StoreKey, decode_chain_epoch, decode_chain_event_envelope, decode_mempool_event_envelope,
+        decode_mempool_event_kind, decode_mempool_event_observed_at, encode_block_artifact,
+        encode_chain_epoch, encode_chain_event_envelope, encode_compact_block_artifact,
+        encode_mempool_event_envelope, encode_subtree_root_artifact, encode_transaction_artifact,
+        encode_transparent_address_utxo_artifact, encode_transparent_utxo_spend_artifact,
+        encode_tree_state_artifact,
     },
-    kv::{RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut, StorageTable},
+    kv::{
+        PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
+        StorageTable,
+    },
 };
 
 use validation::{
@@ -158,6 +166,11 @@ impl SecondaryCatchupOutcome {
 #[derive(Clone)]
 pub struct PrimaryChainStore {
     store: ChainStoreInner,
+    /// Cache of the currently visible chain epoch, populated on first read
+    /// and refreshed on every successful [`commit_chain_epoch`]. Lets the
+    /// mempool orchestrator stamp per-event `first_seen_chain_epoch` without
+    /// touching `RocksDB` on each observation.
+    cached_visible_chain_epoch: Arc<RwLock<Option<ChainEpoch>>>,
 }
 
 /// Canonical chain store opened as a `RocksDB` secondary reader.
@@ -213,12 +226,23 @@ impl PrimaryChainStore {
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
 
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            cached_visible_chain_epoch: Arc::new(RwLock::new(None)),
+        })
     }
 
     /// Reads the currently visible chain epoch.
     pub fn current_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
-        self.store.current_chain_epoch()
+        let cached = *self.cached_visible_chain_epoch.read();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let fetched = self.store.current_chain_epoch()?;
+        if let Some(chain_epoch) = fetched {
+            *self.cached_visible_chain_epoch.write() = Some(chain_epoch);
+        }
+        Ok(fetched)
     }
 
     /// Opens a reader pinned to the currently visible chain epoch.
@@ -239,7 +263,9 @@ impl PrimaryChainStore {
         &self,
         artifacts: ChainEpochArtifacts,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
-        self.store.commit_chain_epoch(artifacts)
+        let outcome = self.store.commit_chain_epoch(artifacts)?;
+        *self.cached_visible_chain_epoch.write() = Some(outcome.chain_epoch);
+        Ok(outcome)
     }
 
     /// Reads a bounded page of retained chain events strictly after the request cursor.
@@ -264,6 +290,48 @@ impl PrimaryChainStore {
     /// Reads the current chain-event retention floor without pruning.
     pub fn chain_event_retention_report(&self) -> Result<ChainEventRetentionReport, StoreError> {
         self.store.chain_event_retention_report()
+    }
+
+    /// Appends a single mempool event to the persistent log.
+    pub fn append_mempool_event(
+        &self,
+        event: MempoolEvent,
+        source_observed_at: UnixTimestampMillis,
+    ) -> Result<MempoolEventEnvelope, StoreError> {
+        self.store.append_mempool_event(event, source_observed_at)
+    }
+
+    /// Reads a bounded page of retained mempool events strictly after the
+    /// request cursor.
+    pub fn mempool_event_history(
+        &self,
+        request: MempoolEventHistoryRequest<'_>,
+    ) -> Result<Vec<MempoolEventEnvelope>, StoreError> {
+        self.store.mempool_event_history(request)
+    }
+
+    /// Deletes retained mempool-event rows older than the per-variant
+    /// retention windows.
+    pub fn prune_mempool_events_before(
+        &self,
+        now: UnixTimestampMillis,
+        retention: MempoolEventRetentionConfig,
+    ) -> Result<MempoolEventRetentionReport, StoreError> {
+        self.store.prune_mempool_events_before(now, retention)
+    }
+
+    /// Reads the current mempool-event retention floor without pruning.
+    pub fn mempool_event_retention_report(
+        &self,
+    ) -> Result<MempoolEventRetentionReport, StoreError> {
+        self.store.mempool_event_retention_report()
+    }
+
+    /// Returns the network bound to this store, used by mempool cursor
+    /// encoding.
+    #[must_use]
+    pub fn network(&self) -> Option<Network> {
+        self.store.options.network
     }
 
     /// Creates a `RocksDB` checkpoint for backup or fixture capture.
@@ -320,6 +388,22 @@ impl SecondaryChainStore {
     /// Reads the current chain-event retention floor without pruning.
     pub fn chain_event_retention_report(&self) -> Result<ChainEventRetentionReport, StoreError> {
         self.store.chain_event_retention_report()
+    }
+
+    /// Reads a bounded page of retained mempool events strictly after the
+    /// request cursor.
+    pub fn mempool_event_history(
+        &self,
+        request: MempoolEventHistoryRequest<'_>,
+    ) -> Result<Vec<MempoolEventEnvelope>, StoreError> {
+        self.store.mempool_event_history(request)
+    }
+
+    /// Reads the current mempool-event retention floor without pruning.
+    pub fn mempool_event_retention_report(
+        &self,
+    ) -> Result<MempoolEventRetentionReport, StoreError> {
+        self.store.mempool_event_retention_report()
     }
 
     /// Replays available WAL and manifest state from the primary store.
@@ -453,7 +537,7 @@ impl ChainStoreInner {
         let current_event_sequence = read_current_chain_event_sequence(&read_view)?;
         if current_event_sequence == 0 {
             if request.from_cursor.is_some() {
-                return Err(StoreError::EventCursorInvalid {
+                return Err(StoreError::ChainEventCursorInvalid {
                     reason: "cursor sequence is ahead of retained history",
                 });
             }
@@ -487,7 +571,7 @@ impl ChainStoreInner {
         {
             let key = StoreKey::chain_event(event_sequence);
             let Some(record_bytes) = read_view.get(StorageTable::ChainEvent, &key)? else {
-                return Err(StoreError::EventCursorExpired {
+                return Err(StoreError::ChainEventCursorExpired {
                     event_sequence: start_sequence.saturating_sub(1),
                     oldest_retained_sequence: event_sequence,
                 });
@@ -518,24 +602,24 @@ impl ChainStoreInner {
 
         let cursor_payload = cursor
             .decode_chain_event(current_chain_epoch.network, self.cursor_auth_key)
-            .map_err(|_| StoreError::EventCursorInvalid {
+            .map_err(|_| StoreError::ChainEventCursorInvalid {
                 reason: "cursor token failed validation",
             })?;
 
         if cursor_payload.event_sequence > bounds.current_event_sequence {
-            return Err(StoreError::EventCursorInvalid {
+            return Err(StoreError::ChainEventCursorInvalid {
                 reason: "cursor sequence is ahead of retained history",
             });
         }
 
         if cursor_payload.event_sequence == 0 {
-            return Err(StoreError::EventCursorInvalid {
+            return Err(StoreError::ChainEventCursorInvalid {
                 reason: "cursor sequence is before retained history",
             });
         }
 
         if cursor_payload.event_sequence < bounds.oldest_retained_sequence {
-            return Err(StoreError::EventCursorExpired {
+            return Err(StoreError::ChainEventCursorExpired {
                 event_sequence: cursor_payload.event_sequence,
                 oldest_retained_sequence: bounds.oldest_retained_sequence,
             });
@@ -544,7 +628,7 @@ impl ChainStoreInner {
         let cursor_event_key = StoreKey::chain_event(cursor_payload.event_sequence);
         let Some(cursor_event_bytes) = inner.get(StorageTable::ChainEvent, &cursor_event_key)?
         else {
-            return Err(StoreError::EventCursorExpired {
+            return Err(StoreError::ChainEventCursorExpired {
                 event_sequence: cursor_payload.event_sequence,
                 oldest_retained_sequence: cursor_payload.event_sequence.saturating_add(1),
             });
@@ -561,7 +645,7 @@ impl ChainStoreInner {
         );
         let cursor_position = (cursor_payload.last_height, cursor_payload.last_hash);
         if retained_position != cursor_position {
-            return Err(StoreError::EventCursorInvalid {
+            return Err(StoreError::ChainEventCursorInvalid {
                 reason: "cursor position does not match retained event",
             });
         }
@@ -662,31 +746,25 @@ impl ChainStoreInner {
     }
 
     fn chain_event_retention_report(&self) -> Result<ChainEventRetentionReport, StoreError> {
-        let read_view = self.read_view();
-        let current_event_sequence = read_current_chain_event_sequence(&read_view)?;
-        let Some(oldest_retained_sequence) =
-            read_oldest_retained_chain_event_sequence(&read_view, current_event_sequence)?
-        else {
-            return Ok(ChainEventRetentionReport::empty());
-        };
-        build_chain_event_retention_report(
-            &read_view,
-            oldest_retained_sequence,
-            current_event_sequence,
-            self.cursor_auth_key,
-            0,
-        )
+        self.chain_event_retention_report_via(&self.read_view())
     }
 
     fn chain_event_retention_report_locked(&self) -> Result<ChainEventRetentionReport, StoreError> {
-        let current_event_sequence = read_current_chain_event_sequence(self.inner.as_ref())?;
+        self.chain_event_retention_report_via(self.inner.as_ref())
+    }
+
+    fn chain_event_retention_report_via<R: RocksChainStoreRead>(
+        &self,
+        read_source: &R,
+    ) -> Result<ChainEventRetentionReport, StoreError> {
+        let current_event_sequence = read_current_chain_event_sequence(read_source)?;
         let Some(oldest_retained_sequence) =
-            read_oldest_retained_chain_event_sequence(self.inner.as_ref(), current_event_sequence)?
+            read_oldest_retained_chain_event_sequence(read_source, current_event_sequence)?
         else {
             return Ok(ChainEventRetentionReport::empty());
         };
         build_chain_event_retention_report(
-            self.inner.as_ref(),
+            read_source,
             oldest_retained_sequence,
             current_event_sequence,
             self.cursor_auth_key,
@@ -701,6 +779,284 @@ impl ChainStoreInner {
 
     fn current_chain_event_sequence(&self) -> Result<u64, StoreError> {
         read_current_chain_event_sequence(self.inner.as_ref())
+    }
+
+    fn append_mempool_event(
+        &self,
+        event: MempoolEvent,
+        source_observed_at: UnixTimestampMillis,
+    ) -> Result<MempoolEventEnvelope, StoreError> {
+        let _control_guard = self.inner.lock_control();
+        let network = self
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainStoreOptions {
+                reason: "mempool events require a network-bound store",
+            })?;
+        let event_sequence = read_current_mempool_event_sequence(self.inner.as_ref())?
+            .checked_add(1)
+            .ok_or(StoreError::MempoolEventSequenceOverflow)?;
+        let cursor = StreamCursorTokenV1::mempool_event(
+            network,
+            MempoolEventStreamFamily::Mempool,
+            event_sequence,
+            event.transaction_id(),
+            self.cursor_auth_key,
+        )
+        .map_err(|_| StoreError::InvalidChainEpochArtifacts {
+            reason: "cursor authentication key could not initialize the MAC",
+        })?;
+        let envelope = MempoolEventEnvelope {
+            cursor,
+            event_sequence,
+            source_observed_unix_millis: source_observed_at.value(),
+            event,
+        };
+
+        let mut puts = vec![
+            StoragePut {
+                table: StorageTable::MempoolEvent,
+                key: StoreKey::mempool_event(event_sequence),
+                value: encode_mempool_event_envelope(&envelope),
+            },
+            StoragePut {
+                table: StorageTable::StorageControl,
+                key: StoreKey::mempool_event_sequence_pointer(),
+                value: event_sequence.to_be_bytes().to_vec(),
+            },
+        ];
+        if event_sequence == 1 {
+            puts.push(StoragePut {
+                table: StorageTable::StorageControl,
+                key: StoreKey::oldest_retained_mempool_event_sequence(),
+                value: event_sequence.to_be_bytes().to_vec(),
+            });
+        }
+        self.inner.write_batch(puts, Vec::new())?;
+
+        Ok(envelope)
+    }
+
+    fn mempool_event_history(
+        &self,
+        request: MempoolEventHistoryRequest<'_>,
+    ) -> Result<Vec<MempoolEventEnvelope>, StoreError> {
+        let network = self
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainStoreOptions {
+                reason: "mempool events require a network-bound store",
+            })?;
+        let read_view = self.read_view();
+        let current_event_sequence = read_current_mempool_event_sequence(&read_view)?;
+        if current_event_sequence == 0 {
+            if request.from_cursor.is_some() {
+                return Err(StoreError::MempoolEventCursorInvalid {
+                    reason: "cursor sequence is ahead of retained history",
+                });
+            }
+            return Ok(Vec::new());
+        }
+
+        let oldest_retained_sequence =
+            read_oldest_retained_mempool_event_sequence(&read_view, current_event_sequence)?
+                .unwrap_or(1);
+        let start_sequence = self.mempool_event_history_start_sequence(
+            request,
+            network,
+            current_event_sequence,
+            oldest_retained_sequence,
+        )?;
+
+        if start_sequence > current_event_sequence {
+            return Ok(Vec::new());
+        }
+
+        let max_events = u32_to_usize(request.max_events.get());
+        let mut event_envelopes = Vec::with_capacity(max_events);
+        let mut decode_error: Option<StoreError> = None;
+        let cursor_auth_key = self.cursor_auth_key;
+        read_view.scan_forward(
+            StorageTable::MempoolEvent,
+            &StoreKey::mempool_event(start_sequence),
+            &mut |key_bytes, record_bytes| {
+                if event_envelopes.len() >= max_events {
+                    return Ok(PrefixScanControl::Stop);
+                }
+                let key = StoreKey::from_raw_bytes(key_bytes);
+                match decode_mempool_event_envelope(&key, record_bytes, network, cursor_auth_key) {
+                    Ok(envelope) => {
+                        if envelope.event_sequence > current_event_sequence {
+                            return Ok(PrefixScanControl::Stop);
+                        }
+                        event_envelopes.push(envelope);
+                        Ok(PrefixScanControl::Continue)
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        Ok(PrefixScanControl::Stop)
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+
+        // If the first observed sequence is past `start_sequence`, the
+        // requested cursor's resume point was pruned between the bounds read
+        // and the iteration. Surface this as `MempoolEventCursorExpired` so
+        // callers resubscribe to the new oldest-retained boundary instead
+        // of silently skipping events.
+        if let Some(first_envelope) = event_envelopes.first()
+            && first_envelope.event_sequence > start_sequence
+        {
+            return Err(StoreError::MempoolEventCursorExpired {
+                event_sequence: start_sequence.saturating_sub(1),
+                oldest_retained_sequence: first_envelope.event_sequence,
+            });
+        }
+
+        Ok(event_envelopes)
+    }
+
+    fn mempool_event_history_start_sequence(
+        &self,
+        request: MempoolEventHistoryRequest<'_>,
+        network: Network,
+        current_event_sequence: u64,
+        oldest_retained_sequence: u64,
+    ) -> Result<u64, StoreError> {
+        let Some(cursor) = request.from_cursor else {
+            return Ok(oldest_retained_sequence);
+        };
+        let cursor_payload = cursor
+            .decode_mempool_event(network, self.cursor_auth_key)
+            .map_err(|_| StoreError::MempoolEventCursorInvalid {
+                reason: "cursor token failed validation",
+            })?;
+        if cursor_payload.event_sequence > current_event_sequence {
+            return Err(StoreError::MempoolEventCursorInvalid {
+                reason: "cursor sequence is ahead of retained history",
+            });
+        }
+        if cursor_payload.event_sequence < oldest_retained_sequence {
+            return Err(StoreError::MempoolEventCursorExpired {
+                event_sequence: cursor_payload.event_sequence,
+                oldest_retained_sequence,
+            });
+        }
+        cursor_payload
+            .event_sequence
+            .checked_add(1)
+            .ok_or(StoreError::MempoolEventSequenceOverflow)
+    }
+
+    fn prune_mempool_events_before(
+        &self,
+        now: UnixTimestampMillis,
+        retention: MempoolEventRetentionConfig,
+    ) -> Result<MempoolEventRetentionReport, StoreError> {
+        let started_at = Instant::now();
+        let prune_outcome = self.prune_mempool_events_locked(now, retention);
+        record_mempool_event_prune_outcome(started_at, &prune_outcome);
+        if let Ok(report) = prune_outcome {
+            record_mempool_event_retention_report(report);
+            return Ok(report);
+        }
+        prune_outcome
+    }
+
+    fn prune_mempool_events_locked(
+        &self,
+        now: UnixTimestampMillis,
+        retention: MempoolEventRetentionConfig,
+    ) -> Result<MempoolEventRetentionReport, StoreError> {
+        // Phase 1: read bounds + scan against a snapshot view, lock-free, so
+        // the per-event `append_mempool_event` path is not blocked during the
+        // potentially-large iteration. The snapshot freezes the input the
+        // delete batch is computed from; concurrent appends after the
+        // snapshot only widen the retained window and remain safe to leave
+        // in place.
+        let read_view = self.read_view();
+        let current_event_sequence = read_current_mempool_event_sequence(&read_view)?;
+        let Some(oldest_retained_sequence) =
+            read_oldest_retained_mempool_event_sequence(&read_view, current_event_sequence)?
+        else {
+            return Ok(MempoolEventRetentionReport::default());
+        };
+        let scan = scan_mempool_events_for_pruning(
+            &read_view,
+            now,
+            retention,
+            oldest_retained_sequence,
+            current_event_sequence,
+        )?;
+        let new_oldest_retained = scan.new_oldest_retained.unwrap_or(current_event_sequence);
+        let observed_at = read_mempool_event_observed_at(&read_view, new_oldest_retained)?;
+        drop(read_view);
+
+        // Phase 2: acquire the control lock only to apply the writes.
+        //
+        // The floor must advance whenever the scan computed a higher
+        // `new_oldest_retained`, regardless of whether `scan.deletes` is
+        // empty. A previous prune that crashed mid-batch can leave the
+        // column family with gaps where the deletes physically already
+        // happened but the floor never advanced; without this branch, the
+        // floor would stay stuck and readers could observe a partially
+        // pruned tail (per ADR-0010 §Implementation: "every prune call
+        // updates `oldest_retained_mempool_event_sequence` atomically with
+        // the column-family delete batch").
+        let floor_advances = new_oldest_retained != oldest_retained_sequence;
+        if floor_advances || !scan.deletes.is_empty() {
+            let _control_guard = self.inner.lock_control();
+            let puts = if floor_advances {
+                vec![StoragePut {
+                    table: StorageTable::StorageControl,
+                    key: StoreKey::oldest_retained_mempool_event_sequence(),
+                    value: new_oldest_retained.to_be_bytes().to_vec(),
+                }]
+            } else {
+                Vec::new()
+            };
+            self.inner.write_batch(puts, scan.deletes)?;
+        }
+
+        let retained_event_count = current_event_sequence
+            .saturating_sub(new_oldest_retained)
+            .saturating_add(1);
+        Ok(MempoolEventRetentionReport {
+            current_event_sequence,
+            oldest_retained_sequence: Some(new_oldest_retained),
+            oldest_retained_observed_at: observed_at,
+            retained_event_count,
+            pruned_added_count: scan.pruned_added,
+            pruned_mined_count: scan.pruned_mined,
+            pruned_invalidated_count: scan.pruned_invalidated,
+        })
+    }
+
+    fn mempool_event_retention_report(&self) -> Result<MempoolEventRetentionReport, StoreError> {
+        let read_view = self.read_view();
+        let current_event_sequence = read_current_mempool_event_sequence(&read_view)?;
+        let Some(oldest_retained_sequence) =
+            read_oldest_retained_mempool_event_sequence(&read_view, current_event_sequence)?
+        else {
+            return Ok(MempoolEventRetentionReport::default());
+        };
+        let observed_at = read_mempool_event_observed_at(&read_view, oldest_retained_sequence)?;
+        let retained_event_count = current_event_sequence
+            .saturating_sub(oldest_retained_sequence)
+            .saturating_add(1);
+        Ok(MempoolEventRetentionReport {
+            current_event_sequence,
+            oldest_retained_sequence: Some(oldest_retained_sequence),
+            oldest_retained_observed_at: observed_at,
+            retained_event_count,
+            pruned_added_count: 0,
+            pruned_mined_count: 0,
+            pruned_invalidated_count: 0,
+        })
     }
 
     fn read_view(&self) -> crate::kv::RocksChainStoreReadView<'_> {
@@ -1389,7 +1745,7 @@ fn read_chain_event_created_at(
 ) -> Result<UnixTimestampMillis, StoreError> {
     let key = StoreKey::chain_event(event_sequence);
     let Some(record_bytes) = inner.get(StorageTable::ChainEvent, &key)? else {
-        return Err(StoreError::EventCursorExpired {
+        return Err(StoreError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence: event_sequence.saturating_add(1),
         });
@@ -1489,6 +1845,214 @@ fn read_chain_epoch(
     decode_chain_epoch(&key, &record_bytes)
 }
 
+fn read_current_mempool_event_sequence(
+    inner: &impl RocksChainStoreRead,
+) -> Result<u64, StoreError> {
+    let key = StoreKey::mempool_event_sequence_pointer();
+    let Some(event_sequence_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
+        return Ok(0);
+    };
+    if event_sequence_bytes.len() != 8 {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.into(),
+            reason: "mempool event sequence pointer must be 8 bytes",
+        });
+    }
+    let event_sequence_bytes =
+        <[u8; 8]>::try_from(event_sequence_bytes.as_slice()).map_err(|_| {
+            StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "mempool event sequence pointer must be 8 bytes",
+            }
+        })?;
+    Ok(u64::from_be_bytes(event_sequence_bytes))
+}
+
+fn read_oldest_retained_mempool_event_sequence(
+    inner: &impl RocksChainStoreRead,
+    current_event_sequence: u64,
+) -> Result<Option<u64>, StoreError> {
+    if current_event_sequence == 0 {
+        return Ok(None);
+    }
+    let key = StoreKey::oldest_retained_mempool_event_sequence();
+    let Some(event_sequence_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
+        return Ok(Some(1));
+    };
+    if event_sequence_bytes.len() != 8 {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.into(),
+            reason: "oldest retained mempool event sequence must be 8 bytes",
+        });
+    }
+    let event_sequence_bytes =
+        <[u8; 8]>::try_from(event_sequence_bytes.as_slice()).map_err(|_| {
+            StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "oldest retained mempool event sequence must be 8 bytes",
+            }
+        })?;
+    let oldest_retained_sequence = u64::from_be_bytes(event_sequence_bytes);
+    if oldest_retained_sequence == 0 || oldest_retained_sequence > current_event_sequence {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.into(),
+            reason: "oldest retained mempool event sequence is outside retained history",
+        });
+    }
+    Ok(Some(oldest_retained_sequence))
+}
+
+fn read_mempool_event_observed_at(
+    inner: &impl RocksChainStoreRead,
+    event_sequence: u64,
+) -> Result<Option<UnixTimestampMillis>, StoreError> {
+    let key = StoreKey::mempool_event(event_sequence);
+    let Some(record_bytes) = inner.get(StorageTable::MempoolEvent, &key)? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_mempool_event_observed_at(&key, &record_bytes)?))
+}
+
+struct MempoolPruneScan {
+    deletes: Vec<StorageDelete>,
+    pruned_added: u64,
+    pruned_mined: u64,
+    pruned_invalidated: u64,
+    new_oldest_retained: Option<u64>,
+}
+
+fn scan_mempool_events_for_pruning(
+    inner: &impl RocksChainStoreRead,
+    now: UnixTimestampMillis,
+    retention: MempoolEventRetentionConfig,
+    oldest_retained_sequence: u64,
+    current_event_sequence: u64,
+) -> Result<MempoolPruneScan, StoreError> {
+    let mut deletes: Vec<StorageDelete> = Vec::new();
+    let mut pruned_added = 0_u64;
+    let mut pruned_mined = 0_u64;
+    let mut pruned_invalidated = 0_u64;
+    let mut new_oldest_retained: Option<u64> = None;
+    let mut iter_error: Option<StoreError> = None;
+
+    inner.scan_forward(
+        StorageTable::MempoolEvent,
+        &StoreKey::mempool_event(oldest_retained_sequence),
+        &mut |key_bytes, record_bytes| {
+            let key = StoreKey::from_raw_bytes(key_bytes);
+            let Some(event_sequence) = StoreKey::mempool_event_sequence_from_key(key_bytes) else {
+                iter_error = Some(StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::MempoolEvent,
+                    key: key.into(),
+                    reason: "mempool event key has malformed length",
+                });
+                return Ok(PrefixScanControl::Stop);
+            };
+            if event_sequence >= current_event_sequence {
+                return Ok(PrefixScanControl::Stop);
+            }
+
+            let observed_at = match decode_mempool_event_observed_at(&key, record_bytes) {
+                Ok(observed_at) => observed_at,
+                Err(error) => {
+                    iter_error = Some(error);
+                    return Ok(PrefixScanControl::Stop);
+                }
+            };
+            let kind = match decode_mempool_event_kind(&key, record_bytes) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    iter_error = Some(error);
+                    return Ok(PrefixScanControl::Stop);
+                }
+            };
+            let retention_window = match kind {
+                MempoolEventKind::Added => retention.added_retention,
+                MempoolEventKind::Mined => retention.mined_retention,
+                MempoolEventKind::Invalidated => retention.invalidated_retention,
+            };
+            let should_prune =
+                retention_window.is_some_and(|window| age_exceeds_window(now, observed_at, window));
+            if should_prune {
+                deletes.push(StorageDelete {
+                    table: StorageTable::MempoolEvent,
+                    key: StoreKey::mempool_event(event_sequence),
+                });
+                match kind {
+                    MempoolEventKind::Added => pruned_added = pruned_added.saturating_add(1),
+                    MempoolEventKind::Mined => pruned_mined = pruned_mined.saturating_add(1),
+                    MempoolEventKind::Invalidated => {
+                        pruned_invalidated = pruned_invalidated.saturating_add(1);
+                    }
+                }
+            } else if new_oldest_retained.is_none() {
+                new_oldest_retained = Some(event_sequence);
+            }
+            Ok(PrefixScanControl::Continue)
+        },
+    )?;
+    if let Some(error) = iter_error {
+        return Err(error);
+    }
+
+    Ok(MempoolPruneScan {
+        deletes,
+        pruned_added,
+        pruned_mined,
+        pruned_invalidated,
+        new_oldest_retained,
+    })
+}
+
+fn age_exceeds_window(
+    now: UnixTimestampMillis,
+    observed_at: UnixTimestampMillis,
+    window: std::time::Duration,
+) -> bool {
+    let age_millis = now.value().saturating_sub(observed_at.value());
+    let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    age_millis > window_millis
+}
+
+fn record_mempool_event_prune_outcome(
+    started_at: Instant,
+    prune_outcome: &Result<MempoolEventRetentionReport, StoreError>,
+) {
+    metrics::histogram!(
+        "zinder_mempool_event_pruning_duration_seconds",
+        "status" => outcome_status(prune_outcome)
+    )
+    .record(started_at.elapsed());
+    if let Ok(report) = prune_outcome {
+        metrics::counter!(
+            "zinder_mempool_events_pruned_total",
+            "kind" => "added"
+        )
+        .increment(report.pruned_added_count);
+        metrics::counter!(
+            "zinder_mempool_events_pruned_total",
+            "kind" => "mined"
+        )
+        .increment(report.pruned_mined_count);
+        metrics::counter!(
+            "zinder_mempool_events_pruned_total",
+            "kind" => "invalidated"
+        )
+        .increment(report.pruned_invalidated_count);
+    }
+}
+
+fn record_mempool_event_retention_report(report: MempoolEventRetentionReport) {
+    metrics::gauge!("zinder_mempool_events_retained").set(u64_to_f64(report.retained_event_count));
+    metrics::gauge!("zinder_mempool_event_retention_oldest_sequence")
+        .set(u64_to_f64(report.oldest_retained_sequence.unwrap_or(0)));
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -1545,7 +2109,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StoreError::EventCursorExpired {
+            StoreError::ChainEventCursorExpired {
                 event_sequence: 1,
                 oldest_retained_sequence: 2,
             }

@@ -52,7 +52,10 @@ Required readiness causes:
 - `reorg_window_exceeded` — the selected branch requires replacing data outside the configured reorg window; operator action required
 - `replica_lagging` — a `zinder-query` or `zinder-compat-lightwalletd` secondary RocksDB reader is behind the writer by more than `secondary_replica_lag_threshold_chain_epochs` (per [ADR-0007](../adrs/0007-multi-process-storage-access.md)); reads still serve from the last replayed state. Usually self-heals within one catchup interval; persistent lag indicates the writer is offline or under load
 - `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `storage.ingest_control_addr` and the ingest-control listener
-- `cursor_at_risk` — chain-event or, after M3, mempool-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
+- `cursor_at_risk` — chain-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
+- `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0010 §Retention windows](../adrs/0010-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
+- `mempool_source_unavailable` — the mempool source stream cannot be opened or has emitted a non-retryable error (`MempoolStreamUnavailable { is_retryable: false }`); the live `MempoolIndex` keeps the last known state but no new `Added`/`Invalidated`/`Mined` events are arriving. Operators check upstream node health and the indexer port (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for streaming, `getrawmempool` reachability for polling)
+- `mempool_hydration_lagging` — hydration of `MempoolChange::ADDED` notifications via `getrawtransaction` is falling behind the source's emission rate; the index and event log will skip events older than the lag threshold and surface them as missing rather than out-of-order. Operators check upstream JSON-RPC latency and the `zinder_node_request_duration_seconds{operation="get_raw_transaction"}` series
 - `shutting_down` — graceful shutdown in progress; new traffic is rejected
 
 `cursor_at_risk` is informational, not failure: load balancers and orchestrators should treat it as "drain, do not fail." Health-check probes that flip to "unhealthy" on any non-`ready` cause will overreact to this signal. The intent is that operators see the warning before consumers are forcibly expired.
@@ -137,6 +140,12 @@ Implemented baseline metrics:
 | `zinder_store_write_batch_bytes_total` | counter | `zinder-store` | Write-batch payload bytes by put/delete kind and column family. |
 | `zinder_store_visibility_seek_total` | counter | `zinder-store` | Visibility-index reverse seeks by artifact family. |
 | `zinder_store_rocksdb_property` | gauge | `zinder-store` | Curated RocksDB integer properties by column family and property name. |
+| `zinder_mempool_hydration_failures_total` | counter | `zinder-source` | Mempool `Added` observations the source could not hydrate by reason (transient JSON-RPC failure, payload too large, unknown txid races). |
+| `zinder_mempool_source_errors_total` | counter | `zinder-source` | Mempool source error items by kind (`stream_item`, `connect`); a non-zero rate is the input signal for `mempool_source_unavailable` readiness. |
+| `zinder_mempool_events_pruned_total` | counter | `zinder-store` | Mempool events pruned by the retention worker by kind (`added`, `invalidated`, `mined`); the cumulative health signal for two-tier retention. |
+| `zinder_mempool_event_retention_oldest_age_seconds` | gauge | `zinder-store` | Age of the oldest retained mempool event in seconds; together with the per-variant retention windows in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), drives `mempool_cursor_at_risk` readiness. |
+| `zinder_mempool_event_retention_oldest_sequence` | gauge | `zinder-store` | Oldest retained mempool-event sequence number; cursor consumers below this floor receive `MempoolCursorExpired`. |
+| `zinder_mempool_snapshot_age_seconds` | gauge | `zinder-ingest` | Wall-clock age of the most recent `WalletQuery.MempoolSnapshot` response; published by the ingest control adapter for clients deciding whether to fall through to `MempoolEvents`. |
 
 For local inspection and public-network baseline capture, use the host-binary
 smoke harness in [`observability/README.md`](../../observability/README.md). It
@@ -167,6 +176,15 @@ P95, P99, and worst-case values before updating performance-budget tables.
   `zinder_node_request_duration_seconds` and
   `zinder_node_request_total`.
 - Migration state and progress.
+- Mempool source health and hydration outcome. The baseline metrics are
+  `zinder_mempool_source_errors_total`,
+  `zinder_mempool_hydration_failures_total`,
+  `zinder_mempool_events_pruned_total`,
+  `zinder_mempool_event_retention_oldest_age_seconds`,
+  `zinder_mempool_event_retention_oldest_sequence`, and
+  `zinder_mempool_snapshot_age_seconds`. These drive the
+  `mempool_source_unavailable`, `mempool_hydration_lagging`, and
+  `mempool_cursor_at_risk` readiness causes.
 
 `zinder-query` should expose:
 
@@ -335,6 +353,35 @@ termination in front of `zinder-compat-lightwalletd`. A reverse proxy such as
 Caddy, nginx, or traefik terminates HTTPS and forwards h2c to the local compat
 process. Plaintext LAN endpoints are development-only for patched SDK demo apps
 and protocol debugging.
+
+The private `IngestControl` gRPC plane that ties `zinder-ingest`,
+`zinder-query`, and `zinder-compat-lightwalletd` together is plaintext h2c.
+Zinder does not offer native TLS on this port. Per
+[ADR-0009](../adrs/0009-ingest-control-transport-security.md), the operator
+chooses one of three deployment patterns:
+
+1. **Localhost only.** All processes share a host and bind to `127.0.0.1`.
+   No bearer token, no TLS. The OS process boundary is the only thing
+   guarding the writer's storage handle.
+2. **VPN or private network.** Readers run on different hosts but reach the
+   writer through Wireguard, Tailscale, or a private VLAN. Configure the
+   shared-secret bearer token on every process so a leaked endpoint URL
+   cannot be exploited from the trust boundary's edge.
+3. **Reverse proxy with TLS.** A proxy (Caddy, nginx, traefik) terminates
+   HTTPS in front of the writer and forwards h2c to the local control port.
+   Readers connect to the proxy's HTTPS endpoint; the bearer token still
+   travels in the proxied request. This is the same pattern
+   `zinder-compat-lightwalletd` uses for public wallet traffic.
+
+The bearer token is configured by `[ingest.control] token_path` on the
+writer and `[storage] ingest_control_token_path` on every reader. The token
+is loaded from a file at startup, validated server-side with constant-time
+comparison, redacted from all logs and `--print-config` output, and never
+sourced from environment variables (env vars leak into process listings
+and debugger snapshots). Rotation requires updating the file on every host
+and restarting each process. With no token configured, the writer accepts
+every request, which is correct for pattern 1 and an explicit operator
+choice for the others.
 
 Writer-status clients must make wrong-endpoint failures diagnosable. A
 secondary reader that reaches the wrong service on `storage.ingest_control_addr`

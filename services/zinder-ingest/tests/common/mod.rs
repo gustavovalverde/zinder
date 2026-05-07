@@ -133,6 +133,55 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
     Ok(NodeSource::tip_id(&probe_source).await?.height)
 }
 
+/// Calls Zebra's regtest-only `generate` JSON-RPC to mine `block_count` empty
+/// blocks. Returns the list of newly mined block hashes.
+///
+/// Live tests use this to drive deterministic chain-tip changes against the
+/// regtest sidecar without depending on a wallet-side broadcast cycle. Only
+/// useful on networks that accept the `generate` RPC; on testnet/mainnet
+/// Zebra the call returns an error.
+pub(crate) async fn regtest_generate_blocks(
+    env: &LiveTestEnv,
+    block_count: u32,
+) -> Result<Vec<String>> {
+    let body =
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{block_count}]}}"#);
+    let output = tokio::process::Command::new("curl")
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body)
+        .arg(env.target.json_rpc_addr.as_str())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "regtest generate({block_count}) curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| eyre!("regtest generate response is not JSON: {error}; body={body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!(
+            "regtest generate({block_count}) RPC returned error: {error_field}"
+        ));
+    }
+    let result_field = parsed
+        .get("result")
+        .ok_or_else(|| eyre!("regtest generate response missing result field; body={body}"))?;
+    let block_hashes: Vec<String> =
+        serde_json::from_value(result_field.clone()).map_err(|error| {
+            eyre!("regtest generate result is not a list of block hashes: {error}; body={body}")
+        })?;
+    Ok(block_hashes)
+}
+
 /// Asserts that the backfilled store answers every wallet read RPC consistently
 /// for `[start_height..=end_height]` against the visible chain epoch.
 pub(crate) async fn assert_native_wallet_read_responses(

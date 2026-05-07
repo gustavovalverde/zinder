@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    ConfigError, path_to_config_string, require_string, zinder_environment_source,
+    BearerToken, BearerTokenError, ConfigError, path_to_config_string, require_string,
+    zinder_environment_source,
 };
 use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 use zinder_store::StoreError;
@@ -25,6 +26,8 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) secondary_catchup_interval: Duration,
     pub(crate) secondary_replica_lag_threshold_chain_epochs: u64,
     pub(crate) ingest_control_addr: String,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) broadcaster: Option<BroadcasterConfig>,
 }
@@ -45,6 +48,7 @@ pub(crate) struct LightwalletdConfigOverrides {
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) secondary_path: Option<PathBuf>,
     pub(crate) ingest_control_addr: Option<String>,
+    pub(crate) ingest_control_token_path: Option<PathBuf>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) node_json_rpc_addr: Option<String>,
 }
@@ -63,6 +67,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error("gRPC transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
+
+    #[error("invalid ingest-control bearer token: {0}")]
+    BearerToken(#[from] BearerTokenError),
 }
 
 /// Loads and validates lightwalletd compat configuration.
@@ -91,7 +98,7 @@ pub(crate) fn load_lightwalletd_config(
         .try_deserialize()
         .map_err(ConfigError::load)?;
 
-    Ok(resolve_lightwalletd_config(raw_config)?)
+    resolve_lightwalletd_config(raw_config)
 }
 
 /// Renders the effective lightwalletd compat configuration in the accepted TOML shape.
@@ -126,6 +133,7 @@ struct StorageSection {
     secondary_catchup_interval_ms: Option<u64>,
     secondary_replica_lag_threshold_chain_epochs: Option<u64>,
     ingest_control_addr: Option<String>,
+    ingest_control_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +189,14 @@ fn apply_overrides(
             .set_override("storage.ingest_control_addr", ingest_control_addr)
             .map_err(ConfigError::load)?;
     }
+    if let Some(token_path) = overrides.ingest_control_token_path {
+        builder = builder
+            .set_override(
+                "storage.ingest_control_token_path",
+                path_to_config_string(token_path, "storage.ingest_control_token_path")?,
+            )
+            .map_err(ConfigError::load)?;
+    }
     if let Some(listen_addr) = overrides.listen_addr {
         builder = builder
             .set_override("compat.listen_addr", listen_addr.to_string())
@@ -197,7 +213,7 @@ fn apply_overrides(
 
 fn resolve_lightwalletd_config(
     config: LightwalletdRawConfig,
-) -> Result<LightwalletdConfig, ConfigError> {
+) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let network_name = require_string(config.network.name, "network.name")?;
     let storage_path = config
         .storage
@@ -211,7 +227,8 @@ fn resolve_lightwalletd_config(
     if secondary_catchup_interval_ms == 0 {
         return Err(ConfigError::invalid(
             "storage.secondary_catchup_interval_ms must be greater than zero",
-        ));
+        )
+        .into());
     }
     let secondary_replica_lag_threshold_chain_epochs = config
         .storage
@@ -226,6 +243,11 @@ fn resolve_lightwalletd_config(
             "storage.ingest_control_addr {ingest_control_addr} is not a tonic endpoint: {source}"
         ))
     })?;
+    let ingest_control_token_path = config.storage.ingest_control_token_path;
+    let ingest_control_bearer_token = ingest_control_token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
     let listen_addr_string = require_string(config.compat.listen_addr, "compat.listen_addr")?;
     let network = Network::from_name(&network_name)
         .ok_or_else(|| ConfigError::invalid(format!("unknown network: {network_name}")))?;
@@ -243,6 +265,8 @@ fn resolve_lightwalletd_config(
         secondary_catchup_interval: Duration::from_millis(secondary_catchup_interval_ms),
         secondary_replica_lag_threshold_chain_epochs,
         ingest_control_addr,
+        ingest_control_token_path,
+        ingest_control_bearer_token,
         listen_addr,
         broadcaster,
     })
@@ -319,6 +343,10 @@ impl LightwalletdConfigToml {
                 secondary_replica_lag_threshold_chain_epochs: config
                     .secondary_replica_lag_threshold_chain_epochs,
                 ingest_control_addr: config.ingest_control_addr.clone(),
+                ingest_control_token_path: config
+                    .ingest_control_token_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
             },
             compat: CompatToml {
                 listen_addr: config.listen_addr.to_string(),
@@ -340,6 +368,8 @@ struct StorageToml {
     secondary_catchup_interval_ms: u64,
     secondary_replica_lag_threshold_chain_epochs: u64,
     ingest_control_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingest_control_token_path: Option<String>,
 }
 
 #[derive(Serialize)]

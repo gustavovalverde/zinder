@@ -43,6 +43,14 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         stdout.contains("ingest_control_addr = \"http://127.0.0.1:9100\""),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("mempool_mined_retention_minutes = 60"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("mempool_invalidated_retention_hours = 24"),
+        "{stdout}"
+    );
     assert!(!stderr.contains("ERROR"), "{stderr}");
 
     Ok(())

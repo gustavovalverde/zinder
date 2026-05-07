@@ -31,6 +31,25 @@ use crate::{
     TransactionBroadcaster, decode_display_block_hash, source_block::decode_display_hash_32,
 };
 
+/// Result of looking up a transaction at the upstream node.
+///
+/// Used by the polling mempool source to classify a txid that disappeared
+/// from successive `getrawmempool` snapshots: a txid still present but
+/// reported as mined produces a [`crate::MempoolSourceEvent::Mined`]; a
+/// txid that the node no longer recognizes produces
+/// [`crate::MempoolSourceEvent::Invalidated`] with reason
+/// [`zinder_core::MempoolEvictionReason::Unknown`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UpstreamTransactionLookup {
+    /// Transaction is still visible in the upstream mempool.
+    InMempool,
+    /// Transaction was mined into a block on the upstream best chain.
+    Mined(BlockHeight),
+    /// Transaction is not in the upstream mempool or main chain.
+    NotFound,
+}
+
 /// Default capability set assumed for Zebra JSON-RPC sources.
 ///
 /// Used until [`ZebraJsonRpcSource::probe_capabilities`] runs. Operators
@@ -57,6 +76,8 @@ const JSON_RPC_WARMING_UP_CODE: i32 = -28;
 const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 /// JSON-RPC error code returned for transactions already in the mempool.
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
+/// JSON-RPC error code returned when a txid is not in mempool or main chain.
+const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
 
 /// Node source backed by Zebra's JSON-RPC API.
 #[derive(Clone)]
@@ -291,6 +312,132 @@ impl ZebraJsonRpcSource {
         record_json_rpc_source_outcome(method, started_at, &rpc_outcome);
 
         rpc_outcome
+    }
+
+    /// Fetches the upstream node's current mempool transaction identifiers.
+    ///
+    /// Uses `getrawmempool` with `verbose=false`, which returns the bare
+    /// txid list. Zinder's polling backend diffs successive snapshots to
+    /// derive mempool change events; a verbose response would trigger
+    /// expensive descendant-graph computation on the node and is not
+    /// needed by the indexer.
+    pub async fn fetch_raw_mempool_transaction_ids(
+        &self,
+    ) -> Result<Vec<TransactionId>, SourceError> {
+        let txid_hex_list: Vec<String> = self
+            .call_typed("getrawmempool", ArrayParams::new(), map_node_unavailable)
+            .await?;
+        let mut transaction_ids = Vec::with_capacity(txid_hex_list.len());
+        for txid_hex in txid_hex_list {
+            transaction_ids.push(decode_display_transaction_id(&txid_hex)?);
+        }
+        Ok(transaction_ids)
+    }
+
+    /// Looks up the upstream node's view of a transaction by identifier.
+    ///
+    /// Returns:
+    ///
+    /// - [`UpstreamTransactionLookup::Mined`] when the node reports the
+    ///   transaction is in a block on its best chain.
+    /// - [`UpstreamTransactionLookup::InMempool`] when the node still has
+    ///   the transaction in its mempool but no confirming block.
+    /// - [`UpstreamTransactionLookup::NotFound`] when Zebra returns the
+    ///   `-5` (`InvalidAddressOrKey`) error for the txid.
+    ///
+    /// The polling [`crate::JsonRpcMempoolSource`] uses this to classify a
+    /// disappeared txid into a [`crate::MempoolSourceEvent::Mined`] or
+    /// [`crate::MempoolSourceEvent::Invalidated`].
+    pub async fn fetch_upstream_transaction_lookup(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<UpstreamTransactionLookup, SourceError> {
+        let params = positional_params([
+            Value::from(display_order_transaction_id_hex(transaction_id)),
+            Value::from(1),
+        ])?;
+
+        let started_at = Instant::now();
+        let response = self
+            .client
+            .request::<Value, _>("getrawtransaction", params)
+            .await;
+        record_json_rpc_client_result("getrawtransaction", started_at, &response);
+
+        match response {
+            Ok(verbose_response) => {
+                if let Some(height_value) = verbose_response.get("height").and_then(Value::as_u64) {
+                    let height_u32 = u32::try_from(height_value).map_err(|_| {
+                        SourceError::SourceProtocolMismatch {
+                            reason: "verbose getrawtransaction height does not fit u32",
+                        }
+                    })?;
+                    Ok(UpstreamTransactionLookup::Mined(BlockHeight::new(
+                        height_u32,
+                    )))
+                } else {
+                    Ok(UpstreamTransactionLookup::InMempool)
+                }
+            }
+            Err(ClientError::Call(error)) => {
+                let call_error = JsonRpcCallError::from(error);
+                if call_error.is_not_found() {
+                    Ok(UpstreamTransactionLookup::NotFound)
+                } else {
+                    Err(SourceError::NodeUnavailable {
+                        is_retryable: call_error.is_retryable(),
+                        reason: call_error.message,
+                    })
+                }
+            }
+            Err(error) => Err(map_transport_error(&error)),
+        }
+    }
+
+    /// Fetches raw serialized transaction bytes by identifier.
+    ///
+    /// Returns `Ok(None)` when the upstream node reports the transaction
+    /// is not present in either the mempool or the main chain (Zebra error
+    /// code -5). This is not an error: a hydration race can remove a
+    /// transaction between an `Added` observation and the follow-up
+    /// fetch. Callers increment `zinder_mempool_hydration_failures_total`
+    /// with reason `not_found` when they observe `None`.
+    pub async fn fetch_raw_transaction_bytes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<RawTransactionBytes>, SourceError> {
+        let params = positional_params([
+            Value::from(display_order_transaction_id_hex(transaction_id)),
+            Value::from(0),
+        ])?;
+
+        let started_at = Instant::now();
+        let response = self
+            .client
+            .request::<String, _>("getrawtransaction", params)
+            .await;
+        record_json_rpc_client_result("getrawtransaction", started_at, &response);
+
+        match response {
+            Ok(raw_transaction_hex) => {
+                let raw_bytes = hex::decode(raw_transaction_hex)
+                    .map_err(|source| SourceError::InvalidRawTransactionHex { source })?;
+                Ok(Some(RawTransactionBytes::new(raw_bytes)))
+            }
+            Err(ClientError::Call(error)) => {
+                let call_error = JsonRpcCallError::from(error);
+                if call_error.is_not_found() {
+                    Ok(None)
+                } else {
+                    Err(SourceError::MempoolHydrationFailed {
+                        transaction_id,
+                        is_retryable: call_error.is_retryable(),
+                        reason: call_error.message,
+                    })
+                }
+            }
+            Err(error) => Err(map_transport_error(&error)),
+        }
     }
 }
 
@@ -546,9 +693,12 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::NodeCapabilityMissing { .. }) => "node_capability_missing",
         Some(SourceError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(SourceError::UnsupportedNodeAuth { .. }) => "unsupported_node_auth",
+        Some(SourceError::MempoolStreamUnavailable { .. }) => "mempool_stream_unavailable",
+        Some(SourceError::MempoolHydrationFailed { .. }) => "mempool_hydration_failed",
         Some(
             SourceError::InvalidBlockHashHex { .. }
             | SourceError::InvalidRawBlockHex { .. }
+            | SourceError::InvalidRawTransactionHex { .. }
             | SourceError::InvalidBlockHashLength { .. }
             | SourceError::InvalidTransactionIdHex { .. }
             | SourceError::InvalidTransactionIdLength { .. }
@@ -766,6 +916,17 @@ fn decode_display_transaction_id(
     .map(TransactionId::from_bytes)
 }
 
+/// Encodes a [`TransactionId`] as a Zebra-display-order hex string for
+/// JSON-RPC requests.
+///
+/// Internal Zinder storage holds canonical (network-order) txid bytes;
+/// Zebra's RPC surface accepts and returns display-order (reversed) hex.
+fn display_order_transaction_id_hex(transaction_id: TransactionId) -> String {
+    let mut display_bytes = transaction_id.as_bytes();
+    display_bytes.reverse();
+    hex::encode(display_bytes)
+}
+
 fn decode_subtree_root_hash(root_hash: &str) -> Result<SubtreeRootHash, SourceError> {
     let root_hash_bytes =
         hex::decode(root_hash).map_err(|source| SourceError::InvalidSubtreeRootHex { source })?;
@@ -816,6 +977,21 @@ struct JsonRpcCallError {
 impl JsonRpcCallError {
     fn is_retryable(&self) -> bool {
         matches!(self.code, Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_WARMING_UP_CODE))
+    }
+
+    /// Returns whether the call error reports the requested resource was
+    /// not found at the source.
+    ///
+    /// Zebra returns code -5 (`InvalidAddressOrKey`) both for unknown
+    /// txids and for malformed input. Mempool hydration callers check
+    /// this only after they have constructed the request from a typed
+    /// [`TransactionId`], so a -5 response unambiguously means "not in
+    /// mempool or main chain."
+    fn is_not_found(&self) -> bool {
+        matches!(
+            self.code,
+            Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE)
+        )
     }
 }
 

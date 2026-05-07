@@ -5,8 +5,14 @@
 //! and does not open storage, call upstream nodes, or build artifacts.
 
 mod grpc;
+mod mempool;
 
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdCompatibilityOptions, LightwalletdGrpcAdapter,
+};
+pub use mempool::{
+    IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
+    MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher,
+    TipChangeWatcherError, WatchTipChangeWatcher, spawn_ingest_control_tip_change_publisher,
 };

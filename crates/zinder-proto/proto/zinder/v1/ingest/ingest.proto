@@ -31,4 +31,14 @@ service IngestControl {
 
   // Streams chain-event history from the ingest writer's primary store.
   rpc ChainEvents(zinder.v1.wallet.ChainEventsRequest) returns (stream zinder.v1.wallet.ChainEventEnvelope);
+
+  // Returns a bounded snapshot of the writer's live mempool index.
+  //
+  // Secondary readers cannot observe the live in-process mempool index
+  // through RocksDB-secondary catchup, so the wallet data plane proxies
+  // mempool snapshots through this control RPC.
+  rpc MempoolSnapshot(zinder.v1.wallet.MempoolSnapshotRequest) returns (zinder.v1.wallet.MempoolSnapshotResponse);
+
+  // Streams mempool events from the writer's mempool event log.
+  rpc MempoolEvents(zinder.v1.wallet.MempoolEventsRequest) returns (stream zinder.v1.wallet.MempoolEventEnvelope);
 }
