@@ -30,6 +30,24 @@ pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/zinder.v1.ingest.rs"));
     }
 
+    /// Explorer-shaped read protocol messages served by zinder-derive.
+    pub mod explorer {
+        #![allow(
+            clippy::allow_attributes_without_reason,
+            clippy::default_trait_access,
+            clippy::derive_partial_eq_without_eq,
+            clippy::disallowed_names,
+            clippy::doc_markdown,
+            clippy::missing_fields_in_debug,
+            clippy::must_use_candidate,
+            clippy::too_many_lines,
+            missing_docs,
+            reason = "Generated protobuf code mirrors owned schemas."
+        )]
+
+        include!(concat!(env!("OUT_DIR"), "/zinder.v1.explorer.rs"));
+    }
+
     /// Native wallet and wallet-like application protocol messages.
     pub mod wallet {
         #![allow(

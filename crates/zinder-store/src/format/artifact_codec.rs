@@ -7,9 +7,9 @@ use zinder_core::{
     ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, MempoolEntry,
     MempoolEvictionReason, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, TransactionArtifact, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentUtxoSpendArtifact, TreeStateArtifact,
-    UnixTimestampMillis,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolSpend,
+    TransparentOutPoint, TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -765,6 +765,56 @@ pub(crate) fn decode_transparent_address_utxo_artifact(
     ))
 }
 
+pub(crate) fn encode_transparent_address_tx_index_artifact(
+    artifact: TransparentAddressTxIndexArtifact,
+) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1,
+        &TransparentAddressTxIndexArtifactRecord {
+            transaction_id: artifact.transaction_id.as_bytes().to_vec(),
+            block_hash: artifact.block_hash.as_bytes().to_vec(),
+        },
+    )
+}
+
+pub(crate) fn decode_transparent_address_tx_index_artifact(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+    address_script_hash: TransparentAddressScriptHash,
+    block_height: BlockHeight,
+    tx_index_in_block: u32,
+) -> Result<TransparentAddressTxIndexArtifact, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::TransparentAddressTxIndex,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1,
+    )?;
+    let record = TransparentAddressTxIndexArtifactRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransparentAddressTxIndex,
+            key: key.clone().into(),
+            reason: "transparent address tx index artifact record is not valid protobuf",
+        }
+    })?;
+
+    Ok(TransparentAddressTxIndexArtifact::new(
+        address_script_hash,
+        block_height,
+        tx_index_in_block,
+        decode_transaction_id_for_family(
+            ArtifactFamily::TransparentAddressTxIndex,
+            key,
+            &record.transaction_id,
+        )?,
+        decode_block_hash(
+            ArtifactFamily::TransparentAddressTxIndex,
+            key,
+            &record.block_hash,
+        )?,
+    ))
+}
+
 pub(crate) fn encode_transparent_utxo_spend_artifact(
     spend: TransparentUtxoSpendArtifact,
 ) -> Result<Vec<u8>, StoreError> {
@@ -1051,6 +1101,9 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
             ArtifactFamily::TransparentAddressUtxo
         }
         PayloadFormat::ZinderTransparentUtxoSpendArtifactV1 => ArtifactFamily::TransparentUtxoSpend,
+        PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1 => {
+            ArtifactFamily::TransparentAddressTxIndex
+        }
     }
 }
 
@@ -1290,6 +1343,14 @@ struct TransparentUtxoSpendArtifactRecord {
     #[prost(uint32, tag = "3")]
     block_height: u32,
     #[prost(bytes, tag = "4")]
+    block_hash: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentAddressTxIndexArtifactRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(bytes, tag = "2")]
     block_hash: Vec<u8>,
 }
 

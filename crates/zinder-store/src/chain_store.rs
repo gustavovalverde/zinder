@@ -6,8 +6,9 @@ use std::{num::NonZeroU32, path::Path, sync::Arc, time::Instant};
 
 use parking_lot::RwLock;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHeightRange, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionArtifact,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
     UnixTimestampMillis,
 };
@@ -23,8 +24,8 @@ use crate::{
         decode_mempool_event_kind, decode_mempool_event_observed_at, encode_block_artifact,
         encode_chain_epoch, encode_chain_event_envelope, encode_compact_block_artifact,
         encode_mempool_event_envelope, encode_subtree_root_artifact, encode_transaction_artifact,
-        encode_transparent_address_utxo_artifact, encode_transparent_utxo_spend_artifact,
-        encode_tree_state_artifact,
+        encode_transparent_address_tx_index_artifact, encode_transparent_address_utxo_artifact,
+        encode_transparent_utxo_spend_artifact, encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
@@ -99,6 +100,72 @@ pub struct ChainEventRetentionReport {
     pub retained_event_count: u64,
     /// Number of event rows deleted by this pass.
     pub pruned_event_count: u64,
+}
+
+/// Bounded transparent-address tx-history page request.
+#[derive(Clone, Copy, Debug)]
+pub struct TransparentAddressTxIndexPageRequest<'cursor> {
+    /// Optional chain epoch to pin the read to. `None` reads at the
+    /// currently visible epoch.
+    pub at_epoch: Option<ChainEpoch>,
+    /// SHA-256 of the transparent address scriptPubKey.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Inclusive minimum block height. Ignored when `from_cursor` is
+    /// `Some`.
+    pub start_height: BlockHeight,
+    /// Inclusive maximum block height.
+    pub end_height: BlockHeight,
+    /// Server-bounded maximum entries per page.
+    pub max_entries: NonZeroU32,
+    /// Iteration direction.
+    pub descending: bool,
+    /// Optional cursor to resume strictly after.
+    pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
+}
+
+/// Bounded transparent-address tx-history page response.
+#[derive(Clone, Debug)]
+pub struct TransparentAddressTxIndexPage {
+    /// Chain epoch used to answer this page.
+    pub chain_epoch: ChainEpoch,
+    /// Tx-history artifacts in the requested order.
+    pub artifacts: Vec<TransparentAddressTxIndexArtifact>,
+    /// Resume cursor when the page reached `max_entries`.
+    pub next_cursor: Option<StreamCursorTokenV1>,
+}
+
+/// Bounded transparent-address UTXO read request.
+///
+/// Cursor handling lives entirely inside the store: the cursor token is
+/// HMAC-authenticated against the store's per-instance auth key and decoded
+/// into a typed position in `read_transparent_address_utxos_paged`.
+#[derive(Clone, Copy, Debug)]
+pub struct TransparentAddressUtxosPageRequest<'cursor> {
+    /// Optional chain epoch to pin the read to. `None` reads at the
+    /// currently visible epoch.
+    pub at_epoch: Option<ChainEpoch>,
+    /// SHA-256 of the transparent address scriptPubKey.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Wallet-birthday optimization: skip UTXOs mined below this height.
+    /// Ignored when `from_cursor` is `Some`.
+    pub start_height: BlockHeight,
+    /// Server-bounded maximum entries per page.
+    pub max_entries: NonZeroU32,
+    /// Optional cursor to resume strictly after. When present,
+    /// `start_height` is ignored.
+    pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
+}
+
+/// Bounded transparent-address UTXO page response.
+#[derive(Clone, Debug)]
+pub struct TransparentAddressUtxosPage {
+    /// Chain epoch used to answer this page.
+    pub chain_epoch: ChainEpoch,
+    /// UTXOs in ascending `(block_height, outpoint)` order.
+    pub utxos: Vec<TransparentAddressUtxoArtifact>,
+    /// Resume cursor when the page reached `max_entries`. `None` when the
+    /// scan was fully drained.
+    pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
 /// Bounded chain-event history read request.
@@ -216,6 +283,25 @@ pub trait ChainEpochReadApi {
         &self,
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError>;
+
+    /// Reads a bounded page of unspent transparent outputs.
+    ///
+    /// Decodes any supplied cursor against the store's per-instance auth key
+    /// and resumes scanning strictly after the cursor position. Emits a
+    /// `next_cursor` only when the page reached `max_entries`, signalling
+    /// that more UTXOs may be available.
+    fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError>;
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts inside an inclusive height range, in ascending or
+    /// descending mined order.
+    fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError>;
 }
 
 impl PrimaryChainStore {
@@ -274,6 +360,23 @@ impl PrimaryChainStore {
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.store.chain_event_history(request)
+    }
+
+    /// Reads a bounded page of unspent transparent outputs.
+    pub fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        self.store.transparent_address_utxos_page(request)
+    }
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts.
+    pub fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
+        self.store.transparent_address_tx_index_page(request)
     }
 
     /// Deletes retained chain-event rows older than `cutoff_created_at`.
@@ -383,6 +486,23 @@ impl SecondaryChainStore {
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.store.chain_event_history(request)
+    }
+
+    /// Reads a bounded page of unspent transparent outputs.
+    pub fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        self.store.transparent_address_utxos_page(request)
+    }
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts.
+    pub fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
+        self.store.transparent_address_tx_index_page(request)
     }
 
     /// Reads the current chain-event retention floor without pruning.
@@ -587,6 +707,158 @@ impl ChainStoreInner {
         }
 
         Ok(event_envelopes)
+    }
+
+    /// Reads a bounded page of unspent transparent outputs.
+    fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        let read_view = self.read_view();
+        let chain_epoch = match request.at_epoch {
+            Some(at_epoch) => {
+                let stored = read_chain_epoch(&read_view, at_epoch.id)?;
+                if stored != at_epoch {
+                    return Err(StoreError::ChainEpochMissing {
+                        chain_epoch: at_epoch.id,
+                    });
+                }
+                stored
+            }
+            None => require_current_chain_epoch(&read_view)?,
+        };
+
+        let resume_after = match request.from_cursor {
+            Some(cursor) => Some(
+                cursor
+                    .decode_transparent_utxo(chain_epoch.network, self.cursor_auth_key)
+                    .map_err(|_| StoreError::TransparentUtxoCursorInvalid {
+                        reason: "cursor token failed validation",
+                    })?,
+            ),
+            None => None,
+        };
+
+        let utxos = crate::transparent_utxo::read_transparent_address_utxos_paged(
+            &read_view,
+            crate::transparent_utxo::TransparentAddressUtxosScan {
+                chain_epoch,
+                address_script_hash: request.address_script_hash,
+                start_height: request.start_height,
+                max_entries: request.max_entries,
+                resume_after,
+            },
+        )?;
+
+        let next_cursor = if utxos.len() >= u32_to_usize(request.max_entries.get()) {
+            match utxos.last() {
+                Some(utxo) => Some(
+                    StreamCursorTokenV1::transparent_utxo(
+                        chain_epoch.network,
+                        crate::format::TransparentUtxoStreamFamily::TransparentUtxo,
+                        utxo.block_height,
+                        utxo.outpoint,
+                        self.cursor_auth_key,
+                    )
+                    .map_err(|_| StoreError::TransparentUtxoCursorInvalid {
+                        reason: "next-cursor encoding failed",
+                    })?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(TransparentAddressUtxosPage {
+            chain_epoch,
+            utxos,
+            next_cursor,
+        })
+    }
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts.
+    fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
+        let read_view = self.read_view();
+        let chain_epoch = match request.at_epoch {
+            Some(at_epoch) => {
+                let stored = read_chain_epoch(&read_view, at_epoch.id)?;
+                if stored != at_epoch {
+                    return Err(StoreError::ChainEpochMissing {
+                        chain_epoch: at_epoch.id,
+                    });
+                }
+                stored
+            }
+            None => require_current_chain_epoch(&read_view)?,
+        };
+
+        let resume_after = match request.from_cursor {
+            Some(cursor) => Some(
+                cursor
+                    .decode_transparent_history(chain_epoch.network, self.cursor_auth_key)
+                    .map_err(|_| StoreError::TransparentHistoryCursorInvalid {
+                        reason: "cursor token failed validation",
+                    })?,
+            ),
+            None => None,
+        };
+        let descending = resume_after.map_or(request.descending, |payload| payload.descending);
+        let resume_position = resume_after.map(|payload| {
+            crate::transparent_address_tx_index::TransparentHistoryResumePosition {
+                last_block_height: payload.last_block_height,
+                last_tx_index_in_block: payload.last_tx_index_in_block,
+            }
+        });
+
+        let artifacts =
+            crate::transparent_address_tx_index::read_transparent_address_tx_index_paged(
+                &read_view,
+                crate::transparent_address_tx_index::TransparentAddressTxIndexScan {
+                    chain_epoch,
+                    address_script_hash: request.address_script_hash,
+                    start_height: request.start_height,
+                    end_height: request.end_height,
+                    max_entries: request.max_entries,
+                    descending,
+                    resume_after: resume_position,
+                },
+            )?;
+
+        let next_cursor =
+            if artifacts.len() >= u32_to_usize(request.max_entries.get()) {
+                match artifacts.last() {
+                Some(artifact) => Some(
+                    StreamCursorTokenV1::transparent_history(
+                        crate::format::TransparentHistoryCursorAnchor {
+                            network: chain_epoch.network,
+                            family:
+                                crate::format::TransparentHistoryStreamFamily::TransparentHistory,
+                            last_block_height: artifact.block_height,
+                            last_tx_index_in_block: artifact.tx_index_in_block,
+                            descending,
+                        },
+                        self.cursor_auth_key,
+                    )
+                    .map_err(|_| StoreError::TransparentHistoryCursorInvalid {
+                        reason: "next-cursor encoding failed",
+                    })?,
+                ),
+                None => None,
+            }
+            } else {
+                None
+            };
+
+        Ok(TransparentAddressTxIndexPage {
+            chain_epoch,
+            artifacts,
+            next_cursor,
+        })
     }
 
     fn chain_event_history_start_sequence(
@@ -1119,6 +1391,20 @@ impl ChainEpochReadApi for PrimaryChainStore {
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.chain_event_history(request)
     }
+
+    fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        self.store.transparent_address_utxos_page(request)
+    }
+
+    fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
+        self.store.transparent_address_tx_index_page(request)
+    }
 }
 
 impl ChainEpochReadApi for SecondaryChainStore {
@@ -1138,6 +1424,20 @@ impl ChainEpochReadApi for SecondaryChainStore {
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.chain_event_history(request)
+    }
+
+    fn transparent_address_utxos_page(
+        &self,
+        request: TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        self.store.transparent_address_utxos_page(request)
+    }
+
+    fn transparent_address_tx_index_page(
+        &self,
+        request: TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
+        self.store.transparent_address_tx_index_page(request)
     }
 }
 
@@ -1365,6 +1665,7 @@ fn build_chain_epoch_puts(
         subtree_roots,
         transparent_address_utxos,
         transparent_utxo_spends,
+        transparent_address_tx_index,
         reorg_window_change: _,
     } = artifacts;
 
@@ -1381,6 +1682,11 @@ fn build_chain_epoch_puts(
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
     push_transparent_address_utxo_artifact_puts(&mut puts, chain_epoch, transparent_address_utxos)?;
     push_transparent_utxo_spend_artifact_puts(&mut puts, chain_epoch, transparent_utxo_spends)?;
+    push_transparent_address_tx_index_artifact_puts(
+        &mut puts,
+        chain_epoch,
+        transparent_address_tx_index,
+    )?;
     push_commit_control_puts(&mut puts, chain_epoch, event_envelope);
 
     Ok(puts)
@@ -1564,6 +1870,30 @@ fn push_transparent_utxo_spend_artifact_puts(
             table: StorageTable::TransparentUtxoSpend,
             key,
             value: encoded_spend,
+        });
+    }
+
+    Ok(())
+}
+
+fn push_transparent_address_tx_index_artifact_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
+) -> Result<(), StoreError> {
+    for artifact in transparent_address_tx_index {
+        let key = StoreKey::transparent_address_tx_index(
+            chain_epoch.network,
+            artifact.address_script_hash,
+            artifact.block_height,
+            artifact.tx_index_in_block,
+            chain_epoch.id,
+        );
+        let encoded = encode_transparent_address_tx_index_artifact(artifact)?;
+        puts.push(StoragePut {
+            table: StorageTable::TransparentAddressTxIndex,
+            key,
+            value: encoded,
         });
     }
 

@@ -11,7 +11,8 @@ use crate::{
     ArtifactFamily, StoreError,
     block_artifact::read_block_artifact,
     format::{
-        StoreKey, decode_transparent_address_utxo_artifact, decode_transparent_utxo_spend_artifact,
+        StoreKey, TransparentUtxoCursorPayload, decode_transparent_address_utxo_artifact,
+        decode_transparent_utxo_spend_artifact,
     },
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
@@ -27,6 +28,16 @@ pub trait TransparentUtxoStore {
     ) -> Result<Vec<TransparentAddressUtxoArtifact>, StoreError>;
 }
 
+/// Scan parameters for [`read_transparent_address_utxos_paged`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransparentAddressUtxosScan {
+    pub(crate) chain_epoch: ChainEpoch,
+    pub(crate) address_script_hash: TransparentAddressScriptHash,
+    pub(crate) start_height: BlockHeight,
+    pub(crate) max_entries: NonZeroU32,
+    pub(crate) resume_after: Option<TransparentUtxoCursorPayload>,
+}
+
 pub(crate) fn read_transparent_address_utxos(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
@@ -34,11 +45,29 @@ pub(crate) fn read_transparent_address_utxos(
     start_height: BlockHeight,
     max_entries: NonZeroU32,
 ) -> Result<Vec<TransparentAddressUtxoArtifact>, StoreError> {
-    let prefix =
-        StoreKey::transparent_address_utxo_prefix(chain_epoch.network, address_script_hash);
+    read_transparent_address_utxos_paged(
+        inner,
+        TransparentAddressUtxosScan {
+            chain_epoch,
+            address_script_hash,
+            start_height,
+            max_entries,
+            resume_after: None,
+        },
+    )
+}
+
+pub(crate) fn read_transparent_address_utxos_paged(
+    inner: &impl RocksChainStoreRead,
+    scan: TransparentAddressUtxosScan,
+) -> Result<Vec<TransparentAddressUtxoArtifact>, StoreError> {
+    let prefix = StoreKey::transparent_address_utxo_prefix(
+        scan.chain_epoch.network,
+        scan.address_script_hash,
+    );
     let mut utxos = Vec::new();
     let mut seen_outpoints = HashSet::new();
-    let max_entries = u32_to_usize(max_entries.get());
+    let max_entries = u32_to_usize(scan.max_entries.get());
 
     inner.scan_prefix(
         StorageTable::TransparentAddressUtxo,
@@ -52,16 +81,23 @@ pub(crate) fn read_transparent_address_utxos(
                     reason: "transparent address UTXO key is malformed",
                 });
             };
-            if source_epoch > chain_epoch.id {
+            if source_epoch > scan.chain_epoch.id {
                 return Ok(PrefixScanControl::Continue);
             }
 
             let utxo = decode_transparent_address_utxo_artifact(&prefix, envelope_bytes)?;
-            if utxo.address_script_hash != address_script_hash || utxo.block_height < start_height {
+            if utxo.address_script_hash != scan.address_script_hash {
                 return Ok(PrefixScanControl::Continue);
             }
-            if !block_is_visible(inner, chain_epoch, utxo.block_height, utxo.block_hash)?
-                || transparent_outpoint_is_spent(inner, chain_epoch, utxo.outpoint)?
+            if let Some(resume) = scan.resume_after {
+                if !is_strictly_after_cursor(&utxo, resume) {
+                    return Ok(PrefixScanControl::Continue);
+                }
+            } else if utxo.block_height < scan.start_height {
+                return Ok(PrefixScanControl::Continue);
+            }
+            if !block_is_visible(inner, scan.chain_epoch, utxo.block_height, utxo.block_hash)?
+                || transparent_outpoint_is_spent(inner, scan.chain_epoch, utxo.outpoint)?
                 || !seen_outpoints.insert(utxo.outpoint)
             {
                 return Ok(PrefixScanControl::Continue);
@@ -77,6 +113,25 @@ pub(crate) fn read_transparent_address_utxos(
     )?;
 
     Ok(utxos)
+}
+
+const fn is_strictly_after_cursor(
+    utxo: &TransparentAddressUtxoArtifact,
+    cursor: TransparentUtxoCursorPayload,
+) -> bool {
+    if utxo.block_height.value() != cursor.last_block_height.value() {
+        return utxo.block_height.value() > cursor.last_block_height.value();
+    }
+    let utxo_txid = utxo.outpoint.transaction_id.as_bytes();
+    let cursor_txid = cursor.last_outpoint.transaction_id.as_bytes();
+    let mut byte_index = 0;
+    while byte_index < utxo_txid.len() {
+        if utxo_txid[byte_index] != cursor_txid[byte_index] {
+            return utxo_txid[byte_index] > cursor_txid[byte_index];
+        }
+        byte_index += 1;
+    }
+    utxo.outpoint.output_index > cursor.last_outpoint.output_index
 }
 
 fn transparent_outpoint_is_spent(

@@ -16,16 +16,17 @@ use zebra_chain::{
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, CompactBlockArtifact, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
-    TransactionId,
+    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransparentAddressTxIndexArtifact,
 };
 use zinder_proto::compat::lightwalletd::{
     self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
 };
 use zinder_query::{
-    SubtreeRoots, TransparentAddressUtxos, TransparentAddressUtxosRequest, TreeState,
-    WalletQueryApi, status_from_query_error,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
+    TransparentAddressUtxosRequest, TreeState, WalletQueryApi, status_from_query_error,
+    transparent_address_script_hash,
 };
 use zinder_store::MempoolEvent;
 
@@ -44,7 +45,7 @@ pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.s
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 
 // Intentionally unimplemented until the owning milestones land:
-// transparent history and balance wait for the full transparent-address surface;
+// transparent balance waits for the full transparent-address surface;
 // mempool transaction streams wait for M3.
 
 /// Runtime options for [`LightwalletdGrpcAdapter`].
@@ -167,7 +168,7 @@ where
 
         for address in request.addresses {
             let query_request = transparent_address_utxos_request(
-                address,
+                &address,
                 latest_block.chain_epoch.network,
                 BlockHeight::new(start_height),
                 max_entries,
@@ -177,7 +178,7 @@ where
                 .transparent_address_utxos_at_epoch(query_request, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            replies.extend(lightwalletd_address_utxos(&address_utxos)?);
+            replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
         }
 
         replies.sort_by(|left, right| {
@@ -335,22 +336,64 @@ where
 
     async fn get_taddress_txids(
         &self,
-        _request: Request<lightwalletd::TransparentAddressBlockFilter>,
+        request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        Err(Status::unimplemented(
-            "GetTaddressTxids is outside the indexed transparent-address history surface",
-        ))
+        let filter = request.into_inner();
+        let latest_block = self
+            .query_api
+            .latest_block()
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let typed_request =
+            transparent_address_tx_history_request(&filter, latest_block.chain_epoch.network)?;
+        let history = transparent_address_tx_history(
+            &self.query_api,
+            typed_request,
+            latest_block.chain_epoch,
+        )
+        .await?;
+        let raw_transactions = history.into_iter().map(|artifact| {
+            Ok(lightwalletd::RawTransaction {
+                data: artifact.transaction_id.as_bytes().to_vec(),
+                height: u64::from(artifact.block_height.value()),
+            })
+        });
+        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
     }
 
     type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
 
     async fn get_taddress_transactions(
         &self,
-        _request: Request<lightwalletd::TransparentAddressBlockFilter>,
+        request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        Err(Status::unimplemented(
-            "GetTaddressTransactions is outside the indexed transparent-address history surface",
-        ))
+        let filter = request.into_inner();
+        let latest_block = self
+            .query_api
+            .latest_block()
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let typed_request =
+            transparent_address_tx_history_request(&filter, latest_block.chain_epoch.network)?;
+        let history = transparent_address_tx_history(
+            &self.query_api,
+            typed_request,
+            latest_block.chain_epoch,
+        )
+        .await?;
+        let mut raw_transactions = Vec::with_capacity(history.len());
+        for artifact in history {
+            let transaction = self
+                .query_api
+                .transaction_at_epoch(artifact.transaction_id, Some(latest_block.chain_epoch))
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
+            raw_transactions.push(Ok(lightwalletd::RawTransaction {
+                data: transaction.transaction.payload_bytes,
+                height: u64::from(transaction.transaction.block_height.value()),
+            }));
+        }
+        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
     }
 
     async fn get_taddress_balance(
@@ -549,6 +592,28 @@ where
     }
 }
 
+async fn transparent_address_tx_history<QueryApi>(
+    query_api: &QueryApi,
+    mut request: TransparentAddressTxIdsInRangeRequest,
+    chain_epoch: ChainEpoch,
+) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
+where
+    QueryApi: WalletQueryApi + ?Sized,
+{
+    let mut artifacts = Vec::new();
+    loop {
+        let response = query_api
+            .transparent_address_tx_ids_in_range_at_epoch(request.clone(), Some(chain_epoch))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        artifacts.extend(response.artifacts);
+        let Some(next_cursor) = response.next_cursor else {
+            return Ok(artifacts);
+        };
+        request.from_cursor = Some(next_cursor);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CompactBlockPoolSelection {
     sapling: bool,
@@ -724,8 +789,57 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     }
 }
 
+fn transparent_address_tx_history_request(
+    filter: &lightwalletd::TransparentAddressBlockFilter,
+    network: Network,
+) -> Result<TransparentAddressTxIdsInRangeRequest, Status> {
+    let address_text = filter.address.as_str();
+    let zebra_address: ZebraTransparentAddress = address_text.parse().map_err(|source| {
+        Status::invalid_argument(format!("transparent address is invalid: {source}"))
+    })?;
+    if !transparent_address_matches_network(zebra_address.network_kind(), network) {
+        return Err(Status::invalid_argument(
+            "transparent address network does not match server network",
+        ));
+    }
+    let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
+    if script_pub_key.is_empty() {
+        return Err(Status::invalid_argument(
+            "transparent address does not produce a receivable script",
+        ));
+    }
+    let address_script_hash = transparent_address_script_hash(&script_pub_key);
+    let range = filter
+        .range
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("range is required"))?;
+    let start_block = range
+        .start
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("range.start is required"))?;
+    let end_block = range
+        .end
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("range.end is required"))?;
+    let start_height = block_height_from_id(start_block)?;
+    let end_height = block_height_from_id(end_block)?;
+    if start_height > end_height {
+        return Err(Status::invalid_argument(
+            "range.start.height must not exceed range.end.height",
+        ));
+    }
+    Ok(TransparentAddressTxIdsInRangeRequest {
+        address_script_hash,
+        start_height,
+        end_height,
+        max_entries: NonZeroU32::MIN.saturating_add(999),
+        from_cursor: None,
+        descending: false,
+    })
+}
+
 fn transparent_address_utxos_request(
-    address: String,
+    address: &str,
     network: Network,
     start_height: BlockHeight,
     max_entries: NonZeroU32,
@@ -749,13 +863,17 @@ fn transparent_address_utxos_request(
     }
 
     Ok(TransparentAddressUtxosRequest {
-        address,
-        script_pub_key,
+        address_script_hash: transparent_address_script_hash(&script_pub_key),
         start_height,
         max_entries,
+        from_cursor: None,
     })
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Network is non_exhaustive; future variants must fail closed against transparent address validation until they are explicitly handled"
+)]
 fn transparent_address_matches_network(address_kind: ZebraNetworkKind, network: Network) -> bool {
     match network {
         Network::ZcashMainnet => address_kind == ZebraNetworkKind::Mainnet,
@@ -771,6 +889,7 @@ fn transparent_address_matches_network(address_kind: ZebraNetworkKind, network: 
 }
 
 fn lightwalletd_address_utxos(
+    address: &str,
     address_utxos: &TransparentAddressUtxos,
 ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
     address_utxos
@@ -778,7 +897,7 @@ fn lightwalletd_address_utxos(
         .iter()
         .map(|utxo| {
             Ok(lightwalletd::GetAddressUtxosReply {
-                address: address_utxos.address.clone(),
+                address: address.to_owned(),
                 txid: utxo.outpoint.transaction_id.as_bytes().to_vec(),
                 index: i32::try_from(utxo.outpoint.output_index)
                     .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,

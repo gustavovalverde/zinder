@@ -6,29 +6,31 @@
 use std::{num::NonZeroU32, time::Instant};
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
 };
 use zinder_source::{SourceError, TransactionBroadcaster};
 use zinder_store::{
     ArtifactFamily, ChainEpochReadApi, ChainEventEnvelope, ChainEventHistoryRequest,
     ChainEventStreamFamily, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, StoreError,
-    StreamCursorTokenV1,
+    StreamCursorTokenV1, TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
 };
 
 mod grpc;
 mod readiness_refresh;
 
 pub use grpc::{
-    ServerInfoSettings, WalletQueryGrpcAdapter, broadcast_transaction_response,
-    build_server_capabilities_message, chain_events_response, compact_block_response,
-    latest_block_response, latest_tree_state_response, status_from_query_error,
-    subtree_roots_response, transaction_response, tree_state_response,
+    ServerInfoSettings, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
+    broadcast_transaction_response, build_server_capabilities_message,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
+    chain_events_response, compact_block_response, latest_block_response,
+    latest_tree_state_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
+    transparent_address_utxos_response, tree_state_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -143,6 +145,26 @@ pub trait WalletQueryApi: Send + Sync + 'static {
             return Err(QueryError::ChainEpochPinUnsupported);
         }
         self.transparent_address_utxos(request).await
+    }
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts.
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+    ) -> Result<TransparentAddressTxIds, QueryError>;
+
+    /// Reads a bounded page of transparent-address tx-history index
+    /// artifacts from a requested chain epoch.
+    async fn transparent_address_tx_ids_in_range_at_epoch(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        if at_epoch.is_some() {
+            return Err(QueryError::ChainEpochPinUnsupported);
+        }
+        self.transparent_address_tx_ids_in_range(request).await
     }
 
     /// Reads the tree-state artifact at a block height.
@@ -496,24 +518,83 @@ where
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
-            let chain_epoch = reader.chain_epoch();
-            let address_script_hash = transparent_address_script_hash(&request.script_pub_key);
-            let utxos = reader.transparent_address_utxos(
-                address_script_hash,
-                request.start_height,
-                request.max_entries,
-            )?;
+            let page = read_api
+                .transparent_address_utxos_page(TransparentAddressUtxosPageRequest {
+                    at_epoch,
+                    address_script_hash: request.address_script_hash,
+                    start_height: request.start_height,
+                    max_entries: request.max_entries,
+                    from_cursor: request.from_cursor.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)?;
 
             Ok(TransparentAddressUtxos {
-                chain_epoch,
-                address: request.address,
-                utxos,
+                chain_epoch: page.chain_epoch,
+                utxos: page.utxos,
+                next_cursor: page.next_cursor,
             })
         }))
         .await;
         record_wallet_query_outcome(
             "transparent_address_utxos",
+            started_at,
+            &query_outcome,
+            None,
+        );
+        query_outcome
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        self.transparent_address_tx_ids_in_range_at_epoch(request, None)
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range_at_epoch(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        let started_at = Instant::now();
+        if request.start_height > request.end_height {
+            let outcome = Err(QueryError::InvalidBlockRange {
+                start_height: request.start_height,
+                end_height: request.end_height,
+            });
+            record_wallet_query_outcome(
+                "transparent_address_tx_ids_in_range",
+                started_at,
+                &outcome,
+                None,
+            );
+            return outcome;
+        }
+
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let page = read_api
+                .transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
+                    at_epoch,
+                    address_script_hash: request.address_script_hash,
+                    start_height: request.start_height,
+                    end_height: request.end_height,
+                    max_entries: request.max_entries,
+                    descending: request.descending,
+                    from_cursor: request.from_cursor.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)?;
+
+            Ok(TransparentAddressTxIds {
+                chain_epoch: page.chain_epoch,
+                artifacts: page.artifacts,
+                next_cursor: page.next_cursor,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_address_tx_ids_in_range",
             started_at,
             &query_outcome,
             None,
@@ -797,6 +878,22 @@ fn map_chain_event_store_error(error: StoreError) -> QueryError {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only the typed transparent-address cursor errors become query cursor errors; every other storage failure is preserved."
+)]
+fn map_transparent_utxo_store_error(error: StoreError) -> QueryError {
+    match error {
+        StoreError::TransparentUtxoCursorInvalid { reason } => {
+            QueryError::TransparentUtxoCursorInvalid { reason }
+        }
+        StoreError::TransparentHistoryCursorInvalid { reason } => {
+            QueryError::TransparentHistoryCursorInvalid { reason }
+        }
+        _ => QueryError::Store(error),
+    }
+}
+
 fn record_wallet_query_outcome<Response>(
     operation: &'static str,
     started_at: Instant,
@@ -841,6 +938,11 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
         Some(QueryError::ChainEventCursorInvalid { .. }) => "chain_event_cursor_invalid",
         Some(QueryError::ChainEventCursorExpired { .. }) => "chain_event_cursor_expired",
+        Some(QueryError::TransparentUtxoCursorInvalid { .. }) => "transparent_utxo_cursor_invalid",
+        Some(QueryError::TransparentHistoryCursorInvalid { .. }) => {
+            "transparent_history_cursor_invalid"
+        }
+        Some(QueryError::InvalidAddress { .. }) => "invalid_address",
         Some(QueryError::ChainEpochPinUnsupported) => "chain_epoch_pin_unsupported",
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
         Some(QueryError::ChainEpochPinMismatch { .. }) => "chain_epoch_pin_mismatch",
@@ -897,16 +999,24 @@ pub struct Transaction {
 }
 
 /// Transparent address UTXO request.
+///
+/// Address inputs are typed: the wire boundary parses string addresses and
+/// SHA-256-hashes them to `address_script_hash` before constructing this
+/// request. The native API never carries a `String` form on the read path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentAddressUtxosRequest {
-    /// Transparent address as supplied by the compatibility client.
-    pub address: String,
-    /// Raw `scriptPubKey` bytes for the transparent address.
-    pub script_pub_key: Vec<u8>,
-    /// Minimum mined height to include.
+    /// SHA-256 of the transparent address scriptPubKey.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Wallet-birthday optimization: minimum mined height to include.
+    /// `BlockHeight::new(0)` means scan from genesis. Ignored when
+    /// `from_cursor` is `Some`.
     pub start_height: BlockHeight,
-    /// Maximum number of UTXOs returned.
+    /// Server-bounded maximum entries per page.
     pub max_entries: NonZeroU32,
+    /// Optional cursor returned by a previous unary or streaming response.
+    /// When supplied, the scan resumes strictly after that position and
+    /// `start_height` is ignored.
+    pub from_cursor: Option<StreamCursorTokenV1>,
 }
 
 /// Transparent address UTXO response bound to one chain epoch.
@@ -914,10 +1024,39 @@ pub struct TransparentAddressUtxosRequest {
 pub struct TransparentAddressUtxos {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
-    /// Transparent address supplied in the request.
-    pub address: String,
-    /// Unspent outputs in ascending mined-height order.
+    /// Unspent outputs in ascending `(block_height, outpoint)` order.
     pub utxos: Vec<TransparentAddressUtxoArtifact>,
+    /// Resume cursor when more UTXOs may be available. `None` when the
+    /// scan was fully drained.
+    pub next_cursor: Option<StreamCursorTokenV1>,
+}
+
+/// Transparent-address tx-history range request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentAddressTxIdsInRangeRequest {
+    /// SHA-256 of the transparent address scriptPubKey.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Inclusive minimum block height. Ignored when `from_cursor` is `Some`.
+    pub start_height: BlockHeight,
+    /// Inclusive maximum block height.
+    pub end_height: BlockHeight,
+    /// Server-bounded maximum entries per page.
+    pub max_entries: NonZeroU32,
+    /// Optional cursor returned by a previous response.
+    pub from_cursor: Option<StreamCursorTokenV1>,
+    /// Iterate newest-first when true.
+    pub descending: bool,
+}
+
+/// Transparent-address tx-history page response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentAddressTxIds {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Tx-history artifacts in the requested order.
+    pub artifacts: Vec<TransparentAddressTxIndexArtifact>,
+    /// Resume cursor when more entries may be available.
+    pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
 /// Tree-state response bound to one chain epoch.
@@ -1042,6 +1181,27 @@ pub enum QueryError {
         protocol: ShieldedProtocol,
     },
 
+    /// Transparent-UTXO cursor failed validation.
+    #[error("transparent-UTXO cursor is invalid: {reason}")]
+    TransparentUtxoCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Transparent address tx-history cursor failed validation.
+    #[error("transparent history cursor is invalid: {reason}")]
+    TransparentHistoryCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Transparent address selector failed validation.
+    #[error("invalid transparent address: {reason}")]
+    InvalidAddress {
+        /// Validation failure reason.
+        reason: &'static str,
+    },
+
     /// Chain-event cursor failed validation.
     #[error("chain-event cursor is invalid: {reason}")]
     ChainEventCursorInvalid {
@@ -1147,12 +1307,6 @@ fn validate_block_range(
 
 fn completed_subtree_count(chain_epoch: ChainEpoch, protocol: ShieldedProtocol) -> u32 {
     chain_epoch.tip_metadata.completed_subtree_count(protocol)
-}
-
-fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
-    let mut hasher = Sha256::new();
-    hasher.update(script_pub_key);
-    TransparentAddressScriptHash::from_bytes(hasher.finalize().into())
 }
 
 fn transaction_id_at_block_index(

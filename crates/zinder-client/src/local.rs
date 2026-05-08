@@ -1,6 +1,6 @@
 //! Local secondary-reader implementation of the chain-index contract.
 
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
@@ -12,11 +12,17 @@ use zinder_core::{
     TreeStateArtifact,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
-use zinder_store::{ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError};
+use zinder_store::{
+    ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
+    TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
+};
 
 use crate::{
     BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream, IndexerError,
-    RemoteChainIndex, RemoteOpenOptions, TxStatus,
+    RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
+    TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
+    TxStatus,
 };
 
 /// Options for opening a local chain index over a `RocksDB` secondary.
@@ -366,6 +372,67 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
+    async fn transparent_address_utxos(
+        &self,
+        query: TransparentAddressUtxosQuery,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        self.transparent_address_utxos_from_epoch(query, None).await
+    }
+
+    async fn transparent_address_utxos_at_epoch(
+        &self,
+        query: TransparentAddressUtxosQuery,
+        at_epoch: ChainEpoch,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        self.transparent_address_utxos_from_epoch(query, Some(at_epoch))
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        self.transparent_address_tx_ids_in_range_from_epoch(query, None)
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range_at_epoch(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+        at_epoch: ChainEpoch,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        self.transparent_address_tx_ids_in_range_from_epoch(query, Some(at_epoch))
+            .await
+    }
+
+    async fn transparent_address_utxos_stream(
+        &self,
+        query: TransparentAddressUtxosQuery,
+    ) -> Result<TransparentAddressUtxoStream, IndexerError> {
+        let view = self
+            .transparent_address_utxos_from_epoch(query, None)
+            .await?;
+        let chain_epoch = view.chain_epoch;
+        let next_cursor = view.next_cursor;
+        let last_index = view.utxos.len().saturating_sub(1);
+        let items = view
+            .utxos
+            .into_iter()
+            .enumerate()
+            .map(move |(index, utxo)| {
+                Ok(TransparentAddressUtxoStreamItem {
+                    chain_epoch,
+                    utxo,
+                    cursor: if index == last_index {
+                        next_cursor.clone()
+                    } else {
+                        None
+                    },
+                })
+            });
+        Ok(Box::pin(stream::iter(items)))
+    }
+
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: zinder_core::TransparentMempoolOutputsRequest,
@@ -446,6 +513,96 @@ impl LocalChainIndex {
         .await
     }
 
+    async fn transparent_address_tx_ids_in_range_from_epoch(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        let max_entries = query
+            .max_entries
+            .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
+        let store = self.store.clone();
+        let descending = query.descending;
+        let page = join_blocking(tokio::task::spawn_blocking(move || {
+            store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let cursor_token = query.from_cursor.map(|cursor| {
+                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
+            });
+            store
+                .transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
+                    at_epoch,
+                    address_script_hash: query.address_script_hash,
+                    start_height: query.start_height,
+                    end_height: query.end_height,
+                    max_entries,
+                    descending: query.descending,
+                    from_cursor: cursor_token.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)
+        }))
+        .await?;
+        let chain_epoch = page.chain_epoch;
+        let next_cursor = page
+            .next_cursor
+            .map(|cursor| crate::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec()));
+        let last_index = page.artifacts.len().saturating_sub(1);
+        let _ = descending;
+        let items = page
+            .artifacts
+            .into_iter()
+            .enumerate()
+            .map(move |(index, artifact)| {
+                Ok(TransparentAddressTxIdsStreamItem {
+                    chain_epoch,
+                    artifact,
+                    cursor: if index == last_index {
+                        next_cursor.clone()
+                    } else {
+                        None
+                    },
+                })
+            });
+        Ok(Box::pin(stream::iter(items)))
+    }
+
+    async fn transparent_address_utxos_from_epoch(
+        &self,
+        query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        let max_entries = query
+            .max_entries
+            .unwrap_or(DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS);
+        let store = self.store.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let cursor_token = query.from_cursor.map(|cursor| {
+                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
+            });
+            let page = store
+                .transparent_address_utxos_page(TransparentAddressUtxosPageRequest {
+                    at_epoch,
+                    address_script_hash: query.address_script_hash,
+                    start_height: query.start_height,
+                    max_entries,
+                    from_cursor: cursor_token.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)?;
+            Ok(TransparentAddressUtxosView {
+                chain_epoch: page.chain_epoch,
+                utxos: page.utxos,
+                next_cursor: page.next_cursor.map(|cursor| {
+                    crate::TransparentUtxoCursor::from_bytes(cursor.as_bytes().to_vec())
+                }),
+            })
+        }))
+        .await
+    }
+
     async fn transaction_by_id_from_epoch(
         &self,
         transaction_id: TransactionId,
@@ -498,6 +655,22 @@ fn spawn_catchup_loop(store: SecondaryChainStore, interval: Duration, cancel: Ca
             }
         }
     });
+}
+
+const DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only the typed transparent-UTXO cursor error becomes a client invalid-request error; every other storage failure preserves its shared mapping."
+)]
+fn map_transparent_utxo_store_error(error: StoreError) -> IndexerError {
+    match error {
+        StoreError::TransparentUtxoCursorInvalid { reason } => {
+            IndexerError::invalid_request(reason)
+        }
+        _ => IndexerError::from_store_error(error),
+    }
 }
 
 #[allow(

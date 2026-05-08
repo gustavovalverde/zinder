@@ -8,6 +8,7 @@ members = [
     "crates/zinder-store",
     "crates/zinder-testkit",
     "services/zinder-compat-lightwalletd",
+    "services/zinder-derive",
     "services/zinder-ingest",
     "services/zinder-query",
 ]
@@ -64,6 +65,7 @@ zebra-chain = "6.0.2"
 zinder-core = { path = "crates/zinder-core" }
 zinder-client = { path = "crates/zinder-client" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
+zinder-derive = { path = "services/zinder-derive" }
 zinder-ingest = { path = "services/zinder-ingest" }
 zinder-proto = { path = "crates/zinder-proto" }
 zinder-query = { path = "services/zinder-query" }

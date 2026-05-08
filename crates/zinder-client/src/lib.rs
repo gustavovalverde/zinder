@@ -14,7 +14,10 @@ pub use chain_index::{
     ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventStream,
     ChainIndex, ChainRangeReverted, IndexStream, MempoolEvent, MempoolEventCursor,
     MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest,
-    MempoolSnapshotView, TxStatus,
+    MempoolSnapshotView, TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
+    TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
+    TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
+    TransparentHistoryCursor, TransparentUtxoCursor, TxStatus,
 };
 pub use error::IndexerError;
 pub use local::{LocalChainIndex, LocalOpenOptions};
@@ -24,7 +27,8 @@ pub use zinder_core::{
     BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
     ChainEpochId, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentMempoolOutput,
+    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
     TreeStateArtifact,
 };

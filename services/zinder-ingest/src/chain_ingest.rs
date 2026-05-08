@@ -7,17 +7,21 @@
 //! [`ChainEpoch`] that the engine writes.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
+use zebra_chain::{
+    serialization::ZcashDeserializeInto, transaction::Transaction as ZebraTransaction,
+};
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, TransactionArtifact, TransparentAddressUtxoArtifact,
-    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    SubtreeRootIndex, TransactionArtifact, TransactionId, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{NodeSource, SourceBlock, SourceError, SourceSubtreeRoots};
 use zinder_store::{
@@ -26,7 +30,9 @@ use zinder_store::{
 };
 
 use crate::{
-    ArtifactDeriveError, artifact_builder::CompactBlockArtifactBuilder, derive_block_artifact,
+    ArtifactDeriveError,
+    artifact_builder::{CompactBlockArtifactBuilder, TransparentAddressTxIndexSpendCandidate},
+    derive_block_artifact,
 };
 
 const FETCH_RETRY_MAX_ATTEMPTS: u32 = 5;
@@ -113,6 +119,18 @@ pub enum IngestError {
         subtree_index: SubtreeRootIndex,
         /// Height of the block that completed this subtree.
         completing_block_height: BlockHeight,
+    },
+
+    /// A stored transparent prevout transaction did not contain the output
+    /// referenced by the spending transaction.
+    #[error(
+        "transparent prevout {transaction_id:?}:{output_index} is missing from the resolved transaction"
+    )]
+    TransparentPrevoutOutputMissing {
+        /// Transaction id of the resolved prevout transaction.
+        transaction_id: TransactionId,
+        /// Output index referenced by the spending transaction input.
+        output_index: u32,
     },
 
     /// Shielded protocol is not supported by the current ingest subtree-root tracker.
@@ -265,6 +283,9 @@ pub(crate) struct BuiltArtifacts {
     pub(crate) transactions: Vec<TransactionArtifact>,
     pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
     pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
+    pub(crate) transparent_address_tx_index_spend_candidates:
+        Vec<TransparentAddressTxIndexSpendCandidate>,
     pub(crate) tip_metadata: ChainTipMetadata,
 }
 
@@ -298,6 +319,9 @@ impl ArtifactBuilder for IngestArtifactBuilder {
             transactions: compact_block_build.transactions,
             transparent_address_utxos: compact_block_build.transparent_address_utxos,
             transparent_utxo_spends: compact_block_build.transparent_utxo_spends,
+            transparent_address_tx_index: compact_block_build.transparent_address_tx_index,
+            transparent_address_tx_index_spend_candidates: compact_block_build
+                .transparent_address_tx_index_spend_candidates,
             tip_metadata: compact_block_build.tip_metadata,
         })
     }
@@ -313,6 +337,9 @@ pub(crate) struct IngestBatch {
     pub(crate) subtree_roots: Vec<SubtreeRootArtifact>,
     pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
     pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
+    pub(crate) transparent_address_tx_index_spend_candidates:
+        Vec<TransparentAddressTxIndexSpendCandidate>,
     pub(crate) tip_metadata: Option<ChainTipMetadata>,
 }
 
@@ -699,6 +726,7 @@ pub(crate) fn commit_ingest_batch(
         record_ingest_commit_outcome(started_at, block_count, &commit_outcome);
         return commit_outcome;
     }
+    append_transparent_spend_tx_index_artifacts(store, batch)?;
     batch.tip_metadata = None;
     let mut artifacts = ChainEpochArtifacts::new(
         chain_epoch,
@@ -728,6 +756,12 @@ pub(crate) fn commit_ingest_batch(
             .with_transparent_utxo_spends(std::mem::take(&mut batch.transparent_utxo_spends));
     }
 
+    if !batch.transparent_address_tx_index.is_empty() {
+        artifacts = artifacts.with_transparent_address_tx_index(std::mem::take(
+            &mut batch.transparent_address_tx_index,
+        ));
+    }
+
     let commit_result = store
         .commit_chain_epoch(artifacts.with_reorg_window_change(reorg_window_change))
         .map_err(IngestError::from);
@@ -745,6 +779,109 @@ pub(crate) fn commit_ingest_batch(
             commit_outcome
         }
     }
+}
+
+fn append_transparent_spend_tx_index_artifacts(
+    store: &PrimaryChainStore,
+    batch: &mut IngestBatch,
+) -> Result<(), IngestError> {
+    if batch
+        .transparent_address_tx_index_spend_candidates
+        .is_empty()
+    {
+        return Ok(());
+    }
+
+    let batch_transactions = batch
+        .transactions
+        .iter()
+        .map(|transaction| (transaction.transaction_id, transaction))
+        .collect::<HashMap<_, _>>();
+    let current_chain_reader = if store.current_chain_epoch()?.is_some() {
+        Some(store.current_chain_epoch_reader()?)
+    } else {
+        None
+    };
+    let mut emitted = batch
+        .transparent_address_tx_index
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.address_script_hash,
+                artifact.block_height,
+                artifact.tx_index_in_block,
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    for candidate in std::mem::take(&mut batch.transparent_address_tx_index_spend_candidates) {
+        let Some(script_pub_key) = transparent_prevout_script_pub_key(
+            candidate.spent_outpoint,
+            &batch_transactions,
+            current_chain_reader.as_ref(),
+        )?
+        else {
+            continue;
+        };
+        let address_script_hash =
+            crate::artifact_builder::transparent_address_script_hash(script_pub_key.as_slice());
+        if emitted.insert((
+            address_script_hash,
+            candidate.block_height,
+            candidate.tx_index_in_block,
+        )) {
+            batch
+                .transparent_address_tx_index
+                .push(TransparentAddressTxIndexArtifact::new(
+                    address_script_hash,
+                    candidate.block_height,
+                    candidate.tx_index_in_block,
+                    candidate.transaction_id,
+                    candidate.block_hash,
+                ));
+        }
+    }
+
+    Ok(())
+}
+
+fn transparent_prevout_script_pub_key(
+    outpoint: TransparentOutPoint,
+    batch_transactions: &HashMap<TransactionId, &TransactionArtifact>,
+    current_chain_reader: Option<&zinder_store::ChainEpochReader<'_>>,
+) -> Result<Option<Vec<u8>>, IngestError> {
+    if let Some(transaction) = batch_transactions.get(&outpoint.transaction_id) {
+        return transparent_output_script_pub_key(transaction, outpoint);
+    }
+
+    let Some(current_chain_reader) = current_chain_reader else {
+        return Ok(None);
+    };
+    let Some(transaction) = current_chain_reader.transaction_by_id(outpoint.transaction_id)? else {
+        return Ok(None);
+    };
+
+    transparent_output_script_pub_key(&transaction, outpoint)
+}
+
+fn transparent_output_script_pub_key(
+    transaction: &TransactionArtifact,
+    outpoint: TransparentOutPoint,
+) -> Result<Option<Vec<u8>>, IngestError> {
+    let transaction = transaction
+        .payload_bytes
+        .as_slice()
+        .zcash_deserialize_into::<ZebraTransaction>()
+        .map_err(|source| ArtifactDeriveError::TransactionParseFailed { source })?;
+    let output_index = u32_to_usize(outpoint.output_index);
+    let Some(output) = transaction.outputs().get(output_index) else {
+        return Err(IngestError::TransparentPrevoutOutputMissing {
+            transaction_id: outpoint.transaction_id,
+            output_index: outpoint.output_index,
+        });
+    };
+
+    Ok(Some(output.lock_script.as_raw_bytes().to_vec()))
 }
 
 fn record_ingest_source_outcome<Response>(
@@ -803,6 +940,9 @@ fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(IngestError::SubtreeRootCompletingBlockMissing { .. }) => {
             "subtree_root_completing_block_missing"
+        }
+        Some(IngestError::TransparentPrevoutOutputMissing { .. }) => {
+            "transparent_prevout_output_missing"
         }
         Some(IngestError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
         Some(IngestError::EmptyIngestBatch) => "empty_ingest_batch",
@@ -991,4 +1131,238 @@ pub(crate) fn current_unix_millis() -> Result<UnixTimestampMillis, IngestError> 
 )]
 const fn u32_to_usize(count: u32) -> usize {
     count as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, num::NonZeroU32};
+
+    use prost::Message;
+    use serde_json::Value;
+    use zinder_core::{Network, TransactionId, TransparentAddressScriptHash};
+    use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
+    use zinder_source::{SourceBlock, decode_display_block_hash};
+    use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, TransparentAddressTxIndexPageRequest};
+    use zinder_testkit::StoreFixture;
+
+    use super::*;
+    use crate::{
+        artifact_builder::transparent_address_script_hash, derive_compact_block_artifact,
+        derive_transaction_artifacts,
+    };
+
+    #[test]
+    fn commit_ingest_batch_indexes_transparent_spend_only_history() -> Result<(), Box<dyn Error>> {
+        let (store_fixture, prevout_block, prevout_transaction_id, address_script_hash) =
+            committed_prevout_fixture()?;
+        let store = store_fixture.chain_store().clone();
+        let spending_transaction_id = TransactionId::from_bytes([0x77; 32]);
+        let spending_block_height = BlockHeight::new(2);
+        let spending_block_hash = test_block_hash(2);
+        let mut batch = transparent_spend_batch(
+            prevout_block.hash,
+            prevout_transaction_id,
+            spending_transaction_id,
+            spending_block_height,
+            spending_block_hash,
+        );
+        let spending_chain_epoch = test_chain_epoch(
+            2,
+            prevout_block.network,
+            spending_block_height,
+            spending_block_hash,
+        );
+
+        commit_ingest_batch(
+            &store,
+            spending_chain_epoch,
+            &mut batch,
+            ReorgWindowChange::FinalizeThrough {
+                height: spending_block_height,
+            },
+        )?;
+
+        let page =
+            store.transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
+                at_epoch: None,
+                address_script_hash,
+                start_height: BlockHeight::new(0),
+                end_height: BlockHeight::new(10),
+                max_entries: NonZeroU32::new(10).ok_or("page size must be nonzero")?,
+                descending: false,
+                from_cursor: None,
+            })?;
+
+        let artifact = page
+            .artifacts
+            .first()
+            .ok_or("transparent spend history artifact should be indexed")?;
+        assert_eq!(page.artifacts.len(), 1);
+        assert_eq!(artifact.block_height, spending_block_height);
+        assert_eq!(artifact.block_hash, spending_block_hash);
+        assert_eq!(artifact.tx_index_in_block, 7);
+        assert_eq!(artifact.transaction_id, spending_transaction_id);
+
+        Ok(())
+    }
+
+    fn committed_prevout_fixture() -> Result<
+        (
+            StoreFixture,
+            SourceBlock,
+            TransactionId,
+            TransparentAddressScriptHash,
+        ),
+        Box<dyn Error>,
+    > {
+        let prevout_block = fixture_source_block()?;
+        let prevout_transactions = derive_transaction_artifacts(&prevout_block)?;
+        let prevout_transaction_id = prevout_transactions
+            .first()
+            .ok_or("fixture block must contain a transaction")?
+            .transaction_id;
+        let script_pub_key = first_transparent_output_script_pub_key(&prevout_block)?;
+        let address_script_hash = transparent_address_script_hash(script_pub_key.as_slice());
+
+        let store_fixture = StoreFixture::open()?;
+        let store = store_fixture.chain_store().clone();
+        let prevout_chain_epoch = test_chain_epoch(
+            1,
+            prevout_block.network,
+            prevout_block.height,
+            prevout_block.hash,
+        );
+        store.commit_chain_epoch(
+            ChainEpochArtifacts::new(
+                prevout_chain_epoch,
+                vec![derive_block_artifact(&prevout_block)?],
+                vec![derive_compact_block_artifact(&prevout_block)?],
+            )
+            .with_transactions(prevout_transactions),
+        )?;
+
+        Ok((
+            store_fixture,
+            prevout_block,
+            prevout_transaction_id,
+            address_script_hash,
+        ))
+    }
+
+    fn transparent_spend_batch(
+        parent_hash: BlockHash,
+        prevout_transaction_id: TransactionId,
+        spending_transaction_id: TransactionId,
+        spending_block_height: BlockHeight,
+        spending_block_hash: BlockHash,
+    ) -> IngestBatch {
+        IngestBatch {
+            finalized_blocks: vec![BlockArtifact::new(
+                spending_block_height,
+                spending_block_hash,
+                parent_hash,
+                b"spending-block".to_vec(),
+            )],
+            compact_blocks: vec![CompactBlockArtifact::new(
+                spending_block_height,
+                spending_block_hash,
+                b"spending-compact-block".to_vec(),
+            )],
+            transparent_address_tx_index_spend_candidates: vec![
+                TransparentAddressTxIndexSpendCandidate {
+                    spent_outpoint: TransparentOutPoint::new(prevout_transaction_id, 0),
+                    block_height: spending_block_height,
+                    block_hash: spending_block_hash,
+                    tx_index_in_block: 7,
+                    transaction_id: spending_transaction_id,
+                },
+            ],
+            tip_metadata: Some(ChainTipMetadata::empty()),
+            ..IngestBatch::default()
+        }
+    }
+
+    fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/z3-regtest-block-1.json"))?;
+        let raw_block_hex = string_field(&fixture, "raw_block_hex")?;
+        let raw_block_bytes = hex::decode(raw_block_hex)?;
+        let height = u32_field(&fixture, "height")?;
+        let source_block = SourceBlock::from_raw_block_bytes(
+            Network::ZcashRegtest,
+            BlockHeight::new(height),
+            raw_block_bytes,
+        )?;
+
+        assert_eq!(
+            source_block.hash,
+            decode_display_block_hash(string_field(&fixture, "hash")?)?
+        );
+        assert_eq!(
+            source_block.parent_hash,
+            decode_display_block_hash(string_field(&fixture, "previousblockhash")?)?
+        );
+        assert_eq!(
+            source_block.block_time_seconds,
+            u32_field(&fixture, "time")?
+        );
+
+        Ok(source_block)
+    }
+
+    fn first_transparent_output_script_pub_key(
+        source_block: &SourceBlock,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let compact_block_artifact = derive_compact_block_artifact(source_block)?;
+        let compact_block =
+            LightwalletdCompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
+        let transaction = compact_block
+            .vtx
+            .first()
+            .ok_or("fixture compact block must contain a transaction")?;
+        let output = transaction
+            .vout
+            .first()
+            .ok_or("fixture compact transaction must contain a transparent output")?;
+
+        Ok(output.script_pub_key.clone())
+    }
+
+    fn test_chain_epoch(
+        id: u64,
+        network: Network,
+        tip_height: BlockHeight,
+        tip_hash: BlockHash,
+    ) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(id),
+            network,
+            tip_height,
+            tip_hash,
+            finalized_height: tip_height,
+            finalized_hash: tip_hash,
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1_774_669_000_000 + id),
+        }
+    }
+
+    fn test_block_hash(seed: u8) -> BlockHash {
+        BlockHash::from_bytes([seed; 32])
+    }
+
+    fn string_field<'value>(value: &'value Value, field: &str) -> Result<&'value str, String> {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{field} must be a string"))
+    }
+
+    fn u32_field(value: &Value, field: &str) -> Result<u32, String> {
+        let raw = value
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
+        u32::try_from(raw).map_err(|error| format!("{field} exceeds u32: {error}"))
+    }
 }

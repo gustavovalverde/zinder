@@ -20,7 +20,8 @@ const SUBTREE_ROOT_KEY_KIND: u8 = 5;
 const TRANSPARENT_ADDRESS_UTXO_KEY_KIND: u8 = 6;
 const TRANSPARENT_UTXO_SPEND_KEY_KIND: u8 = 7;
 const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
-// Key kinds 9..=32 are reserved for future artifact families; visibility keys start at 33.
+const TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND: u8 = 9;
+// Key kinds 10..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -186,6 +187,42 @@ impl StoreKey {
         Self(key)
     }
 
+    pub(crate) fn transparent_address_tx_index_address_prefix(
+        network: Network,
+        address_script_hash: TransparentAddressScriptHash,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&address_script_hash.as_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_address_tx_index_height_prefix(
+        network: Network,
+        address_script_hash: TransparentAddressScriptHash,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key =
+            Self::transparent_address_tx_index_address_prefix(network, address_script_hash).0;
+        key.extend_from_slice(&height.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_address_tx_index(
+        network: Network,
+        address_script_hash: TransparentAddressScriptHash,
+        height: BlockHeight,
+        tx_index_in_block: u32,
+        chain_epoch: ChainEpochId,
+    ) -> Self {
+        let mut key =
+            Self::transparent_address_tx_index_height_prefix(network, address_script_hash, height)
+                .0;
+        key.extend_from_slice(&tx_index_in_block.to_be_bytes());
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        Self(key)
+    }
+
     pub(crate) fn chain_event(event_sequence: u64) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&event_sequence.to_be_bytes());
@@ -340,7 +377,9 @@ impl StoreKey {
         }
         if !matches!(
             key_bytes[1],
-            TRANSPARENT_ADDRESS_UTXO_KEY_KIND | TRANSPARENT_UTXO_SPEND_KEY_KIND
+            TRANSPARENT_ADDRESS_UTXO_KEY_KIND
+                | TRANSPARENT_UTXO_SPEND_KEY_KIND
+                | TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND
         ) {
             return None;
         }
@@ -427,6 +466,14 @@ mod tests {
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
                 chain_epoch,
             ),
+            StoreKey::transparent_address_tx_index(
+                network,
+                zinder_core::TransparentAddressScriptHash::from_bytes([0x55; 32]),
+                height,
+                7,
+                chain_epoch,
+            ),
+            StoreKey::mempool_event(99),
         ]
         .map(|key| key.as_bytes()[..2].to_vec());
         let visibility_prefixes = [
@@ -441,7 +488,13 @@ mod tests {
             ),
         ]
         .map(|key| key.as_bytes()[..2].to_vec());
+        let raw_artifact_prefix_count = artifact_prefixes.len();
         let artifact_prefixes = artifact_prefixes.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            artifact_prefixes.len(),
+            raw_artifact_prefix_count,
+            "artifact key kinds collide within the artifact namespace"
+        );
 
         for visibility_prefix in visibility_prefixes {
             assert!(!artifact_prefixes.contains(&visibility_prefix));

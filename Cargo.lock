@@ -5123,6 +5123,32 @@ name = "zinder-core"
 version = "0.1.0"
 
 [[package]]
+name = "zinder-derive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "config",
+ "eyre",
+ "prost",
+ "rust-rocksdb",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tonic-health",
+ "tonic-reflection",
+ "tracing",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-runtime",
+]
+
+[[package]]
 name = "zinder-ingest"
 version = "0.1.0"
 dependencies = [
@@ -5193,6 +5219,7 @@ dependencies = [
  "tonic-reflection",
  "tonic-types",
  "tracing",
+ "zebra-chain",
  "zinder-core",
  "zinder-proto",
  "zinder-runtime",

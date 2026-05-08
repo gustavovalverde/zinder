@@ -203,6 +203,12 @@ where
         batch
             .transparent_utxo_spends
             .extend(built_artifacts.transparent_utxo_spends);
+        batch
+            .transparent_address_tx_index
+            .extend(built_artifacts.transparent_address_tx_index);
+        batch
+            .transparent_address_tx_index_spend_candidates
+            .extend(built_artifacts.transparent_address_tx_index_spend_candidates);
         batch.tip_metadata = Some(built_artifacts.tip_metadata);
 
         if batch.len() == commit_batch_blocks {
@@ -1203,6 +1209,8 @@ mod tests {
                 transactions: Vec::new(),
                 transparent_address_utxos: Vec::new(),
                 transparent_utxo_spends: Vec::new(),
+                transparent_address_tx_index: Vec::new(),
+                transparent_address_tx_index_spend_candidates: Vec::new(),
                 tip_metadata: ChainTipMetadata::new(
                     self.sapling_commitment_tree_size,
                     self.orchard_commitment_tree_size,

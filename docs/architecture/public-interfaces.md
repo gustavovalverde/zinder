@@ -467,13 +467,13 @@ Current active wallet capabilities:
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-M2 wallet-compatibility hardening capability strings, reserved but not
-advertised until the native proto surface exists:
+Transparent-address read capabilities advertised once the native proto and
+`zinder-client::ChainIndex` cover them:
 
-- `wallet.address.transparent_utxos_v1` (advertised only when the native
-  `WalletQuery` proto and `zinder-client::ChainIndex` expose transparent UTXO
-  reads backed by stored artifacts; the lightwalletd compatibility adapter
-  already uses that stored-artifact path)
+- `wallet.address.transparent_utxos_v1` (advertised on every deployment that
+  exposes the `TransparentAddressUtxos` and `TransparentAddressUtxosStream`
+  RPCs over the stored transparent-UTXO and transparent-spend artifact
+  families)
 
 M3 and later capability strings, reserved but not advertised in M2:
 

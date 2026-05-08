@@ -41,6 +41,8 @@ pub enum ArtifactFamily {
     TransparentAddressUtxo,
     /// Transparent UTXO spend artifact.
     TransparentUtxoSpend,
+    /// Transparent address tx-history index artifact.
+    TransparentAddressTxIndex,
     /// Mempool event envelope.
     MempoolEvent,
 }
@@ -204,6 +206,20 @@ pub enum StoreError {
     /// Chain event cursor failed validation.
     #[error("chain event cursor is invalid: {reason}")]
     ChainEventCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Transparent UTXO cursor failed validation.
+    #[error("transparent UTXO cursor is invalid: {reason}")]
+    TransparentUtxoCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Transparent address tx-history cursor failed validation.
+    #[error("transparent history cursor is invalid: {reason}")]
+    TransparentHistoryCursorInvalid {
         /// Cursor validation failure reason.
         reason: &'static str,
     },

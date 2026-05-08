@@ -606,6 +606,148 @@ message MempoolEventEnvelope {
   }
 }
 
+// Address selector accepted by every transparent-address request.
+//
+// Typed clients use script_hash for the high-throughput path; CLI, tests,
+// and debug callers use the string form. The native adapter parses string
+// addresses through ZebraTransparentAddress and SHA-256-hashes them; the
+// in-process WalletQueryApi only sees the typed script hash.
+message AddressLookup {
+  oneof selector {
+    // SHA-256 of the transparent address scriptPubKey, in canonical 32-byte
+    // form.
+    bytes script_hash = 1;
+
+    // P2PKH or P2SH transparent address in its base58check string form.
+    string address = 2;
+  }
+}
+
+// Transparent-address UTXO request consumed by both the unary and streaming
+// RPCs. Pagination across both forms uses the same opaque cursor envelope.
+message TransparentAddressUtxosRequest {
+  // Selector for the transparent address being queried.
+  AddressLookup address = 1;
+
+  // Maximum number of UTXOs returned. Absent means use the server default;
+  // values larger than the server's configured cap are silently clamped.
+  optional uint32 max_entries = 2;
+
+  // Empty starts at start_height. Non-empty resumes strictly after the
+  // supplied opaque cursor, ignoring start_height.
+  bytes from_cursor = 3;
+
+  // Optional chain epoch that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 4;
+
+  // Wallet-birthday optimization: minimum mined height to include. 0 means
+  // scan from genesis.
+  uint32 start_height = 5;
+}
+
+// One unspent transparent output.
+message TransparentAddressUtxo {
+  // SHA-256 of the transparent address scriptPubKey.
+  bytes address_script_hash = 1;
+
+  // Raw scriptPubKey bytes.
+  bytes script_pub_key = 2;
+
+  // Identifier of the transaction that creates this output.
+  bytes transaction_id = 3;
+
+  // Output index within the creating transaction.
+  uint32 output_index = 4;
+
+  // Output value in zatoshis.
+  uint64 value_zat = 5;
+
+  // Height of the block that mined the creating transaction.
+  uint32 block_height = 6;
+
+  // Hash of the block that mined the creating transaction.
+  bytes block_hash = 7;
+}
+
+// Bounded transparent UTXO response bound to one chain epoch.
+message TransparentAddressUtxosResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Unspent outputs in ascending mined-height order.
+  repeated TransparentAddressUtxo utxos = 2;
+
+  // Empty when the bounded scan was fully drained. Non-empty carries an
+  // opaque StreamCursorTokenV1 for resuming the next page.
+  bytes next_cursor = 3;
+}
+
+// Streamed transparent UTXO chunk emitted one per UTXO. Streaming is the
+// preferred form for mining and exchange addresses.
+message TransparentAddressUtxosStreamChunk {
+  // Chain epoch used for this UTXO.
+  ChainEpoch chain_epoch = 1;
+
+  // Single unspent output.
+  TransparentAddressUtxo utxo = 2;
+
+  // Cursor for resuming strictly after this UTXO.
+  bytes cursor = 3;
+}
+
+// Transparent-address tx-history range request, server-streamed.
+message TransparentAddressTxIdsInRangeRequest {
+  // Selector for the transparent address being queried.
+  AddressLookup address = 1;
+
+  // Inclusive minimum block height. 0 means start from genesis.
+  uint32 start_height = 2;
+
+  // Inclusive maximum block height.
+  uint32 end_height = 3;
+
+  // Server-bounded maximum entries per page. 0 means use the server
+  // default; values larger than the server's configured cap are silently
+  // clamped.
+  uint32 max_entries = 4;
+
+  // Empty starts at start_height (in the requested direction). Non-empty
+  // resumes strictly after the supplied opaque cursor; the cursor's
+  // encoded direction is authoritative.
+  bytes from_cursor = 5;
+
+  // Optional chain epoch that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 6;
+
+  // Iterate newest-first when true. The cursor body encodes the direction
+  // so resume continues in the same order.
+  bool descending = 7;
+}
+
+// One streamed transparent-address tx-history chunk.
+message TransparentAddressTxIdsChunk {
+  // Chain epoch used for this chunk.
+  ChainEpoch chain_epoch = 1;
+
+  // Identifier of the indexed transaction.
+  bytes transaction_id = 2;
+
+  // Height of the block that mined the indexed transaction.
+  uint32 block_height = 3;
+
+  // Position of the indexed transaction inside its block.
+  uint32 tx_index_in_block = 4;
+
+  // Hash of the block that mined the indexed transaction.
+  bytes block_hash = 5;
+
+  // Cursor for resuming strictly after this entry. Empty on every chunk
+  // except the last one when more entries may be available.
+  bytes cursor = 6;
+}
+
 // Native Zinder wallet and wallet-like application query service.
 service WalletQuery {
   // Return latest visible block metadata.
@@ -640,6 +782,21 @@ service WalletQuery {
 
   // Stream replayable mempool events.
   rpc MempoolEvents(MempoolEventsRequest) returns (stream MempoolEventEnvelope);
+
+  // Return unspent transparent outputs for one transparent address.
+  rpc TransparentAddressUtxos(TransparentAddressUtxosRequest)
+      returns (TransparentAddressUtxosResponse);
+
+  // Stream unspent transparent outputs for one transparent address. Used by
+  // mining and exchange addresses where a single message would exceed the
+  // gRPC size cap.
+  rpc TransparentAddressUtxosStream(TransparentAddressUtxosRequest)
+      returns (stream TransparentAddressUtxosStreamChunk);
+
+  // Stream the transparent-address tx-history index for an inclusive
+  // height range, in ascending or descending mined order.
+  rpc TransparentAddressTxIdsInRange(TransparentAddressTxIdsInRangeRequest)
+      returns (stream TransparentAddressTxIdsChunk);
 
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);

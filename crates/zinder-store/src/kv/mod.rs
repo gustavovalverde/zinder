@@ -16,6 +16,7 @@ pub(crate) enum StorageTable {
     SubtreeRoot,
     TransparentAddressUtxo,
     TransparentUtxoSpend,
+    TransparentAddressTxIndex,
     ReorgWindow,
     ChainEvent,
     MempoolEvent,
@@ -33,13 +34,14 @@ impl StorageTable {
             Self::SubtreeRoot => "subtree_root",
             Self::TransparentAddressUtxo => "transparent_address_utxo",
             Self::TransparentUtxoSpend => "transparent_utxo_spend",
+            Self::TransparentAddressTxIndex => "transparent_address_tx_index",
             Self::ReorgWindow => "reorg_window",
             Self::ChainEvent => "chain_event",
             Self::MempoolEvent => "mempool_event",
         }
     }
 
-    pub(crate) const fn all() -> [Self; 12] {
+    pub(crate) const fn all() -> [Self; 13] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
@@ -50,6 +52,7 @@ impl StorageTable {
             Self::SubtreeRoot,
             Self::TransparentAddressUtxo,
             Self::TransparentUtxoSpend,
+            Self::TransparentAddressTxIndex,
             Self::ReorgWindow,
             Self::ChainEvent,
             Self::MempoolEvent,

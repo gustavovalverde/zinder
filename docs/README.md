@@ -47,7 +47,10 @@ Living external references that constrain Zinder's design. Refreshed as the upst
 
 Mutable working documents for un-shipped multi-PR work. When a spec's work lands, its locked decisions promote to one or more ADRs and the spec is deleted.
 
-No specs are currently in flight. The most recent spec to land was M3 mempool; its locked decisions live in [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
+- [M4: Transparent-address artifact surface](specs/m4-transparent-address.md): native `WalletQuery.TransparentAddressUtxos[Stream]` and `TransparentAddressTxIdsInRange`, the matching `ChainIndex` methods, lightwalletd `GetTaddressTxids` / `GetTaddressTransactions`, and the new tx-history canonical artifact family.
+- [M5: Transparent-address balance and derive-plane instantiation](specs/m5-transparent-address-balance.md): instantiates `services/zinder-derive` as a real deployable, ships `TransparentAddressBalance` as the first derive consumer (running-totals accumulator with structured `confirmed_zat` / `unconfirmed_delta_zat` wire shape), federates the RPC under `WalletQuery` per derive-plane Shape 2, and exposes the matching `ChainIndex` and lightwalletd `GetTaddressBalance` methods.
+
+The most recent spec to land was M3 mempool; its locked decisions live in [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
 
 ## Vocabulary and naming rules
 

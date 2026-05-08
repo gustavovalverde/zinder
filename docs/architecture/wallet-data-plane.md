@@ -158,10 +158,23 @@ is not a reason to bypass the wallet data plane.
 
 `GetLightdInfo.taddr_support` is `true` only when the adapter reads from stored
 transparent UTXO artifacts. It is a product contract for legacy lightwalletd
-clients, not a way to silence Android SDK logs. The public native gRPC
-capability `wallet.address.transparent_utxos_v1` remains reserved until the
-native `WalletQuery` proto and `zinder-client::ChainIndex` expose the same
-artifact-backed method.
+clients, not a way to silence Android SDK logs.
+
+The native `WalletQuery` proto exposes the same artifact-backed reads through
+`TransparentAddressUtxos` (unary, page-bounded) and
+`TransparentAddressUtxosStream` (server-streamed, page-bounded). Both consume
+a shared `AddressLookup` oneof that accepts either a 32-byte
+`script_hash` (typed clients) or a base58 transparent `address` (CLI, tests,
+debug callers); the native adapter parses string addresses through
+`ZebraTransparentAddress`, validates the network, and SHA-256-hashes the
+`scriptPubKey` before any in-process call. The Rust `ChainIndex` trait carries
+the same surface: `transparent_address_utxos`,
+`transparent_address_utxos_at_epoch`, and `transparent_address_utxos_stream`,
+all keyed by the typed `TransparentAddressScriptHash`. The `at_epoch` companion
+honors the standard chain-epoch pin contract; cursor-based pagination uses
+`TransparentUtxoCursor` (`StreamCursorTokenV1` family flag nibble `0x4`).
+Capability `wallet.address.transparent_utxos_v1` is advertised on every
+deployment that can serve the read.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the store was produced with the wallet-serving

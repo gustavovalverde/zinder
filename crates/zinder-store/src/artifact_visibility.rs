@@ -45,6 +45,7 @@ const fn artifact_family_label(family: ArtifactFamily) -> &'static str {
         ArtifactFamily::SubtreeRoot => "subtree_root",
         ArtifactFamily::TransparentAddressUtxo => "transparent_address_utxo",
         ArtifactFamily::TransparentUtxoSpend => "transparent_utxo_spend",
+        ArtifactFamily::TransparentAddressTxIndex => "transparent_address_tx_index",
         ArtifactFamily::MempoolEvent => "mempool_event",
     }
 }

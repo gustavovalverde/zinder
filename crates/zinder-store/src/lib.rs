@@ -19,6 +19,7 @@ mod proto_codec;
 mod store_error;
 mod subtree_root;
 mod transaction_artifact;
+mod transparent_address_tx_index;
 mod transparent_utxo;
 mod tree_state;
 
@@ -34,11 +35,14 @@ pub use chain_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochReadApi, ChainEventHistoryRequest,
     ChainEventRetentionReport, ChainStoreOptions, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
     MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, SecondaryCatchupOutcome,
-    SecondaryChainStore,
+    SecondaryChainStore, TransparentAddressTxIndexPage, TransparentAddressTxIndexPageRequest,
+    TransparentAddressUtxosPage, TransparentAddressUtxosPageRequest,
 };
 pub use format::{
     ChainEventStreamFamily, MempoolEventCursorPayload, MempoolEventStreamFamily,
     STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
+    TransparentHistoryCursorAnchor, TransparentHistoryCursorPayload,
+    TransparentHistoryStreamFamily, TransparentUtxoCursorPayload, TransparentUtxoStreamFamily,
 };
 pub use grpc_status::status_from_store_error;
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope};
@@ -54,5 +58,6 @@ pub use proto_codec::{
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::TransactionArtifactStore;
+pub use transparent_address_tx_index::TransparentAddressTxIndexStore;
 pub use transparent_utxo::TransparentUtxoStore;
 pub use tree_state::TreeStateStore;

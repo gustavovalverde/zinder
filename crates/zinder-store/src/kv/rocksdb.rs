@@ -200,6 +200,47 @@ impl RocksChainStore {
         scan_outcome
     }
 
+    pub(crate) fn scan_prefix_reverse(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            let column_family = self.column_family(table)?;
+            let mut iterator = self.db.raw_iterator_cf(&column_family);
+            if let Some(upper_bound) = exclusive_prefix_upper_bound(prefix.as_bytes()) {
+                iterator.seek(&upper_bound);
+                if iterator.valid() {
+                    iterator.prev();
+                } else {
+                    iterator.seek_to_last();
+                }
+            } else {
+                iterator.seek_to_last();
+            }
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.prev();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(table, started_at, &scan_outcome);
+
+        scan_outcome
+    }
+
     pub(crate) fn scan_forward(
         &self,
         table: StorageTable,
@@ -366,6 +407,13 @@ pub(crate) trait RocksChainStoreRead {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError>;
 
+    fn scan_prefix_reverse(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError>;
+
     fn scan_forward(
         &self,
         table: StorageTable,
@@ -408,6 +456,15 @@ impl RocksChainStoreRead for RocksChainStore {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
         Self::scan_prefix(self, table, prefix, visit)
+    }
+
+    fn scan_prefix_reverse(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        Self::scan_prefix_reverse(self, table, prefix, visit)
     }
 
     fn scan_forward(
@@ -470,6 +527,18 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_prefix(table, prefix, visit),
             Self::Direct(store) => store.scan_prefix(table, prefix, visit),
+        }
+    }
+
+    fn scan_prefix_reverse(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.scan_prefix_reverse(table, prefix, visit),
+            Self::Direct(store) => store.scan_prefix_reverse(table, prefix, visit),
         }
     }
 
@@ -582,6 +651,47 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
         scan_outcome
     }
 
+    fn scan_prefix_reverse(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            let column_family = self.store.column_family(table)?;
+            let mut iterator = self.snapshot.raw_iterator_cf(&column_family);
+            if let Some(upper_bound) = exclusive_prefix_upper_bound(prefix.as_bytes()) {
+                iterator.seek(&upper_bound);
+                if iterator.valid() {
+                    iterator.prev();
+                } else {
+                    iterator.seek_to_last();
+                }
+            } else {
+                iterator.seek_to_last();
+            }
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.prev();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(table, started_at, &scan_outcome);
+
+        scan_outcome
+    }
+
     fn scan_forward(
         &self,
         table: StorageTable,
@@ -610,6 +720,14 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
 
         scan_outcome
     }
+}
+
+fn exclusive_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper_bound = prefix.to_vec();
+    let increment_index = upper_bound.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper_bound[increment_index] = upper_bound[increment_index].saturating_add(1);
+    upper_bound.truncate(increment_index.saturating_add(1));
+    Some(upper_bound)
 }
 
 const ROCKSDB_INT_PROPERTIES: [&str; 6] = [

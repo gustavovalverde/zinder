@@ -1,5 +1,6 @@
 //! Remote gRPC implementation of the chain-index contract.
 
+use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -11,7 +12,8 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact, MempoolEntry,
     Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
     SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact,
 };
 use zinder_proto::v1::wallet::{self, ServerCapabilities, wallet_query_client::WalletQueryClient};
@@ -25,7 +27,10 @@ use crate::{
     BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
     ChainEventStream, ChainIndex, ChainRangeReverted, IndexStream, IndexerError, MempoolEvent,
     MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, TxStatus,
+    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
+    TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
+    TransparentHistoryCursor, TransparentUtxoCursor, TxStatus,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -284,6 +289,58 @@ impl ChainIndex for RemoteChainIndex {
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
 
+    async fn transparent_address_utxos(
+        &self,
+        query: TransparentAddressUtxosQuery,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        self.transparent_address_utxos_from_epoch(query, None).await
+    }
+
+    async fn transparent_address_utxos_at_epoch(
+        &self,
+        query: TransparentAddressUtxosQuery,
+        at_epoch: ChainEpoch,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        self.transparent_address_utxos_from_epoch(query, Some(at_epoch))
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        self.transparent_address_tx_ids_in_range_from_epoch(query, None)
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range_at_epoch(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+        at_epoch: ChainEpoch,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        self.transparent_address_tx_ids_in_range_from_epoch(query, Some(at_epoch))
+            .await
+    }
+
+    async fn transparent_address_utxos_stream(
+        &self,
+        query: TransparentAddressUtxosQuery,
+    ) -> Result<TransparentAddressUtxoStream, IndexerError> {
+        let request = transparent_address_utxos_request_message(&query, None);
+        let response = self
+            .client()
+            .await
+            .transparent_address_utxos_stream(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?;
+        let expected_network = self.network;
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            transparent_address_utxos_stream_item_from_message(expected_network, chunk)
+        });
+        Ok(Box::pin(stream))
+    }
+
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: TransparentMempoolOutputsRequest,
@@ -455,6 +512,83 @@ impl RemoteChainIndex {
             .into_iter()
             .map(|root| subtree_root_from_message(protocol, root))
             .collect()
+    }
+
+    async fn transparent_address_tx_ids_in_range_from_epoch(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        let address_script_hash = query.address_script_hash;
+        let request = wallet::TransparentAddressTxIdsInRangeRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            start_height: query.start_height.value(),
+            end_height: query.end_height.value(),
+            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
+            from_cursor: query
+                .from_cursor
+                .as_ref()
+                .map(|cursor| cursor.as_bytes().to_vec())
+                .unwrap_or_default(),
+            at_epoch: at_epoch.map(chain_epoch_to_message),
+            descending: query.descending,
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_address_tx_ids_in_range(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?;
+        let expected_network = self.network;
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            transparent_address_tx_ids_chunk_from_message(
+                expected_network,
+                address_script_hash,
+                chunk,
+            )
+        });
+        Ok(Box::pin(stream))
+    }
+
+    async fn transparent_address_utxos_from_epoch(
+        &self,
+        query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+        let request = transparent_address_utxos_request_message(&query, at_epoch);
+        let response = self
+            .client()
+            .await
+            .transparent_address_utxos(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        let chain_epoch = chain_epoch_from_message_with_network(
+            self.network,
+            response
+                .chain_epoch
+                .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+        )?;
+        let utxos = response
+            .utxos
+            .into_iter()
+            .map(transparent_address_utxo_from_message)
+            .collect::<Result<Vec<_>, IndexerError>>()?;
+        let next_cursor = if response.next_cursor.is_empty() {
+            None
+        } else {
+            Some(TransparentUtxoCursor::from_bytes(response.next_cursor))
+        };
+        Ok(TransparentAddressUtxosView {
+            chain_epoch,
+            utxos,
+            next_cursor,
+        })
     }
 
     async fn transaction_by_id_from_epoch(
@@ -637,6 +771,112 @@ fn subtree_root_from_message(
             message.completing_block_hash,
         )?,
     ))
+}
+
+fn transparent_address_utxos_request_message(
+    query: &TransparentAddressUtxosQuery,
+    at_epoch: Option<ChainEpoch>,
+) -> wallet::TransparentAddressUtxosRequest {
+    wallet::TransparentAddressUtxosRequest {
+        address: Some(wallet::AddressLookup {
+            selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                query.address_script_hash.as_bytes().to_vec(),
+            )),
+        }),
+        max_entries: query.max_entries.map(NonZeroU32::get),
+        from_cursor: query
+            .from_cursor
+            .as_ref()
+            .map(|cursor| cursor.as_bytes().to_vec())
+            .unwrap_or_default(),
+        at_epoch: at_epoch.map(chain_epoch_to_message),
+        start_height: query.start_height.value(),
+    }
+}
+
+fn transparent_address_tx_ids_chunk_from_message(
+    expected_network: Network,
+    address_script_hash: TransparentAddressScriptHash,
+    message: wallet::TransparentAddressTxIdsChunk,
+) -> Result<TransparentAddressTxIdsStreamItem, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    let transaction_id = transaction_id_from_bytes("transaction_id", message.transaction_id)?;
+    let block_hash = block_hash_from_bytes("block_hash", message.block_hash)?;
+    let artifact = TransparentAddressTxIndexArtifact::new(
+        address_script_hash,
+        BlockHeight::new(message.block_height),
+        message.tx_index_in_block,
+        transaction_id,
+        block_hash,
+    );
+    let cursor = if message.cursor.is_empty() {
+        None
+    } else {
+        Some(TransparentHistoryCursor::from_bytes(message.cursor))
+    };
+    Ok(TransparentAddressTxIdsStreamItem {
+        chain_epoch,
+        artifact,
+        cursor,
+    })
+}
+
+fn transparent_address_utxo_from_message(
+    message: wallet::TransparentAddressUtxo,
+) -> Result<TransparentAddressUtxoArtifact, IndexerError> {
+    let address_script_hash_bytes = fixed_32_bytes(
+        "transparent_address_utxo.address_script_hash",
+        message.address_script_hash,
+    )?;
+    let transaction_id_bytes = fixed_32_bytes(
+        "transparent_address_utxo.transaction_id",
+        message.transaction_id,
+    )?;
+    let block_hash =
+        block_hash_from_bytes("transparent_address_utxo.block_hash", message.block_hash)?;
+    Ok(TransparentAddressUtxoArtifact::new(
+        TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
+        message.script_pub_key,
+        TransparentOutPoint::new(
+            TransactionId::from_bytes(transaction_id_bytes),
+            message.output_index,
+        ),
+        message.value_zat,
+        BlockHeight::new(message.block_height),
+        block_hash,
+    ))
+}
+
+fn transparent_address_utxos_stream_item_from_message(
+    expected_network: Network,
+    message: wallet::TransparentAddressUtxosStreamChunk,
+) -> Result<TransparentAddressUtxoStreamItem, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    let utxo = transparent_address_utxo_from_message(
+        message
+            .utxo
+            .ok_or_else(|| IndexerError::malformed("utxo", "field is missing"))?,
+    )?;
+    let cursor = if message.cursor.is_empty() {
+        None
+    } else {
+        Some(TransparentUtxoCursor::from_bytes(message.cursor))
+    };
+    Ok(TransparentAddressUtxoStreamItem {
+        chain_epoch,
+        utxo,
+        cursor,
+    })
 }
 
 fn transaction_from_message(

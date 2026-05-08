@@ -1,0 +1,44 @@
+[package]
+name = "zinder-derive"
+version = "0.1.0"
+description = "Zinder derive-plane runtime that hosts explorer and analytics consumers"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "derive"]
+categories = ["api-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
+config.workspace = true
+prost.workspace = true
+rust-rocksdb.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["server", "transport"] }
+tonic-health.workspace = true
+tonic-reflection.workspace = true
+tracing.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-runtime.workspace = true
+
+[[bin]]
+name = "zinder-derive"
+path = "src/bin/zinder-derive/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+eyre.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["transport"] }

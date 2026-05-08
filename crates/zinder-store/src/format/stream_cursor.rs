@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
-use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
+use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
 /// Fixed byte length of a [`StreamCursorTokenV1`].
 pub const STREAM_CURSOR_TOKEN_V1_LEN: usize = 82;
@@ -91,6 +91,116 @@ pub struct MempoolEventCursorPayload {
     /// Identifier of the mempool transaction last delivered before this
     /// cursor was issued.
     pub last_transaction_id: TransactionId,
+}
+
+/// Transparent-history stream family encoded in a cursor flags byte.
+///
+/// The single variant `TransparentHistory` (flag `0x3`) bookmarks a
+/// position inside a transparent-address tx-history scan. The high nibble
+/// of the flags byte encodes the iteration direction so resume continues
+/// in the same order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransparentHistoryStreamFamily {
+    /// Transparent-address tx-history bookmark family (flag `0x3`).
+    TransparentHistory,
+}
+
+const STREAM_DIRECTION_FLAG_BIT: u8 = 0x10;
+
+impl TransparentHistoryStreamFamily {
+    pub(crate) const fn flags(self, descending: bool) -> u8 {
+        let direction_bit = if descending {
+            STREAM_DIRECTION_FLAG_BIT
+        } else {
+            0
+        };
+        match self {
+            Self::TransparentHistory => 0x3 | direction_bit,
+        }
+    }
+
+    const fn from_flags(flags: u8) -> Option<(Self, bool)> {
+        let reserved_mask = STREAM_RESERVED_FLAGS_MASK & !STREAM_DIRECTION_FLAG_BIT;
+        if flags & reserved_mask != 0 {
+            return None;
+        }
+        let descending = flags & STREAM_DIRECTION_FLAG_BIT != 0;
+        match flags & STREAM_FAMILY_MASK {
+            0x3 => Some((Self::TransparentHistory, descending)),
+            _ => None,
+        }
+    }
+}
+
+/// Anchor used to construct a transparent-history cursor token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransparentHistoryCursorAnchor {
+    /// Network the cursor is bound to.
+    pub network: Network,
+    /// Stream family encoded in the cursor flags byte.
+    pub family: TransparentHistoryStreamFamily,
+    /// Block height of the last yielded entry.
+    pub last_block_height: BlockHeight,
+    /// Position of the last yielded entry inside its block.
+    pub last_tx_index_in_block: u32,
+    /// Iteration direction at issue time.
+    pub descending: bool,
+}
+
+/// Cursor payload decoded from a transparent-history stream cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransparentHistoryCursorPayload {
+    /// Stream family encoded in the cursor flags byte.
+    pub family: TransparentHistoryStreamFamily,
+    /// Descending iteration direction encoded in the cursor flags byte.
+    pub descending: bool,
+    /// Block height of the last yielded transaction.
+    pub last_block_height: BlockHeight,
+    /// Position of the last yielded transaction inside its block.
+    pub last_tx_index_in_block: u32,
+}
+
+/// Transparent-UTXO stream family encoded in the low nibble of a cursor
+/// flags byte.
+///
+/// The single variant `TransparentUtxo` (flag `0x4`) bookmarks a position
+/// inside a `(network, address_script_hash)` prefix scan. The cursor body
+/// records the last yielded `(block_height, outpoint)` so resuming
+/// continues strictly after that UTXO regardless of how the upstream
+/// iterator dedupes outpoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransparentUtxoStreamFamily {
+    /// UTXO bookmark family (flag `0x4`).
+    TransparentUtxo,
+}
+
+impl TransparentUtxoStreamFamily {
+    pub(crate) const fn flags(self) -> u8 {
+        match self {
+            Self::TransparentUtxo => 0x4,
+        }
+    }
+
+    const fn from_flags(flags: u8) -> Option<Self> {
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
+            return None;
+        }
+        match flags & STREAM_FAMILY_MASK {
+            0x4 => Some(Self::TransparentUtxo),
+            _ => None,
+        }
+    }
+}
+
+/// Cursor payload decoded from a transparent-UTXO stream cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransparentUtxoCursorPayload {
+    /// Stream family encoded in the cursor flags byte.
+    pub family: TransparentUtxoStreamFamily,
+    /// Block height of the last yielded UTXO.
+    pub last_block_height: BlockHeight,
+    /// Outpoint of the last yielded UTXO.
+    pub last_outpoint: TransparentOutPoint,
 }
 
 /// Cursor payload decoded from a chain-event stream cursor.
@@ -262,6 +372,150 @@ impl StreamCursorTokenV1 {
         })
     }
 
+    /// Builds a transparent-history cursor token bookmarking
+    /// `(last_block_height, last_tx_index_in_block)` plus the iteration
+    /// direction.
+    pub fn transparent_history(
+        anchor: TransparentHistoryCursorAnchor,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<Self, StreamCursorError> {
+        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
+        cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
+        cursor_bytes.extend_from_slice(&anchor.network.id().to_be_bytes());
+        cursor_bytes.extend_from_slice(&anchor.last_block_height.value().to_be_bytes());
+        cursor_bytes.extend_from_slice(&anchor.last_tx_index_in_block.to_be_bytes());
+        // Reserved padding to keep the body 50 bytes long
+        // (1 + 4 + 4 + 4 + 36 + 1).
+        cursor_bytes.extend_from_slice(&[0u8; 36]);
+        cursor_bytes.push(anchor.family.flags(anchor.descending));
+
+        let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
+        cursor_bytes.extend_from_slice(&auth_tag);
+
+        Ok(Self(cursor_bytes))
+    }
+
+    /// Decodes a transparent-history cursor token.
+    pub fn decode_transparent_history(
+        &self,
+        expected_network: Network,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<TransparentHistoryCursorPayload, StreamCursorError> {
+        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
+            return Err(StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            });
+        }
+
+        if self.0[0] != STREAM_CURSOR_SCHEMA_VERSION {
+            return Err(StreamCursorError::UnsupportedSchemaVersion { version: self.0[0] });
+        }
+
+        let network_id = read_u32_be(&self.0, 1)?;
+        let network =
+            Network::from_id(network_id).ok_or(StreamCursorError::UnknownNetwork { network_id })?;
+        if network != expected_network {
+            return Err(StreamCursorError::NetworkMismatch {
+                expected: expected_network,
+                actual: network,
+            });
+        }
+
+        let flags = self.0[49];
+        let (family, descending) = TransparentHistoryStreamFamily::from_flags(flags)
+            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+
+        verify_auth_tag(
+            cursor_auth_key,
+            &self.0[..CURSOR_BODY_LEN],
+            &self.0[CURSOR_BODY_LEN..],
+        )?;
+
+        Ok(TransparentHistoryCursorPayload {
+            family,
+            descending,
+            last_block_height: BlockHeight::new(read_u32_be(&self.0, 5)?),
+            last_tx_index_in_block: read_u32_be(&self.0, 9)?,
+        })
+    }
+
+    /// Builds a transparent-UTXO cursor token bookmarking
+    /// `(last_block_height, last_outpoint)`.
+    pub fn transparent_utxo(
+        network: Network,
+        family: TransparentUtxoStreamFamily,
+        last_block_height: BlockHeight,
+        last_outpoint: TransparentOutPoint,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<Self, StreamCursorError> {
+        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
+        cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
+        cursor_bytes.extend_from_slice(&network.id().to_be_bytes());
+        cursor_bytes.extend_from_slice(&last_block_height.value().to_be_bytes());
+        cursor_bytes.extend_from_slice(&last_outpoint.transaction_id.as_bytes());
+        cursor_bytes.extend_from_slice(&last_outpoint.output_index.to_be_bytes());
+        // Reserved padding to keep the body 50 bytes long
+        // (1 + 4 + 4 + 32 + 4 + 4 + 1).
+        cursor_bytes.extend_from_slice(&[0u8; 4]);
+        cursor_bytes.push(family.flags());
+
+        let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
+        cursor_bytes.extend_from_slice(&auth_tag);
+
+        Ok(Self(cursor_bytes))
+    }
+
+    /// Decodes a transparent-UTXO cursor token.
+    pub fn decode_transparent_utxo(
+        &self,
+        expected_network: Network,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<TransparentUtxoCursorPayload, StreamCursorError> {
+        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
+            return Err(StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            });
+        }
+
+        if self.0[0] != STREAM_CURSOR_SCHEMA_VERSION {
+            return Err(StreamCursorError::UnsupportedSchemaVersion { version: self.0[0] });
+        }
+
+        let network_id = read_u32_be(&self.0, 1)?;
+        let network =
+            Network::from_id(network_id).ok_or(StreamCursorError::UnknownNetwork { network_id })?;
+        if network != expected_network {
+            return Err(StreamCursorError::NetworkMismatch {
+                expected: expected_network,
+                actual: network,
+            });
+        }
+
+        let flags = self.0[49];
+        let family = TransparentUtxoStreamFamily::from_flags(flags)
+            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+
+        verify_auth_tag(
+            cursor_auth_key,
+            &self.0[..CURSOR_BODY_LEN],
+            &self.0[CURSOR_BODY_LEN..],
+        )?;
+
+        let transaction_id_bytes =
+            <[u8; 32]>::try_from(&self.0[9..41]).map_err(|_| StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            })?;
+
+        Ok(TransparentUtxoCursorPayload {
+            family,
+            last_block_height: BlockHeight::new(read_u32_be(&self.0, 5)?),
+            last_outpoint: TransparentOutPoint {
+                transaction_id: TransactionId::from_bytes(transaction_id_bytes),
+                output_index: read_u32_be(&self.0, 41)?,
+            },
+        })
+    }
+
     /// Creates a cursor token from encoded bytes supplied by a client.
     #[must_use]
     pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
@@ -409,11 +663,12 @@ pub enum StreamCursorError {
 
 #[cfg(test)]
 mod tests {
-    use zinder_core::{BlockHash, BlockHeight, Network};
+    use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
     use super::{
         ChainEventCursorAnchor, ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-        StreamCursorError, StreamCursorTokenV1,
+        StreamCursorError, StreamCursorTokenV1, TransparentUtxoCursorPayload,
+        TransparentUtxoStreamFamily,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -548,5 +803,68 @@ mod tests {
             },
             CURSOR_AUTH_KEY,
         )
+    }
+
+    #[test]
+    fn transparent_utxo_cursor_round_trips() -> Result<(), StreamCursorError> {
+        let last_outpoint = TransparentOutPoint {
+            transaction_id: TransactionId::from_bytes([5; 32]),
+            output_index: 11,
+        };
+        let cursor = StreamCursorTokenV1::transparent_utxo(
+            Network::ZcashRegtest,
+            TransparentUtxoStreamFamily::TransparentUtxo,
+            BlockHeight::new(2024),
+            last_outpoint,
+            CURSOR_AUTH_KEY,
+        )?;
+
+        assert_eq!(cursor.as_bytes().len(), STREAM_CURSOR_TOKEN_V1_LEN);
+        assert_eq!(
+            cursor.as_bytes()[49],
+            TransparentUtxoStreamFamily::TransparentUtxo.flags()
+        );
+
+        let decoded = cursor.decode_transparent_utxo(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
+
+        assert_eq!(
+            decoded,
+            TransparentUtxoCursorPayload {
+                family: TransparentUtxoStreamFamily::TransparentUtxo,
+                last_block_height: BlockHeight::new(2024),
+                last_outpoint,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_utxo_cursor_rejects_chain_event_flags() -> Result<(), StreamCursorError> {
+        let chain_event_cursor = test_cursor()?;
+        assert!(matches!(
+            chain_event_cursor.decode_transparent_utxo(Network::ZcashRegtest, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::StreamFamilyMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_utxo_cursor_rejects_wrong_network() -> Result<(), StreamCursorError> {
+        let cursor = StreamCursorTokenV1::transparent_utxo(
+            Network::ZcashRegtest,
+            TransparentUtxoStreamFamily::TransparentUtxo,
+            BlockHeight::new(1),
+            TransparentOutPoint {
+                transaction_id: TransactionId::from_bytes([0; 32]),
+                output_index: 0,
+            },
+            CURSOR_AUTH_KEY,
+        )?;
+        assert!(matches!(
+            cursor.decode_transparent_utxo(Network::ZcashMainnet, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::NetworkMismatch { .. })
+        ));
+        Ok(())
     }
 }

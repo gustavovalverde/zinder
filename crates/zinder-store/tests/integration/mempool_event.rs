@@ -97,10 +97,12 @@ fn mempool_event_history_resumes_strictly_after_cursor() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Atomicity: when a prune pass observes that the floor must advance but no
-/// physical deletes remain (a previous prune crashed mid-batch and the
-/// column-family delete has already happened), the floor still advances so
-/// readers do not observe a partially pruned tail.
+/// Atomicity: idempotent floor advancement on resumed prune.
+///
+/// When a prune pass observes that the floor must advance but no physical
+/// deletes remain (a previous prune crashed mid-batch and the column-family
+/// delete has already happened), the floor still advances so readers do not
+/// observe a partially pruned tail.
 #[test]
 fn prune_advances_floor_when_deletes_already_applied() -> eyre::Result<()> {
     let tempdir = tempdir()?;
@@ -230,9 +232,11 @@ fn cursor_below_pruned_floor_returns_mempool_cursor_expired() -> eyre::Result<()
     Ok(())
 }
 
-/// Crash-resume durability: after a `prune_mempool_events_before` call, the
-/// store is closed and reopened. The `oldest_retained_mempool_event_sequence`
-/// floor is preserved durably (not just held in process memory).
+/// Crash-resume durability of the prune floor.
+///
+/// After a `prune_mempool_events_before` call, the store is closed and
+/// reopened. The `oldest_retained_mempool_event_sequence` floor is preserved
+/// durably (not just held in process memory).
 #[test]
 fn pruned_floor_persists_across_store_reopen() -> eyre::Result<()> {
     let tempdir = tempdir()?;

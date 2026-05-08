@@ -11,9 +11,12 @@ use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    ServerInfoSettings, broadcast_transaction_response, build_server_capabilities_message,
-    chain_events_response, compact_block_response, latest_block_response,
-    latest_tree_state_response, subtree_roots_response, transaction_response, tree_state_response,
+    ServerInfoSettings, address_lookup_to_script_hash, broadcast_transaction_response,
+    build_server_capabilities_message, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
+    latest_block_response, latest_tree_state_response, subtree_roots_response,
+    transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
+    transparent_address_utxos_response, tree_state_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -32,6 +35,9 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
         QueryError::InvalidBlockRange { .. }
         | QueryError::CompactBlockRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
+        | QueryError::TransparentUtxoCursorInvalid { .. }
+        | QueryError::TransparentHistoryCursorInvalid { .. }
+        | QueryError::InvalidAddress { .. }
         | QueryError::UnsupportedShieldedProtocol { .. } => {
             Status::with_error_details(Code::InvalidArgument, message, bad_request_details(error))
         }
@@ -95,8 +101,13 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
                 format!("requested {requested} compact blocks; maximum is {maximum}"),
             )
         }
-        QueryError::ChainEventCursorInvalid { reason } => {
+        QueryError::ChainEventCursorInvalid { reason }
+        | QueryError::TransparentUtxoCursorInvalid { reason }
+        | QueryError::TransparentHistoryCursorInvalid { reason } => {
             ErrorDetails::with_bad_request_violation("from_cursor", *reason)
+        }
+        QueryError::InvalidAddress { reason } => {
+            ErrorDetails::with_bad_request_violation("address", *reason)
         }
         QueryError::UnsupportedShieldedProtocol { protocol } => {
             ErrorDetails::with_bad_request_violation(

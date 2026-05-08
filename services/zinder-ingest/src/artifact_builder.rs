@@ -13,9 +13,9 @@ use zebra_chain::{
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
-    BlockArtifact, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, TransactionArtifact,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressUtxoArtifact,
-    TransparentOutPoint, TransparentUtxoSpendArtifact,
+    BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
+    ShieldedProtocol, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
 };
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
@@ -39,6 +39,14 @@ pub enum ArtifactDeriveError {
     /// Zebra-chain consensus block parse failed.
     #[error("zebra-chain block parse failed: {source}")]
     BlockParseFailed {
+        /// Underlying parse error.
+        #[source]
+        source: zebra_chain::serialization::SerializationError,
+    },
+
+    /// Zebra-chain consensus transaction parse failed.
+    #[error("zebra-chain transaction parse failed: {source}")]
+    TransactionParseFailed {
         /// Underlying parse error.
         #[source]
         source: zebra_chain::serialization::SerializationError,
@@ -287,6 +295,24 @@ pub(crate) struct CompactBlockArtifactBuild {
     pub(crate) transactions: Vec<TransactionArtifact>,
     pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
     pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
+    pub(crate) transparent_address_tx_index_spend_candidates:
+        Vec<TransparentAddressTxIndexSpendCandidate>,
+}
+
+/// Transparent-address tx-history row candidate derived from a transparent
+/// spend input.
+///
+/// The spending transaction does not carry the spent output script. Commit-time
+/// resolution binds this candidate to the canonical prevout transaction before
+/// writing the address-index row.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct TransparentAddressTxIndexSpendCandidate {
+    pub(crate) spent_outpoint: TransparentOutPoint,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) block_hash: BlockHash,
+    pub(crate) tx_index_in_block: u32,
+    pub(crate) transaction_id: TransactionId,
 }
 
 #[derive(Debug, Default)]
@@ -324,6 +350,10 @@ fn build_compact_block_artifact(
     let (compact_transactions, tree_size_additions) = compact_transactions(&parsed_block)?;
     let (transparent_address_utxos, transparent_utxo_spends) =
         transparent_utxo_artifacts(source_block, &compact_transactions)?;
+    let transparent_address_tx_index =
+        transparent_address_tx_index_artifacts(source_block, &compact_transactions)?;
+    let transparent_address_tx_index_spend_candidates =
+        transparent_address_tx_index_spend_candidates(source_block, &compact_transactions)?;
     let final_tree_sizes = initial_tree_sizes.checked_add(tree_size_additions)?;
     validate_observed_tree_sizes(source_block, final_tree_sizes)?;
 
@@ -354,6 +384,8 @@ fn build_compact_block_artifact(
         transactions,
         transparent_address_utxos,
         transparent_utxo_spends,
+        transparent_address_tx_index,
+        transparent_address_tx_index_spend_candidates,
     })
 }
 
@@ -604,6 +636,67 @@ fn transparent_utxo_artifacts(
     }
 
     Ok((transparent_address_utxos, transparent_utxo_spends))
+}
+
+pub(crate) fn transparent_address_tx_index_artifacts(
+    source_block: &SourceBlock,
+    compact_transactions: &[CompactTx],
+) -> Result<Vec<zinder_core::TransparentAddressTxIndexArtifact>, ArtifactDeriveError> {
+    use std::collections::HashSet;
+    let mut artifacts = Vec::new();
+    let mut emitted = HashSet::new();
+
+    for transaction in compact_transactions {
+        let transaction_id = transaction_id_from_compact_tx(transaction)?;
+        let tx_index_in_block =
+            u32::try_from(transaction.index).map_err(|_| ArtifactDeriveError::CountOverflow {
+                field: "transparent transaction index",
+            })?;
+        for output in &transaction.vout {
+            let address_script_hash = transparent_address_script_hash(&output.script_pub_key);
+            if emitted.insert((address_script_hash, tx_index_in_block)) {
+                artifacts.push(zinder_core::TransparentAddressTxIndexArtifact::new(
+                    address_script_hash,
+                    source_block.height,
+                    tx_index_in_block,
+                    transaction_id,
+                    source_block.hash,
+                ));
+            }
+        }
+    }
+
+    Ok(artifacts)
+}
+
+pub(crate) fn transparent_address_tx_index_spend_candidates(
+    source_block: &SourceBlock,
+    compact_transactions: &[CompactTx],
+) -> Result<Vec<TransparentAddressTxIndexSpendCandidate>, ArtifactDeriveError> {
+    let mut spend_candidates = Vec::new();
+
+    for transaction in compact_transactions {
+        let transaction_id = transaction_id_from_compact_tx(transaction)?;
+        let tx_index_in_block =
+            u32::try_from(transaction.index).map_err(|_| ArtifactDeriveError::CountOverflow {
+                field: "transparent transaction index",
+            })?;
+        for input in &transaction.vin {
+            let previous_transaction_id = previous_transaction_id_from_compact_input(input)?;
+            spend_candidates.push(TransparentAddressTxIndexSpendCandidate {
+                spent_outpoint: TransparentOutPoint::new(
+                    previous_transaction_id,
+                    input.prevout_index,
+                ),
+                block_height: source_block.height,
+                block_hash: source_block.hash,
+                tx_index_in_block,
+                transaction_id,
+            });
+        }
+    }
+
+    Ok(spend_candidates)
 }
 
 /// Hashes a transparent `scriptPubKey` into the canonical

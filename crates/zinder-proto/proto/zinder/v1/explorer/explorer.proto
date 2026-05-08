@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package zinder.v1.explorer;
+
+// Capability descriptor advertised by `ExplorerQuery.ServerInfo`.
+message ExplorerServerCapabilities {
+  // Capability strings advertised by the running zinder-derive instance.
+  // Format: `derive.{consumer}.{capability}_v{N}` per
+  // docs/architecture/derive-plane.md.
+  repeated string capabilities = 1;
+
+  // Service vendor, always "Zinder".
+  string vendor = 2;
+
+  // Service semantic version reported by `CARGO_PKG_VERSION`.
+  string version = 3;
+
+  // Network this consumer mirrors, for example `zcash-mainnet`.
+  string network = 4;
+}
+
+// Server capability descriptor request.
+message ServerInfoRequest {}
+
+// Server capability descriptor response.
+message ServerInfoResponse {
+  ExplorerServerCapabilities capabilities = 1;
+}
+
+// Explorer-shaped read surface served by zinder-derive.
+service ExplorerQuery {
+  // Returns the consumer-side capability descriptor.
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+}

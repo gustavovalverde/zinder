@@ -15,7 +15,9 @@ pub fn status_from_store_error(error: &StoreError) -> Status {
     let message = error.to_string();
     match error {
         StoreError::ChainEventCursorInvalid { reason }
-        | StoreError::MempoolEventCursorInvalid { reason } => Status::with_error_details(
+        | StoreError::MempoolEventCursorInvalid { reason }
+        | StoreError::TransparentUtxoCursorInvalid { reason }
+        | StoreError::TransparentHistoryCursorInvalid { reason } => Status::with_error_details(
             Code::InvalidArgument,
             message,
             ErrorDetails::with_bad_request(vec![FieldViolation::new("from_cursor", *reason)]),

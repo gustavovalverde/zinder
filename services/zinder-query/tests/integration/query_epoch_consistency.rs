@@ -271,4 +271,18 @@ impl ChainEpochReadApi for CommitAfterReaderReadApi {
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.store.chain_event_history(request)
     }
+
+    fn transparent_address_utxos_page(
+        &self,
+        request: zinder_store::TransparentAddressUtxosPageRequest<'_>,
+    ) -> Result<zinder_store::TransparentAddressUtxosPage, StoreError> {
+        self.store.transparent_address_utxos_page(request)
+    }
+
+    fn transparent_address_tx_index_page(
+        &self,
+        request: zinder_store::TransparentAddressTxIndexPageRequest<'_>,
+    ) -> Result<zinder_store::TransparentAddressTxIndexPage, StoreError> {
+        self.store.transparent_address_tx_index_page(request)
+    }
 }

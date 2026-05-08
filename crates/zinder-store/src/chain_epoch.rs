@@ -2,8 +2,8 @@
 
 use zinder_core::{
     BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
-    SubtreeRootArtifact, TransactionArtifact, TransparentAddressUtxoArtifact,
-    TransparentUtxoSpendArtifact, TreeStateArtifact,
+    SubtreeRootArtifact, TransactionArtifact, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
 };
 
 /// Complete artifact set committed as one visible chain epoch.
@@ -25,6 +25,8 @@ pub struct ChainEpochArtifacts {
     pub transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
     /// Transparent spend artifacts included in this commit.
     pub transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    /// Transparent address tx-history index artifacts included in this commit.
+    pub transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
     /// Reorg-window transition included in this commit.
     pub reorg_window_change: ReorgWindowChange,
 }
@@ -46,6 +48,7 @@ impl ChainEpochArtifacts {
             subtree_roots: Vec::new(),
             transparent_address_utxos: Vec::new(),
             transparent_utxo_spends: Vec::new(),
+            transparent_address_tx_index: Vec::new(),
             reorg_window_change: ReorgWindowChange::Unchanged,
         }
     }
@@ -88,6 +91,16 @@ impl ChainEpochArtifacts {
         transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
     ) -> Self {
         self.transparent_utxo_spends = transparent_utxo_spends;
+        self
+    }
+
+    /// Adds transparent-address tx-history index artifacts to this commit value.
+    #[must_use]
+    pub fn with_transparent_address_tx_index(
+        mut self,
+        transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
+    ) -> Self {
+        self.transparent_address_tx_index = transparent_address_tx_index;
         self
     }
 

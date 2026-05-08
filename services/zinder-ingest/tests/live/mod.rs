@@ -5,3 +5,5 @@ mod latency;
 mod mempool_broadcast_cycle;
 mod mempool_pipeline;
 mod tip_follow;
+mod transparent_address_surface;
+mod transparent_address_utxos;

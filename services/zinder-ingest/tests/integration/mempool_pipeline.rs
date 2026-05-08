@@ -654,10 +654,7 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
                     // not a per-event observation. Filter it out so the
                     // count-based wait helpers below stay aligned with
                     // pushed source events.
-                    if !matches!(
-                        outcome,
-                        MempoolOrchestratorEventOutcome::SourceStreamOpened
-                    ) {
+                    if !matches!(outcome, MempoolOrchestratorEventOutcome::SourceStreamOpened) {
                         outcomes_for_orchestrator.lock().push(outcome);
                     }
                 },

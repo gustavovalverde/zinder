@@ -16,8 +16,9 @@ use prost::Message;
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
-    SubtreeRootIndex, TransactionArtifact, TransparentAddressUtxoArtifact,
-    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    SubtreeRootIndex, TransactionArtifact, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
@@ -141,6 +142,7 @@ pub struct ChainFixture {
     transaction_artifacts: Vec<TransactionArtifact>,
     transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
     transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
 }
 
 impl ChainFixture {
@@ -156,6 +158,7 @@ impl ChainFixture {
             transaction_artifacts: Vec::new(),
             transparent_address_utxos: Vec::new(),
             transparent_utxo_spends: Vec::new(),
+            transparent_address_tx_index: Vec::new(),
         }
     }
 
@@ -235,6 +238,7 @@ impl ChainFixture {
             transaction_artifacts: Vec::new(),
             transparent_address_utxos: Vec::new(),
             transparent_utxo_spends: Vec::new(),
+            transparent_address_tx_index: Vec::new(),
         })
     }
 
@@ -331,6 +335,18 @@ impl ChainFixture {
         transparent_utxo_spend: TransparentUtxoSpendArtifact,
     ) -> Self {
         self.transparent_utxo_spends.push(transparent_utxo_spend);
+        self
+    }
+
+    /// Attaches a [`TransparentAddressTxIndexArtifact`] to this fixture's
+    /// commit set.
+    #[must_use]
+    pub fn with_transparent_address_tx_index(
+        mut self,
+        transparent_address_tx_index: TransparentAddressTxIndexArtifact,
+    ) -> Self {
+        self.transparent_address_tx_index
+            .push(transparent_address_tx_index);
         self
     }
 
@@ -476,6 +492,10 @@ impl ChainFixture {
         if !self.transparent_utxo_spends.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
                 .with_transparent_utxo_spends(self.transparent_utxo_spends.clone());
+        }
+        if !self.transparent_address_tx_index.is_empty() {
+            chain_epoch_artifacts = chain_epoch_artifacts
+                .with_transparent_address_tx_index(self.transparent_address_tx_index.clone());
         }
         Some(chain_epoch_artifacts)
     }

@@ -26,6 +26,9 @@ pub(crate) enum PayloadFormat {
     ZinderTransparentAddressUtxoArtifactV1 = 6,
     /// Zinder protobuf payload for a transparent UTXO spend artifact.
     ZinderTransparentUtxoSpendArtifactV1 = 7,
+    /// Zinder protobuf payload for a transparent address tx-history index
+    /// artifact.
+    ZinderTransparentAddressTxIndexArtifactV1 = 8,
 }
 
 impl PayloadFormat {
@@ -38,6 +41,7 @@ impl PayloadFormat {
             5 => Some(Self::ZinderSubtreeRootArtifactV1),
             6 => Some(Self::ZinderTransparentAddressUtxoArtifactV1),
             7 => Some(Self::ZinderTransparentUtxoSpendArtifactV1),
+            8 => Some(Self::ZinderTransparentAddressTxIndexArtifactV1),
             _ => None,
         }
     }

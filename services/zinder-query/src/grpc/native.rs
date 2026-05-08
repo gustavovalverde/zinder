@@ -6,19 +6,25 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
+use sha2::{Digest, Sha256};
+use zebra_chain::{
+    parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
+};
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange, TransactionArtifact,
-    TransactionBroadcastResult, TransactionId,
+    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
 };
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::wallet;
 
 use crate::{
-    ChainEvents, CompactBlock, LatestBlock, QueryError, SubtreeRoots, Transaction, TreeState,
-    WalletQueryApi,
+    ChainEvents, CompactBlock, LatestBlock, QueryError, SubtreeRoots, Transaction,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
+    TransparentAddressUtxosRequest, TreeState, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
@@ -201,6 +207,166 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
         .chain_events(from_cursor, family)
         .await
         .and_then(|chain_events| build_chain_events_response(&chain_events))
+}
+
+/// Reads transparent address UTXOs for `request` and encodes the native
+/// wallet response. The unary RPC and the streaming RPC share this helper.
+pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    request: TransparentAddressUtxosRequest,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::TransparentAddressUtxosResponse, QueryError> {
+    query_api
+        .transparent_address_utxos_at_epoch(request, at_epoch)
+        .await
+        .map(build_transparent_address_utxos_response)
+}
+
+/// Resolves a `wallet::AddressLookup` oneof to the typed
+/// `TransparentAddressScriptHash`. String addresses are parsed against
+/// `network` and SHA-256-hashed; raw script-hash bytes are taken verbatim.
+pub fn address_lookup_to_script_hash(
+    address: Option<wallet::AddressLookup>,
+    network: Network,
+) -> Result<TransparentAddressScriptHash, QueryError> {
+    let lookup = address.ok_or(QueryError::InvalidAddress {
+        reason: "address selector is required",
+    })?;
+    let selector = lookup.selector.ok_or(QueryError::InvalidAddress {
+        reason: "address selector is empty",
+    })?;
+    match selector {
+        wallet::address_lookup::Selector::ScriptHash(bytes) => {
+            let hash_bytes: [u8; 32] =
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| QueryError::InvalidAddress {
+                        reason: "script_hash must be 32 bytes",
+                    })?;
+            Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
+        }
+        wallet::address_lookup::Selector::Address(address_text) => {
+            let zebra_address = address_text
+                .parse::<ZebraTransparentAddress>()
+                .map_err(|_| QueryError::InvalidAddress {
+                    reason: "transparent address could not be parsed",
+                })?;
+            if !transparent_address_matches_network(zebra_address.network_kind(), network) {
+                return Err(QueryError::InvalidAddress {
+                    reason: "transparent address network does not match server network",
+                });
+            }
+            let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
+            if script_pub_key.is_empty() {
+                return Err(QueryError::InvalidAddress {
+                    reason: "transparent address does not produce a receivable script",
+                });
+            }
+            Ok(transparent_address_script_hash(&script_pub_key))
+        }
+    }
+}
+
+/// SHA-256 of a transparent scriptPubKey, materialized as the typed
+/// `TransparentAddressScriptHash`.
+#[must_use]
+pub fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
+    let mut hasher = Sha256::new();
+    hasher.update(script_pub_key);
+    TransparentAddressScriptHash::from_bytes(hasher.finalize().into())
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Network is non_exhaustive; future variants must fail closed against transparent address validation until they are explicitly handled"
+)]
+fn transparent_address_matches_network(address_kind: ZebraNetworkKind, network: Network) -> bool {
+    match network {
+        Network::ZcashMainnet => address_kind == ZebraNetworkKind::Mainnet,
+        Network::ZcashTestnet => address_kind == ZebraNetworkKind::Testnet,
+        Network::ZcashRegtest => matches!(
+            address_kind,
+            ZebraNetworkKind::Testnet | ZebraNetworkKind::Regtest
+        ),
+        _ => false,
+    }
+}
+
+/// Reads a page of transparent-address tx-history index artifacts and
+/// surfaces them through the typed query layer for the gRPC adapter to
+/// chunk into a server-streamed response.
+pub async fn transparent_address_tx_ids_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    request: TransparentAddressTxIdsInRangeRequest,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<TransparentAddressTxIds, QueryError> {
+    query_api
+        .transparent_address_tx_ids_in_range_at_epoch(request, at_epoch)
+        .await
+}
+
+/// Builds one streamed tx-history chunk message.
+#[must_use]
+pub fn build_transparent_address_tx_ids_chunk(
+    chain_epoch: ChainEpoch,
+    artifact: &TransparentAddressTxIndexArtifact,
+    cursor: Vec<u8>,
+) -> wallet::TransparentAddressTxIdsChunk {
+    wallet::TransparentAddressTxIdsChunk {
+        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        transaction_id: artifact.transaction_id.as_bytes().to_vec(),
+        block_height: artifact.block_height.value(),
+        tx_index_in_block: artifact.tx_index_in_block,
+        block_hash: artifact.block_hash.as_bytes().to_vec(),
+        cursor,
+    }
+}
+
+/// Builds one stream chunk message from a UTXO and the chain epoch.
+#[must_use]
+pub fn build_transparent_address_utxos_stream_chunk(
+    chain_epoch: ChainEpoch,
+    utxo: &TransparentAddressUtxoArtifact,
+    cursor: Vec<u8>,
+) -> wallet::TransparentAddressUtxosStreamChunk {
+    wallet::TransparentAddressUtxosStreamChunk {
+        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        utxo: Some(build_transparent_address_utxo_message(utxo)),
+        cursor,
+    }
+}
+
+fn build_transparent_address_utxos_response(
+    response: TransparentAddressUtxos,
+) -> wallet::TransparentAddressUtxosResponse {
+    let chain_epoch = build_chain_epoch_message(response.chain_epoch);
+    wallet::TransparentAddressUtxosResponse {
+        chain_epoch: Some(chain_epoch),
+        utxos: response
+            .utxos
+            .iter()
+            .map(build_transparent_address_utxo_message)
+            .collect(),
+        next_cursor: response
+            .next_cursor
+            .map(|cursor| cursor.as_bytes().to_vec())
+            .unwrap_or_default(),
+    }
+}
+
+fn build_transparent_address_utxo_message(
+    utxo: &TransparentAddressUtxoArtifact,
+) -> wallet::TransparentAddressUtxo {
+    wallet::TransparentAddressUtxo {
+        address_script_hash: utxo.address_script_hash.as_bytes().to_vec(),
+        script_pub_key: utxo.script_pub_key.clone(),
+        transaction_id: utxo.outpoint.transaction_id.as_bytes().to_vec(),
+        output_index: utxo.outpoint.output_index,
+        value_zat: utxo.value_zat,
+        block_height: utxo.block_height.value(),
+        block_hash: utxo.block_hash.as_bytes().to_vec(),
+    }
 }
 
 fn build_latest_block_response(latest_block: LatestBlock) -> wallet::LatestBlockResponse {

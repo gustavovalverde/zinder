@@ -106,7 +106,21 @@ Two read paths are exposed:
 
 A write path is exposed only to `zinder-ingest`. `PrimaryChainStore::commit_chain_epoch` is extended to accept the new artifact in its commit batch. **The write path must participate in the atomic `WriteBatch`**; an artifact written separately from the visible-epoch pointer breaks epoch consistency.
 
-The `ReorgWindow` table in `chain_store.rs` is extended to track the new family's entries within the non-finalized window. Reorg deletes must include the new family's keys for the reverted range. **This step is the most common silent failure point.** Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch for the new family wherever one appears.
+#### Reorg model: pick by key shape
+
+There are two reorg-handling patterns. The right one is determined by the family's key shape, not by preference.
+
+1. **Per-block families** (compact blocks, transactions, tree states, subtree roots): use **eager-delete**. The key contains a single `BlockHeight` (no per-address dimension), so a reorged height has exactly one row to revert. The `ReorgWindow` table tracks the family's entries within the non-finalized window. Reorg deletes must include the new family's keys for the reverted range. Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch for the new family wherever one appears.
+
+2. **Address-keyed families** (transparent address UTXOs, transparent address tx history, future address-shaped artifacts): use **dynamic-filter visibility**. The key fans out across many addresses per height, which makes per-height eager-delete an O(addresses-touched-by-block) write amplification on every reorg. Instead, rows are written and never physically deleted. `build_reorg_window_deletes` returns empty for the family. The key carries a trailing `chain_epoch_id` (8 BE bytes) recording the source epoch. Read paths enforce visibility at scan time:
+   - Reject rows whose `source_epoch > chain_epoch.id` (visibility filter).
+   - Call `block_is_visible(height, expected_hash)`, which reads the `BlockArtifact` at the row's height and rejects rows whose stored `block_hash` does not match the visible chain at that height.
+
+   Reorg-revert is logical, not physical; reorged-out rows are silently skipped on every read. The canonical example is `crates/zinder-store/src/transparent_utxo.rs::read_transparent_address_utxos` together with the `kind=6/7` key layouts in `format/store_key.rs`.
+
+Mixing the patterns within one family is a design error. Pick eager-delete for `(network, height, ...)` families and dynamic-filter for `(network, address_script_hash, ...)` families. The trailing `chain_epoch_id` byte and the `block_is_visible` check are non-optional for dynamic-filter families.
+
+**This step is the most common silent-failure point in either pattern.** For per-block families, omitting a delete branch silently retains stale state. For address-keyed families, omitting the trailing `chain_epoch_id` byte from the key or skipping `block_is_visible` at read time silently exposes reorged-out rows.
 
 ### Step 3 — Ingest path in `zinder-ingest`
 
@@ -181,6 +195,26 @@ Naming check:
 - Field names use snake_case in proto, matching the typed Rust signature. The lookup key field is named after the key noun: `address`, `transaction_id`, `subtree_root_index`.
 - Optional epoch pin: `optional ChainEpoch at_epoch = N;` (proto field name `at_epoch`, not `at`, because `at` is reserved-looking in some languages; the typed Rust API converts).
 
+#### Address-keyed inputs use the `AddressLookup` oneof
+
+When a request key is a transparent address, the request takes the `AddressLookup` shared message:
+
+```proto
+message AddressLookup {
+  oneof selector {
+    bytes script_hash = 1;
+    string address = 2;
+  }
+}
+
+message TransparentAddressTxIndexByAddressRequest {
+  AddressLookup address = 1;
+  // ... other fields
+}
+```
+
+The native gRPC adapter accepts either form on the wire, parses the string variant via `ZebraTransparentAddress::parse` plus SHA-256, and returns typed `InvalidAddress` for parse failures. The Rust `ChainIndex` API accepts only the typed `TransparentAddressScriptHash`; the dual wire shape is a convenience for clients (CLIs, debug tools, third-party SDKs) and does not relax the typed boundary on the in-process API. The compatibility shim is the only other site that converts strings to typed addresses.
+
 Do not invent new cursor types for non-streaming methods. If the response is bounded, return a single message. If it is a range read with a server stream, follow the cursor conventions in [Public Interfaces §Cursor Conventions](public-interfaces.md#cursor-conventions).
 
 Add a capability string. New methods require a new capability per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery):
@@ -245,33 +279,49 @@ but its priority and capability are different: it is release-gated by
 `wallet.address.transparent_utxos_v1`, while this transaction-history example
 uses `wallet.address.transparent_history_v1`.
 
-1. **Domain type**: `crates/zinder-core/src/transparent_address_tx_index.rs` exporting `TransparentAddressTxIndexArtifact { address, tx_ids: Vec<TransactionId>, schema_version: u32 }`.
+1. **Domain type**: `crates/zinder-core/src/transparent_address_tx_index.rs` exporting `TransparentAddressTxIndexArtifact { address_script_hash, block_height, tx_index_in_block, transaction_id, block_hash }`. One row per `(address, transaction)` pair, regardless of how many transparent inputs or outputs the transaction has for that address.
 
-2. **Storage**: a new column family `transparent_address_tx_index` whose key is `(network, transparent_address_bytes, block_height_be)` and whose payload is `Vec<TransactionId>` for that address at that height. Schema fingerprint version 1, postcard payload.
+2. **Storage**: a new column family `transparent_address_tx_index` whose key is `(network_id, address_script_hash, block_height_be, tx_index_be)` plus the trailing `chain_epoch_id` (8 BE bytes), totaling 41 bytes plus the trailing 8. The payload is `(transaction_id, block_hash)` encoded with `prost::Message` per [ADR-0002](../adrs/0002-boundary-specific-serialization.md). Schema fingerprint version 1, `PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1`.
 
-3. **Ingest**: `IngestArtifactBuilder::build_transparent_address_tx_index_artifact(&self, block: &SourceBlock)` extracts transparent inputs and outputs from the block's transactions and emits one `TransparentAddressTxIndexArtifact` per address-height combination. Invoked from `build_block_artifacts`.
+   Per-row keying lets pagination cursors point at exact `(height, tx_index)` boundaries without re-decoding a vec payload to skip already-returned txids; this is the canonical shape for tx-history-keyed families. Reorg semantics follow the address-keyed dynamic-filter pattern from Step 2: `build_reorg_window_deletes` returns empty, and read paths enforce visibility through the `source_epoch <= chain_epoch.id` filter and a `block_is_visible` check.
 
-4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(address: TransparentAddress, range: RangeInclusive<BlockHeight>, at: Option<ChainEpoch>) -> impl Stream<Item = Result<TransactionId, QueryError>>`.
+3. **Ingest**: `IngestArtifactBuilder::build_transparent_address_tx_index_artifacts(&self, block: &SourceBlock)` walks each transaction's transparent inputs and outputs, deduplicates by `(address_script_hash, tx_index_in_block)`, and emits one artifact per matching pair. Invoked from `build_block_artifacts`.
+
+4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(request: TransparentAddressTxIdsInRangeRequest) -> impl Stream<Item = Result<TransparentAddressTxIdsChunk, QueryError>>`, plus the `_at_epoch` companion. The request carries the typed `address_script_hash: TransparentAddressScriptHash`, an inclusive height range, `max_entries` bounded by `WalletQueryOptions::max_transparent_history_entries`, an opaque `from_cursor` for resume, and a `descending: bool` flag for newest-first iteration.
 
 5. **Wire**:
 
    ```proto
    rpc TransparentAddressTxIdsInRange(TransparentAddressTxIdsInRangeRequest)
-       returns (stream TransactionId);
+       returns (stream TransparentAddressTxIdsChunk);
 
    message TransparentAddressTxIdsInRangeRequest {
-     bytes transparent_address = 1;
+     AddressLookup address = 1;
      uint32 start_height = 2;
      uint32 end_height = 3;
-     optional ChainEpoch at_epoch = 4;
+     uint32 max_entries = 4;
+     bytes from_cursor = 5;
+     optional ChainEpoch at_epoch = 6;
+     bool descending = 7;
+   }
+
+   message TransparentAddressTxIdsChunk {
+     ChainEpoch chain_epoch = 1;
+     bytes transaction_id = 2;
+     uint32 block_height = 3;
+     uint32 tx_index_in_block = 4;
+     bytes block_hash = 5;
+     bytes cursor = 6;
    }
    ```
 
    Capability string: `wallet.address.transparent_history_v1`.
 
-6. **Adapters**: native gRPC adapter implements `transparent_address_tx_ids_in_range`. Compat shim adapter wires `GetTaddressTxids` over the new method, with cursor pagination synthesized from the request range (the lightwalletd contract has no cursor; the compat shim emulates).
+   The cursor is a `StreamCursorTokenV1` token with the `TransparentHistory` family flag (nibble `0x3`); the body encodes `(network_id, address_script_hash, last_height, last_tx_index, descending_bit)`. Decoding follows the same HMAC-verify-then-parse pattern as `decode_chain_event` and `decode_mempool_event`; mismatched family produces `StreamCursorError::StreamFamilyMismatch`.
 
-7. **Tests, capability, docs**: new tests in store, query, compat (`tests/integration/`), and a live test under `services/zinder-ingest/tests/live/`. Capability added. `wallet-data-plane.md`, `storage-backend.md`, `public-interfaces.md` amended.
+6. **Adapters**: native gRPC adapter implements `transparent_address_tx_ids_in_range`. Compat shim adapter implements `GetTaddressTxids` and `GetTaddressTransactions` over the same native method: `GetTaddressTxids` emits each `TransactionId` as `RawTransaction { hash }`, and `GetTaddressTransactions` resolves each `TransactionId` through `WalletQueryApi::transaction` to fill `RawTransaction { data, height }`. The lightwalletd contract has no cursor; the compat shim drains the native stream within the requested height range and accepts the bounded result.
+
+7. **Tests, capability, docs**: new tests in store, query, compat (`tests/integration/`), and a live test under `services/zinder-ingest/tests/live/`. Capability added. `wallet-data-plane.md`, `storage-backend.md`, `public-interfaces.md` amended. The capability-coverage test in `crates/zinder-client/tests/integration/capability_coverage.rs` asserts the new `ChainIndex` method exists.
 
 ## Common mistakes
 
@@ -280,7 +330,9 @@ The DX/AX audit and code review have surfaced a recurring set of errors. Each is
 | Mistake | Why it happens | Right shape |
 |---------|----------------|-------------|
 | Adding a top-level error variant for the new family (`TransparentAddressUnavailable`) | The old split-error precedent suggests it | Use `ArtifactUnavailable { family, key }` |
-| Forgetting to extend the `ReorgWindow` delete path in `chain_store.rs` | The pattern is implicit, not enforced | Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch wherever it appears |
+| Forgetting to extend the `ReorgWindow` delete path in `chain_store.rs` | The pattern is implicit, not enforced | Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch wherever it appears (per-block families only) |
+| Applying eager-delete `ReorgWindow` semantics to an address-keyed family | The cookbook used to assume one reorg pattern; the actual code uses two | Pick by key shape per Step 2: per-block keys use eager-delete; address-keyed keys use dynamic-filter. Address-keyed families must include the trailing `chain_epoch_id` byte and call `block_is_visible` at read time |
+| Taking `bytes script_pub_key` or `bytes address_script_hash` only on a public address-keyed RPC | Looks more typed than `string`; in practice it taxes every CLI/test/debug session | Use the `AddressLookup` oneof; the adapter parses the string variant. The Rust `ChainIndex` API stays typed on `TransparentAddressScriptHash` |
 | Duplicating `status_from_query_error` in the new adapter | The function is named in two services and looks copy-friendly | Import from `services/zinder-query/src/grpc/mod.rs`; never copy |
 | Inventing a new cursor type for a one-off paginated read | The cursor section is long; skipping seems efficient | Use `StreamCursorTokenV1` or `MempoolStreamCursorV1` with the appropriate family tag |
 | Naming the method `get_*` or `fetch_*` | These verbs are common in other codebases | Use the bare-noun convention: `transparent_address_tx_ids_in_range`, not `get_transparent_address_tx_ids` or `fetch_*` |

@@ -18,7 +18,8 @@ use zinder_core::{
     BroadcastUnknown, ChainEpochId, ChainTipMetadata, Network, SUBTREE_LEAF_COUNT,
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionArtifact,
     TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentUtxoSpendArtifact,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -273,6 +274,66 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
         ]
     );
     assert!(streamed_utxos.iter().all(|utxo| utxo.address == address_b));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_taddress_history_drains_native_pages() -> eyre::Result<()> {
+    let transparent_address =
+        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x31; 20]);
+    let address = transparent_address.to_string();
+    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
+    let address_script_hash = transparent_address_script_hash(&script_pub_key);
+    let store_fixture = acceptance_store_fixture_with_transactions_and_tx_history(
+        DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        |block| {
+            (0..1001)
+                .map(|index| {
+                    TransactionArtifact::new(
+                        tx_id_for_index(index),
+                        block.height,
+                        block.hash,
+                        tx_payload_for_index(index),
+                    )
+                })
+                .collect()
+        },
+        |block| {
+            (0..1001)
+                .map(|index| {
+                    TransparentAddressTxIndexArtifact::new(
+                        address_script_hash,
+                        block.height,
+                        index,
+                        tx_id_for_index(index),
+                        block.hash,
+                    )
+                })
+                .collect()
+        },
+    )?;
+    let adapter =
+        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()));
+    let request = transparent_address_block_filter(address);
+
+    let txids = adapter
+        .get_taddress_txids(Request::new(request.clone()))
+        .await?
+        .into_inner();
+    let txids = collect_stream(txids).await?;
+    let transactions = adapter
+        .get_taddress_transactions(Request::new(request))
+        .await?
+        .into_inner();
+    let transactions = collect_stream(transactions).await?;
+
+    assert_eq!(txids.len(), 1001);
+    assert_eq!(transactions.len(), 1001);
+    assert_eq!(txids[0].data, tx_id_for_index(0).as_bytes().to_vec());
+    assert_eq!(txids[1000].data, tx_id_for_index(1000).as_bytes().to_vec());
+    assert_eq!(transactions[0].data, tx_payload_for_index(0));
+    assert_eq!(transactions[1000].data, tx_payload_for_index(1000));
 
     Ok(())
 }
@@ -841,6 +902,54 @@ where
     )?)
 }
 
+fn acceptance_store_fixture_with_transactions_and_tx_history<TransactionsFn, TxHistoryFn>(
+    tree_state_payload: Vec<u8>,
+    build_transactions: TransactionsFn,
+    build_tx_history: TxHistoryFn,
+) -> eyre::Result<StoreFixture>
+where
+    TransactionsFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<TransactionArtifact>,
+    TxHistoryFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<TransparentAddressTxIndexArtifact>,
+{
+    let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(1)
+        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0))
+        .with_tree_state_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);
+    let acceptance_block = base_fixture
+        .block_at(ACCEPTANCE_BLOCK_HEIGHT)
+        .ok_or_else(|| eyre!("acceptance fixture must include the height 1 block"))?
+        .clone();
+    let block_hash = acceptance_block.hash;
+    let parent_hash = acceptance_block.parent_hash;
+    let block_time_seconds = acceptance_block.block_time_seconds;
+    let transaction_artifacts = build_transactions(&acceptance_block);
+    let tx_history = build_tx_history(&acceptance_block);
+
+    let mut chain_fixture = base_fixture
+        .with_compact_block_payload_at(
+            ACCEPTANCE_BLOCK_HEIGHT,
+            acceptance_compact_block_payload(block_hash, parent_hash, block_time_seconds),
+        )
+        .with_sapling_subtree_root(SubtreeRootArtifact::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            SubtreeRootHash::from_bytes(SAPLING_SUBTREE_ROOT_HASH),
+            ACCEPTANCE_BLOCK_HEIGHT,
+            block_hash,
+        ));
+    for transaction_artifact in transaction_artifacts {
+        chain_fixture = chain_fixture.with_transaction_artifact(transaction_artifact);
+    }
+    for tx_history_artifact in tx_history {
+        chain_fixture = chain_fixture.with_transparent_address_tx_index(tx_history_artifact);
+    }
+
+    Ok(StoreFixture::with_chain_committed(
+        &chain_fixture,
+        ChainEpochId::new(1),
+    )?)
+}
+
 fn acceptance_compact_block_payload(
     block_hash: BlockHash,
     parent_hash: BlockHash,
@@ -879,6 +988,35 @@ fn acceptance_compact_block_payload(
         }),
     }
     .encode_to_vec()
+}
+
+fn transparent_address_block_filter(
+    address: String,
+) -> lightwalletd::TransparentAddressBlockFilter {
+    lightwalletd::TransparentAddressBlockFilter {
+        address,
+        range: Some(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    }
+}
+
+fn tx_id_for_index(index: u32) -> TransactionId {
+    let mut bytes = [0; 32];
+    bytes[..4].copy_from_slice(&index.to_be_bytes());
+    TransactionId::from_bytes(bytes)
+}
+
+fn tx_payload_for_index(index: u32) -> Vec<u8> {
+    format!("tx-payload-{index}").into_bytes()
 }
 
 fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
