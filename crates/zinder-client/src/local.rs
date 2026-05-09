@@ -535,6 +535,16 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
+    async fn transparent_address_balance(
+        &self,
+        addresses: &[zinder_core::TransparentAddressScriptHash],
+        at_epoch: Option<zinder_core::ChainEpoch>,
+    ) -> Result<zinder_core::TransparentAddressBalance, IndexerError> {
+        self.remote("transparent_address_balance")?
+            .transparent_address_balance(addresses, at_epoch)
+            .await
+    }
+
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
     }

@@ -45,7 +45,13 @@ pub enum UpstreamTransactionLookup {
     /// Transaction is still visible in the upstream mempool.
     InMempool,
     /// Transaction was mined into a block on the upstream best chain.
-    Mined(BlockHeight),
+    Mined {
+        /// Height at which the upstream node reports the transaction is mined.
+        mined_height: BlockHeight,
+        /// Hash of the block that mined the transaction, as reported by the
+        /// upstream node.
+        block_hash: BlockHash,
+    },
     /// Transaction is not in the upstream mempool or main chain.
     NotFound,
 }
@@ -366,18 +372,26 @@ impl ZebraJsonRpcSource {
 
         match response {
             Ok(verbose_response) => {
-                if let Some(height_value) = verbose_response.get("height").and_then(Value::as_u64) {
-                    let height_u32 = u32::try_from(height_value).map_err(|_| {
-                        SourceError::SourceProtocolMismatch {
-                            reason: "verbose getrawtransaction height does not fit u32",
-                        }
+                let height_value = verbose_response.get("height").and_then(Value::as_u64);
+                let Some(height_value) = height_value else {
+                    return Ok(UpstreamTransactionLookup::InMempool);
+                };
+                let mined_height = BlockHeight::new(u32::try_from(height_value).map_err(|_| {
+                    SourceError::SourceProtocolMismatch {
+                        reason: "verbose getrawtransaction height does not fit u32",
+                    }
+                })?);
+                let block_hash_hex = verbose_response
+                    .get("blockhash")
+                    .and_then(Value::as_str)
+                    .ok_or(SourceError::SourceProtocolMismatch {
+                        reason: "verbose getrawtransaction reports a height without a blockhash",
                     })?;
-                    Ok(UpstreamTransactionLookup::Mined(BlockHeight::new(
-                        height_u32,
-                    )))
-                } else {
-                    Ok(UpstreamTransactionLookup::InMempool)
-                }
+                let block_hash = decode_display_block_hash(block_hash_hex)?;
+                Ok(UpstreamTransactionLookup::Mined {
+                    mined_height,
+                    block_hash,
+                })
             }
             Err(ClientError::Call(error)) => {
                 let call_error = JsonRpcCallError::from(error);

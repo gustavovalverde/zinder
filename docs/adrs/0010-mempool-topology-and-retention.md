@@ -109,7 +109,7 @@ This is a breaking change for any client that built against the M2 shape. Zinder
 - Persistent pipeline tests live in `services/zinder-ingest/tests/integration/mempool_pipeline.rs`. They cover the snapshot+events delivery path, cursor resume, restart durability (`mempool_event_log_resumes_after_writer_restart`), and time-window pruning surfacing `MempoolCursorExpired` (`mempool_event_log_prunes_mined_under_short_retention`).
 - Compat surface tests in `services/zinder-compat-lightwalletd/tests/integration/mempool_compat.rs` cover `lightwalletd_get_mempool_stream_closes_on_tip_change` against a `ScriptedTipChangeWatcher`.
 - Live broadcast cycle tests in `services/zinder-ingest/tests/live/mempool_broadcast_cycle.rs` use `zinder_testkit::TransparentTestKey` to sign + broadcast a real v5 transparent transaction and observe it through the polling source. The reorg-out gate uses Zebra's `invalidateblock` JSON-RPC.
-- Mainnet streaming-source soak remains operational and `workflow_dispatch`-only per [ADR-0006](0006-test-tiers-and-live-config.md).
+- Mainnet streaming-source soak runs against an operator-hosted Zebra; the CI matrix shape is pending per [ADR-0006 §Open mainnet infrastructure questions](0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions). Local invocation is supported today via `require_live_mainnet()` plus the standard `ZINDER_NETWORK=zcash-mainnet` schema.
 
 ## Alternatives Considered
 
@@ -128,6 +128,22 @@ Rejected. The live index needs microsecond-latency transparent-overlay lookups. 
 ### Skip `TipChangeWatcher`; let consumers handle stream-end semantics
 
 Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the lightwalletd Go contract specifically requires close-on-tip-change. Diverging from the published contract is a compatibility regression even if a particular consumer happens to tolerate it.
+
+## Shipped Surfaces
+
+- `MempoolMinedEvent` carries `transaction_id`, `mined_height`, and `block_hash`
+  on the wire and on the canonical `MempoolEvent::Mined` variant. The `block_hash`
+  is source-driven enrichment: `MempoolSourceEvent::Mined` carries the block hash
+  observed by the source (`UpstreamTransactionLookup::Mined { mined_height,
+  block_hash }`), and the orchestrator passes the value through without a chain-
+  store fallback lookup. Lifecycle consumers receive the full mined block identity
+  in one cursor delivery.
+- `WalletQuery.TransparentMempoolOutputsByAddress` and
+  `WalletQuery.TransparentMempoolSpendByOutpoint` mirror the typed
+  `ChainIndex` mempool point lookups onto the gRPC wire. Both proxy through
+  `IngestControl` so secondary readers continue to share one mempool source.
+  Capabilities `wallet.mempool.transparent_outputs_by_address_v1` and
+  `wallet.mempool.transparent_spend_by_outpoint_v1` advertise the surface.
 
 ## Out of Scope
 

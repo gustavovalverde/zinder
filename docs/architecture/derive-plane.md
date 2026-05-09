@@ -53,17 +53,23 @@ The primary input. A `zinder-derive` consumer subscribes to `WalletQuery.ChainEv
 
 This channel is sufficient for views that derive from chain transitions: balance accumulators, address activity feeds, transaction count time-series, fee-rate distributions over time. The consumer's view is rebuilt by replaying the stream from `cursor = None`.
 
+The shipped consumer-side helper is `zinder_derive::run_chain_events_subscriber`. It implements the `DeriveConsumer` trait dispatch loop, decodes wire envelopes into typed `ChainCommittedEvent` / `ChainReorgedEvent` shapes, and persists the cursor atomically with each consumer's `WriteBatch` so a crash mid-apply replays the envelope on next start.
+
 ### Channel B — `MempoolEvents` subscription
 
 For views that include unconfirmed activity. A `zinder-derive` consumer subscribes to `WalletQuery.MempoolEvents` (defined in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)) with a persisted `MempoolStreamCursorV1` cursor.
 
 Combine with Channel A when the view needs both chain and mempool perspectives (e.g. explorer dashboards showing pending transactions alongside confirmed activity). The two streams have independent cursors and independent retention; consumers handle cross-stream ordering.
 
+The shipped consumer-side helper is `zinder_derive::run_mempool_events_subscriber`. The same atomic-cursor contract applies; consumers implement `DeriveMempoolConsumer` and stage writes into `DeriveConsumerCtx::batch` per `MempoolConsumerEvent`.
+
 ### Channel C — Canonical artifact replay
 
 For views that need full block bodies, full transaction data, or cross-block aggregations that the event stream does not carry. A `zinder-derive` consumer reads canonical artifacts via `ChainEpochReadApi` (in-process) or `WalletQuery` (over gRPC).
 
 This channel is used for one-time replay (initial backfill, full rebuild) and for occasional historical reads. Steady-state operation should use Channel A or B. A derive consumer that pulls from Channel C continuously is a smell: the data should probably be carried in `ChainEvents` instead, or the view is in the wrong plane.
+
+The Channel C → Channel A handoff is mediated by `zinder_derive::backfill_then_attach`. The helper probes the live stream for the earliest retained envelope, drains `compact_block_range` for the gap below the retention floor, dispatches each block as a synthetic `ChainCommittedEvent`, and resumes the live subscriber using the probe's first envelope as the cursor anchor. Per the M5 D12 contract, this is the canonical cold-start path every fresh derive consumer follows.
 
 ### What the derive plane must not consume
 
@@ -83,9 +89,11 @@ The service's capability strings use the `derive.<consumer>.<capability>_v{N}` n
 
 ### Shape 2 — Federated under `WalletQuery`
 
-For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in `services/zinder-derive` (or a dedicated derive crate) and is composed into `WalletQueryGrpcAdapter` at startup.
+For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in `services/zinder-derive` (or a dedicated derive crate) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) is owned by [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) and lives in `services/zinder-query/src/derive_proxy.rs`; every federated derive method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
 
-This shape is reserved for views that wallets and applications consume *as if* they were canonical. The `derive.*` capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident.
+The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance` (M5 Slice B), which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-derive`. The federated capability `derive.explorer.transparent_balance_v1` is advertised on `WalletQuery.ServerInfo` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `derive.explorer.ready_v1` ready inside the configured window.
+
+This shape is reserved for views that wallets and applications consume *as if* they were canonical. The `derive.*` capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 
 ### Shape 3 — Sink-only (no Zinder-served queries)
 
@@ -165,9 +173,8 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 
 ## Out of scope (for now)
 
-- **A reference derive consumer implementation.** This document defines the contract; implementations land per-consumer when concrete needs appear. The first likely consumer is an explorer view (paginated address history, block summaries, fee histograms) when wallet-side sync against M1 is validated.
 - **Federation across multiple derive consumers.** A single client query that joins data across `derive.explorer` and `derive.analytics` is not supported. Clients call each consumer separately and reconcile if needed.
-- **A standardized derive-consumer SDK.** Consumers are free-form Rust code that consumes `ChainEvents`. A future "consumer SDK" might land if the boilerplate becomes recurrent; until then, the contract is the cursor protocol.
+- **Extraction of the consumer SDK into a separate crate.** Backfill-then-attach, the cursor-persisting `ChainEvents` subscriber, and the mempool-events subscriber are shipped today as in-process helpers under `services/zinder-derive/src/consumer/` (entry points: `run_chain_events_subscriber`, `run_mempool_events_subscriber`, `backfill_then_attach`). Extraction to a dedicated `zinder-derive-sdk` crate is deferred until M6+ adds a second derive consumer that justifies the split.
 - **Derive consumers that require upstream node data not in canonical artifacts.** If a use case appears (e.g. mempool fee rates that Zinder does not currently surface), the canonical artifact extends first; derive consumers do not bypass.
 
 ## Cross-references
@@ -179,5 +186,7 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the subscription contract.
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows that bound derive-consumer downtime tolerance.
 - [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
+- [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) — the federation primitive (`DeriveProxy<Client>`, readiness probe loop, capability namespace rule) that every federated derive method reuses.
+- [M5 spec](../specs/m5-transparent-address-balance.md) — the first shipped derive consumer (transparent address balance) and the Shape C compute-at-read-time pattern that the explorer balance handler implements.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — the capability protocol derive consumers must implement.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions that derive consumers inherit.

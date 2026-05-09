@@ -346,6 +346,24 @@ impl IngestControl for SharedWriterStatus {
             "readiness_refresh test stub does not implement MempoolEvents",
         ))
     }
+
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        _request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement TransparentMempoolOutputsByAddress",
+        ))
+    }
+
+    async fn transparent_mempool_spend_by_outpoint(
+        &self,
+        _request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement TransparentMempoolSpendByOutpoint",
+        ))
+    }
 }
 
 async fn spawn_writer_status_server(

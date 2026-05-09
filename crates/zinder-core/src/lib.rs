@@ -14,6 +14,7 @@ mod chain_epoch;
 mod mempool;
 mod subtree_root;
 mod transaction;
+mod transparent_address_balance;
 mod transparent_address_tx_index;
 mod transparent_utxo;
 mod tree_state;
@@ -38,6 +39,7 @@ pub use transaction::{
     BroadcastUnknown, MinedDetails, MinedTransaction, RawTransactionBytes, TransactionArtifact,
     TransactionBroadcastResult, TransactionId, TxStatus,
 };
+pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_utxo::{
     TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,

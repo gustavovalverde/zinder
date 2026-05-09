@@ -10,10 +10,13 @@ use zinder_core::{
     RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
 };
 use zinder_proto::v1::{
+    explorer::explorer_query_client::ExplorerQueryClient,
     ingest::ingest_control_client::IngestControlClient,
     wallet::{self, wallet_query_server},
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
+
+use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge};
 use zinder_store::{
     ChainEventStreamFamily, StreamCursorTokenV1, chain_epoch_from_message, run_chain_event_stream,
 };
@@ -55,6 +58,7 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     server_info: ServerInfoSettings,
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
+    explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
 }
 
 impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
@@ -67,6 +71,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             server_info,
             ingest_control_proxy_endpoint: None,
             ingest_control_bearer_token: None,
+            explorer_proxy: None,
         }
     }
 
@@ -87,7 +92,33 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             server_info,
             ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
             ingest_control_bearer_token: None,
+            explorer_proxy: None,
         }
+    }
+
+    /// Wires a derive-plane explorer proxy that federates
+    /// `WalletQuery.TransparentAddressBalance` to
+    /// `zinder-derive`'s `ExplorerQuery`.
+    ///
+    /// Without an explorer proxy the federated balance method returns
+    /// `UNAVAILABLE` and `ServerInfo` omits the corresponding capability
+    /// string.
+    #[must_use]
+    pub fn with_explorer_proxy(
+        mut self,
+        explorer_proxy: DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>,
+    ) -> Self {
+        self.explorer_proxy = Some(explorer_proxy);
+        self
+    }
+
+    /// Returns the readiness gauge of the configured explorer proxy.
+    ///
+    /// Operators wire the gauge into a [`crate::spawn_derive_readiness_probe`]
+    /// task so the federated capability is gated on a live readiness probe.
+    #[must_use]
+    pub fn explorer_proxy_readiness(&self) -> Option<DeriveReadinessGauge> {
+        self.explorer_proxy.as_ref().map(DeriveProxy::readiness)
     }
 
     /// Attaches a shared-secret bearer token to every proxied request.
@@ -352,6 +383,46 @@ where
         proxy_mempool_events(endpoint, self.ingest_control_bearer_token.clone(), request).await
     }
 
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
+        let endpoint = self.require_ingest_control_proxy_endpoint(
+            "TransparentMempoolOutputsByAddress requires the ingest-control proxy; \
+             configure the writer endpoint",
+        )?;
+        let request = request.into_inner();
+        let address_script_hash =
+            address_lookup_to_script_hash(request.address.clone(), self.server_info_network()?)
+                .map_err(|error| status_from_query_error(&error))?;
+        let normalized_request = wallet::TransparentMempoolOutputsByAddressRequest {
+            address: Some(typed_script_hash_address_lookup(
+                &address_script_hash.as_bytes(),
+            )),
+            max_entries: request.max_entries,
+        };
+        let mut client =
+            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+                .await?;
+        client
+            .transparent_mempool_outputs_by_address(Request::new(normalized_request))
+            .await
+    }
+
+    async fn transparent_mempool_spend_by_outpoint(
+        &self,
+        request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        let endpoint = self.require_ingest_control_proxy_endpoint(
+            "TransparentMempoolSpendByOutpoint requires the ingest-control proxy; \
+             configure the writer endpoint",
+        )?;
+        let mut client =
+            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+                .await?;
+        client.transparent_mempool_spend_by_outpoint(request).await
+    }
+
     async fn transparent_address_utxos(
         &self,
         request: Request<wallet::TransparentAddressUtxosRequest>,
@@ -446,12 +517,44 @@ where
         Ok(Response::new(Box::pin(stream::iter(chunks))))
     }
 
+    async fn transparent_address_balance(
+        &self,
+        request: Request<wallet::TransparentAddressBalanceRequest>,
+    ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
+        let proxy = self.explorer_proxy.as_ref().ok_or_else(|| {
+            Status::unavailable(
+                "TransparentAddressBalance requires the derive-plane explorer proxy; \
+                 configure the zinder-derive endpoint",
+            )
+        })?;
+        proxy
+            .forward(request, |mut client, request| async move {
+                client.transparent_address_balance(request).await
+            })
+            .await
+    }
+
     async fn server_info(
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
+        let mut capabilities = build_server_capabilities_message(&self.server_info);
+        let federated_balance_capability = self
+            .explorer_proxy
+            .as_ref()
+            .filter(|proxy| proxy.is_ready())
+            .map(|proxy| proxy.capability().to_owned());
+        if let Some(capability) = federated_balance_capability {
+            if !capabilities.capabilities.contains(&capability) {
+                capabilities.capabilities.push(capability);
+            }
+        } else {
+            capabilities
+                .capabilities
+                .retain(|advertised| advertised != "derive.explorer.transparent_balance_v1");
+        }
         Ok(Response::new(wallet::ServerInfoResponse {
-            capabilities: Some(build_server_capabilities_message(&self.server_info)),
+            capabilities: Some(capabilities),
         }))
     }
 }
@@ -526,6 +629,29 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
                 self.server_info.network
             ))
         })
+    }
+
+    fn require_ingest_control_proxy_endpoint(
+        &self,
+        unconfigured_message: &'static str,
+    ) -> Result<String, Status> {
+        self.ingest_control_proxy_endpoint
+            .clone()
+            .ok_or_else(|| Status::unavailable(unconfigured_message))
+    }
+}
+
+/// Builds an `AddressLookup` whose only populated arm is the typed
+/// script-hash bytes.
+///
+/// The native adapter parses public `AddressLookup` selectors at the
+/// public boundary; this helper produces the normalized shape the
+/// private ingest-control surface accepts.
+fn typed_script_hash_address_lookup(script_hash_bytes: &[u8]) -> wallet::AddressLookup {
+    wallet::AddressLookup {
+        selector: Some(wallet::address_lookup::Selector::ScriptHash(
+            script_hash_bytes.to_vec(),
+        )),
     }
 }
 

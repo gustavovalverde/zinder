@@ -202,9 +202,11 @@ fn canonical_event_from_source(
         MempoolSourceEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         } => Ok(MempoolEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         }),
         _ => Err(MempoolHydrationFailureReason::UnknownSourceEventVariant),
     }

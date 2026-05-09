@@ -173,7 +173,7 @@ In-crate `#[cfg(test)] mod tests` blocks remain the home for T0 unit tests.
 | T0 unit | `#[cfg(test)] mod tests` in `src/` | `default` / `ci` | (default-filter) | every PR |
 | T1 integration | `tests/integration/` | `default` / `ci` | (default-filter) | every PR |
 | T2 perf | `tests/perf/` | `ci-perf` | `test(/^perf::/)` | every PR (separate job) |
-| T3 live | `tests/live/` | `ci-live` | `test(/^live::/)` | nightly (regtest), weekly (testnet), `workflow_dispatch` (mainnet) |
+| T3 live | `tests/live/` | `ci-live` | `test(/^live::/)` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape still under discussion per §Open mainnet infrastructure questions) |
 
 ### Test runner: nextest
 
@@ -215,14 +215,14 @@ The workspace-level lint floor (`unwrap`, `expect`, `dbg`, `print` denied in tes
 
 ### Open mainnet infrastructure questions
 
-Until each is answered, T3 mainnet is `workflow_dispatch`-only on the same GitHub-hosted runner shape as T3 regtest/testnet, and tests guard their own scope through `require_live_for(&[Network::ZcashMainnet])` plus checkpoint-bounded ranges:
+Local mainnet runs are supported today against an operator-hosted Zebra: `ZINDER_TEST_LIVE=1 ZINDER_NETWORK=zcash-mainnet` plus the standard `ZINDER_NODE__*` schema reaches the local node, and per-test scope is still guarded by `require_live_for(&[Network::ZcashMainnet])` plus checkpoint-bounded ranges. The open questions below scope the **CI** matrix shape (cadence, hosting, cost), not whether mainnet T3 is runnable; they remain unresolved:
 
 1. **Mainnet node hosting.** ZFND-operated dedicated Zebra node, or third-party node with credentials shared via GitHub Actions secrets.
 2. **Mainnet runner topology.** GitHub-hosted runners cap at 6 hours. A genesis backfill on mainnet exceeds that.
-3. **T3 mainnet trigger model.** Release-tag only, scheduled monthly, both, or `workflow_dispatch`-only.
+3. **T3 mainnet CI trigger model.** Release-tag only, scheduled monthly, both, or `workflow_dispatch`-only.
 4. **Cost ownership.** Persistent runner plus multi-TB disk has a recurring monthly cost.
 5. **On-call destination.** Slack channel, email list, or auto-opened GitHub issue.
-6. **T3 mainnet scope.** Mainnet starts with capability probe, single read-RPC roundtrip, checkpoint-bounded backfill.
+6. **T3 mainnet CI scope.** Mainnet starts with capability probe, single read-RPC roundtrip, checkpoint-bounded backfill.
 
 ## Consequences
 
@@ -243,7 +243,7 @@ Negative:
 - `zinder-testkit` has a path dep on `zinder-runtime` so `LiveTestEnv` can reuse `zinder_environment_source`. The dependency is one-way.
 - `cargo test --test <name>` invocations someone may have memorized are gone; per-file binaries become one-binary-per-crate. Nextest filter expressions are a strict superset.
 - `eyre` is a dev-dep across the workspace.
-- The mainnet workflow is `workflow_dispatch`-only until the six open questions resolve.
+- The mainnet CI workflow shape (cadence, runner, cost ownership) remains under discussion until the six open questions resolve. Local mainnet runs against an operator-hosted Zebra are supported today and use the same `require_live_mainnet()` opt-in.
 
 Tradeoffs:
 

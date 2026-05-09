@@ -13,7 +13,7 @@ use zinder_core::{
     CompactBlockArtifact, MempoolEntry, MinedDetails, MinedTransaction, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
     SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
@@ -22,6 +22,8 @@ use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
     mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
+    transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
+    transparent_mempool_spend_from_message as transparent_mempool_spend_from_message_shared,
 };
 
 use crate::{
@@ -488,40 +490,105 @@ impl ChainIndex for RemoteChainIndex {
         &self,
         request: TransparentMempoolOutputsRequest,
     ) -> Result<Vec<TransparentMempoolOutput>, IndexerError> {
-        let max_outputs = u32_to_usize(request.max_entries);
-        let mut outputs: Vec<TransparentMempoolOutput> = Vec::new();
-        self.for_each_mempool_entry(|entry| {
-            for output in &entry.transparent_outputs {
-                if output.address_script_hash == request.address_script_hash {
-                    outputs.push(output.clone());
-                    if outputs.len() >= max_outputs {
-                        return ControlFlow::Break(());
-                    }
-                }
-            }
-            ControlFlow::Continue(())
-        })
-        .await?;
-        Ok(outputs)
+        let wire_request = wallet::TransparentMempoolOutputsByAddressRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    request.address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            max_entries: Some(request.max_entries),
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_mempool_outputs_by_address(Request::new(wire_request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        response
+            .outputs
+            .into_iter()
+            .map(transparent_mempool_output_from_message)
+            .collect::<Result<Vec<_>, IndexerError>>()
     }
 
     async fn transparent_mempool_spend_by_outpoint(
         &self,
         outpoint: TransparentOutPoint,
     ) -> Result<Option<TransparentMempoolSpend>, IndexerError> {
-        let mut found_spend: Option<TransparentMempoolSpend> = None;
-        self.for_each_mempool_entry(|entry| {
-            for spend in &entry.transparent_spends {
-                if spend.spent_outpoint == outpoint {
-                    found_spend = Some(*spend);
-                    return ControlFlow::Break(());
-                }
-            }
-            ControlFlow::Continue(())
-        })
-        .await?;
-        Ok(found_spend)
+        let wire_request = wallet::TransparentMempoolSpendByOutpointRequest {
+            transaction_id: outpoint.transaction_id.as_bytes().to_vec(),
+            output_index: outpoint.output_index,
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_mempool_spend_by_outpoint(Request::new(wire_request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        response
+            .spend
+            .map(transparent_mempool_spend_from_message)
+            .transpose()
     }
+
+    async fn transparent_address_balance(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        let wire_addresses = addresses
+            .iter()
+            .map(|script_hash| wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    script_hash.as_bytes().to_vec(),
+                )),
+            })
+            .collect();
+        let request = wallet::TransparentAddressBalanceRequest {
+            addresses: wire_addresses,
+            at_epoch: at_epoch.map(chain_epoch_to_message),
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_address_balance(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        transparent_address_balance_from_message(self.network, response)
+    }
+}
+
+fn transparent_address_balance_from_message(
+    expected_network: Network,
+    message: wallet::TransparentAddressBalanceResponse,
+) -> Result<TransparentAddressBalance, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    Ok(TransparentAddressBalance {
+        confirmed_zat: message.confirmed_zat,
+        unconfirmed_delta_zat: message.unconfirmed_delta_zat,
+        address_count: message.address_count,
+        chain_epoch,
+    })
+}
+
+fn transparent_mempool_output_from_message(
+    message: wallet::TransparentMempoolOutput,
+) -> Result<TransparentMempoolOutput, IndexerError> {
+    transparent_mempool_output_from_message_shared(message).map_err(decode_error_to_indexer_error)
+}
+
+fn transparent_mempool_spend_from_message(
+    message: wallet::TransparentMempoolSpend,
+) -> Result<TransparentMempoolSpend, IndexerError> {
+    transparent_mempool_spend_from_message_shared(message).map_err(decode_error_to_indexer_error)
 }
 
 impl RemoteChainIndex {
@@ -579,14 +646,6 @@ impl RemoteChainIndex {
             }
         }
     }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "zinder-core rejects targets with pointer widths below 32 bits"
-)]
-const fn u32_to_usize(count: u32) -> usize {
-    count as usize
 }
 
 fn ensure_network_name(expected: Network, actual_name: &str) -> Result<(), IndexerError> {
@@ -1138,9 +1197,11 @@ fn mempool_event_envelope_from_message(
         zinder_store::MempoolEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         } => MempoolEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         },
         _ => {
             return Err(IndexerError::malformed(

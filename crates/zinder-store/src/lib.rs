@@ -56,6 +56,8 @@ pub use proto_codec::{
     ChainEventEncodeError, MempoolDecodeError, chain_epoch_from_message, chain_epoch_message,
     chain_event_envelope_message, mempool_entry_from_message, mempool_entry_message,
     mempool_event_envelope_from_message, mempool_event_envelope_message,
+    transparent_mempool_output_from_message, transparent_mempool_output_message,
+    transparent_mempool_spend_from_message, transparent_mempool_spend_message,
 };
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;

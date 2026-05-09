@@ -228,28 +228,46 @@ Mempool retention is two-tier (60 minutes mined / 24 hours invalidated by defaul
 
 `MempoolSnapshot` is the bootstrap and bounded-enumeration surface. It is not
 the long-term contract for every non-Rust client that wants a single transaction,
-address, or outpoint answer. Native gRPC should expose focused point lookups that
+address, or outpoint answer. Native gRPC exposes focused point lookups that
 mirror the `ChainIndex` methods:
 
-- `TransactionStatus` or an equivalent status-bearing `Transaction` response for
-  mined/mempool/not-found/conflicting-chain state.
-- `TransparentMempoolOutputsByAddress` for unmined transparent outputs tied to
-  one transparent address script hash.
-- `TransparentMempoolSpendByOutpoint` for the unmined spend of one transparent
-  outpoint, when present.
+- `WalletQuery.Transaction` returns the typed `TransactionStatusResponse`
+  carrying `Mined`/`InMempool`/`ConflictingChain` (with `NotFound` mapped to
+  gRPC `NOT_FOUND`).
+- `WalletQuery.TransparentMempoolOutputsByAddress` (capability
+  `wallet.mempool.transparent_outputs_by_address_v1`) returns unmined
+  transparent outputs that fund one transparent address.
+- `WalletQuery.TransparentMempoolSpendByOutpoint` (capability
+  `wallet.mempool.transparent_spend_by_outpoint_v1`) returns the unmined spend
+  of one transparent outpoint, when present.
 
-These methods still read the writer-owned `MempoolIndex` through the
-`IngestControl` proxy path settled by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+The mempool live state is in-memory and not chain-epoch-pinnable; both
+responses bind to `chain_epoch` visible at lookup time and the requests do not
+take an `at_epoch` field. Cap rules: `optional max_entries` defaults to a
+server constant, and values larger than the server's hard cap are silently
+clamped.
+
+These methods read the writer-owned `MempoolIndex` through the `IngestControl`
+proxy path settled by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
 They do not open a second mempool source and do not reconstruct a local live
-index inside `zinder-query`.
+index inside `zinder-query`. The native adapter parses the public
+`AddressLookup` (string or script-hash form) at the public boundary and
+forwards a normalized script-hash-only request to `IngestControl`; the
+private writer-side handler rejects the address-string arm because the
+adapter is the only client.
 
 The transparent-address mempool methods are explicitly transparent-only: the
 privacy boundary forbids by-address shielded queries, and clients scan mempool
 compact-transaction payloads locally for shielded interest.
 
-`MempoolMinedEvent` carries both `mined_height` and `block_hash`. Consumers that
-track a pending transaction through mining need the full mined block identity to
-handle reorgs and local wallet bookkeeping without a follow-up latest-tip read.
+`MempoolMinedEvent` carries `transaction_id`, `mined_height`, and `block_hash`.
+Block hash is source-driven enrichment: the source backends extract the mined
+block hash from the upstream node's observation (Zebra streaming
+`MempoolChange::Mined` plus `getrawtransaction`, JSON-RPC polling
+`getrawtransaction`'s `blockhash` field) so the orchestrator passes through
+authoritative bytes without a chain-store-not-yet-caught-up race. Consumers
+that track a pending transaction through mining receive the full mined block
+identity in one cursor delivery.
 
 The lightwalletd compat shim maps `GetMempoolStream` and `GetMempoolTx` over
 `MempoolEvents` and `MempoolSnapshot` when the adapter is configured with the
@@ -313,6 +331,20 @@ artifact reads to satisfy the request, but the public response and stream must
 be deterministically ordered and capped as one result set. `maxEntries = 0`
 uses the adapter's configured default bound rather than becoming an unbounded
 query.
+
+## Transparent Address Balance
+
+Transparent-address balance is a derive-plane consumer ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery), [M5 spec](../specs/m5-transparent-address-balance.md)) federated under `WalletQuery` for consumer neutrality. The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, `address_count: uint32`, and the binding `chain_epoch`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.
+
+Capability `derive.explorer.transparent_balance_v1` is advertised on `WalletQuery.ServerInfo` only when `zinder-query` is configured with a derive proxy and the proxy's readiness probe reports the `derive.explorer.ready_v1` capability fresh within the probe interval. Deployments without `zinder-derive` reachable omit the capability and the federated method returns gRPC `UNAVAILABLE`. The federation primitive is owned by [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md).
+
+The compute path is Shape C ([M5 spec §D4](../specs/m5-transparent-address-balance.md)). For each address in the request, the derive-plane handler (in `services/zinder-derive/src/grpc/adapter.rs`) calls back to `WalletQuery.TransparentAddressUtxos` for confirmed UTXOs, `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, and `WalletQuery.TransparentMempoolSpendByOutpoint` per UTXO for unconfirmed spends. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends. No new column family lives in `zinder-derive`'s RocksDB for balance; the canonical UTXO and mempool surfaces carry every byte the response needs. A future read-path optimization (the accumulator-backed Shape A reserved in M5 D4) does not change the public wire shape or the capability string.
+
+The address list is hard-capped at 256 entries per request to bound the compute fanout. The `at_epoch` field pins the read to a specific chain epoch (per the standard chain-epoch pin contract); historical balance at an arbitrary height is out of scope ([M5 spec §D8](../specs/m5-transparent-address-balance.md)).
+
+The lightwalletd compat shim wires `GetTaddressBalance` and `GetTaddressBalanceStream` over the federated path. `GetTaddressBalance` projects the structured `TransparentAddressBalanceResponse` to legacy `lightwalletd::Balance.value_zat` by casting `confirmed_zat` to `int64` and dropping `unconfirmed_delta_zat` (the lightwalletd proto cannot carry both). `GetTaddressBalanceStream` is a per-address loop over the unary form for legacy clients; it has zero call sites across the surveyed wallet ecosystem and exists only for the lightwalletd contract.
+
+The `ChainIndex` Rust API exposes `transparent_address_balance(addresses, at_epoch)` returning `TransparentAddressBalance`. `LocalChainIndex` and `RemoteChainIndex` both implement it; the capability-coverage test asserts the method exists for any consumer that advertises `derive.explorer.transparent_balance_v1`.
 
 ## Capability Discovery
 

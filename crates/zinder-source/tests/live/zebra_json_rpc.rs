@@ -202,9 +202,18 @@ async fn upstream_transaction_lookup_resolves_mined_coinbase() -> Result<()> {
         .fetch_upstream_transaction_lookup(mined_transaction_id)
         .await?;
 
-    assert!(matches!(lookup, UpstreamTransactionLookup::Mined(_)));
-    if let UpstreamTransactionLookup::Mined(observed_height) = lookup {
+    assert!(matches!(lookup, UpstreamTransactionLookup::Mined { .. }));
+    if let UpstreamTransactionLookup::Mined {
+        mined_height: observed_height,
+        block_hash: observed_hash,
+    } = lookup
+    {
         assert_eq!(observed_height, tip_height);
+        assert_ne!(
+            observed_hash.as_bytes(),
+            [0u8; 32],
+            "blockhash must be present"
+        );
     }
     Ok(())
 }

@@ -6,7 +6,7 @@
 //! height. The envelope binds the event to its cursor token, monotonic
 //! sequence, and source-observation timestamp.
 
-use zinder_core::{BlockHeight, MempoolEntry, MempoolEvictionReason, TransactionId};
+use zinder_core::{BlockHash, BlockHeight, MempoolEntry, MempoolEvictionReason, TransactionId};
 
 use crate::StreamCursorTokenV1;
 
@@ -63,6 +63,10 @@ pub enum MempoolEvent {
         transaction_id: TransactionId,
         /// Height at which the source observed the mining.
         mined_height: BlockHeight,
+        /// Hash of the block that mined the transaction, as observed by the
+        /// source. Persisted alongside the height so cursor consumers can
+        /// track lifecycle without a follow-up tip read.
+        block_hash: BlockHash,
     },
 }
 

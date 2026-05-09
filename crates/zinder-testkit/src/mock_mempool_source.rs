@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use zinder_core::{BlockHeight, MempoolEvictionReason, TransactionId};
+use zinder_core::{BlockHash, BlockHeight, MempoolEvictionReason, TransactionId};
 use zinder_source::{
     MempoolSource, MempoolSourceBackend, MempoolSourceCapabilities, MempoolSourceEntry,
     MempoolSourceEvent, MempoolSourceEventStream, SourceError,
@@ -99,10 +99,12 @@ impl MockMempoolSourceControl {
         &self,
         transaction_id: TransactionId,
         mined_height: BlockHeight,
+        block_hash: BlockHash,
     ) -> Result<(), MockMempoolSourceClosed> {
         self.push_result(Ok(MempoolSourceEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         }))
     }
 
@@ -168,8 +170,8 @@ mod tests {
     use std::error::Error;
     use tokio_stream::StreamExt;
     use zinder_core::{
-        AuthDigest, BlockHeight, MempoolEvictionReason, RawTransactionBytes, TransactionId,
-        UnixTimestampMillis,
+        AuthDigest, BlockHash, BlockHeight, MempoolEvictionReason, RawTransactionBytes,
+        TransactionId, UnixTimestampMillis,
     };
     use zinder_source::{
         MempoolSource, MempoolSourceBackend, MempoolSourceEntry, MempoolSourceEvent,
@@ -191,7 +193,11 @@ mod tests {
         let mut stream = mock.events().await?;
 
         control.push_added(sample_entry(0x10))?;
-        control.push_mined(TransactionId::from_bytes([0x11; 32]), BlockHeight::new(101))?;
+        control.push_mined(
+            TransactionId::from_bytes([0x11; 32]),
+            BlockHeight::new(101),
+            BlockHash::from_bytes([0x11; 32]),
+        )?;
         control.close_stream();
 
         let first_event = stream.next().await.ok_or("expected first event")??;

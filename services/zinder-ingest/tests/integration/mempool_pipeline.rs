@@ -11,8 +11,8 @@ use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_core::{
-    AuthDigest, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes, TransactionId,
-    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
+    AuthDigest, BlockHash, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes,
+    TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
     TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex};
@@ -396,6 +396,7 @@ async fn mempool_event_log_prunes_mined_under_short_retention() -> Result<()> {
         MempoolEvent::Mined {
             transaction_id: entry_old.transaction_id,
             mined_height: zinder_core::BlockHeight::new(123),
+            block_hash: BlockHash::from_bytes([0xC0; 32]),
         },
     )?;
     let now = u64::try_from(
@@ -498,6 +499,7 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
         MempoolEvent::Mined {
             transaction_id: TransactionId::from_bytes([0xD0; 32]),
             mined_height: zinder_core::BlockHeight::new(101),
+            block_hash: BlockHash::from_bytes([0xD0; 32]),
         },
     )?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -514,6 +516,7 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
         MempoolEvent::Mined {
             transaction_id: TransactionId::from_bytes([0xD2; 32]),
             mined_height: zinder_core::BlockHeight::new(102),
+            block_hash: BlockHash::from_bytes([0xD2; 32]),
         },
     )?;
 
@@ -693,7 +696,11 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
 
     // Phase 2: source observes Mined → orchestrator removes the entry from
     // the live index, the event log records a Mined transition.
-    control.push_mined(admitted_transaction_id, zinder_core::BlockHeight::new(101))?;
+    control.push_mined(
+        admitted_transaction_id,
+        zinder_core::BlockHeight::new(101),
+        BlockHash::from_bytes([0xE0; 32]),
+    )?;
     wait_for_outcome_count(&outcomes, 2).await?;
     assert!(
         !mempool_index.is_in_mempool(admitted_transaction_id),
@@ -756,6 +763,159 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
     // Cleanup
     control.close_stream();
     let _ = tokio::time::timeout(Duration::from_secs(2), orchestrator_handle).await;
+    Ok(())
+}
+
+/// Phase 3 — `IngestControl.TransparentMempoolOutputsByAddress` returns the
+/// outputs of an admitted mempool entry that fund the requested address, and
+/// returns an empty list for an address with no mempool footprint.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_serves_transparent_mempool_outputs_by_address() -> Result<()> {
+    use zinder_proto::v1::wallet::{
+        AddressLookup, TransparentMempoolOutputsByAddressRequest, address_lookup,
+    };
+
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let chain_epoch = *store_fixture
+        .committed_chain_epoch()
+        .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
+    let mempool_index = MempoolIndex::new();
+    let admitted = synthetic_entry(0xAA, chain_epoch);
+    assert_eq!(
+        mempool_index.apply_added(admitted.clone()),
+        MempoolApplyOutcome::Applied
+    );
+    let listen_addr =
+        spawn_ingest_control(store_fixture.chain_store().clone(), mempool_index.clone()).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+
+    // Synthetic entry funds address script-hash [0xAA; 32].
+    let funded_response = client
+        .transparent_mempool_outputs_by_address(TransparentMempoolOutputsByAddressRequest {
+            address: Some(AddressLookup {
+                selector: Some(address_lookup::Selector::ScriptHash(vec![0xAA; 32])),
+            }),
+            max_entries: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(funded_response.outputs.len(), 1);
+    let output = funded_response
+        .outputs
+        .first()
+        .ok_or_else(|| eyre::eyre!("response.outputs is empty"))?;
+    assert_eq!(output.address_script_hash, vec![0xAA; 32]);
+    assert_eq!(output.value_zat, 1_000);
+
+    // Address with no mempool footprint resolves to an empty list, not an error.
+    let unknown_response = client
+        .transparent_mempool_outputs_by_address(TransparentMempoolOutputsByAddressRequest {
+            address: Some(AddressLookup {
+                selector: Some(address_lookup::Selector::ScriptHash(vec![0xFF; 32])),
+            }),
+            max_entries: None,
+        })
+        .await?
+        .into_inner();
+    assert!(unknown_response.outputs.is_empty());
+
+    Ok(())
+}
+
+/// Phase 3 — `IngestControl.TransparentMempoolSpendByOutpoint` returns the
+/// mempool spend that consumes the requested outpoint, and `None` for an
+/// outpoint that is not being spent in the mempool.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result<()> {
+    use zinder_proto::v1::wallet::TransparentMempoolSpendByOutpointRequest;
+
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let chain_epoch = *store_fixture
+        .committed_chain_epoch()
+        .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
+    let mempool_index = MempoolIndex::new();
+    let admitted = synthetic_entry(0xAA, chain_epoch);
+    assert_eq!(
+        mempool_index.apply_added(admitted.clone()),
+        MempoolApplyOutcome::Applied
+    );
+    let listen_addr =
+        spawn_ingest_control(store_fixture.chain_store().clone(), mempool_index.clone()).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+
+    // Synthetic entry spends outpoint ([0x55; 32], 0).
+    let spent_response = client
+        .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
+            transaction_id: vec![0x55; 32],
+            output_index: 0,
+        })
+        .await?
+        .into_inner();
+    let spend = spent_response
+        .spend
+        .ok_or_else(|| eyre::eyre!("expected mempool spend"))?;
+    assert_eq!(spend.spent_transaction_id, vec![0x55; 32]);
+    assert_eq!(spend.spent_output_index, 0);
+    assert_eq!(
+        spend.spending_transaction_id,
+        admitted.transaction_id.as_bytes().to_vec()
+    );
+
+    let unknown_response = client
+        .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
+            transaction_id: vec![0xFF; 32],
+            output_index: 7,
+        })
+        .await?
+        .into_inner();
+    assert!(unknown_response.spend.is_none());
+
+    Ok(())
+}
+
+/// Phase 3 — `MempoolMinedEvent.block_hash` rides the wire alongside
+/// `mined_height`. Source-driven enrichment: the canonical event log persists
+/// the source-observed block hash and the gRPC stream replays it verbatim.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_mined_event_block_hash_rides_the_wire() -> Result<()> {
+    use zinder_core::BlockHash;
+
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let store = store_fixture.chain_store().clone();
+    let mempool_index = MempoolIndex::new();
+
+    let txid = TransactionId::from_bytes([0xCA; 32]);
+    let block_hash = BlockHash::from_bytes([0xCB; 32]);
+    let _mined_envelope = append_mempool_event(
+        &store,
+        MempoolEvent::Mined {
+            transaction_id: txid,
+            mined_height: zinder_core::BlockHeight::new(42),
+            block_hash,
+        },
+    )?;
+
+    let listen_addr = spawn_ingest_control(store, mempool_index).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+    let mut event_stream = client
+        .mempool_events(MempoolEventsRequest {
+            from_cursor: Vec::new(),
+            family: MempoolEventStreamFamily::Mempool as i32,
+        })
+        .await?
+        .into_inner();
+
+    let envelope = next_envelope(&mut event_stream).await?;
+    let event = envelope
+        .event
+        .ok_or_else(|| eyre::eyre!("envelope event missing"))?;
+    let mempool_event_envelope::Event::Mined(mined) = event else {
+        return Err(eyre::eyre!("expected Mined event"));
+    };
+    assert_eq!(mined.transaction_id, txid.as_bytes().to_vec());
+    assert_eq!(mined.mined_height, 42);
+    assert_eq!(mined.block_hash, block_hash.as_bytes().to_vec());
+
     Ok(())
 }
 

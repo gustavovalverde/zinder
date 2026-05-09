@@ -20,6 +20,10 @@ pub(crate) struct DeriveConfig {
     pub(crate) storage_path: PathBuf,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    /// Wallet-query endpoint that backs the Shape C balance read path.
+    /// Empty string means the federated balance method is unavailable; the
+    /// `derive.explorer.transparent_balance_v1` capability is omitted.
+    pub(crate) wallet_query_endpoint: Option<String>,
 }
 
 /// Command-line overrides applied on top of the layered configuration.
@@ -29,6 +33,7 @@ pub(crate) struct DeriveConfigOverrides {
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) wallet_query_endpoint: Option<String>,
 }
 
 /// Error returned while resolving derive configuration or running the binary.
@@ -105,6 +110,7 @@ struct DeriveSection {
 struct DeriveExplorerSection {
     listen_addr: Option<String>,
     storage_path: Option<String>,
+    wallet_query_endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,6 +140,7 @@ struct DeriveToml {
 struct DeriveExplorerToml {
     listen_addr: String,
     storage_path: String,
+    wallet_query_endpoint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +158,7 @@ impl DeriveConfigToml {
                 explorer: DeriveExplorerToml {
                     listen_addr: config.listen_addr.to_string(),
                     storage_path: config.storage_path.to_string_lossy().into_owned(),
+                    wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
                 },
             },
             ops: OpsToml {
@@ -191,6 +199,11 @@ fn apply_derive_overrides(
             .set_override("ops.listen_addr", ops_listen_addr.to_string())
             .map_err(ConfigError::load)?;
     }
+    if let Some(endpoint) = overrides.wallet_query_endpoint {
+        builder = builder
+            .set_override("derive.explorer.wallet_query_endpoint", endpoint)
+            .map_err(ConfigError::load)?;
+    }
     Ok(builder)
 }
 
@@ -217,10 +230,16 @@ fn resolve_derive_config(raw: DeriveRawConfig) -> Result<DeriveConfig, DeriveCon
         ),
         _ => None,
     };
+    let wallet_query_endpoint = raw
+        .derive
+        .explorer
+        .wallet_query_endpoint
+        .filter(|endpoint| !endpoint.is_empty());
     Ok(DeriveConfig {
         network,
         storage_path,
         listen_addr,
         ops_listen_addr,
+        wallet_query_endpoint,
     })
 }

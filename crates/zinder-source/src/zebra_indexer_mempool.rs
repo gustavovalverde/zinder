@@ -263,9 +263,13 @@ async fn build_mined_event(
         .fetch_upstream_transaction_lookup(transaction_id)
         .await?
     {
-        UpstreamTransactionLookup::Mined(mined_height) => Ok(MempoolSourceEvent::Mined {
+        UpstreamTransactionLookup::Mined {
+            mined_height,
+            block_hash,
+        } => Ok(MempoolSourceEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         }),
         UpstreamTransactionLookup::InMempool | UpstreamTransactionLookup::NotFound => {
             // Race window: streaming reported MINED but the follow-up

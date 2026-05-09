@@ -2,11 +2,11 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Decisions locked; implementation unstarted. Bootstraps `services/zinder-derive` (currently zero source files) |
+| Status | Slice A foundation shipped 2026-05-08; Slice B shipped 2026-05-09 with the Shape C compute-at-read-time variant of D4 (see implementation note below). Spec is awaiting promotion to ADR-0012 (federation/cursor) and ADR-0013 (storage/wire shape). |
 | Created | 2026-05-08 |
 | Product | Zinder |
 | Audience | Zinder maintainers, explorer developers, wallet developers, future analytics integrators |
-| Related | [PRD-0001](../prd-0001-zinder-indexer.md), [Derive plane](../architecture/derive-plane.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Chain events](../architecture/chain-events.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md), [Extending artifacts](../architecture/extending-artifacts.md), [M4 spec](m4-transparent-address.md), [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) |
+| Related | [PRD-0001](../prd-0001-zinder-indexer.md), [Derive plane](../architecture/derive-plane.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Chain events](../architecture/chain-events.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md), [Extending artifacts](../architecture/extending-artifacts.md), [M4 spec](m4-transparent-address.md), [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) |
 
 ## Context
 
@@ -58,23 +58,25 @@ The decision procedure from [derive-plane.md §When to use the derive plane](../
 
 **How to apply:** No new column family lands in `crates/zinder-store`. The balance accumulator's storage lives entirely inside `services/zinder-derive`'s own RocksDB instance. `WalletQueryApi::transparent_address_balance` proxies to `zinder-derive`'s `ExplorerQuery.TransparentAddressBalance` over gRPC; `zinder-store` is unaffected.
 
-### D4. Storage shape: per-block running totals (Shape A)
+### D4. Storage shape
 
-The balance accumulator stores one row per `(network, address_script_hash, block_height_be)` triple at every height the address was touched, with the trailing 8-byte `chain_epoch_id` matching M4's dynamic-filter pattern. The payload carries running totals: `confirmed_zat: u64`, `funded_count: u64`, `spent_count: u64`. Reorg semantics use the same dynamic-filter visibility model as M4 D9: rows are written and never physically deleted, visibility is enforced at read time via `source_epoch <= chain_epoch.id` plus `block_is_visible(height, expected_hash)`.
+**Shipped: Shape C (compute at read time).** Slice B sums confirmed UTXO values per address from M4's canonical transparent UTXO artifacts (via `WalletQuery.TransparentAddressUtxos`) and composes the mempool overlay from M3's existing point lookups (via `WalletQuery.TransparentMempoolOutputsByAddress` and `TransparentMempoolSpendByOutpoint`). No new column family lands in `zinder-derive`'s RocksDB for balance: the consumer reuses the canonical UTXO surface as its data source, paginates within a hard cap of `MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES = 256` addresses per request, and binds every response to the `ChainEpoch` returned by the federated calls. The implementation lives in `services/zinder-derive/src/grpc/adapter.rs::compute_transparent_address_balance`.
 
-**Why:** Three storage shapes were considered (running totals, deltas, UTXO-scan-and-sum). Running totals win on every axis the explorer audience cares about:
+**Reserved: Shape A (per-block running totals).** The accumulator-backed read-path optimization is preserved as a future change with no public-wire impact. If a future consumer needs the worst-case sub-millisecond budget on a 143K-tx miner address that Shape C cannot meet, `services/zinder-derive`'s RocksDB grows a `transparent_address_balance` column family keyed by `(network, address_script_hash, block_height_be, chain_epoch_id)` carrying `confirmed_zat`, `funded_count`, `spent_count`, with the dynamic-filter visibility model from M4 D9. The wire shape (D5), capability namespace (D10), and federation pattern (D11) do not change.
 
-| Shape | Storage (mainnet) | Read at tip (143K-tx miner) | Balance-at-height | Mempool overlay |
-| ----- | ----------------- | --------------------------- | ----------------- | --------------- |
-| **A. Running totals** | ~55-60 GB compressed | One reverse-prefix seek + visibility | Single seek; same cost | Sum mempool deltas |
-| B. Per-block deltas | ~55-60 GB compressed | Sum 100K+ delta rows; tens of ms | Same as tip; tens of ms | Same |
-| C. UTXO-set sum (no new storage) | 0 GB | 100ms+ on heavy addresses | Not supported | Same |
+**Why Shape C shipped first.** Three storage shapes were originally considered (running totals, per-block deltas, UTXO-set sum). The Shape A analysis below remains accurate for the worst-case latency profile; what tipped the implementation toward Shape C is a different set of axes that became visible only once the M4 surfaces shipped:
 
-Shape A's read latency is constant in address activity; the worst-case 143K-tx miner address reads in the same sub-millisecond budget as a 5-UTXO consumer wallet. Shape B saves nothing on storage and pays 100x worse read latency. Shape C cannot serve historical balance at all.
+| Shape | Storage (mainnet) | Read at tip (143K-tx miner) | Balance-at-height | Mempool overlay | New canonical inputs required |
+| ----- | ----------------- | --------------------------- | ----------------- | --------------- | ----------------------------- |
+| A. Running totals | ~55-60 GB compressed | One reverse-prefix seek + visibility | Single seek; same cost | Sum mempool deltas | New "transparent artifacts in height range" RPC, or a `CompactBlock` extension carrying transparent inputs and outputs |
+| B. Per-block deltas | ~55-60 GB compressed | Sum 100K+ delta rows; tens of ms | Same as tip; tens of ms | Same | Same as A |
+| **C. UTXO-set sum (shipped)** | 0 GB | Bounded by per-request address cap (256) and that address's live UTXO count; sub-millisecond on consumer wallets, single-digit ms on heavy addresses against M4 surfaces | Not supported (D8 already defers historical balance) | Sum M3 mempool deltas | None: M4 + M3 + M5 Slice A foundation are sufficient |
 
-The reorg correctness is identical to M4's UTXO surface, which is already integration-tested. The only subtle bug to guard against: the read-modify-write at commit must use the visibility-checked rev-iter (matching `read_transparent_address_utxos`), not a raw `scan_prefix` reverse, otherwise a commit during reorg recovery could base its new running total on a reorged-out previous row.
+D8 already defers balance-at-height, which is the only axis Shape A wins on after the cap is in place. Shape C uses zero new inputs (the M4 transparent-UTXO artifacts and M3 mempool point lookups carry every byte the response needs), zero new column families in derive's RocksDB, and zero new RPC surfaces beyond the M5 Slice B wire types. Shipping Shape A would have required either extending `CompactBlock` with transparent inputs and outputs (touching the lightwalletd compatibility surface and the entire ingest path) or adding a `WalletQuery.TransparentArtifactsInRange` RPC purpose-built for the accumulator's `apply_event` hook (a one-off addition the wider system has no other use for). Both are architectural carries the spec did not earn against the user-visible contract D5 already locks.
 
-**How to apply:** Slice B's storage layout mirrors M4 §B2 with one change: the trailing `chain_epoch_id` field still applies, but the column family lives in `services/zinder-derive`'s own RocksDB instance, not in `zinder-store`. The codec, key layout discipline, and visibility-check pattern are copied from `crates/zinder-store/src/transparent_utxo.rs`.
+The reorg correctness Shape A required (read-modify-write with visibility-checked rev-iter to avoid basing a new running total on a reorged-out row) does not exist in Shape C: the mempool index, the canonical UTXO artifact family, and the federated `chain_epoch` propagation already enforce visibility at every level Shape C reads from. There is no reorg path inside the balance handler.
+
+**How to apply.** Slice B's `ExplorerQuery.TransparentAddressBalance` adapter walks each address in the request, calls `WalletQuery.TransparentAddressUtxos` for confirmed UTXOs, calls `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, and per-UTXO calls `WalletQuery.TransparentMempoolSpendByOutpoint` to subtract pending spends. The first non-empty `chain_epoch` from any of these calls binds the response. Future consumers can promote Shape A by adding the column family without changing this adapter's public contract: the federated path stays identical and the capability string `derive.explorer.transparent_balance_v1` does not bump.
 
 ### D5. Wire shape: structured `Balance { confirmed_zat, unconfirmed_delta_zat, address_count }`
 
@@ -181,6 +183,26 @@ The transition between Channel C and Channel A must not drop or duplicate events
 **Why:** This is the canonical "derive consumer cold-start" path. Without it, a fresh consumer trying to backfill from genesis via Channel A alone fails because `chain_event_retention_hours` retains only ~7 days. With it, every derive consumer has the same bootstrap shape: backfill from canonical artifacts, attach to live events, persist cursor durably. The pattern is reusable for M6+ consumers.
 
 **How to apply:** Slice A ships `backfill_then_attach` as a free function inside `services/zinder-derive` (not yet extracted to a separate SDK crate). The function takes a generic `DeriveConsumer` trait that the balance accumulator (and future consumers) implement. Cursor persistence uses RocksDB column family `cursor` colocated with the consumer's data column family.
+
+## Shipped surfaces
+
+The build order below is preserved as the historical plan; this section records what landed.
+
+**Slice A foundation (2026-05-08).** `services/zinder-derive` crate scaffold, `ExplorerQuery.ServerInfo` proto and adapter, `DeriveStore` (RocksDB cursor + consumer_metadata column families), capability `derive.explorer.ready_v1`.
+
+**Slice A consumer SDK (2026-05-09).** Trait surface and subscriber primitives from D12 are now shipped under `services/zinder-derive/src/consumer/`:
+
+- `DeriveConsumer` and `DeriveMempoolConsumer` traits with the `apply_chain_*` / `apply_mempool_event` hooks plus the `DeriveConsumerCtx` (store reference + `WriteBatch`) that makes cursor advance + consumer state writes atomic per envelope.
+- Typed event wrappers (`ChainCommittedEvent`, `ChainReorgedEvent`, `RevertedRange`, `CommittedRange`, `MempoolConsumerEvent` + variants) that decode wire envelopes into `zinder-core` primitives so consumers never see prost-generated types.
+- `run_chain_events_subscriber` (A4): drains a `ChainEventEnvelope` stream, dispatches to the consumer, persists the cursor atomically with consumer writes through `DeriveStore::write_batch`. Generic over the stream type so production code passes a `tonic::Streaming` and tests pass an in-memory channel.
+- `backfill_then_attach` (A5): probe-the-first-envelope contract from D12, drains `compact_block_range` for the gap, and switches to the live subscriber using the probe's first envelope as the resume point. Skeleton landed; first M6+ consumer that needs Channel C exercises the production path.
+- `run_mempool_events_subscriber` (A6): mirror of the chain-events subscriber for the M3 mempool stream; cursor persisted in the same `cursor` column family under a different consumer name.
+
+The accumulator-backed Shape A column family (B2, B3 below) and the readiness-cause extensions remain reserved.
+
+**Slice B (2026-05-09).** Shape C compute path (per D4): `ExplorerQuery.TransparentAddressBalance` and federated `WalletQuery.TransparentAddressBalance`, the M5 wire types in `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto`, the `zinder-core::TransparentAddressBalance` domain type, `ChainIndex::transparent_address_balance` on both `LocalChainIndex` and `RemoteChainIndex`, the compat shim's federated `GetTaddressBalance` and per-address-loop `GetTaddressBalanceStream`, capability `derive.explorer.transparent_balance_v1` advertised on both `ExplorerQuery.ServerInfo` and `WalletQuery.ServerInfo`, capability gating via the `DeriveProxy<Client>` primitive shipped under [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md), and the integration tests in `services/zinder-derive/tests/integration/bootstrap.rs` and `services/zinder-ingest/tests/integration/mempool_pipeline.rs`. The accumulator-backed Shape A column family (B2, B3 below) is reserved and not yet shipped.
+
+The federated balance handler is implemented at `services/zinder-derive/src/grpc/adapter.rs::compute_transparent_address_balance`; the compat-side projection from the structured `Balance` to legacy `lightwalletd::Balance.value_zat` is implemented at `services/zinder-compat-lightwalletd/src/grpc.rs::balance_response_from_proxy` and drops `unconfirmed_delta_zat` (legacy proto cannot express it).
 
 ## Build order
 
@@ -344,7 +366,9 @@ pub struct TransparentAddressBalance {
 
 Re-exported from `lib.rs`. The accumulator's storage row is internal to `zinder-derive` and is not in `zinder-core` (it is a derive concern, not a canonical concern).
 
-#### B2. DeriveStore schema and accumulator row
+#### B2. DeriveStore schema and accumulator row (reserved for Shape A; not shipped)
+
+This sub-step is the storage shape that Shape C does not need (per D4, shipped). It is preserved as the layout a future contributor follows when promoting the read path from compute-at-read-time to accumulator-backed without changing the public wire shape. Slice B as shipped does not touch `services/zinder-derive`'s RocksDB column families beyond Slice A's `cursor` and `consumer_metadata`.
 
 `services/zinder-derive/src/balance/store.rs` adds the `transparent_address_balance` column family with the key layout:
 
@@ -367,7 +391,9 @@ struct TransparentBalanceAccumulatorRecord {
 
 `SchemaFingerprintEntry` for the consumer with `schema_version = 1`. Read path follows M4 D9 dynamic-filter visibility.
 
-#### B3. Accumulator consumer
+#### B3. Accumulator consumer (reserved for Shape A; not shipped)
+
+Same as B2: this is the future Shape A read-path optimization. Slice B as shipped does not implement a balance-specific `DeriveConsumer`; the read handler in `services/zinder-derive/src/grpc/adapter.rs` reads canonical UTXO and mempool surfaces directly, with no accumulator state to apply, advance, or revert. The reorg correctness check below remains the test the future Shape A consumer must satisfy when the column family lands.
 
 `services/zinder-derive/src/balance/consumer.rs` implements `DeriveConsumer` for `TransparentBalanceAccumulator`:
 
@@ -527,10 +553,12 @@ Out of M5. `ChainEvent::BalanceChanged` enum slot is reserved with no producer. 
 
 ## ADR promotion
 
-When both slices ship, this spec is deleted and decisions promote to:
+[ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md) shipped ahead of Slice B and locks the federation primitive (`DeriveProxy<Client>`, the readiness-gauge probe loop, the capability namespace rule). It is in production today.
 
-- **ADR-0012: Derive-plane instantiation and the Channel A/C backfill-then-attach contract**. Captures the topology, federation pattern (Shape 2), capability namespace, cursor persistence contract, and replayability rule from Slice A. References `derive-plane.md` as the architecture doc the ADR makes durable.
-- **ADR-0013: Balance accumulator running-totals pattern**. Captures the storage shape A choice (per-block running totals with dynamic-filter visibility), the read-modify-write-with-visibility-checked-rev-iter correctness rule, the mempool-overlay-at-adapter pattern, and the "wire-shape splits confirmed and unconfirmed_delta" decision from D5. References M4's ADR-0011 for the dynamic-filter pattern it reuses.
+When the rest of M5 promotes (Slice A continuation deliverables: `ChainEventsSubscriber`, `backfill_then_attach`, `MempoolEventsSubscriber`), this spec is deleted and the remaining decisions move to:
+
+- **ADR-0012: Derive-plane instantiation and the Channel A/C backfill-then-attach contract**. Captures the topology, capability namespace, cursor persistence contract, and replayability rule from Slice A. References `derive-plane.md` as the architecture doc the ADR makes durable. The federation primitive that ADR-0012 would otherwise have carried is already in ADR-0011, so ADR-0012 is the consumer-side contract only.
+- **ADR-0013: Transparent address balance read-path shape**. Captures the shipped Shape C compute-at-read-time pattern (federated UTXO sum + M3 mempool overlay), the wire-shape decision from D5 (`confirmed_zat` plus signed `unconfirmed_delta_zat`), the per-request address cap, and the reservation of Shape A as a future read-path optimization that does not change the public contract. References M4's dynamic-filter ADR for the visibility model the future Shape A column family would reuse.
 
 ## Out of scope (reserved for future)
 

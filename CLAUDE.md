@@ -74,7 +74,22 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-`require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. T3 mainnet runs are `workflow_dispatch`-only until [ADR-0012 §Open mainnet infrastructure questions](docs/adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions-parked) resolve.
+`require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. Local mainnet runs are supported against an operator-hosted Zebra; the CI matrix shape for T3 mainnet is still being finalized per [ADR-0006 §Open mainnet infrastructure questions](docs/adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions).
+
+Mainnet (operator-hosted Zebra):
+
+```bash
+cookie=$(docker exec <zebra_mainnet_container> cat /var/run/auth/.cookie)
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-mainnet \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:8232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=${cookie%%:*} \
+  ZINDER_NODE__AUTH__PASSWORD=${cookie#*:} \
+  cargo nextest run --profile=ci-live --run-ignored=all
+```
+
+Tests that did not opt in via `require_live_for(&[Network::ZcashMainnet])` still skip on mainnet; opt-in is per-test, not per-invocation.
 
 `ZINDER_TEST_*` is stripped from `zinder_runtime::zinder_environment_source` so test-only knobs never leak into production config. There is no `ZINDER_Z3_*` namespace; tests use the production schema directly.
 

@@ -4,6 +4,7 @@ use std::{num::NonZeroU32, pin::Pin};
 
 use prost::Message;
 use serde_json::Value;
+use tokio_stream::StreamExt as _;
 use tokio_stream::{self as stream};
 use tonic::{Request, Response, Status};
 use zebra_chain::{
@@ -21,11 +22,16 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{
     self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
 };
+use zinder_proto::v1::{
+    explorer::explorer_query_client::ExplorerQueryClient,
+    wallet::{self as wallet_proto, TransparentAddressBalanceRequest, address_lookup},
+};
 use zinder_query::{
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
+    DeriveProxy, SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
     TransparentAddressUtxosRequest, TreeState, WalletQueryApi, status_from_query_error,
     transparent_address_script_hash,
 };
+use zinder_runtime::AuthenticatedChannel;
 use zinder_source::zebra_network;
 use zinder_store::MempoolEvent;
 
@@ -76,6 +82,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
+    explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
 }
 
 impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<QueryApi> {
@@ -86,6 +93,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
+            .field("explorer_proxy", &self.explorer_proxy.is_some())
             .finish()
     }
 }
@@ -113,6 +121,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
+            explorer_proxy: None,
         }
     }
 
@@ -129,6 +138,22 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_tip_change_watcher(mut self, watcher: SharedTipChangeWatcher) -> Self {
         self.tip_change_watcher = Some(watcher);
+        self
+    }
+
+    /// Wires the derive-plane explorer proxy that backs
+    /// `GetTaddressBalance` and `GetTaddressBalanceStream`.
+    ///
+    /// Without an explorer proxy both balance methods return
+    /// `UNAVAILABLE`. The proxy's readiness gauge gates the call: a
+    /// configured-but-not-ready proxy still surfaces `UNAVAILABLE` so the
+    /// compat shim never serves a stale-or-zero balance under cold-start.
+    #[must_use]
+    pub fn with_explorer_proxy(
+        mut self,
+        explorer_proxy: DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>,
+    ) -> Self {
+        self.explorer_proxy = Some(explorer_proxy);
         self
     }
 
@@ -430,20 +455,23 @@ where
 
     async fn get_taddress_balance(
         &self,
-        _request: Request<lightwalletd::AddressList>,
+        request: Request<lightwalletd::AddressList>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
-        Err(Status::unimplemented(
-            "GetTaddressBalance is outside the transparent balance surface",
-        ))
+        let addresses = request.into_inner().addresses;
+        balance_response_from_proxy(self.explorer_proxy.as_ref(), addresses).await
     }
 
     async fn get_taddress_balance_stream(
         &self,
-        _request: Request<tonic::Streaming<lightwalletd::Address>>,
+        request: Request<tonic::Streaming<lightwalletd::Address>>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
-        Err(Status::unimplemented(
-            "GetTaddressBalanceStream is outside the transparent balance surface",
-        ))
+        let mut stream = request.into_inner();
+        let mut addresses: Vec<String> = Vec::new();
+        while let Some(received) = stream.next().await {
+            let address = received?;
+            addresses.push(address.address);
+        }
+        balance_response_from_proxy(self.explorer_proxy.as_ref(), addresses).await
     }
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
@@ -1152,6 +1180,42 @@ fn display_transaction_id(transaction_id: zinder_core::TransactionId) -> String 
     clippy::cast_possible_truncation,
     reason = "zinder-core rejects targets with pointer widths below 32 bits"
 )]
+/// Projects the structured native balance response into the lightwalletd
+/// `Balance { value_zat: int64 }` shape.
+///
+/// Lightwalletd's wire shape predates the confirmed/unconfirmed split that
+/// M5's native API exposes. The compat shim drops `unconfirmed_delta_zat`
+/// because the legacy proto cannot carry it; clients that want the full
+/// split must speak the native `WalletQuery.TransparentAddressBalance`.
+async fn balance_response_from_proxy(
+    explorer_proxy: Option<&DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
+    address_strings: Vec<String>,
+) -> Result<Response<lightwalletd::Balance>, Status> {
+    let proxy = explorer_proxy.ok_or_else(|| {
+        Status::unavailable(
+            "GetTaddressBalance requires the derive-plane explorer proxy; \
+             configure the zinder-derive endpoint",
+        )
+    })?;
+    let request = TransparentAddressBalanceRequest {
+        addresses: address_strings
+            .into_iter()
+            .map(|address| wallet_proto::AddressLookup {
+                selector: Some(address_lookup::Selector::Address(address)),
+            })
+            .collect(),
+        at_epoch: None,
+    };
+    let response = proxy
+        .forward(Request::new(request), |mut client, request| async move {
+            client.transparent_address_balance(request).await
+        })
+        .await?
+        .into_inner();
+    let value_zat = i64::try_from(response.confirmed_zat).unwrap_or(i64::MAX);
+    Ok(Response::new(lightwalletd::Balance { value_zat }))
+}
+
 const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }

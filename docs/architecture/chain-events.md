@@ -96,7 +96,13 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 
 Derived consumers resume through
 `chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })` or
-the equivalent private ingest subscription RPC.
+the equivalent private ingest subscription RPC. The shipped consumer-side
+helper `zinder_derive::run_chain_events_subscriber` drains the stream into a
+`DeriveConsumer` and persists each cursor advance atomically with the
+consumer's `WriteBatch`. Fresh consumers whose persisted cursor sits below the
+retention floor cold-start through `zinder_derive::backfill_then_attach`,
+which drains `compact_block_range` for the gap before attaching to the live
+stream per the M5 D12 contract.
 
 Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The cursor protocol below is the same for both consumer paths.
 

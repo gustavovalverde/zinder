@@ -25,8 +25,14 @@ use zinder_store::{
     TransparentAddressUtxosPageRequest,
 };
 
+mod derive_proxy;
 mod grpc;
 mod readiness_refresh;
+
+pub use derive_proxy::{
+    DEFAULT_DERIVE_PROBE_INTERVAL, DeriveProxy, DeriveProxyConfig, DeriveReadinessGauge,
+    DeriveReadinessProbeConfig, MIN_DERIVE_PROBE_INTERVAL, spawn_derive_readiness_probe,
+};
 
 pub use grpc::{
     ServerInfoSettings, WalletQueryGrpcAdapter, address_lookup_to_script_hash,

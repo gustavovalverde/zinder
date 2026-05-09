@@ -29,6 +29,7 @@ tracing.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 zinder-runtime.workspace = true
+zinder-store.workspace = true
 
 [[bin]]
 name = "zinder-derive"
@@ -39,6 +40,17 @@ workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
+tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
+tracing.workspace = true
+zebra-chain.workspace = true
+zinder-ingest.workspace = true
+zinder-query.workspace = true
+zinder-source.workspace = true
+zinder-testkit.workspace = true

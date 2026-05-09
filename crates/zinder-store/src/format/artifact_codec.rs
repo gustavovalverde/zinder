@@ -232,6 +232,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
         MempoolEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         } => MempoolEventRecord {
             event_kind: MEMPOOL_EVENT_KIND_MINED,
             added: None,
@@ -239,6 +240,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
             mined: Some(MempoolMinedRecord {
                 transaction_id: transaction_id.as_bytes().to_vec(),
                 mined_height: mined_height.value(),
+                block_hash: block_hash.as_bytes().to_vec(),
             }),
         },
         // The Rust enum is `#[non_exhaustive]`; future variants force a
@@ -299,6 +301,11 @@ fn decode_mempool_event_record(
                     &mined.transaction_id,
                 )?,
                 mined_height: BlockHeight::new(mined.mined_height),
+                block_hash: decode_block_hash(
+                    ArtifactFamily::MempoolEvent,
+                    key,
+                    &mined.block_hash,
+                )?,
             })
         }
     }
@@ -1414,6 +1421,8 @@ struct MempoolMinedRecord {
     transaction_id: Vec<u8>,
     #[prost(uint32, tag = "2")]
     mined_height: u32,
+    #[prost(bytes, tag = "3")]
+    block_hash: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

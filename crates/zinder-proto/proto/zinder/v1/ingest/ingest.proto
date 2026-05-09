@@ -41,4 +41,17 @@ service IngestControl {
 
   // Streams mempool events from the writer's mempool event log.
   rpc MempoolEvents(zinder.v1.wallet.MempoolEventsRequest) returns (stream zinder.v1.wallet.MempoolEventEnvelope);
+
+  // Returns unmined transparent outputs that fund a transparent address.
+  //
+  // Secondary readers cannot observe the writer's live `MempoolIndex`
+  // through RocksDB-secondary catchup, so the wallet data plane proxies
+  // transparent-mempool point lookups through this control RPC.
+  rpc TransparentMempoolOutputsByAddress(zinder.v1.wallet.TransparentMempoolOutputsByAddressRequest)
+      returns (zinder.v1.wallet.TransparentMempoolOutputsByAddressResponse);
+
+  // Returns the unmined spend of a transparent outpoint, when one is
+  // visible in the writer's live mempool index.
+  rpc TransparentMempoolSpendByOutpoint(zinder.v1.wallet.TransparentMempoolSpendByOutpointRequest)
+      returns (zinder.v1.wallet.TransparentMempoolSpendByOutpointResponse);
 }

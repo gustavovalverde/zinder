@@ -84,6 +84,24 @@ Use these names consistently. When a term is marked as M2 or M3, it is canonical
 | `ServerInfoResponse` | Native wallet protocol capability-descriptor response |
 | `ServerCapabilities` | Capability descriptor advertised by `zinder-query` to clients |
 
+### Derive plane
+
+| Term | Meaning |
+|------|---------|
+| `ExplorerQuery` | Native protobuf service for explorer-shaped reads served by `zinder-derive` |
+| `ExplorerQueryGrpcAdapter` | Tonic adapter for `ExplorerQuery`; carries the optional `WalletQuery` endpoint that backs the Shape C federated balance compute path |
+| `DeriveStore` | Per-consumer `RocksDB` wrapper colocated with the derive binary; never colocated with canonical storage. Owns the `cursor` and `consumer_metadata` column families |
+| `DeriveStoreTable` | Logical column-family identifier referenced by reads and `WriteBatch` puts |
+| `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
+| `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
+| `DeriveMempoolConsumer` | Rust trait for consumers that observe `MempoolEvents` instead of (or in addition to) chain events |
+| `DeriveConsumerCtx` | Per-event consumer context carrying a `&DeriveStore` borrow for reads and a `&mut WriteBatch` consumers stage their writes into; the SDK appends the cursor advance to the same batch and commits atomically |
+| `ChainCommittedEvent`, `ChainReorgedEvent` | Typed wrappers around the wire chain-event variants, decoded into `zinder-core` primitives so consumers never see prost-generated types |
+| `MempoolConsumerEvent` | Typed wrapper around one `MempoolEventEnvelope`, carrying borrowed transaction-id and raw-transaction-bytes slices for the duration of the apply call |
+| `run_chain_events_subscriber` | Drains a `Stream<ChainEventEnvelope>` into a `DeriveConsumer`, persisting the cursor atomically with consumer writes after every envelope |
+| `run_mempool_events_subscriber` | Mirror of the chain-events subscriber for `MempoolEventEnvelope` streams and `DeriveMempoolConsumer` |
+| `backfill_then_attach` | M5 D12 contract entry point: probes the upstream's earliest retained envelope, drains `compact_block_range` for the gap below the retention floor, then attaches to the live stream |
+
 ### Cursors, events, errors
 
 | Term | Meaning |
@@ -471,9 +489,12 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.events.chain_v1`
 - `wallet.snapshot.mempool_v1`
 - `wallet.events.mempool_v1`
+- `wallet.mempool.transparent_outputs_by_address_v1`
+- `wallet.mempool.transparent_spend_by_outpoint_v1`
 - `wallet.address.transparent_utxos_v1`
 - `wallet.address.transparent_history_v1`
 - `derive.explorer.ready_v1`
+- `derive.explorer.transparent_balance_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.

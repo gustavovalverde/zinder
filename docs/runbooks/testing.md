@@ -155,23 +155,35 @@ ZINDER_TEST_LIVE=1 \
 `require_live()` accepts testnet by default; nothing further to opt in. Tests
 that target only mainnet (see below) still skip.
 
-## T3: Live mainnet (`workflow_dispatch` only)
+## T3: Live mainnet (operator-hosted Zebra)
 
-Mainnet T3 is restricted to manually triggered CI runs while
+Local mainnet runs are supported against an operator-hosted Zebra. The
 [ADR-0006 §Open mainnet infrastructure questions](../adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions)
-remain open. Locally:
+that remain open scope the **CI** matrix shape (cadence, hosting, cost), not
+whether mainnet T3 is runnable. Locally:
 
 1. Mainnet tests opt in via `require_live_for(&[Network::ZcashMainnet])` or
    `require_live_mainnet()`. They refuse to run on any other network.
 2. `ZINDER_NETWORK=zcash-mainnet` plus the standard `ZINDER_NODE__*` schema
    pointed at a synced mainnet Zebra.
-3. Same `cargo nextest` invocation as above. The currently-mainnet-only tests
-   are: `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
-   `tip_id_advances_above_one_million`,
-   `backfills_last_1000_blocks_from_checkpoint`.
+3. Same `cargo nextest` invocation as above:
 
-Don't enable mainnet T3 in the default CI matrix until the open questions in
-the ADR resolve.
+```bash
+cookie=$(docker exec <zebra_mainnet_container> cat /var/run/auth/.cookie)
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-mainnet \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:8232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=${cookie%%:*} \
+  ZINDER_NODE__AUTH__PASSWORD=${cookie#*:} \
+  cargo nextest run --profile=ci-live --run-ignored=all
+```
+
+Currently-mainnet-only tests are:
+`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
+`tip_id_advances_above_one_million`,
+`backfills_last_1000_blocks_from_checkpoint`, plus the M5 federated balance
+read-only confirmations under `services/zinder-derive/tests/live/`.
 
 ## Performance calibration (T2 + live latency)
 
@@ -458,9 +470,12 @@ wallet.broadcast.transaction_v1
 wallet.events.chain_v1
 wallet.snapshot.mempool_v1
 wallet.events.mempool_v1
+wallet.mempool.transparent_outputs_by_address_v1
+wallet.mempool.transparent_spend_by_outpoint_v1
 wallet.address.transparent_utxos_v1
 wallet.address.transparent_history_v1
 derive.explorer.ready_v1
+derive.explorer.transparent_balance_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

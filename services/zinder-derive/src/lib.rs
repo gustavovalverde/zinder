@@ -16,10 +16,20 @@ mod error;
 mod grpc;
 mod store;
 
-pub use consumer::{DeriveConsumer, DeriveConsumerName};
+pub use consumer::backfill::{
+    BackfillPrepareError, BackfillThenAttachConfig, BackfillThenAttachOutcome, backfill_then_attach,
+};
+pub use consumer::chain_events::{ChainEventsRunOutcome, run as run_chain_events_subscriber};
+pub use consumer::mempool_events::{MempoolEventsRunOutcome, run as run_mempool_events_subscriber};
+pub use consumer::{
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
+    DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent,
+    MempoolConsumerEventVariant, RevertedRange,
+};
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use grpc::{
-    DERIVE_EXPLORER_READY_CAPABILITY, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
+    DERIVE_EXPLORER_READY_CAPABILITY, DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
+    ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
 };
 pub use store::{
     DERIVE_SCHEMA_VERSION, DeriveCursorEntry, DeriveStore, DeriveStoreOptions, DeriveStoreTable,

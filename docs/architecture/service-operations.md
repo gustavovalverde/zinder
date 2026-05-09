@@ -443,7 +443,7 @@ Tests are organized into four tiers by **runtime mechanism** ([ADR-0006](../adrs
 | T0 unit | in-process pure logic | `#[cfg(test)] mod tests` in `src/` | every PR |
 | T1 integration | fixture-driven, no external state | `tests/integration/` | every PR |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
-| T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet), `workflow_dispatch` (mainnet) |
+| T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape pending per [ADR-0006 §Open mainnet infrastructure questions](../adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions)) |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
 

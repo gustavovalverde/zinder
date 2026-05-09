@@ -38,6 +38,10 @@ struct Cli {
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
+    /// `WalletQuery` gRPC endpoint that backs the `TransparentAddressBalance`
+    /// federated read path. Empty/unset disables the balance capability.
+    #[arg(long = "wallet-query-endpoint")]
+    wallet_query_endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -92,7 +96,10 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     let server_info = ExplorerServerInfoSettings {
         network: derive_config.network.name().to_owned(),
     };
-    let grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info);
+    let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info);
+    if let Some(endpoint) = derive_config.wallet_query_endpoint.clone() {
+        grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
+    }
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     readiness.set(ReadinessState::ready(None));
@@ -157,6 +164,7 @@ impl From<Cli> for DeriveConfigOverrides {
             storage_path: cli.storage_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
+            wallet_query_endpoint: cli.wallet_query_endpoint,
         }
     }
 }

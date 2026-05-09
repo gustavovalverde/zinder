@@ -37,6 +37,7 @@ fn mempool_event_history_round_trip() -> eyre::Result<()> {
         MempoolEvent::Mined {
             transaction_id: added.transaction_id,
             mined_height: BlockHeight::new(7),
+            block_hash: BlockHash::from_bytes([0xC7; 32]),
         },
         UnixTimestampMillis::new(2_000),
     )?;
@@ -113,6 +114,7 @@ fn prune_advances_floor_when_deletes_already_applied() -> eyre::Result<()> {
         MempoolEvent::Mined {
             transaction_id: TransactionId::from_bytes([0xA0; 32]),
             mined_height: BlockHeight::new(1),
+            block_hash: BlockHash::from_bytes([0xB0; 32]),
         },
         UnixTimestampMillis::new(0),
     )?;
@@ -120,6 +122,7 @@ fn prune_advances_floor_when_deletes_already_applied() -> eyre::Result<()> {
         MempoolEvent::Mined {
             transaction_id: TransactionId::from_bytes([0xA1; 32]),
             mined_height: BlockHeight::new(1),
+            block_hash: BlockHash::from_bytes([0xB1; 32]),
         },
         UnixTimestampMillis::new(0),
     )?;
@@ -200,6 +203,7 @@ fn cursor_below_pruned_floor_returns_mempool_cursor_expired() -> eyre::Result<()
         MempoolEvent::Mined {
             transaction_id: TransactionId::from_bytes([0xA0; 32]),
             mined_height: BlockHeight::new(1),
+            block_hash: BlockHash::from_bytes([0xC2; 32]),
         },
         UnixTimestampMillis::new(0),
     )?;
@@ -248,6 +252,7 @@ fn pruned_floor_persists_across_store_reopen() -> eyre::Result<()> {
             MempoolEvent::Mined {
                 transaction_id: TransactionId::from_bytes([0xA0; 32]),
                 mined_height: BlockHeight::new(1),
+                block_hash: BlockHash::from_bytes([0xC3; 32]),
             },
             UnixTimestampMillis::new(0),
         )?;

@@ -129,9 +129,11 @@ pub fn mempool_event_envelope_message(
         MempoolEvent::Mined {
             transaction_id,
             mined_height,
+            block_hash,
         } => wallet::mempool_event_envelope::Event::Mined(wallet::MempoolMinedEvent {
             transaction_id: transaction_id.as_bytes().into(),
             mined_height: mined_height.value(),
+            block_hash: block_hash.as_bytes().into(),
         }),
         _ => {
             return Err(ChainEventEncodeError::UnsupportedChainEvent {
@@ -148,8 +150,12 @@ pub fn mempool_event_envelope_message(
     })
 }
 
+/// Encodes a [`TransparentMempoolOutput`] into the wallet protocol message.
+///
+/// Public so the writer-side mempool point-lookup adapter can encode
+/// responses without re-deriving the field layout.
 #[must_use]
-fn transparent_mempool_output_message(
+pub fn transparent_mempool_output_message(
     transparent_output: &TransparentMempoolOutput,
 ) -> wallet::TransparentMempoolOutput {
     wallet::TransparentMempoolOutput {
@@ -161,8 +167,11 @@ fn transparent_mempool_output_message(
     }
 }
 
+/// Encodes a [`TransparentMempoolSpend`] into the wallet protocol message.
+///
+/// Public for the same reason as [`transparent_mempool_output_message`].
 #[must_use]
-fn transparent_mempool_spend_message(
+pub fn transparent_mempool_spend_message(
     transparent_spend: &TransparentMempoolSpend,
 ) -> wallet::TransparentMempoolSpend {
     wallet::TransparentMempoolSpend {
@@ -383,6 +392,10 @@ pub fn mempool_event_envelope_from_message(
                 mined.transaction_id,
             )?,
             mined_height: BlockHeight::new(mined.mined_height),
+            block_hash: block_hash_from_bytes(
+                "mempool_event_envelope.mined.block_hash",
+                mined.block_hash,
+            )?,
         },
     };
     Ok(MempoolEventEnvelope {
@@ -393,7 +406,11 @@ pub fn mempool_event_envelope_from_message(
     })
 }
 
-fn transparent_mempool_output_from_message(
+/// Decodes a wallet-protocol [`wallet::TransparentMempoolOutput`] into the canonical type.
+///
+/// Public for the same reason as [`transparent_mempool_output_message`]:
+/// writer-side and reader-side adapters share one decoder.
+pub fn transparent_mempool_output_from_message(
     message: wallet::TransparentMempoolOutput,
 ) -> Result<TransparentMempoolOutput, MempoolDecodeError> {
     Ok(TransparentMempoolOutput {
@@ -413,7 +430,10 @@ fn transparent_mempool_output_from_message(
     })
 }
 
-fn transparent_mempool_spend_from_message(
+/// Decodes a wallet-protocol [`wallet::TransparentMempoolSpend`] into the canonical type.
+///
+/// Public for the same reason as [`transparent_mempool_spend_message`].
+pub fn transparent_mempool_spend_from_message(
     message: wallet::TransparentMempoolSpend,
 ) -> Result<TransparentMempoolSpend, MempoolDecodeError> {
     Ok(TransparentMempoolSpend {

@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use thiserror::Error;
+use zinder_store::MempoolDecodeError;
+
+use crate::consumer::DeriveConsumerError;
 
 /// Boundary error returned by the derive-plane runtime.
 ///
@@ -21,6 +24,13 @@ pub enum DeriveError {
     /// Upstream gRPC call returned a non-Ok status.
     #[error("derive upstream error: {0}")]
     Upstream(#[from] tonic::Status),
+    /// Wire envelope failed to decode into the typed event shape the
+    /// subscriber dispatches to consumers.
+    #[error("derive event decode failure: {0}")]
+    Decode(#[from] MempoolDecodeError),
+    /// Consumer `apply_*` hook returned a domain error.
+    #[error("derive consumer apply failure: {0}")]
+    Consumer(#[source] DeriveConsumerError),
     /// Cursor delivered by upstream did not match the persisted cursor.
     #[error("derive cursor mismatch: persisted cursor disagrees with upstream stream resume")]
     CursorMismatch,

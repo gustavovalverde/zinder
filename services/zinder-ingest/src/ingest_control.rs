@@ -6,7 +6,10 @@ use std::{pin::Pin, time::Instant};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{ChainEpoch, Network, TransactionId, UnixTimestampMillis};
+use zinder_core::{
+    ChainEpoch, Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    UnixTimestampMillis,
+};
 use zinder_proto::v1::{
     ingest::{
         WriterStatusRequest, WriterStatusResponse,
@@ -18,8 +21,9 @@ use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
-    StreamCursorTokenV1, chain_event_envelope_message, mempool_entry_message,
+    StreamCursorTokenV1, chain_epoch_message, chain_event_envelope_message, mempool_entry_message,
     mempool_event_envelope_message, run_chain_event_stream, status_from_store_error,
+    transparent_mempool_output_message, transparent_mempool_spend_message,
 };
 
 use crate::mempool::MempoolIndex;
@@ -219,6 +223,111 @@ impl IngestControl for IngestControlGrpcAdapter {
         tokio::spawn(stream_mempool_events(store, from_cursor, event_sender));
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
     }
+
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
+        let mempool_index = self
+            .mempool_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
+        let request = request.into_inner();
+        let address_script_hash = address_lookup_to_script_hash_typed(request.address)?;
+        let max_entries = bounded_point_lookup_max_entries(request.max_entries);
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+        let outputs = mempool_index
+            .transparent_outputs_by_address(address_script_hash, max_entries)
+            .iter()
+            .map(transparent_mempool_output_message)
+            .collect();
+        Ok(Response::new(
+            wallet::TransparentMempoolOutputsByAddressResponse {
+                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                outputs,
+            },
+        ))
+    }
+
+    async fn transparent_mempool_spend_by_outpoint(
+        &self,
+        request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        let mempool_index = self
+            .mempool_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
+        let request = request.into_inner();
+        let transaction_id = transaction_id_from_bytes(&request.transaction_id)?;
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+        let outpoint = TransparentOutPoint::new(transaction_id, request.output_index);
+        let spend = mempool_index
+            .transparent_spend_by_outpoint(outpoint)
+            .as_ref()
+            .map(transparent_mempool_spend_message);
+        Ok(Response::new(
+            wallet::TransparentMempoolSpendByOutpointResponse {
+                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                spend,
+            },
+        ))
+    }
+}
+
+/// Default cap for transparent-mempool point lookups when the request omits one.
+const DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 256;
+
+/// Hard cap enforced by the writer regardless of caller-requested page size.
+const MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 1024;
+
+const fn bounded_point_lookup_max_entries(requested: Option<u32>) -> u32 {
+    let Some(requested) = requested else {
+        return DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES;
+    };
+    if requested == 0 {
+        DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES
+    } else if requested > MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES {
+        MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES
+    } else {
+        requested
+    }
+}
+
+fn address_lookup_to_script_hash_typed(
+    address: Option<wallet::AddressLookup>,
+) -> Result<TransparentAddressScriptHash, Status> {
+    let lookup = address.ok_or_else(|| Status::invalid_argument("address selector is required"))?;
+    let selector = lookup
+        .selector
+        .ok_or_else(|| Status::invalid_argument("address selector is empty"))?;
+    match selector {
+        wallet::address_lookup::Selector::ScriptHash(bytes) => {
+            let hash_bytes: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("address.script_hash must be 32 bytes"))?;
+            Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
+        }
+        wallet::address_lookup::Selector::Address(_) => Err(Status::invalid_argument(
+            "ingest-control accepts only the script_hash selector; \
+             callers must pre-resolve transparent addresses",
+        )),
+    }
+}
+
+fn transaction_id_from_bytes(bytes: &[u8]) -> Result<TransactionId, Status> {
+    let id_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Status::invalid_argument("transaction_id must be 32 bytes"))?;
+    Ok(TransactionId::from_bytes(id_bytes))
 }
 
 async fn stream_mempool_events(

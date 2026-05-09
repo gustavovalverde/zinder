@@ -5,10 +5,10 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
+    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
     CompactBlockArtifact, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus,
 };
@@ -197,6 +197,10 @@ pub enum MempoolEvent {
         transaction_id: TransactionId,
         /// Height at which the source observed the mining.
         mined_height: BlockHeight,
+        /// Hash of the block that mined the transaction, as observed by the
+        /// source. Lifecycle consumers can resolve mined block identity
+        /// without a follow-up tip read.
+        block_hash: BlockHash,
     },
 }
 
@@ -475,6 +479,17 @@ pub trait ChainIndex: Send + Sync + 'static {
         &self,
         outpoint: TransparentOutPoint,
     ) -> Result<Option<TransparentMempoolSpend>, IndexerError>;
+
+    /// Returns the transparent-address balance summed across `addresses`.
+    ///
+    /// Federated to the derive plane: deployments without `zinder-derive`
+    /// reachable surface this as
+    /// [`IndexerError::ServiceUnavailable`]/derive-unavailable.
+    async fn transparent_address_balance(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentAddressBalance, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

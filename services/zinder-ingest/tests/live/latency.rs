@@ -102,7 +102,8 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
         let _status = wallet_query.transaction(coinbase_txid, None).await?;
     }
     let transaction_total_micros = measurement_start.elapsed().as_micros();
-    let transaction_avg_micros = transaction_total_micros / u128::from(TRANSACTION_LOOKUP_ITERATIONS);
+    let transaction_avg_micros =
+        transaction_total_micros / u128::from(TRANSACTION_LOOKUP_ITERATIONS);
 
     #[allow(
         clippy::print_stderr,

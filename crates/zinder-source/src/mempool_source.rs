@@ -15,7 +15,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    AuthDigest, BlockHeight, MempoolEvictionReason, RawTransactionBytes, TransactionId,
+    AuthDigest, BlockHash, BlockHeight, MempoolEvictionReason, RawTransactionBytes, TransactionId,
     UnixTimestampMillis,
 };
 
@@ -49,6 +49,11 @@ pub enum MempoolSourceEvent {
         transaction_id: TransactionId,
         /// Height at which the source observed the mining.
         mined_height: BlockHeight,
+        /// Hash of the block that mined the transaction, as observed by the
+        /// source. Authoritative observation: avoids the canonical-chain
+        /// catch-up race when consumers want to track lifecycle without a
+        /// follow-up tip read.
+        block_hash: BlockHash,
     },
 }
 

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package zinder.v1.explorer;
 
+import "zinder/v1/wallet/wallet.proto";
+
 // Capability descriptor advertised by `ExplorerQuery.ServerInfo`.
 message ExplorerServerCapabilities {
   // Capability strings advertised by the running zinder-derive instance.
@@ -31,4 +33,11 @@ message ServerInfoResponse {
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+
+  // Returns the transparent-address balance summed across the requested
+  // addresses. Capability: `derive.explorer.transparent_balance_v1`.
+  // Federated to consumers under `WalletQuery.TransparentAddressBalance`;
+  // the wire shape and compute path are identical between the two surfaces.
+  rpc TransparentAddressBalance(zinder.v1.wallet.TransparentAddressBalanceRequest)
+      returns (zinder.v1.wallet.TransparentAddressBalanceResponse);
 }

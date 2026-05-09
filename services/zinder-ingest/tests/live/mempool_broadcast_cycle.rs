@@ -284,6 +284,7 @@ async fn wait_for_mined(
             Ok(Some(Ok(MempoolSourceEvent::Mined {
                 transaction_id,
                 mined_height,
+                ..
             }))) if transaction_id == expected_txid => {
                 return Ok(mined_height);
             }

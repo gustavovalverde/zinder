@@ -307,10 +307,14 @@ async fn emit_disappearance_event(
         .fetch_upstream_transaction_lookup(transaction_id)
         .await
     {
-        Ok(UpstreamTransactionLookup::Mined(mined_height)) => forward_event(
+        Ok(UpstreamTransactionLookup::Mined {
+            mined_height,
+            block_hash,
+        }) => forward_event(
             MempoolSourceEvent::Mined {
                 transaction_id,
                 mined_height,
+                block_hash,
             },
             event_sender,
         )

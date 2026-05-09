@@ -674,6 +674,50 @@ message MempoolSnapshotResponse {
   bytes next_cursor = 5;
 }
 
+// Bounded request for unmined transparent outputs at one transparent address.
+//
+// The mempool live state is in-memory and not chain-epoch-pinnable; the
+// response binds the answer to the chain epoch visible at lookup time.
+message TransparentMempoolOutputsByAddressRequest {
+  // Selector for the transparent address being queried.
+  AddressLookup address = 1;
+
+  // Maximum number of outputs returned. Absent means use the server default;
+  // values larger than the server's configured cap are silently clamped.
+  optional uint32 max_entries = 2;
+}
+
+// Response for [`TransparentMempoolOutputsByAddress`] bound to the chain
+// epoch visible at lookup time.
+message TransparentMempoolOutputsByAddressResponse {
+  // Chain epoch visible at lookup time.
+  ChainEpoch chain_epoch = 1;
+
+  // Unmined transparent outputs that fund the queried address, in
+  // canonical `(transaction_id, output_index)` order.
+  repeated TransparentMempoolOutput outputs = 2;
+}
+
+// Point-lookup request for the unmined spend of one transparent outpoint.
+message TransparentMempoolSpendByOutpointRequest {
+  // Identifier of the previously-known transaction whose output may be
+  // spent in the live mempool.
+  bytes transaction_id = 1;
+
+  // Output index within that transaction.
+  uint32 output_index = 2;
+}
+
+// Response for [`TransparentMempoolSpendByOutpoint`] bound to the chain
+// epoch visible at lookup time.
+message TransparentMempoolSpendByOutpointResponse {
+  // Chain epoch visible at lookup time.
+  ChainEpoch chain_epoch = 1;
+
+  // Mempool spend that consumes the outpoint, when one is present.
+  optional TransparentMempoolSpend spend = 2;
+}
+
 // Mempool-event stream family. Reserved for future extensions; today only
 // MEMPOOL_EVENT_STREAM_FAMILY_MEMPOOL is populated.
 enum MempoolEventStreamFamily {
@@ -715,6 +759,11 @@ message MempoolMinedEvent {
   // Height of the block that mined the transaction, as reported by the
   // upstream node.
   uint32 mined_height = 2;
+
+  // Hash of the block that mined the transaction, as reported by the
+  // upstream node. Source-driven enrichment: lifecycle consumers can
+  // resolve the mined block identity without a follow-up tip read.
+  bytes block_hash = 3;
 }
 
 // Cursor-bound mempool event envelope.
@@ -826,6 +875,45 @@ message TransparentAddressUtxosStreamChunk {
   bytes cursor = 3;
 }
 
+// Bounded transparent-address balance request federated to `zinder-derive`.
+//
+// The balance read is computed from canonical transparent UTXOs at the
+// requested addresses plus the live mempool overlay. Mempool live state is
+// not chain-epoch-pinnable, so the response binds to the visible chain epoch
+// at lookup time; callers may pin canonical reads through `at_epoch`. An
+// empty `addresses` list is rejected with `INVALID_ARGUMENT`.
+message TransparentAddressBalanceRequest {
+  // Transparent addresses summed into one balance response.
+  repeated AddressLookup addresses = 1;
+
+  // Optional chain epoch that must be used to answer the canonical portion of
+  // the request. When absent, the server uses the visible epoch at request
+  // time. The mempool overlay always observes the live mempool index.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Transparent-address balance response federated from `zinder-derive`.
+//
+// Splits the canonical confirmed total from the signed mempool delta so
+// explorer-shaped clients can render `confirmed`/`unconfirmed` separately;
+// legacy lightwalletd clients project this into a single `value_zat` at the
+// compatibility boundary. Named `*Response` to match the rest of
+// `wallet.proto` and avoid a name collision with the same-named RPC.
+message TransparentAddressBalanceResponse {
+  // Sum of unspent canonical outputs at the requested addresses.
+  uint64 confirmed_zat = 1;
+
+  // Signed mempool delta: pending inflows minus pending outflows. Negative
+  // when pending outflows exceed pending inflows.
+  int64 unconfirmed_delta_zat = 2;
+
+  // Number of transparent addresses summarized by this response.
+  uint32 address_count = 3;
+
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 4;
+}
+
 // Transparent-address tx-history range request, server-streamed.
 message TransparentAddressTxIdsInRangeRequest {
   // Selector for the transparent address being queried.
@@ -921,6 +1009,17 @@ service WalletQuery {
   // Stream replayable mempool events.
   rpc MempoolEvents(MempoolEventsRequest) returns (stream MempoolEventEnvelope);
 
+  // Return unmined transparent outputs that fund a transparent address. Mirrors
+  // the typed Rust `transparent_mempool_outputs_by_address` so non-Rust clients
+  // do not have to scan the full mempool snapshot.
+  rpc TransparentMempoolOutputsByAddress(TransparentMempoolOutputsByAddressRequest)
+      returns (TransparentMempoolOutputsByAddressResponse);
+
+  // Return the unmined spend of a transparent outpoint, when one is visible
+  // in the live mempool index.
+  rpc TransparentMempoolSpendByOutpoint(TransparentMempoolSpendByOutpointRequest)
+      returns (TransparentMempoolSpendByOutpointResponse);
+
   // Return unspent transparent outputs for one transparent address.
   rpc TransparentAddressUtxos(TransparentAddressUtxosRequest)
       returns (TransparentAddressUtxosResponse);
@@ -935,6 +1034,15 @@ service WalletQuery {
   // height range, in ascending or descending mined order.
   rpc TransparentAddressTxIdsInRange(TransparentAddressTxIdsInRangeRequest)
       returns (stream TransparentAddressTxIdsChunk);
+
+  // Return the transparent-address balance summed across the requested
+  // addresses. Federated by `zinder-query` to `zinder-derive`'s
+  // `ExplorerQuery.TransparentAddressBalance`; deployments without a
+  // configured derive plane omit the corresponding capability and reject the
+  // call with `UNAVAILABLE`. Capability:
+  // `derive.explorer.transparent_balance_v1`.
+  rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
+      returns (TransparentAddressBalanceResponse);
 
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
