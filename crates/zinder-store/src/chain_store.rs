@@ -79,7 +79,7 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 2;
+const STORE_SCHEMA_VERSION: u16 = 1;
 /// Durable artifact schema version written by this binary.
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(2);
 /// Highest durable artifact schema version this binary can read.
