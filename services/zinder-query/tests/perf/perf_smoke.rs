@@ -33,10 +33,13 @@ async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::R
 
     let start = Instant::now();
     let response = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(PERF_SMOKE_BLOCK_COUNT),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(PERF_SMOKE_BLOCK_COUNT),
+            ),
+            None,
+        )
         .await?;
     let elapsed = start.elapsed();
 
@@ -58,7 +61,7 @@ async fn latest_block_stays_under_budget() -> eyre::Result<()> {
     let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
 
     let start = Instant::now();
-    let response = wallet_query.latest_block().await?;
+    let response = wallet_query.latest_block(None).await?;
     let elapsed = start.elapsed();
 
     assert_eq!(response.height, BlockHeight::new(1));

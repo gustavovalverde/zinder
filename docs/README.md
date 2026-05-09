@@ -42,6 +42,13 @@ Living external references that constrain Zinder's design. Refreshed as the upst
 - [Serving Zebra and Zallet](reference/serving-zebra-and-zallet.md): the integration audit between the upstream node and full-node wallet.
 - [Findings from Android wallet integration](reference/android-wallet-integration-findings.md): observed behavior of `zcash-android-wallet-sdk` against `zinder-compat-lightwalletd`.
 - [Serving public lightwalletd clients](reference/serving-public-lightwalletd-clients.md): operator gap analysis vs. community-run servers like `zec.rocks` and the deployment recipe to match them.
+- [Closing the Zaino surface gap](reference/closing-the-zaino-surface-gap.md): cross-consumer gap inventory of what Zinder still needs to ship before Zaino consumers (Zallet, Zashi/Zodl, public lightwalletd, explorers) can replace Zaino without a parity regression.
+
+## Runbooks
+
+Operational procedures for running Zinder against the workspace and external systems. Edited in place when the procedure changes; never describes architectural intent (that role belongs to the architecture docs).
+
+- [Testing](runbooks/testing.md): T0–T3 test tiers, the default validation gate, live regtest/testnet/mainnet sweeps, end-to-end runs against Zallet and the Android SDK through the lightwalletd compat shim, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
 
 ## Specs (in flight)
 
@@ -64,6 +71,7 @@ Each tree under `docs/` has its own retire-on-ship rule.
 - **ADRs** (`docs/adrs/`): record of accepted design decisions in present tense. Edited in place when the decision rationale needs clarification; substantive design changes get a new ADR with a contiguous number. ADRs reference architecture docs (up); they do not reference each other to "explain context" (that role belongs to the architecture doc).
 - **Specs** (`docs/specs/`): mutable working documents for un-shipped multi-PR work. Pre-decision drafts go here; ADRs do not. When a spec's work lands, decisions promote to one or more ADRs and the spec is deleted.
 - **Reference** (`docs/reference/`): living external constraints. Anti-pattern catalogs, integration requirements, upstream surface audits. Refreshed as the upstream world changes; never describes Zinder's own contracts.
+- **Runbooks** (`docs/runbooks/`): operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs (up) but do not describe architectural intent.
 
 Removed by design (not used in this repo):
 

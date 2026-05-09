@@ -8,17 +8,15 @@ use tokio_stream::{self as stream};
 use tonic::{Request, Response, Status};
 use zebra_chain::{
     block::Height as ZebraBlockHeight,
-    parameters::{
-        Network as ZebraNetwork, NetworkKind as ZebraNetworkKind, NetworkUpgrade,
-        testnet::RegtestParameters,
-    },
+    parameters::{NetworkKind as ZebraNetworkKind, NetworkUpgrade},
     transparent::Address as ZebraTransparentAddress,
 };
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransparentAddressTxIndexArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
+    CompactBlockArtifact, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
+    TransparentAddressTxIndexArtifact, TxStatus,
 };
 use zinder_proto::compat::lightwalletd::{
     self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
@@ -28,6 +26,7 @@ use zinder_query::{
     TransparentAddressUtxosRequest, TreeState, WalletQueryApi, status_from_query_error,
     transparent_address_script_hash,
 };
+use zinder_source::zebra_network;
 use zinder_store::MempoolEvent;
 
 use crate::mempool::{
@@ -147,6 +146,35 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
+    /// Resolves a lightwalletd `BlockId` to a typed [`BlockHeight`].
+    ///
+    /// `BlockId { height, hash }` accepts three legacy shapes: height-only
+    /// (`hash` empty), hash-only (`height = 0` with `hash` populated), and
+    /// height-with-hash (both populated; the hash is verified after the read).
+    /// Hash-only resolves through the canonical best-chain
+    /// [`BlockSelector`] resolver; height-zero with empty hash returns
+    /// `Status::not_found`.
+    async fn resolve_block_height(
+        &self,
+        block_id: &lightwalletd::BlockId,
+    ) -> Result<BlockHeight, Status> {
+        let height_zero = block_id.height == 0;
+        if !block_id.hash.is_empty() && height_zero {
+            let hash_bytes: [u8; 32] = block_id
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
+            let resolved = self
+                .query_api
+                .block_id_by_selector(BlockSelector::Hash(BlockHash::from_bytes(hash_bytes)), None)
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
+            return Ok(resolved.block_id.height);
+        }
+        block_height_from_id(block_id)
+    }
+
     async fn address_utxos(
         &self,
         request: lightwalletd::GetAddressUtxosArg,
@@ -161,7 +189,7 @@ where
             NonZeroU32::new(request.max_entries).unwrap_or(self.options.max_address_utxos);
         let latest_block = self
             .query_api
-            .latest_block()
+            .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let mut replies = Vec::new();
@@ -175,7 +203,7 @@ where
             )?;
             let address_utxos = self
                 .query_api
-                .transparent_address_utxos_at_epoch(query_request, Some(latest_block.chain_epoch))
+                .transparent_address_utxos(query_request, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
@@ -204,7 +232,7 @@ where
     ) -> Result<Response<lightwalletd::BlockId>, Status> {
         let latest_block = self
             .query_api
-            .latest_block()
+            .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -219,10 +247,10 @@ where
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
         let block_id = request.into_inner();
-        let height = block_height_from_id(&block_id)?;
+        let height = self.resolve_block_height(&block_id).await?;
         let compact_block = self
             .query_api
-            .compact_block_at(height)
+            .compact_block_at(height, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let compact_block = decode_compact_block(&compact_block.compact_block.payload_bytes)?;
@@ -259,7 +287,7 @@ where
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_block_range(block_range)
+            .compact_block_range(block_range, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(
@@ -280,7 +308,7 @@ where
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_block_range(block_range)
+            .compact_block_range(block_range, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(
@@ -297,23 +325,26 @@ where
     ) -> Result<Response<lightwalletd::RawTransaction>, Status> {
         let filter = request.into_inner();
 
-        let transaction = if let Some(block_id) = filter.block.as_ref() {
-            let height = block_height_from_id(block_id)?;
+        let mined_artifact = if let Some(block_id) = filter.block.as_ref() {
+            let height = self.resolve_block_height(block_id).await?;
             self.query_api
-                .transaction_at_block_index(height, filter.index)
+                .transaction_at_block_index(height, filter.index, None)
                 .await
                 .map_err(|error| status_from_query_error(&error))?
+                .transaction
         } else {
             let transaction_id = transaction_id_from_lightwalletd_hash(&filter.hash)?;
-            self.query_api
-                .transaction(transaction_id)
+            let response = self
+                .query_api
+                .transaction(transaction_id, None)
                 .await
-                .map_err(|error| status_from_query_error(&error))?
+                .map_err(|error| status_from_query_error(&error))?;
+            mined_artifact_from_status(response.status)?
         };
 
         Ok(Response::new(lightwalletd::RawTransaction {
-            data: transaction.transaction.payload_bytes,
-            height: u64::from(transaction.transaction.block_height.value()),
+            data: mined_artifact.payload_bytes,
+            height: u64::from(mined_artifact.block_height.value()),
         }))
     }
 
@@ -341,7 +372,7 @@ where
         let filter = request.into_inner();
         let latest_block = self
             .query_api
-            .latest_block()
+            .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let typed_request =
@@ -370,7 +401,7 @@ where
         let filter = request.into_inner();
         let latest_block = self
             .query_api
-            .latest_block()
+            .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let typed_request =
@@ -383,14 +414,15 @@ where
         .await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
         for artifact in history {
-            let transaction = self
+            let response = self
                 .query_api
-                .transaction_at_epoch(artifact.transaction_id, Some(latest_block.chain_epoch))
+                .transaction(artifact.transaction_id, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
+            let mined = mined_artifact_from_status(response.status)?;
             raw_transactions.push(Ok(lightwalletd::RawTransaction {
-                data: transaction.transaction.payload_bytes,
-                height: u64::from(transaction.transaction.block_height.value()),
+                data: mined.payload_bytes,
+                height: u64::from(mined.block_height.value()),
             }));
         }
         Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
@@ -497,10 +529,11 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        let height = block_height_from_id(&request.into_inner())?;
+        let block_id = request.into_inner();
+        let height = self.resolve_block_height(&block_id).await?;
         let tree_state = self
             .query_api
-            .tree_state_at(height)
+            .tree_state_at(height, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -513,7 +546,7 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let tree_state = self
             .query_api
-            .latest_tree_state()
+            .latest_tree_state(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -532,11 +565,14 @@ where
             NonZeroU32::new(request.max_entries).unwrap_or(self.options.max_subtree_roots);
         let subtree_roots = self
             .query_api
-            .subtree_roots(SubtreeRootRange::new(
-                protocol,
-                SubtreeRootIndex::new(request.start_index),
-                max_entries,
-            ))
+            .subtree_roots(
+                SubtreeRootRange::new(
+                    protocol,
+                    SubtreeRootIndex::new(request.start_index),
+                    max_entries,
+                ),
+                None,
+            )
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -571,7 +607,7 @@ where
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let latest_block = self
             .query_api
-            .latest_block()
+            .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -603,7 +639,7 @@ where
     let mut artifacts = Vec::new();
     loop {
         let response = query_api
-            .transparent_address_tx_ids_in_range_at_epoch(request.clone(), Some(chain_epoch))
+            .transparent_address_tx_ids_in_range(request.clone(), Some(chain_epoch))
             .await
             .map_err(|error| status_from_query_error(&error))?;
         artifacts.extend(response.artifacts);
@@ -755,16 +791,31 @@ fn block_range_from_request(
     Ok((block_range, is_descending))
 }
 
-fn block_height_from_id(block_id: &lightwalletd::BlockId) -> Result<BlockHeight, Status> {
-    if !block_id.hash.is_empty() && block_id.height == 0 {
-        return Err(Status::unimplemented(
-            "hash-only block lookups are outside the indexed block lookup surface",
-        ));
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "TxStatus is #[non_exhaustive]; non-mined statuses map to gRPC NOT_FOUND on the lightwalletd wire because lightwalletd's RawTransaction shape is mined-only."
+)]
+fn mined_artifact_from_status(status: TxStatus) -> Result<TransactionArtifact, Status> {
+    match status {
+        TxStatus::Mined(mined) => Ok(mined.artifact),
+        TxStatus::NotFound | TxStatus::InMempool(_) | TxStatus::ConflictingChain => Err(
+            Status::not_found("transaction is not mined in the canonical chain"),
+        ),
+        _ => Err(Status::not_found(
+            "transaction status is not representable on the lightwalletd wire",
+        )),
     }
+}
 
+fn block_height_from_id(block_id: &lightwalletd::BlockId) -> Result<BlockHeight, Status> {
     let height = u32::try_from(block_id.height)
         .map_err(|_| Status::invalid_argument("block height exceeds u32"))?;
     if height == 0 {
+        if !block_id.hash.is_empty() {
+            return Err(Status::invalid_argument(
+                "hash-only block lookups must be resolved through resolve_block_height",
+            ));
+        }
         return Err(Status::not_found("block height 0 is not indexed"));
     }
 
@@ -984,9 +1035,11 @@ fn lightd_info(
     network: Network,
     tip_height: BlockHeight,
 ) -> Result<lightwalletd::LightdInfo, Status> {
-    let zebra_network = zebra_network(network)?;
+    let zebra_network = zebra_network(network).ok_or_else(|| {
+        Status::failed_precondition("network is not supported by lightwalletd compatibility")
+    })?;
     let current_upgrade =
-        NetworkUpgrade::current(&zebra_network, ZebraBlockHeight(tip_height.value()));
+        NetworkUpgrade::current(zebra_network, ZebraBlockHeight(tip_height.value()));
     let consensus_branch_id = current_upgrade.branch_id().map(u32::from).map_or_else(
         || "00000000".to_owned(),
         |branch_id| format!("{branch_id:08x}"),
@@ -1112,21 +1165,6 @@ fn lightwalletd_chain_name(network: Network) -> Result<&'static str, Status> {
         Network::ZcashMainnet => Ok("main"),
         Network::ZcashTestnet => Ok("test"),
         Network::ZcashRegtest => Ok("regtest"),
-        _ => Err(Status::failed_precondition(
-            "network is not supported by lightwalletd compatibility",
-        )),
-    }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "non-exhaustive core networks must fail closed until Zebra mapping exists"
-)]
-fn zebra_network(network: Network) -> Result<ZebraNetwork, Status> {
-    match network {
-        Network::ZcashMainnet => Ok(ZebraNetwork::Mainnet),
-        Network::ZcashTestnet => Ok(ZebraNetwork::new_default_testnet()),
-        Network::ZcashRegtest => Ok(ZebraNetwork::new_regtest(RegtestParameters::default())),
         _ => Err(Status::failed_precondition(
             "network is not supported by lightwalletd compatibility",
         )),

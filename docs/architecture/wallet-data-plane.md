@@ -21,7 +21,7 @@ It should provide:
 - Tree state APIs required for wallet sync.
 - Sapling and Orchard subtree root APIs required for batched wallet scanning.
 - Transparent-address UTXO APIs required by lightwalletd/Zashi compatibility,
-  once the stored transparent UTXO artifact family lands.
+  backed by the stored transparent UTXO artifact family.
 - Transaction broadcast.
 - Chain-event subscription per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription).
 - Mempool snapshot and mempool-event subscription per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
@@ -80,6 +80,93 @@ query-time compact-block decoding: it reads `ChainTipMetadata` from the same
 return a typed unavailable error; ranges beyond the completed subtree count
 return an empty response.
 
+## Block Identity and Hash-Keyed Reads
+
+Height remains the primary key for compact-block reads. Wallet scanning is
+height-ordered, compact-block ranges are height-bounded, and the canonical store
+keeps those reads cheap and predictable. Do not turn compact-block range APIs
+into hash-driven scans.
+
+Zinder ships a canonical best-chain hash-to-height resolver through the typed
+[`zinder_core::BlockSelector`] enum (`Height(BlockHeight) | Hash(BlockHash)`).
+The resolver is backed by the `block_hash_index` column family in `zinder-store`:
+every committed block writes a `(network, hash) -> (height, source_chain_epoch)`
+entry, and read paths verify the recorded height is still visible at the
+request's chain epoch via the existing height-visibility index. Reorged-out
+hashes return `BlockHashLookup::NotInBestChain` without an eager delete.
+
+The native surface is `WalletQuery.BlockIdBySelector` (capability
+`wallet.read.block_id_by_selector_v1`) returning `BlockIdResponse { chain_epoch,
+block_id }`. Compat hash-only requests (`GetBlock`, `GetTreeState`,
+`GetTransaction`-by-block-hash) call the resolver before reaching the existing
+height-keyed read; height-only callers get a normalized `BlockId` with the
+resolved hash. Both the gRPC adapter and `zinder-client::ChainIndex` expose
+`block_id_by_selector(BlockSelector)`.
+
+The same resolver backs the typed block-header read model:
+`WalletQuery.BlockHeaderBySelector` (capability
+`wallet.read.block_header_by_selector_v1`) returns `BlockHeaderResponse {
+chain_epoch, block_header }` where `BlockHeaderInfo` is the Zinder-native
+header shape (block identity, previous hash, merkle root, commitment bytes,
+block time, bits, nonce, version). The shape does not re-export Zebra's
+JSON-RPC `getblockheader` object or any zaino-internal response type. The
+header is parsed at request time from the underlying `BlockArtifact` payload
+through `zinder_source::block_header_info_from_raw_block_bytes`; storage
+remains a single `BlockArtifact` per block. If repeated parsing becomes the
+larger cost, the implementation may promote a dedicated `BlockHeader`
+artifact without changing the public vocabulary.
+
+`BlockSelector` is `#[non_exhaustive]`. Future non-best-chain `(txid, block_hash)`
+lookup is a *separate method*, not a third selector arm. That form is a
+non-best-chain transaction lookup and has different retention, secondary-reader,
+and explorer semantics than ordinary wallet sync. It is deferred until
+explorer parity or zcashd-compat parity becomes an explicitly named milestone.
+Until then, `Transaction` / `TransactionStatus` answers against the visible
+canonical chain plus the live mempool.
+
+## Transaction Status and Enrichment
+
+Native transaction lookup returns typed transaction status, not a mined-only
+artifact shape plus out-of-band probing. The public Rust shape is
+`zinder_core::TxStatus` and the native gRPC surface mirrors it through
+`WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
+under capability `wallet.read.transaction_by_id_v1`. With no consumers shipped
+yet, wire-shape evolution mutates `_v1` in place rather than bumping; capability
+versioning becomes a deprecation mechanism only after a consumer ships. The wire
+oneof has three arms; `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because
+typed errors do not consume oneof variants:
+
+- `Mined`: `MinedTransaction { Transaction transaction; MinedDetails details }`.
+- `InMempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
+- `ConflictingChain`: `ConflictingChainTransaction {}` (reserved shape; status
+  is the signal, fields are reserved for future non-best-chain lookup).
+
+The mined variant carries epoch-bound `MinedDetails {
+consensus_branch_id, block_time, confirmations }`. These fields are
+response/read-model values, not persisted transaction-artifact fields.
+`MinedDetails::from_response_epoch(epoch, mined_height, consensus_branch_id,
+block_time)` is the **only** public constructor in `zinder-core`. Callers
+cannot construct `MinedDetails` without the response's `ChainEpoch` in scope,
+so the racy `tip_height - block_height` confirmations computation is
+prevented by construction. `consensus_branch_id` comes from
+`zinder_source::consensus_branch_id_at(network, height)` (zebra-chain network
+upgrades); `block_time` is parsed from the stored `BlockArtifact` through
+`zinder_source::block_header_info_from_raw_block_bytes` and falls back to `0`
+when the block payload cannot be parsed.
+
+A response builder must not call the upstream node or latest tip again during
+response construction.
+
+The epoch rule is stricter for mempool. An `at_epoch` transaction lookup is a
+canonical chain read and never consults live mempool state. A non-epoch-pinned
+lookup may fall through to the writer-owned mempool index after the canonical
+chain returns `NotFound`.
+
+Changing the native wire response from mined-only `Transaction` to a
+status-bearing response required a new capability string. If the RPC name is
+kept for source compatibility, the capability still records the semantic change;
+silent widening is not allowed.
+
 ## Chain-Event Subscription
 
 Wallet sync needs durable chain-state notifications. `WalletQuery.ChainEvents` is the M2 native subscription that delivers `ChainEventEnvelope` messages to wallet clients in `event_sequence` order, settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). Chain ingestion already produces these envelopes at every canonical commit; this RPC is the wire boundary that exposes them to wallet clients without requiring them to poll latest-block metadata or infer tip changes from unrelated stream lifecycles.
@@ -124,7 +211,7 @@ Three architectural consequences follow from that map:
 - The public server-observed type is `MempoolEntry`, not `PendingTransaction`. A pending transaction is a wallet-local UX state: it can include a transaction that was created locally but never accepted by the network.
 - Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zashi/Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means M3 plus the transparent history and balance surfaces needed for address-oriented views.
 
-The M3 native protocol will expose two complementary methods:
+The M3 native protocol exposes two complementary methods:
 
 - **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold.
 - **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via `MempoolStreamCursorV1`.
@@ -137,9 +224,39 @@ mempool cache class documented in the Zaino comparison.
 
 Mempool retention is two-tier (60 minutes mined / 24 hours invalidated by default, both configurable). Expired cursors return `MempoolCursorExpired` with `oldest_retained_sequence` in `PreconditionFailure` detail.
 
-The M3 transparent-address mempool methods (`is_in_mempool`, `transparent_mempool_outputs_by_address`, `transparent_mempool_spend_by_outpoint`) will live on `WalletQueryApi` and `ChainIndex`. They are explicitly transparent-only: the privacy boundary forbids by-address shielded queries, and clients scan mempool compact-transaction payloads locally for shielded interest.
+### Mempool Point Lookups
 
-The lightwalletd compat shim will map `GetMempoolStream` and `GetMempoolTx` over `MempoolEvents` and `MempoolSnapshot` only after M3 lands. Until then, `wallet.events.mempool_v1` and `wallet.snapshot.mempool_v1` are absent from `ServerCapabilities`.
+`MempoolSnapshot` is the bootstrap and bounded-enumeration surface. It is not
+the long-term contract for every non-Rust client that wants a single transaction,
+address, or outpoint answer. Native gRPC should expose focused point lookups that
+mirror the `ChainIndex` methods:
+
+- `TransactionStatus` or an equivalent status-bearing `Transaction` response for
+  mined/mempool/not-found/conflicting-chain state.
+- `TransparentMempoolOutputsByAddress` for unmined transparent outputs tied to
+  one transparent address script hash.
+- `TransparentMempoolSpendByOutpoint` for the unmined spend of one transparent
+  outpoint, when present.
+
+These methods still read the writer-owned `MempoolIndex` through the
+`IngestControl` proxy path settled by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+They do not open a second mempool source and do not reconstruct a local live
+index inside `zinder-query`.
+
+The transparent-address mempool methods are explicitly transparent-only: the
+privacy boundary forbids by-address shielded queries, and clients scan mempool
+compact-transaction payloads locally for shielded interest.
+
+`MempoolMinedEvent` carries both `mined_height` and `block_hash`. Consumers that
+track a pending transaction through mining need the full mined block identity to
+handle reorgs and local wallet bookkeeping without a follow-up latest-tip read.
+
+The lightwalletd compat shim maps `GetMempoolStream` and `GetMempoolTx` over
+`MempoolEvents` and `MempoolSnapshot` when the adapter is configured with the
+mempool surface. Deployments without that surface omit
+`wallet.events.mempool_v1` and `wallet.snapshot.mempool_v1` from
+`ServerCapabilities` and return a typed unavailable response from the compat
+methods.
 
 ## Transparent Address UTXOs
 
@@ -168,13 +285,21 @@ a shared `AddressLookup` oneof that accepts either a 32-byte
 debug callers); the native adapter parses string addresses through
 `ZebraTransparentAddress`, validates the network, and SHA-256-hashes the
 `scriptPubKey` before any in-process call. The Rust `ChainIndex` trait carries
-the same surface: `transparent_address_utxos`,
-`transparent_address_utxos_at_epoch`, and `transparent_address_utxos_stream`,
-all keyed by the typed `TransparentAddressScriptHash`. The `at_epoch` companion
+the same surface: `transparent_address_utxos(query, at_epoch)` and
+`transparent_address_utxos_stream(query, at_epoch)`, both keyed by the typed
+`TransparentAddressScriptHash`. The `at_epoch: Option<ChainEpoch>` parameter
 honors the standard chain-epoch pin contract; cursor-based pagination uses
 `TransparentUtxoCursor` (`StreamCursorTokenV1` family flag nibble `0x4`).
 Capability `wallet.address.transparent_utxos_v1` is advertised on every
 deployment that can serve the read.
+
+Cursor cadence on the streaming surfaces: the wire emits the resume cursor only
+on the terminal chunk of a server stream. Non-terminal `TransparentAddressUtxosStreamChunk`
+and `TransparentAddressTxIdsChunk` envelopes carry empty `cursor` bytes; the
+last envelope carries either the next-page cursor (when more entries may be
+available) or empty bytes (stream fully drained). Clients that lose the
+connection mid-stream must restart the page rather than resume from a
+non-terminal envelope; bounded UTXO/history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the store was produced with the wallet-serving

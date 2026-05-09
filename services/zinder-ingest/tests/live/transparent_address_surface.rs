@@ -175,12 +175,15 @@ async fn assert_utxo_round_trip(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_address_utxos(TransparentAddressUtxosRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            from_cursor: None,
-        })
+        .transparent_address_utxos(
+            TransparentAddressUtxosRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     let matched = response
         .utxos
@@ -211,14 +214,17 @@ async fn assert_tx_history_round_trip(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            end_height: sample.tip_height,
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            descending: false,
-            from_cursor: None,
-        })
+        .transparent_address_tx_ids_in_range(
+            TransparentAddressTxIdsInRangeRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                end_height: sample.tip_height,
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                descending: false,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     assert!(
         response
@@ -237,24 +243,30 @@ async fn assert_tx_history_descending_matches_ascending(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let ascending = wallet_query
-        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            end_height: sample.tip_height,
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            descending: false,
-            from_cursor: None,
-        })
+        .transparent_address_tx_ids_in_range(
+            TransparentAddressTxIdsInRangeRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                end_height: sample.tip_height,
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                descending: false,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     let descending = wallet_query
-        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            end_height: sample.tip_height,
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            descending: true,
-            from_cursor: None,
-        })
+        .transparent_address_tx_ids_in_range(
+            TransparentAddressTxIdsInRangeRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                end_height: sample.tip_height,
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                descending: true,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     assert_eq!(
         ascending.artifacts.len(),
@@ -278,12 +290,15 @@ async fn assert_utxo_cursor_resumes(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let baseline = wallet_query
-        .transparent_address_utxos(TransparentAddressUtxosRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            from_cursor: None,
-        })
+        .transparent_address_utxos(
+            TransparentAddressUtxosRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     if baseline.utxos.len() < 2 {
         // Address only paid once in the backfill window: cursor pagination is
@@ -291,24 +306,30 @@ async fn assert_utxo_cursor_resumes(
         return Ok(());
     }
     let first_page = wallet_query
-        .transparent_address_utxos(TransparentAddressUtxosRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
-            max_entries: NonZeroU32::MIN,
-            from_cursor: None,
-        })
+        .transparent_address_utxos(
+            TransparentAddressUtxosRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: sample.backfill_from_height,
+                max_entries: NonZeroU32::MIN,
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
     assert_eq!(first_page.utxos.len(), 1);
     let cursor = first_page
         .next_cursor
         .ok_or_else(|| eyre!("first page must return a resume cursor when more UTXOs exist"))?;
     let second_page = wallet_query
-        .transparent_address_utxos(TransparentAddressUtxosRequest {
-            address_script_hash: sample.address_script_hash,
-            start_height: BlockHeight::new(0),
-            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-            from_cursor: Some(cursor),
-        })
+        .transparent_address_utxos(
+            TransparentAddressUtxosRequest {
+                address_script_hash: sample.address_script_hash,
+                start_height: BlockHeight::new(0),
+                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+                from_cursor: Some(cursor),
+            },
+            None,
+        )
         .await?;
     let resumed: Vec<_> = first_page
         .utxos

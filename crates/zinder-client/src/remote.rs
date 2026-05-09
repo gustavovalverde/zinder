@@ -9,12 +9,13 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, transport::Channel};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact, MempoolEntry,
-    Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
-    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    CompactBlockArtifact, MempoolEntry, MinedDetails, MinedTransaction, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact,
+    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, ServerCapabilities, wallet_query_client::WalletQueryClient};
 use zinder_store::{
@@ -30,7 +31,7 @@ use crate::{
     MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
     TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
-    TransparentHistoryCursor, TransparentUtxoCursor, TxStatus,
+    TransparentHistoryCursor, TransparentUtxoCursor,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -103,101 +104,198 @@ impl ChainIndex for RemoteChainIndex {
         )
     }
 
-    async fn latest_block(&self) -> Result<BlockId, IndexerError> {
-        self.latest_block_from_epoch(None).await
+    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError> {
+        let response = self
+            .client()
+            .await
+            .latest_block(Request::new(wallet::LatestBlockRequest {
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        let latest_block = response
+            .latest_block
+            .ok_or_else(|| IndexerError::malformed("latest_block", "field is missing"))?;
+
+        Ok(BlockId {
+            height: BlockHeight::new(latest_block.height),
+            hash: block_hash_from_bytes("latest_block.block_hash", latest_block.block_hash)?,
+        })
     }
 
-    async fn latest_block_at_epoch(&self, at_epoch: ChainEpoch) -> Result<BlockId, IndexerError> {
-        self.latest_block_from_epoch(Some(at_epoch)).await
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError> {
+        let response = self
+            .client()
+            .await
+            .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+                selector: Some(block_selector_to_message(selector)?),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        block_id_from_message(response.block_id)
+    }
+
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockHeaderInfo, IndexerError> {
+        let response = self
+            .client()
+            .await
+            .block_header_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+                selector: Some(block_selector_to_message(selector)?),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        let header_message = response
+            .block_header
+            .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
+        block_header_info_from_message(header_message)
     }
 
     async fn compact_block_at(
         &self,
         height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
-        self.compact_block_from_epoch(height, None).await
-    }
-
-    async fn compact_block_at_epoch(
-        &self,
-        height: BlockHeight,
-        at_epoch: ChainEpoch,
-    ) -> Result<CompactBlockArtifact, IndexerError> {
-        self.compact_block_from_epoch(height, Some(at_epoch)).await
+        let response = self
+            .client()
+            .await
+            .compact_block(Request::new(wallet::CompactBlockRequest {
+                height: height.value(),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        compact_block_from_message(
+            response
+                .compact_block
+                .ok_or_else(|| IndexerError::malformed("compact_block", "field is missing"))?,
+        )
     }
 
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        self.compact_blocks_in_range_from_epoch(block_range, None)
+        let response = self
+            .client()
             .await
-    }
-
-    async fn compact_blocks_in_range_at_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: ChainEpoch,
-    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        self.compact_blocks_in_range_from_epoch(block_range, Some(at_epoch))
+            .compact_block_range(Request::new(wallet::CompactBlockRangeRequest {
+                start_height: block_range.start.value(),
+                end_height: block_range.end.value(),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
             .await
+            .map_err(IndexerError::from_status)?;
+        let stream = response.into_inner().map(|chunk_result| {
+            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            compact_block_from_message(
+                chunk
+                    .compact_block
+                    .ok_or_else(|| IndexerError::malformed("compact_block", "field is missing"))?,
+            )
+        });
+
+        Ok(Box::pin(stream))
     }
 
-    async fn tree_state_at(&self, height: BlockHeight) -> Result<TreeStateArtifact, IndexerError> {
-        self.tree_state_from_epoch(height, None).await
-    }
-
-    async fn tree_state_at_epoch(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.tree_state_from_epoch(height, Some(at_epoch)).await
+        let response = self
+            .client()
+            .await
+            .tree_state(Request::new(wallet::TreeStateRequest {
+                height: height.value(),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        tree_state_from_response(response)
     }
 
-    async fn latest_tree_state(&self) -> Result<TreeStateArtifact, IndexerError> {
-        self.latest_tree_state_from_epoch(None).await
-    }
-
-    async fn latest_tree_state_at_epoch(
+    async fn latest_tree_state(
         &self,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.latest_tree_state_from_epoch(Some(at_epoch)).await
+        let response = self
+            .client()
+            .await
+            .latest_tree_state(Request::new(wallet::LatestTreeStateRequest {
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        tree_state_from_response(response)
     }
 
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.subtree_roots_in_range_from_epoch(subtree_root_range, None)
+        let response = self
+            .client()
             .await
-    }
-
-    async fn subtree_roots_in_range_at_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch: ChainEpoch,
-    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.subtree_roots_in_range_from_epoch(subtree_root_range, Some(at_epoch))
+            .subtree_roots(Request::new(wallet::SubtreeRootsRequest {
+                shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
+                    as i32,
+                start_index: subtree_root_range.start_index.value(),
+                max_entries: subtree_root_range.max_entries.get(),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
             .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        let protocol = shielded_protocol_from_message(response.shielded_protocol)?;
+        response
+            .subtree_roots
+            .into_iter()
+            .map(|root| subtree_root_from_message(protocol, root))
+            .collect()
     }
 
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TxStatus, IndexerError> {
-        self.transaction_by_id_from_epoch(transaction_id, None)
+        let response = match self
+            .client()
             .await
-    }
-
-    async fn transaction_by_id_at_epoch(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch: ChainEpoch,
-    ) -> Result<TxStatus, IndexerError> {
-        self.transaction_by_id_from_epoch(transaction_id, Some(at_epoch))
+            .transaction(Request::new(wallet::TransactionRequest {
+                transaction_id: transaction_id.as_bytes().to_vec(),
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
             .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                if at_epoch.is_some() {
+                    return Ok(TxStatus::NotFound);
+                }
+                return self.lookup_in_mempool(transaction_id).await;
+            }
+            Err(status) => return Err(IndexerError::from_status(status)),
+        };
+        tx_status_from_message(response)
     }
 
     async fn broadcast_transaction(
@@ -285,48 +383,93 @@ impl ChainIndex for RemoteChainIndex {
         // first and falls through to the mempool when no mined record
         // exists. This avoids a second round-trip and reuses the writer's
         // typed `TxStatus::InMempool` answer.
-        let outcome = self.transaction_by_id(transaction_id).await?;
+        let outcome = self.transaction_by_id(transaction_id, None).await?;
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
 
     async fn transparent_address_utxos(
         &self,
         query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        self.transparent_address_utxos_from_epoch(query, None).await
-    }
-
-    async fn transparent_address_utxos_at_epoch(
-        &self,
-        query: TransparentAddressUtxosQuery,
-        at_epoch: ChainEpoch,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        self.transparent_address_utxos_from_epoch(query, Some(at_epoch))
+        let request = transparent_address_utxos_request_message(&query, at_epoch);
+        let response = self
+            .client()
             .await
+            .transparent_address_utxos(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        let chain_epoch = chain_epoch_from_message_with_network(
+            self.network,
+            response
+                .chain_epoch
+                .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+        )?;
+        let utxos = response
+            .utxos
+            .into_iter()
+            .map(transparent_address_utxo_from_message)
+            .collect::<Result<Vec<_>, IndexerError>>()?;
+        let next_cursor = if response.next_cursor.is_empty() {
+            None
+        } else {
+            Some(TransparentUtxoCursor::from_bytes(response.next_cursor))
+        };
+        Ok(TransparentAddressUtxosView {
+            chain_epoch,
+            utxos,
+            next_cursor,
+        })
     }
 
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        self.transparent_address_tx_ids_in_range_from_epoch(query, None)
+        let address_script_hash = query.address_script_hash;
+        let request = wallet::TransparentAddressTxIdsInRangeRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            start_height: query.start_height.value(),
+            end_height: query.end_height.value(),
+            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
+            from_cursor: query
+                .from_cursor
+                .as_ref()
+                .map(|cursor| cursor.as_bytes().to_vec())
+                .unwrap_or_default(),
+            at_epoch: at_epoch.map(chain_epoch_to_message),
+            descending: query.descending,
+        };
+        let response = self
+            .client()
             .await
-    }
-
-    async fn transparent_address_tx_ids_in_range_at_epoch(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-        at_epoch: ChainEpoch,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        self.transparent_address_tx_ids_in_range_from_epoch(query, Some(at_epoch))
+            .transparent_address_tx_ids_in_range(Request::new(request))
             .await
+            .map_err(IndexerError::from_status)?;
+        let expected_network = self.network;
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            transparent_address_tx_ids_chunk_from_message(
+                expected_network,
+                address_script_hash,
+                chunk,
+            )
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn transparent_address_utxos_stream(
         &self,
         query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxoStream, IndexerError> {
-        let request = transparent_address_utxos_request_message(&query, None);
+        let request = transparent_address_utxos_request_message(&query, at_epoch);
         let response = self
             .client()
             .await
@@ -382,250 +525,6 @@ impl ChainIndex for RemoteChainIndex {
 }
 
 impl RemoteChainIndex {
-    async fn latest_block_from_epoch(
-        &self,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<BlockId, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .latest_block(Request::new(wallet::LatestBlockRequest {
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        let latest_block = response
-            .latest_block
-            .ok_or_else(|| IndexerError::malformed("latest_block", "field is missing"))?;
-
-        Ok(BlockId {
-            height: BlockHeight::new(latest_block.height),
-            hash: block_hash_from_bytes("latest_block.block_hash", latest_block.block_hash)?,
-        })
-    }
-
-    async fn compact_block_from_epoch(
-        &self,
-        height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<CompactBlockArtifact, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .compact_block(Request::new(wallet::CompactBlockRequest {
-                height: height.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        compact_block_from_message(
-            response
-                .compact_block
-                .ok_or_else(|| IndexerError::malformed("compact_block", "field is missing"))?,
-        )
-    }
-
-    async fn compact_blocks_in_range_from_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .compact_block_range(Request::new(wallet::CompactBlockRangeRequest {
-                start_height: block_range.start.value(),
-                end_height: block_range.end.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?;
-        let stream = response.into_inner().map(|chunk_result| {
-            let chunk = chunk_result.map_err(IndexerError::from_status)?;
-            compact_block_from_message(
-                chunk
-                    .compact_block
-                    .ok_or_else(|| IndexerError::malformed("compact_block", "field is missing"))?,
-            )
-        });
-
-        Ok(Box::pin(stream))
-    }
-
-    async fn tree_state_from_epoch(
-        &self,
-        height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TreeStateArtifact, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .tree_state(Request::new(wallet::TreeStateRequest {
-                height: height.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        tree_state_from_response(response)
-    }
-
-    async fn latest_tree_state_from_epoch(
-        &self,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TreeStateArtifact, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .latest_tree_state(Request::new(wallet::LatestTreeStateRequest {
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        tree_state_from_response(response)
-    }
-
-    async fn subtree_roots_in_range_from_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        let response = self
-            .client()
-            .await
-            .subtree_roots(Request::new(wallet::SubtreeRootsRequest {
-                shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
-                    as i32,
-                start_index: subtree_root_range.start_index.value(),
-                max_entries: subtree_root_range.max_entries.get(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        let protocol = shielded_protocol_from_message(response.shielded_protocol)?;
-        response
-            .subtree_roots
-            .into_iter()
-            .map(|root| subtree_root_from_message(protocol, root))
-            .collect()
-    }
-
-    async fn transparent_address_tx_ids_in_range_from_epoch(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        let address_script_hash = query.address_script_hash;
-        let request = wallet::TransparentAddressTxIdsInRangeRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
-            start_height: query.start_height.value(),
-            end_height: query.end_height.value(),
-            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
-            from_cursor: query
-                .from_cursor
-                .as_ref()
-                .map(|cursor| cursor.as_bytes().to_vec())
-                .unwrap_or_default(),
-            at_epoch: at_epoch.map(chain_epoch_to_message),
-            descending: query.descending,
-        };
-        let response = self
-            .client()
-            .await
-            .transparent_address_tx_ids_in_range(Request::new(request))
-            .await
-            .map_err(IndexerError::from_status)?;
-        let expected_network = self.network;
-        let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(IndexerError::from_status)?;
-            transparent_address_tx_ids_chunk_from_message(
-                expected_network,
-                address_script_hash,
-                chunk,
-            )
-        });
-        Ok(Box::pin(stream))
-    }
-
-    async fn transparent_address_utxos_from_epoch(
-        &self,
-        query: TransparentAddressUtxosQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        let request = transparent_address_utxos_request_message(&query, at_epoch);
-        let response = self
-            .client()
-            .await
-            .transparent_address_utxos(Request::new(request))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        let chain_epoch = chain_epoch_from_message_with_network(
-            self.network,
-            response
-                .chain_epoch
-                .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-        )?;
-        let utxos = response
-            .utxos
-            .into_iter()
-            .map(transparent_address_utxo_from_message)
-            .collect::<Result<Vec<_>, IndexerError>>()?;
-        let next_cursor = if response.next_cursor.is_empty() {
-            None
-        } else {
-            Some(TransparentUtxoCursor::from_bytes(response.next_cursor))
-        };
-        Ok(TransparentAddressUtxosView {
-            chain_epoch,
-            utxos,
-            next_cursor,
-        })
-    }
-
-    async fn transaction_by_id_from_epoch(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TxStatus, IndexerError> {
-        let response = match self
-            .client()
-            .await
-            .transaction(Request::new(wallet::TransactionRequest {
-                transaction_id: transaction_id.as_bytes().to_vec(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-        {
-            Ok(response) => response.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => {
-                if at_epoch.is_some() {
-                    // Caller bound the read to a chain epoch. Mempool
-                    // state is not part of any chain epoch; return the
-                    // canonical NotFound answer without a mempool
-                    // round-trip.
-                    return Ok(TxStatus::NotFound);
-                }
-                return self.lookup_in_mempool(transaction_id).await;
-            }
-            Err(status) => return Err(IndexerError::from_status(status)),
-        };
-        let transaction = transaction_from_message(
-            response
-                .transaction
-                .ok_or_else(|| IndexerError::malformed("transaction", "field is missing"))?,
-        )?;
-        Ok(TxStatus::Mined(transaction))
-    }
-
     async fn lookup_in_mempool(
         &self,
         transaction_id: TransactionId,
@@ -1058,6 +957,114 @@ fn chain_event_stream_family_to_message(
 fn block_hash_from_bytes(field: &'static str, bytes: Vec<u8>) -> Result<BlockHash, IndexerError> {
     let bytes = fixed_32_bytes(field, bytes)?;
     Ok(BlockHash::from_bytes(bytes))
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BlockSelector is #[non_exhaustive]; new selector variants need wire opt-in before they can be sent"
+)]
+fn block_selector_to_message(
+    selector: BlockSelector,
+) -> Result<wallet::BlockSelector, IndexerError> {
+    let inner = match selector {
+        BlockSelector::Height(height) => wallet::block_selector::Selector::Height(height.value()),
+        BlockSelector::Hash(hash) => {
+            wallet::block_selector::Selector::Hash(hash.as_bytes().to_vec())
+        }
+        _ => {
+            return Err(IndexerError::invalid_request(
+                "unsupported block selector variant",
+            ));
+        }
+    };
+    Ok(wallet::BlockSelector {
+        selector: Some(inner),
+    })
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "TransactionStatusResponse oneof is non-exhaustive in the protobuf-generated enum; new variants are a deliberate wire change."
+)]
+fn tx_status_from_message(
+    response: wallet::TransactionStatusResponse,
+) -> Result<TxStatus, IndexerError> {
+    let chain_epoch_message = response
+        .chain_epoch
+        .as_ref()
+        .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?;
+    let status = response
+        .status
+        .ok_or_else(|| IndexerError::malformed("status", "field is missing"))?;
+    match status {
+        wallet::transaction_status_response::Status::Mined(mined) => {
+            let artifact = transaction_from_message(mined.transaction.ok_or_else(|| {
+                IndexerError::malformed("mined.transaction", "field is missing")
+            })?)?;
+            let details_message = mined
+                .details
+                .ok_or_else(|| IndexerError::malformed("mined.details", "field is missing"))?;
+            let details = MinedDetails {
+                consensus_branch_id: details_message.consensus_branch_id,
+                block_time: details_message.block_time,
+                confirmations: details_message.confirmations,
+            };
+            Ok(TxStatus::Mined(MinedTransaction::new(artifact, details)))
+        }
+        wallet::transaction_status_response::Status::InMempool(in_mempool) => {
+            let chain_epoch = chain_epoch_from_message(chain_epoch_message.clone())
+                .map_err(decode_error_to_indexer_error)?;
+            let entry = MempoolEntry {
+                transaction_id: TransactionId::from_bytes([0; 32]),
+                auth_digest: None,
+                raw_transaction_bytes: RawTransactionBytes::new(in_mempool.payload_bytes),
+                compact_transaction_bytes: Vec::new(),
+                first_seen_unix_millis: UnixTimestampMillis::new(
+                    u64::try_from(in_mempool.first_seen_unix_seconds.saturating_mul(1000))
+                        .unwrap_or(0),
+                ),
+                first_seen_chain_epoch: chain_epoch,
+                transparent_outputs: Vec::new(),
+                transparent_spends: Vec::new(),
+            };
+            Ok(TxStatus::InMempool(entry))
+        }
+        wallet::transaction_status_response::Status::Conflicting(_) => {
+            Ok(TxStatus::ConflictingChain)
+        }
+    }
+}
+
+fn block_id_from_message(block_id: Option<wallet::BlockMetadata>) -> Result<BlockId, IndexerError> {
+    let metadata =
+        block_id.ok_or_else(|| IndexerError::malformed("block_id", "field is missing"))?;
+    let block_hash = block_hash_from_bytes("block_id.block_hash", metadata.block_hash)?;
+    Ok(BlockId::new(BlockHeight::new(metadata.height), block_hash))
+}
+
+fn block_header_info_from_message(
+    message: wallet::BlockHeaderInfo,
+) -> Result<BlockHeaderInfo, IndexerError> {
+    let block_id = block_id_from_message(message.block_id)?;
+    let previous_block_hash = block_hash_from_bytes(
+        "block_header.previous_block_hash",
+        message.previous_block_hash,
+    )?;
+    let merkle_root_hash =
+        fixed_32_bytes("block_header.merkle_root_hash", message.merkle_root_hash)?;
+    let commitment_bytes =
+        fixed_32_bytes("block_header.commitment_bytes", message.commitment_bytes)?;
+    let nonce = fixed_32_bytes("block_header.nonce", message.nonce)?;
+    Ok(BlockHeaderInfo::new(
+        block_id,
+        previous_block_hash,
+        merkle_root_hash,
+        commitment_bytes,
+        message.block_time,
+        message.bits,
+        nonce,
+        message.version,
+    ))
 }
 
 fn subtree_root_hash_from_bytes(

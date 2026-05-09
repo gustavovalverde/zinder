@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpoch, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
 };
 use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
@@ -25,8 +25,9 @@ use crate::{
 };
 
 use super::native::{
-    ServerInfoSettings, address_lookup_to_script_hash, broadcast_transaction_response,
-    build_chain_epoch_message, build_compact_block_message, build_server_capabilities_message,
+    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
+    build_compact_block_message, build_server_capabilities_message,
     build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
     chain_events_response, compact_block_response, latest_block_response,
     latest_tree_state_response, subtree_roots_response, transaction_response,
@@ -147,10 +148,36 @@ where
         .map_err(|error| status_from_query_error(&error))
     }
 
+    async fn block_id_by_selector(
+        &self,
+        request: Request<wallet::BlockIdBySelectorRequest>,
+    ) -> Result<Response<wallet::BlockIdResponse>, Status> {
+        let request = request.into_inner();
+        let selector = block_selector_from_request(request.selector)?;
+        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        block_id_by_selector_response(&self.query_api, selector, at_epoch)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn block_header_by_selector(
+        &self,
+        request: Request<wallet::BlockIdBySelectorRequest>,
+    ) -> Result<Response<wallet::BlockHeaderResponse>, Status> {
+        let request = request.into_inner();
+        let selector = block_selector_from_request(request.selector)?;
+        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        block_header_by_selector_response(&self.query_api, selector, at_epoch)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
     async fn transaction(
         &self,
         request: Request<wallet::TransactionRequest>,
-    ) -> Result<Response<wallet::TransactionResponse>, Status> {
+    ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
         let request = request.into_inner();
         let transaction_id = transaction_id_from_request(&request.transaction_id)?;
 
@@ -160,8 +187,11 @@ where
             chain_epoch_from_request(request.at_epoch)?,
         )
         .await
+        .map_err(|error| status_from_query_error(&error))?
+        .ok_or_else(|| {
+            Status::not_found("transaction is not visible in the canonical chain or live mempool")
+        })
         .map(Response::new)
-        .map_err(|error| status_from_query_error(&error))
     }
 
     async fn compact_block_range(
@@ -177,7 +207,7 @@ where
 
         let compact_block_range = self
             .query_api
-            .compact_block_range_at_epoch(block_range, at_epoch)
+            .compact_block_range(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = build_chain_epoch_message(compact_block_range.chain_epoch);
@@ -347,7 +377,7 @@ where
             transparent_address_utxos_request_from_message(request, self.server_info_network()?)?;
         let response = self
             .query_api
-            .transparent_address_utxos_at_epoch(typed_request, at_epoch)
+            .transparent_address_utxos(typed_request, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = response.chain_epoch;
@@ -388,7 +418,7 @@ where
         )?;
         let response = self
             .query_api
-            .transparent_address_tx_ids_in_range_at_epoch(typed_request, at_epoch)
+            .transparent_address_tx_ids_in_range(typed_request, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = response.chain_epoch;
@@ -555,6 +585,25 @@ fn chain_epoch_from_request(
                 .map_err(|error| Status::invalid_argument(error.to_string()))
         })
         .transpose()
+}
+
+fn block_selector_from_request(
+    selector: Option<wallet::BlockSelector>,
+) -> Result<BlockSelector, Status> {
+    let inner = selector
+        .and_then(|message| message.selector)
+        .ok_or_else(|| Status::invalid_argument("block selector must be specified"))?;
+    match inner {
+        wallet::block_selector::Selector::Height(height) => {
+            Ok(BlockSelector::Height(BlockHeight::new(height)))
+        }
+        wallet::block_selector::Selector::Hash(hash_bytes) => {
+            let bytes: [u8; 32] = hash_bytes
+                .try_into()
+                .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
+            Ok(BlockSelector::Hash(BlockHash::from_bytes(bytes)))
+        }
+    }
 }
 
 fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Status> {

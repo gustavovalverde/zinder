@@ -40,25 +40,30 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
     .await?;
 
     let current_epoch = chain_index.current_epoch().await?;
-    let latest_block = chain_index.latest_block().await?;
-    let compact_block = chain_index.compact_block_at(BlockHeight::new(1)).await?;
-    let tree_state = chain_index.latest_tree_state().await?;
-    let subtree_roots = chain_index
-        .subtree_roots_in_range(SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::MIN,
-        ))
+    let latest_block = chain_index.latest_block(None).await?;
+    let compact_block = chain_index
+        .compact_block_at(BlockHeight::new(1), None)
         .await?;
-    let mined_transaction = chain_index.transaction_by_id(transaction_id).await?;
+    let tree_state = chain_index.latest_tree_state(None).await?;
+    let subtree_roots = chain_index
+        .subtree_roots_in_range(
+            SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(0),
+                NonZeroU32::MIN,
+            ),
+            None,
+        )
+        .await?;
+    let mined_transaction = chain_index.transaction_by_id(transaction_id, None).await?;
     let missing_transaction = chain_index
-        .transaction_by_id(TransactionId::from_bytes([0x55; 32]))
+        .transaction_by_id(TransactionId::from_bytes([0x55; 32]), None)
         .await?;
     let mut compact_block_stream = chain_index
-        .compact_blocks_in_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
+        .compact_blocks_in_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            None,
+        )
         .await?;
     let mut compact_block_count = 0;
     while let Some(compact_block_result) = compact_block_stream.next().await {
@@ -71,7 +76,12 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
     assert_eq!(compact_block.height, BlockHeight::new(1));
     assert_eq!(tree_state.height, BlockHeight::new(2));
     assert_eq!(subtree_roots.len(), 1);
-    assert_eq!(mined_transaction, TxStatus::Mined(transaction));
+    let TxStatus::Mined(mined) = mined_transaction else {
+        return Err(eyre!(
+            "expected mined transaction, got {mined_transaction:?}"
+        ));
+    };
+    assert_eq!(mined.artifact, transaction);
     assert_eq!(missing_transaction, TxStatus::NotFound);
     assert_eq!(compact_block_count, 2);
     assert!(matches!(

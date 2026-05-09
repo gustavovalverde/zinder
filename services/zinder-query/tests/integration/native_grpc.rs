@@ -163,6 +163,38 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
 }
 
 #[tokio::test]
+async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    commit_wallet_artifacts(&store)?;
+    let requested_transaction_id = TransactionId::from_bytes([0x45; 32]);
+    let wallet_query = WalletQuery::new(store, ());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+
+    let status = match WalletQueryService::transaction(
+        &grpc_adapter,
+        Request::new(wallet::TransactionRequest {
+            transaction_id: requested_transaction_id.as_bytes().to_vec(),
+            at_epoch: None,
+        }),
+    )
+    .await
+    {
+        Ok(response) => return Err(eyre!("expected transaction error, got {response:?}")),
+        Err(status) => status,
+    };
+
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(
+        status.message().contains("not visible"),
+        "expected wire message to describe visibility, got {:?}",
+        status.message()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_grpc_service_broadcasts_raw_transactions() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let transaction_id = TransactionId::from_bytes([0x9a; 32]);

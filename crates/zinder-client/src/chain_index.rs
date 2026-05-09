@@ -5,12 +5,12 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact, MempoolEntry,
-    MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TreeStateArtifact,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
+    CompactBlockArtifact, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -90,36 +90,6 @@ pub struct ChainRangeReverted {
     pub chain_epoch: ChainEpoch,
     /// Inclusive block range invalidated by this transition.
     pub block_range: BlockHeightRange,
-}
-
-/// Transaction lookup status.
-///
-/// Returned by [`ChainIndex::transaction_by_id`]. The plain (non-`at_epoch`)
-/// variant consults the live mempool when the canonical chain does not
-/// contain the transaction; the `at_epoch` variant binds strictly to the
-/// requested chain epoch and never consults mempool state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "InMempool carries the full hydrated MempoolEntry by design so consumers (Zallet, Zashi/Zodl) can drop the string-matching tx-status workaround they currently use against zaino. Boxing would push allocation cost into every consumer's pattern match."
-)]
-pub enum TxStatus {
-    /// Transaction is mined in the canonical chain.
-    Mined(TransactionArtifact),
-    /// Transaction is not indexed in the visible canonical chain.
-    NotFound,
-    /// Transaction is known to be in the mempool.
-    ///
-    /// Carries the hydrated [`MempoolEntry`] so consumers correlating
-    /// pending state (transparent UTXO overlays, rebroadcast decisions,
-    /// transaction lifecycle UI) do not need to follow up with
-    /// [`ChainIndex::transparent_mempool_outputs_by_address`] or
-    /// [`ChainIndex::transparent_mempool_spend_by_outpoint`] to obtain
-    /// the same state.
-    InMempool(MempoolEntry),
-    /// Transaction conflicts with the visible canonical chain.
-    ConflictingChain,
 }
 
 /// Opaque mempool-event cursor.
@@ -345,6 +315,11 @@ pub struct TransparentAddressUtxoStreamItem {
 }
 
 /// Typed chain-index contract consumed by wallets and applications.
+///
+/// Every read that depends on chain state takes `at_epoch: Option<ChainEpoch>`.
+/// `None` resolves to the visible chain epoch at call time; `Some(epoch)`
+/// pins the read to that epoch. Implementations that cannot honor a pinned
+/// epoch return [`IndexerError::FailedPrecondition`].
 #[async_trait]
 pub trait ChainIndex: Send + Sync + 'static {
     /// Returns the server capability descriptor when the implementation has a
@@ -355,81 +330,75 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError>;
 
     /// Returns the latest visible block identity.
-    async fn latest_block(&self) -> Result<BlockId, IndexerError>;
+    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError>;
 
-    /// Returns the latest block identity from a requested chain epoch.
-    async fn latest_block_at_epoch(&self, at_epoch: ChainEpoch) -> Result<BlockId, IndexerError>;
+    /// Resolves a block selector against the canonical best chain.
+    ///
+    /// Replaces the lightwalletd `BlockId { height, hash }` request shape:
+    /// hash-only callers no longer need to pretend `height = 0` is a
+    /// sentinel, and height-only callers get a normalized [`BlockId`] with
+    /// the resolved hash. Returns [`IndexerError::NotFound`] when the
+    /// selector addresses a block that is not visible at the request's
+    /// chain epoch (reorged out or never indexed).
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError>;
+
+    /// Returns the typed block-header read model for a block selector.
+    ///
+    /// The Zinder header shape is independent of the lightwalletd compact
+    /// header and the upstream node's JSON-RPC `getblockheader` shape.
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockHeaderInfo, IndexerError>;
 
     /// Reads one compact block artifact.
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-    ) -> Result<CompactBlockArtifact, IndexerError>;
-
-    /// Reads one compact block artifact from a requested chain epoch.
-    async fn compact_block_at_epoch(
-        &self,
-        height: BlockHeight,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockArtifact, IndexerError>;
 
     /// Streams compact block artifacts for an inclusive range.
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
-    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError>;
-
-    /// Streams compact block artifacts for an inclusive range from a requested
-    /// chain epoch.
-    async fn compact_blocks_in_range_at_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError>;
 
     /// Reads one tree-state artifact.
-    async fn tree_state_at(&self, height: BlockHeight) -> Result<TreeStateArtifact, IndexerError>;
-
-    /// Reads one tree-state artifact from a requested chain epoch.
-    async fn tree_state_at_epoch(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads the tree-state artifact at the visible tip.
-    async fn latest_tree_state(&self) -> Result<TreeStateArtifact, IndexerError>;
-
-    /// Reads the tree-state artifact at a requested chain epoch's tip.
-    async fn latest_tree_state_at_epoch(
+    async fn latest_tree_state(
         &self,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads subtree roots for a bounded range.
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
-    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError>;
-
-    /// Reads subtree roots for a bounded range from a requested chain epoch.
-    async fn subtree_roots_in_range_at_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError>;
 
     /// Looks up a transaction by id.
+    ///
+    /// `None` for `at_epoch` consults the live mempool when the canonical
+    /// chain has no record. `Some(epoch)` pins the read to that epoch and
+    /// never consults mempool state.
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<TxStatus, IndexerError>;
-
-    /// Looks up a transaction by id from a requested chain epoch.
-    async fn transaction_by_id_at_epoch(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TxStatus, IndexerError>;
 
     /// Broadcasts raw transaction bytes without mutating canonical storage.
@@ -474,34 +443,21 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn transparent_address_utxos(
         &self,
         query: TransparentAddressUtxosQuery,
-    ) -> Result<TransparentAddressUtxosView, IndexerError>;
-
-    /// Reads a bounded page of unspent transparent outputs from a requested
-    /// chain epoch.
-    async fn transparent_address_utxos_at_epoch(
-        &self,
-        query: TransparentAddressUtxosQuery,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxosView, IndexerError>;
 
     /// Streams unspent transparent outputs for one transparent address.
     async fn transparent_address_utxos_stream(
         &self,
         query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxoStream, IndexerError>;
 
     /// Streams transparent-address tx-history index entries.
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError>;
-
-    /// Streams transparent-address tx-history index entries from a
-    /// requested chain epoch.
-    async fn transparent_address_tx_ids_in_range_at_epoch(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError>;
 
     /// Returns transparent mempool outputs tied to one address.

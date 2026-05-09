@@ -7,13 +7,15 @@ use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact, Network, RawTransactionBytes,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TreeStateArtifact,
+    TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
+use zinder_source::{block_header_info_from_raw_block_bytes, consensus_branch_id_at};
 use zinder_store::{
-    ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
+    BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
     TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
 };
 
@@ -22,7 +24,6 @@ use crate::{
     RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
     TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
-    TxStatus,
 };
 
 /// Options for opening a local chain index over a `RocksDB` secondary.
@@ -98,19 +99,7 @@ impl LocalChainIndex {
         })
     }
 
-    async fn read_from_current<Output>(
-        &self,
-        read: impl FnOnce(&zinder_store::ChainEpochReader<'_>) -> Result<Output, IndexerError>
-        + Send
-        + 'static,
-    ) -> Result<Output, IndexerError>
-    where
-        Output: Send + 'static,
-    {
-        self.read_from_epoch(None, read).await
-    }
-
-    async fn read_from_epoch<Output>(
+    async fn read_at_epoch<Output>(
         &self,
         at_epoch: Option<ChainEpoch>,
         read: impl FnOnce(&zinder_store::ChainEpochReader<'_>) -> Result<Output, IndexerError>
@@ -166,12 +155,12 @@ impl ChainIndex for LocalChainIndex {
     }
 
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
-        self.read_from_current(|reader| Ok(reader.chain_epoch()))
+        self.read_at_epoch(None, |reader| Ok(reader.chain_epoch()))
             .await
     }
 
-    async fn latest_block(&self) -> Result<BlockId, IndexerError> {
-        self.read_from_current(|reader| {
+    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError> {
+        self.read_at_epoch(at_epoch, |reader| {
             let chain_epoch = reader.chain_epoch();
             Ok(BlockId {
                 height: chain_epoch.tip_height,
@@ -181,13 +170,31 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
-    async fn latest_block_at_epoch(&self, at_epoch: ChainEpoch) -> Result<BlockId, IndexerError> {
-        self.read_from_epoch(Some(at_epoch), |reader| {
-            let chain_epoch = reader.chain_epoch();
-            Ok(BlockId {
-                height: chain_epoch.tip_height,
-                hash: chain_epoch.tip_hash,
-            })
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError> {
+        self.read_at_epoch(at_epoch, move |reader| resolve_block_id(reader, selector))
+            .await
+    }
+
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockHeaderInfo, IndexerError> {
+        self.read_at_epoch(at_epoch, move |reader| {
+            let block_id = resolve_block_id(reader, selector)?;
+            let block = reader
+                .block_at(block_id.height)
+                .map_err(IndexerError::from_store_error)?
+                .ok_or(IndexerError::NotFound { resource: "block" })?;
+            block_header_info_from_raw_block_bytes(block_id.height, &block.payload_bytes).map_err(
+                |error| IndexerError::DataLoss {
+                    reason: error.to_string(),
+                },
+            )
         })
         .await
     }
@@ -195,24 +202,9 @@ impl ChainIndex for LocalChainIndex {
     async fn compact_block_at(
         &self,
         height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
-        self.read_from_current(move |reader| {
-            reader
-                .compact_block_at(height)
-                .map_err(IndexerError::from_store_error)?
-                .ok_or(IndexerError::NotFound {
-                    resource: "compact block",
-                })
-        })
-        .await
-    }
-
-    async fn compact_block_at_epoch(
-        &self,
-        height: BlockHeight,
-        at_epoch: ChainEpoch,
-    ) -> Result<CompactBlockArtifact, IndexerError> {
-        self.read_from_epoch(Some(at_epoch), move |reader| {
+        self.read_at_epoch(at_epoch, move |reader| {
             reader
                 .compact_block_at(height)
                 .map_err(IndexerError::from_store_error)?
@@ -226,38 +218,45 @@ impl ChainIndex for LocalChainIndex {
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        self.compact_blocks_in_range_from_epoch(block_range, None)
-            .await
+        if block_range.start > block_range.end {
+            return Err(IndexerError::invalid_request(
+                "start height exceeds end height",
+            ));
+        }
+
+        let compact_blocks = self
+            .read_at_epoch(at_epoch, move |reader| {
+                let maybe_blocks = reader
+                    .compact_blocks_in_range(block_range)
+                    .map_err(IndexerError::from_store_error)?;
+                let mut compact_blocks = Vec::with_capacity(maybe_blocks.len());
+                for (height, maybe_block) in block_range.into_iter().zip(maybe_blocks) {
+                    let compact_block = maybe_block.ok_or(IndexerError::NotFound {
+                        resource: "compact block",
+                    })?;
+                    if compact_block.height != height {
+                        return Err(IndexerError::malformed(
+                            "compact_block.height",
+                            "height does not match requested range",
+                        ));
+                    }
+                    compact_blocks.push(compact_block);
+                }
+                Ok(compact_blocks)
+            })
+            .await?;
+
+        Ok(Box::pin(stream::iter(compact_blocks.into_iter().map(Ok))))
     }
 
-    async fn compact_blocks_in_range_at_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: ChainEpoch,
-    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        self.compact_blocks_in_range_from_epoch(block_range, Some(at_epoch))
-            .await
-    }
-
-    async fn tree_state_at(&self, height: BlockHeight) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_from_current(move |reader| {
-            reader
-                .tree_state_at(height)
-                .map_err(IndexerError::from_store_error)?
-                .ok_or(IndexerError::NotFound {
-                    resource: "tree state",
-                })
-        })
-        .await
-    }
-
-    async fn tree_state_at_epoch(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_from_epoch(Some(at_epoch), move |reader| {
+        self.read_at_epoch(at_epoch, move |reader| {
             reader
                 .tree_state_at(height)
                 .map_err(IndexerError::from_store_error)?
@@ -268,23 +267,11 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
-    async fn latest_tree_state(&self) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_from_current(|reader| {
-            reader
-                .latest_tree_state()
-                .map_err(IndexerError::from_store_error)?
-                .ok_or(IndexerError::NotFound {
-                    resource: "tree state",
-                })
-        })
-        .await
-    }
-
-    async fn latest_tree_state_at_epoch(
+    async fn latest_tree_state(
         &self,
-        at_epoch: ChainEpoch,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_from_epoch(Some(at_epoch), |reader| {
+        self.read_at_epoch(at_epoch, |reader| {
             reader
                 .latest_tree_state()
                 .map_err(IndexerError::from_store_error)?
@@ -298,35 +285,78 @@ impl ChainIndex for LocalChainIndex {
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.subtree_roots_in_range_from_epoch(subtree_root_range, None)
-            .await
-    }
-
-    async fn subtree_roots_in_range_at_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch: ChainEpoch,
-    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.subtree_roots_in_range_from_epoch(subtree_root_range, Some(at_epoch))
-            .await
+        self.read_at_epoch(at_epoch, move |reader| {
+            let maybe_roots = reader
+                .subtree_roots(subtree_root_range)
+                .map_err(IndexerError::from_store_error)?;
+            let mut subtree_roots = Vec::with_capacity(maybe_roots.len());
+            for maybe_root in maybe_roots {
+                subtree_roots.push(maybe_root.ok_or(IndexerError::NotFound {
+                    resource: "subtree root",
+                })?);
+            }
+            Ok(subtree_roots)
+        })
+        .await
     }
 
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TxStatus, IndexerError> {
-        self.transaction_by_id_from_epoch(transaction_id, None)
-            .await
-    }
+        let mined_outcome = self
+            .read_at_epoch(at_epoch, move |reader| {
+                let Some(artifact) = reader
+                    .transaction_by_id(transaction_id)
+                    .map_err(IndexerError::from_store_error)?
+                else {
+                    return Ok(TxStatus::NotFound);
+                };
+                let chain_epoch = reader.chain_epoch();
+                let block_time = reader
+                    .block_at(artifact.block_height)
+                    .map_err(IndexerError::from_store_error)?
+                    .and_then(|block| {
+                        block_header_info_from_raw_block_bytes(
+                            artifact.block_height,
+                            &block.payload_bytes,
+                        )
+                        .ok()
+                        .map(|header| header.block_time)
+                    })
+                    .unwrap_or_default();
+                let consensus_branch_id =
+                    consensus_branch_id_at(chain_epoch.network, artifact.block_height);
+                let details = MinedDetails::from_response_epoch(
+                    &chain_epoch,
+                    artifact.block_height,
+                    consensus_branch_id,
+                    block_time,
+                );
+                Ok(TxStatus::Mined(MinedTransaction::new(artifact, details)))
+            })
+            .await?;
 
-    async fn transaction_by_id_at_epoch(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch: ChainEpoch,
-    ) -> Result<TxStatus, IndexerError> {
-        self.transaction_by_id_from_epoch(transaction_id, Some(at_epoch))
-            .await
+        if !matches!(mined_outcome, TxStatus::NotFound) || at_epoch.is_some() {
+            // Found mined, OR caller bound the read to a specific epoch
+            // (mempool state is non-canonical and is not part of any
+            // chain epoch). Either way, return the canonical answer.
+            return Ok(mined_outcome);
+        }
+
+        // Canonical chain has no record. Delegate to the remote endpoint
+        // to consult the live mempool index. Local secondary readers
+        // cannot observe the writer's in-process mempool state, so this
+        // path is skipped (NotFound is returned) when no remote endpoint
+        // is wired.
+        match self.remote("transaction_by_id_mempool_fallback") {
+            Ok(remote) => remote.transaction_by_id(transaction_id, None).await,
+            Err(IndexerError::RemoteEndpointUnconfigured { .. }) => Ok(TxStatus::NotFound),
+            Err(error) => Err(error),
+        }
     }
 
     async fn broadcast_transaction(
@@ -375,43 +405,97 @@ impl ChainIndex for LocalChainIndex {
     async fn transparent_address_utxos(
         &self,
         query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        self.transparent_address_utxos_from_epoch(query, None).await
-    }
-
-    async fn transparent_address_utxos_at_epoch(
-        &self,
-        query: TransparentAddressUtxosQuery,
-        at_epoch: ChainEpoch,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        self.transparent_address_utxos_from_epoch(query, Some(at_epoch))
-            .await
+        let max_entries = query
+            .max_entries
+            .unwrap_or(DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS);
+        let store = self.store.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let cursor_token = query.from_cursor.map(|cursor| {
+                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
+            });
+            let page = store
+                .transparent_address_utxos_page(TransparentAddressUtxosPageRequest {
+                    at_epoch,
+                    address_script_hash: query.address_script_hash,
+                    start_height: query.start_height,
+                    max_entries,
+                    from_cursor: cursor_token.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)?;
+            Ok(TransparentAddressUtxosView {
+                chain_epoch: page.chain_epoch,
+                utxos: page.utxos,
+                next_cursor: page.next_cursor.map(|cursor| {
+                    crate::TransparentUtxoCursor::from_bytes(cursor.as_bytes().to_vec())
+                }),
+            })
+        }))
+        .await
     }
 
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        self.transparent_address_tx_ids_in_range_from_epoch(query, None)
-            .await
-    }
-
-    async fn transparent_address_tx_ids_in_range_at_epoch(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-        at_epoch: ChainEpoch,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        self.transparent_address_tx_ids_in_range_from_epoch(query, Some(at_epoch))
-            .await
+        let max_entries = query
+            .max_entries
+            .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
+        let store = self.store.clone();
+        let page = join_blocking(tokio::task::spawn_blocking(move || {
+            store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let cursor_token = query.from_cursor.map(|cursor| {
+                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
+            });
+            store
+                .transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
+                    at_epoch,
+                    address_script_hash: query.address_script_hash,
+                    start_height: query.start_height,
+                    end_height: query.end_height,
+                    max_entries,
+                    descending: query.descending,
+                    from_cursor: cursor_token.as_ref(),
+                })
+                .map_err(map_transparent_utxo_store_error)
+        }))
+        .await?;
+        let chain_epoch = page.chain_epoch;
+        let next_cursor = page
+            .next_cursor
+            .map(|cursor| crate::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec()));
+        let last_index = page.artifacts.len().saturating_sub(1);
+        let items = page
+            .artifacts
+            .into_iter()
+            .enumerate()
+            .map(move |(index, artifact)| {
+                Ok(TransparentAddressTxIdsStreamItem {
+                    chain_epoch,
+                    artifact,
+                    cursor: if index == last_index {
+                        next_cursor.clone()
+                    } else {
+                        None
+                    },
+                })
+            });
+        Ok(Box::pin(stream::iter(items)))
     }
 
     async fn transparent_address_utxos_stream(
         &self,
         query: TransparentAddressUtxosQuery,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxoStream, IndexerError> {
-        let view = self
-            .transparent_address_utxos_from_epoch(query, None)
-            .await?;
+        let view = self.transparent_address_utxos(query, at_epoch).await?;
         let chain_epoch = view.chain_epoch;
         let next_cursor = view.next_cursor;
         let last_index = view.utxos.len().saturating_sub(1);
@@ -453,190 +537,6 @@ impl ChainIndex for LocalChainIndex {
 
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
-    }
-}
-
-impl LocalChainIndex {
-    async fn compact_blocks_in_range_from_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
-        if block_range.start > block_range.end {
-            return Err(IndexerError::invalid_request(
-                "start height exceeds end height",
-            ));
-        }
-
-        let compact_blocks = self
-            .read_from_epoch(at_epoch, move |reader| {
-                let maybe_blocks = reader
-                    .compact_blocks_in_range(block_range)
-                    .map_err(IndexerError::from_store_error)?;
-                let mut compact_blocks = Vec::with_capacity(maybe_blocks.len());
-                for (height, maybe_block) in block_range.into_iter().zip(maybe_blocks) {
-                    let compact_block = maybe_block.ok_or(IndexerError::NotFound {
-                        resource: "compact block",
-                    })?;
-                    if compact_block.height != height {
-                        return Err(IndexerError::malformed(
-                            "compact_block.height",
-                            "height does not match requested range",
-                        ));
-                    }
-                    compact_blocks.push(compact_block);
-                }
-                Ok(compact_blocks)
-            })
-            .await?;
-
-        Ok(Box::pin(stream::iter(compact_blocks.into_iter().map(Ok))))
-    }
-
-    async fn subtree_roots_in_range_from_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.read_from_epoch(at_epoch, move |reader| {
-            let maybe_roots = reader
-                .subtree_roots(subtree_root_range)
-                .map_err(IndexerError::from_store_error)?;
-            let mut subtree_roots = Vec::with_capacity(maybe_roots.len());
-            for maybe_root in maybe_roots {
-                subtree_roots.push(maybe_root.ok_or(IndexerError::NotFound {
-                    resource: "subtree root",
-                })?);
-            }
-            Ok(subtree_roots)
-        })
-        .await
-    }
-
-    async fn transparent_address_tx_ids_in_range_from_epoch(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        let max_entries = query
-            .max_entries
-            .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
-        let store = self.store.clone();
-        let descending = query.descending;
-        let page = join_blocking(tokio::task::spawn_blocking(move || {
-            store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
-            let cursor_token = query.from_cursor.map(|cursor| {
-                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
-            });
-            store
-                .transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
-                    at_epoch,
-                    address_script_hash: query.address_script_hash,
-                    start_height: query.start_height,
-                    end_height: query.end_height,
-                    max_entries,
-                    descending: query.descending,
-                    from_cursor: cursor_token.as_ref(),
-                })
-                .map_err(map_transparent_utxo_store_error)
-        }))
-        .await?;
-        let chain_epoch = page.chain_epoch;
-        let next_cursor = page
-            .next_cursor
-            .map(|cursor| crate::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec()));
-        let last_index = page.artifacts.len().saturating_sub(1);
-        let _ = descending;
-        let items = page
-            .artifacts
-            .into_iter()
-            .enumerate()
-            .map(move |(index, artifact)| {
-                Ok(TransparentAddressTxIdsStreamItem {
-                    chain_epoch,
-                    artifact,
-                    cursor: if index == last_index {
-                        next_cursor.clone()
-                    } else {
-                        None
-                    },
-                })
-            });
-        Ok(Box::pin(stream::iter(items)))
-    }
-
-    async fn transparent_address_utxos_from_epoch(
-        &self,
-        query: TransparentAddressUtxosQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        let max_entries = query
-            .max_entries
-            .unwrap_or(DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS);
-        let store = self.store.clone();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
-            let cursor_token = query.from_cursor.map(|cursor| {
-                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
-            });
-            let page = store
-                .transparent_address_utxos_page(TransparentAddressUtxosPageRequest {
-                    at_epoch,
-                    address_script_hash: query.address_script_hash,
-                    start_height: query.start_height,
-                    max_entries,
-                    from_cursor: cursor_token.as_ref(),
-                })
-                .map_err(map_transparent_utxo_store_error)?;
-            Ok(TransparentAddressUtxosView {
-                chain_epoch: page.chain_epoch,
-                utxos: page.utxos,
-                next_cursor: page.next_cursor.map(|cursor| {
-                    crate::TransparentUtxoCursor::from_bytes(cursor.as_bytes().to_vec())
-                }),
-            })
-        }))
-        .await
-    }
-
-    async fn transaction_by_id_from_epoch(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TxStatus, IndexerError> {
-        let mined_outcome = self
-            .read_from_epoch(at_epoch, move |reader| {
-                let Some(transaction) = reader
-                    .transaction_by_id(transaction_id)
-                    .map_err(IndexerError::from_store_error)?
-                else {
-                    return Ok(TxStatus::NotFound);
-                };
-                Ok(TxStatus::Mined(transaction))
-            })
-            .await?;
-
-        if !matches!(mined_outcome, TxStatus::NotFound) || at_epoch.is_some() {
-            // Found mined, OR caller bound the read to a specific epoch
-            // (mempool state is non-canonical and is not part of any
-            // chain epoch). Either way, return the canonical answer.
-            return Ok(mined_outcome);
-        }
-
-        // Canonical chain has no record. Delegate to the remote endpoint
-        // to consult the live mempool index. Local secondary readers
-        // cannot observe the writer's in-process mempool state, so this
-        // path is skipped (NotFound is returned) when no remote endpoint
-        // is wired.
-        match self.remote("transaction_by_id_mempool_fallback") {
-            Ok(remote) => remote.transaction_by_id(transaction_id).await,
-            Err(IndexerError::RemoteEndpointUnconfigured { .. }) => Ok(TxStatus::NotFound),
-            Err(error) => Err(error),
-        }
     }
 }
 
@@ -693,6 +593,43 @@ async fn join_blocking<Output>(
         Ok(blocking_outcome) => blocking_outcome,
         Err(error) => Err(IndexerError::BlockingTaskFailed {
             reason: error.to_string(),
+        }),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BlockSelector is #[non_exhaustive]; adding new selector variants is a separate decision per the gap doc, not a default fall-through"
+)]
+fn resolve_block_id(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    selector: BlockSelector,
+) -> Result<BlockId, IndexerError> {
+    match selector {
+        BlockSelector::Height(height) => {
+            let chain_epoch = reader.chain_epoch();
+            if height > chain_epoch.tip_height {
+                return Err(IndexerError::NotFound { resource: "block" });
+            }
+            let block = reader
+                .block_at(height)
+                .map_err(IndexerError::from_store_error)?
+                .ok_or(IndexerError::NotFound { resource: "block" })?;
+            Ok(BlockId::new(height, block.block_hash))
+        }
+        BlockSelector::Hash(hash) => {
+            match reader
+                .block_hash_lookup(hash)
+                .map_err(IndexerError::from_store_error)?
+            {
+                BlockHashLookup::Resolved(block_id) => Ok(block_id),
+                BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                    Err(IndexerError::NotFound { resource: "block" })
+                }
+            }
+        }
+        _ => Err(IndexerError::InvalidRequest {
+            reason: "unsupported block selector variant".to_owned(),
         }),
     }
 }

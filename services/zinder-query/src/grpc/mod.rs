@@ -11,7 +11,8 @@ use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    ServerInfoSettings, address_lookup_to_script_hash, broadcast_transaction_response,
+    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
     build_server_capabilities_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
     latest_block_response, latest_tree_state_response, subtree_roots_response,
@@ -60,8 +61,13 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
                 "artifact is not available in the selected chain epoch",
             ),
         ),
-        QueryError::CompactBlockPayloadMalformed { .. } => Status::data_loss(message),
+        QueryError::CompactBlockPayloadMalformed { .. } | QueryError::ArtifactCorrupt { .. } => {
+            Status::data_loss(message)
+        }
+        QueryError::BlockNotInBestChain => Status::not_found(message),
         QueryError::UnsupportedChainEvent { .. }
+        | QueryError::UnsupportedBlockSelector { .. }
+        | QueryError::UnsupportedTransactionStatus { .. }
         | QueryError::BlockingTaskFailed { .. }
         | QueryError::Node(_) => Status::unavailable(message),
         QueryError::Store(error) => status_from_store_error(error),

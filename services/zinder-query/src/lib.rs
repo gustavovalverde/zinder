@@ -8,16 +8,21 @@ use std::{num::NonZeroU32, time::Instant};
 use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
+    TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TxStatus,
 };
-use zinder_source::{SourceError, TransactionBroadcaster};
+use zinder_source::{
+    SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes,
+    consensus_branch_id_at,
+};
 use zinder_store::{
-    ArtifactFamily, ChainEpochReadApi, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, StoreError,
-    StreamCursorTokenV1, TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
+    ArtifactFamily, BlockHashLookup, ChainEpochReadApi, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
+    StoreError, StreamCursorTokenV1, TransparentAddressTxIndexPageRequest,
+    TransparentAddressUtxosPageRequest,
 };
 
 mod grpc;
@@ -25,6 +30,7 @@ mod readiness_refresh;
 
 pub use grpc::{
     ServerInfoSettings, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
+    block_header_by_selector_response, block_id_by_selector_response,
     broadcast_transaction_response, build_server_capabilities_message,
     build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
     chain_events_response, compact_block_response, latest_block_response,
@@ -38,73 +44,59 @@ pub use readiness_refresh::{
 };
 
 /// Wallet-facing read API backed by epoch-bound canonical reads.
+///
+/// Every read that depends on chain state takes `at_epoch: Option<ChainEpoch>`.
+/// `None` resolves to the visible chain epoch at call time; `Some(epoch)` pins
+/// the read to that epoch. Implementations that cannot honor a pinned epoch
+/// return [`QueryError::ChainEpochPinUnsupported`].
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads latest visible block metadata.
-    async fn latest_block(&self) -> Result<LatestBlock, QueryError>;
+    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<LatestBlock, QueryError>;
 
-    /// Reads latest block metadata from a requested chain epoch.
-    async fn latest_block_at_epoch(
+    /// Resolves a typed block selector against the canonical best chain.
+    async fn block_id_by_selector(
         &self,
+        selector: BlockSelector,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<LatestBlock, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.latest_block().await
-    }
+    ) -> Result<BlockIdResponseValue, QueryError>;
+
+    /// Reads the typed block-header read model at a typed block selector.
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockHeaderResponseValue, QueryError>;
 
     /// Reads one compact block artifact at a given height.
-    async fn compact_block_at(&self, height: BlockHeight) -> Result<CompactBlock, QueryError>;
-
-    /// Reads one compact block artifact from a requested chain epoch.
-    async fn compact_block_at_epoch(
+    async fn compact_block_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<CompactBlock, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.compact_block_at(height).await
-    }
+    ) -> Result<CompactBlock, QueryError>;
 
     /// Reads compact block artifacts for an inclusive height range.
     async fn compact_block_range(
         &self,
         block_range: BlockHeightRange,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockRange, QueryError>;
 
-    /// Reads compact block artifacts for an inclusive height range from a
-    /// requested chain epoch.
-    async fn compact_block_range_at_epoch(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<CompactBlockRange, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.compact_block_range(block_range).await
-    }
-
-    /// Reads one indexed transaction by transaction id.
-    async fn transaction(&self, transaction_id: TransactionId) -> Result<Transaction, QueryError>;
-
-    /// Reads one indexed transaction by transaction id from a requested chain epoch.
-    async fn transaction_at_epoch(
+    /// Reads typed transaction status by transaction id.
+    ///
+    /// Returns [`TxStatus::Mined`] for mined transactions, with epoch-bound
+    /// [`MinedDetails`] enrichment, [`TxStatus::NotFound`] when the
+    /// transaction is not visible in the canonical chain, and
+    /// [`QueryError`] for storage/upstream failures. An `at_epoch` pin is
+    /// a canonical-chain read and never consults live mempool state;
+    /// mempool fall-through is the caller's responsibility on this trait.
+    async fn transaction(
         &self,
         transaction_id: TransactionId,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<Transaction, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.transaction(transaction_id).await
-    }
+    ) -> Result<TransactionStatus, QueryError>;
 
-    /// Reads the indexed transaction at `(height, tx_index)` within the
-    /// visible chain epoch.
+    /// Reads the indexed transaction at `(height, tx_index)`.
     ///
     /// `tx_index` is the transaction's position within the full block, as
     /// produced by ingestion. The lookup decodes the indexed compact block
@@ -113,107 +105,43 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         height: BlockHeight,
         tx_index: u64,
-    ) -> Result<Transaction, QueryError>;
-
-    /// Reads an indexed transaction at `(height, tx_index)` from a requested
-    /// chain epoch.
-    async fn transaction_at_block_index_at_epoch(
-        &self,
-        height: BlockHeight,
-        tx_index: u64,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<Transaction, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.transaction_at_block_index(height, tx_index).await
-    }
+    ) -> Result<Transaction, QueryError>;
 
     /// Reads unspent transparent outputs for one transparent address script.
     async fn transparent_address_utxos(
         &self,
         request: TransparentAddressUtxosRequest,
-    ) -> Result<TransparentAddressUtxos, QueryError>;
-
-    /// Reads unspent transparent outputs from a requested chain epoch.
-    async fn transparent_address_utxos_at_epoch(
-        &self,
-        request: TransparentAddressUtxosRequest,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxos, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.transparent_address_utxos(request).await
-    }
+    ) -> Result<TransparentAddressUtxos, QueryError>;
 
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts.
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIds, QueryError>;
 
-    /// Reads a bounded page of transparent-address tx-history index
-    /// artifacts from a requested chain epoch.
-    async fn transparent_address_tx_ids_in_range_at_epoch(
-        &self,
-        request: TransparentAddressTxIdsInRangeRequest,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressTxIds, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.transparent_address_tx_ids_in_range(request).await
-    }
-
     /// Reads the tree-state artifact at a block height.
-    async fn tree_state_at(&self, height: BlockHeight) -> Result<TreeState, QueryError>;
-
-    /// Reads the tree-state artifact at a block height from a requested chain epoch.
-    async fn tree_state_at_epoch(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TreeState, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.tree_state_at(height).await
-    }
+    ) -> Result<TreeState, QueryError>;
 
-    /// Reads the latest tree-state artifact at the current chain epoch tip.
-    async fn latest_tree_state(&self) -> Result<TreeState, QueryError>;
-
-    /// Reads the latest tree-state artifact at a requested chain epoch tip.
-    async fn latest_tree_state_at_epoch(
+    /// Reads the latest tree-state artifact at the visible chain epoch tip.
+    async fn latest_tree_state(
         &self,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TreeState, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.latest_tree_state().await
-    }
+    ) -> Result<TreeState, QueryError>;
 
     /// Reads subtree-root artifacts for a bounded subtree range.
     async fn subtree_roots(
         &self,
         subtree_root_range: SubtreeRootRange,
-    ) -> Result<SubtreeRoots, QueryError>;
-
-    /// Reads subtree-root artifacts for a bounded subtree range from a
-    /// requested chain epoch.
-    async fn subtree_roots_at_epoch(
-        &self,
-        subtree_root_range: SubtreeRootRange,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<SubtreeRoots, QueryError> {
-        if at_epoch.is_some() {
-            return Err(QueryError::ChainEpochPinUnsupported);
-        }
-        self.subtree_roots(subtree_root_range).await
-    }
+    ) -> Result<SubtreeRoots, QueryError>;
 
     /// Reads a bounded page of replayable chain events.
     async fn chain_events(
@@ -289,14 +217,7 @@ where
     ReadApi: ChainEpochReadApi + Clone + Send + Sync + 'static,
     Broadcaster: TransactionBroadcaster + Clone,
 {
-    async fn latest_block(&self) -> Result<LatestBlock, QueryError> {
-        self.latest_block_at_epoch(None).await
-    }
-
-    async fn latest_block_at_epoch(
-        &self,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<LatestBlock, QueryError> {
+    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<LatestBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
@@ -313,11 +234,58 @@ where
         query_outcome
     }
 
-    async fn compact_block_at(&self, height: BlockHeight) -> Result<CompactBlock, QueryError> {
-        self.compact_block_at_epoch(height, None).await
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockIdResponseValue, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let chain_epoch = reader.chain_epoch();
+            let block_id = resolve_block_selector(&reader, selector)?;
+            Ok(BlockIdResponseValue {
+                chain_epoch,
+                block_id,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome("block_id_by_selector", started_at, &query_outcome, None);
+        query_outcome
     }
 
-    async fn compact_block_at_epoch(
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockHeaderResponseValue, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let chain_epoch = reader.chain_epoch();
+            let block_id = resolve_block_selector(&reader, selector)?;
+            let block = reader.block_at(block_id.height)?.ok_or_else(|| {
+                block_height_artifact_unavailable(ArtifactFamily::FinalizedBlock, block_id.height)
+            })?;
+            let block_header =
+                block_header_info_from_raw_block_bytes(block_id.height, &block.payload_bytes)
+                    .map_err(|error| QueryError::ArtifactCorrupt {
+                        family: ArtifactFamily::FinalizedBlock,
+                        reason: error.to_string(),
+                    })?;
+            Ok(BlockHeaderResponseValue {
+                chain_epoch,
+                block_header,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome("block_header_by_selector", started_at, &query_outcome, None);
+        query_outcome
+    }
+
+    async fn compact_block_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
@@ -352,30 +320,44 @@ where
         query_outcome
     }
 
-    async fn transaction(&self, transaction_id: TransactionId) -> Result<Transaction, QueryError> {
-        self.transaction_at_epoch(transaction_id, None).await
-    }
-
-    async fn transaction_at_epoch(
+    async fn transaction(
         &self,
         transaction_id: TransactionId,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<Transaction, QueryError> {
+    ) -> Result<TransactionStatus, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
-            let transaction = reader.transaction_by_id(transaction_id)?.ok_or_else(|| {
-                artifact_unavailable(
-                    ArtifactFamily::Transaction,
-                    ArtifactKey::TransactionId(transaction_id),
-                )
-            })?;
-
-            Ok(Transaction {
+            let Some(artifact) = reader.transaction_by_id(transaction_id)? else {
+                return Ok(TransactionStatus {
+                    chain_epoch,
+                    status: TxStatus::NotFound,
+                });
+            };
+            let block_time = reader
+                .block_at(artifact.block_height)?
+                .and_then(|block| {
+                    block_header_info_from_raw_block_bytes(
+                        artifact.block_height,
+                        &block.payload_bytes,
+                    )
+                    .ok()
+                    .map(|header| header.block_time)
+                })
+                .unwrap_or_default();
+            let consensus_branch_id =
+                consensus_branch_id_at(chain_epoch.network, artifact.block_height);
+            let details = MinedDetails::from_response_epoch(
+                &chain_epoch,
+                artifact.block_height,
+                consensus_branch_id,
+                block_time,
+            );
+            Ok(TransactionStatus {
                 chain_epoch,
-                transaction,
+                status: TxStatus::Mined(MinedTransaction::new(artifact, details)),
             })
         }))
         .await;
@@ -384,15 +366,6 @@ where
     }
 
     async fn transaction_at_block_index(
-        &self,
-        height: BlockHeight,
-        tx_index: u64,
-    ) -> Result<Transaction, QueryError> {
-        self.transaction_at_block_index_at_epoch(height, tx_index, None)
-            .await
-    }
-
-    async fn transaction_at_block_index_at_epoch(
         &self,
         height: BlockHeight,
         tx_index: u64,
@@ -447,13 +420,6 @@ where
     async fn compact_block_range(
         &self,
         block_range: BlockHeightRange,
-    ) -> Result<CompactBlockRange, QueryError> {
-        self.compact_block_range_at_epoch(block_range, None).await
-    }
-
-    async fn compact_block_range_at_epoch(
-        &self,
-        block_range: BlockHeightRange,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockRange, QueryError> {
         let started_at = Instant::now();
@@ -506,13 +472,6 @@ where
     async fn transparent_address_utxos(
         &self,
         request: TransparentAddressUtxosRequest,
-    ) -> Result<TransparentAddressUtxos, QueryError> {
-        self.transparent_address_utxos_at_epoch(request, None).await
-    }
-
-    async fn transparent_address_utxos_at_epoch(
-        &self,
-        request: TransparentAddressUtxosRequest,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressUtxos, QueryError> {
         let started_at = Instant::now();
@@ -545,14 +504,6 @@ where
     }
 
     async fn transparent_address_tx_ids_in_range(
-        &self,
-        request: TransparentAddressTxIdsInRangeRequest,
-    ) -> Result<TransparentAddressTxIds, QueryError> {
-        self.transparent_address_tx_ids_in_range_at_epoch(request, None)
-            .await
-    }
-
-    async fn transparent_address_tx_ids_in_range_at_epoch(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
         at_epoch: Option<ChainEpoch>,
@@ -602,11 +553,7 @@ where
         query_outcome
     }
 
-    async fn tree_state_at(&self, height: BlockHeight) -> Result<TreeState, QueryError> {
-        self.tree_state_at_epoch(height, None).await
-    }
-
-    async fn tree_state_at_epoch(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
@@ -644,11 +591,7 @@ where
         query_outcome
     }
 
-    async fn latest_tree_state(&self) -> Result<TreeState, QueryError> {
-        self.latest_tree_state_at_epoch(None).await
-    }
-
-    async fn latest_tree_state_at_epoch(
+    async fn latest_tree_state(
         &self,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeState, QueryError> {
@@ -686,13 +629,6 @@ where
     }
 
     async fn subtree_roots(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-    ) -> Result<SubtreeRoots, QueryError> {
-        self.subtree_roots_at_epoch(subtree_root_range, None).await
-    }
-
-    async fn subtree_roots_at_epoch(
         &self,
         subtree_root_range: SubtreeRootRange,
         at_epoch: Option<ChainEpoch>,
@@ -947,8 +883,12 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
         Some(QueryError::ChainEpochPinMismatch { .. }) => "chain_epoch_pin_mismatch",
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
+        Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
+        Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
+        Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
+        Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
         Some(QueryError::Node(_)) => "node",
     }
@@ -967,6 +907,24 @@ pub struct LatestBlock {
     pub height: BlockHeight,
     /// Latest visible block hash.
     pub block_hash: zinder_core::BlockHash,
+}
+
+/// Block-identity resolver response bound to one chain epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockIdResponseValue {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Resolved block identity in the canonical best chain.
+    pub block_id: BlockId,
+}
+
+/// Block-header read response bound to one chain epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockHeaderResponseValue {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Block-header read-model value at the resolved selector.
+    pub block_header: BlockHeaderInfo,
 }
 
 /// Single compact block response bound to one chain epoch.
@@ -989,13 +947,29 @@ pub struct CompactBlockRange {
     pub compact_blocks: Vec<CompactBlockArtifact>,
 }
 
-/// Single transaction response bound to one chain epoch.
+/// Single mined-transaction response bound to one chain epoch. Used by
+/// [`WalletQueryApi::transaction_at_block_index`], which only resolves
+/// mined transactions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
     /// Transaction artifact at the requested transaction id.
     pub transaction: TransactionArtifact,
+}
+
+/// Typed transaction-status response bound to one chain epoch.
+///
+/// Returned by [`WalletQueryApi::transaction`]. Carries the typed
+/// [`TxStatus`] (`Mined`/`InMempool`/`ConflictingChain`/`NotFound`) and
+/// the epoch used to answer the read; the wire-side adapter maps
+/// `TxStatus::NotFound` to gRPC `NOT_FOUND`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionStatus {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Typed transaction status.
+    pub status: TxStatus,
 }
 
 /// Transparent address UTXO request.
@@ -1174,6 +1148,19 @@ pub enum QueryError {
         reason: String,
     },
 
+    /// Stored artifact bytes failed Zcash protocol decoding at request time.
+    #[error("{family:?} artifact is corrupt: {reason}")]
+    ArtifactCorrupt {
+        /// Artifact family that failed to decode.
+        family: ArtifactFamily,
+        /// Decoder failure reason.
+        reason: String,
+    },
+
+    /// Block selector resolved to no visible block in the canonical best chain.
+    #[error("block selector resolved to no visible block in the canonical best chain")]
+    BlockNotInBestChain,
+
     /// Shielded protocol cannot be represented on the native wallet protocol.
     #[error("{protocol:?} is not supported by the native wallet protocol")]
     UnsupportedShieldedProtocol {
@@ -1247,6 +1234,20 @@ pub enum QueryError {
         event: &'static str,
     },
 
+    /// Block selector variant cannot be resolved by this query implementation.
+    #[error("unsupported block selector: {reason}")]
+    UnsupportedBlockSelector {
+        /// Stable diagnostic reason.
+        reason: &'static str,
+    },
+
+    /// Typed transaction status cannot be encoded on the native wire protocol.
+    #[error("unsupported transaction status: {reason}")]
+    UnsupportedTransactionStatus {
+        /// Stable diagnostic reason.
+        reason: &'static str,
+    },
+
     /// Transaction broadcast is disabled for this query handle.
     #[error("transaction broadcast is disabled")]
     TransactionBroadcastDisabled,
@@ -1269,6 +1270,37 @@ pub enum QueryError {
 
 fn block_height_artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryError {
     artifact_unavailable(family, ArtifactKey::BlockHeight(height))
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BlockSelector is #[non_exhaustive]; new selector variants are a deliberate decision per the gap doc, not a default fall-through"
+)]
+fn resolve_block_selector(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    selector: BlockSelector,
+) -> Result<BlockId, QueryError> {
+    match selector {
+        BlockSelector::Height(height) => {
+            let chain_epoch = reader.chain_epoch();
+            if height > chain_epoch.tip_height {
+                return Err(QueryError::BlockNotInBestChain);
+            }
+            let block = reader
+                .block_at(height)?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            Ok(BlockId::new(height, block.block_hash))
+        }
+        BlockSelector::Hash(hash) => match reader.block_hash_lookup(hash)? {
+            BlockHashLookup::Resolved(block_id) => Ok(block_id),
+            BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                Err(QueryError::BlockNotInBestChain)
+            }
+        },
+        _ => Err(QueryError::UnsupportedBlockSelector {
+            reason: "selector variant has no canonical resolver",
+        }),
+    }
 }
 
 fn subtree_root_artifact_unavailable(

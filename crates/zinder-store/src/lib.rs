@@ -5,6 +5,7 @@
 
 mod artifact_visibility;
 mod block_artifact;
+mod block_hash_index;
 mod chain_epoch;
 mod chain_epoch_reader;
 mod chain_event;
@@ -24,6 +25,7 @@ mod transparent_utxo;
 mod tree_state;
 
 pub use block_artifact::{CompactBlockStore, FinalizedBlockStore};
+pub use block_hash_index::BlockHashLookup;
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{

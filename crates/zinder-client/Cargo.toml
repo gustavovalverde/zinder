@@ -19,6 +19,7 @@ tokio-util.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 zinder-core.workspace = true
 zinder-proto.workspace = true
+zinder-source.workspace = true
 zinder-store.workspace = true
 
 [dev-dependencies]

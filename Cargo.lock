@@ -5081,6 +5081,7 @@ dependencies = [
  "zinder-core",
  "zinder-proto",
  "zinder-query",
+ "zinder-source",
  "zinder-store",
  "zinder-testkit",
 ]

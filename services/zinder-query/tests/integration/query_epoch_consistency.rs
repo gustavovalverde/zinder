@@ -48,10 +48,10 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
     let wallet_query = WalletQuery::new(read_api, ());
 
     let compact_block_range = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(1),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
+            None,
+        )
         .await?;
 
     assert_eq!(compact_block_range.chain_epoch, first_epoch);

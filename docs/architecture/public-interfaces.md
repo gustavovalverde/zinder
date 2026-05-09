@@ -452,34 +452,34 @@ message NodeCapabilitiesDescriptor {
 
 Capability strings are exact-match (no version negotiation, no regex). New capabilities are additive. Removing a capability from a deployed server is a breaking change. The naming convention is `domain.subdomain.capability_name_v{N}`.
 
-Current active wallet capabilities:
+Until a Zinder consumer ships, no capability is "deployed" in this sense; pre-launch wire-shape evolution mutates the `_v1` string in place rather than bumping. Capability versioning becomes a deprecation mechanism only after the first consumer reads the string in production, at which point a wire-shape change bumps to `_v2` and retains `_v1` in `deprecated_capabilities` for the documented overlap window.
 
-- `wallet.broadcast.transaction_v1`
-- `wallet.events.chain_v1`
-- `wallet.read.compact_block_range_v1`
-- `wallet.read.compact_block_at_v1`
+The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs); a CI test (`zinder-proto::integration::capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities`) fails when this list and the constant diverge, so any drift is caught at build time.
+
+<!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
+- `wallet.read.block_id_by_selector_v1`
+- `wallet.read.block_header_by_selector_v1`
+- `wallet.read.compact_block_at_v1`
+- `wallet.read.compact_block_range_v1`
+- `wallet.read.tree_state_at_v1`
 - `wallet.read.latest_tree_state_v1`
-- `wallet.read.server_info_v1`
 - `wallet.read.subtree_roots_in_range_v1`
 - `wallet.read.transaction_by_id_v1`
-- `wallet.read.tree_state_at_v1`
+- `wallet.read.server_info_v1`
+- `wallet.broadcast.transaction_v1`
+- `wallet.events.chain_v1`
+- `wallet.snapshot.mempool_v1`
+- `wallet.events.mempool_v1`
+- `wallet.address.transparent_utxos_v1`
+- `wallet.address.transparent_history_v1`
+- `derive.explorer.ready_v1`
+<!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-Transparent-address read capabilities advertised once the native proto and
-`zinder-client::ChainIndex` cover them:
+Reserved capability strings (named but not yet in `ZINDER_CAPABILITIES`; the named milestone adds them):
 
-- `wallet.address.transparent_utxos_v1` (advertised on every deployment that
-  exposes the `TransparentAddressUtxos` and `TransparentAddressUtxosStream`
-  RPCs over the stored transparent-UTXO and transparent-spend artifact
-  families)
-
-M3 and later capability strings, reserved but not advertised in M2:
-
-- `wallet.events.mempool_v1`
-- `wallet.snapshot.mempool_v1`
-- `wallet.address.transparent_history_v1` (added when transparent-address history lands)
 - `wallet.address.transparent_balance_v1` (added when transparent-address balance lands)
 
 Do not add native capability strings for lightwalletd-shaped mempool products

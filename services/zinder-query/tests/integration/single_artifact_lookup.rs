@@ -6,10 +6,10 @@
 use eyre::eyre;
 use zinder_core::{
     ArtifactSchemaVersion, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
-    TransactionArtifact, TransactionId, UnixTimestampMillis,
+    TransactionArtifact, TransactionId, TxStatus, UnixTimestampMillis,
 };
-use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts, ReorgWindowChange};
+use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
+use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::StoreFixture;
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
@@ -27,7 +27,9 @@ async fn compact_block_at_returns_indexed_block() -> eyre::Result<()> {
     ))?;
 
     let wallet_query = WalletQuery::new(store, ());
-    let response = wallet_query.compact_block_at(BlockHeight::new(1)).await?;
+    let response = wallet_query
+        .compact_block_at(BlockHeight::new(1), None)
+        .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
     assert_eq!(response.compact_block, compact_block);
@@ -48,7 +50,10 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
     ))?;
 
     let wallet_query = WalletQuery::new(store, ());
-    let error = match wallet_query.compact_block_at(BlockHeight::new(99)).await {
+    let error = match wallet_query
+        .compact_block_at(BlockHeight::new(99), None)
+        .await
+    {
         Ok(response) => return Err(eyre!("expected unavailable, got {response:?}")),
         Err(error) => error,
     };
@@ -84,7 +89,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
     )?;
 
     let wallet_query = WalletQuery::new(store, ());
-    let error = match wallet_query.compact_block_at(checkpoint_height).await {
+    let error = match wallet_query.compact_block_at(checkpoint_height, None).await {
         Ok(response) => return Err(eyre!("expected unavailable, got {response:?}")),
         Err(error) => error,
     };
@@ -113,10 +118,13 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
     )?;
 
     let wallet_query = WalletQuery::new(store, ());
-    let response = wallet_query.transaction(transaction_id).await?;
+    let response = wallet_query.transaction(transaction_id, None).await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
-    assert_eq!(response.transaction, transaction);
+    let TxStatus::Mined(mined) = response.status else {
+        return Err(eyre!("expected mined transaction status, got {response:?}"));
+    };
+    assert_eq!(mined.artifact, transaction);
 
     Ok(())
 }
@@ -134,21 +142,16 @@ async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
     ))?;
 
     let wallet_query = WalletQuery::new(store, ());
-    let error = match wallet_query
-        .transaction(TransactionId::from_bytes([0xCD; 32]))
-        .await
-    {
-        Ok(response) => return Err(eyre!("expected unavailable, got {response:?}")),
-        Err(error) => error,
-    };
+    let response = wallet_query
+        .transaction(TransactionId::from_bytes([0xCD; 32]), None)
+        .await?;
 
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::Transaction,
-            key: ArtifactKey::TransactionId(_)
-        }
-    ));
+    assert_eq!(response.chain_epoch, chain_epoch);
+    assert!(
+        matches!(response.status, TxStatus::NotFound),
+        "expected NotFound status, got {:?}",
+        response.status
+    );
 
     Ok(())
 }

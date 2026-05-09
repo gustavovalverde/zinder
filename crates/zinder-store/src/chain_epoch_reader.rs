@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU32;
 use zinder_core::{
-    BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
+    BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     SubtreeRootArtifact, SubtreeRootRange, TransactionArtifact, TransactionId,
     TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TreeStateArtifact,
 };
@@ -13,6 +13,7 @@ use crate::{
         CompactBlockStore, FinalizedBlockStore, read_block_artifact, read_compact_block_artifact,
         read_compact_block_artifacts,
     },
+    block_hash_index::{BlockHashLookup, read_block_hash_lookup},
     kv::RocksChainStoreReadView,
     subtree_root::{SubtreeRootStore, read_subtree_root_artifacts},
     transaction_artifact::{TransactionArtifactStore, read_transaction_artifact},
@@ -107,6 +108,11 @@ impl<'store> ChainEpochReader<'store> {
             start_height,
             max_entries,
         )
+    }
+
+    /// Resolves a block hash through the canonical best-chain index.
+    pub fn block_hash_lookup(&self, block_hash: BlockHash) -> Result<BlockHashLookup, StoreError> {
+        read_block_hash_lookup(&self.read_view, self.chain_epoch, block_hash)
     }
 }
 

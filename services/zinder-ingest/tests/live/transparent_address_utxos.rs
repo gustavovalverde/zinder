@@ -79,12 +79,15 @@ async fn transparent_address_utxos_surface_through_typed_wallet_query() -> Resul
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
     let response = wallet_query
-        .transparent_address_utxos(TransparentAddressUtxosRequest {
-            address_script_hash,
-            start_height: BlockHeight::new(0),
-            max_entries: NonZeroU32::MIN.saturating_add(99),
-            from_cursor: None,
-        })
+        .transparent_address_utxos(
+            TransparentAddressUtxosRequest {
+                address_script_hash,
+                start_height: BlockHeight::new(0),
+                max_entries: NonZeroU32::MIN.saturating_add(99),
+                from_cursor: None,
+            },
+            None,
+        )
         .await?;
 
     assert!(

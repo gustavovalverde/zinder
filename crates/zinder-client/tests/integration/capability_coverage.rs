@@ -29,6 +29,14 @@ use zinder_client::{ChainIndex, ZINDER_CAPABILITIES};
 /// entry has a corresponding row here.
 const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
     ("wallet.read.latest_block_v1", "latest_block"),
+    (
+        "wallet.read.block_id_by_selector_v1",
+        "block_id_by_selector",
+    ),
+    (
+        "wallet.read.block_header_by_selector_v1",
+        "block_header_by_selector",
+    ),
     ("wallet.read.compact_block_at_v1", "compact_block_at"),
     (
         "wallet.read.compact_block_range_v1",
@@ -98,6 +106,8 @@ fn capability_coverage_table_does_not_reference_retired_capabilities() {
 )]
 fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::latest_block;
+    let _ = T::block_id_by_selector;
+    let _ = T::block_header_by_selector;
     let _ = T::compact_block_at;
     let _ = T::compact_blocks_in_range;
     let _ = T::tree_state_at;

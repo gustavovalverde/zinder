@@ -28,6 +28,10 @@ use zinder_store::{
 };
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "scenario covers checkpoint bootstrap, backfill outcome assertions, and follow-up wallet queries; splitting into helpers obscures the end-to-end story"
+)]
 async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
@@ -95,7 +99,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     );
 
     let wallet_query = WalletQuery::new(store, ());
-    let unavailable = match wallet_query.compact_block_at(checkpoint_height).await {
+    let unavailable = match wallet_query.compact_block_at(checkpoint_height, None).await {
         Ok(response) => {
             return Err(eyre!(
                 "expected checkpoint artifact unavailable, got {response:?}"
@@ -111,7 +115,9 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         } if height == checkpoint_height
     ));
 
-    let compact_block = wallet_query.compact_block_at(source_block.height).await?;
+    let compact_block = wallet_query
+        .compact_block_at(source_block.height, None)
+        .await?;
     assert_eq!(compact_block.chain_epoch.tip_height, source_block.height);
     assert_eq!(compact_block.compact_block.height, source_block.height);
 

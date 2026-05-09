@@ -6,7 +6,7 @@
 | Audience | Zinder maintainers, contributors |
 | Sources | Local Zebra, Zallet, Zaino, lightwalletd, Android SDK, and Zodl source trees as of 2026-04-29; GitHub issues for Zebra and Zallet |
 | Related | [PRD-0001](../prd-0001-zinder-indexer.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md), [Lessons from Zaino](lessons-from-zaino.md), [Wallet Data Plane](../architecture/wallet-data-plane.md), [Chain Ingestion](../architecture/chain-ingestion.md), [Chain events](../architecture/chain-events.md) |
-| Last refresh | 2026-04-29: M3 mempool consumer roles re-checked against local Zebra, Zallet, Zaino, lightwalletd, Android SDK, and Zodl source trees. |
+| Last refresh | 2026-05-09: §Part B "What Zinder Currently Provides Against These Contracts" refreshed after M3 mempool, M4 Slice A (transparent UTXOs), M4 Slice B (transparent tx history), and M5 Slice A foundation shipped. The cross-consumer gap inventory now lives in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md); this document continues to carry the Zebra-side and Zallet-side integration evidence. <br> 2026-04-29: M3 mempool consumer roles re-checked against local Zebra, Zallet, Zaino, lightwalletd, Android SDK, and Zodl source trees. |
 
 ## Purpose
 
@@ -251,7 +251,7 @@ the Rust `WalletQueryApi` boundary. Both share the same generated code path.
 
 ## What Zinder Currently Provides Against These Contracts
 
-This subsection is a 2026-04-28 audit of the Zinder code in this repository against the contracts above. It is a point-in-time snapshot; the source of truth is `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto` for the native surface and `services/zinder-compat-lightwalletd/src/grpc.rs` for the lightwalletd-compatible surface.
+This subsection is a 2026-05-09 audit of the Zinder code in this repository against the contracts above. It is a point-in-time snapshot; the source of truth is `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto` for the native surface and `services/zinder-compat-lightwalletd/src/grpc.rs` for the lightwalletd-compatible surface. Cross-consumer gap inventory and per-consumer prioritization live in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md); this section is the Zallet-specific snapshot.
 
 Zinder's durable direction is now [ADR-0008: Consumer-neutral wallet data
 plane](../adrs/0008-consumer-neutral-wallet-data-plane.md): compatibility
@@ -266,14 +266,21 @@ Implemented end-to-end:
 - `LatestBlock`, `CompactBlock`, `CompactBlockRange` (server streaming, capped by `max_compact_block_range` with default `1000`).
 - `Transaction` by transaction id.
 - `TreeState` by height, `LatestTreeState`, `SubtreeRoots` (paged, request-bounded).
+- `BroadcastTransaction` with typed accepted/duplicate/invalid-encoding/rejected/unknown outcomes (M3, gated on `[node]` config).
+- `ChainEvents` server-streaming with replayable `StreamCursorTokenV1` cursors and Tip/Finalized families.
+- `MempoolSnapshot` and `MempoolEvents` (M3): bounded snapshot plus replayable `Added`/`Invalidated`/`Mined` events with `MempoolStreamCursorV1` resumption.
+- `TransparentAddressUtxos` and `TransparentAddressUtxosStream` (M4 Slice A): paged and streaming UTXO reads keyed by either `script_hash` or base58 `address` through the shared `AddressLookup` selector.
+- `TransparentAddressTxIdsInRange` (M4 Slice B): server-streamed transparent-address tx-history index with ascending or descending iteration.
+- `ServerInfo` returning the `ServerCapabilities` descriptor with capability strings and node-side capabilities.
 
-Every response carries the `ChainEpoch` it was answered from, and native read requests accept an optional `at_epoch` pin. This satisfies the atomic-snapshot contract for multi-call wallet flows: a client can call `LatestBlock`, persist the returned `ChainEpoch`, and require `CompactBlockRange`, `TreeState`, `LatestTreeState`, `SubtreeRoots`, and `Transaction` to answer from that same epoch.
+Every response carries the `ChainEpoch` it was answered from, and native read requests accept an optional `at_epoch` pin. This satisfies the atomic-snapshot contract for multi-call wallet flows: a client can call `LatestBlock`, persist the returned `ChainEpoch`, and require `CompactBlockRange`, `TreeState`, `LatestTreeState`, `SubtreeRoots`, `Transaction`, `TransparentAddressUtxos`, and `TransparentAddressTxIdsInRange` to answer from that same epoch.
 
 Not yet on the native surface:
 
-- Enriched transaction response. `Transaction` returns the artifact bytes; it does not yet carry `(height, hex, confirmations, branch_id)`, which Zallet currently reconstructs from `RawTransaction` via the workaround at `components/sync.rs:647-660`.
-- Address-history queries. `TransactionsInvolvingAddress` (Zallet's `#237` use case) and t-address tx-id lookups are not on the native surface.
-- Mempool query or subscription. No native RPC exposes mempool presence, mempool spends, or mempool UTXOs.
+- Enriched transaction response. `Transaction` returns the artifact bytes; it does not yet carry `(consensus_branch_id, block_time, confirmations)`, which Zallet currently reconstructs from `RawTransaction` via the workaround at `wallet/zallet/src/components/sync.rs:647-660`. Tracked as G3 in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md).
+- Transparent-address balance. `TransparentAddressBalance` is reserved for M5 Slice B; M5 Slice A foundation (`services/zinder-derive` deployable, capability `derive.explorer.ready_v1`) shipped 2026-05-08. Tracked as G1.
+- Native gRPC transaction-status shape and focused transparent-mempool point lookups. The decision is to expose a status-bearing transaction response plus transparent mempool output/spend lookups, rather than making non-Rust clients page `MempoolSnapshot` for single-answer questions. Tracked as G6 and G7.
+- Best-chain hash-to-height resolver and typed block-header read model. Compact-block reads stay height-first; hash-only compatibility reads resolve through the canonical resolver; non-best-chain `(txid, block_hash)` lookup is deferred until explorer or zcashd-compat parity becomes a named milestone. Tracked as G2 and G4.
 
 ### Lightwalletd compat (`zinder_proto::compat::lightwalletd`)
 
@@ -281,39 +288,39 @@ Implemented end-to-end in `services/zinder-compat-lightwalletd/src/grpc.rs`:
 
 - `GetLatestBlock`, `GetBlock`, `GetBlockRange`, `GetBlockNullifiers`, `GetBlockRangeNullifiers`.
 - `GetTransaction` by hash and by block index.
-- `GetTreeState` by height, `GetLatestTreeState`. Hash-only lookup returns `Status::unimplemented`.
+- `GetTreeState` by height, `GetLatestTreeState`. Hash-only lookup returns `Status::unimplemented`; tracked as G2.
 - `GetSubtreeRoots`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS` rather than treated as unbounded.
-- `GetAddressUtxos`, `GetAddressUtxosStream`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS` and results are served from stored transparent UTXO artifacts.
+- `GetAddressUtxos`, `GetAddressUtxosStream`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS` and results are served from stored transparent UTXO artifacts (M4 Slice A).
+- `GetTaddressTxids`, `GetTaddressTransactions` (M4 Slice B). Both consume the bounded `TransparentAddressTxIdsInRange` native surface; `GetTaddressTxids` returns txid bytes in `RawTransaction.data` (matching the upstream lightwalletd-go quirk), `GetTaddressTransactions` fetches and returns full raw transaction bytes.
 - `SendTransaction`, gated on the `[node]` configuration block.
-- `GetLightdInfo`. Several fields (`zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, `upgrade_height`) are populated as empty strings or zero; `taddr_support` is `true` because the UTXO stream is backed by stored transparent artifacts.
+- `GetMempoolTx`, `GetMempoolStream` (M3). Both gated on the adapter's `mempool_surface` option; `Status::unavailable` without it. With it, `GetMempoolStream` closes cleanly on tip change when a `tip_change_watcher` is wired, preserving the lightwalletd Go server's de-facto contract.
+- `GetLightdInfo`. Several fields (`zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, `upgrade_height`) are populated as empty strings or zero; `taddr_support` is `true` because the UTXO stream is backed by stored transparent artifacts. Tracked as G9.
 - `Ping`.
 
-Returning `Status::unimplemented` today, with each row mapped to a Zallet call site that exercises it in steady state:
+Returning `Status::unimplemented` today:
 
-| Compat method | Returns | Zallet call site |
-| ------------- | ------- | ---------------- |
-| `GetMempoolTx`, `GetMempoolStream` | `Status::unimplemented` | `components/sync.rs:388,407` (also the Zallet tip-change signal) |
-| `GetTaddressTxids`, `GetTaddressTransactions` | `Status::unimplemented` | `components/sync.rs:756` |
+| Compat method | Returns | Owning gap |
+| ------------- | ------- | ---------- |
+| `GetTaddressBalance`, `GetTaddressBalanceStream` | `Status::unimplemented` | G1 (M5 Slice B) |
+| `GetBlock` / `GetTreeState` with hash-only `BlockID` | `Status::unimplemented` | G2 |
 
 Android SDK and Zashi compatibility details are owned by
 [Findings from Android wallet integration](android-wallet-integration-findings.md)
 and the canonical claim in
 [Wallet data plane](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims).
 
-A Zallet build wired against `zinder-compat-lightwalletd` today still needs
-mempool and transparent-address history parity. Closing those rows is parity
-work, not differentiation work.
-
 ### Status-by-contract summary
 
 | Contract from "What Zinder Owes Zallet" | Status | Notes |
 | --------------------------------------- | ------ | ----- |
-| Atomic chain snapshots | Done for M2 | `ChainEpochReadApi` snapshots in place; per-response `chain_epoch` advertised; native requests and `zinder-client::ChainIndex` support request-side epoch pins |
-| Typed Rust API | M2 slice implemented | `zinder-client` exports `ChainIndex`, `LocalChainIndex`, `RemoteChainIndex`, typed `TxStatus`, typed `TransactionBroadcastResult`, `IndexerError`, chain-event streams, and epoch-pinned read variants |
-| Chain notifications | Native exposed | `WalletQuery.ChainEvents`, `IngestControl.ChainEvents`, and `zinder-client::ChainIndex::chain_events` expose replayable Tip/Finalized chain events with retention pruning; deployed query processes proxy public streams to the private ingest-control endpoint |
-| Mempool as queryable index | Not exposed | Compat shim returns `Status::unimplemented`; native surface has no mempool method |
-| Fixed-height variants of every chain query | M2 read surface done | Heighted reads and transaction queries accept request-side `ChainEpoch` pins on the native and typed Rust surfaces |
+| Atomic chain snapshots | Done | `ChainEpochReadApi` snapshots in place; per-response `chain_epoch` advertised; native requests and `zinder-client::ChainIndex` support request-side epoch pins |
+| Typed Rust API | Done for read + mempool surfaces | `zinder-client` exports `ChainIndex`, `LocalChainIndex`, `RemoteChainIndex`, typed `TxStatus`, typed `TransactionBroadcastResult`, `IndexerError`, chain-event streams, mempool snapshot/event streams, transparent-mempool overlay reads, and epoch-pinned variants |
+| Chain notifications | Done | `WalletQuery.ChainEvents`, `IngestControl.ChainEvents`, and `zinder-client::ChainIndex::chain_events` expose replayable Tip/Finalized chain events with retention pruning; deployed query processes proxy public streams to the private ingest-control endpoint |
+| Mempool as queryable index | Done in M3 | `MempoolSnapshot` (bounded snapshot), `MempoolEvents` (replayable `Added`/`Invalidated`/`Mined` stream), `ChainIndex::is_in_mempool`, `transparent_mempool_outputs_by_address`, `transparent_mempool_spend_by_outpoint`; gRPC mirroring of the per-tx and per-outpoint surfaces remains a Rust-trait-only path tracked as G6 and G7 in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md) |
+| Fixed-height variants of every chain query | Done | Heighted reads, transaction queries, transparent UTXO reads, and transparent tx-history reads accept request-side `ChainEpoch` pins on both native and typed Rust surfaces |
 | Compact block streaming with batch range fetch | Done | `CompactBlockRange` streams up to `max_compact_block_range` per request, bounded |
+| Transparent-address read surface | Done in M4 | `TransparentAddressUtxos[Stream]` (Slice A), `TransparentAddressTxIdsInRange` (Slice B), matching `ChainIndex` methods, lightwalletd-compat `GetAddressUtxos*` and `GetTaddressTxids` / `GetTaddressTransactions`; transparent balance is M5 Slice B |
+| Transaction broadcast | Done in M3 | Native `BroadcastTransaction` with typed outcomes; compat `SendTransaction` maps onto the same path; gated on `[node]` config |
 
 ### Architectural opportunities the existing internal vocabulary already covers
 

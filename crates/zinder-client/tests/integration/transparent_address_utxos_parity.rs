@@ -35,11 +35,11 @@ async fn local_and_remote_drained_scan_returns_identical_utxos() -> eyre::Result
     };
     let local_view = fixtures
         .local
-        .transparent_address_utxos(drain_query.clone())
+        .transparent_address_utxos(drain_query.clone(), None)
         .await?;
     let remote_view = fixtures
         .remote
-        .transparent_address_utxos(drain_query)
+        .transparent_address_utxos(drain_query, None)
         .await?;
 
     assert_eq!(local_view.utxos.len(), 3);
@@ -70,11 +70,11 @@ async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result
     };
     let local_first = fixtures
         .local
-        .transparent_address_utxos(first_page_query.clone())
+        .transparent_address_utxos(first_page_query.clone(), None)
         .await?;
     let remote_first = fixtures
         .remote
-        .transparent_address_utxos(first_page_query)
+        .transparent_address_utxos(first_page_query, None)
         .await?;
 
     assert_eq!(local_first.utxos.len(), 2);
@@ -103,11 +103,11 @@ async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result
     };
     let local_resume = fixtures
         .local
-        .transparent_address_utxos(resume_query.clone())
+        .transparent_address_utxos(resume_query.clone(), None)
         .await?;
     let remote_resume = fixtures
         .remote
-        .transparent_address_utxos(resume_query)
+        .transparent_address_utxos(resume_query, None)
         .await?;
 
     assert_eq!(local_resume.utxos, remote_resume.utxos);

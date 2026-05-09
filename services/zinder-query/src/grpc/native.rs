@@ -12,19 +12,20 @@ use zebra_chain::{
 };
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, Network,
+    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TxStatus,
 };
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::wallet;
 
 use crate::{
-    ChainEvents, CompactBlock, LatestBlock, QueryError, SubtreeRoots, Transaction,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
-    TransparentAddressUtxosRequest, TreeState, WalletQueryApi,
+    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, LatestBlock,
+    QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos, TransparentAddressUtxosRequest,
+    TreeState, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
@@ -122,7 +123,7 @@ pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::LatestBlockResponse, QueryError> {
     query_api
-        .latest_block_at_epoch(at_epoch)
+        .latest_block(at_epoch)
         .await
         .map(build_latest_block_response)
 }
@@ -134,21 +135,52 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::CompactBlockResponse, QueryError> {
     query_api
-        .compact_block_at_epoch(height, at_epoch)
+        .compact_block_at(height, at_epoch)
         .await
         .map(build_compact_block_response)
 }
 
-/// Reads the indexed transaction at `transaction_id` and encodes the native wallet response.
+/// Resolves a typed block selector and encodes the native wallet response.
+pub async fn block_id_by_selector_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    selector: zinder_core::BlockSelector,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::BlockIdResponse, QueryError> {
+    query_api
+        .block_id_by_selector(selector, at_epoch)
+        .await
+        .map(build_block_id_response)
+}
+
+/// Reads the typed block-header read model at a typed block selector and
+/// encodes the native wallet response.
+pub async fn block_header_by_selector_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    selector: zinder_core::BlockSelector,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::BlockHeaderResponse, QueryError> {
+    query_api
+        .block_header_by_selector(selector, at_epoch)
+        .await
+        .map(|response| build_block_header_response(&response))
+}
+
+/// Reads the typed transaction status at `transaction_id` and encodes
+/// the native wallet response.
+///
+/// Returns `Ok(None)` when the canonical chain and the live mempool both
+/// have no record of the transaction. The wire contract maps that case to
+/// gRPC `NOT_FOUND` at the adapter layer, where the original transaction
+/// id is in scope for the error message; the encoder never has to
+/// fabricate a transaction id for a status that does not appear on the
+/// wire oneof.
 pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     transaction_id: TransactionId,
     at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::TransactionResponse, QueryError> {
-    query_api
-        .transaction_at_epoch(transaction_id, at_epoch)
-        .await
-        .map(build_transaction_response)
+) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
+    let status = query_api.transaction(transaction_id, at_epoch).await?;
+    build_transaction_status_response(status)
 }
 
 /// Reads the tree-state at `height` and encodes the native wallet response.
@@ -158,7 +190,7 @@ pub async fn tree_state_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .tree_state_at_epoch(height, at_epoch)
+        .tree_state_at(height, at_epoch)
         .await
         .map(build_tree_state_response)
 }
@@ -169,7 +201,7 @@ pub async fn latest_tree_state_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .latest_tree_state_at_epoch(at_epoch)
+        .latest_tree_state(at_epoch)
         .await
         .map(build_tree_state_response)
 }
@@ -181,7 +213,7 @@ pub async fn subtree_roots_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::SubtreeRootsResponse, QueryError> {
     query_api
-        .subtree_roots_at_epoch(subtree_root_range, at_epoch)
+        .subtree_roots(subtree_root_range, at_epoch)
         .await
         .and_then(|subtree_roots| build_subtree_roots_response(&subtree_roots))
 }
@@ -217,7 +249,7 @@ pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TransparentAddressUtxosResponse, QueryError> {
     query_api
-        .transparent_address_utxos_at_epoch(request, at_epoch)
+        .transparent_address_utxos(request, at_epoch)
         .await
         .map(build_transparent_address_utxos_response)
 }
@@ -302,7 +334,7 @@ pub async fn transparent_address_tx_ids_response<Q: WalletQueryApi + ?Sized>(
     at_epoch: Option<ChainEpoch>,
 ) -> Result<TransparentAddressTxIds, QueryError> {
     query_api
-        .transparent_address_tx_ids_in_range_at_epoch(request, at_epoch)
+        .transparent_address_tx_ids_in_range(request, at_epoch)
         .await
 }
 
@@ -379,6 +411,36 @@ fn build_latest_block_response(latest_block: LatestBlock) -> wallet::LatestBlock
     }
 }
 
+fn build_block_id_response(response: BlockIdResponseValue) -> wallet::BlockIdResponse {
+    wallet::BlockIdResponse {
+        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        block_id: Some(build_block_metadata_message(
+            response.block_id.height,
+            response.block_id.hash,
+        )),
+    }
+}
+
+fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::BlockHeaderResponse {
+    let header = &response.block_header;
+    wallet::BlockHeaderResponse {
+        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        block_header: Some(wallet::BlockHeaderInfo {
+            block_id: Some(build_block_metadata_message(
+                header.block_id.height,
+                header.block_id.hash,
+            )),
+            previous_block_hash: header.previous_block_hash.as_bytes().to_vec(),
+            merkle_root_hash: header.merkle_root_hash.to_vec(),
+            commitment_bytes: header.commitment_bytes.to_vec(),
+            block_time: header.block_time,
+            bits: header.bits,
+            nonce: header.nonce.to_vec(),
+            version: header.version,
+        }),
+    }
+}
+
 fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactBlockResponse {
     wallet::CompactBlockResponse {
         chain_epoch: Some(build_chain_epoch_message(compact_block.chain_epoch)),
@@ -386,10 +448,49 @@ fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactB
     }
 }
 
-fn build_transaction_response(transaction: Transaction) -> wallet::TransactionResponse {
-    wallet::TransactionResponse {
-        chain_epoch: Some(build_chain_epoch_message(transaction.chain_epoch)),
-        transaction: Some(build_transaction_message(transaction.transaction)),
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "TxStatus is #[non_exhaustive]; new arms must be wired into the proto oneof in a deliberate change, not folded into a default branch."
+)]
+fn build_transaction_status_response(
+    status: TransactionStatus,
+) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
+    let chain_epoch = status.chain_epoch;
+    let oneof = match status.status {
+        TxStatus::Mined(mined) => {
+            wallet::transaction_status_response::Status::Mined(wallet::MinedTransaction {
+                transaction: Some(build_transaction_message(mined.artifact)),
+                details: Some(build_mined_details_message(mined.details)),
+            })
+        }
+        TxStatus::InMempool(entry) => {
+            wallet::transaction_status_response::Status::InMempool(wallet::MempoolTransaction {
+                payload_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
+                first_seen_unix_seconds: i64::try_from(entry.first_seen_unix_millis.value() / 1000)
+                    .unwrap_or(i64::MAX),
+            })
+        }
+        TxStatus::ConflictingChain => wallet::transaction_status_response::Status::Conflicting(
+            wallet::ConflictingChainTransaction {},
+        ),
+        TxStatus::NotFound => return Ok(None),
+        _ => {
+            return Err(QueryError::UnsupportedTransactionStatus {
+                reason: "transaction status variant has no wire representation",
+            });
+        }
+    };
+    Ok(Some(wallet::TransactionStatusResponse {
+        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        status: Some(oneof),
+    }))
+}
+
+fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
+    wallet::MinedDetails {
+        consensus_branch_id: details.consensus_branch_id,
+        block_time: details.block_time,
+        confirmations: details.confirmations,
     }
 }
 

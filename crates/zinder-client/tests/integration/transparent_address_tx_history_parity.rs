@@ -35,14 +35,14 @@ async fn local_and_remote_ascending_drain_returns_identical_tx_history() -> eyre
     let local_chunks = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(drain_query.clone())
+            .transparent_address_tx_ids_in_range(drain_query.clone(), None)
             .await?,
     )
     .await?;
     let remote_chunks = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(drain_query)
+            .transparent_address_tx_ids_in_range(drain_query, None)
             .await?,
     )
     .await?;
@@ -71,14 +71,14 @@ async fn local_and_remote_descending_drain_returns_identical_tx_history() -> eyr
     let local_chunks = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(descending_query.clone())
+            .transparent_address_tx_ids_in_range(descending_query.clone(), None)
             .await?,
     )
     .await?;
     let remote_chunks = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(descending_query)
+            .transparent_address_tx_ids_in_range(descending_query, None)
             .await?,
     )
     .await?;
@@ -106,14 +106,14 @@ async fn local_and_remote_paged_resume_returns_identical_tx_history() -> eyre::R
     let local_first = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(first_page_query.clone())
+            .transparent_address_tx_ids_in_range(first_page_query.clone(), None)
             .await?,
     )
     .await?;
     let remote_first = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(first_page_query)
+            .transparent_address_tx_ids_in_range(first_page_query, None)
             .await?,
     )
     .await?;
@@ -140,14 +140,14 @@ async fn local_and_remote_paged_resume_returns_identical_tx_history() -> eyre::R
     let local_resume = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(resume_query.clone())
+            .transparent_address_tx_ids_in_range(resume_query.clone(), None)
             .await?,
     )
     .await?;
     let remote_resume = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(resume_query)
+            .transparent_address_tx_ids_in_range(resume_query, None)
             .await?,
     )
     .await?;

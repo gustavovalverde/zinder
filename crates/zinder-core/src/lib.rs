@@ -8,6 +8,7 @@
 compile_error!("Zinder supports only 32-bit and wider targets.");
 
 mod block_artifact;
+mod block_header;
 mod block_id;
 mod chain_epoch;
 mod mempool;
@@ -18,7 +19,8 @@ mod transparent_utxo;
 mod tree_state;
 
 pub use block_artifact::{BlockArtifact, CompactBlockArtifact};
-pub use block_id::BlockId;
+pub use block_header::BlockHeaderInfo;
+pub use block_id::{BlockId, BlockSelector};
 pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
     ChainEpoch, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
@@ -33,8 +35,8 @@ pub use subtree_root::{
 };
 pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
-    BroadcastUnknown, RawTransactionBytes, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId,
+    BroadcastUnknown, MinedDetails, MinedTransaction, RawTransactionBytes, TransactionArtifact,
+    TransactionBroadcastResult, TransactionId, TxStatus,
 };
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_utxo::{

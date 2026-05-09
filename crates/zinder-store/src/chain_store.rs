@@ -18,6 +18,7 @@ use crate::{
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
     MempoolEventRetentionReport, ReorgWindowChange, StoreError, StreamCursorTokenV1,
+    block_hash_index::block_hash_index_put,
     format::{
         ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
         StoreKey, decode_chain_epoch, decode_chain_event_envelope, decode_mempool_event_envelope,
@@ -78,7 +79,7 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 1;
+const STORE_SCHEMA_VERSION: u16 = 2;
 /// Durable artifact schema version written by this binary.
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(2);
 /// Highest durable artifact schema version this binary can read.
@@ -1707,6 +1708,7 @@ fn push_block_artifact_puts(
 ) -> Result<(), StoreError> {
     for block in finalized_blocks {
         let height = block.height;
+        let block_hash = block.block_hash;
         let encoded_block = encode_block_artifact(block)?;
         puts.push(StoragePut {
             table: StorageTable::FinalizedBlock,
@@ -1718,6 +1720,12 @@ fn push_block_artifact_puts(
             key: StoreKey::visible_block_epoch(chain_epoch.network, height, chain_epoch.id),
             value: visibility_value(chain_epoch),
         });
+        puts.push(block_hash_index_put(
+            chain_epoch.network,
+            chain_epoch.id,
+            height,
+            block_hash,
+        ));
     }
 
     Ok(())
@@ -2556,7 +2564,7 @@ mod tests {
                 error,
                 StoreError::SchemaMismatch {
                     persisted_version,
-                    expected_version: 1,
+                    expected_version: STORE_SCHEMA_VERSION,
                 } if persisted_version == u16::MAX
             ),
             "unexpected error: {error:?}"

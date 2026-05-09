@@ -40,12 +40,14 @@ async fn remote_chain_index_uses_native_grpc_for_m2_methods() -> eyre::Result<()
 
     let server_info = chain_index.server_info().await?;
     let current_epoch = chain_index.current_epoch().await?;
-    let compact_block = chain_index.compact_block_at(BlockHeight::new(1)).await?;
+    let compact_block = chain_index
+        .compact_block_at(BlockHeight::new(1), None)
+        .await?;
     let mut compact_blocks = chain_index
-        .compact_blocks_in_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
+        .compact_blocks_in_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            None,
+        )
         .await?;
     let mut compact_block_count = 0;
     while let Some(compact_block_result) = compact_blocks.next().await {

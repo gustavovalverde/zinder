@@ -43,6 +43,8 @@ pub enum ArtifactFamily {
     TransparentUtxoSpend,
     /// Transparent address tx-history index artifact.
     TransparentAddressTxIndex,
+    /// Best-chain block-hash to height index entry.
+    BlockHashIndex,
     /// Mempool event envelope.
     MempoolEvent,
 }

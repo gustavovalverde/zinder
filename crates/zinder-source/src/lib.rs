@@ -31,7 +31,8 @@ pub use node_target::{
     DEFAULT_NODE_REQUEST_TIMEOUT_SECS, NodeAuthSection, NodeConfigError, NodeSection, NodeTarget,
 };
 pub use source_block::{
-    SourceBlock, SourceBlockHeader, decode_display_block_hash, encode_display_block_hash,
+    SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes, consensus_branch_id_at,
+    decode_display_block_hash, encode_display_block_hash, zebra_network,
 };
 pub use source_error::SourceError;
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};

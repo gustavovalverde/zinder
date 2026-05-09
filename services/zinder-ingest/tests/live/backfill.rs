@@ -208,45 +208,51 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     let wallet_query = WalletQuery::new(store, ());
 
     let measurement_start = std::time::Instant::now();
-    let _latest = wallet_query.latest_block().await?;
+    let _latest = wallet_query.latest_block(None).await?;
     let latest_block_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
-    let _block = wallet_query.compact_block_at(from_height).await?;
+    let _block = wallet_query.compact_block_at(from_height, None).await?;
     let compact_block_at_first_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
-    let _block = wallet_query.compact_block_at(tip_height).await?;
+    let _block = wallet_query.compact_block_at(tip_height, None).await?;
     let compact_block_at_tip_micros = measurement_start.elapsed().as_micros();
 
     let one_block_range = BlockHeightRange::inclusive(from_height, from_height);
     let measurement_start = std::time::Instant::now();
-    let one_block = wallet_query.compact_block_range(one_block_range).await?;
+    let one_block = wallet_query
+        .compact_block_range(one_block_range, None)
+        .await?;
     let compact_block_range_1_micros = measurement_start.elapsed().as_micros();
     assert_eq!(one_block.compact_blocks.len(), 1);
 
     let ten_block_range =
         BlockHeightRange::inclusive(from_height, BlockHeight::new(from_height.value() + 9));
     let measurement_start = std::time::Instant::now();
-    let ten_blocks = wallet_query.compact_block_range(ten_block_range).await?;
+    let ten_blocks = wallet_query
+        .compact_block_range(ten_block_range, None)
+        .await?;
     let compact_block_range_10_micros = measurement_start.elapsed().as_micros();
     assert_eq!(ten_blocks.compact_blocks.len(), 10);
 
     let fifty_block_range =
         BlockHeightRange::inclusive(from_height, BlockHeight::new(from_height.value() + 49));
     let measurement_start = std::time::Instant::now();
-    let fifty_blocks = wallet_query.compact_block_range(fifty_block_range).await?;
+    let fifty_blocks = wallet_query
+        .compact_block_range(fifty_block_range, None)
+        .await?;
     let compact_block_range_50_micros = measurement_start.elapsed().as_micros();
     assert_eq!(fifty_blocks.compact_blocks.len(), 50);
 
     let full_range = BlockHeightRange::inclusive(from_height, tip_height);
     let measurement_start = std::time::Instant::now();
-    let full_blocks = wallet_query.compact_block_range(full_range).await?;
+    let full_blocks = wallet_query.compact_block_range(full_range, None).await?;
     let compact_block_range_1000_micros = measurement_start.elapsed().as_micros();
     assert_eq!(full_blocks.compact_blocks.len(), 1000);
 
     let measurement_start = std::time::Instant::now();
-    let _tree_state = wallet_query.tree_state_at(tip_height).await?;
+    let _tree_state = wallet_query.tree_state_at(tip_height, None).await?;
     let tree_state_at_micros = measurement_start.elapsed().as_micros();
 
     // A checkpoint-bootstrapped store only carries subtree roots completed
@@ -260,7 +266,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
         NonZeroU32::new(8).ok_or_else(|| eyre!("invalid max entries"))?,
     );
     let measurement_start = std::time::Instant::now();
-    let _subtree_roots = wallet_query.subtree_roots(subtree_root_range).await?;
+    let _subtree_roots = wallet_query.subtree_roots(subtree_root_range, None).await?;
     let subtree_roots_micros = measurement_start.elapsed().as_micros();
 
     #[allow(

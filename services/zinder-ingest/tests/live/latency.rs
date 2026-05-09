@@ -16,8 +16,14 @@ use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
+const TRANSACTION_LOOKUP_ITERATIONS: u32 = 100;
+
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single calibration test reports five read-path measurements end-to-end against a real node; splitting per-measurement obscures the operator-facing trace line at the bottom"
+)]
 async fn read_endpoint_latency_baseline() -> Result<()> {
     let _guard = init();
     // The baseline backfills [1, tip], which only fits in CI budgets on
@@ -51,26 +57,52 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     let wallet_query = WalletQuery::new(store, ());
 
     let measurement_start = std::time::Instant::now();
-    let _latest = wallet_query.latest_block().await?;
+    let _latest = wallet_query.latest_block(None).await?;
     let latest_block_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
-    let _block = wallet_query.compact_block_at(BlockHeight::new(1)).await?;
+    let _block = wallet_query
+        .compact_block_at(BlockHeight::new(1), None)
+        .await?;
     let compact_block_at_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
     let range = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(tip_height.value().min(50)),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(tip_height.value().min(50)),
+            ),
+            None,
+        )
         .await?;
     let compact_block_range_50_micros = measurement_start.elapsed().as_micros();
     assert!(!range.compact_blocks.is_empty());
 
     let measurement_start = std::time::Instant::now();
-    let _tree = wallet_query.tree_state_at(BlockHeight::new(1)).await?;
+    let _tree = wallet_query
+        .tree_state_at(BlockHeight::new(1), None)
+        .await?;
     let tree_state_at_micros = measurement_start.elapsed().as_micros();
+
+    // Pick a real txid from the backfilled chain by reading the coinbase at
+    // height 1 through the indexed compact block. Then call `transaction()`
+    // repeatedly so the average covers the artifact-lookup + header-parse
+    // + consensus-branch-id path that powers `MinedDetails` enrichment.
+    // Header parsing only succeeds against real Zcash block bytes, so this
+    // measurement only fires on live nodes (the synthetic test fixtures
+    // produce non-parseable raw block bytes).
+    let coinbase_lookup = wallet_query
+        .transaction_at_block_index(BlockHeight::new(1), 0, None)
+        .await?;
+    let coinbase_txid = coinbase_lookup.transaction.transaction_id;
+
+    let measurement_start = std::time::Instant::now();
+    for _ in 0..TRANSACTION_LOOKUP_ITERATIONS {
+        let _status = wallet_query.transaction(coinbase_txid, None).await?;
+    }
+    let transaction_total_micros = measurement_start.elapsed().as_micros();
+    let transaction_avg_micros = transaction_total_micros / u128::from(TRANSACTION_LOOKUP_ITERATIONS);
 
     #[allow(
         clippy::print_stderr,
@@ -79,13 +111,17 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     {
         eprintln!(
             "live_latency_baseline network={} tip={} latest_block={}us compact_block_at={}us \
-             compact_block_range_50={}us tree_state_at={}us",
+             compact_block_range_50={}us tree_state_at={}us transaction_avg={}us \
+             (n={} total={}us)",
             env.network().name(),
             tip_height.value(),
             latest_block_micros,
             compact_block_at_micros,
             compact_block_range_50_micros,
             tree_state_at_micros,
+            transaction_avg_micros,
+            TRANSACTION_LOOKUP_ITERATIONS,
+            transaction_total_micros,
         );
     }
     Ok(())

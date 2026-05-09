@@ -432,6 +432,8 @@ When a Zinder PR adds a new public type, configuration field, RPC method, or sto
 
 When a user files a feature request, the maintainer should check whether the request maps onto an open seam in the section above. If it does, the request should be expressible as an additive change. If it does not, the request requires an architecture decision before implementation.
 
+For the concrete-shape companion to this document, see [Closing the Zaino Surface Gap §Anti-Patterns Zinder Refuses to Replicate](closing-the-zaino-surface-gap.md#anti-patterns-zinder-refuses-to-replicate). The patterns above describe abstract design pressures; the anti-patterns section enumerates five specific Zaino shapes (verbosity integers, "verbose" booleans, string-keyed pool discriminants, sentinel-overloaded `BlockId`, `zaino_proto::*` types on the Rust API) that Zinder will not replicate, with `wallet/zallet/` evidence for each. A reviewer who sees one of those shapes in a PR should link the matching anti-pattern row, not (only) the pattern here.
+
 ## Closing Note
 
 Zaino's tracker is valuable prior art. The point is to treat public project experience as design input. Zinder starts with the benefit of Zaino maintainer discussions, Zallet integration notes, and Zebra's newer source surfaces. The work below every Zinder ADR, RFC, and architecture doc is to choose the product guarantees deliberately instead of rediscovering those tradeoffs later.

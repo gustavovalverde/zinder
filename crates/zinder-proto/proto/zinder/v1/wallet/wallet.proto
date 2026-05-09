@@ -62,6 +62,78 @@ message LatestBlockRequest {
   optional ChainEpoch at_epoch = 1;
 }
 
+// Typed selector for a block in the canonical best chain.
+//
+// Replaces the lightwalletd `BlockId { height, hash }` request shape: hash-only
+// callers no longer need a `height = 0` sentinel, and height-only callers get a
+// normalized response. Non-best-chain `(txid, block_hash)` lookup is a separate
+// future operation, not a third oneof arm.
+message BlockSelector {
+  oneof selector {
+    // Address the block at this height in the canonical best chain.
+    uint32 height = 1;
+    // Address the block with this hash in the canonical best chain.
+    bytes hash = 2;
+  }
+}
+
+// Block-identity resolver request.
+message BlockIdBySelectorRequest {
+  // Typed selector for the requested block.
+  BlockSelector selector = 1;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Block-identity resolver response bound to one chain epoch.
+message BlockIdResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Resolved block identity in the canonical best chain.
+  BlockMetadata block_id = 2;
+}
+
+// Typed block-header read-model response. The shape is Zinder-native: it does
+// not re-export upstream-node JSON-RPC fields or zaino-internal response types.
+message BlockHeaderInfo {
+  // Resolved block identity.
+  BlockMetadata block_id = 1;
+
+  // Hash of the previous block.
+  bytes previous_block_hash = 2;
+
+  // Merkle root of the transactions in this block.
+  bytes merkle_root_hash = 3;
+
+  // Block-commitment bytes (Sapling root or hashChainHistoryRoot, depending
+  // on network and height).
+  bytes commitment_bytes = 4;
+
+  // Block-time as Unix seconds.
+  int64 block_time = 5;
+
+  // Compact representation of the difficulty target.
+  uint32 bits = 6;
+
+  // Block nonce bytes.
+  bytes nonce = 7;
+
+  // Block version field from the header.
+  uint32 version = 8;
+}
+
+// Block-header read response bound to one chain epoch.
+message BlockHeaderResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Block-header read-model value at the resolved selector.
+  BlockHeaderInfo block_header = 2;
+}
+
 // A wallet-facing compact block payload from one chain epoch.
 message CompactBlock {
   // Height of the source block.
@@ -131,13 +203,71 @@ message Transaction {
   bytes payload_bytes = 4;
 }
 
-// Single transaction response bound to one chain epoch.
-message TransactionResponse {
+// Mined-transaction enrichment bound to a response's chain epoch.
+//
+// `MinedDetails` is response-shape, not artifact-shape. `confirmations`
+// MUST be computed from the response's `chain_epoch.tip_height` and the
+// transaction's mined height; `consensus_branch_id` and `block_time` are
+// derived from the source-aware layer that owns Zcash consensus
+// parameters and block-header parsing.
+message MinedDetails {
+  // Consensus branch identifier in effect at the mined height.
+  uint32 consensus_branch_id = 1;
+
+  // Block-time as Unix seconds, taken from the mined block header.
+  int64 block_time = 2;
+
+  // Confirmations: tip_height - mined_height + 1, bound to the
+  // response's chain_epoch.
+  uint32 confirmations = 3;
+}
+
+// Mined-transaction response carrier: the durable `Transaction` artifact
+// plus epoch-bound enrichment.
+message MinedTransaction {
+  // Mined-transaction artifact.
+  Transaction transaction = 1;
+
+  // Epoch-bound enrichment fields.
+  MinedDetails details = 2;
+}
+
+// Mempool-transaction response carrier.
+message MempoolTransaction {
+  // Serialized transaction payload bytes.
+  bytes payload_bytes = 1;
+
+  // Wall-clock time at which the indexer first observed the
+  // transaction in the source mempool.
+  int64 first_seen_unix_seconds = 2;
+}
+
+// Conflicting-chain transaction response carrier (reserved shape).
+message ConflictingChainTransaction {
+  // Reserved for future fields once non-best-chain transaction lookup
+  // ships. Empty today; the conflicting-chain status is its own signal.
+}
+
+// Single transaction-status response bound to one chain epoch.
+//
+// Replaces the legacy mined-only `TransactionResponse`. `NotFound` is
+// conveyed as gRPC `NOT_FOUND`, not as an oneof arm, because typed
+// errors do not consume oneof slots.
+message TransactionStatusResponse {
   // Chain epoch used to answer this response.
   ChainEpoch chain_epoch = 1;
 
-  // Transaction artifact at the requested transaction id.
-  Transaction transaction = 2;
+  // Typed transaction status.
+  oneof status {
+    // Transaction is mined in the canonical chain.
+    MinedTransaction mined = 2;
+
+    // Transaction is currently visible in the live mempool.
+    MempoolTransaction in_mempool = 3;
+
+    // Transaction is known to conflict with the visible canonical chain.
+    ConflictingChainTransaction conflicting = 4;
+  }
 }
 
 // Streamed compact block range chunk bound to one chain epoch.
@@ -753,14 +883,22 @@ service WalletQuery {
   // Return latest visible block metadata.
   rpc LatestBlock(LatestBlockRequest) returns (LatestBlockResponse);
 
+  // Resolve a typed block selector against the canonical best chain.
+  rpc BlockIdBySelector(BlockIdBySelectorRequest) returns (BlockIdResponse);
+
+  // Return the typed block-header read model at a typed block selector.
+  rpc BlockHeaderBySelector(BlockIdBySelectorRequest) returns (BlockHeaderResponse);
+
   // Return one compact block at a given height.
   rpc CompactBlock(CompactBlockRequest) returns (CompactBlockResponse);
 
   // Stream compact blocks for an inclusive height range.
   rpc CompactBlockRange(CompactBlockRangeRequest) returns (stream CompactBlockRangeChunk);
 
-  // Return one indexed transaction by transaction id.
-  rpc Transaction(TransactionRequest) returns (TransactionResponse);
+  // Return the typed status of one transaction by transaction id. NotFound
+  // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states
+  // are typed in the response oneof.
+  rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
   // Return tree state at one block height.
   rpc TreeState(TreeStateRequest) returns (TreeStateResponse);

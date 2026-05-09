@@ -42,10 +42,10 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
 
     let wallet_query = WalletQuery::new(store, ());
     let compact_block_range = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            None,
+        )
         .await?;
 
     assert_eq!(compact_block_range.chain_epoch, second_epoch);
@@ -71,10 +71,10 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
 
     let wallet_query = WalletQuery::new(store, ());
     let compact_block_range = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(1),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
+            None,
+        )
         .await?;
     let response_compact_block = compact_block_range
         .compact_blocks
@@ -403,11 +403,14 @@ async fn subtree_roots_response_uses_stored_tip_metadata_not_compact_block_paylo
 
     let wallet_query = WalletQuery::new(store, ());
     let response = wallet_query
-        .subtree_roots(SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-        ))
+        .subtree_roots(
+            SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(0),
+                NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+            ),
+            None,
+        )
         .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
@@ -430,10 +433,10 @@ async fn compact_block_range_reports_unavailable_artifact_without_node_repair() 
 
     let wallet_query = WalletQuery::new(store, ());
     let error = match wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            None,
+        )
         .await
     {
         Ok(compact_block_range) => {
@@ -496,10 +499,10 @@ async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()>
     let wallet_query = WalletQuery::new(store, ());
 
     let error = match wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(2),
-            BlockHeight::new(1),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(1)),
+            None,
+        )
         .await
     {
         Ok(compact_block_range) => {
@@ -527,10 +530,10 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
     );
 
     let error = match wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
+        .compact_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            None,
+        )
         .await
     {
         Ok(compact_block_range) => {

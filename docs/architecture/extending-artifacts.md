@@ -25,6 +25,38 @@ If any of these are false, you may not be adding an artifact family. Common alte
 
 When in doubt, the [Wallet data plane](wallet-data-plane.md) and [derive plane](derive-plane.md) docs distinguish the two boundaries.
 
+## Response enrichment is not an artifact family
+
+Some public responses need fields that are useful to consumers but are not
+canonical artifacts themselves. Do not add a storage family just because a client
+wants a more convenient response.
+
+Use response/read-model enrichment when all of the following are true:
+
+- The value can be computed from existing canonical artifacts, the response's
+  `ChainEpoch`, or network-upgrade metadata.
+- The value has no independent retention policy or lookup key.
+- The value is only meaningful when bound to the same chain view as the response.
+
+Current examples:
+
+- `confirmations` is derived from the response `ChainEpoch` and the mined block
+  height. It must not be computed from a second latest-tip read.
+- `consensus_branch_id` is derived from the network upgrade active at the mined
+  block height. It is not a transaction payload field.
+- `block_time` can be read from the retained block or compact-block header. If
+  repeated header parsing becomes too expensive, promote a typed block-header
+  read model or artifact; do not widen `TransactionArtifact` to cache a copy.
+- `MempoolMinedEvent.block_hash` is event enrichment from the mined block
+  identity. It belongs on the event payload so consumers do not issue a racy
+  follow-up read after receiving `Mined`.
+
+The rule for enrichment is epoch binding. A response builder may synthesize
+fields only from the same `ChainEpoch` or the same source event it is already
+serving. It must not call the upstream node, read an unpinned latest tip, or mix
+two visible epochs to fill a convenience field. If the value is added to a public
+wire response, add or update the capability string in the same change.
+
 ## The seven steps
 
 Adding a canonical artifact family touches seven layers, in this order:

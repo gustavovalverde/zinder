@@ -13,11 +13,14 @@ use std::{
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockId, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    UnixTimestampMillis,
 };
-use zinder_store::{ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange};
+use zinder_store::{
+    BlockHashLookup, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+};
 
 const CRASH_CHILD_ENV: &str = "ZINDER_STORE_CRASH_CHILD";
 const CRASH_STORE_PATH_ENV: &str = "ZINDER_STORE_CRASH_PATH";
@@ -118,6 +121,108 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
     assert_eq!(
         post_reorg_reader.compact_block_at(replacement_height)?,
         Some(replacement_compact_block)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "scenario builds three sequential chain epochs to exercise hash reintroduction; splitting it into helpers obscures the reorg sequence"
+)]
+fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (finalized_epoch, finalized_block, finalized_compact_block) = synthetic_epoch(1, 1);
+    let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
+    initial_epoch.finalized_height = finalized_epoch.tip_height;
+    initial_epoch.finalized_hash = finalized_epoch.tip_hash;
+    let reintroduced_hash = initial_block.block_hash;
+    let replacement_height = BlockHeight::new(2);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        initial_epoch,
+        vec![finalized_block.clone(), initial_block],
+        vec![finalized_compact_block, initial_compact_block],
+    ))?;
+
+    let replacement_hash = BlockHash::from_bytes([42; 32]);
+    let replacement_epoch = ChainEpoch {
+        id: ChainEpochId::new(2),
+        network: Network::ZcashRegtest,
+        tip_height: replacement_height,
+        tip_hash: replacement_hash,
+        finalized_height: finalized_epoch.tip_height,
+        finalized_hash: finalized_epoch.tip_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_020),
+    };
+    let replacement_block = BlockArtifact::new(
+        replacement_height,
+        replacement_hash,
+        finalized_block.block_hash,
+        b"replacement-block-2".to_vec(),
+    );
+    let replacement_compact_block = CompactBlockArtifact::new(
+        replacement_height,
+        replacement_hash,
+        b"replacement-compact-block-2".to_vec(),
+    );
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            replacement_epoch,
+            vec![replacement_block],
+            vec![replacement_compact_block],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: replacement_height,
+        }),
+    )?;
+
+    let reintroduced_epoch = ChainEpoch {
+        id: ChainEpochId::new(3),
+        network: Network::ZcashRegtest,
+        tip_height: replacement_height,
+        tip_hash: reintroduced_hash,
+        finalized_height: finalized_epoch.tip_height,
+        finalized_hash: finalized_epoch.tip_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_030),
+    };
+    let reintroduced_block = BlockArtifact::new(
+        replacement_height,
+        reintroduced_hash,
+        finalized_block.block_hash,
+        b"reintroduced-block-2".to_vec(),
+    );
+    let reintroduced_compact_block = CompactBlockArtifact::new(
+        replacement_height,
+        reintroduced_hash,
+        b"reintroduced-compact-block-2".to_vec(),
+    );
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            reintroduced_epoch,
+            vec![reintroduced_block],
+            vec![reintroduced_compact_block],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: replacement_height,
+        }),
+    )?;
+
+    let historical_reader = store.chain_epoch_reader_at(initial_epoch.id)?;
+    assert_eq!(
+        historical_reader.block_hash_lookup(reintroduced_hash)?,
+        BlockHashLookup::Resolved(BlockId::new(replacement_height, reintroduced_hash))
+    );
+
+    let current_reader = store.current_chain_epoch_reader()?;
+    assert_eq!(
+        current_reader.block_hash_lookup(replacement_hash)?,
+        BlockHashLookup::NotInBestChain
     );
 
     Ok(())

@@ -3,8 +3,8 @@
 use std::mem::size_of;
 
 use zinder_core::{
-    BlockHeight, ChainEpochId, Network, ShieldedProtocol, SubtreeRootIndex, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint,
+    BlockHash, BlockHeight, ChainEpochId, Network, ShieldedProtocol, SubtreeRootIndex,
+    TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
 };
 
 /// Ordered key bytes used inside `RocksDB` column families.
@@ -21,7 +21,8 @@ const TRANSPARENT_ADDRESS_UTXO_KEY_KIND: u8 = 6;
 const TRANSPARENT_UTXO_SPEND_KEY_KIND: u8 = 7;
 const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
 const TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND: u8 = 9;
-// Key kinds 10..=32 are reserved for future artifact families; visibility keys start at 33.
+const BLOCK_HASH_INDEX_KEY_KIND: u8 = 10;
+// Key kinds 11..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -220,6 +221,13 @@ impl StoreKey {
                 .0;
         key.extend_from_slice(&tx_index_in_block.to_be_bytes());
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn block_hash_index(network: Network, block_hash: BlockHash) -> Self {
+        let mut key = artifact_key_prefix(BLOCK_HASH_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&block_hash.as_bytes());
         Self(key)
     }
 
