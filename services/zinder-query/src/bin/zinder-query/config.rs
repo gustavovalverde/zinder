@@ -1,20 +1,17 @@
 //! Configuration loading for the `zinder-query` binary.
 
-use std::{net::SocketAddr, num::NonZeroU64, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use ::config::{Config, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, path_to_config_string, require_string,
-    zinder_environment_source,
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
+    NodeToml, duration_as_millis_u64, require_field,
 };
-use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget};
+use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
 
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get();
 const DEFAULT_INGEST_CONTROL_ADDR: &str = "http://127.0.0.1:9100";
 const DEFAULT_CHAIN_EVENT_RETENTION_HOURS: u64 = 168;
 const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
@@ -97,45 +94,50 @@ pub(crate) fn load_query_config(
     config_path: Option<PathBuf>,
     overrides: QueryConfigOverrides,
 ) -> Result<QueryConfig, QueryConfigError> {
-    let mut builder = Config::builder()
-        .set_default("query.listen_addr", "127.0.0.1:9101")
-        .map_err(ConfigError::load)?
-        .set_default("query.grpc.enable_reflection", true)
-        .map_err(ConfigError::load)?
-        .set_default("query.grpc.enable_health", true)
-        .map_err(ConfigError::load)?
-        .set_default("node.request_timeout_secs", DEFAULT_REQUEST_TIMEOUT_SECS)
-        .map_err(ConfigError::load)?
-        .set_default("node.max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
-        .map_err(ConfigError::load)?
-        .set_default(
+    let raw_config: QueryRawConfig = ConfigLoader::new()
+        .with_default("query.listen_addr", "127.0.0.1:9101")?
+        .with_default("query.grpc.enable_reflection", true)?
+        .with_default("query.grpc.enable_health", true)?
+        .with_default(
             "storage.chain_event_retention_hours",
             DEFAULT_CHAIN_EVENT_RETENTION_HOURS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "storage.mempool_mined_retention_minutes",
             DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "storage.mempool_invalidated_retention_hours",
             DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS,
-        )
-        .map_err(ConfigError::load)?;
-
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(true));
-    }
-
-    builder = builder.add_source(zinder_environment_source()?);
-    builder = apply_query_overrides(builder, overrides)?;
-
-    let raw_config: QueryRawConfig = builder
-        .build()
-        .map_err(ConfigError::load)?
-        .try_deserialize()
-        .map_err(ConfigError::load)?;
+        )?
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_path_if("storage.secondary_path", overrides.secondary_path)?
+        .with_override_if("storage.ingest_control_addr", overrides.ingest_control_addr)?
+        .with_override_path_if(
+            "storage.ingest_control_token_path",
+            overrides.ingest_control_token_path,
+        )?
+        .with_override_if(
+            "storage.chain_event_retention_hours",
+            overrides.chain_event_retention_hours,
+        )?
+        .with_override_if(
+            "storage.mempool_mined_retention_minutes",
+            overrides.mempool_mined_retention_minutes,
+        )?
+        .with_override_if(
+            "storage.mempool_invalidated_retention_hours",
+            overrides.mempool_invalidated_retention_hours,
+        )?
+        .with_override_if(
+            "query.listen_addr",
+            overrides.listen_addr.map(|addr| addr.to_string()),
+        )?
+        .with_override_if("node.json_rpc_addr", overrides.node_json_rpc_addr)?
+        .load()?;
 
     resolve_query_config(raw_config)
 }
@@ -154,12 +156,6 @@ struct QueryRawConfig {
     storage: StorageSection,
     query: QuerySection,
     node: NodeSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NetworkSection {
-    name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -190,103 +186,8 @@ struct QueryGrpcSection {
     enable_health: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NodeSection {
-    json_rpc_addr: Option<String>,
-    indexer_grpc_addr: Option<String>,
-    request_timeout_secs: Option<u64>,
-    max_response_bytes: Option<u64>,
-    auth: NodeAuthSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NodeAuthSection {
-    method: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-fn apply_query_overrides(
-    mut builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: QueryConfigOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, ConfigError> {
-    if let Some(network) = overrides.network {
-        builder = builder
-            .set_override("network.name", network)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(storage_path) = overrides.storage_path {
-        builder = builder
-            .set_override(
-                "storage.path",
-                path_to_config_string(storage_path, "storage.path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(secondary_path) = overrides.secondary_path {
-        builder = builder
-            .set_override(
-                "storage.secondary_path",
-                path_to_config_string(secondary_path, "storage.secondary_path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(ingest_control_addr) = overrides.ingest_control_addr {
-        builder = builder
-            .set_override("storage.ingest_control_addr", ingest_control_addr)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(token_path) = overrides.ingest_control_token_path {
-        builder = builder
-            .set_override(
-                "storage.ingest_control_token_path",
-                path_to_config_string(token_path, "storage.ingest_control_token_path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(chain_event_retention_hours) = overrides.chain_event_retention_hours {
-        builder = builder
-            .set_override(
-                "storage.chain_event_retention_hours",
-                chain_event_retention_hours,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(mempool_mined_retention_minutes) = overrides.mempool_mined_retention_minutes {
-        builder = builder
-            .set_override(
-                "storage.mempool_mined_retention_minutes",
-                mempool_mined_retention_minutes,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(mempool_invalidated_retention_hours) = overrides.mempool_invalidated_retention_hours
-    {
-        builder = builder
-            .set_override(
-                "storage.mempool_invalidated_retention_hours",
-                mempool_invalidated_retention_hours,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(listen_addr) = overrides.listen_addr {
-        builder = builder
-            .set_override("query.listen_addr", listen_addr.to_string())
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(json_rpc_addr) = overrides.node_json_rpc_addr {
-        builder = builder
-            .set_override("node.json_rpc_addr", json_rpc_addr)
-            .map_err(ConfigError::load)?;
-    }
-
-    Ok(builder)
-}
-
 fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
-    let network_name = require_string(config.network.name, "network.name")?;
+    let network = config.network.resolve()?;
     let retention_advertisement = resolve_retention_advertisement(&config.storage);
     let storage_path = config
         .storage
@@ -321,25 +222,19 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         .as_deref()
         .map(BearerToken::from_file)
         .transpose()?;
-    let listen_addr_string = require_string(config.query.listen_addr, "query.listen_addr")?;
-    let network = Network::from_name(&network_name)
-        .ok_or_else(|| ConfigError::invalid(format!("unknown network: {network_name}")))?;
+    let listen_addr_string = require_field(config.query.listen_addr, "query.listen_addr")?;
     let listen_addr = listen_addr_string.parse::<SocketAddr>().map_err(|source| {
         ConfigError::invalid(format!(
             "query.listen_addr {listen_addr_string} is not a socket address: {source}"
         ))
     })?;
-    let enable_reflection = config
-        .query
-        .grpc
-        .enable_reflection
-        .ok_or_else(|| ConfigError::missing_field("query.grpc.enable_reflection"))?;
-    let enable_health = config
-        .query
-        .grpc
-        .enable_health
-        .ok_or_else(|| ConfigError::missing_field("query.grpc.enable_health"))?;
-    let broadcaster = resolve_broadcaster_config(network, config.node)?;
+    let enable_reflection = require_field(
+        config.query.grpc.enable_reflection,
+        "query.grpc.enable_reflection",
+    )?;
+    let enable_health = require_field(config.query.grpc.enable_health, "query.grpc.enable_health")?;
+    let broadcaster =
+        NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
 
     Ok(QueryConfig {
         network,
@@ -380,60 +275,6 @@ fn resolve_retention_advertisement(storage: &StorageSection) -> RetentionAdverti
     }
 }
 
-fn resolve_broadcaster_config(
-    network: Network,
-    section: NodeSection,
-) -> Result<Option<NodeTarget>, ConfigError> {
-    let Some(json_rpc_addr) = section.json_rpc_addr else {
-        return Ok(None);
-    };
-
-    let request_timeout = section.request_timeout_secs.map_or_else(
-        || Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
-        Duration::from_secs,
-    );
-    let max_response_bytes = section
-        .max_response_bytes
-        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
-    let max_response_bytes = NonZeroU64::new(max_response_bytes)
-        .ok_or_else(|| ConfigError::invalid("node.max_response_bytes must be greater than zero"))?;
-    let node_auth = resolve_node_auth(section.auth)?;
-
-    Ok(Some(
-        NodeTarget::new(
-            network,
-            json_rpc_addr,
-            node_auth,
-            request_timeout,
-            max_response_bytes,
-        )
-        .with_indexer_grpc_addr(section.indexer_grpc_addr),
-    ))
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "configuration durations are rejected by operators long before u64 millis overflow"
-)]
-fn millis_u64(duration: Duration) -> u64 {
-    duration.as_millis() as u64
-}
-
-fn resolve_node_auth(auth: NodeAuthSection) -> Result<NodeAuth, ConfigError> {
-    let method = auth.method.unwrap_or_else(|| "none".to_string());
-    match method.as_str() {
-        "none" => Ok(NodeAuth::None),
-        "basic" => {
-            let username = require_string(auth.username, "node.auth.username")?;
-            let password = require_string(auth.password, "node.auth.password")?;
-            Ok(NodeAuth::basic(username, password))
-        }
-        other => Err(ConfigError::invalid(format!(
-            "node.auth.method {other} must be one of: none, basic"
-        ))),
-    }
-}
-
 #[derive(Serialize)]
 struct QueryConfigToml {
     network: NetworkToml,
@@ -446,13 +287,13 @@ struct QueryConfigToml {
 impl QueryConfigToml {
     fn from_query_config(config: &QueryConfig) -> Self {
         Self {
-            network: NetworkToml {
-                name: config.network.name(),
-            },
+            network: NetworkToml::from_network(config.network),
             storage: StorageToml {
                 path: config.storage_path.display().to_string(),
                 secondary_path: config.secondary_path.display().to_string(),
-                secondary_catchup_interval_ms: millis_u64(config.secondary_catchup_interval),
+                secondary_catchup_interval_ms: duration_as_millis_u64(
+                    config.secondary_catchup_interval,
+                ),
                 secondary_replica_lag_threshold_chain_epochs: config
                     .secondary_replica_lag_threshold_chain_epochs,
                 ingest_control_addr: config.ingest_control_addr.clone(),
@@ -472,14 +313,9 @@ impl QueryConfigToml {
                     enable_health: config.grpc.enable_health,
                 },
             },
-            node: config.broadcaster.as_ref().map(NodeToml::from),
+            node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
         }
     }
-}
-
-#[derive(Serialize)]
-struct NetworkToml {
-    name: &'static str,
 }
 
 #[derive(Serialize)]
@@ -506,57 +342,4 @@ struct QueryToml {
 struct QueryGrpcToml {
     enable_reflection: bool,
     enable_health: bool,
-}
-
-#[derive(Serialize)]
-struct NodeToml {
-    json_rpc_addr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    indexer_grpc_addr: Option<String>,
-    request_timeout_secs: u64,
-    max_response_bytes: u64,
-    auth: NodeAuthToml,
-}
-
-impl From<&NodeTarget> for NodeToml {
-    fn from(target: &NodeTarget) -> Self {
-        Self {
-            json_rpc_addr: target.json_rpc_addr.clone(),
-            indexer_grpc_addr: target.indexer_grpc_addr.clone(),
-            request_timeout_secs: target.request_timeout.as_secs(),
-            max_response_bytes: target.max_response_bytes.get(),
-            auth: NodeAuthToml::from(&target.node_auth),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct NodeAuthToml {
-    method: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password: Option<&'static str>,
-}
-
-impl From<&NodeAuth> for NodeAuthToml {
-    fn from(auth: &NodeAuth) -> Self {
-        match auth {
-            NodeAuth::None => Self {
-                method: "none",
-                username: None,
-                password: None,
-            },
-            NodeAuth::Basic { username, .. } => Self {
-                method: "basic",
-                username: Some(username.clone()),
-                password: Some("[REDACTED]"),
-            },
-            NodeAuth::Cookie { .. } => Self {
-                method: "cookie",
-                username: None,
-                password: Some("[REDACTED]"),
-            },
-        }
-    }
 }

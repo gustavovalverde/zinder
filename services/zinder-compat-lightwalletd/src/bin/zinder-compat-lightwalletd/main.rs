@@ -10,14 +10,12 @@ use zinder_compat_lightwalletd::{
 use zinder_runtime::{
     OpsServer, Readiness, cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::SecondaryChainStore;
 
 mod config;
 
-use config::{
-    BroadcasterConfig, LightwalletdConfig, LightwalletdConfigError, LightwalletdConfigOverrides,
-};
+use config::{LightwalletdConfig, LightwalletdConfigError, LightwalletdConfigOverrides};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -114,10 +112,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .current_chain_epoch()
         .map_err(LightwalletdConfigError::Store)?
         .map(|epoch| epoch.tip_height.value());
-    let broadcaster = build_broadcaster(
-        lightwalletd_config.network,
-        lightwalletd_config.broadcaster.as_ref(),
-    )?;
+    let broadcaster = build_broadcaster(lightwalletd_config.broadcaster.as_ref())?;
     let wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
@@ -200,10 +195,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 }
 
 fn build_broadcaster(
-    network: zinder_core::Network,
-    broadcaster_config: Option<&BroadcasterConfig>,
+    broadcaster_target: Option<&NodeTarget>,
 ) -> Result<Option<ZebraJsonRpcSource>, LightwalletdConfigError> {
-    let Some(broadcaster_config) = broadcaster_config else {
+    let Some(broadcaster_target) = broadcaster_target else {
         tracing::info!(
             target: "zinder::compat_lightwalletd",
             event = "transaction_broadcast_disabled",
@@ -213,12 +207,12 @@ fn build_broadcaster(
     };
 
     let source = ZebraJsonRpcSource::with_options(
-        network,
-        broadcaster_config.json_rpc_addr.clone(),
-        broadcaster_config.auth.clone(),
+        broadcaster_target.network,
+        broadcaster_target.json_rpc_addr.clone(),
+        broadcaster_target.node_auth.clone(),
         ZebraJsonRpcSourceOptions {
-            request_timeout: broadcaster_config.request_timeout,
-            max_response_bytes: broadcaster_config.max_response_bytes,
+            request_timeout: broadcaster_target.request_timeout,
+            max_response_bytes: broadcaster_target.max_response_bytes,
         },
     )
     .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?;
@@ -226,7 +220,7 @@ fn build_broadcaster(
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "transaction_broadcast_enabled",
-        json_rpc_addr = %broadcaster_config.json_rpc_addr,
+        json_rpc_addr = %broadcaster_target.json_rpc_addr,
         "transaction broadcast enabled via Zebra JSON-RPC"
     );
     Ok(Some(source))

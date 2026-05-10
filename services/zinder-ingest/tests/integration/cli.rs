@@ -423,7 +423,7 @@ fn sensitive_password_environment_override_is_rejected() -> Result<(), Box<dyn E
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("sensitive field password"));
+    assert!(stderr.contains("ZINDER_NODE__AUTH__PASSWORD targets a sensitive field"));
     assert!(!stderr.contains("env-secret"));
 
     Ok(())
@@ -448,7 +448,7 @@ fn sensitive_password_hint_environment_override_is_rejected() -> Result<(), Box<
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("sensitive field password_hint"));
+    assert!(stderr.contains("ZINDER_NODE__AUTH__PASSWORD_HINT targets a sensitive field"));
     assert!(!stderr.contains("env-secret"));
 
     Ok(())
@@ -513,7 +513,7 @@ fn zero_max_response_bytes_fails_before_storage_creation() -> Result<(), Box<dyn
     assert!(!output.status.success());
     assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("invalid JSON-RPC response byte limit"));
+    assert!(stderr.contains("node.max_response_bytes must be greater than zero"));
 
     Ok(())
 }

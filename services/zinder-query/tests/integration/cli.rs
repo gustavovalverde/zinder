@@ -114,7 +114,10 @@ fn sensitive_environment_override_is_rejected() -> eyre::Result<()> {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("sensitive field password"), "{stderr}");
+    assert!(
+        stderr.contains("ZINDER_QUERY__AUTH__PASSWORD targets a sensitive field"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("env-secret"), "{stderr}");
 
     Ok(())

@@ -54,13 +54,6 @@ pub enum NodeSourceKind {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IngestError {
-    /// Requested network name is not supported.
-    #[error("unknown network: {network_name}")]
-    UnknownNetwork {
-        /// User-provided network name.
-        network_name: String,
-    },
-
     /// Requested node source name is not supported.
     #[error("unknown node source: {node_source}")]
     UnknownNodeSource {
@@ -88,10 +81,6 @@ pub enum IngestError {
     /// Tip-follow poll interval is invalid.
     #[error("invalid tip-follow poll interval: poll interval must be greater than zero")]
     InvalidTipFollowPollInterval,
-
-    /// JSON-RPC response byte limit is invalid.
-    #[error("invalid JSON-RPC response byte limit: max response bytes must be greater than zero")]
-    InvalidMaxResponseBytes,
 
     /// Node returned fewer subtree roots than committed tree sizes require.
     #[error(
@@ -930,13 +919,11 @@ const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
 fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
     match error {
         None => "none",
-        Some(IngestError::UnknownNetwork { .. }) => "unknown_network",
         Some(IngestError::UnknownNodeSource { .. }) => "unknown_node_source",
         Some(IngestError::InvalidBackfillRange { .. }) => "invalid_backfill_range",
         Some(IngestError::InvalidCommitBatchBlocks) => "invalid_commit_batch_blocks",
         Some(IngestError::InvalidReorgWindowBlocks) => "invalid_reorg_window_blocks",
         Some(IngestError::InvalidTipFollowPollInterval) => "invalid_tip_follow_poll_interval",
-        Some(IngestError::InvalidMaxResponseBytes) => "invalid_max_response_bytes",
         Some(IngestError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(IngestError::SubtreeRootCompletingBlockMissing { .. }) => {
             "subtree_root_completing_block_missing"

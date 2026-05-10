@@ -6,8 +6,10 @@
 //!   values defined in `docs/architecture/service-operations.md`.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
-//! - The shared configuration error type and helpers ([`ConfigError`],
-//!   [`zinder_environment_source`], [`require_string`], [`path_to_config_string`])
+//! - The shared configuration error type, fluent layered loader, and shared
+//!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
+//!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeToml`],
+//!   [`zinder_environment_source`], [`require_field`], [`duration_as_millis_u64`])
 //!   that every service binary uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
@@ -27,7 +29,10 @@ pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
     BearerTokenError, BearerTokenServerInterceptor, connect_authenticated_channel,
 };
-pub use config::{ConfigError, path_to_config_string, require_string, zinder_environment_source};
+pub use config::{
+    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeToml,
+    duration_as_millis_u64, require_field, zinder_environment_source,
+};
 pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,

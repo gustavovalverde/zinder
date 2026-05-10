@@ -86,6 +86,23 @@ impl NodeTarget {
         self
     }
 
+    /// Resolves an optional [`NodeTarget`] from a deserialized [`NodeSection`].
+    ///
+    /// Returns `Ok(None)` when [`NodeSection::json_rpc_addr`] is unset, so a
+    /// missing `[node]` section means "no node target," not "validation
+    /// failure." Once the address is present every other required field is
+    /// validated through [`NodeTarget::resolve`]. Used by reader binaries
+    /// where the broadcaster is optional.
+    pub fn resolve_optional(
+        network: Network,
+        section: NodeSection,
+    ) -> Result<Option<Self>, NodeConfigError> {
+        if section.json_rpc_addr.is_none() {
+            return Ok(None);
+        }
+        Self::resolve(network, section).map(Some)
+    }
+
     /// Resolves a [`NodeTarget`] from a deserialized [`NodeSection`].
     ///
     /// Each production binary calls this after deserializing its raw config

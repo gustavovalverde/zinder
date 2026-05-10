@@ -11,10 +11,16 @@
 //! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-use ::config::{ConfigError as InnerConfigError, Environment};
+use ::config::{
+    Config, ConfigBuilder, ConfigError as InnerConfigError, Environment, File, FileFormat, Value,
+    builder::DefaultState,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+use zinder_core::Network;
+use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
@@ -61,13 +67,11 @@ pub enum ConfigError {
     /// Sensitive values must come from the TOML config file or a secret
     /// manager so they never appear in process environment.
     #[error(
-        "environment variable {variable} targets sensitive field {field}; use the config file or secret manager instead"
+        "environment variable {variable} targets a sensitive field; provide it through the config file or a secret manager instead"
     )]
     SensitiveEnvironmentOverride {
         /// Environment variable name.
         variable: String,
-        /// Sensitive leaf field name.
-        field: String,
     },
 
     /// A CLI-supplied path is not valid UTF-8 and cannot be carried through
@@ -101,6 +105,25 @@ impl ConfigError {
     }
 }
 
+impl From<NodeConfigError> for ConfigError {
+    fn from(error: NodeConfigError) -> Self {
+        match error {
+            NodeConfigError::MissingField { field } => Self::MissingField { field },
+            NodeConfigError::Invalid { reason } => Self::invalid(reason),
+            NodeConfigError::AuthFieldNotApplicable { field, method } => Self::invalid(format!(
+                "{field} is not valid when node.auth.method is {method}"
+            )),
+            NodeConfigError::UnknownAuthMethod { method } => {
+                Self::invalid(format!("unknown node.auth.method: {method}"))
+            }
+            NodeConfigError::EnvParseFailed { field, reason } => Self::invalid(format!(
+                "failed to parse environment variable for {field}: {reason}"
+            )),
+            other => Self::invalid(other.to_string()),
+        }
+    }
+}
+
 /// Builds the standard Zinder environment source for `config-rs`.
 ///
 /// Strips the `ZINDER_TEST_` prefix (used by `ZINDER_TEST_LIVE` and crash-
@@ -122,8 +145,8 @@ pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
             continue;
         };
 
-        if let Some(field) = sensitive_env_field(config_key) {
-            return Err(ConfigError::SensitiveEnvironmentOverride { variable, field });
+        if env_leaf_is_sensitive(config_key) {
+            return Err(ConfigError::SensitiveEnvironmentOverride { variable });
         }
 
         filtered_env.insert(config_key.to_owned(), env_value);
@@ -135,8 +158,8 @@ pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
         .source(Some(filtered_env)))
 }
 
-/// Returns the sensitive leaf field name if `config_key` targets one.
-fn sensitive_env_field(config_key: &str) -> Option<String> {
+/// Returns `true` when `config_key`'s leaf segment matches a sensitive marker.
+fn env_leaf_is_sensitive(config_key: &str) -> bool {
     let leaf = config_key
         .rsplit("__")
         .next()
@@ -146,25 +169,250 @@ fn sensitive_env_field(config_key: &str) -> Option<String> {
     SENSITIVE_ENV_LEAF_MARKERS
         .iter()
         .any(|marker| leaf.contains(marker))
-        .then_some(leaf)
 }
 
 /// Returns `field_value` or a [`ConfigError::MissingField`] error pointing at
 /// `field`.
-pub fn require_string(
-    field_value: Option<String>,
-    field: &'static str,
-) -> Result<String, ConfigError> {
+pub fn require_field<T>(field_value: Option<T>, field: &'static str) -> Result<T, ConfigError> {
     field_value.ok_or(ConfigError::MissingField { field })
 }
 
 /// Converts `path` to a UTF-8 string suitable for the TOML-shaped config
 /// layer, returning [`ConfigError::NonUnicodePath`] if the path is not valid
 /// UTF-8.
-pub fn path_to_config_string(path: PathBuf, field: &'static str) -> Result<String, ConfigError> {
+fn path_to_config_string(path: PathBuf, field: &'static str) -> Result<String, ConfigError> {
     path.into_os_string()
         .into_string()
         .map_err(|_| ConfigError::NonUnicodePath { field })
+}
+
+/// Converts a [`Duration`] to whole milliseconds as `u64`.
+///
+/// Saturates at [`u64::MAX`] for durations that exceed the representable
+/// range. Used by every binary's `--print-config` renderer; the saturating
+/// fallback keeps the cast lint-clean without panicking on absurd
+/// configurations.
+#[must_use]
+pub fn duration_as_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Raw `[network]` config section shared by every Zinder service binary.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSection {
+    /// Network name: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`.
+    pub name: Option<String>,
+}
+
+impl NetworkSection {
+    /// Resolves the configured [`Network`] or returns
+    /// [`ConfigError::MissingField`] / [`ConfigError::Invalid`].
+    pub fn resolve(self) -> Result<Network, ConfigError> {
+        let name = require_field(self.name, "network.name")?;
+        Network::from_name(&name).ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "unknown network: {name}; expected zcash-mainnet, zcash-testnet, or zcash-regtest"
+            ))
+        })
+    }
+}
+
+/// Fluent layered configuration loader.
+///
+/// Encapsulates the canonical Zinder precedence: `defaults -> file ->
+/// ZINDER_* environment -> CLI overrides`. Each binary builds the same shape
+/// by chaining [`ConfigLoader::with_default`], [`ConfigLoader::with_file`],
+/// [`ConfigLoader::with_zinder_env`], and [`ConfigLoader::with_override_if`]
+/// before calling [`ConfigLoader::load`] to deserialize.
+#[must_use]
+pub struct ConfigLoader {
+    builder: ConfigBuilder<DefaultState>,
+}
+
+impl ConfigLoader {
+    /// Starts a new loader with no sources or defaults.
+    pub fn new() -> Self {
+        Self {
+            builder: Config::builder(),
+        }
+    }
+
+    /// Records a default for `key`. Defaults sit at the lowest precedence
+    /// regardless of when they are recorded.
+    pub fn with_default<V>(mut self, key: &str, default_for_key: V) -> Result<Self, ConfigError>
+    where
+        V: Into<Value>,
+    {
+        self.builder = self
+            .builder
+            .set_default(key, default_for_key)
+            .map_err(ConfigError::load)?;
+        Ok(self)
+    }
+
+    /// Adds an optional TOML file source. When `path` is `None` the loader
+    /// is unchanged; when `Some`, the file is required to exist.
+    pub fn with_file(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(path) = path {
+            self.builder = self
+                .builder
+                .add_source(File::from(path).format(FileFormat::Toml).required(true));
+        }
+        self
+    }
+
+    /// Adds the standard Zinder environment source (sensitive-leaf rejection
+    /// + `ZINDER_TEST_*` stripping).
+    pub fn with_zinder_env(mut self) -> Result<Self, ConfigError> {
+        self.builder = self.builder.add_source(zinder_environment_source()?);
+        Ok(self)
+    }
+
+    /// Records an override for `key` when `override_for_key` is `Some`.
+    /// Overrides sit at the highest precedence regardless of when they are
+    /// recorded.
+    pub fn with_override_if<V>(
+        mut self,
+        key: &str,
+        override_for_key: Option<V>,
+    ) -> Result<Self, ConfigError>
+    where
+        V: Into<Value>,
+    {
+        if let Some(override_for_key) = override_for_key {
+            self.builder = self
+                .builder
+                .set_override(key, override_for_key)
+                .map_err(ConfigError::load)?;
+        }
+        Ok(self)
+    }
+
+    /// Records an override for `key` from a [`PathBuf`] when present,
+    /// converting to UTF-8 for the TOML-shaped config layer.
+    pub fn with_override_path_if(
+        mut self,
+        key: &'static str,
+        override_path: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        if let Some(path) = override_path {
+            let path_string = path_to_config_string(path, key)?;
+            self.builder = self
+                .builder
+                .set_override(key, path_string)
+                .map_err(ConfigError::load)?;
+        }
+        Ok(self)
+    }
+
+    /// Builds the merged configuration and deserializes it as `T`.
+    pub fn load<T>(self) -> Result<T, ConfigError>
+    where
+        T: DeserializeOwned,
+    {
+        self.builder
+            .build()
+            .map_err(ConfigError::load)?
+            .try_deserialize::<T>()
+            .map_err(ConfigError::load)
+    }
+}
+
+impl Default for ConfigLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Redacted TOML projection of `[network]` for `--print-config`.
+#[derive(Debug, Serialize)]
+pub struct NetworkToml {
+    /// Network name in canonical form (e.g. `zcash-mainnet`).
+    pub name: &'static str,
+}
+
+impl NetworkToml {
+    /// Builds a [`NetworkToml`] from a resolved [`Network`].
+    #[must_use]
+    pub const fn from_network(network: Network) -> Self {
+        Self {
+            name: network.name(),
+        }
+    }
+}
+
+/// Redacted TOML projection of `[node.auth]` for `--print-config`.
+#[derive(Debug, Serialize)]
+pub struct NodeAuthToml {
+    /// Auth method: `none`, `basic`, or `cookie`.
+    pub method: &'static str,
+    /// Basic-auth username, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Basic-auth password placeholder. Always `[REDACTED]` when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<&'static str>,
+    /// Cookie-auth path placeholder. Always `[REDACTED]` when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<&'static str>,
+}
+
+impl NodeAuthToml {
+    /// Builds a redacted [`NodeAuthToml`] from a resolved [`NodeAuth`].
+    #[must_use]
+    pub fn from_node_auth(auth: &NodeAuth) -> Self {
+        match auth {
+            NodeAuth::None => Self {
+                method: "none",
+                username: None,
+                password: None,
+                path: None,
+            },
+            NodeAuth::Basic { username, .. } => Self {
+                method: "basic",
+                username: Some(username.clone()),
+                password: Some("[REDACTED]"),
+                path: None,
+            },
+            NodeAuth::Cookie { .. } => Self {
+                method: "cookie",
+                username: None,
+                password: None,
+                path: Some("[REDACTED]"),
+            },
+        }
+    }
+}
+
+/// Redacted TOML projection of `[node]` for `--print-config`.
+#[derive(Debug, Serialize)]
+pub struct NodeToml {
+    /// Node JSON-RPC base URL.
+    pub json_rpc_addr: String,
+    /// Optional Zebra indexer gRPC endpoint URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexer_grpc_addr: Option<String>,
+    /// Per-RPC request timeout in seconds.
+    pub request_timeout_secs: u64,
+    /// Maximum JSON-RPC response body size accepted from the node.
+    pub max_response_bytes: u64,
+    /// Auth subsection.
+    pub auth: NodeAuthToml,
+}
+
+impl NodeToml {
+    /// Builds a redacted [`NodeToml`] from a resolved [`NodeTarget`].
+    #[must_use]
+    pub fn from_node_target(target: &NodeTarget) -> Self {
+        Self {
+            json_rpc_addr: target.json_rpc_addr.clone(),
+            indexer_grpc_addr: target.indexer_grpc_addr.clone(),
+            request_timeout_secs: target.request_timeout.as_secs(),
+            max_response_bytes: target.max_response_bytes.get(),
+            auth: NodeAuthToml::from_node_auth(&target.node_auth),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -172,23 +420,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sensitive_env_field_detects_password_leaf() {
-        assert_eq!(
-            sensitive_env_field("NODE__AUTH__PASSWORD"),
-            Some("password".to_owned())
-        );
+    fn env_leaf_is_sensitive_detects_password_leaf() {
+        assert!(env_leaf_is_sensitive("NODE__AUTH__PASSWORD"));
     }
 
     #[test]
-    fn sensitive_env_field_passes_innocuous_leaf() {
-        assert!(sensitive_env_field("NODE__JSON_RPC_ADDR").is_none());
+    fn env_leaf_is_sensitive_passes_innocuous_leaf() {
+        assert!(!env_leaf_is_sensitive("NODE__JSON_RPC_ADDR"));
     }
 
     #[test]
-    fn require_string_returns_missing_field_for_none() {
-        let result = require_string(None, "ingest.commit_batch_blocks");
+    fn require_field_returns_missing_field_for_none() {
+        let outcome: Result<u32, _> = require_field(None, "ingest.commit_batch_blocks");
         assert!(matches!(
-            result,
+            outcome,
             Err(ConfigError::MissingField {
                 field: "ingest.commit_batch_blocks"
             })
@@ -196,9 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn require_string_passes_through_value() -> Result<(), ConfigError> {
-        let value = require_string(Some("hello".to_owned()), "x")?;
-        assert_eq!(value, "hello");
+    fn require_field_passes_through_value() -> Result<(), ConfigError> {
+        let resolved: String = require_field(Some("hello".to_owned()), "x")?;
+        assert_eq!(resolved, "hello");
         Ok(())
+    }
+
+    #[test]
+    fn duration_as_millis_u64_saturates_on_overflow() {
+        assert_eq!(duration_as_millis_u64(Duration::from_millis(1_500)), 1_500);
+        assert_eq!(duration_as_millis_u64(Duration::MAX), u64::MAX);
     }
 }

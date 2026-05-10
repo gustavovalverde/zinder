@@ -27,6 +27,8 @@ toml.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zinder-core.workspace = true
+zinder-source.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

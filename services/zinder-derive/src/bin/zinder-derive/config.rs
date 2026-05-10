@@ -2,13 +2,10 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use ::config::{Config, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_runtime::{
-    ConfigError, path_to_config_string, require_string, zinder_environment_source,
-};
+use zinder_runtime::{ConfigError, ConfigLoader, NetworkSection, NetworkToml, require_field};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9069";
@@ -60,21 +57,26 @@ pub(crate) fn load_derive_config(
     config_path: Option<PathBuf>,
     overrides: DeriveConfigOverrides,
 ) -> Result<DeriveConfig, DeriveConfigError> {
-    let mut builder = Config::builder()
-        .set_default("derive.explorer.listen_addr", DEFAULT_LISTEN_ADDR)
-        .map_err(ConfigError::load)?
-        .set_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)
-        .map_err(ConfigError::load)?;
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(true));
-    }
-    builder = builder.add_source(zinder_environment_source()?);
-    builder = apply_derive_overrides(builder, overrides)?;
-    let raw: DeriveRawConfig = builder
-        .build()
-        .map_err(ConfigError::load)?
-        .try_deserialize()
-        .map_err(ConfigError::load)?;
+    let raw: DeriveRawConfig = ConfigLoader::new()
+        .with_default("derive.explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
+        .with_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)?
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_path_if("derive.explorer.storage_path", overrides.storage_path)?
+        .with_override_if(
+            "derive.explorer.listen_addr",
+            overrides.listen_addr.map(|addr| addr.to_string()),
+        )?
+        .with_override_if(
+            "ops.listen_addr",
+            overrides.ops_listen_addr.map(|addr| addr.to_string()),
+        )?
+        .with_override_if(
+            "derive.explorer.wallet_query_endpoint",
+            overrides.wallet_query_endpoint,
+        )?
+        .load()?;
     resolve_derive_config(raw)
 }
 
@@ -91,12 +93,6 @@ struct DeriveRawConfig {
     network: NetworkSection,
     derive: DeriveSection,
     ops: OpsSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NetworkSection {
-    name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -127,11 +123,6 @@ struct DeriveConfigToml {
 }
 
 #[derive(Debug, Serialize)]
-struct NetworkToml {
-    name: String,
-}
-
-#[derive(Debug, Serialize)]
 struct DeriveToml {
     explorer: DeriveExplorerToml,
 }
@@ -151,9 +142,7 @@ struct OpsToml {
 impl DeriveConfigToml {
     fn from_resolved(config: &DeriveConfig) -> Self {
         Self {
-            network: NetworkToml {
-                name: config.network.name().to_owned(),
-            },
+            network: NetworkToml::from_network(config.network),
             derive: DeriveToml {
                 explorer: DeriveExplorerToml {
                     listen_addr: config.listen_addr.to_string(),
@@ -171,54 +160,16 @@ impl DeriveConfigToml {
     }
 }
 
-fn apply_derive_overrides(
-    builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: DeriveConfigOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, DeriveConfigError> {
-    let mut builder = builder;
-    if let Some(network) = overrides.network {
-        builder = builder
-            .set_override("network.name", network)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(storage_path) = overrides.storage_path {
-        builder = builder
-            .set_override(
-                "derive.explorer.storage_path",
-                path_to_config_string(storage_path, "derive.explorer.storage_path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(listen_addr) = overrides.listen_addr {
-        builder = builder
-            .set_override("derive.explorer.listen_addr", listen_addr.to_string())
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(ops_listen_addr) = overrides.ops_listen_addr {
-        builder = builder
-            .set_override("ops.listen_addr", ops_listen_addr.to_string())
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(endpoint) = overrides.wallet_query_endpoint {
-        builder = builder
-            .set_override("derive.explorer.wallet_query_endpoint", endpoint)
-            .map_err(ConfigError::load)?;
-    }
-    Ok(builder)
-}
-
 fn resolve_derive_config(raw: DeriveRawConfig) -> Result<DeriveConfig, DeriveConfigError> {
-    let network_name = require_string(raw.network.name, "network.name")?;
-    let network = Network::from_name(&network_name)
-        .ok_or_else(|| ConfigError::invalid(format!("unsupported network name: {network_name}")))?;
-    let listen_addr_text = require_string(
+    let network = raw.network.resolve()?;
+    let listen_addr_text = require_field(
         raw.derive.explorer.listen_addr,
         "derive.explorer.listen_addr",
     )?;
     let listen_addr = listen_addr_text
         .parse::<SocketAddr>()
         .map_err(|error| ConfigError::invalid(error.to_string()))?;
-    let storage_path_text = require_string(
+    let storage_path_text = require_field(
         raw.derive.explorer.storage_path,
         "derive.explorer.storage_path",
     )?;

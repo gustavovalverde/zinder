@@ -2,7 +2,6 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use ::config::{Config, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
@@ -11,21 +10,16 @@ use zinder_ingest::{
     IngestError, MempoolEventRetentionWorkerConfig, NodeSourceKind, TipFollowConfig,
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, path_to_config_string, require_string,
-    zinder_environment_source,
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
+    NodeToml, duration_as_millis_u64, require_field,
 };
 use zinder_store::MempoolEventRetentionConfig;
 
 use crate::cli::parse::{
-    parse_commit_batch_blocks, parse_max_response_bytes, parse_network, parse_node_source,
-    parse_poll_interval_ms, parse_reorg_window_blocks,
+    parse_commit_batch_blocks, parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks,
 };
-use zinder_source::{
-    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceChainCheckpoint,
-};
+use zinder_source::{NodeAuthSection, NodeSection, NodeTarget, SourceChainCheckpoint};
 
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get();
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
 const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
@@ -78,7 +72,8 @@ impl BackfillCommandConfig {
 }
 
 /// Backfill coverage policy selected by an operator.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum BackfillCoverage {
     /// Use explicitly supplied heights.
     Explicit,
@@ -87,7 +82,7 @@ pub(crate) enum BackfillCoverage {
 }
 
 impl BackfillCoverage {
-    const fn as_str(self) -> &'static str {
+    const fn as_kebab_case(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
             Self::WalletServing => "wallet-serving",
@@ -202,31 +197,37 @@ pub(crate) fn load_backfill_config(
     config_path: Option<PathBuf>,
     overrides: BackfillConfigOverrides,
 ) -> Result<BackfillCommandConfig, IngestConfigError> {
-    let mut builder = Config::builder()
-        .set_default("node.request_timeout_secs", DEFAULT_REQUEST_TIMEOUT_SECS)
-        .map_err(ConfigError::load)?
-        .set_default("node.max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
-        .map_err(ConfigError::load)?
-        .set_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)
-        .map_err(ConfigError::load)?
-        .set_default(
+    let raw_config: IngestConfig = ConfigLoader::new()
+        .with_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)?
+        .with_default(
             "backfill.allow_near_tip_finalize",
             DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
-        )
-        .map_err(ConfigError::load)?;
-
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(true));
-    }
-
-    builder = builder.add_source(zinder_environment_source()?);
-    builder = apply_backfill_overrides(builder, overrides)?;
-
-    let raw_config: IngestConfig = builder
-        .build()
-        .map_err(ConfigError::load)?
-        .try_deserialize()
-        .map_err(ConfigError::load)?;
+        )?
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_if("node.source", overrides.node_source)?
+        .with_override_if("node.json_rpc_addr", overrides.json_rpc_addr)?
+        .with_override_if("node.auth.method", overrides.node_auth_method)?
+        .with_override_if("node.auth.username", overrides.node_auth_username)?
+        .with_override_path_if("node.auth.path", overrides.node_auth_path)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
+        .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
+        .with_override_if("ingest.commit_batch_blocks", overrides.commit_batch_blocks)?
+        .with_override_if("backfill.from_height", overrides.from_height)?
+        .with_override_if("backfill.to_height", overrides.to_height)?
+        .with_override_if(
+            "backfill.allow_near_tip_finalize",
+            overrides.allow_near_tip_finalize,
+        )?
+        .with_override_if("backfill.checkpoint_height", overrides.checkpoint_height)?
+        .with_override_if(
+            "backfill.coverage",
+            (overrides.wallet_serving == Some(true))
+                .then_some(BackfillCoverage::WalletServing.as_kebab_case()),
+        )?
+        .load()?;
 
     resolve_backfill_config(raw_config)
 }
@@ -236,73 +237,74 @@ pub(crate) fn load_tip_follow_config(
     config_path: Option<PathBuf>,
     overrides: TipFollowConfigOverrides,
 ) -> Result<TipFollowCommandConfig, IngestConfigError> {
-    let mut builder = Config::builder()
-        .set_default("node.request_timeout_secs", DEFAULT_REQUEST_TIMEOUT_SECS)
-        .map_err(ConfigError::load)?
-        .set_default("node.max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
-        .map_err(ConfigError::load)?
-        .set_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)
-        .map_err(ConfigError::load)?
-        .set_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)
-        .map_err(ConfigError::load)?
-        .set_default(
+    let raw_config: IngestConfig = ConfigLoader::new()
+        .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
+        .with_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)?
+        .with_default(
             "tip_follow.poll_interval_ms",
             DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "tip_follow.lag_threshold_blocks",
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.chain_event_retention_hours",
             DEFAULT_CHAIN_EVENT_RETENTION_HOURS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.chain_event_retention_check_interval_ms",
             DEFAULT_CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.cursor_at_risk_warning_hours",
             DEFAULT_CURSOR_AT_RISK_WARNING_HOURS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.mempool_mined_retention_minutes",
             DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.mempool_invalidated_retention_hours",
             DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.mempool_event_retention_check_interval_ms",
             DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS,
-        )
-        .map_err(ConfigError::load)?
-        .set_default(
+        )?
+        .with_default(
             "ingest.retention.mempool_cursor_at_risk_warning_minutes",
             DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES,
-        )
-        .map_err(ConfigError::load)?;
-
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(true));
-    }
-
-    builder = builder.add_source(zinder_environment_source()?);
-    builder = apply_tip_follow_overrides(builder, overrides)?;
-
-    let raw_config: IngestConfig = builder
-        .build()
-        .map_err(ConfigError::load)?
-        .try_deserialize()
-        .map_err(ConfigError::load)?;
+        )?
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_if("node.source", overrides.node_source)?
+        .with_override_if("node.json_rpc_addr", overrides.json_rpc_addr)?
+        .with_override_if("node.auth.method", overrides.node_auth_method)?
+        .with_override_if("node.auth.username", overrides.node_auth_username)?
+        .with_override_path_if("node.auth.path", overrides.node_auth_path)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
+        .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
+        .with_override_if("ingest.reorg_window_blocks", overrides.reorg_window_blocks)?
+        .with_override_if("ingest.commit_batch_blocks", overrides.commit_batch_blocks)?
+        .with_override_if("tip_follow.poll_interval_ms", overrides.poll_interval_ms)?
+        .with_override_if(
+            "tip_follow.lag_threshold_blocks",
+            overrides.lag_threshold_blocks,
+        )?
+        .with_override_if(
+            "ingest.control.listen_addr",
+            overrides
+                .ingest_control_listen_addr
+                .map(|addr| addr.to_string()),
+        )?
+        .with_override_path_if(
+            "ingest.control.token_path",
+            overrides.ingest_control_token_path,
+        )?
+        .load()?;
 
     resolve_tip_follow_config(raw_config)
 }
@@ -312,20 +314,13 @@ pub(crate) fn load_backup_config(
     config_path: Option<PathBuf>,
     overrides: BackupConfigOverrides,
 ) -> Result<BackupCommandConfig, IngestConfigError> {
-    let mut builder = Config::builder();
-
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(true));
-    }
-
-    builder = builder.add_source(zinder_environment_source()?);
-    builder = apply_backup_overrides(builder, overrides)?;
-
-    let raw_config: IngestConfig = builder
-        .build()
-        .map_err(ConfigError::load)?
-        .try_deserialize()
-        .map_err(ConfigError::load)?;
+    let raw_config: IngestConfig = ConfigLoader::new()
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_path_if("backup.to_path", overrides.to_path)?
+        .load()?;
 
     resolve_backup_config(raw_config)
 }
@@ -360,8 +355,8 @@ pub(crate) fn redacted_backup_config_toml(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestConfig {
-    network: NetworkConfig,
-    node: NodeConfig,
+    network: NetworkSection,
+    node: IngestNodeConfig,
     storage: StorageConfig,
     ingest: IngestSectionConfig,
     backfill: BackfillSectionConfig,
@@ -371,28 +366,25 @@ struct IngestConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct NetworkConfig {
-    name: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NodeConfig {
+struct IngestNodeConfig {
     source: Option<String>,
     json_rpc_addr: Option<String>,
     indexer_grpc_addr: Option<String>,
     request_timeout_secs: Option<u64>,
     max_response_bytes: Option<u64>,
-    auth: NodeAuthConfig,
+    auth: NodeAuthSection,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NodeAuthConfig {
-    method: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-    path: Option<PathBuf>,
+impl IngestNodeConfig {
+    fn into_node_section(self) -> NodeSection {
+        NodeSection {
+            json_rpc_addr: self.json_rpc_addr,
+            indexer_grpc_addr: self.indexer_grpc_addr,
+            request_timeout_secs: self.request_timeout_secs,
+            max_response_bytes: self.max_response_bytes,
+            auth: self.auth,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -436,7 +428,7 @@ struct BackfillSectionConfig {
     to_height: Option<u32>,
     allow_near_tip_finalize: Option<bool>,
     checkpoint_height: Option<u32>,
-    coverage: Option<String>,
+    coverage: Option<BackfillCoverage>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -452,218 +444,6 @@ struct BackupSectionConfig {
     to_path: Option<PathBuf>,
 }
 
-struct CommonNodeOverrides {
-    network: Option<String>,
-    node_source: Option<String>,
-    json_rpc_addr: Option<String>,
-    node_auth_method: Option<String>,
-    node_auth_username: Option<String>,
-    node_auth_path: Option<PathBuf>,
-    storage_path: Option<PathBuf>,
-    request_timeout_secs: Option<u64>,
-    max_response_bytes: Option<u64>,
-    commit_batch_blocks: Option<u32>,
-}
-
-fn apply_common_overrides(
-    mut builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: CommonNodeOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, IngestConfigError> {
-    if let Some(network) = overrides.network {
-        builder = builder
-            .set_override("network.name", network)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(node_source) = overrides.node_source {
-        builder = builder
-            .set_override("node.source", node_source)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(json_rpc_addr) = overrides.json_rpc_addr {
-        builder = builder
-            .set_override("node.json_rpc_addr", json_rpc_addr)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(node_auth_method) = overrides.node_auth_method {
-        builder = builder
-            .set_override("node.auth.method", node_auth_method)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(node_auth_username) = overrides.node_auth_username {
-        builder = builder
-            .set_override("node.auth.username", node_auth_username)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(node_auth_path) = overrides.node_auth_path {
-        builder = builder
-            .set_override(
-                "node.auth.path",
-                path_to_config_string(node_auth_path, "node.auth.path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(storage_path) = overrides.storage_path {
-        builder = builder
-            .set_override(
-                "storage.path",
-                path_to_config_string(storage_path, "storage.path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(request_timeout_secs) = overrides.request_timeout_secs {
-        builder = builder
-            .set_override("node.request_timeout_secs", request_timeout_secs)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(max_response_bytes) = overrides.max_response_bytes {
-        builder = builder
-            .set_override("node.max_response_bytes", max_response_bytes)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(commit_batch_blocks) = overrides.commit_batch_blocks {
-        builder = builder
-            .set_override("ingest.commit_batch_blocks", commit_batch_blocks)
-            .map_err(ConfigError::load)?;
-    }
-
-    Ok(builder)
-}
-
-fn apply_backfill_overrides(
-    mut builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: BackfillConfigOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, IngestConfigError> {
-    builder = apply_common_overrides(
-        builder,
-        CommonNodeOverrides {
-            network: overrides.network,
-            node_source: overrides.node_source,
-            json_rpc_addr: overrides.json_rpc_addr,
-            node_auth_method: overrides.node_auth_method,
-            node_auth_username: overrides.node_auth_username,
-            node_auth_path: overrides.node_auth_path,
-            storage_path: overrides.storage_path,
-            request_timeout_secs: overrides.request_timeout_secs,
-            max_response_bytes: overrides.max_response_bytes,
-            commit_batch_blocks: overrides.commit_batch_blocks,
-        },
-    )?;
-
-    if let Some(from_height) = overrides.from_height {
-        builder = builder
-            .set_override("backfill.from_height", from_height)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(to_height) = overrides.to_height {
-        builder = builder
-            .set_override("backfill.to_height", to_height)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(allow_near_tip_finalize) = overrides.allow_near_tip_finalize {
-        builder = builder
-            .set_override("backfill.allow_near_tip_finalize", allow_near_tip_finalize)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(checkpoint_height) = overrides.checkpoint_height {
-        builder = builder
-            .set_override("backfill.checkpoint_height", checkpoint_height)
-            .map_err(ConfigError::load)?;
-    }
-    if overrides.wallet_serving == Some(true) {
-        builder = builder
-            .set_override(
-                "backfill.coverage",
-                BackfillCoverage::WalletServing.as_str(),
-            )
-            .map_err(ConfigError::load)?;
-    }
-
-    Ok(builder)
-}
-
-fn apply_tip_follow_overrides(
-    mut builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: TipFollowConfigOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, IngestConfigError> {
-    builder = apply_common_overrides(
-        builder,
-        CommonNodeOverrides {
-            network: overrides.network,
-            node_source: overrides.node_source,
-            json_rpc_addr: overrides.json_rpc_addr,
-            node_auth_method: overrides.node_auth_method,
-            node_auth_username: overrides.node_auth_username,
-            node_auth_path: overrides.node_auth_path,
-            storage_path: overrides.storage_path,
-            request_timeout_secs: overrides.request_timeout_secs,
-            max_response_bytes: overrides.max_response_bytes,
-            commit_batch_blocks: overrides.commit_batch_blocks,
-        },
-    )?;
-
-    if let Some(reorg_window_blocks) = overrides.reorg_window_blocks {
-        builder = builder
-            .set_override("ingest.reorg_window_blocks", reorg_window_blocks)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(poll_interval_ms) = overrides.poll_interval_ms {
-        builder = builder
-            .set_override("tip_follow.poll_interval_ms", poll_interval_ms)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(lag_threshold_blocks) = overrides.lag_threshold_blocks {
-        builder = builder
-            .set_override("tip_follow.lag_threshold_blocks", lag_threshold_blocks)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(ingest_control_listen_addr) = overrides.ingest_control_listen_addr {
-        builder = builder
-            .set_override(
-                "ingest.control.listen_addr",
-                ingest_control_listen_addr.to_string(),
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(token_path) = overrides.ingest_control_token_path {
-        builder = builder
-            .set_override(
-                "ingest.control.token_path",
-                path_to_config_string(token_path, "ingest.control.token_path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    Ok(builder)
-}
-
-fn apply_backup_overrides(
-    mut builder: ::config::ConfigBuilder<::config::builder::DefaultState>,
-    overrides: BackupConfigOverrides,
-) -> Result<::config::ConfigBuilder<::config::builder::DefaultState>, IngestConfigError> {
-    if let Some(network) = overrides.network {
-        builder = builder
-            .set_override("network.name", network)
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(storage_path) = overrides.storage_path {
-        builder = builder
-            .set_override(
-                "storage.path",
-                path_to_config_string(storage_path, "storage.path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-    if let Some(to_path) = overrides.to_path {
-        builder = builder
-            .set_override(
-                "backup.to_path",
-                path_to_config_string(to_path, "backup.to_path")?,
-            )
-            .map_err(ConfigError::load)?;
-    }
-
-    Ok(builder)
-}
-
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     match node_source {
         NodeSourceKind::ZebraJsonRpc => "zebra-json-rpc",
@@ -673,17 +453,19 @@ const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
 fn resolve_backfill_config(
     config: IngestConfig,
 ) -> Result<BackfillCommandConfig, IngestConfigError> {
-    let network = require_string(config.network.name, "network.name")?;
-    let node_source = require_string(config.node.source, "node.source")?;
-    let json_rpc_addr = require_string(config.node.json_rpc_addr, "node.json_rpc_addr")?;
+    let network = config.network.resolve()?;
+    let node_source_text = require_field(config.node.source.clone(), "node.source")?;
     let storage_path = config
         .storage
         .path
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let coverage = parse_backfill_coverage(config.backfill.coverage.as_deref())?;
+    let coverage = config
+        .backfill
+        .coverage
+        .unwrap_or(BackfillCoverage::Explicit);
     let from_height = resolve_backfill_from_height(config.backfill.from_height, coverage)?;
     let to_height =
-        require_u32(config.backfill.to_height, "backfill.to_height").map(BlockHeight::new)?;
+        require_field(config.backfill.to_height, "backfill.to_height").map(BlockHeight::new)?;
     if matches!(coverage, BackfillCoverage::WalletServing)
         && config.backfill.checkpoint_height.is_some()
     {
@@ -692,17 +474,11 @@ fn resolve_backfill_config(
         )
         .into());
     }
-    let request_timeout_secs = require_u64(
-        config.node.request_timeout_secs,
-        "node.request_timeout_secs",
-    )?;
-    let max_response_bytes =
-        require_u64(config.node.max_response_bytes, "node.max_response_bytes")?;
-    let commit_batch_blocks = require_u32(
+    let commit_batch_blocks = require_field(
         config.ingest.commit_batch_blocks,
         "ingest.commit_batch_blocks",
     )?;
-    let allow_near_tip_finalize = require_bool(
+    let allow_near_tip_finalize = require_field(
         config.backfill.allow_near_tip_finalize,
         "backfill.allow_near_tip_finalize",
     )?;
@@ -712,18 +488,12 @@ fn resolve_backfill_config(
         )
         .into());
     }
-    let node_source = parse_node_source(&node_source)?;
-    let node_auth = resolve_node_auth(config.node.auth)?;
+    let node_source = parse_node_source(&node_source_text)?;
+    let node_target =
+        NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
 
     Ok(BackfillCommandConfig {
-        node: NodeTarget::new(
-            parse_network(&network)?,
-            json_rpc_addr,
-            node_auth,
-            Duration::from_secs(request_timeout_secs),
-            parse_max_response_bytes(max_response_bytes)?,
-        )
-        .with_indexer_grpc_addr(config.node.indexer_grpc_addr),
+        node: node_target,
         node_source,
         storage_path,
         from_height,
@@ -733,17 +503,6 @@ fn resolve_backfill_config(
         checkpoint_height: config.backfill.checkpoint_height.map(BlockHeight::new),
         coverage,
     })
-}
-
-fn parse_backfill_coverage(coverage: Option<&str>) -> Result<BackfillCoverage, IngestConfigError> {
-    match coverage.unwrap_or("explicit") {
-        "explicit" => Ok(BackfillCoverage::Explicit),
-        "wallet-serving" => Ok(BackfillCoverage::WalletServing),
-        other => Err(ConfigError::invalid(format!(
-            "unknown backfill.coverage: {other}; expected explicit or wallet-serving"
-        ))
-        .into()),
-    }
 }
 
 fn resolve_backfill_from_height(
@@ -770,32 +529,25 @@ fn resolve_backfill_from_height(
 fn resolve_tip_follow_config(
     config: IngestConfig,
 ) -> Result<TipFollowCommandConfig, IngestConfigError> {
-    let network = require_string(config.network.name, "network.name")?;
-    let node_source = require_string(config.node.source, "node.source")?;
-    let json_rpc_addr = require_string(config.node.json_rpc_addr, "node.json_rpc_addr")?;
+    let network = config.network.resolve()?;
+    let node_source_text = require_field(config.node.source.clone(), "node.source")?;
     let storage_path = config
         .storage
         .path
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let request_timeout_secs = require_u64(
-        config.node.request_timeout_secs,
-        "node.request_timeout_secs",
-    )?;
-    let max_response_bytes =
-        require_u64(config.node.max_response_bytes, "node.max_response_bytes")?;
-    let reorg_window_blocks = require_u32(
+    let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
         "ingest.reorg_window_blocks",
     )?;
-    let commit_batch_blocks = require_u32(
+    let commit_batch_blocks = require_field(
         config.ingest.commit_batch_blocks,
         "ingest.commit_batch_blocks",
     )?;
-    let poll_interval_ms = require_u64(
+    let poll_interval_ms = require_field(
         config.tip_follow.poll_interval_ms,
         "tip_follow.poll_interval_ms",
     )?;
-    let lag_threshold_blocks = require_u64(
+    let lag_threshold_blocks = require_field(
         config.tip_follow.lag_threshold_blocks,
         "tip_follow.lag_threshold_blocks",
     )?;
@@ -817,37 +569,37 @@ fn resolve_tip_follow_config(
         .as_deref()
         .map(BearerToken::from_file)
         .transpose()?;
-    let chain_event_retention_hours = require_u64(
+    let chain_event_retention_hours = require_field(
         config.ingest.retention.chain_event_retention_hours,
         "ingest.retention.chain_event_retention_hours",
     )?;
-    let chain_event_retention_check_interval_ms = require_u64(
+    let chain_event_retention_check_interval_ms = require_field(
         config
             .ingest
             .retention
             .chain_event_retention_check_interval_ms,
         "ingest.retention.chain_event_retention_check_interval_ms",
     )?;
-    let cursor_at_risk_warning_hours = require_u64(
+    let cursor_at_risk_warning_hours = require_field(
         config.ingest.retention.cursor_at_risk_warning_hours,
         "ingest.retention.cursor_at_risk_warning_hours",
     )?;
-    let mempool_mined_retention_minutes = require_u64(
+    let mempool_mined_retention_minutes = require_field(
         config.ingest.retention.mempool_mined_retention_minutes,
         "ingest.retention.mempool_mined_retention_minutes",
     )?;
-    let mempool_invalidated_retention_hours = require_u64(
+    let mempool_invalidated_retention_hours = require_field(
         config.ingest.retention.mempool_invalidated_retention_hours,
         "ingest.retention.mempool_invalidated_retention_hours",
     )?;
-    let mempool_event_retention_check_interval_ms = require_u64(
+    let mempool_event_retention_check_interval_ms = require_field(
         config
             .ingest
             .retention
             .mempool_event_retention_check_interval_ms,
         "ingest.retention.mempool_event_retention_check_interval_ms",
     )?;
-    let mempool_cursor_at_risk_warning_minutes = require_u64(
+    let mempool_cursor_at_risk_warning_minutes = require_field(
         config
             .ingest
             .retention
@@ -885,19 +637,13 @@ fn resolve_tip_follow_config(
         )
         .into());
     }
-    let node_source = parse_node_source(&node_source)?;
-    let node_auth = resolve_node_auth(config.node.auth)?;
+    let node_source = parse_node_source(&node_source_text)?;
+    let node_target =
+        NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
 
     Ok(TipFollowCommandConfig {
         tip_follow: TipFollowConfig {
-            node: NodeTarget::new(
-                parse_network(&network)?,
-                json_rpc_addr,
-                node_auth,
-                Duration::from_secs(request_timeout_secs),
-                parse_max_response_bytes(max_response_bytes)?,
-            )
-            .with_indexer_grpc_addr(config.node.indexer_grpc_addr),
+            node: node_target,
             node_source,
             storage_path,
             reorg_window_blocks: parse_reorg_window_blocks(reorg_window_blocks)?,
@@ -944,7 +690,7 @@ fn shortest_mempool_window_minutes_from(mined_minutes: u64, invalidated_hours: u
 }
 
 fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
-    let network = require_string(config.network.name, "network.name")?;
+    let network = config.network.resolve()?;
     let storage_path = config
         .storage
         .path
@@ -955,71 +701,16 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
         .ok_or_else(|| ConfigError::missing_field("backup.to_path"))?;
 
     Ok(BackupCommandConfig {
-        network: parse_network(&network)?,
+        network,
         storage_path,
         to_path,
     })
 }
 
-fn resolve_node_auth(auth: NodeAuthConfig) -> Result<NodeAuth, IngestConfigError> {
-    let method = auth.method.as_deref().unwrap_or("none");
-
-    match method {
-        "none" => {
-            reject_present(auth.username.is_some(), "node.auth.username", "none")?;
-            reject_present(auth.password.is_some(), "node.auth.password", "none")?;
-            reject_present(auth.path.is_some(), "node.auth.path", "none")?;
-            Ok(NodeAuth::None)
-        }
-        "basic" => {
-            reject_present(auth.path.is_some(), "node.auth.path", "basic")?;
-            let username = require_string(auth.username, "node.auth.username")?;
-            let password = require_string(auth.password, "node.auth.password")?;
-            Ok(NodeAuth::basic(username, password))
-        }
-        "cookie" => {
-            reject_present(auth.username.is_some(), "node.auth.username", "cookie")?;
-            reject_present(auth.password.is_some(), "node.auth.password", "cookie")?;
-            let path = auth
-                .path
-                .ok_or_else(|| ConfigError::missing_field("node.auth.path"))?;
-
-            Ok(NodeAuth::Cookie { path })
-        }
-        _ => Err(ConfigError::invalid(format!("unknown node auth method: {method}")).into()),
-    }
-}
-
-fn reject_present(
-    is_field_present: bool,
-    field: &'static str,
-    method: &'static str,
-) -> Result<(), ConfigError> {
-    if is_field_present {
-        return Err(ConfigError::invalid(format!(
-            "{field} is not valid when node.auth.method is {method}"
-        )));
-    }
-
-    Ok(())
-}
-
-fn require_u32(field_value: Option<u32>, field: &'static str) -> Result<u32, ConfigError> {
-    field_value.ok_or_else(|| ConfigError::missing_field(field))
-}
-
-fn require_u64(field_value: Option<u64>, field: &'static str) -> Result<u64, ConfigError> {
-    field_value.ok_or_else(|| ConfigError::missing_field(field))
-}
-
-fn require_bool(field_value: Option<bool>, field: &'static str) -> Result<bool, ConfigError> {
-    field_value.ok_or_else(|| ConfigError::missing_field(field))
-}
-
 #[derive(Serialize)]
 struct RedactedBackfillConfigToml {
     network: NetworkToml,
-    node: NodeToml,
+    node: IngestNodeToml,
     storage: StorageToml,
     ingest: IngestToml,
     backfill: BackfillToml,
@@ -1028,7 +719,7 @@ struct RedactedBackfillConfigToml {
 #[derive(Serialize)]
 struct RedactedTipFollowConfigToml {
     network: NetworkToml,
-    node: NodeToml,
+    node: IngestNodeToml,
     storage: StorageToml,
     ingest: IngestToml,
     tip_follow: TipFollowToml,
@@ -1041,20 +732,27 @@ struct RedactedBackupConfigToml {
     backup: BackupToml,
 }
 
+#[derive(Serialize)]
+struct IngestNodeToml {
+    source: &'static str,
+    #[serde(flatten)]
+    base: NodeToml,
+}
+
+impl IngestNodeToml {
+    fn from_target(node_source: NodeSourceKind, target: &NodeTarget) -> Self {
+        Self {
+            source: node_source_name(node_source),
+            base: NodeToml::from_node_target(target),
+        }
+    }
+}
+
 impl RedactedBackfillConfigToml {
     fn from_backfill_config(config: &BackfillCommandConfig) -> Self {
         Self {
-            network: NetworkToml {
-                name: config.node.network.name(),
-            },
-            node: NodeToml {
-                source: node_source_name(config.node_source),
-                json_rpc_addr: config.node.json_rpc_addr.clone(),
-                indexer_grpc_addr: config.node.indexer_grpc_addr.clone(),
-                request_timeout_secs: config.node.request_timeout.as_secs(),
-                max_response_bytes: config.node.max_response_bytes.get(),
-                auth: NodeAuthToml::from_node_auth(&config.node.node_auth),
-            },
+            network: NetworkToml::from_network(config.node.network),
+            node: IngestNodeToml::from_target(config.node_source, &config.node),
             storage: StorageToml {
                 path: config.storage_path.display().to_string(),
             },
@@ -1073,7 +771,7 @@ impl RedactedBackfillConfigToml {
                 to_height: config.to_height.value(),
                 allow_near_tip_finalize: config.allow_near_tip_finalize,
                 checkpoint_height: config.checkpoint_height.map(BlockHeight::value),
-                coverage: config.coverage.as_str(),
+                coverage: config.coverage,
             },
         }
     }
@@ -1082,17 +780,11 @@ impl RedactedBackfillConfigToml {
 impl RedactedTipFollowConfigToml {
     fn from_tip_follow_config(config: &TipFollowCommandConfig) -> Self {
         Self {
-            network: NetworkToml {
-                name: config.tip_follow.node.network.name(),
-            },
-            node: NodeToml {
-                source: node_source_name(config.tip_follow.node_source),
-                json_rpc_addr: config.tip_follow.node.json_rpc_addr.clone(),
-                indexer_grpc_addr: config.tip_follow.node.indexer_grpc_addr.clone(),
-                request_timeout_secs: config.tip_follow.node.request_timeout.as_secs(),
-                max_response_bytes: config.tip_follow.node.max_response_bytes.get(),
-                auth: NodeAuthToml::from_node_auth(&config.tip_follow.node.node_auth),
-            },
+            network: NetworkToml::from_network(config.tip_follow.node.network),
+            node: IngestNodeToml::from_target(
+                config.tip_follow.node_source,
+                &config.tip_follow.node,
+            ),
             storage: StorageToml {
                 path: config.tip_follow.storage_path.display().to_string(),
             },
@@ -1112,7 +804,7 @@ impl RedactedTipFollowConfigToml {
                 )),
             },
             tip_follow: TipFollowToml {
-                poll_interval_ms: duration_millis(config.tip_follow.poll_interval),
+                poll_interval_ms: duration_as_millis_u64(config.tip_follow.poll_interval),
                 lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
             },
         }
@@ -1122,66 +814,12 @@ impl RedactedTipFollowConfigToml {
 impl RedactedBackupConfigToml {
     fn from_backup_config(config: &BackupCommandConfig) -> Self {
         Self {
-            network: NetworkToml {
-                name: config.network.name(),
-            },
+            network: NetworkToml::from_network(config.network),
             storage: StorageToml {
                 path: config.storage_path.display().to_string(),
             },
             backup: BackupToml {
                 to_path: config.to_path.display().to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct NetworkToml {
-    name: &'static str,
-}
-
-#[derive(Serialize)]
-struct NodeToml {
-    source: &'static str,
-    json_rpc_addr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    indexer_grpc_addr: Option<String>,
-    request_timeout_secs: u64,
-    max_response_bytes: u64,
-    auth: NodeAuthToml,
-}
-
-#[derive(Serialize)]
-struct NodeAuthToml {
-    method: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<&'static str>,
-}
-
-impl NodeAuthToml {
-    fn from_node_auth(node_auth: &NodeAuth) -> Self {
-        match node_auth {
-            NodeAuth::None => Self {
-                method: "none",
-                username: None,
-                password: None,
-                path: None,
-            },
-            NodeAuth::Cookie { .. } => Self {
-                method: "cookie",
-                username: None,
-                password: None,
-                path: Some("[REDACTED]"),
-            },
-            NodeAuth::Basic { username, .. } => Self {
-                method: "basic",
-                username: Some(username.clone()),
-                password: Some("[REDACTED]"),
-                path: None,
             },
         }
     }
@@ -1228,7 +866,7 @@ impl IngestRetentionToml {
     ) -> Self {
         Self {
             chain_event_retention_hours: chain.retention_window.map_or(0, duration_hours),
-            chain_event_retention_check_interval_ms: duration_millis(chain.check_interval),
+            chain_event_retention_check_interval_ms: duration_as_millis_u64(chain.check_interval),
             cursor_at_risk_warning_hours: duration_hours(chain.cursor_at_risk_warning),
             mempool_mined_retention_minutes: mempool
                 .retention
@@ -1238,7 +876,9 @@ impl IngestRetentionToml {
                 .retention
                 .invalidated_retention
                 .map_or(0, duration_hours),
-            mempool_event_retention_check_interval_ms: duration_millis(mempool.check_interval),
+            mempool_event_retention_check_interval_ms: duration_as_millis_u64(
+                mempool.check_interval,
+            ),
             mempool_cursor_at_risk_warning_minutes: duration_minutes(
                 mempool.cursor_at_risk_warning,
             ),
@@ -1254,7 +894,7 @@ struct BackfillToml {
     allow_near_tip_finalize: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_height: Option<u32>,
-    coverage: &'static str,
+    coverage: BackfillCoverage,
 }
 
 #[derive(Serialize)]
@@ -1266,10 +906,6 @@ struct TipFollowToml {
 #[derive(Serialize)]
 struct BackupToml {
     to_path: String,
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn duration_hours(duration: Duration) -> u64 {
