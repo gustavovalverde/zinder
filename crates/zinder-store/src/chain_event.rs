@@ -66,8 +66,8 @@ impl ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A pure append or visibility advance was committed.
-    ChainCommitted {
+    /// A non-reorg commit advanced the canonical tip.
+    TipAdvanced {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
@@ -78,6 +78,17 @@ pub enum ChainEvent {
         /// Replacement range committed by this transition.
         committed: ChainEpochCommitted,
     },
+}
+
+impl ChainEvent {
+    /// Returns `true` when this event represents a non-reorg tip advance.
+    ///
+    /// Convenience for consumers that need a single boolean for tip-change
+    /// notifications without `match`-ing on every variant.
+    #[must_use]
+    pub const fn is_tip_advance(&self) -> bool {
+        matches!(self, Self::TipAdvanced { .. })
+    }
 }
 
 /// Event payload for a previously visible non-finalized range.

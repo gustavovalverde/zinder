@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 use tonic::Code;
-use zinder_core::Network;
-use zinder_store::StoreError;
+use zinder_core::{Network, artifact_family};
+use zinder_store::{ArtifactFamily, StoreError};
 
 /// Error returned by [`crate::ChainIndex`] implementations.
 #[derive(Debug, Error)]
@@ -18,6 +18,22 @@ pub enum IndexerError {
     NotFound {
         /// Resource kind.
         resource: &'static str,
+    },
+
+    /// Requested artifact key is valid but absent from the named family.
+    ///
+    /// This is the canonical per-artifact unavailability signal; future
+    /// per-artifact "not present" cases use this variant rather than adding
+    /// a new top-level variant. Constants for `family` live in
+    /// [`zinder_core::artifact_family`].
+    ///
+    /// closes: G14
+    #[error("artifact unavailable in family {family}: key {key}")]
+    ArtifactUnavailable {
+        /// Canonical family label (see [`zinder_core::artifact_family`]).
+        family: &'static str,
+        /// Diagnostic representation of the missing key.
+        key: String,
     },
 
     /// Request failed local validation or remote argument validation.
@@ -97,11 +113,13 @@ impl IndexerError {
     pub(crate) fn from_store_error(error: StoreError) -> Self {
         match error {
             StoreError::NoVisibleChainEpoch => Self::NoVisibleChainEpoch,
-            StoreError::ChainEpochMissing { .. } | StoreError::ArtifactMissing { .. } => {
-                Self::NotFound {
-                    resource: "artifact",
-                }
-            }
+            StoreError::ArtifactMissing { family, key } => Self::ArtifactUnavailable {
+                family: artifact_family_label(family),
+                key: format!("{key:?}"),
+            },
+            StoreError::ChainEpochMissing { .. } => Self::NotFound {
+                resource: "artifact",
+            },
             StoreError::ChainEventCursorInvalid { reason }
             | StoreError::MempoolEventCursorInvalid { reason }
             | StoreError::InvalidChainEpochArtifacts { reason }
@@ -195,5 +213,29 @@ impl IndexerError {
         Self::InvalidRequest {
             reason: reason.into(),
         }
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "ArtifactFamily is #[non_exhaustive]; the wildcard handles future variants without a compile break, and unknown families surface as the literal \"unknown_artifact\" so consumers can detect drift."
+)]
+fn artifact_family_label(family: ArtifactFamily) -> &'static str {
+    match family {
+        ArtifactFamily::ChainEpoch => artifact_family::CHAIN_EPOCH,
+        ArtifactFamily::ChainEvent => artifact_family::CHAIN_EVENT,
+        ArtifactFamily::FinalizedBlock => artifact_family::FINALIZED_BLOCK,
+        ArtifactFamily::CompactBlock => artifact_family::COMPACT_BLOCK,
+        ArtifactFamily::Transaction => artifact_family::MINED_TRANSACTION,
+        ArtifactFamily::TreeState => artifact_family::TREE_STATE,
+        ArtifactFamily::SubtreeRoot => artifact_family::SUBTREE_ROOT,
+        ArtifactFamily::TransparentAddressUtxo => artifact_family::TRANSPARENT_ADDRESS_UTXO,
+        ArtifactFamily::TransparentUtxoSpend => artifact_family::TRANSPARENT_UTXO_SPEND,
+        ArtifactFamily::TransparentAddressTxIndex => {
+            artifact_family::TRANSPARENT_ADDRESS_TX_INDEX
+        }
+        ArtifactFamily::BlockHashIndex => artifact_family::BLOCK_HASH_INDEX,
+        ArtifactFamily::MempoolEvent => artifact_family::MEMPOOL_EVENT,
+        _ => "unknown_artifact",
     }
 }

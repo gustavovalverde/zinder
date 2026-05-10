@@ -924,7 +924,7 @@ fn decode_chain_epoch_record(
 
 fn chain_event_record(event: &ChainEvent) -> ChainEventRecord {
     match event {
-        ChainEvent::ChainCommitted { committed } => ChainEventRecord {
+        ChainEvent::TipAdvanced { committed } => ChainEventRecord {
             event_kind: CHAIN_EVENT_KIND_COMMITTED,
             committed: Some(chain_epoch_committed_record(committed)),
             reverted: None,
@@ -955,7 +955,7 @@ fn decode_chain_event_record(
                 })
                 .and_then(|record| decode_chain_epoch_committed_record(key, record))?;
 
-            Ok(ChainEvent::ChainCommitted { committed })
+            Ok(ChainEvent::TipAdvanced { committed })
         }
         CHAIN_EVENT_KIND_REORGED => {
             let reverted = event_record

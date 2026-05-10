@@ -4,3 +4,4 @@
 )]
 
 mod integration;
+mod parity;

@@ -4,6 +4,8 @@ This document is a cookbook. When you (a contributor or an LLM agent) need to ad
 
 The goal is unambiguity. After reading this document, an agent should be able to add a transparent-address artifact family without inventing new conventions, asking clarifying questions, or making decisions that conflict with the naming spine in [Public Interfaces](public-interfaces.md).
 
+See also [Extending the wallet data plane](extending-the-wallet-data-plane.md) for adding a typed read method on existing artifacts (no new storage), and [Derive plane](derive-plane.md) for adding a new derive consumer.
+
 ## When to add an artifact family
 
 You are adding a new artifact family when **all** of the following are true:

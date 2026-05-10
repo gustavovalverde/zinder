@@ -78,7 +78,7 @@ async fn remote_chain_index_uses_native_grpc_for_m2_methods() -> eyre::Result<()
     );
     assert!(matches!(
         first_event.event,
-        ChainEvent::ChainCommitted { committed }
+        ChainEvent::TipAdvanced { committed }
             if committed.block_range.start == BlockHeight::new(1)
     ));
     assert!(!first_event.cursor.as_bytes().is_empty());

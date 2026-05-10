@@ -46,6 +46,13 @@ pub struct RemoteOpenOptions {
 }
 
 /// Remote chain index backed by the native wallet gRPC API.
+///
+/// `RemoteChainIndex` is the recommended baseline for the Zallet-with-Zinder
+/// operator recipe documented in
+/// [Service operations §Zallet with Zinder](../../../docs/architecture/service-operations.md#zallet-with-zinder).
+/// `LocalChainIndex` is the colocated optimization for advanced operators.
+///
+/// closes: G12
 #[derive(Clone)]
 pub struct RemoteChainIndex {
     client: Arc<Mutex<WalletQueryClient<Channel>>>,
@@ -908,14 +915,16 @@ fn chain_event_envelope_from_message(
         .event
         .ok_or_else(|| IndexerError::malformed("event", "field is missing"))?
     {
-        wallet::chain_event_envelope::Event::Committed(committed) => ChainEvent::ChainCommitted {
-            committed: chain_epoch_committed_from_message(
-                expected_network,
-                committed.committed.ok_or_else(|| {
-                    IndexerError::malformed("committed.committed", "field is missing")
-                })?,
-            )?,
-        },
+        wallet::chain_event_envelope::Event::TipAdvanced(tip_advanced) => {
+            ChainEvent::TipAdvanced {
+                committed: chain_epoch_committed_from_message(
+                    expected_network,
+                    tip_advanced.committed.ok_or_else(|| {
+                        IndexerError::malformed("tip_advanced.committed", "field is missing")
+                    })?,
+                )?,
+            }
+        }
         wallet::chain_event_envelope::Event::Reorged(reorged) => ChainEvent::ChainReorged {
             reverted: chain_range_reverted_from_message(
                 expected_network,

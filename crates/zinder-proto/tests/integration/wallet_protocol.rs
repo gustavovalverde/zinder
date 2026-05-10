@@ -103,8 +103,8 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
         event_sequence: 11,
         chain_epoch: Some(synthetic_chain_epoch()),
         finalized_height: 40,
-        event: Some(wallet::chain_event_envelope::Event::Committed(
-            wallet::ChainCommitted {
+        event: Some(wallet::chain_event_envelope::Event::TipAdvanced(
+            wallet::TipAdvanced {
                 committed: Some(wallet::ChainEpochCommitted {
                     chain_epoch: Some(synthetic_chain_epoch()),
                     start_height: 40,
@@ -120,7 +120,7 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
     assert!(decoded_response.chain_epoch.is_some());
     assert!(matches!(
         decoded_response.event,
-        Some(wallet::chain_event_envelope::Event::Committed(committed))
+        Some(wallet::chain_event_envelope::Event::TipAdvanced(committed))
             if committed.committed.as_ref().is_some_and(|inner| {
                 inner.start_height == 40 && inner.end_height == 42
             })

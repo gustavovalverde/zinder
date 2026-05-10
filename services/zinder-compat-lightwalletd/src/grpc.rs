@@ -476,6 +476,7 @@ where
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
 
+    /// closes: G8
     async fn get_mempool_tx(
         &self,
         request: Request<lightwalletd::GetMempoolTxRequest>,
@@ -485,7 +486,9 @@ where
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
             .clone();
-        let exclude_txid_suffixes = request.into_inner().exclude_txid_suffixes;
+        let request = request.into_inner();
+        let exclude_txid_suffixes = request.exclude_txid_suffixes;
+        let pool_selection = pool_selection_from_request(&request.pool_types)?;
         let mut compact_messages = Vec::new();
         let mut next_cursor = None;
         loop {
@@ -507,7 +510,15 @@ where
                                 "stored compact transaction bytes failed to decode: {error}"
                             ))
                         })?;
-                compact_messages.push(Ok(compact_message));
+                let pruned = prune_compact_transaction(
+                    compact_message,
+                    pool_selection,
+                    CompactBlockPayloadMode::Full,
+                );
+                if !compact_transaction_has_payload(&pruned) {
+                    continue;
+                }
+                compact_messages.push(Ok(pruned));
             }
             if snapshot_page.next_cursor.is_none() {
                 break;
@@ -629,6 +640,7 @@ where
         Ok(Response::new(stream_items(replies)))
     }
 
+    /// closes: G9
     async fn get_lightd_info(
         &self,
         _request: Request<lightwalletd::Empty>,
@@ -731,34 +743,44 @@ fn decode_compact_block(payload_bytes: &[u8]) -> Result<lightwalletd::CompactBlo
     })
 }
 
+fn prune_compact_transaction(
+    mut transaction: lightwalletd::CompactTx,
+    pool_selection: CompactBlockPoolSelection,
+    payload_mode: CompactBlockPayloadMode,
+) -> lightwalletd::CompactTx {
+    if !pool_selection.sapling || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
+        transaction.outputs.clear();
+    }
+    if !pool_selection.sapling {
+        transaction.spends.clear();
+    }
+    if !pool_selection.orchard {
+        transaction.actions.clear();
+    } else if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
+        for action in &mut transaction.actions {
+            action.cmx.clear();
+            action.ephemeral_key.clear();
+            action.ciphertext.clear();
+        }
+    }
+    if !pool_selection.transparent || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
+        transaction.vin.clear();
+        transaction.vout.clear();
+    }
+    transaction
+}
+
 fn prune_compact_block(
     mut compact_block: lightwalletd::CompactBlock,
     pool_selection: CompactBlockPoolSelection,
     payload_mode: CompactBlockPayloadMode,
 ) -> lightwalletd::CompactBlock {
-    for transaction in &mut compact_block.vtx {
-        if !pool_selection.sapling || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-            transaction.outputs.clear();
-        }
-        if !pool_selection.sapling {
-            transaction.spends.clear();
-        }
-        if !pool_selection.orchard {
-            transaction.actions.clear();
-        } else if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-            for action in &mut transaction.actions {
-                action.cmx.clear();
-                action.ephemeral_key.clear();
-                action.ciphertext.clear();
-            }
-        }
-        if !pool_selection.transparent || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-            transaction.vin.clear();
-            transaction.vout.clear();
-        }
-    }
-
-    compact_block.vtx.retain(compact_transaction_has_payload);
+    compact_block.vtx = compact_block
+        .vtx
+        .into_iter()
+        .map(|transaction| prune_compact_transaction(transaction, pool_selection, payload_mode))
+        .filter(compact_transaction_has_payload)
+        .collect();
     compact_block
 }
 
@@ -1072,6 +1094,11 @@ fn lightd_info(
         || "00000000".to_owned(),
         |branch_id| format!("{branch_id:08x}"),
     );
+    let upgrade_name = format!("{current_upgrade:?}");
+    let upgrade_height = current_upgrade
+        .activation_height(zebra_network)
+        .map(|height| u64::from(height.0))
+        .unwrap_or_default();
 
     Ok(lightwalletd::LightdInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -1081,16 +1108,23 @@ fn lightd_info(
         sapling_activation_height: u64::from(zebra_network.sapling_activation_height().0),
         consensus_branch_id,
         block_height: u64::from(tip_height.value()),
-        git_commit: String::new(),
+        git_commit: option_env!("ZINDER_GIT_COMMIT")
+            .unwrap_or_default()
+            .to_owned(),
         branch: String::new(),
         build_date: String::new(),
         build_user: String::new(),
         estimated_height: u64::from(tip_height.value()),
+        // Deliberately empty: Zinder is not zcashd; impersonating a build
+        // version misleads operators inspecting the field.
         zcashd_build: String::new(),
         zcashd_subversion: String::new(),
+        // Operator-configured field; deferred until the runtime config schema
+        // grows a `donation_address` field. Empty string preserves the
+        // lightwalletd-go convention for unset.
         donation_address: String::new(),
-        upgrade_name: String::new(),
-        upgrade_height: 0,
+        upgrade_name,
+        upgrade_height,
         lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
     })
 }

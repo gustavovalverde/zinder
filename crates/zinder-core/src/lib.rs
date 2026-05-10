@@ -7,6 +7,7 @@
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("Zinder supports only 32-bit and wider targets.");
 
+pub mod artifact_family;
 mod block_artifact;
 mod block_header;
 mod block_id;

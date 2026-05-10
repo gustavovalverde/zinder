@@ -7,6 +7,7 @@
 #   T1 integration  -> tests/integration/               (default-filter)
 #   T2 perf         -> tests/perf/                      (ci-perf profile)
 #   T3 live         -> tests/live/                      (ci-live profile)
+#   T4 parity       -> tests/parity/                    (ci-parity profile)
 #
 # default-filter is the structural boundary between tiers; #[ignore] is the
 # libtest-fallback safety net for `cargo test` users without nextest. Both
@@ -15,7 +16,7 @@
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 fail-fast = false
-default-filter = "not test(/^live::/) and not test(/^perf::/)"
+default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"
 
 [profile.ci]
 inherits = "default"
@@ -33,6 +34,15 @@ default-filter = "test(/^live::/)"
 retries = { count = 2, backoff = "exponential", delay = "5s" }
 slow-timeout = { period = "60s", terminate-after = 1 }
 junit = { path = "target/nextest/live.xml" }
+
+# Consumer-release certification tier per ADR-0012. Per-consumer parity
+# assertions live under `tests/parity/` in each crate that surfaces a public
+# consumer contract. The release-tag pipeline runs this profile as a release
+# gate; per-PR runs are advisory.
+[profile.ci-parity]
+default-filter = "test(/^parity::/)"
+slow-timeout = { period = "60s", terminate-after = 1 }
+junit = { path = "target/nextest/parity.xml" }
 
 # Live tests that mutate node state share a single Docker container.
 # Read-only live tests (capability probes, tip fetches, broadcast-rejection

@@ -35,8 +35,8 @@ pub fn chain_event_envelope_message(
     event_envelope: &ChainEventEnvelope,
 ) -> Result<wallet::ChainEventEnvelope, ChainEventEncodeError> {
     let event = match &event_envelope.event {
-        ChainEvent::ChainCommitted { committed } => {
-            wallet::chain_event_envelope::Event::Committed(wallet::ChainCommitted {
+        ChainEvent::TipAdvanced { committed } => {
+            wallet::chain_event_envelope::Event::TipAdvanced(wallet::TipAdvanced {
                 committed: Some(chain_epoch_committed_message(*committed)),
             })
         }

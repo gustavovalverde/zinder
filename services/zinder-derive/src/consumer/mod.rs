@@ -88,10 +88,10 @@ pub struct DeriveConsumerCtx<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
-/// Typed wrapper for a `ChainCommitted` chain event delivered to a consumer.
+/// Typed wrapper for a `TipAdvanced` chain event delivered to a consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct ChainCommittedEvent {
+pub struct TipAdvancedEvent {
     /// Monotonic event sequence the SDK uses for cursor accounting.
     pub event_sequence: u64,
     /// Chain epoch visible after the commit.
@@ -133,7 +133,7 @@ pub struct RevertedRange {
 }
 
 /// Committed block range carried by a [`ChainReorgedEvent`] or
-/// [`ChainCommittedEvent`].
+/// [`TipAdvancedEvent`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CommittedRange {
@@ -164,9 +164,9 @@ pub trait DeriveConsumer: Send + Sync {
 
     /// Apply a committed range. Stage state writes into `ctx.batch`; the SDK
     /// adds the cursor advance and commits atomically.
-    async fn apply_chain_committed(
+    async fn apply_tip_advanced(
         &mut self,
-        event: &ChainCommittedEvent,
+        event: &TipAdvancedEvent,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError>;
 

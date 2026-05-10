@@ -12,7 +12,7 @@
 //!    reorg_window_blocks`: enter Channel C backfill mode, draining
 //!    `compact_block_range(last_processed_height..=oldest_retained_height -
 //!    reorg_window_blocks)` block by block and dispatching each as a
-//!    synthetic `ChainCommittedEvent` to the consumer.
+//!    synthetic `TipAdvancedEvent` to the consumer.
 //! 4. Once the consumer's cursor catches up to the retained floor, attach to
 //!    the live `ChainEvents` stream using the first envelope's cursor as the
 //!    resume point.
@@ -31,7 +31,7 @@ use zinder_proto::v1::wallet::{
 use zinder_runtime::AuthenticatedChannel;
 
 use crate::consumer::chain_events;
-use crate::consumer::{ChainCommittedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx};
+use crate::consumer::{TipAdvancedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx};
 use crate::error::DeriveError;
 use crate::store::DeriveStore;
 
@@ -174,10 +174,10 @@ fn first_committed_range_from_envelope(
         })
     })?;
     let (chain_epoch_message, start_height, end_height) = match event {
-        WireEvent::Committed(wire) => {
+        WireEvent::TipAdvanced(wire) => {
             let payload = wire.committed.as_ref().ok_or_else(|| {
                 DeriveError::Decode(zinder_store::MempoolDecodeError::MissingField {
-                    field: "chain_committed.committed",
+                    field: "tip_advanced.committed",
                 })
             })?;
             (
@@ -282,7 +282,7 @@ async fn drain_compact_block_range<C: DeriveConsumer>(
             apply_synthetic_committed(
                 consumer,
                 store,
-                ChainCommittedEvent {
+                TipAdvancedEvent {
                     event_sequence: 0,
                     chain_epoch: range.chain_epoch,
                     finalized_height: range.finalized_height,
@@ -304,7 +304,7 @@ async fn drain_compact_block_range<C: DeriveConsumer>(
 async fn apply_synthetic_committed<C: DeriveConsumer>(
     consumer: &mut C,
     store: &DeriveStore,
-    event: ChainCommittedEvent,
+    event: TipAdvancedEvent,
 ) -> Result<(), DeriveError> {
     let mut batch = WriteBatch::default();
     {
@@ -313,7 +313,7 @@ async fn apply_synthetic_committed<C: DeriveConsumer>(
             batch: &mut batch,
         };
         consumer
-            .apply_chain_committed(&event, &mut ctx)
+            .apply_tip_advanced(&event, &mut ctx)
             .await
             .map_err(DeriveError::Consumer)?;
     }

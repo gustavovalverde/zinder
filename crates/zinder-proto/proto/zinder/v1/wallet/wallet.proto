@@ -470,8 +470,8 @@ message ChainRangeReverted {
   uint32 end_height = 3;
 }
 
-// Pure commit chain event.
-message ChainCommitted {
+// Tip-advance chain event: a non-reorg commit that advanced the canonical tip.
+message TipAdvanced {
   ChainEpochCommitted committed = 1;
 }
 
@@ -496,7 +496,7 @@ message ChainEventEnvelope {
   uint32 finalized_height = 4;
 
   oneof event {
-    ChainCommitted committed = 10;
+    TipAdvanced tip_advanced = 10;
     ChainReorged reorged = 11;
   }
 }

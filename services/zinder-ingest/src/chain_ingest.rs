@@ -998,7 +998,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
     record_writer_progress(chain_epoch);
 
     match &commit_outcome.event {
-        ChainEvent::ChainCommitted { committed } => {
+        ChainEvent::TipAdvanced { committed } => {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "chain_committed",

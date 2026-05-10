@@ -113,6 +113,15 @@ async fn lightwalletd_adapter_serves_m1_read_sync_methods() -> eyre::Result<()> 
         lightd_info.lightwallet_protocol_version,
         lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT
     );
+    assert!(
+        !lightd_info.upgrade_name.is_empty(),
+        "upgrade_name must be populated from NetworkUpgrade::current"
+    );
+    assert!(
+        lightd_info.upgrade_height > 0,
+        "upgrade_height must reflect the active upgrade activation; got {}",
+        lightd_info.upgrade_height
+    );
 
     Ok(())
 }

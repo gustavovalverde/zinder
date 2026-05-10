@@ -33,6 +33,8 @@ impl BlockId {
 /// operation; future support lands as a different method, not a third
 /// selector arm. The enum is `#[non_exhaustive]` to keep that boundary
 /// explicit.
+///
+/// refuses: A4
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum BlockSelector {

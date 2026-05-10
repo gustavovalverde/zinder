@@ -95,6 +95,8 @@ The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`
 
 This shape is reserved for views that wallets and applications consume *as if* they were canonical. The `derive.*` capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 
+The step-by-step file list for adding a new Shape 2 consumer (the `DeriveProxy<C>` field, the readiness probe wiring, the two capability strings, and the compat-shim federation) is documented in [Extending the wallet data plane §Federation extension](extending-the-wallet-data-plane.md#federation-extension).
+
 ### Shape 3 — Sink-only (no Zinder-served queries)
 
 The derive consumer writes to an external sink (Postgres, ClickHouse, S3, Kafka) and does not expose a Zinder-side query API. The consumer's user is the operator's own analytics stack. Zinder's only role is producing the event stream the consumer subscribes to.

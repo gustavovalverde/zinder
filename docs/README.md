@@ -20,6 +20,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [Service operations](architecture/service-operations.md)
 - [Public interfaces](architecture/public-interfaces.md)
 - [Extending artifacts](architecture/extending-artifacts.md)
+- [Extending the wallet data plane](architecture/extending-the-wallet-data-plane.md)
 
 ## ADRs
 
@@ -33,6 +34,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0008: Consumer-neutral wallet data plane](adrs/0008-consumer-neutral-wallet-data-plane.md)
 - [ADR-0009: IngestControl transport security](adrs/0009-ingest-control-transport-security.md)
 - [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md)
+- [ADR-0012: Consumer-release certification tier](adrs/0012-consumer-release-certification.md)
 
 ## Reference
 

@@ -1602,7 +1602,7 @@ fn build_chain_event(
         }
         ReorgWindowChange::Unchanged
         | ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::FinalizeThrough { .. } => ChainEvent::ChainCommitted { committed },
+        | ReorgWindowChange::FinalizeThrough { .. } => ChainEvent::TipAdvanced { committed },
     };
 
     Ok(event)
@@ -1648,7 +1648,7 @@ fn chain_event_matches_family(
         ChainEventStreamFamily::Tip => true,
         ChainEventStreamFamily::Finalized => {
             event_envelope.chain_epoch.tip_height <= event_envelope.finalized_height
-                && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
+                && matches!(&event_envelope.event, ChainEvent::TipAdvanced { .. })
         }
     }
 }

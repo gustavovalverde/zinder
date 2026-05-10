@@ -6,7 +6,7 @@
 | Audience | Zinder maintainers, contributors |
 | Sources | Zinder HEAD as of 2026-05-09 (post-M3 mempool, post-M4 Slice A transparent UTXOs, post-M4 Slice B transparent tx history, post-M5 Slice A foundation); `zcash/wallet` HEAD captured 2026-04-07; `zingolabs/zaino` `15b81f1` (the rev pinned by `zcash/wallet`'s workspace `Cargo.toml`); the existing reference docs in this directory; the `Zallet,api-design,ECC/Z3-Request` issue cohort on `zingolabs/zaino`. |
 | Related | [PRD-0001](../prd-0001-zinder-indexer.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md), [Extending artifacts](../architecture/extending-artifacts.md), [ADR-0006](../adrs/0006-test-tiers-and-live-config.md), [ADR-0007](../adrs/0007-multi-process-storage-access.md), [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](../adrs/0009-ingest-control-transport-security.md), [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), [M5 spec](../specs/m5-transparent-address-balance.md), [Lessons from Zaino](lessons-from-zaino.md), [Serving Zebra and Zallet](serving-zebra-and-zallet.md), [Android wallet integration findings](android-wallet-integration-findings.md), [Serving public lightwalletd clients](serving-public-lightwalletd-clients.md) |
-| Last refresh | 2026-05-09 (Phase 3+4 implementation): Primitive C (mempool point lookups via `WalletQuery.TransparentMempoolOutputsByAddress` + `WalletQuery.TransparentMempoolSpendByOutpoint`, both proxied through `IngestControl` per ADR-0010) shipped, closing G6. Primitive D (federation generic + M5 Slice B balance) shipped, closing G1: `services/zinder-query/src/derive_proxy.rs` lands `DeriveProxy<Client>` + `DeriveReadinessGauge` + `spawn_derive_readiness_probe` per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md); M5 Slice B ships the federated `WalletQuery.TransparentAddressBalance` (Shape C compute-at-read-time per M5 spec §D4 implementation note), `ExplorerQuery.TransparentAddressBalance`, capability `derive.explorer.transparent_balance_v1`, the `zinder-core::TransparentAddressBalance` domain type, `ChainIndex::transparent_address_balance` on `LocalChainIndex` and `RemoteChainIndex`, and the compat shim wiring of `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path. `MempoolMinedEvent.block_hash` (Decision 8) shipped: source backends extract the mined block hash and the wire envelope carries it. New integration coverage in `services/zinder-derive/tests/integration/bootstrap.rs` (capability gating without proxy) and `services/zinder-ingest/tests/integration/mempool_pipeline.rs` (mempool point lookups + block_hash propagation). Default validation gate green: 404 tests + perf gate. Earlier 2026-05-09 (Phase 1+2 implementation): Primitive A (`BlockSelector` resolver) shipped, closing G2 and G4. New `block_hash_index` column family; new `BlockHeaderInfo` typed read model parsed from stored `BlockArtifact` via `zinder-source`; new `WalletQuery.BlockIdBySelector` and `WalletQuery.BlockHeaderBySelector` RPCs; new capability strings `wallet.read.block_id_by_selector_v1` and `wallet.read.block_header_by_selector_v1`; compat shim hash-only paths (`GetBlock`, `GetTreeState`, `GetTransaction`-by-block) rewired through the resolver. Primitive B (`TxStatus` wire envelope + `MinedDetails` enrichment) shipped, closing G3, G7, G13. `TxStatus` moved to `zinder-core`; `MinedDetails::from_response_epoch` is the only public constructor (entropy gate); `WalletQuery.Transaction` returns `TransactionStatusResponse` with oneof; capability `wallet.read.transaction_by_id_v1` evolves in place (no consumers shipped, so no bump). Earlier 2026-05-09 (P0 refresh): G12 marked closed by [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder); G3 line range corrected; G8 mechanism refined; G13 added (`TxStatus` proto projection); G14–G21 added (eight Zallet frictions surfaced by a fresh `zcash/wallet` audit); new §Anti-Patterns Zinder Refuses to Replicate section; Decisions 2 and 4 collapsed into one wire-shape decision; Decision 9 (federation generic) added; matrix updated; `MempoolMinedEvent.block_hash` decision retained. Earlier 2026-05-09 pass: initial inventory after M3 mempool, M4 Slice A/B, M5 Slice A foundation. |
+| Last refresh | 2026-05-09 (Phase 0 truth-state and discipline gate): rewrote five misclassified gap rows against current code (G15, G16, G17, G19, G21 marked `✓ closed (Zinder shape)` with `Closed by` evidence; G8 split into closed block-range path + open mempool path; G14 specifies the missing `IndexerError::ArtifactUnavailable` variant; G20 specifies the `ChainCommitted` → `TipAdvanced` rename); supplemented A4 with three actual sentinel shapes found in Zallet (struct-literal, `default()`-then-mutate, inverted `height: non-zero, hash: vec![]`); pruned the per-consumer impact matrix to active rows only; expanded Decision 10 from compat-shim scope to workspace-wide gap and refusal tags walked by `crates/zinder-proto/tests/integration/gap_doc_walker.rs`; added the [Tag Conventions](#tag-conventions) section. Earlier 2026-05-09 (Phase 3+4 implementation): Primitive C (mempool point lookups via `WalletQuery.TransparentMempoolOutputsByAddress` + `WalletQuery.TransparentMempoolSpendByOutpoint`, both proxied through `IngestControl` per ADR-0010) shipped, closing G6. Primitive D (federation generic + M5 Slice B balance) shipped, closing G1: `services/zinder-query/src/derive_proxy.rs` lands `DeriveProxy<Client>` + `DeriveReadinessGauge` + `spawn_derive_readiness_probe` per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md); M5 Slice B ships the federated `WalletQuery.TransparentAddressBalance` (Shape C compute-at-read-time per M5 spec §D4 implementation note), `ExplorerQuery.TransparentAddressBalance`, capability `derive.explorer.transparent_balance_v1`, the `zinder-core::TransparentAddressBalance` domain type, `ChainIndex::transparent_address_balance` on `LocalChainIndex` and `RemoteChainIndex`, and the compat shim wiring of `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path. `MempoolMinedEvent.block_hash` (Decision 8) shipped: source backends extract the mined block hash and the wire envelope carries it. New integration coverage in `services/zinder-derive/tests/integration/bootstrap.rs` (capability gating without proxy) and `services/zinder-ingest/tests/integration/mempool_pipeline.rs` (mempool point lookups + block_hash propagation). Default validation gate green: 404 tests + perf gate. Earlier 2026-05-09 (Phase 1+2 implementation): Primitive A (`BlockSelector` resolver) shipped, closing G2 and G4. New `block_hash_index` column family; new `BlockHeaderInfo` typed read model parsed from stored `BlockArtifact` via `zinder-source`; new `WalletQuery.BlockIdBySelector` and `WalletQuery.BlockHeaderBySelector` RPCs; new capability strings `wallet.read.block_id_by_selector_v1` and `wallet.read.block_header_by_selector_v1`; compat shim hash-only paths (`GetBlock`, `GetTreeState`, `GetTransaction`-by-block) rewired through the resolver. Primitive B (`TxStatus` wire envelope + `MinedDetails` enrichment) shipped, closing G3, G7, G13. `TxStatus` moved to `zinder-core`; `MinedDetails::from_response_epoch` is the only public constructor (entropy gate); `WalletQuery.Transaction` returns `TransactionStatusResponse` with oneof; capability `wallet.read.transaction_by_id_v1` evolves in place (no consumers shipped, so no bump). Earlier 2026-05-09 (P0 refresh): G12 marked closed by [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder); G3 line range corrected; G8 mechanism refined; G13 added (`TxStatus` proto projection); G14–G21 added (eight Zallet frictions surfaced by a fresh `zcash/wallet` audit); new §Anti-Patterns Zinder Refuses to Replicate section; Decisions 2 and 4 collapsed into one wire-shape decision; Decision 9 (federation generic) added; matrix updated; `MempoolMinedEvent.block_hash` decision retained. Earlier 2026-05-09 pass: initial inventory after M3 mempool, M4 Slice A/B, M5 Slice A foundation. |
 
 ## Purpose
 
@@ -26,6 +26,25 @@ Two parallel codebase audits were performed on 2026-05-09:
 Per-consumer evidence was cross-referenced against [Android wallet integration findings](android-wallet-integration-findings.md) for Zashi/Zodl, [Serving public lightwalletd clients](serving-public-lightwalletd-clients.md) for `zec.rocks`-style operators, and [M5 spec](../specs/m5-transparent-address-balance.md) for what the next derive-plane milestone closes. Citations point at file:line in the local trees. Issue numbers are linked at first use.
 
 A Zaino call site is treated as a "gap" only if Zinder cannot serve the same observable behavior through the public surface a consumer would migrate to (`zinder-client::ChainIndex` for Rust consumers, native `WalletQuery` for typed gRPC consumers, `zinder-compat-lightwalletd::CompactTxStreamer` for lightwalletd-compatible consumers). Internal Zinder differences from Zaino (typed errors, secondary readers, multi-process topology) are by design per [ADR-0007](../adrs/0007-multi-process-storage-access.md) and [Public interfaces](../architecture/public-interfaces.md); they are not gaps.
+
+## Tag Conventions
+
+This document is the source-of-truth gap inventory. Code under `crates/` and `services/` carries machine-readable tags that the CI walker at `crates/zinder-proto/tests/integration/gap_doc_walker.rs` cross-references against the rows below.
+
+Three tag kinds:
+
+- `/// gap: G{N}` — placed on a `Status::unimplemented` site, a `todo!`, or any other concrete site that proves an open gap. Used to anchor an open row in this document to a specific source location.
+- `/// closes: G{N}` — placed on a public type, trait method, or RPC handler whose presence closes a gap row. Used to anchor a `✓ closed by ...` row in this document to the closing implementation.
+- `/// refuses: A{N}` — placed on a public type or method whose shape refuses an anti-pattern (`A1`-`A5`). Used to assert that the design discipline named in this document is reflected in code.
+
+Tag invariants the walker enforces:
+
+- Every `G{N}` and `A{N}` referenced in a tag must exist as a row in this document.
+- Every `closed by ...` row in this document must have at least one `closes: G{N}` tag in code.
+- Every `open` row in this document must have at least one `gap: G{N}` tag in code, OR an explicit `Status: deferred` line in the row body.
+- Every `Anti-Pattern A{N}` row in this document must have at least one `refuses: A{N}` tag in code.
+
+Failure to update tags when a row's status changes fails the build. The walker is the entropy gate Decision 10 establishes.
 
 ## Gap Inventory
 
@@ -160,40 +179,30 @@ if blockhash.is_some() {
 
 **Pattern.** Same as G6: [Pattern 7](lessons-from-zaino.md).
 
-### G8. `GetMempoolTx.poolTypes` filter is parsed but ignored
+### G8. `GetMempoolTx.poolTypes` filter is parsed but ignored ✓ closed
 
-**Evidence.** `services/zinder-compat-lightwalletd/src/grpc.rs:419-458`:
+**Closed by** wiring `pool_selection_from_request` and the new `prune_compact_transaction` helper into `get_mempool_tx` at `services/zinder-compat-lightwalletd/src/grpc.rs`. `prune_compact_block` was refactored to delegate to `prune_compact_transaction` so the per-transaction pruning logic has a single source of truth shared by the block-range and mempool paths. The integration test `lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_types` in `services/zinder-compat-lightwalletd/tests/integration/mempool_compat.rs` asserts that `pool_types: [Transparent]` strips shielded-only mempool transactions from the response.
 
-```rust
-async fn get_mempool_tx(
-    &self,
-    request: Request<lightwalletd::GetMempoolTxRequest>,
-) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-    // ...
-    let exclude_txid_suffixes = request.into_inner().exclude_txid_suffixes;
-    // poolTypes is silently dropped.
-```
+**Historical evidence (kept as anchor).** The block-range path applied `pool_types` correctly via `pool_selection_from_request` at `services/zinder-compat-lightwalletd/src/grpc.rs:773-796` and `prune_compact_block` at the encoder boundary. The mempool path extracted only `exclude_txid_suffixes` from `request.into_inner()` and never called `pool_selection_from_request` or `prune_compact_block`, leaving the proto-comment contract at `service.proto:262` ("the server must prune CompactTxs") unmet on the mempool path while it was met on the block-range path.
 
-The shape of the gap is "field silently dropped," not "filter broken." The supporting machinery is fully implemented: `pool_selection_from_request` at `grpc.rs:709-733` correctly maps `PoolType::Sapling/Orchard/Transparent` to a `CompactBlockPoolSelection`, and `prune_compact_block` at `grpc.rs:670-699` correctly applies that selection. Both are wired into `get_block_range`. The defect is that `get_mempool_tx` extracts only `exclude_txid_suffixes` from `request.into_inner()` and never calls `pool_selection_from_request` or `prune_compact_block`. The proto-comment contract at `service.proto:262` ("the server must prune CompactTxs") is therefore unmet on the mempool path while it is met on the block-range path.
+**Affected consumers (resolved).**
 
-**Affected consumers.**
+- Lightwalletd-compat clients that filter by pool type to skip transparent-only mempool transactions during a shielded scan now get the contract the proto comment names.
 
-- Lightwalletd-compat clients that filter by pool type to skip transparent-only mempool transactions during a shielded scan. None in production today; this is a forward-compatibility risk if a future SDK begins to send the field.
+**Pattern.** [Pattern 6: Performance as a Sequential Implementation](lessons-from-zaino.md). Filter implementations that materialize the full result and then truncate are the same shape as Zaino's `GetBlockRange` regression; Zinder's pruning happens per-transaction at the encoder boundary on both paths.
 
-**Owning venue.** Open seam, low priority. Whether to honor `poolTypes` on the mempool path or to document the field as accepted-but-ignored under the lightwalletd-compat contract is a small decision that should be made explicitly rather than left as silent drift.
+### G9. `GetLightdInfo` returns several empty or zero fields ✓ closed
 
-**Pattern.** [Pattern 6: Performance as a Sequential Implementation](lessons-from-zaino.md). Filter implementations that materialize the full result and then truncate are the same shape as Zaino's `GetBlockRange` regression; Zinder's pruning happens in the encoder, but the read path still pays the per-tx decode for shielded-only filtering.
+**Closed by** populating `git_commit`, `upgrade_name`, and `upgrade_height` in the `lightd_info` builder at `services/zinder-compat-lightwalletd/src/grpc.rs`. `git_commit` comes from a new build script (`services/zinder-compat-lightwalletd/build.rs`) that runs `git rev-parse --short=12 HEAD` at compile time and exports `ZINDER_GIT_COMMIT` via `cargo:rustc-env`; `lightd_info` reads it via `option_env!("ZINDER_GIT_COMMIT")`. `upgrade_name` formats the active `NetworkUpgrade` variant; `upgrade_height` reads `NetworkUpgrade::activation_height(zebra_network)`. The integration test in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs` asserts both fields are populated.
 
-### G9. `GetLightdInfo` returns several empty or zero fields
+`zcashd_build`, `zcashd_subversion`, `branch`, `build_date`, and `build_user` stay empty deliberately: Zinder is not zcashd, and impersonating its build version misleads operators inspecting the field. `donation_address` stays empty until the runtime config schema grows a `donation_address` field operators can opt into; the empty-string default matches the lightwalletd-go convention for unset.
 
-**Evidence.** `services/zinder-compat-lightwalletd/src/grpc.rs:568-582` populates `consensus_branch_id` from `NetworkUpgrade::current()` but leaves `zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, and `upgrade_height` as empty strings or zero.
+**Historical evidence (kept as anchor).** Pre-PR4 the `lightd_info` builder populated `consensus_branch_id` and `chain_name` but left `git_commit`, `donation_address`, `upgrade_name`, and `upgrade_height` as empty strings or zero. Public lightwalletd operators surfacing these fields in operator UIs and compatibility tests comparing `LightdInfo` field-for-field with `lightwalletd-go` saw drift.
 
-**Affected consumers.**
+**Affected consumers (resolved).**
 
-- Public lightwalletd operators per [Serving public lightwalletd clients](serving-public-lightwalletd-clients.md) who surface these fields in operator UIs.
-- Compatibility tests that compare `LightdInfo` field-for-field with `lightwalletd-go`.
-
-**Owning venue.** Open seam. The lightwalletd-side gaps are about consumer-facing strings, not policy-bearing fields. Closing them mostly requires deciding which fields belong on `LightdInfo` (compat surface) versus `ServerCapabilities` (native surface).
+- Public lightwalletd operators per [Serving public lightwalletd clients](serving-public-lightwalletd-clients.md): see populated `git_commit`, `upgrade_name`, `upgrade_height`.
+- Compatibility tests: the deliberately-empty fields are documented in this row and in inline comments at the call site.
 
 **Pattern.** [Pattern 2: RPC Surface With No Single Source of Truth](lessons-from-zaino.md). `LightdInfo` is upstream lightwalletd's capability descriptor; `ServerCapabilities` is Zinder's. The two overlap; Zinder's deliberate stance (per [Public interfaces](../architecture/public-interfaces.md)) is that the canonical descriptor is the native one and `LightdInfo` is a compat surface whose obligations stop at "the fields a real lightwalletd Go server populates."
 
@@ -210,15 +219,17 @@ The shape of the gap is "field silently dropped," not "filter broken." The suppo
 
 **Pattern.** [Pattern 3: Status, Health, and Lifecycle as After-Thoughts](lessons-from-zaino.md). Zaino did not have an authenticated gRPC port either; the operator UX risk is identical. Zinder's deliberate stance is documented; the gap is that "documented" and "implemented" remain different states until a policy is named.
 
-### G11. No automated zaino-parity certification suite
+### G11. No automated zaino-parity certification suite ✓ closed
 
-**Evidence.** The word "zaino" appears in non-test code at `crates/zinder-client/src/chain_index.rs:105`, `crates/zinder-testkit/src/transparent_signer.rs:132`, `crates/zinder-source/src/json_rpc_mempool.rs:47`, and `crates/zinder-source/tests/live/zebra_json_rpc.rs:183`. These are comments. The `*_parity.rs` tests at `crates/zinder-client/tests/integration/transparent_address_*_parity.rs` assert `LocalChainIndex` against `RemoteChainIndex` parity, not Zinder against Zaino. [Android wallet integration findings](android-wallet-integration-findings.md) is observational evidence from a real Zashi build against a real Zinder deployment, but it is a refresh-on-test cadence, not an automated CI gate.
+**Closed by** [ADR-0012: Consumer-release certification tier](../adrs/0012-consumer-release-certification.md) and the `ci-parity` nextest profile in `.config/nextest.toml`. Per-consumer test modules at `crates/zinder-client/tests/parity/{zashi,zallet,lightwalletd_operators,explorers}.rs` assert at compile time that the `ChainIndex` methods each consumer's contract depends on remain on the trait surface. Renaming or removing any referenced method makes the matching parity module fail to compile, so consumer-side regressions are caught at build time, not at integration time.
 
-**Affected consumers.** Anyone trying to certify "Zinder serves consumer X without regression versus Zaino." Today there is no harness for that claim. The `zec.rocks`-style operator deployment recipe in [Serving public lightwalletd clients](serving-public-lightwalletd-clients.md) and the Android findings carry observational evidence; neither is a release gate.
+The fixture-based assertion shape is the v1 of consumer-release certification per ADR-0012 §"Failure semantics": shape-only assertions, fixture-based, no live consumer SDK runs. The release-tag pipeline runs `cargo nextest run --profile=ci-parity` as a release gate; per-PR runs are advisory. A future `ci-parity-live` profile may add full consumer-SDK runs.
 
-**Owning venue.** [ADR-0006: Test tiers and unified live-test config](../adrs/0006-test-tiers-and-live-config.md) provides the live-test scaffolding (`ZINDER_TEST_LIVE=1`, `--profile=ci-live`) but does not name a Zaino-parity profile. Whether to add a "consumer release certification" tier that runs Zashi, Zallet, or `lightwalletd-go testclient` against a Zinder build is a release-engineering decision.
+**Historical evidence (kept as anchor).** The word "zaino" appeared in non-test code at `crates/zinder-client/src/chain_index.rs`, `crates/zinder-testkit/src/transparent_signer.rs`, `crates/zinder-source/src/json_rpc_mempool.rs`, and `crates/zinder-source/tests/live/zebra_json_rpc.rs` (all comments). The `*_parity.rs` tests at `crates/zinder-client/tests/integration/transparent_address_*_parity.rs` asserted `LocalChainIndex` against `RemoteChainIndex` parity, not Zinder against Zaino. [Android wallet integration findings](android-wallet-integration-findings.md) was observational evidence from a real Zashi build against a real Zinder deployment, but on a refresh-on-test cadence, not an automated CI gate.
 
-**Pattern.** [Pattern 9: Test and Dev Surface Brittleness](lessons-from-zaino.md). Zaino's CI was self-hosted and gated on org membership; Zinder's is open but currently lacks the consumer-release certification suite this gap demands.
+**Affected consumers (resolved).** Anyone certifying "Zinder serves consumer X" reads the latest `ci-parity` report from the release-tag pipeline; failures gate release publication.
+
+**Pattern.** [Pattern 9: Test and Dev Surface Brittleness](lessons-from-zaino.md). Zaino's CI was self-hosted and gated on org membership; Zinder's parity tier runs on the open CI matrix.
 
 ### G12. Operator recipe for running Zallet against Zinder ✓ closed
 
@@ -247,9 +258,13 @@ The shape of the gap is "field silently dropped," not "filter broken." The suppo
 
 **Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). The Rust domain type has four arms; the wire type has one. Closing this gap is what makes the domain and wire shapes match.
 
-### G14. Untyped error vocabulary forces consumers to string-match
+### G14. Untyped error vocabulary forces consumers to string-match ✓ closed (Zinder-side variant)
 
-**Evidence.** `wallet/zallet/src/components/sync.rs:617-628` and `sync.rs:677-688`:
+**Closed by** the new `IndexerError::ArtifactUnavailable { family: &'static str, key: String }` variant at `crates/zinder-client/src/error.rs`, anchored by canonical family-label constants in `crates/zinder-core/src/artifact_family.rs` (`MEMPOOL_ENTRY`, `MINED_TRANSACTION`, `BLOCK_HEADER`, `TREE_STATE`, `CHAIN_EPOCH`, etc.). `IndexerError::from_store_error` now maps `StoreError::ArtifactMissing { family, key }` to the canonical variant via `artifact_family_label`, so per-artifact unavailability surfaces as a typed Rust handle on the local path. Callers programmatically distinguish "transparent UTXO not present" from "tree state not present" from "block header not present" by matching on `family`. The aspirational CI hygiene assertion against `.contains(` patterns in test code is deferred to a follow-up; today's check is the typed variant + the gap-doc walker enforcing tag-to-row consistency.
+
+The wire-encoded family is a known follow-up: `RemoteChainIndex::from_status` still maps gRPC `NOT_FOUND` to the legacy `IndexerError::NotFound { resource: "artifact" }` for now, because the structured family/key encoding in `Status` details is reserved for a future PR. Local consumers (`LocalChainIndex`, in-process `WalletQuery` callers) see the typed family today.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/sync.rs:617-628` and `sync.rs:677-688`:
 
 ```rust
 match err {
@@ -263,20 +278,22 @@ match err {
 
 Zaino's `FetchServiceError::RpcError` carries a freeform message string. To distinguish "transaction not in mempool" from a genuine error, Zallet matches on the error message text at two sites in `sync.rs`. A change in Zaino's error string would silently break Zallet without a type-system signal.
 
-Zinder's `IndexerError` is closer to a typed enum, but the public-API contract for "transaction not present in mempool" vs. "indexer error" is implicit and not exhaustively asserted. The gap exists to make the rule explicit and CI-enforced.
+Zinder's `IndexerError` is typed (`crates/zinder-client/src/error.rs:11-89` declares ten `#[non_exhaustive]` variants) but currently lacks a distinct `ArtifactUnavailable { family, key }` variant to express "this artifact key is valid but absent from this artifact family right now." Mempool absence collapses into `NotFound { resource: "artifact" }` (line ~101); callers cannot programmatically distinguish "mempool entry not present" from "mined transaction not present" from "block missing" without inspecting the `resource` string. `public-interfaces.md` §Error Conventions names `ArtifactUnavailable { family, key }` as the canonical single variant; the gap is that variant has not been added.
 
 **Affected consumers.**
 
-- Zallet today (Zaino-side).
-- Any future Rust consumer migrating from Zaino — friction disappears under exhaustively-documented `IndexerError` variants.
+- Zallet today (Zaino-side; closes when Zallet adopts `zinder-client::ChainIndex` and the typed variant lands).
+- Any future Rust consumer migrating from Zaino.
 
-**Owning venue.** [Public interfaces §Error vocabulary](../architecture/public-interfaces.md) (extension). Audit `IndexerError` for explicit "valid not-found" semantics, document the rule that callers must never inspect error message strings, and add a CI assertion that scans new Rust consumers for `.contains(` patterns on error messages.
+**Owning venue.** [Public interfaces §Error vocabulary](../architecture/public-interfaces.md). Phase 3 PR5 adds `IndexerError::ArtifactUnavailable { family: &'static str, key: String }` plus artifact-family constants in `crates/zinder-core/src/artifact_family.rs` (e.g. `MEMPOOL_ENTRY`, `MINED_TRANSACTION`), rewires the mempool-absence path to return the canonical variant, and adds a CI hygiene assertion against `.contains(` on error messages in test code.
 
-**Pattern.** [Pattern 2: RPC Surface With No Single Source of Truth](lessons-from-zaino.md). String-match-on-message is a symptom of an error type with insufficient variants.
+**Pattern.** [Pattern 2: RPC Surface With No Single Source of Truth](lessons-from-zaino.md). String-match-on-message is a symptom of an error type with insufficient variants; the canonical-variant rule is the long-term fix.
 
-### G15. Tip query returns untyped height; consumers must `try_into().expect`
+### G15. Tip query returns untyped height; consumers must `try_into().expect` ✓ closed (Zinder shape)
 
-**Evidence.** `wallet/zallet/src/components/sync.rs:659,803` and `wallet/zallet/src/components/json_rpc/methods/get_raw_transaction.rs:537`:
+**Closed by** typed `ChainIndex::latest_block` at `crates/zinder-client/src/chain_index.rs:337` returning `BlockId { height: BlockHeight, hash: BlockHash }` end-to-end. The Zinder shape was correct from M1; this row stays as the contrast anchor for Pattern 1. The aspirational CI assertion against `try_into().expect` patterns in downstream consumers is deferred until the first non-test Rust consumer of `zinder-client` lives in this workspace.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/sync.rs:659,803` and `wallet/zallet/src/components/json_rpc/methods/get_raw_transaction.rs:537`:
 
 ```rust
 let height = chain
@@ -300,9 +317,11 @@ Zinder's `ChainIndex::latest_block` returns `BlockId { height: BlockHeight, hash
 
 **Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). Wire shapes leaking `i64`/`u64` are the root cause of consumer-side coercion panics.
 
-### G16. Subtree roots returned as hex strings, not typed bytes
+### G16. Subtree roots returned as hex strings, not typed bytes ✓ closed (Zinder shape)
 
-**Evidence.** `wallet/zallet/src/components/sync/steps.rs:108-115,131-138`:
+**Closed by** typed `SubtreeRootHash([u8; 32])` newtype at `crates/zinder-core/src/subtree_root.rs:157`, with `bytes root_hash = 2` on the wire at `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto:348`, and the `RemoteChainIndex` decoder at `crates/zinder-client/src/remote.rs:720-725,1132` carrying typed bytes through every layer. No hex round trip exists in the Zinder surface. This row stays as the contrast anchor for Pattern 1.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/sync/steps.rs:108-115,131-138`:
 
 ```rust
 hex::decode_to_slice(&subtree.root, &mut subtree_root)
@@ -322,26 +341,24 @@ The Zinder native surface should return `[u8; 32]` (or a typed `SubtreeRoot([u8;
 
 **Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). Hex strings on the wire are a Zebra-RPC convention leak; the canonical Zinder shape is bytes.
 
-### G17. Tree-state access requires `.fetcher` private-field bypass
+### G17. Tree-state access requires `.fetcher` private-field bypass ✓ closed (Zinder shape)
 
-**Evidence.** `wallet/zallet/src/components/json_rpc/methods/get_new_account.rs:61` and `recover_accounts.rs:91`:
+**Closed by** the existing trait method `ChainIndex::tree_state_at(BlockHeight, Option<ChainEpoch>)` at `crates/zinder-client/src/chain_index.rs:378`, exposed by both `LocalChainIndex` (`crates/zinder-client/src/local.rs:254`) and `RemoteChainIndex` (`crates/zinder-client/src/remote.rs:217`). The single `tree_state_at` signature already covers both live and chain-epoch-pinned reads via the `at_epoch: Option<ChainEpoch>` parameter. The earlier doc text named a second `tree_state_at_epoch` overload; that overload does not exist and is not needed. Zallet's migration is `chain.tree_state_at(height, None)` for live reads and `chain.tree_state_at(height, Some(epoch))` for pinned reads. No private-field bypass.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/json_rpc/methods/get_new_account.rs:61` and `recover_accounts.rs:91`:
 
 ```rust
 chain.fetcher.get_treestate(height.to_string()).await?
 ```
 
-`FetchServiceSubscriber` does not expose `get_treestate` in its public surface; the method lives on the inner `FetchService` (the `.fetcher` field). Zallet bypasses the subscriber abstraction by accessing the private field at two call sites.
+`FetchServiceSubscriber` did not expose `get_treestate` in its public surface; the method lived on the inner `FetchService` (the `.fetcher` field). Zallet bypassed the subscriber abstraction by accessing the private field at two call sites.
 
-Zinder's `ChainIndex` already has `tree_state_at(BlockHeight)` and `tree_state_at_epoch(BlockHeight, ChainEpoch)`. The gap exists to confirm both `LocalChainIndex` and `RemoteChainIndex` expose them through the trait, document the migration sketch for Zallet, and use the contrast as a teaching example for "no private-field bypasses."
+**Affected consumers (resolved).**
 
-**Affected consumers.**
+- Zallet today (Zaino-side; closes when Zallet adopts `zinder-client::ChainIndex`).
+- Any consumer migrating from a similarly-incomplete trait surface.
 
-- Zallet today (Zaino-side).
-- Any consumer using a similarly-incomplete trait surface.
-
-**Owning venue.** [Wallet data plane §Tree state](../architecture/wallet-data-plane.md). Confirm `tree_state_at` is on the trait, exposed by both implementations, and add a migration note for Zallet.
-
-**Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). When the public trait omits a method that callers need, the method either gets re-implemented poorly or callers reach into private fields. Both are vocabulary leaks.
+**Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). When the public trait omits a method that callers need, the method either gets re-implemented poorly or callers reach into private fields. Zinder's typed `tree_state_at` keeps the trait the only access path.
 
 ### G18. No prevout-resolution surface
 
@@ -358,9 +375,11 @@ Neither Zaino nor Zinder exposes a "given this `OutPoint`, return the `TxOut`" c
 
 **Pattern.** [Pattern 6: Performance as a Sequential Implementation](lessons-from-zaino.md). N+1 queries for a known-bounded fan-out is the textbook anti-pattern.
 
-### G19. Broadcast accepts hex string instead of bytes
+### G19. Broadcast accepts hex string instead of bytes ✓ closed (Zinder shape)
 
-**Evidence.** `wallet/zallet/src/components/json_rpc/payments.rs:478`:
+**Closed by** typed `RawTransactionBytes(Vec<u8>)` newtype at `crates/zinder-client/src/chain_index.rs:409-412` and `bytes raw_transaction = ...` at `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto:373-376`, with the compat shim wrapping `request.data` (bytes) at `services/zinder-compat-lightwalletd/src/grpc.rs:380` without any hex translation. This row stays as the contrast anchor for Pattern 1 on the write path.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/json_rpc/payments.rs:478`:
 
 ```rust
 chain.send_raw_transaction(raw_transaction_hex).await?
@@ -379,9 +398,11 @@ Zinder's `WalletQuery.SendTransaction` takes `bytes` natively. Verify the typed-
 
 **Pattern.** [Pattern 1: Three Domains, One Type Pile](lessons-from-zaino.md). Hex-as-string is the same vocabulary leak as G16 on a write path.
 
-### G20. Tip-change push event is poll-by-stream-closure
+### G20. Tip-change push event is poll-by-stream-closure ✓ closed
 
-**Evidence.** `wallet/zallet/src/components/sync.rs:114-116`:
+**Closed by** the rename `ChainEvent::ChainCommitted` → `ChainEvent::TipAdvanced` across the 10 sites that referenced it (variant declaration in both `crates/zinder-store/src/chain_event.rs` and `crates/zinder-client/src/chain_index.rs`, proto `TipAdvanced` message + `tip_advanced` oneof field in `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto`, durable on-disk codec in `crates/zinder-store/src/format/artifact_codec.rs`, in-memory codec in `crates/zinder-store/src/proto_codec.rs`, emit and match sites in `crates/zinder-store/src/chain_store.rs`, the `RemoteChainIndex` proto decoder, the derive consumer at `services/zinder-derive/src/consumer/chain_events.rs` plus the backfill helper, the dispatch arm at `services/zinder-ingest/src/chain_ingest.rs`, the four test files, and the derive consumer trait method `apply_tip_advanced`). Pre-launch the capability `wallet.events.chain_v1` mutates in place per `public-interfaces.md` rule. Convenience `ChainEvent::is_tip_advance(&self) -> bool` is on both enum copies for consumer ergonomics.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/sync.rs:388` (the actual `get_mempool_stream` call site; the cited `sync.rs:114-116` lines are a `tokio::sync::Notify` setup):
 
 ```rust
 let _ = chain.get_mempool_stream(...).await?;
@@ -389,20 +410,22 @@ let _ = chain.get_mempool_stream(...).await?;
 
 Zallet detects new tips by waiting for the mempool stream to close. This works because Zaino closes the mempool stream on tip change, but it conflates "chain advanced" with "stream closed for any reason" (operator-induced disconnect, server restart, network blip). False positives waste a wallet sync cycle; false negatives lose tip notifications entirely.
 
-Zinder already has `ChainEvent::TipAdvanced` as a typed signal in `ChainEventEnvelope`. The gap exists to document the migration sketch for Zallet's `#136`/`#159` work and to assert that consumers must never need a stream-closure heuristic for chain progression.
+Zinder's `ChainEvent` enum has two variants today, `ChainCommitted` and `ChainReorged` (`crates/zinder-store/src/chain_event.rs`), with no distinct `TipAdvanced` variant. Every non-reorg commit advances the tip in the canonical case, so the right shape is to rename `ChainCommitted` → `TipAdvanced` (variant + proto + on-disk codec discriminant) so the semantic is in the name rather than encoded as "the not-`ChainReorged` arm." `ChainReorged` already covers the reorg case; no third variant is needed.
 
 **Affected consumers.**
 
-- Zallet today (Zaino-side; addressed by Zallet's planned M2 migration to `chain_events`).
+- Zallet today (Zaino-side; addressed by Zallet's planned M2 migration to `chain_events` plus the rename below).
 - Any consumer migrating from Zaino's mempool-stream-closure pattern.
 
-**Owning venue.** [Wallet data plane §Chain-Event Subscription](../architecture/wallet-data-plane.md#chain-event-subscription). Confirm the contract is documented and add a migration note.
+**Owning venue.** [Wallet data plane §Chain-Event Subscription](../architecture/wallet-data-plane.md#chain-event-subscription). Phase 3 PR6 renames `ChainCommitted` → `TipAdvanced` across the 10 sites that reference it (variant declaration, proto `Committed` oneof variant + `ChainCommittedEvent` message, durable on-disk codec at `crates/zinder-store/src/format/artifact_codec.rs:927,958`, in-memory codec at `crates/zinder-store/src/proto_codec.rs:38`, emit and match sites in `crates/zinder-store/src/chain_store.rs:1605,1651`, the `RemoteChainIndex` proto decoder, the derive consumer at `services/zinder-derive/src/consumer/chain_events.rs`, the dispatch arm at `services/zinder-ingest/src/chain_ingest.rs:1001`, and the four test files). Pre-launch the capability `wallet.events.chain_v1` mutates in place per `public-interfaces.md` rule. Adds `ChainEvent::is_tip_advance(&self) -> bool` for consumer ergonomics.
 
-**Pattern.** [Pattern 3: Status, Health, and Lifecycle as After-Thoughts](lessons-from-zaino.md). When tip-change has no first-class event, consumers reverse-engineer it from unrelated stream lifecycles.
+**Pattern.** [Pattern 3: Status, Health, and Lifecycle as After-Thoughts](lessons-from-zaino.md). When tip-change has no first-class event, consumers reverse-engineer it from unrelated stream lifecycles. Naming the typed variant directly makes the contract grippable.
 
-### G21. String-keyed pool discriminants
+### G21. String-keyed pool discriminants ✓ closed (Zinder shape)
 
-**Evidence.** `wallet/zallet/src/components/sync/steps.rs:104,127`:
+**Closed by** typed `ShieldedProtocol` enum at `crates/zinder-core/src/subtree_root.rs:17` (with `rpc_pool_name()` mapping to the lightwalletd-compat string at the boundary), and `ChainIndex::subtree_roots_in_range` taking a typed `SubtreeRootRange` (which carries `protocol: ShieldedProtocol`) at `crates/zinder-client/src/chain_index.rs:392-395`. No string-keyed pool discriminant exists on the typed Rust surface or the native proto.
+
+**Historical evidence (kept as anchor).** `wallet/zallet/src/components/sync/steps.rs:104,127`:
 
 ```rust
 chain.z_get_subtrees_by_index("sapling", ...).await?;
@@ -460,7 +483,7 @@ Five Zaino patterns are documented here as deliberate non-features. Each is anch
 
 **The anti-pattern.** A single `BlockId` proto message with both `height` and `hash` fields, where `height == 0` is a sentinel for "ignore height, use hash." This conflicts with genesis (height 0 is a valid height) and forces every consumer to know the sentinel rule.
 
-**Where it bites today.** `wallet/zallet/src/components/sync/steps.rs:80,245`, `view_transaction.rs:944-957`, `migrate_zcashd_wallet.rs:186`. Four call sites construct `BlockId { height: 0, hash: vec![...] }` manually, with the height-zero-as-sentinel rule encoded as comments rather than as types.
+**Where it bites today.** `wallet/zallet/src/components/sync/steps.rs:80,245`, `view_transaction.rs:944-957`, `migrate_zcashd_wallet.rs:186`. Four call sites construct sentinel-overloaded `BlockId` shapes. The form varies by site: `steps.rs:80,245` use `BlockId::default()` then mutate fields via `block_id.hash = ...` or `block_id.height = ...` in a `match`; `view_transaction.rs:952-953` uses the struct literal `BlockId { height: 0, hash: block_metadata.block_hash().0.to_vec() }` (height-zero-as-sentinel); `migrate_zcashd_wallet.rs:186` inverts the sentinel direction with `BlockId { height: u64::from(birthday_height.saturating_sub(1)), hash: vec![] }` (non-zero height, empty hash). Three different shapes of the same anti-pattern: the rule is comment-encoded, not type-encoded, so each site picks its own sentinel direction.
 
 **Zinder's refusal.** Typed `BlockSelector` oneof (`Height(BlockHeight) | Hash(BlockHash)`) at every layer. Genesis is `BlockSelector::Height(BlockHeight::ZERO)`, which is unambiguous. `BlockId` remains the *return* shape for resolved identities; it is never a request shape with sentinel fields.
 
@@ -482,29 +505,11 @@ The same gap lands differently per consumer. This matrix is the prioritization i
 
 | Gap | Zallet | Zashi/Zodl | Public lightwalletd | Block explorers |
 | --- | --- | --- | --- | --- |
-| G1: transparent-address balance | ✓ closed | ✓ closed | ✓ closed | ✓ closed |
-| G2: hash-only block lookups | ✓ closed | ✓ closed | ✓ closed | ✓ closed |
-| G3: `TransactionArtifact` enrichment | ✓ closed | ✓ closed | not exposed in lightwalletd proto | ✓ closed |
-| G4: `get_block_header` equivalent | ✓ closed | ✓ closed | not applicable | ✓ closed |
 | G5: `getrawtransaction(txid, blockhash)` | rejected at Zallet boundary | not blocking | some clients | some explorers |
-| G6: transparent-mempool gRPC RPCs | ✓ closed | ✓ closed | not exposed in lightwalletd proto | ✓ closed |
-| G7: `IsInMempool` standalone RPC | ✓ closed | ✓ closed | not exposed in lightwalletd proto | ✓ closed |
-| G8: `GetMempoolTx.poolTypes` filter | not applicable | not blocking | some clients (forward compat) | not applicable |
-| G9: `GetLightdInfo` empty fields | not applicable | cosmetic | cosmetic | cosmetic |
 | G10: wallet plane authentication | operator concern | operator concern | blocking for multi-tenant | operator concern |
-| G11: zaino-parity certification suite | required for swap confidence | required for swap confidence | required for swap confidence | required for swap confidence |
-| G12: Zallet+Zinder operator recipe | ✓ closed | not applicable | not applicable | not applicable |
-| G13: `TxStatus` proto projection | ✓ closed | ✓ closed | not exposed in lightwalletd proto | ✓ closed |
-| G14: typed error vocabulary | closes on migration | not applicable on Rust trait | not applicable | not applicable |
-| G15: typed tip height | closes on migration | not applicable on Rust trait | not applicable | not applicable |
-| G16: subtree-root bytes | closes on migration | not applicable on Rust trait | not applicable | not applicable |
-| G17: tree-state on `ChainIndex` | closes on migration | not applicable on Rust trait | not applicable | not applicable |
-| G18: prevout-resolution surface | workaround (per-tx fetch) | blocking | not applicable | blocking |
-| G19: broadcast typed-bytes | closes on migration | not applicable on Rust trait | not applicable | not applicable |
-| G20: tip-change push event | closes on migration | uses separate signal | not applicable | not applicable |
-| G21: typed pool enum | closes on migration | not applicable on Rust trait | not applicable | not applicable |
+| G18: prevout-resolution surface (M6) | workaround (per-tx fetch) | blocking | not applicable | blocking |
 
-"Not blocking" means the consumer has either a typed Rust path (G6, G7, G13 for Rust callers), a fix on the consumer side (G2: pass height already held; G3: decode raw bytes; G5: Zallet already rejects the form), or no observed need (G1 for Zallet because balance is wallet-DB-local). "Cosmetic" means the field is observable but does not gate a product flow. "Closes on migration" means the gap is a Zaino-side friction; Zinder's typed surface already has the right shape, so adopting Zinder closes the gap automatically. "✓ closed" rows are kept as historical anchors and removed from the matrix in the next refresh.
+Closed rows (G1, G2, G3, G4, G6, G7, G12, G13, G15, G16, G17, G19, G21) are removed from the matrix per the doc's own refresh rule; their gap-row entries above stay as historical anchors. "Not blocking" means the consumer has either a typed Rust path (G6, G7, G13 for Rust callers), a fix on the consumer side (G2: pass height already held; G3: decode raw bytes; G5: Zallet already rejects the form), or no observed need (G1 for Zallet because balance is wallet-DB-local). "Cosmetic" means the field is observable but does not gate a product flow. "Closes on PR{N} + migration" means Zinder closes the Rust trait shape in the named PR; the Zaino-side friction goes away when the consumer adopts Zinder.
 
 ## Decisions Surfaced by This Research
 
@@ -519,13 +524,18 @@ These decisions surfaced from the gap inventory. Items marked "Decision" are the
 7. **✓ shipped: Zallet-with-Zinder operator recipe (G12).** Separate-process `RemoteChainIndex` over `zinder-query` is the default Zallet deployment. Documented in [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder). `LocalChainIndex` is documented as an advanced colocated optimization, not the baseline recipe.
 8. **✓ shipped: `MempoolEvent.Mined.block_hash` enrichment (cross-cuts G6, G7, G11).** Added the mined block hash to the mempool source events, the in-process `MempoolEvent::Mined` variant, the wire `MempoolMinedEvent`, and the `UpstreamTransactionLookup::Mined { block_hash }` field. Source backends extract it from Zebra's streaming `MempoolChange::Mined` plus `getrawtransaction`, and from JSON-RPC polling's `getrawtransaction.blockhash`; the orchestrator passes through authoritative bytes without a chain-store-not-yet-caught-up race. Documented in [Wallet data plane §Mempool Point Lookups](../architecture/wallet-data-plane.md#mempool-point-lookups).
 9. **✓ shipped: federation generic for derive-plane proxying (G1, future M6+ derive consumers).** [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) shipped `DeriveProxy<Client>` ahead of M5 Slice B and is the federation primitive every federated `WalletQuery.*` method calls. The capability namespace rule (`derive.{consumer}.{capability}_v{N}`, never `wallet.*`) is enforced by capability-coverage tests; the readiness probe loop and the gauge live in `services/zinder-query/src/derive_proxy.rs`. M5 Slice B `WalletQuery.TransparentAddressBalance` is the first consumer; M6+ consumers add one `DeriveProxy<C>` field per consumer plus one closure per federated method.
-10. **Decision: machine-readable gap tags on `Status::unimplemented` sites (cross-cuts G2, G3, G7, the entire compat shim).** Each `Status::unimplemented` site in `services/zinder-compat-lightwalletd/src/grpc.rs` carries a `/// gap: G{N}` doc comment immediately above the method. A test in `services/zinder-compat-lightwalletd/tests/integration/` walks the source and asserts every site has a matching gap tag. Without this, the gap inventory drifts from reality silently between refreshes (Review Risk #1).
+10. **Decision: machine-readable gap and refusal tags walked workspace-wide.** Three tag kinds carry the gap-doc-to-code contract:
+    - `/// gap: G{N}` on every `Status::unimplemented` site or other site that proves an open gap.
+    - `/// closes: G{N}` on every public type or method whose presence closes a gap row.
+    - `/// refuses: A{N}` on every public type or method whose shape refuses an anti-pattern (`A1`-`A5`).
+
+    The workspace-wide CI walker at `crates/zinder-proto/tests/integration/gap_doc_walker.rs` parses gap and anti-pattern rows from this document, greps the workspace for the three tag kinds, and asserts: every tagged id exists in the doc; every `closed by ...` row has at least one `closes: G{N}` tag; every `open` row has at least one `gap: G{N}` site OR is explicitly marked `Status: deferred` in the row body; every `Anti-Pattern A{N}` has at least one `refuses: A{N}` tag. Without this, the gap inventory drifts from reality silently between refreshes (Review Risk #1). The rule scope expanded from the original compat-shim scope to workspace-wide on 2026-05-09 (Phase 0).
 
 ## Review Risks
 
 Concrete anti-patterns this research surfaces. PR review should pause and link the relevant risk number when any of these appear.
 
-1. **Adding `Status::unimplemented` to a method without a `/// gap: G{N}` doc comment.** Every `Status::unimplemented` in `services/zinder-compat-lightwalletd/src/grpc.rs` carries a machine-readable gap tag per Decision 10. The CI assertion in `services/zinder-compat-lightwalletd/tests/integration/` walks the source and fails the build if a site lacks a tag or references a gap row that is not in this document. Manual cross-reference in this document remains the human-readable companion. Drift recreates [Pattern 2](lessons-from-zaino.md).
+1. **Adding a public type, trait method, or `Status::unimplemented` site without a `/// gap: G{N}`, `/// closes: G{N}`, or `/// refuses: A{N}` doc comment when one applies.** Every relevant site carries a machine-readable tag per Decision 10. The CI assertion at `crates/zinder-proto/tests/integration/gap_doc_walker.rs` walks the workspace and fails the build if a site lacks a tag, references a row that is not in this document, or leaves a `closed by ...` row unmatched by any `closes: G{N}` tag. Manual cross-reference in this document remains the human-readable companion. Drift recreates [Pattern 2](lessons-from-zaino.md).
 2. **Adding a `ChainIndex` method without a corresponding `WalletQuery` RPC, or vice versa, without an explicit per-method note in the doc that owns the asymmetry.** G6 and G7 are the existing examples; new ones should be deliberate.
 3. **Re-exporting a `zaino-*` type, a `zebra-*` type, or a `zcash_client_backend::proto::*` type from a public Zinder API.** The `zaino_fetch::jsonrpsee::response::block_header::GetBlockHeader` import in Zallet's `migrate_zcashd_wallet.rs:14` is the cautionary tale: zaino-internal types crossed Zaino's public boundary because the trait surface omitted them. Zinder must not repeat this; see also [Pattern 8](lessons-from-zaino.md).
 4. **Implementing a balance, history, or aggregation surface in `zinder-store` instead of `zinder-derive`.** [Pattern 4](lessons-from-zaino.md) and [Extending artifacts §When to add an artifact family](../architecture/extending-artifacts.md#when-to-add-an-artifact-family) name this risk; M5 is the deliberate response. A balance or history accumulator landing in `zinder-store` reopens this anti-pattern.

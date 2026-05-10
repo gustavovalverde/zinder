@@ -71,6 +71,30 @@ async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_types()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry(0xC1, synthetic_chain_epoch()),
+        transparent_only_entry(0xC2, synthetic_chain_epoch()),
+    ]);
+    let adapter =
+        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()))
+            .with_mempool_surface(Arc::new(surface));
+
+    let response = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: vec![lightwalletd::PoolType::Transparent as i32],
+        }))
+        .await?
+        .into_inner();
+    let collected = collect_compact_txids(response).await?;
+    assert_eq!(collected, vec![[0xC2; 32].to_vec()]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_tx_reads_all_snapshot_pages() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
@@ -180,18 +204,56 @@ fn synthetic_chain_epoch() -> ChainEpoch {
 }
 
 fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+    synthetic_entry_with_compact_tx(
+        transaction_id_byte,
+        chain_epoch,
+        &lightwalletd::CompactTx {
+            index: 0,
+            txid: transaction_id_byte_to_txid_vec(transaction_id_byte),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: vec![lightwalletd::CompactSaplingOutput {
+                cmu: vec![transaction_id_byte; 32],
+                ephemeral_key: vec![transaction_id_byte; 32],
+                ciphertext: vec![transaction_id_byte; 52],
+            }],
+            actions: Vec::new(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        },
+    )
+}
+
+fn transparent_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+    synthetic_entry_with_compact_tx(
+        transaction_id_byte,
+        chain_epoch,
+        &lightwalletd::CompactTx {
+            index: 0,
+            txid: transaction_id_byte_to_txid_vec(transaction_id_byte),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: Vec::new(),
+            vin: vec![lightwalletd::CompactTxIn {
+                prevout_txid: vec![0x11; 32],
+                prevout_index: 0,
+            }],
+            vout: vec![lightwalletd::TxOut {
+                value: 100,
+                script_pub_key: vec![0xAB; 25],
+            }],
+        },
+    )
+}
+
+fn synthetic_entry_with_compact_tx(
+    transaction_id_byte: u8,
+    chain_epoch: ChainEpoch,
+    compact_tx: &lightwalletd::CompactTx,
+) -> MempoolEntry {
     let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
-    let dummy_compact = lightwalletd::CompactTx {
-        index: 0,
-        txid: transaction_id_byte_to_txid_vec(transaction_id_byte),
-        fee: 0,
-        spends: Vec::new(),
-        outputs: Vec::new(),
-        actions: Vec::new(),
-        vin: Vec::new(),
-        vout: Vec::new(),
-    };
-    let compact_bytes = dummy_compact.encode_to_vec();
+    let compact_bytes = compact_tx.encode_to_vec();
     MempoolEntry {
         transaction_id,
         auth_digest: Some(AuthDigest::from_bytes([transaction_id_byte; 32])),
