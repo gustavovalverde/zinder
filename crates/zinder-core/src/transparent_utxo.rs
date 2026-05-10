@@ -30,6 +30,12 @@ pub struct TransparentOutPoint {
 }
 
 impl TransparentOutPoint {
+    /// Sentinel outpoint used by Zcash transaction inputs to mark coinbase.
+    ///
+    /// Coinbase inputs do not spend a previous transparent output, so wallet
+    /// consumers must filter this value before prevout-resolution requests.
+    pub const COINBASE_SENTINEL: Self = Self::new(TransactionId::from_bytes([0u8; 32]), u32::MAX);
+
     /// Creates a transparent outpoint.
     #[must_use]
     pub const fn new(transaction_id: TransactionId, output_index: u32) -> Self {
@@ -37,6 +43,12 @@ impl TransparentOutPoint {
             transaction_id,
             output_index,
         }
+    }
+
+    /// Returns true when this outpoint is the Zcash coinbase input sentinel.
+    #[must_use]
+    pub fn is_coinbase_sentinel(self) -> bool {
+        self == Self::COINBASE_SENTINEL
     }
 }
 

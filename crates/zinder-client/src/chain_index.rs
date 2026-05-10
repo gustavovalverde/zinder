@@ -526,6 +526,10 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// `None` when the canonical chain at the response's epoch does not
     /// have the referenced output.
     ///
+    /// Implementations reject the coinbase sentinel and silently truncate
+    /// requests above
+    /// [`zinder_core::MAX_TRANSPARENT_PREVOUTS_PER_REQUEST`].
+    ///
     async fn transparent_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],

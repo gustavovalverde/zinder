@@ -26,12 +26,12 @@ pub use zinder_core::{
     BlockArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
     BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastRejected, BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact,
-    MempoolEntry, MempoolEvictionReason, MinedDetails, MinedTransaction, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TreeStateArtifact, TxStatus,
+    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, MempoolEntry, MempoolEvictionReason, MinedDetails,
+    MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus,
 };
 pub use zinder_proto::ZINDER_CAPABILITIES;
 pub use zinder_proto::v1::wallet::ServerCapabilities;

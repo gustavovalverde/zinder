@@ -562,7 +562,7 @@ impl ChainIndex for LocalChainIndex {
         outpoints: &[zinder_core::TransparentOutPoint],
         at_epoch: Option<ChainEpoch>,
     ) -> Result<zinder_core::TransparentPrevoutsResponse, IndexerError> {
-        let outpoints = outpoints.to_vec();
+        let outpoints = normalize_transparent_prevout_outpoints(outpoints)?;
         self.read_at_epoch(at_epoch, move |reader| {
             let chain_epoch = reader.chain_epoch();
             let mut entries = Vec::with_capacity(outpoints.len());
@@ -602,6 +602,26 @@ impl ChainIndex for LocalChainIndex {
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
     }
+}
+
+fn normalize_transparent_prevout_outpoints(
+    outpoints: &[zinder_core::TransparentOutPoint],
+) -> Result<Vec<zinder_core::TransparentOutPoint>, IndexerError> {
+    for (request_index, outpoint) in outpoints.iter().enumerate() {
+        if outpoint.is_coinbase_sentinel() {
+            return Err(IndexerError::invalid_request(format!(
+                "outpoints[{request_index}] is the coinbase sentinel \
+                 (transaction_id == [0u8; 32], output_index == 0xFFFFFFFF); \
+                 filter coinbase inputs at the request boundary",
+            )));
+        }
+    }
+
+    Ok(outpoints
+        .iter()
+        .take(zinder_core::MAX_TRANSPARENT_PREVOUTS_PER_REQUEST)
+        .copied()
+        .collect())
 }
 
 fn spawn_catchup_loop(store: SecondaryChainStore, interval: Duration, cancel: CancellationToken) {

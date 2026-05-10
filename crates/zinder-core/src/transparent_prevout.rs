@@ -22,6 +22,13 @@
 
 use crate::{ChainEpoch, TransparentOutPoint};
 
+/// Hard cap on the number of transparent outpoints one prevout-resolution
+/// request may resolve.
+///
+/// Requests above the cap are silently truncated to the first N outpoints so
+/// canonical, mempool, local, and remote paths expose the same batch contract.
+pub const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
+
 /// Resolved transparent output referenced by an outpoint.
 ///
 /// Carries the intrinsic fields a consumer needs to compute input value

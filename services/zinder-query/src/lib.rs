@@ -450,7 +450,6 @@ where
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentPrevoutsResponse, QueryError> {
         let started_at = Instant::now();
-        let outpoint_count = outpoints.len();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
@@ -488,12 +487,7 @@ where
             })
         }))
         .await;
-        record_wallet_query_outcome(
-            "transparent_prevouts",
-            started_at,
-            &query_outcome,
-            Some(outpoint_count),
-        );
+        record_wallet_query_outcome("transparent_prevouts", started_at, &query_outcome, None);
         query_outcome
     }
 

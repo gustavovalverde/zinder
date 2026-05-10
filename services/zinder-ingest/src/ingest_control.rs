@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{
-    ChainEpoch, Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    UnixTimestampMillis,
+    ChainEpoch, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_proto::v1::{
     ingest::{
@@ -311,13 +311,6 @@ impl IngestControl for IngestControlGrpcAdapter {
         }))
     }
 }
-
-/// Hard cap on the number of outpoints one mempool prevout request may resolve.
-///
-/// Mirrors the canonical cap declared in
-/// `services/zinder-query/src/grpc/adapter.rs` so the two surfaces enforce
-/// identical batch sizes.
-const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
 
 fn transparent_mempool_prevout_entry_message(
     entry: zinder_core::TransparentPrevoutEntry,

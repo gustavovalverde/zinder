@@ -6,9 +6,9 @@ use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
-    TransparentOutPoint,
+    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -733,28 +733,15 @@ fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<Transactio
     Ok(TransactionId::from_bytes(bytes))
 }
 
-/// Hard cap on the number of outpoints one prevout-resolution request may resolve.
-///
-/// Requests above the cap are silently truncated to the first N outpoints.
-/// The value mirrors the transparent-address balance address cap so DX is
-/// uniform across batched wallet-plane reads.
-const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
-
-/// Coinbase sentinel outpoint.
-///
-/// Coinbase inputs spend nothing on chain; every observed consumer (Zallet,
-/// Zaino, Esplora) filters them at the call site. Slice 2 rejects the
-/// sentinel loudly so consumer bugs surface at request construction time.
-const COINBASE_SENTINEL_TRANSACTION_ID: [u8; 32] = [0u8; 32];
-const COINBASE_SENTINEL_OUTPUT_INDEX: u32 = u32::MAX;
-
 /// Rejects the coinbase sentinel outpoint with `INVALID_ARGUMENT` and a
 /// `BadRequest`-shaped diagnostic naming the offending request index.
 ///
 fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Status> {
+    let sentinel = TransparentOutPoint::COINBASE_SENTINEL;
+    let sentinel_transaction_id = sentinel.transaction_id.as_bytes();
     for (request_index, outpoint) in outpoints.iter().enumerate() {
-        if outpoint.transaction_id.as_slice() == COINBASE_SENTINEL_TRANSACTION_ID
-            && outpoint.output_index == COINBASE_SENTINEL_OUTPUT_INDEX
+        if outpoint.transaction_id.as_slice() == sentinel_transaction_id.as_slice()
+            && outpoint.output_index == sentinel.output_index
         {
             return Err(Status::invalid_argument(format!(
                 "outpoints[{request_index}] is the coinbase sentinel \
