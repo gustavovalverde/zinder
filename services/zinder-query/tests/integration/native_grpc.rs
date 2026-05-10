@@ -739,6 +739,15 @@ impl IngestControl for StaticIngestControl {
             "test scaffold does not stub TransparentMempoolSpendByOutpoint",
         ))
     }
+
+    async fn transparent_mempool_prevouts(
+        &self,
+        _request: Request<wallet::TransparentMempoolPrevoutsRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+        Err(Status::unimplemented(
+            "test scaffold does not stub TransparentMempoolPrevouts",
+        ))
+    }
 }
 
 async fn spawn_ingest_control_server(

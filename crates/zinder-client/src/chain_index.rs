@@ -10,7 +10,8 @@ use zinder_core::{
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus,
+    TransparentMempoolPrevoutsResponse, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -536,6 +537,28 @@ pub trait ChainIndex: Send + Sync + 'static {
         addresses: &[TransparentAddressScriptHash],
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressBalance, IndexerError>;
+
+    /// Resolves a batch of canonical-chain transparent outpoints to their
+    /// referenced outputs, in input order. Each entry's `prevout` is
+    /// `None` when the canonical chain at the response's epoch does not
+    /// have the referenced output.
+    ///
+    /// closes: G18
+    async fn transparent_prevouts(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentPrevoutsResponse, IndexerError>;
+
+    /// Resolves a batch of outpoints against the live mempool index. Used
+    /// when an outpoint references an output of an unconfirmed mempool
+    /// transaction (chained-mempool flows).
+    ///
+    /// closes: G18
+    async fn transparent_mempool_prevouts(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentMempoolPrevoutsResponse, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

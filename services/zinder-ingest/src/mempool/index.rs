@@ -18,7 +18,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use zinder_core::{
     MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
-    TransparentMempoolSpend, TransparentOutPoint, UnixTimestampMillis,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevout, TransparentPrevoutEntry,
+    UnixTimestampMillis,
 };
 
 /// Outcome of applying a single source-observed event to the index.
@@ -167,6 +168,42 @@ impl MempoolIndex {
         let transparent_outputs = outputs.values().take(bound).cloned().collect::<Vec<_>>();
         drop(state);
         transparent_outputs
+    }
+
+    /// Resolves a batch of outpoints against the live mempool index.
+    ///
+    /// Returns one entry per requested outpoint, in input order. Each entry
+    /// carries the resolved transparent output when the outpoint references
+    /// a transaction currently in the mempool and the output index is in
+    /// bounds; otherwise the entry's `prevout` is `None`.
+    #[must_use]
+    pub fn transparent_prevouts_by_outpoints(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Vec<TransparentPrevoutEntry> {
+        let state = self.state.read();
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                let prevout = state
+                    .entries
+                    .get(&outpoint.transaction_id)
+                    .and_then(|entry| {
+                        entry
+                            .transparent_outputs
+                            .iter()
+                            .find(|mempool_output| mempool_output.outpoint == *outpoint)
+                    })
+                    .map(|mempool_output| TransparentPrevout {
+                        value_zat: mempool_output.value_zat,
+                        script_pub_key: mempool_output.script_pub_key.clone(),
+                    });
+                TransparentPrevoutEntry {
+                    outpoint: *outpoint,
+                    prevout,
+                }
+            })
+            .collect()
     }
 
     /// Returns the mempool spend that consumes `spent_outpoint`, when

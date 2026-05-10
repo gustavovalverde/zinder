@@ -262,13 +262,12 @@ impl IngestControl for IngestControlGrpcAdapter {
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
         let request = request.into_inner();
-        let transaction_id = transaction_id_from_bytes(&request.transaction_id)?;
+        let outpoint = outpoint_from_request_message(request.outpoint)?;
         let chain_epoch = self
             .store
             .current_chain_epoch()
             .map_err(|error| status_from_store_error(&error))?
             .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
-        let outpoint = TransparentOutPoint::new(transaction_id, request.output_index);
         let spend = mempool_index
             .transparent_spend_by_outpoint(outpoint)
             .as_ref()
@@ -279,6 +278,57 @@ impl IngestControl for IngestControlGrpcAdapter {
                 spend,
             },
         ))
+    }
+
+    /// closes: G18
+    async fn transparent_mempool_prevouts(
+        &self,
+        request: Request<wallet::TransparentMempoolPrevoutsRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+        let mempool_index = self
+            .mempool_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
+        let request = request.into_inner();
+        let mut request_outpoints = request.outpoints;
+        request_outpoints.truncate(MAX_TRANSPARENT_PREVOUTS_PER_REQUEST);
+        let outpoints = request_outpoints
+            .into_iter()
+            .map(|message| outpoint_from_request_message(Some(message)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+        let entries = mempool_index
+            .transparent_prevouts_by_outpoints(&outpoints)
+            .into_iter()
+            .map(transparent_mempool_prevout_entry_message)
+            .collect();
+        Ok(Response::new(wallet::TransparentMempoolPrevoutsResponse {
+            chain_epoch: Some(chain_epoch_message(chain_epoch)),
+            entries,
+        }))
+    }
+}
+
+/// Hard cap on the number of outpoints one mempool prevout request may resolve.
+///
+/// Mirrors the canonical cap declared in
+/// `services/zinder-query/src/grpc/adapter.rs` so the two surfaces enforce
+/// identical batch sizes.
+const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
+
+fn transparent_mempool_prevout_entry_message(
+    entry: zinder_core::TransparentPrevoutEntry,
+) -> wallet::TransparentMempoolPrevoutEntry {
+    wallet::TransparentMempoolPrevoutEntry {
+        outpoint: Some(zinder_store::outpoint_message(&entry.outpoint)),
+        prevout: entry.prevout.map(|prevout| wallet::TransparentPrevout {
+            value_zat: prevout.value_zat,
+            script_pub_key: prevout.script_pub_key,
+        }),
     }
 }
 
@@ -328,6 +378,17 @@ fn transaction_id_from_bytes(bytes: &[u8]) -> Result<TransactionId, Status> {
         .try_into()
         .map_err(|_| Status::invalid_argument("transaction_id must be 32 bytes"))?;
     Ok(TransactionId::from_bytes(id_bytes))
+}
+
+fn outpoint_from_request_message(
+    message: Option<wallet::OutPoint>,
+) -> Result<TransparentOutPoint, Status> {
+    let message = message.ok_or_else(|| Status::invalid_argument("outpoint is required"))?;
+    let transaction_id = transaction_id_from_bytes(&message.transaction_id)?;
+    Ok(TransparentOutPoint::new(
+        transaction_id,
+        message.output_index,
+    ))
 }
 
 async fn stream_mempool_events(

@@ -150,6 +150,18 @@ pub fn mempool_event_envelope_message(
     })
 }
 
+/// Encodes a [`TransparentOutPoint`] into the wallet protocol message.
+///
+/// Public so every wallet-plane outpoint-keyed RPC encodes through one
+/// canonical helper instead of re-deriving `(transaction_id, output_index)`.
+#[must_use]
+pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
+    wallet::OutPoint {
+        transaction_id: outpoint.transaction_id.as_bytes().into(),
+        output_index: outpoint.output_index,
+    }
+}
+
 /// Encodes a [`TransparentMempoolOutput`] into the wallet protocol message.
 ///
 /// Public so the writer-side mempool point-lookup adapter can encode
@@ -161,8 +173,7 @@ pub fn transparent_mempool_output_message(
     wallet::TransparentMempoolOutput {
         address_script_hash: transparent_output.address_script_hash.as_bytes().into(),
         script_pub_key: transparent_output.script_pub_key.clone(),
-        spending_transaction_id: transparent_output.outpoint.transaction_id.as_bytes().into(),
-        output_index: transparent_output.outpoint.output_index,
+        outpoint: Some(outpoint_message(&transparent_output.outpoint)),
         value_zat: transparent_output.value_zat,
     }
 }
@@ -175,12 +186,7 @@ pub fn transparent_mempool_spend_message(
     transparent_spend: &TransparentMempoolSpend,
 ) -> wallet::TransparentMempoolSpend {
     wallet::TransparentMempoolSpend {
-        spent_transaction_id: transparent_spend
-            .spent_outpoint
-            .transaction_id
-            .as_bytes()
-            .into(),
-        spent_output_index: transparent_spend.spent_outpoint.output_index,
+        spent_outpoint: Some(outpoint_message(&transparent_spend.spent_outpoint)),
         spending_transaction_id: transparent_spend.spending_transaction_id.as_bytes().into(),
     }
 }
@@ -406,6 +412,23 @@ pub fn mempool_event_envelope_from_message(
     })
 }
 
+/// Decodes a wallet-protocol [`wallet::OutPoint`] into the canonical type.
+///
+/// `field` is the field path of the outpoint message itself (used in
+/// diagnostics if `transaction_id` carries the wrong length). Callers
+/// pre-unwrap the `Option<wallet::OutPoint>` and emit
+/// [`MempoolDecodeError::MissingField`] with their own precise path when
+/// the message is absent.
+pub fn outpoint_from_message(
+    field: &'static str,
+    message: wallet::OutPoint,
+) -> Result<TransparentOutPoint, MempoolDecodeError> {
+    Ok(TransparentOutPoint::new(
+        TransactionId::from_bytes(fixed_32_bytes(field, message.transaction_id)?),
+        message.output_index,
+    ))
+}
+
 /// Decodes a wallet-protocol [`wallet::TransparentMempoolOutput`] into the canonical type.
 ///
 /// Public for the same reason as [`transparent_mempool_output_message`]:
@@ -413,19 +436,16 @@ pub fn mempool_event_envelope_from_message(
 pub fn transparent_mempool_output_from_message(
     message: wallet::TransparentMempoolOutput,
 ) -> Result<TransparentMempoolOutput, MempoolDecodeError> {
+    let outpoint_message = message.outpoint.ok_or(MempoolDecodeError::MissingField {
+        field: "transparent_output.outpoint",
+    })?;
     Ok(TransparentMempoolOutput {
         address_script_hash: TransparentAddressScriptHash::from_bytes(fixed_32_bytes(
             "transparent_output.address_script_hash",
             message.address_script_hash,
         )?),
         script_pub_key: message.script_pub_key,
-        outpoint: TransparentOutPoint::new(
-            transaction_id_from_bytes(
-                "transparent_output.spending_transaction_id",
-                message.spending_transaction_id,
-            )?,
-            message.output_index,
-        ),
+        outpoint: outpoint_from_message("transparent_output.outpoint", outpoint_message)?,
         value_zat: message.value_zat,
     })
 }
@@ -436,14 +456,17 @@ pub fn transparent_mempool_output_from_message(
 pub fn transparent_mempool_spend_from_message(
     message: wallet::TransparentMempoolSpend,
 ) -> Result<TransparentMempoolSpend, MempoolDecodeError> {
+    let spent_outpoint_message =
+        message
+            .spent_outpoint
+            .ok_or(MempoolDecodeError::MissingField {
+                field: "transparent_spend.spent_outpoint",
+            })?;
     Ok(TransparentMempoolSpend {
-        spent_outpoint: TransparentOutPoint::new(
-            transaction_id_from_bytes(
-                "transparent_spend.spent_transaction_id",
-                message.spent_transaction_id,
-            )?,
-            message.spent_output_index,
-        ),
+        spent_outpoint: outpoint_from_message(
+            "transparent_spend.spent_outpoint",
+            spent_outpoint_message,
+        )?,
         spending_transaction_id: transaction_id_from_bytes(
             "transparent_spend.spending_transaction_id",
             message.spending_transaction_id,

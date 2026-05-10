@@ -13,7 +13,10 @@ use zinder_core::{
     TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
-use zinder_source::{block_header_info_from_raw_block_bytes, consensus_branch_id_at};
+use zinder_source::{
+    block_header_info_from_raw_block_bytes, consensus_branch_id_at,
+    transparent_prevout_from_raw_transaction_bytes,
+};
 use zinder_store::{
     BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
     TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
@@ -543,6 +546,59 @@ impl ChainIndex for LocalChainIndex {
         self.remote("transparent_address_balance")?
             .transparent_address_balance(addresses, at_epoch)
             .await
+    }
+
+    /// closes: G18
+    async fn transparent_mempool_prevouts(
+        &self,
+        outpoints: &[zinder_core::TransparentOutPoint],
+    ) -> Result<zinder_core::TransparentMempoolPrevoutsResponse, IndexerError> {
+        self.remote("transparent_mempool_prevouts")?
+            .transparent_mempool_prevouts(outpoints)
+            .await
+    }
+
+    /// closes: G18
+    async fn transparent_prevouts(
+        &self,
+        outpoints: &[zinder_core::TransparentOutPoint],
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<zinder_core::TransparentPrevoutsResponse, IndexerError> {
+        let outpoints = outpoints.to_vec();
+        self.read_at_epoch(at_epoch, move |reader| {
+            let chain_epoch = reader.chain_epoch();
+            let mut entries = Vec::with_capacity(outpoints.len());
+            let mut payload_cache: std::collections::HashMap<TransactionId, Option<Vec<u8>>> =
+                std::collections::HashMap::new();
+            for outpoint in outpoints {
+                let cached_payload = match payload_cache.entry(outpoint.transaction_id) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let payload = reader
+                            .transaction_by_id(outpoint.transaction_id)
+                            .map_err(IndexerError::from_store_error)?
+                            .map(|artifact| artifact.payload_bytes);
+                        entry.insert(payload)
+                    }
+                };
+                let prevout = match cached_payload {
+                    None => None,
+                    Some(payload_bytes) => transparent_prevout_from_raw_transaction_bytes(
+                        payload_bytes,
+                        outpoint.output_index,
+                    )
+                    .map_err(|error| {
+                        IndexerError::malformed("transparent_prevout", error.to_string())
+                    })?,
+                };
+                entries.push(zinder_core::TransparentPrevoutEntry { outpoint, prevout });
+            }
+            Ok(zinder_core::TransparentPrevoutsResponse {
+                chain_epoch,
+                entries,
+            })
+        })
+        .await
     }
 
     fn local_catchup_interval(&self) -> Option<Duration> {

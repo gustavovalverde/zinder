@@ -364,6 +364,15 @@ impl IngestControl for SharedWriterStatus {
             "readiness_refresh test stub does not implement TransparentMempoolSpendByOutpoint",
         ))
     }
+
+    async fn transparent_mempool_prevouts(
+        &self,
+        _request: Request<wallet::TransparentMempoolPrevoutsRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement TransparentMempoolPrevouts",
+        ))
+    }
 }
 
 async fn spawn_writer_status_server(

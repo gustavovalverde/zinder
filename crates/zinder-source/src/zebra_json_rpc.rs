@@ -719,6 +719,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::InvalidSubtreeRootHex { .. }
             | SourceError::InvalidSubtreeRootLength { .. }
             | SourceError::RawBlockParseFailed { .. }
+            | SourceError::RawTransactionParseFailed { .. }
             | SourceError::RawBlockCoinbaseHeightMissing
             | SourceError::RawBlockHeightMismatch { .. }
             | SourceError::RawBlockTimeOutOfRange,

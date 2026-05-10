@@ -15,13 +15,15 @@ use zinder_core::{
     SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus, UnixTimestampMillis,
+    TransparentMempoolPrevoutsResponse, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, ServerCapabilities, wallet_query_client::WalletQueryClient};
 use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
     mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
+    outpoint_message,
     transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
     transparent_mempool_spend_from_message as transparent_mempool_spend_from_message_shared,
 };
@@ -524,8 +526,7 @@ impl ChainIndex for RemoteChainIndex {
         outpoint: TransparentOutPoint,
     ) -> Result<Option<TransparentMempoolSpend>, IndexerError> {
         let wire_request = wallet::TransparentMempoolSpendByOutpointRequest {
-            transaction_id: outpoint.transaction_id.as_bytes().to_vec(),
-            output_index: outpoint.output_index,
+            outpoint: Some(outpoint_message(&outpoint)),
         };
         let response = self
             .client()
@@ -566,6 +567,131 @@ impl ChainIndex for RemoteChainIndex {
             .into_inner();
         transparent_address_balance_from_message(self.network, response)
     }
+
+    /// closes: G18
+    async fn transparent_prevouts(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentPrevoutsResponse, IndexerError> {
+        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
+        let request = wallet::TransparentPrevoutsRequest {
+            outpoints: wire_outpoints,
+            at_epoch: at_epoch.map(chain_epoch_to_message),
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_prevouts(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        transparent_prevouts_response_from_message(self.network, response)
+    }
+
+    /// closes: G18
+    async fn transparent_mempool_prevouts(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentMempoolPrevoutsResponse, IndexerError> {
+        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
+        let request = wallet::TransparentMempoolPrevoutsRequest {
+            outpoints: wire_outpoints,
+        };
+        let response = self
+            .client()
+            .await
+            .transparent_mempool_prevouts(Request::new(request))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        transparent_mempool_prevouts_response_from_message(self.network, response)
+    }
+}
+
+fn transparent_mempool_prevouts_response_from_message(
+    expected_network: Network,
+    message: wallet::TransparentMempoolPrevoutsResponse,
+) -> Result<TransparentMempoolPrevoutsResponse, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    let entries = message
+        .entries
+        .into_iter()
+        .map(transparent_mempool_prevout_entry_from_message)
+        .collect::<Result<Vec<_>, IndexerError>>()?;
+    Ok(TransparentMempoolPrevoutsResponse {
+        chain_epoch,
+        entries,
+    })
+}
+
+fn transparent_mempool_prevout_entry_from_message(
+    message: wallet::TransparentMempoolPrevoutEntry,
+) -> Result<zinder_core::TransparentPrevoutEntry, IndexerError> {
+    let outpoint_message = message.outpoint.ok_or_else(|| {
+        IndexerError::malformed(
+            "transparent_mempool_prevout_entry.outpoint",
+            "field is missing",
+        )
+    })?;
+    let transaction_id = TransactionId::from_bytes(fixed_32_bytes(
+        "transparent_mempool_prevout_entry.outpoint.transaction_id",
+        outpoint_message.transaction_id,
+    )?);
+    let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
+    let prevout = message
+        .prevout
+        .map(|prevout_message| zinder_core::TransparentPrevout {
+            value_zat: prevout_message.value_zat,
+            script_pub_key: prevout_message.script_pub_key,
+        });
+    Ok(zinder_core::TransparentPrevoutEntry { outpoint, prevout })
+}
+
+fn transparent_prevouts_response_from_message(
+    expected_network: Network,
+    message: wallet::TransparentPrevoutsResponse,
+) -> Result<TransparentPrevoutsResponse, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    let entries = message
+        .entries
+        .into_iter()
+        .map(transparent_prevout_entry_from_message)
+        .collect::<Result<Vec<_>, IndexerError>>()?;
+    Ok(TransparentPrevoutsResponse {
+        chain_epoch,
+        entries,
+    })
+}
+
+fn transparent_prevout_entry_from_message(
+    message: wallet::TransparentPrevoutEntry,
+) -> Result<zinder_core::TransparentPrevoutEntry, IndexerError> {
+    let outpoint_message = message.outpoint.ok_or_else(|| {
+        IndexerError::malformed("transparent_prevout_entry.outpoint", "field is missing")
+    })?;
+    let transaction_id = TransactionId::from_bytes(fixed_32_bytes(
+        "transparent_prevout_entry.outpoint.transaction_id",
+        outpoint_message.transaction_id,
+    )?);
+    let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
+    let prevout = message
+        .prevout
+        .map(|prevout_message| zinder_core::TransparentPrevout {
+            value_zat: prevout_message.value_zat,
+            script_pub_key: prevout_message.script_pub_key,
+        });
+    Ok(zinder_core::TransparentPrevoutEntry { outpoint, prevout })
 }
 
 fn transparent_address_balance_from_message(
@@ -798,9 +924,12 @@ fn transparent_address_utxo_from_message(
         "transparent_address_utxo.address_script_hash",
         message.address_script_hash,
     )?;
+    let outpoint_message = message.outpoint.ok_or_else(|| {
+        IndexerError::malformed("transparent_address_utxo.outpoint", "field is missing")
+    })?;
     let transaction_id_bytes = fixed_32_bytes(
-        "transparent_address_utxo.transaction_id",
-        message.transaction_id,
+        "transparent_address_utxo.outpoint.transaction_id",
+        outpoint_message.transaction_id,
     )?;
     let block_hash =
         block_hash_from_bytes("transparent_address_utxo.block_hash", message.block_hash)?;
@@ -809,7 +938,7 @@ fn transparent_address_utxo_from_message(
         message.script_pub_key,
         TransparentOutPoint::new(
             TransactionId::from_bytes(transaction_id_bytes),
-            message.output_index,
+            outpoint_message.output_index,
         ),
         message.value_zat,
         BlockHeight::new(message.block_height),
@@ -915,16 +1044,14 @@ fn chain_event_envelope_from_message(
         .event
         .ok_or_else(|| IndexerError::malformed("event", "field is missing"))?
     {
-        wallet::chain_event_envelope::Event::TipAdvanced(tip_advanced) => {
-            ChainEvent::TipAdvanced {
-                committed: chain_epoch_committed_from_message(
-                    expected_network,
-                    tip_advanced.committed.ok_or_else(|| {
-                        IndexerError::malformed("tip_advanced.committed", "field is missing")
-                    })?,
-                )?,
-            }
-        }
+        wallet::chain_event_envelope::Event::TipAdvanced(tip_advanced) => ChainEvent::TipAdvanced {
+            committed: chain_epoch_committed_from_message(
+                expected_network,
+                tip_advanced.committed.ok_or_else(|| {
+                    IndexerError::malformed("tip_advanced.committed", "field is missing")
+                })?,
+            )?,
+        },
         wallet::chain_event_envelope::Event::Reorged(reorged) => ChainEvent::ChainReorged {
             reverted: chain_range_reverted_from_message(
                 expected_network,

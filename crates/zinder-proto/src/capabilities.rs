@@ -35,6 +35,8 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     "wallet.events.mempool_v1",
     "wallet.mempool.transparent_outputs_by_address_v1",
     "wallet.mempool.transparent_spend_by_outpoint_v1",
+    "wallet.mempool.transparent_prevouts_v1",
+    "wallet.read.transparent_prevouts_v1",
     "wallet.address.transparent_utxos_v1",
     "wallet.address.transparent_history_v1",
     "derive.explorer.ready_v1",

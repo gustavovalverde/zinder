@@ -55,8 +55,8 @@ pub use mempool_event_store::{
 pub use proto_codec::{
     ChainEventEncodeError, MempoolDecodeError, chain_epoch_from_message, chain_epoch_message,
     chain_event_envelope_message, mempool_entry_from_message, mempool_entry_message,
-    mempool_event_envelope_from_message, mempool_event_envelope_message,
-    transparent_mempool_output_from_message, transparent_mempool_output_message,
+    mempool_event_envelope_from_message, mempool_event_envelope_message, outpoint_from_message,
+    outpoint_message, transparent_mempool_output_from_message, transparent_mempool_output_message,
     transparent_mempool_spend_from_message, transparent_mempool_spend_message,
 };
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};

@@ -7,3 +7,4 @@ mod single_artifact_lookup;
 mod transaction_broadcast;
 mod transparent_address_tx_history;
 mod transparent_address_utxos;
+mod transparent_prevouts;

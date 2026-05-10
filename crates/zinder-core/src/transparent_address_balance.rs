@@ -1,10 +1,11 @@
 //! Transparent-address balance read-model.
 //!
-//! Per [docs/specs/m5-transparent-address-balance.md] D5, a balance response
-//! splits the canonical confirmed total from a signed mempool delta. The
-//! delta is computed at read time from the live mempool surfaces and is not
-//! persisted; the response binds both values to the [`ChainEpoch`] visible at
-//! lookup time.
+//! Per [ADR-0013] §Wire shape, a balance response splits the canonical
+//! confirmed total from a signed mempool delta. The delta is computed at read
+//! time from the live mempool surfaces and is not persisted; the response
+//! binds both values to the [`ChainEpoch`] visible at lookup time.
+//!
+//! [ADR-0013]: https://github.com/zfnd/zinder/blob/main/docs/adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md
 //!
 //! `unconfirmed_delta_zat` is signed because pending spends from the address
 //! reduce the visible balance, while pending receives raise it. A miner that

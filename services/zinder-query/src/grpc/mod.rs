@@ -17,7 +17,7 @@ pub use native::{
     build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
     latest_block_response, latest_tree_state_response, subtree_roots_response,
     transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
-    transparent_address_utxos_response, tree_state_response,
+    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping

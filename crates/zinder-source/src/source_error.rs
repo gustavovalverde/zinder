@@ -80,6 +80,13 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// Raw transaction bytes could not be parsed as a Zcash transaction.
+    #[error("raw transaction parse failed: {reason}")]
+    RawTransactionParseFailed {
+        /// Parser failure reason.
+        reason: String,
+    },
+
     /// Parsed raw block did not contain a coinbase height.
     #[error("raw block is missing its coinbase height")]
     RawBlockCoinbaseHeightMissing,
@@ -221,6 +228,7 @@ impl SourceError {
             | Self::InvalidSubtreeRootHex { .. }
             | Self::InvalidSubtreeRootLength { .. }
             | Self::RawBlockParseFailed { .. }
+            | Self::RawTransactionParseFailed { .. }
             | Self::RawBlockCoinbaseHeightMissing
             | Self::RawBlockHeightMismatch { .. }
             | Self::RawBlockTimeOutOfRange

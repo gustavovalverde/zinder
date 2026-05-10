@@ -34,7 +34,10 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0008: Consumer-neutral wallet data plane](adrs/0008-consumer-neutral-wallet-data-plane.md)
 - [ADR-0009: IngestControl transport security](adrs/0009-ingest-control-transport-security.md)
 - [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md)
+- [ADR-0011: Derive-plane federation pattern](adrs/0011-derive-plane-federation-pattern.md)
 - [ADR-0012: Consumer-release certification tier](adrs/0012-consumer-release-certification.md)
+- [ADR-0013: Derive-plane instantiation and transparent address balance read-path](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)
+- [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md)
 
 ## Reference
 
@@ -57,9 +60,12 @@ Operational procedures for running Zinder against the workspace and external sys
 Mutable working documents for un-shipped multi-PR work. When a spec's work lands, its locked decisions promote to one or more ADRs and the spec is deleted.
 
 - [M4: Transparent-address artifact surface](specs/m4-transparent-address.md): native `WalletQuery.TransparentAddressUtxos[Stream]` and `TransparentAddressTxIdsInRange`, the matching `ChainIndex` methods, lightwalletd `GetTaddressTxids` / `GetTaddressTransactions`, and the new tx-history canonical artifact family.
-- [M5: Transparent-address balance and derive-plane instantiation](specs/m5-transparent-address-balance.md): instantiates `services/zinder-derive` as a real deployable, ships `TransparentAddressBalance` as the first derive consumer (running-totals accumulator with structured `confirmed_zat` / `unconfirmed_delta_zat` wire shape), federates the RPC under `WalletQuery` per derive-plane Shape 2, and exposes the matching `ChainIndex` and lightwalletd `GetTaddressBalance` methods.
 
-The most recent spec to land was M3 mempool; its locked decisions live in [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
+Recently retired specs and where their decisions live:
+
+- **M5 transparent-address balance + derive-plane instantiation**: split across [ADR-0011](adrs/0011-derive-plane-federation-pattern.md) (federation primitive), [ADR-0013](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) (operational topology, consumer SDK contract, balance wire shape), and [ADR-0014](adrs/0014-compute-at-read-time-canonical-reads.md) (the compute-at-read-time pattern the balance handler uses).
+- **M6 prevout resolution**: locked into [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md).
+- **M3 mempool**: locked into [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
 
 ## Vocabulary and naming rules
 

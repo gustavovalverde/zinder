@@ -31,7 +31,7 @@ use zinder_proto::v1::wallet::{
 use zinder_runtime::AuthenticatedChannel;
 
 use crate::consumer::chain_events;
-use crate::consumer::{TipAdvancedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx};
+use crate::consumer::{CommittedRange, DeriveConsumer, DeriveConsumerCtx, TipAdvancedEvent};
 use crate::error::DeriveError;
 use crate::store::DeriveStore;
 

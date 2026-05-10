@@ -189,6 +189,7 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows that bound derive-consumer downtime tolerance.
 - [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
 - [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) — the federation primitive (`DeriveProxy<Client>`, readiness probe loop, capability namespace rule) that every federated derive method reuses.
-- [M5 spec](../specs/m5-transparent-address-balance.md) — the first shipped derive consumer (transparent address balance) and the Shape C compute-at-read-time pattern that the explorer balance handler implements.
+- [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) — the first shipped derive consumer (transparent address balance), the consumer SDK contract, and the operational topology the rest of this doc describes in architectural terms.
+- [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) — the Shape C compute-at-read-time pattern that the explorer balance handler implements.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — the capability protocol derive consumers must implement.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions that derive consumers inherit.

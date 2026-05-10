@@ -8,6 +8,7 @@ use tonic::{Request, Response, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    TransparentOutPoint,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -34,7 +35,7 @@ use super::native::{
     build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
     chain_events_response, compact_block_response, latest_block_response,
     latest_tree_state_response, subtree_roots_response, transaction_response,
-    transparent_address_utxos_response, tree_state_response,
+    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
 use super::status_from_query_error;
 
@@ -423,6 +424,37 @@ where
         client.transparent_mempool_spend_by_outpoint(request).await
     }
 
+    async fn transparent_prevouts(
+        &self,
+        request: Request<wallet::TransparentPrevoutsRequest>,
+    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
+        let request = request.into_inner();
+        reject_coinbase_sentinels(&request.outpoints)?;
+        let outpoints = transparent_outpoints_from_request(request.outpoints)?;
+        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        transparent_prevouts_response(&self.query_api, outpoints, at_epoch)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    /// closes: G18
+    async fn transparent_mempool_prevouts(
+        &self,
+        request: Request<wallet::TransparentMempoolPrevoutsRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+        let request_inner = request.get_ref();
+        reject_coinbase_sentinels(&request_inner.outpoints)?;
+        let endpoint = self.require_ingest_control_proxy_endpoint(
+            "TransparentMempoolPrevouts requires the ingest-control proxy; \
+             configure the writer endpoint",
+        )?;
+        let mut client =
+            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+                .await?;
+        client.transparent_mempool_prevouts(request).await
+    }
+
     async fn transparent_address_utxos(
         &self,
         request: Request<wallet::TransparentAddressUtxosRequest>,
@@ -700,6 +732,59 @@ fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<Transactio
         .try_into()
         .map_err(|_| Status::invalid_argument("transaction_id must be 32 bytes"))?;
     Ok(TransactionId::from_bytes(bytes))
+}
+
+/// Hard cap on the number of outpoints one prevout-resolution request may resolve.
+///
+/// Requests above the cap are silently truncated to the first N outpoints
+/// (per `docs/specs/m6-prevout-resolution.md` D4); the chosen value mirrors
+/// the M5 balance address cap so DX is uniform across batched wallet-plane
+/// reads.
+const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
+
+/// Coinbase sentinel outpoint.
+///
+/// Coinbase inputs spend nothing on chain; every observed consumer (Zallet,
+/// Zaino, Esplora) filters them at the call site. Slice 2 rejects the
+/// sentinel loudly so consumer bugs surface at request construction time.
+const COINBASE_SENTINEL_TRANSACTION_ID: [u8; 32] = [0u8; 32];
+const COINBASE_SENTINEL_OUTPUT_INDEX: u32 = u32::MAX;
+
+/// Rejects the coinbase sentinel outpoint with `INVALID_ARGUMENT` and a
+/// `BadRequest`-shaped diagnostic naming the offending request index.
+///
+/// refuses: A4
+fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Status> {
+    for (request_index, outpoint) in outpoints.iter().enumerate() {
+        if outpoint.transaction_id.as_slice() == COINBASE_SENTINEL_TRANSACTION_ID
+            && outpoint.output_index == COINBASE_SENTINEL_OUTPUT_INDEX
+        {
+            return Err(Status::invalid_argument(format!(
+                "outpoints[{request_index}] is the coinbase sentinel \
+                 (transaction_id == [0u8; 32], output_index == 0xFFFFFFFF); \
+                 filter coinbase inputs at the request boundary",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Translates a wire outpoint list into typed `TransparentOutPoint`s,
+/// silently truncating to [`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST`].
+fn transparent_outpoints_from_request(
+    mut outpoints: Vec<wallet::OutPoint>,
+) -> Result<Vec<TransparentOutPoint>, Status> {
+    outpoints.truncate(MAX_TRANSPARENT_PREVOUTS_PER_REQUEST);
+    outpoints
+        .into_iter()
+        .map(|outpoint| {
+            let transaction_id = transaction_id_from_request(&outpoint.transaction_id)?;
+            Ok(TransparentOutPoint::new(
+                transaction_id,
+                outpoint.output_index,
+            ))
+        })
+        .collect()
 }
 
 fn chain_epoch_from_request(

@@ -3,7 +3,11 @@
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
 //! calling upstream node sources or mutating canonical storage.
 
-use std::{num::NonZeroU32, time::Instant};
+use std::{
+    collections::{HashMap, hash_map::Entry as HashMapEntry},
+    num::NonZeroU32,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -12,11 +16,12 @@ use zinder_core::{
     ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, RawTransactionBytes,
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
     TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TxStatus,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentPrevoutEntry, TransparentPrevoutsResponse, TxStatus,
 };
 use zinder_source::{
     SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes,
-    consensus_branch_id_at,
+    consensus_branch_id_at, transparent_prevout_from_raw_transaction_bytes,
 };
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEpochReadApi, ChainEventEnvelope,
@@ -42,7 +47,7 @@ pub use grpc::{
     chain_events_response, compact_block_response, latest_block_response,
     latest_tree_state_response, status_from_query_error, subtree_roots_response,
     transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
-    transparent_address_utxos_response, tree_state_response,
+    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -113,6 +118,23 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         tx_index: u64,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<Transaction, QueryError>;
+
+    /// Resolves a batch of canonical-chain transparent outpoints to their
+    /// referenced outputs.
+    ///
+    /// Reads each unique `transaction_id` once from the canonical
+    /// transaction artifact and indexes into the transaction's `vout` list
+    /// (Shape C compute-at-read-time per `docs/specs/m6-prevout-resolution.md`
+    /// D3). Outpoints that do not resolve at the response's [`ChainEpoch`]
+    /// return an entry with `prevout = None`. The response preserves input
+    /// order; duplicate outpoints emit duplicate entries.
+    ///
+    /// closes: G18
+    async fn transparent_prevouts(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentPrevoutsResponse, QueryError>;
 
     /// Reads unspent transparent outputs for one transparent address script.
     async fn transparent_address_utxos(
@@ -419,6 +441,59 @@ where
             started_at,
             &query_outcome,
             None,
+        );
+        query_outcome
+    }
+
+    async fn transparent_prevouts(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<TransparentPrevoutsResponse, QueryError> {
+        let started_at = Instant::now();
+        let outpoint_count = outpoints.len();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let chain_epoch = reader.chain_epoch();
+            let mut entries = Vec::with_capacity(outpoints.len());
+            let mut payload_cache: HashMap<TransactionId, Option<Vec<u8>>> = HashMap::new();
+
+            for outpoint in outpoints {
+                let cached_payload = match payload_cache.entry(outpoint.transaction_id) {
+                    HashMapEntry::Occupied(entry) => entry.into_mut(),
+                    HashMapEntry::Vacant(entry) => {
+                        let payload = reader
+                            .transaction_by_id(outpoint.transaction_id)?
+                            .map(|artifact| artifact.payload_bytes);
+                        entry.insert(payload)
+                    }
+                };
+                let prevout = match cached_payload {
+                    None => None,
+                    Some(payload_bytes) => transparent_prevout_from_raw_transaction_bytes(
+                        payload_bytes,
+                        outpoint.output_index,
+                    )
+                    .map_err(|error| QueryError::ArtifactCorrupt {
+                        family: ArtifactFamily::Transaction,
+                        reason: error.to_string(),
+                    })?,
+                };
+                entries.push(TransparentPrevoutEntry { outpoint, prevout });
+            }
+
+            Ok(TransparentPrevoutsResponse {
+                chain_epoch,
+                entries,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_prevouts",
+            started_at,
+            &query_outcome,
+            Some(outpoint_count),
         );
         query_outcome
     }

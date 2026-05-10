@@ -8,8 +8,8 @@
 //! live in the canonical wallet data plane.
 //!
 //! See `docs/architecture/derive-plane.md` for the architectural backdrop and
-//! `docs/specs/m5-transparent-address-balance.md` for the milestone that
-//! introduces this crate.
+//! `docs/adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md`
+//! for the milestone that introduces this crate.
 
 mod consumer;
 mod error;
@@ -22,9 +22,9 @@ pub use consumer::backfill::{
 pub use consumer::chain_events::{ChainEventsRunOutcome, run as run_chain_events_subscriber};
 pub use consumer::mempool_events::{MempoolEventsRunOutcome, run as run_mempool_events_subscriber};
 pub use consumer::{
-    TipAdvancedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
-    DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent,
-    MempoolConsumerEventVariant, RevertedRange,
+    ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx, DeriveConsumerError,
+    DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
+    RevertedRange, TipAdvancedEvent,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use grpc::{

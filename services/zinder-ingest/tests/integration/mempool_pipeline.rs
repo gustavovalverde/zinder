@@ -827,7 +827,7 @@ async fn ingest_control_serves_transparent_mempool_outputs_by_address() -> Resul
 /// outpoint that is not being spent in the mempool.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result<()> {
-    use zinder_proto::v1::wallet::TransparentMempoolSpendByOutpointRequest;
+    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolSpendByOutpointRequest};
 
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let chain_epoch = *store_fixture
@@ -846,16 +846,21 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
     // Synthetic entry spends outpoint ([0x55; 32], 0).
     let spent_response = client
         .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
-            transaction_id: vec![0x55; 32],
-            output_index: 0,
+            outpoint: Some(OutPoint {
+                transaction_id: vec![0x55; 32],
+                output_index: 0,
+            }),
         })
         .await?
         .into_inner();
     let spend = spent_response
         .spend
         .ok_or_else(|| eyre::eyre!("expected mempool spend"))?;
-    assert_eq!(spend.spent_transaction_id, vec![0x55; 32]);
-    assert_eq!(spend.spent_output_index, 0);
+    let spent_outpoint = spend
+        .spent_outpoint
+        .ok_or_else(|| eyre::eyre!("expected spent_outpoint on mempool spend"))?;
+    assert_eq!(spent_outpoint.transaction_id, vec![0x55; 32]);
+    assert_eq!(spent_outpoint.output_index, 0);
     assert_eq!(
         spend.spending_transaction_id,
         admitted.transaction_id.as_bytes().to_vec()
@@ -863,13 +868,80 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
 
     let unknown_response = client
         .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
-            transaction_id: vec![0xFF; 32],
-            output_index: 7,
+            outpoint: Some(OutPoint {
+                transaction_id: vec![0xFF; 32],
+                output_index: 7,
+            }),
         })
         .await?
         .into_inner();
     assert!(unknown_response.spend.is_none());
 
+    Ok(())
+}
+
+/// M6 Slice 3 — `IngestControl.TransparentMempoolPrevouts` resolves the
+/// outputs of mempool transactions into per-entry prevouts in input order,
+/// returning `None` for outpoints that reference unknown transactions or
+/// out-of-bounds output indices.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
+    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolPrevoutsRequest};
+
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let chain_epoch = *store_fixture
+        .committed_chain_epoch()
+        .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
+    let mempool_index = MempoolIndex::new();
+    let admitted = synthetic_entry(0xAB, chain_epoch);
+    assert_eq!(
+        mempool_index.apply_added(admitted.clone()),
+        MempoolApplyOutcome::Applied
+    );
+    let listen_addr =
+        spawn_ingest_control(store_fixture.chain_store().clone(), mempool_index.clone()).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+
+    let known_outpoint = OutPoint {
+        transaction_id: admitted.transaction_id.as_bytes().to_vec(),
+        output_index: 0,
+    };
+    let unknown_outpoint = OutPoint {
+        transaction_id: vec![0xFF; 32],
+        output_index: 0,
+    };
+    let oob_outpoint = OutPoint {
+        transaction_id: admitted.transaction_id.as_bytes().to_vec(),
+        output_index: 99,
+    };
+
+    let response = client
+        .transparent_mempool_prevouts(TransparentMempoolPrevoutsRequest {
+            outpoints: vec![
+                known_outpoint.clone(),
+                unknown_outpoint.clone(),
+                oob_outpoint.clone(),
+            ],
+        })
+        .await?
+        .into_inner();
+
+    assert!(response.chain_epoch.is_some());
+    assert_eq!(response.entries.len(), 3);
+    let known_prevout = response.entries[0]
+        .prevout
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("known mempool outpoint must resolve to a prevout"))?;
+    assert_eq!(known_prevout.value_zat, 1_000);
+    assert_eq!(known_prevout.script_pub_key, vec![0xAA; 25]);
+    assert!(
+        response.entries[1].prevout.is_none(),
+        "unknown txid must resolve to None",
+    );
+    assert!(
+        response.entries[2].prevout.is_none(),
+        "out-of-bounds output_index must resolve to None",
+    );
     Ok(())
 }
 

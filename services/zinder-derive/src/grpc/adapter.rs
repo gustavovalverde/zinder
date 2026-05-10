@@ -4,12 +4,12 @@
 //! capability [`DERIVE_EXPLORER_READY_CAPABILITY`] once the consumer
 //! infrastructure is alive. Slice B layers
 //! [`ExplorerQuery::TransparentAddressBalance`] onto the same adapter using
-//! the Shape C compute path documented in the M5 spec: confirmed totals are
-//! summed at read time from canonical transparent UTXO artifacts (via
-//! `WalletQuery`), and the mempool overlay is computed from M3's existing
-//! mempool point lookups (also via `WalletQuery`). The accumulator-backed
-//! Shape A path is a future read-path optimization that does not change the
-//! public wire shape.
+//! the Shape C compute path documented in ADR-0013 (storage and read-path)
+//! and ADR-0014 (compute-at-read-time): confirmed totals are summed at read
+//! time from canonical transparent UTXO artifacts (via `WalletQuery`), and
+//! the mempool overlay is computed from M3's existing mempool point lookups
+//! (also via `WalletQuery`). The accumulator-backed Shape A path is a future
+//! read-path optimization that does not change the public wire shape.
 
 use tonic::{Request, Response, Status, transport::Channel};
 use zinder_proto::v1::{
@@ -214,11 +214,13 @@ async fn compute_transparent_address_balance(
         }
 
         for utxo in &utxos_response.utxos {
+            let utxo_outpoint = utxo.outpoint.clone().ok_or_else(|| {
+                Status::data_loss("TransparentAddressUtxo.outpoint missing in WalletQuery response")
+            })?;
             let spend_response = client
                 .transparent_mempool_spend_by_outpoint(Request::new(
                     wallet::TransparentMempoolSpendByOutpointRequest {
-                        transaction_id: utxo.transaction_id.clone(),
-                        output_index: utxo.output_index,
+                        outpoint: Some(utxo_outpoint),
                     },
                 ))
                 .await?

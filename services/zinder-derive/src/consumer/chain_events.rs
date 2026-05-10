@@ -25,8 +25,8 @@ use zinder_proto::v1::wallet::{
 use zinder_store::{MempoolDecodeError, chain_epoch_from_message};
 
 use crate::consumer::{
-    TipAdvancedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
-    RevertedRange,
+    ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx, RevertedRange,
+    TipAdvancedEvent,
 };
 use crate::error::DeriveError;
 use crate::store::{DeriveStore, DeriveStoreTable};

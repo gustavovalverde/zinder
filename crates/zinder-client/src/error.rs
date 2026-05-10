@@ -231,9 +231,7 @@ fn artifact_family_label(family: ArtifactFamily) -> &'static str {
         ArtifactFamily::SubtreeRoot => artifact_family::SUBTREE_ROOT,
         ArtifactFamily::TransparentAddressUtxo => artifact_family::TRANSPARENT_ADDRESS_UTXO,
         ArtifactFamily::TransparentUtxoSpend => artifact_family::TRANSPARENT_UTXO_SPEND,
-        ArtifactFamily::TransparentAddressTxIndex => {
-            artifact_family::TRANSPARENT_ADDRESS_TX_INDEX
-        }
+        ArtifactFamily::TransparentAddressTxIndex => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
         ArtifactFamily::BlockHashIndex => artifact_family::BLOCK_HASH_INDEX,
         ArtifactFamily::MempoolEvent => artifact_family::MEMPOOL_EVENT,
         _ => "unknown_artifact",

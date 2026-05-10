@@ -5,7 +5,7 @@
 | Status | Proposed |
 | Product | Zinder |
 | Domain | Cross-process query federation, derive-plane consumer integration |
-| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Derive plane](../architecture/derive-plane.md), [Public interfaces](../architecture/public-interfaces.md), [ADR-0008](0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](0009-ingest-control-transport-security.md), [M5 spec](../specs/m5-transparent-address-balance.md) |
+| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Derive plane](../architecture/derive-plane.md), [Public interfaces](../architecture/public-interfaces.md), [ADR-0008](0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](0009-ingest-control-transport-security.md), [ADR-0013](0013-derive-plane-instantiation-and-transparent-address-balance.md) |
 
 ## Context
 

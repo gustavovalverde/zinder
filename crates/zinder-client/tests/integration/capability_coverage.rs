@@ -63,6 +63,14 @@ const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
         "transparent_mempool_spend_by_outpoint",
     ),
     (
+        "wallet.mempool.transparent_prevouts_v1",
+        "transparent_mempool_prevouts",
+    ),
+    (
+        "wallet.read.transparent_prevouts_v1",
+        "transparent_prevouts",
+    ),
+    (
         "wallet.address.transparent_utxos_v1",
         "transparent_address_utxos",
     ),
@@ -133,6 +141,8 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::mempool_events;
     let _ = T::transparent_mempool_outputs_by_address;
     let _ = T::transparent_mempool_spend_by_outpoint;
+    let _ = T::transparent_mempool_prevouts;
+    let _ = T::transparent_prevouts;
     let _ = T::transparent_address_utxos;
     let _ = T::transparent_address_tx_ids_in_range;
     let _ = T::transparent_address_balance;

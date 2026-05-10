@@ -54,4 +54,12 @@ service IngestControl {
   // visible in the writer's live mempool index.
   rpc TransparentMempoolSpendByOutpoint(zinder.v1.wallet.TransparentMempoolSpendByOutpointRequest)
       returns (zinder.v1.wallet.TransparentMempoolSpendByOutpointResponse);
+
+  // Resolves a batch of outpoints against the writer's live mempool index.
+  //
+  // Used by chained-mempool flows: outpoints that reference outputs of
+  // unconfirmed mempool transactions resolve here without a canonical-chain
+  // round trip.
+  rpc TransparentMempoolPrevouts(zinder.v1.wallet.TransparentMempoolPrevoutsRequest)
+      returns (zinder.v1.wallet.TransparentMempoolPrevoutsResponse);
 }

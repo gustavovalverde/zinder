@@ -15,7 +15,8 @@ use zinder_core::{
     BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TxStatus,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentPrevout, TransparentPrevoutEntry, TransparentPrevoutsResponse, TxStatus,
 };
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
@@ -30,7 +31,7 @@ use crate::{
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
-    chain_event_envelope_message,
+    chain_event_envelope_message, outpoint_message,
 };
 
 /// Operator-configured snapshot used to build the `ServerCapabilities` descriptor.
@@ -241,6 +242,21 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
         .and_then(|chain_events| build_chain_events_response(&chain_events))
 }
 
+/// Resolves a batch of canonical-chain transparent outpoints to their
+/// referenced outputs and encodes the native wallet response.
+///
+/// closes: G18
+pub async fn transparent_prevouts_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    outpoints: Vec<TransparentOutPoint>,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::TransparentPrevoutsResponse, QueryError> {
+    query_api
+        .transparent_prevouts(outpoints, at_epoch)
+        .await
+        .map(build_transparent_prevouts_response)
+}
+
 /// Reads transparent address UTXOs for `request` and encodes the native
 /// wallet response. The unary RPC and the streaming RPC share this helper.
 pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
@@ -369,6 +385,37 @@ pub fn build_transparent_address_utxos_stream_chunk(
     }
 }
 
+fn build_transparent_prevouts_response(
+    response: TransparentPrevoutsResponse,
+) -> wallet::TransparentPrevoutsResponse {
+    let chain_epoch = build_chain_epoch_message(response.chain_epoch);
+    let entries = response
+        .entries
+        .into_iter()
+        .map(build_transparent_prevout_entry_message)
+        .collect();
+    wallet::TransparentPrevoutsResponse {
+        chain_epoch: Some(chain_epoch),
+        entries,
+    }
+}
+
+fn build_transparent_prevout_entry_message(
+    entry: TransparentPrevoutEntry,
+) -> wallet::TransparentPrevoutEntry {
+    wallet::TransparentPrevoutEntry {
+        outpoint: Some(outpoint_message(&entry.outpoint)),
+        prevout: entry.prevout.map(build_transparent_prevout_message),
+    }
+}
+
+fn build_transparent_prevout_message(prevout: TransparentPrevout) -> wallet::TransparentPrevout {
+    wallet::TransparentPrevout {
+        value_zat: prevout.value_zat,
+        script_pub_key: prevout.script_pub_key,
+    }
+}
+
 fn build_transparent_address_utxos_response(
     response: TransparentAddressUtxos,
 ) -> wallet::TransparentAddressUtxosResponse {
@@ -393,8 +440,7 @@ fn build_transparent_address_utxo_message(
     wallet::TransparentAddressUtxo {
         address_script_hash: utxo.address_script_hash.as_bytes().to_vec(),
         script_pub_key: utxo.script_pub_key.clone(),
-        transaction_id: utxo.outpoint.transaction_id.as_bytes().to_vec(),
-        output_index: utxo.outpoint.output_index,
+        outpoint: Some(outpoint_message(&utxo.outpoint)),
         value_zat: utxo.value_zat,
         block_height: utxo.block_height.value(),
         block_hash: utxo.block_hash.as_bytes().to_vec(),

@@ -1,11 +1,10 @@
-//! Canonical artifact-family labels for the
-//! [`IndexerError::ArtifactUnavailable`] variant declared in
-//! [`zinder_client::IndexerError`].
+//! Canonical artifact-family labels for the [`IndexerError::ArtifactUnavailable`]
+//! variant declared in `zinder_client::IndexerError`.
 //!
 //! Constants live in `zinder-core` so every crate that constructs or matches
 //! on the typed error variant uses the same string literal. The CI walker at
 //! `crates/zinder-proto/tests/integration/gap_doc_walker.rs` verifies the
-//! variant carries the canonical refusal of [`IndexerError::NotFound`]
+//! variant carries the canonical refusal of the `IndexerError::NotFound`
 //! generic-resource collapse.
 //!
 //! [`IndexerError::ArtifactUnavailable`]: https://docs.rs/zinder-client/latest/zinder_client/enum.IndexerError.html#variant.ArtifactUnavailable
@@ -28,6 +27,8 @@ pub const SUBTREE_ROOT: &str = "subtree_root";
 pub const TRANSPARENT_ADDRESS_UTXO: &str = "transparent_address_utxo";
 /// Transparent UTXO spend artifact.
 pub const TRANSPARENT_UTXO_SPEND: &str = "transparent_utxo_spend";
+/// Transparent prevout (output referenced by an outpoint).
+pub const TRANSPARENT_PREVOUT: &str = "transparent_prevout";
 /// Transparent address tx-history index artifact.
 pub const TRANSPARENT_ADDRESS_TX_INDEX: &str = "transparent_address_tx_index";
 /// Best-chain block-hash to height index entry.

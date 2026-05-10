@@ -5,7 +5,7 @@
 | Status | In progress (Phases 0–2 shipped; Phases 3–6 pending) |
 | Audience | Zinder maintainers picking up the gap-closing work in a new session |
 | Source | Phased plan extracted from the 2026-05-09 analysis session that produced the Phase 0 gap-doc refresh and shipped Primitives A and B |
-| Related | [Closing the Zaino Surface Gap](../reference/closing-the-zaino-surface-gap.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Extending artifacts](../architecture/extending-artifacts.md), [Lessons from Zaino](../reference/lessons-from-zaino.md), [M5 spec](../specs/m5-transparent-address-balance.md), [ADR-0006](../adrs/0006-test-tiers-and-live-config.md), [ADR-0007](../adrs/0007-multi-process-storage-access.md), [ADR-0009](../adrs/0009-ingest-control-transport-security.md), [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) |
+| Related | [Closing the Zaino Surface Gap](../reference/closing-the-zaino-surface-gap.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Extending artifacts](../architecture/extending-artifacts.md), [Lessons from Zaino](../reference/lessons-from-zaino.md), [ADR-0006](../adrs/0006-test-tiers-and-live-config.md), [ADR-0007](../adrs/0007-multi-process-storage-access.md), [ADR-0009](../adrs/0009-ingest-control-transport-security.md), [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) |
 
 ## Purpose
 
@@ -126,7 +126,7 @@ impl WalletQueryGrpcAdapter<QueryApi> {
 }
 ```
 
-**M5 Slice B work** (per the existing M5 spec):
+**M5 Slice B work** (now retired to [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) + [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md)):
 
 - `services/zinder-derive/src/balance_accumulator.rs` — running totals with dynamic-filter visibility, mempool overlay path.
 - `crates/zinder-proto/proto/zinder/v1/derive/explorer.proto` — `ExplorerQuery.TransparentAddressBalance` RPC.
@@ -146,7 +146,7 @@ impl WalletQueryGrpcAdapter<QueryApi> {
 
 **Doc updates.**
 
-- `docs/specs/m5-transparent-address-balance.md` — mark Slice B shipped.
+- ~~`docs/specs/m5-transparent-address-balance.md`~~ — retired per the retire-on-ship rule; M5 decisions live in ADR-0011, ADR-0013, ADR-0014.
 - `docs/architecture/wallet-data-plane.md` — add §Federation section documenting the proxy pattern and namespace rule.
 - `docs/reference/closing-the-zaino-surface-gap.md` — mark G1 closed.
 

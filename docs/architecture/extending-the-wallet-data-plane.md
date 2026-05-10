@@ -305,7 +305,20 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F6: capabilities `derive.explorer.ready_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
-The compute shape is Shape C (compute at read time, federated UTXO sum + M3 mempool overlay) per the M5 spec; the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape.
+The compute shape is Shape C (compute at read time, federated UTXO sum + M3 mempool overlay) per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md); the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape ([ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)).
+
+### Example 4 — `TransparentPrevouts` and `TransparentMempoolPrevouts` (M6)
+
+A pair of canonical wallet-plane reads that resolve outpoints to their referenced outputs. Both share the new wire-level `OutPoint` message, the `TransparentPrevout` payload, and a `repeated TransparentPrevoutEntry` response shape with `optional TransparentPrevout prevout` per entry.
+
+- The canonical method reads `TransactionArtifact.payload_bytes` and uses `zinder_source::transparent_prevout_from_raw_transaction_bytes` to extract one output by index. Shape C compute-at-read-time; no new column family.
+- The mempool method reads `MempoolEntry.transparent_outputs` through `MempoolIndex::transparent_prevouts_by_outpoints`. Proxied through `IngestControl` because secondary readers cannot observe live writer state.
+- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256`) and the same coinbase-sentinel rejection (anti-pattern A4 refused at the wallet adapter).
+- Capability strings: `wallet.read.transparent_prevouts_v1` (canonical) and `wallet.mempool.transparent_prevouts_v1` (mempool).
+- `ChainIndex` exposes three methods: `transparent_prevouts`, `transparent_prevouts_at_epoch`, `transparent_mempool_prevouts`.
+- No compat-shim counterpart: `CompactTxStreamer` has no prevout endpoint, and the cookbook forbids inventing one.
+
+This is the second worked example of the **compute-at-read-time pattern** (`zinder-source::transparent_prevout_from_raw_transaction_bytes` parses an existing `TransactionArtifact` payload at read time without committing new storage). M5 Slice B was the first instance (federated-balance Shape C); M6 generalizes the pattern for direct wallet-data-plane reads. [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) makes the pattern durable: the public wire shape and the capability string never depend on the storage shape, so a future Shape A landing (a dedicated `OutPoint`-keyed column family) does not bump the capability or change the response message.
 
 ## Common mistakes
 
