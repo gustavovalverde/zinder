@@ -1,0 +1,138 @@
+#![allow(
+    missing_docs,
+    reason = "Live test names describe the behavior under test."
+)]
+
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use eyre::{WrapErr, eyre};
+use zinder_core::Network;
+use zinder_testkit::live::{init, require_live_for};
+
+const ENABLE_ZALLET_GATE: &str = "ZINDER_TEST_ZALLET";
+const ZALLET_BINARY_ENV: &str = "ZINDER_TEST_ZALLET_BIN";
+const ZALLET_CONFIG_ENV: &str = "ZINDER_TEST_ZALLET_CONFIG";
+const ZALLET_CONFIG_MARKER_ENV: &str = "ZINDER_TEST_ZALLET_CONFIG_MUST_CONTAIN";
+const ZALLET_ARGS_ENV: &str = "ZINDER_TEST_ZALLET_ARGS";
+const ZALLET_OUTPUT_MARKER_ENV: &str = "ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN";
+const EMBEDDED_ZAINO_CONFIG_FIELDS: &[&str] = &[
+    "validator_address",
+    "validator_cookie_path",
+    "validator_user",
+    "validator_password",
+];
+
+#[test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+fn zallet_binary_runs_against_zinder_native_contract() -> eyre::Result<()> {
+    let _guard = init();
+    require_zallet_gate()?;
+    let live_env = require_live_for(&[
+        Network::ZcashRegtest,
+        Network::ZcashTestnet,
+        Network::ZcashMainnet,
+    ])?;
+
+    let config_path = PathBuf::from(require_env(ZALLET_CONFIG_ENV)?);
+    let config_source = fs::read_to_string(&config_path)
+        .wrap_err_with(|| format!("could not read {}", config_path.display()))?;
+    reject_embedded_zaino_config(&config_source, &config_path)?;
+    require_config_marker(&config_source)?;
+
+    let zallet_binary = env::var(ZALLET_BINARY_ENV).unwrap_or_else(|_| "zallet".to_owned());
+    let zallet_args = require_args()?;
+    let output = Command::new(&zallet_binary)
+        .args(&zallet_args)
+        .env("ZINDER_NETWORK", live_env.network().name())
+        .output()
+        .wrap_err_with(|| format!("failed to execute {zallet_binary}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(eyre!(
+            "Zallet command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            stderr
+        ));
+    }
+
+    let output_marker = require_env(ZALLET_OUTPUT_MARKER_ENV)?;
+    if !stdout.contains(&output_marker) && !stderr.contains(&output_marker) {
+        return Err(eyre!(
+            "Zallet command output did not contain required marker {output_marker:?}\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_zallet_gate() -> eyre::Result<()> {
+    if env::var(ENABLE_ZALLET_GATE).as_deref() == Ok("1") {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "set {ENABLE_ZALLET_GATE}=1 to run the real Zallet T3 gate"
+        ))
+    }
+}
+
+fn require_config_marker(config_source: &str) -> eyre::Result<()> {
+    let marker = require_env(ZALLET_CONFIG_MARKER_ENV)?;
+    if active_config_contains(config_source, &marker) {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "Zallet config does not contain required active marker {marker:?}; \
+             set {ZALLET_CONFIG_MARKER_ENV} to a line fragment that proves the \
+             Zallet build is pointed at Zinder's native contract"
+        ))
+    }
+}
+
+fn reject_embedded_zaino_config(config_source: &str, config_path: &Path) -> eyre::Result<()> {
+    for field in EMBEDDED_ZAINO_CONFIG_FIELDS {
+        if active_config_contains(config_source, field) {
+            return Err(eyre!(
+                "{} contains active `{field}`; that is Zallet's embedded-Zaino \
+                 validator path, not the Zinder native contract",
+                config_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_args() -> eyre::Result<Vec<String>> {
+    let args_source = require_env(ZALLET_ARGS_ENV)?;
+    let args: Vec<String> = args_source
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect();
+    if args.is_empty() {
+        Err(eyre!(
+            "{ZALLET_ARGS_ENV} must contain at least one argument"
+        ))
+    } else {
+        Ok(args)
+    }
+}
+
+fn require_env(name: &str) -> eyre::Result<String> {
+    env::var(name).wrap_err_with(|| format!("missing required env var {name}"))
+}
+
+fn active_config_contains(config_source: &str, needle: &str) -> bool {
+    config_source
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| line.contains(needle))
+}

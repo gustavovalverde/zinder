@@ -162,7 +162,7 @@ Every crate with a `tests/` directory uses one binary per crate via `tests/accep
     <sut>.rs             # time-budgeted, no external state
 ```
 
-Tier selection is by module path through nextest filter expressions. Adding a file under `live/` automatically enrolls it in T3.
+Tier selection is by module path through nextest filter expressions. Adding a file under `live/` automatically enrolls it in T3. Zallet's real-binary gate is the one live-test subprofile: it lives under `tests/live/` but runs through `ci-zallet-live` because it requires an external Zallet build and config that target Zinder.
 
 In-crate `#[cfg(test)] mod tests` blocks remain the home for T0 unit tests.
 
@@ -173,18 +173,20 @@ In-crate `#[cfg(test)] mod tests` blocks remain the home for T0 unit tests.
 | T0 unit | `#[cfg(test)] mod tests` in `src/` | `default` / `ci` | (default-filter) | every PR |
 | T1 integration | `tests/integration/` | `default` / `ci` | (default-filter) | every PR |
 | T2 perf | `tests/perf/` | `ci-perf` | `test(/^perf::/)` | every PR (separate job) |
-| T3 live | `tests/live/` | `ci-live` | `test(/^live::/)` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape still under discussion per §Open mainnet infrastructure questions) |
+| T3 live | `tests/live/` except `live::zallet::` | `ci-live` | `test(/^live::/) and not test(/^live::zallet::/)` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape still under discussion per §Open mainnet infrastructure questions) |
+| T3 Zallet live | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | `test(/^live::zallet::/)` | release / integration certification when a Zinder-native Zallet build is available |
 
 ### Test runner: nextest
 
 `cargo nextest run` is the canonical workspace test runner. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the validation gate.
 
-Four nextest profiles in `.config/nextest.toml`:
+Nextest profiles in `.config/nextest.toml`:
 
 - **`default`**: local dev. Excludes `live::` and `perf::` via `default-filter`. `fail-fast = false`.
 - **`ci`**: PR CI. Inherits from `default`. Adds JUnit output and one retry.
 - **`ci-perf`**: separate PR job. Filters to `test(/^perf::/)`. Raised slow-timeout for budget assertions.
-- **`ci-live`**: nightly/weekly/release. Filters to `test(/^live::/)`. Two retries for network flake. `node-mutating` test group with `max-threads = 1` for state-mutating live tests.
+- **`ci-live`**: nightly/weekly/release. Filters to `test(/^live::/) and not test(/^live::zallet::/)`. Two retries for network flake. `node-mutating` test group with `max-threads = 1` for state-mutating live tests.
+- **`ci-zallet-live`**: release/integration certification. Filters to `test(/^live::zallet::/)` and requires a real Zallet binary/config that target Zinder's native contract.
 
 The `default-filter` mechanism is the structural boundary between tiers. `#[ignore]` is the libtest-fallback safety net for `cargo test` users without nextest. Both are required.
 

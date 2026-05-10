@@ -9,13 +9,17 @@
 
 ## Context
 
-[ADR-0006](0006-test-tiers-and-live-config.md) defines four nextest profiles: `default` (T0/T1 unit + integration), `ci` (canonical CI gate), `ci-perf` (smoke perf budgets), and `ci-live` (T3 network-touching tests). Each tier answers a different question:
+[ADR-0006](0006-test-tiers-and-live-config.md) defines the core nextest profiles: `default` (T0/T1 unit + integration), `ci` (canonical CI gate), `ci-perf` (smoke perf budgets), `ci-live` (T3 network-touching tests), and `ci-zallet-live` (real Zallet binary certification). Each tier answers a different question:
 
 - `default` and `ci`: does the code compile and behave correctly in isolation?
 - `ci-perf`: does the read path stay inside loose CI budgets?
 - `ci-live`: does the indexer agree with a real upstream node on regtest, testnet, and mainnet?
+- `ci-zallet-live`: does a real Zallet binary consume Zinder's native client contract?
 
-None of those tiers answers the consumer-facing question: **does Zinder serve consumer X without a parity regression versus the prior-art Zaino surface?**
+`ci-zallet-live` certifies one runtime integration: a real Zallet binary against
+Zinder's native contract. It does not replace the broader consumer-facing
+question: **does Zinder serve consumer X without a parity regression versus the
+prior-art Zaino surface?**
 
 The four named consumers ([ADR-0008](0008-consumer-neutral-wallet-data-plane.md)) each exercise a different public contract:
 
@@ -30,7 +34,9 @@ The release-engineering gap: a release candidate cannot be certified as "no pari
 
 ## Decision
 
-`zinder` adds a fifth nextest profile, `ci-parity`, defined in `.config/nextest.toml`. The profile runs T2 integration tests scoped to consumer-facing surfaces and asserts the typed shape each closed gap row promises.
+`zinder` defines `ci-parity` in `.config/nextest.toml`. The profile runs
+fixture-backed integration tests scoped to consumer-facing surfaces and asserts
+the typed shape each closed gap row promises.
 
 ### Profile shape
 
@@ -63,6 +69,7 @@ Each module asserts shape only, not behavioral equivalence with Zaino. "Parity" 
 | `ci` | T0/T1/T2 against fixtures | No | Yes |
 | `ci-perf` | Range-read latency budgets | No | Yes |
 | `ci-live` | T3 against regtest / testnet / mainnet | Yes | Manual / scheduled |
+| `ci-zallet-live` | Real Zallet binary against Zinder's native contract | Yes | Release / integration certification |
 | `ci-parity` (new) | Consumer-shaped requests against fixtures | No | Release-tag pipeline |
 
 `ci-parity` uses the same `StoreFixture` infrastructure as `ci`; the new dimension is the test-module organization (per-consumer) and the assertion target (consumer-shaped requests).

@@ -119,7 +119,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)): T0 unit, T1 integration, T2 perf, T3 live. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs T3. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the real Zallet binary gate when a Zinder-native Zallet build is available. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage or parser changes:
 

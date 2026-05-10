@@ -30,7 +30,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-perf`, `ci-live`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage/parser changes (also run by scheduled CI):
 

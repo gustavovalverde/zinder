@@ -14,10 +14,13 @@ step-by-step guide for actually running them.
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
-| External | n/a | n/a | Manual | Real-wallet integration (Zallet, Zashi/Android SDK, public lightwalletd clients) |
+| T3 Zallet live | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | Release / integration certification | Real Zallet binary using Zinder's native contract |
+| External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
 
-`default-filter = "not test(/^live::/) and not test(/^perf::/)"` is the
-structural boundary. Every live test additionally carries
+`default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"`
+is the structural boundary. The regular `ci-live` profile excludes
+`live::zallet::`; run `ci-zallet-live` explicitly when a Zallet build that
+targets Zinder is available. Every live test additionally carries
 `#[ignore = LIVE_TEST_IGNORE_REASON]` and a runtime
 `zinder_testkit::live::require_live()` check, so a stray `cargo test` cannot
 talk to a node by accident.
@@ -101,8 +104,9 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Expected outcome on a healthy regtest: **25 passed, 3 failed, 397 skipped**
-in ~30 s. The three remaining failures are the mainnet-only tests
+Expected outcome on a healthy regtest with the indexer gRPC port set: all
+regtest-targeted tests pass in ~30 s. The only failures in a full regtest
+`ci-live` invocation should be the mainnet-only tests
 (`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
 `backfills_last_1000_blocks_from_checkpoint`); they refuse to run on regtest
@@ -250,11 +254,61 @@ cargo mutants --workspace --all-features \
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
 gate on whether you actually changed trust-sensitive code.
 
-## External integration: Zallet via lightwalletd compat shim
+## T3: Real Zallet binary gate
 
-Zallet's current build links `lightwalletd-tonic-tls-webpki-roots` and consumes
-the lightwalletd protocol. The breaking changes in this batch reach Zallet
-through `services/zinder-compat-lightwalletd`, not the native API.
+Zallet compatibility is a native-client claim, not a lightwalletd-compat claim.
+The current public Zallet sidecar (`v0.1.0-alpha.3`) uses its embedded Zaino
+indexer and points `[indexer].validator_address` at Zebra JSON-RPC. Do not count
+that path as Zinder compatibility: it proves Zallet + Zebra/Zaino, not Zallet +
+Zinder.
+
+The automated Zallet gate lives in
+`crates/zinder-client/tests/live/zallet.rs` and runs under the
+`ci-zallet-live` profile. It is intentionally separate from the regular
+`ci-live` sweep because it needs a Zallet build and config that target Zinder's
+native contract, for example a Zallet branch wired to `RemoteChainIndex` over
+`zinder-query`.
+
+The gate fails closed when enabled:
+
+- `ZINDER_TEST_ZALLET=1` must be set.
+- `ZINDER_TEST_ZALLET_CONFIG` must point at the exact config used by the Zallet
+  process.
+- `ZINDER_TEST_ZALLET_CONFIG_MUST_CONTAIN` must be an active, uncommented line
+  fragment proving that the config targets Zinder's native contract.
+- Active `validator_address`, `validator_cookie_path`, `validator_user`, or
+  `validator_password` entries are rejected because they are the embedded-Zaino
+  validator path.
+- `ZINDER_TEST_ZALLET_ARGS` is the real `zallet` command to execute, split on
+  whitespace.
+- `ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN` must appear in stdout or stderr from
+  that command.
+
+Example shape once a Zinder-native Zallet build exists:
+
+```bash
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-regtest \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=zebra \
+  ZINDER_NODE__AUTH__PASSWORD=zebra \
+  ZINDER_TEST_ZALLET=1 \
+  ZINDER_TEST_ZALLET_BIN=/path/to/zallet \
+  ZINDER_TEST_ZALLET_CONFIG=/path/to/zallet.toml \
+  ZINDER_TEST_ZALLET_CONFIG_MUST_CONTAIN='zinder_query_addr = "http://127.0.0.1:9101"' \
+  ZINDER_TEST_ZALLET_ARGS='--datadir /tmp/zallet --config /path/to/zallet.toml rpc getblockchaininfo' \
+  ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN='regtest' \
+  cargo nextest run --profile=ci-zallet-live --run-ignored=all
+```
+
+This profile does not start `zinder-query` or Zallet for you. The test is the
+certification check over a running integration setup, so the failure output
+points at the wrong config, missing binary, failed command, or unexpected
+consumer output directly.
+
+## External integration: lightwalletd-compatible wallets
 
 ### Conventions for the recipes below
 
@@ -342,7 +396,7 @@ in the default validation gate. It:
 This test is the deterministic version of the wallet-SDK contract; running it
 under `cargo nextest run --profile=ci` is part of every commit.
 
-### End-to-end with a real Zallet binary
+### End-to-end with a real lightwalletd-compatible client
 
 Three terminals.
 
@@ -362,32 +416,25 @@ cargo run --release --bin zinder-compat-lightwalletd -- \
 ```
 
 ```bash
-# Terminal 3: Zallet pointing at the compat shim
-cd /Users/gustavovalverde/dev/zfnd/wallet
-# Configure the lightwalletd endpoint in Zallet's config (see Zallet's docs
-# for the canonical config field; the value is http://127.0.0.1:9067).
-cargo run --bin zallet -- <wallet-command>
+# Terminal 3: a lightwalletd-compatible wallet or SDK pointing at the compat shim
+# Configure the endpoint to http://127.0.0.1:9067.
+<wallet-or-sdk-command>
 ```
 
 What this catches that the deterministic test does not:
 
-- `GetTransaction` NotFound mapping (Zallet sees plain `NOT_FOUND`, not the
+- `GetTransaction` NotFound mapping (the client sees plain `NOT_FOUND`, not the
   legacy `ArtifactUnavailable`-with-resource_info detail).
 - `GetBlock { height=0, hash }` flow through the new `BlockSelector`
   resolver.
 - `GetTaddressTxids` / `GetTaddressTransactions` via the transparent-history
   index.
-- Real-world streaming and connection-reuse patterns the in-process test
-  cannot reproduce.
-
-If you transition Zallet to `zinder-client::RemoteChainIndex` (per
-[service-operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder)),
-re-run this same setup pointing Zallet at the `zinder-query` endpoint instead
-of the compat shim.
+- Real-world streaming and connection-reuse patterns the in-process test cannot
+  reproduce.
 
 ## External integration: Zashi / Android SDK
 
-Same compat-shim path as Zallet. The Android SDK speaks lightwalletd; point it
+Same compat-shim path. The Android SDK speaks lightwalletd; point it
 at the running `zinder-compat-lightwalletd:9067`.
 
 What to validate by hand:
@@ -546,8 +593,12 @@ The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
 - [ ] Default validation gate green (`cargo fmt`/`cargo clippy`/`cargo nextest run --profile=ci`/`cargo nextest run --profile=ci-perf`/`cargo doc`/`cargo deny`).
 - [ ] Live regtest sweep green (`ci-live` profile against z3, with indexer
       gRPC env). Three mainnet-only failures are expected and acceptable.
+- [ ] If the change claims Zallet compatibility: real Zallet binary gate green
+      (`ci-zallet-live` with `ZINDER_TEST_ZALLET*` env against the Zinder-native
+      contract).
 - [ ] If the change touched the lightwalletd wire surface: a manual end-to-end
-      run with Zallet or the Android SDK against `zinder-compat-lightwalletd`.
+      run with a lightwalletd-compatible wallet or the Android SDK against
+      `zinder-compat-lightwalletd`.
 - [ ] If the change touched the native `WalletQuery` wire surface: grpcurl
       probes confirm the new shape and the capability descriptor reflects
       every added/removed/renamed cap.

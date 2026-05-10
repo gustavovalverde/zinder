@@ -451,6 +451,7 @@ Tests are organized into four tiers by **runtime mechanism** ([ADR-0006](../adrs
 | T1 integration | fixture-driven, no external state | `tests/integration/` | every PR |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
 | T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape pending per [ADR-0006 §Open mainnet infrastructure questions](../adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions)) |
+| T3 Zallet live | real Zallet binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | release / integration certification |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
 
@@ -458,4 +459,4 @@ T3 tests carry two gates: `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a first-lin
 
 Test functions under `tests/live/` use plain `snake_case_describing_behavior` names. Do not include `live`, `regtest`, `testnet`, `mainnet`, or `z3` in the function name; the directory and runtime parameterization handle that.
 
-`cargo nextest run` is the canonical runner. The four profiles (`default`, `ci`, `ci-perf`, `ci-live`) live in `.config/nextest.toml`. Live tests and production binaries read the same env-var schema (`ZINDER_NETWORK`, `ZINDER_NODE__*`); the full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
+`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live tests and production binaries read the same env-var schema (`ZINDER_NETWORK`, `ZINDER_NODE__*`); the full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
