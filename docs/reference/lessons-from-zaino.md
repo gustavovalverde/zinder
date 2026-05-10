@@ -1,30 +1,8 @@
 # Lessons from Zaino
 
-| Field    | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Status   | Background research                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Audience | Zinder maintainers, contributors, downstream developers                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Sources  | [zingolabs/zaino issues](https://github.com/zingolabs/zaino/issues) (open + closed, sampled through 2026-04-26), Zaino architecture commentary by maintainers                                                                                                                                                                                                                                                                                                                                                   |
-| Related  | [PRD-0001](../prd-0001-zinder-indexer.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md), [Service Boundaries](../architecture/service-boundaries.md), [Service Operations](../architecture/service-operations.md), [Node source boundary](../architecture/node-source-boundary.md), [Protocol boundary](../architecture/protocol-boundary.md), [ADR-0002](../adrs/0002-boundary-specific-serialization.md), [ADR-0004](../adrs/0004-node-source-and-protocol-boundaries.md) |
+Zaino is prior art for Zinder's indexer boundary. These notes keep the recurring design pressures from its public issue tracker and bind them to the Zinder architecture choices that should avoid the same failure modes.
 
-## Purpose
-
-Zinder is a separate clean-slate indexer, not a fork of Zaino. It is not a judgment on Zaino and not a claim about Zaino's role in the ecosystem. Zaino is active ecosystem prior art; Zinder targets a different product shape: an epoch-consistent data plane for multiple consumers with explicit ingestion, query, compatibility, and derived-index boundaries.
-
-This document is the audit trail. It captures:
-
-1. The architectural pressure points Zaino's maintainers have publicly identified in tracker and design discussions.
-2. The user requests and integration constraints that are relevant to Zinder's scope.
-3. How Zinder's current decisions choose different product and architecture tradeoffs, and where new decisions are still owed.
-4. The open seams Zinder must preserve so the next round of feature requests does not require a rewrite.
-
-This is a research input, not a change-log. When a Zinder decision is referenced (PRD, RFC, ADR), assume that document is authoritative and this one is the rationale.
-
-## Method
-
-Issues were sampled from `zingolabs/zaino` (300 most recent, both open and closed). High-signal threads were read in full: tracking issues, "architecture" labelled issues, "Top Priority" labels, perf benchmarks, and issues whose bodies discussed architecture follow-up work. Each finding cites the issue number so future readers can pull the original context.
-
-The clusters below are not exhaustive; they are the patterns that recurred at least three times under different surface symptoms. The recurrence test matters: a single bug can be a local implementation issue, while repeated stress against the same boundary is product and architecture input for Zinder.
+The issues cited below were sampled from `zingolabs/zaino` through 2026-04-26. Each cluster recurred under several symptoms; isolated bugs are omitted unless they exposed a boundary issue.
 
 ## Pattern 1: Three Domains, One Type Pile
 
@@ -395,25 +373,6 @@ This is the user-facing summary. Each row links a request from the Zaino tracker
 
 The common thread: every entry in this table touches more than one design pressure. Zinder should treat those rows as product-contract input rather than as isolated feature requests.
 
-## Review Risks To Catch Early
-
-These come from the tracker. They are listed here so reviewers can name the risk quickly:
-
-1. A configuration struct that mixes server, storage, source, and debug concerns. ([#502](https://github.com/zingolabs/zaino/issues/502))
-2. A bool flag paired with an optional path or value, where `true` + `None` compiles. ([#503](https://github.com/zingolabs/zaino/issues/503))
-3. A trait whose generic bound is a concrete transport library. ([#717](https://github.com/zingolabs/zaino/issues/717))
-4. A "service" that silently delegates to another backend on certain inputs. ([#716](https://github.com/zingolabs/zaino/issues/716))
-5. A custom parser for consensus-critical data when the upstream node or Zcash primitive crates already provide validated structures. ([#538](https://github.com/zingolabs/zaino/issues/538))
-6. A shutdown path that polls a flag with `sleep`. ([#1032](https://github.com/zingolabs/zaino/issues/1032), [#1051](https://github.com/zingolabs/zaino/issues/1051))
-7. A status type that proliferates because no module owns "what does ready mean." ([#889](https://github.com/zingolabs/zaino/issues/889), [#923](https://github.com/zingolabs/zaino/issues/923))
-8. A list endpoint without a cursor or maximum size. ([#974](https://github.com/zingolabs/zaino/issues/974), [#789](https://github.com/zingolabs/zaino/issues/789))
-9. A range read implemented as `for height in start..=end { fetch_one(height).await }`. ([#791](https://github.com/zingolabs/zaino/issues/791))
-10. A constant for "100 confirmations" or "genesis exists" that lives outside test fixtures. ([#1006](https://github.com/zingolabs/zaino/issues/1006), [#1007](https://github.com/zingolabs/zaino/issues/1007))
-11. A migration system whose only model of progress is a single linear ladder. ([#859](https://github.com/zingolabs/zaino/issues/859))
-12. A public-API field whose type is `zebra_state::Config` or another upstream-node internal type. ([#515](https://github.com/zingolabs/zaino/issues/515))
-13. CI that fails on forks because of a self-hosted runner gate. ([#991](https://github.com/zingolabs/zaino/issues/991))
-14. Two parallel sources of truth for the same data (RPC spec, activation heights, schema version). ([#907](https://github.com/zingolabs/zaino/issues/907), [#743](https://github.com/zingolabs/zaino/issues/743))
-
 ## Open Seams Zinder Must Preserve
 
 Architectural decisions are bets about which axes of change matter. The list below describes the changes Zinder should be ready to absorb without rewrite, drawn from requests and constraints visible in the Zaino tracker.
@@ -425,15 +384,3 @@ Architectural decisions are bets about which axes of change matter. The list bel
 - **Derived index families.** Explorer, analytics, or compliance views land in `zinder-derive` and consume `ChainEventEnvelope`. They can fail or rebuild without affecting wallet sync.
 - **Lifecycle observers.** A new operator integration (Kubernetes, systemd, OCI runtime) reads the existing typed readiness causes; no new endpoint required.
 - **Network awareness.** Mainnet, testnet, regtest, and future networks differ only in configuration and fixtures, not in code paths.
-
-## How To Use This Document
-
-When a Zinder PR adds a new public type, configuration field, RPC method, or storage layout, the reviewer should ask: which design pressure from this document would this reintroduce if it were merged as written? If the answer is one of the risks above, link the relevant section in the review.
-
-When a user files a feature request, the maintainer should check whether the request maps onto an open seam in the section above. If it does, the request should be expressible as an additive change. If it does not, the request requires an architecture decision before implementation.
-
-For concrete refusal examples (verbosity integers, "verbose" booleans, string-keyed pool discriminants, sentinel-overloaded `BlockId`, `zaino_proto::*` types on the Rust API), see [Extending the wallet data plane §Anti-patterns to refuse](../architecture/extending-the-wallet-data-plane.md#anti-patterns-to-refuse). The patterns above describe abstract design pressures; that section binds them to specific Zinder code shapes.
-
-## Closing Note
-
-Zaino's tracker is valuable prior art. The point is to treat public project experience as design input. Zinder starts with the benefit of Zaino maintainer discussions, Zallet integration notes, and Zebra's newer source surfaces. The work below every Zinder ADR, RFC, and architecture doc is to choose the product guarantees deliberately instead of rediscovering those tradeoffs later.

@@ -433,7 +433,7 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
 }
 
 #[tokio::test]
-async fn native_grpc_service_advertises_only_configured_m2_capabilities() -> eyre::Result<()> {
+async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let read_only_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
     let read_only_adapter =

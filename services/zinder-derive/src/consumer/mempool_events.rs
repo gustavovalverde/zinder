@@ -172,12 +172,9 @@ mod tests {
         let stream = stream_from(envelopes);
         let outcome = run(&mut consumer, &store, stream).await?;
         assert_eq!(outcome.applied_envelopes, 1);
-        let calls = consumer.applied();
-        assert_eq!(calls.len(), 1);
-        let CapturedVariant::Added(transaction_id) = &calls[0].1 else {
-            return Err(eyre::eyre!("expected Added variant"));
-        };
-        assert_eq!(transaction_id.as_slice(), &[0xAB; 32]);
+        let transaction_ids = consumer.applied_transaction_ids();
+        assert_eq!(transaction_ids.len(), 1);
+        assert_eq!(transaction_ids[0].as_slice(), &[0xAB; 32]);
         assert_eq!(
             store.get_cursor(TEST_CONSUMER_NAME)?.as_deref(),
             Some(b"cursor-1".as_slice())
@@ -247,29 +244,22 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug)]
-    enum CapturedVariant {
-        Added(Vec<u8>),
-        #[allow(dead_code, reason = "Reserved for future invalidated/mined coverage")]
-        Other,
-    }
-
     #[derive(Debug)]
     struct RecordingConsumer {
         name: DeriveConsumerName,
-        applied: Arc<Mutex<Vec<(u64, CapturedVariant)>>>,
+        applied_transaction_ids: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl RecordingConsumer {
         fn new(name: DeriveConsumerName) -> Self {
             Self {
                 name,
-                applied: Arc::new(Mutex::new(Vec::new())),
+                applied_transaction_ids: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn applied(&self) -> Vec<(u64, CapturedVariant)> {
-            self.applied.lock().clone()
+        fn applied_transaction_ids(&self) -> Vec<Vec<u8>> {
+            self.applied_transaction_ids.lock().clone()
         }
     }
 
@@ -284,14 +274,11 @@ mod tests {
             event: &MempoolConsumerEvent<'_>,
             _ctx: &mut DeriveConsumerCtx<'_>,
         ) -> Result<(), DeriveConsumerError> {
-            let captured = match &event.variant {
-                MempoolConsumerEventVariant::Added { transaction_id, .. } => {
-                    CapturedVariant::Added(transaction_id.to_vec())
-                }
-                MempoolConsumerEventVariant::Invalidated { .. }
-                | MempoolConsumerEventVariant::Mined { .. } => CapturedVariant::Other,
-            };
-            self.applied.lock().push((event.event_sequence, captured));
+            if let MempoolConsumerEventVariant::Added { transaction_id, .. } = &event.variant {
+                self.applied_transaction_ids
+                    .lock()
+                    .push(transaction_id.to_vec());
+            }
             Ok(())
         }
     }

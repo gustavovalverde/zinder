@@ -17,7 +17,7 @@ use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, MockTransactionBroadcaster, StoreFixture};
 
 #[tokio::test]
-async fn remote_chain_index_uses_native_grpc_for_m2_methods() -> eyre::Result<()> {
+async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let store_fixture =
         StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;

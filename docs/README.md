@@ -54,13 +54,9 @@ Operational procedures for running Zinder against the workspace and external sys
 
 - [Testing](runbooks/testing.md): T0–T3 test tiers, the default validation gate, live regtest/testnet/mainnet sweeps, end-to-end runs against Zallet and the Android SDK through the lightwalletd compat shim, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
 
-## Specs
+## Current Contracts
 
-Mutable working documents for un-shipped multi-PR work live in `docs/specs/`. When a spec's work lands, its locked decisions promote to one or more ADRs (or to architecture-doc sections) and the spec is deleted. No specs are currently in flight.
-
-Where retired specs' decisions live:
-
-- **Transparent-address artifact surface (`TransparentAddressUtxos[Stream]`, `TransparentAddressTxIdsInRange`, the new tx-history artifact family)**: documented in [Extending artifacts](architecture/extending-artifacts.md) (the canonical worked example) and [Wallet data plane](architecture/wallet-data-plane.md) (wire shapes and capability strings).
+- **Transparent-address artifact surface**: [Wallet data plane §Transparent Address UTXOs](architecture/wallet-data-plane.md#transparent-address-utxos) and [§Transparent Address Tx History](architecture/wallet-data-plane.md#transparent-address-tx-history) carry the wire shapes and capability strings; [Extending artifacts](architecture/extending-artifacts.md) holds the canonical worked example for adding a new artifact family.
 - **Transparent-address balance + derive-plane instantiation**: split across [ADR-0011](adrs/0011-derive-plane-federation-pattern.md) (federation primitive), [ADR-0013](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) (operational topology, balance wire shape), and [ADR-0014](adrs/0014-compute-at-read-time-canonical-reads.md) (the compute-at-read-time pattern).
 - **Prevout resolution**: locked into [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md).
 - **Mempool topology**: locked into [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
@@ -75,11 +71,5 @@ Each tree under `docs/` has its own retire-on-ship rule.
 
 - **Architecture** (`docs/architecture/`): the durable spine. Explains why each contract exists, what its invariants are, and where its boundary lives. Edited in place when contracts change. Architecture docs reference other architecture docs and at most one ADR per topic.
 - **ADRs** (`docs/adrs/`): record of accepted design decisions in present tense. Edited in place when the decision rationale needs clarification; substantive design changes get a new ADR with a contiguous number. ADRs reference architecture docs (up); they do not reference each other to "explain context" (that role belongs to the architecture doc).
-- **Specs** (`docs/specs/`): mutable working documents for un-shipped multi-PR work. Pre-decision drafts go here; ADRs do not. When a spec's work lands, decisions promote to one or more ADRs and the spec is deleted.
 - **Reference** (`docs/reference/`): living external constraints. Anti-pattern catalogs, integration requirements, upstream surface audits. Refreshed as the upstream world changes; never describes Zinder's own contracts.
 - **Runbooks** (`docs/runbooks/`): operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs (up) but do not describe architectural intent.
-
-Removed by design (not used in this repo):
-
-- **`docs/plans/`**: working drafts go in `docs/specs/` instead.
-- **`docs/research/`**: pre-decision rationale lives in the resulting ADR's Context section. Living external references go in `docs/reference/`.

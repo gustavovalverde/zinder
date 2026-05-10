@@ -2,12 +2,10 @@
 //!
 //! Subset of `services/zinder-ingest/tests/common/mod.rs` that the
 //! `services/zinder-derive` test crate needs to backfill against a live
-//! upstream node and probe the federated balance read path. The helpers are
-//! a deliberate paste of the `zinder-ingest` originals to keep the live
-//! gating contract in one place ([ADR-0006]); a future refactor can promote
-//! them into `zinder-testkit::live` once a third consumer needs them.
-//!
-//! [ADR-0006]: ../../docs/adrs/0006-test-tiers-and-live-config.md
+//! upstream node and probe the federated balance read path. Duplicated
+//! deliberately so the live gating contract stays colocated with the
+//! consumer; a third consumer is the prompt for consolidating into
+//! `zinder-testkit::live`.
 
 #![allow(
     dead_code,

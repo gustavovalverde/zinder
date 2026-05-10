@@ -32,27 +32,10 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live};
 ///
 /// The test exercises the same parsing pipeline that the streaming
 /// orchestrator runs on every observed `Added` notification, but against the
-/// regtest tip's coinbase transaction so it requires no wallet setup.
-///
-/// # Companion broadcast-cycle test (deferred)
-///
-/// A separate test that drives a real `z_sendmany` through Zallet, observes
-/// `MempoolSourceEvent::Added` on the streaming `ZebraIndexerMempoolSource`,
-/// and asserts the orchestrator-applied `MempoolEntry` matches the broadcast
-/// transaction is the next step. The regtest sidecar's funding plumbing is
-/// already in place (see `z3/.tmp/regtest-sidecar-wallet.env` for the saved
-/// Zallet account UUID, transparent/sapling/orchard addresses, and
-/// `ZEBRA_MINING__MINER_ADDRESS` matched to the Zallet account's transparent
-/// receiver), but Zallet v0.1.0-alpha.3's shielded-first design means
-/// `z_listunspent` / `z_gettotalbalance` do not surface transparent UTXOs
-/// at addresses inside its own derived unified address. Two paths to
-/// unblock:
-///
-/// 1. Reconfigure `ZEBRA_MINING__MINER_ADDRESS` to point at the orchard or
-///    sapling receiver (shielded coinbase) so Zallet's shielded scanner
-///    picks up matured notes.
-/// 2. Replace Zallet broadcast with a Rust transaction builder that signs
-///    transparent transactions directly (substantial implementation cost).
+/// regtest tip's coinbase transaction so it requires no wallet setup. The
+/// end-to-end broadcast cycle (a real `z_sendmany`-shaped transaction observed
+/// through `MempoolSourceEvent::Added` and reconciled with the resulting
+/// `MempoolEntry`) is covered by `mempool_broadcast_cycle.rs`.
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn build_mempool_entry_decodes_real_zebra_coinbase_into_canonical_form() -> Result<()> {

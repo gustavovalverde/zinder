@@ -1,4 +1,4 @@
-//! Consumer-release certification tier per [ADR-0012](../../../../docs/adrs/0012-consumer-release-certification.md).
+//! Consumer-release certification tests for the public client contracts.
 //!
 //! Each per-consumer module asserts the typed shape that consumer's contract
 //! depends on. Parity here means "Zinder serves the consumer-expected shape",

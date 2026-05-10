@@ -501,8 +501,7 @@ message ChainEventEnvelope {
   }
 }
 
-// Server capability descriptor advertised to clients per the M2 capability
-// descriptor contract.
+// Server capability descriptor advertised to clients for capability discovery.
 message ServerCapabilities {
   // Network identifier: "zcash-mainnet", "zcash-testnet", "zcash-regtest".
   string network = 1;

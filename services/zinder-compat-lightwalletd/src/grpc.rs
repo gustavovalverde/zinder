@@ -1113,9 +1113,8 @@ fn lightd_info(
         // version misleads operators inspecting the field.
         zcashd_build: String::new(),
         zcashd_subversion: String::new(),
-        // Operator-configured field; deferred until the runtime config schema
-        // grows a `donation_address` field. Empty string preserves the
-        // lightwalletd-go convention for unset.
+        // Operator-configured in lightwalletd-go. Zinder has no donation
+        // address config, so the empty string preserves the unset convention.
         donation_address: String::new(),
         upgrade_name,
         upgrade_height,

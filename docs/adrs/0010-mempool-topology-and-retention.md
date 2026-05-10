@@ -88,7 +88,7 @@ pub enum TxStatus {
 
 The `MempoolEntry` carries the hydrated transaction, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes. Consumers no longer parse error strings; the type tells them everything `transaction_by_id` saw.
 
-This is a breaking change for any client that built against the prior shape. Zinder treats it as required for product correctness, not deferrable to a major version: the string-matching workaround was always a temporary affordance.
+String-matching against `transaction_by_id` error text is not a stable contract. Zinder treats the typed `TransactionStatus` as required for product correctness, not deferrable to a major version.
 
 ## Consequences
 

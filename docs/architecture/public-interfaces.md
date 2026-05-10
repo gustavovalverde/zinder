@@ -347,12 +347,14 @@ password = "..."
 path = "/var/lib/zinder"
 max_size_bytes = 1099511627776
 sync_writes = true
-# Reader-only knobs (zinder-query, zinder-compat-lightwalletd) per ADR-0007:
+# Reader-only knobs (zinder-query, zinder-compat-lightwalletd):
 secondary_path = "/var/lib/zinder/query-secondary"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
 ingest_control_addr = "http://127.0.0.1:9100"
 chain_event_retention_hours = 168 # descriptor mirror for zinder-query ServerInfo
+mempool_mined_retention_minutes = 60 # descriptor mirror for zinder-query ServerInfo
+mempool_invalidated_retention_hours = 24 # descriptor mirror for zinder-query ServerInfo
 
 [ingest]
 reorg_window_blocks = 100
@@ -362,9 +364,10 @@ commit_batch_blocks = 1000
 chain_event_retention_hours = 168
 chain_event_retention_check_interval_ms = 60000
 cursor_at_risk_warning_hours = 24
-# M3 only:
 mempool_mined_retention_minutes = 60
 mempool_invalidated_retention_hours = 24
+mempool_event_retention_check_interval_ms = 60000
+mempool_cursor_at_risk_warning_minutes = 30
 
 [ingest.control]
 listen_addr = "127.0.0.1:9100"
@@ -380,11 +383,6 @@ to_path = "/var/backups/zinder/checkpoint-2026-04-28"
 [tip_follow]
 poll_interval_ms = 1000
 
-[mempool]
-# M3 only:
-poll_interval_ms = 10000
-max_snapshot_age_ms = 30000
-
 [query]
 listen_addr = "127.0.0.1:9101"
 max_compact_block_range = 1000
@@ -396,6 +394,8 @@ enable_health = true
 [compat]
 listen_addr = "127.0.0.1:9067"
 ```
+
+The retention fields appear twice on purpose. `[ingest.retention]` is authoritative: `zinder-ingest` enforces eviction against those values. The `[storage]` mirror is read by `zinder-query` when it builds `ServerCapabilities`, so wallet clients see the same retention windows the writer is enforcing. The two sets are not cross-validated at startup; operators are responsible for keeping them in sync, and `--print-config` against both binaries is the recommended check.
 
 ### Unit suffix rule
 
@@ -443,9 +443,9 @@ message ServerCapabilities {
   string lightwalletd_protocol_commit = 3;       // vendored lightwalletd commit hash
   uint32 schema_version = 4;                     // canonical artifact schema version
   uint32 reorg_window_blocks = 5;                // configured non-finalized window depth
-  uint64 chain_event_retention_seconds = 6;      // 0 = unbounded
-  uint64 mempool_mined_retention_seconds = 7;    // 0 until M3 support exists
-  uint64 mempool_invalidated_retention_seconds = 8; // 0 until M3 support exists
+  uint64 chain_event_retention_seconds = 6;         // 0 = unbounded retention (development only)
+  uint64 mempool_mined_retention_seconds = 7;       // 0 = mined-event family not retained on this deployment
+  uint64 mempool_invalidated_retention_seconds = 8; // 0 = invalidated-event family not retained on this deployment
   repeated string capabilities = 9;              // capability strings; clients match exact strings
   repeated DeprecatedCapability deprecated_capabilities = 10;
   NodeCapabilitiesDescriptor node = 11;
@@ -613,7 +613,7 @@ This example is illustrative, not final. The important points:
 
 ### Storage-level names
 
-Storage and cursor byte contracts are lower-level than the normal public API, but their names are stable and searchable: `StoreKey`, `ArtifactEnvelopeHeaderV1`, and `StreamCursorTokenV1` for M2, plus reserved `MempoolStreamCursorV1` for M3. Mechanism-shaped names such as `key_codec`, `cursor_helper`, or `bytes_utils` are forbidden.
+Storage and cursor byte contracts are lower-level than the normal public API, but their names are stable and searchable: `StoreKey`, `ArtifactEnvelopeHeaderV1`, `StreamCursorTokenV1`, and `MempoolStreamCursorV1`. Mechanism-shaped names such as `key_codec`, `cursor_helper`, or `bytes_utils` are forbidden.
 
 ## Crate Boundaries
 

@@ -183,7 +183,7 @@ transaction data, and commitment-tree sizes required by the pinned lightwalletd
 contract. If the pinned protocol says a field such as `CompactBlock.header`
 should be empty, the builder and tests must follow that contract instead of
 using a non-empty value as a proof of completeness. Decoding an empty protobuf
-shell is a fixture milestone, not a compatibility claim.
+shell is fixture coverage, not a compatibility claim.
 
 The compatibility adapter consumes `WalletQueryApi`; it does not own storage,
 source I/O, or artifact construction. Its production claim is limited to the

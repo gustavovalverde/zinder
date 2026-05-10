@@ -9,8 +9,7 @@
 //! Live tests reuse the production env-var schema directly; the
 //! `ZINDER_TEST_LIVE` gate (and other `ZINDER_TEST_*` knobs like
 //! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
-//! cannot leak into a production binary's config (per
-//! [ADR-0006](../../../docs/adrs/0006-test-tiers-and-live-config.md)).
+//! cannot leak into a production binary's config.
 
 use std::{collections::HashMap, path::PathBuf};
 

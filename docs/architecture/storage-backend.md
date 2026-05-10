@@ -234,9 +234,9 @@ Internal storage errors map to service errors at the boundary:
 
 Avoid catch-all errors in public boundaries. Internal adapter errors may be wrapped, but the boundary error must preserve the operator action.
 
-## Prototype Evidence Checklist
+## Storage Readiness Checklist
 
-Production storage code should not be treated as ready until the prototype proves:
+Production storage code should not be treated as ready until these checks pass:
 
 1. Real Zcash fixture replay from Zebra or curated mainnet artifacts.
 2. `GetBlockRange` P50, P99, and P99.9 under concurrent ingest.

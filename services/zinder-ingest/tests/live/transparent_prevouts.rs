@@ -81,7 +81,6 @@ struct SampledOutput {
     script_pub_key: Vec<u8>,
     value_zat: u64,
     block_height: BlockHeight,
-    #[allow(dead_code, reason = "diagnostic-only field for failure logs")]
     block_hash: BlockHash,
 }
 
@@ -166,8 +165,9 @@ async fn assert_known_outpoint_resolves(
     assert_eq!(entry.outpoint, sample.outpoint);
     let prevout = entry.prevout.as_ref().ok_or_else(|| {
         eyre!(
-            "sampled coinbase outpoint did not resolve; height={}",
+            "sampled coinbase outpoint did not resolve; height={}, hash={:?}",
             sample.block_height.value(),
+            sample.block_hash,
         )
     })?;
     assert_eq!(prevout.value_zat, sample.value_zat);

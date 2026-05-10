@@ -167,7 +167,7 @@ Required for range reads where N-block reads could regress. Not required for poi
 
 ## Federation extension
 
-When the new RPC delegates to `zinder-derive`'s `ExplorerQuery` (or a future M6+ consumer), add everything above plus seven sub-steps. See [ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md) for the design rationale.
+When the new RPC delegates to `zinder-derive`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. See [ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md) for the design rationale.
 
 ### F1. ExplorerQuery proto
 

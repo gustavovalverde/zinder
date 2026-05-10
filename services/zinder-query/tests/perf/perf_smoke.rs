@@ -6,9 +6,9 @@
 //! Performance regression-only smoke tests for the wallet query plane.
 //!
 //! These tests guarantee that a representative range read completes within
-//! a generous CI budget. They are not benchmarks; the dedicated `criterion`
-//! suite (W6 follow-up) measures P50/P99 numbers, while this file catches
-//! catastrophic regressions on every CI run.
+//! a generous CI budget. They are not benchmarks; a dedicated benchmark suite
+//! should measure P50/P99 numbers, while this file catches catastrophic
+//! regressions on every CI run.
 //!
 //! Budgets are deliberately loose so this test stays green under contended
 //! CI workers. Tight per-percentile numbers live in

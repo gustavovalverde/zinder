@@ -27,7 +27,7 @@ struct StreamCursorTokenV1 {
 }
 ```
 
-The authentication tag covers every preceding byte. Stream-family flags are part of the body so a cursor minted for one stream family cannot be replayed against another. The `flags` byte uses its lower nibble for the family code (`Tip = 0x0`, `Finalized = 0x1`, `Mempool = 0x2` reserved for M3) and its upper nibble for per-family reserved bits.
+The authentication tag covers every preceding byte. Stream-family flags are part of the body so a cursor minted for one stream family cannot be replayed against another. The `flags` byte uses its lower nibble for the family code (`Tip = 0x0`, `Finalized = 0x1`, `Mempool = 0x2`) and its upper nibble for per-family reserved bits.
 
 `chain_event_history` accepts a bounded request:
 

@@ -2,7 +2,7 @@
 //!
 //! Zallet (the desktop wallet) is the primary `zinder-client::ChainIndex` Rust
 //! consumer. These compile-time assertions ensure the `ChainIndex` methods
-//! Zallet's planned migration depends on stay present on the trait surface.
+//! Zallet depends on stay present on the trait surface.
 //! Renaming or removing any referenced method makes this module fail to
 //! compile, gating Zallet's migration confidence at build time.
 

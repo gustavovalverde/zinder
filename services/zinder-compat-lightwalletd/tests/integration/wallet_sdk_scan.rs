@@ -25,11 +25,11 @@
 //! 5. Assert no viewing keys, spending keys, seed phrases, or other key
 //!    material appear in any client→server payload.
 //!
-//! The full `zcash_client_backend` SDK note-discovery test is documented as
-//! a follow-up (gated behind a `wallet-sdk-acceptance` cargo feature) so the
-//! workspace dependency graph stays clean. This file proves the contract
-//! wallets consume; the SDK test will prove a specific reference wallet
-//! interprets the contract correctly.
+//! The full `zcash_client_backend` SDK note-discovery test belongs in a
+//! separate `wallet-sdk-acceptance` cargo feature so the default workspace
+//! dependency graph stays clean. This file proves the contract wallets consume;
+//! the SDK test proves a specific reference wallet interprets the contract
+//! correctly.
 
 use eyre::eyre;
 use prost::Message;

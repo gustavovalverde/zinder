@@ -745,9 +745,10 @@ impl RemoteChainIndex {
     ///
     /// Each page is bounded by the server's `MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE`
     /// (1024 entries today). For typical mempool sizes this is one
-    /// round-trip; for soak workloads it remains O(mempool-size). A
-    /// dedicated point-lookup gRPC primitive is filed as
-    /// [`docs/architecture/wallet-data-plane.md`] follow-up.
+    /// round-trip; iterating callers pay O(mempool-size) by design, since
+    /// `MempoolSnapshot` is the only public mempool enumeration surface.
+    /// Per-txid presence checks should call [`ChainIndex::is_in_mempool`]
+    /// rather than walk the snapshot.
     async fn for_each_mempool_entry<Visitor>(
         &self,
         mut visitor: Visitor,

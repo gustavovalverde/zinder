@@ -26,7 +26,7 @@ Per [Service operations](../architecture/service-operations.md):
 - Three deployable binaries: `zinder-ingest` (sole writer), `zinder-query` (native gRPC API), `zinder-compat-lightwalletd` (lightwalletd adapter, default listen `127.0.0.1:9067`).
 - Operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) on a separate `--ops-listen-addr` socket, with typed readiness causes per [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness).
 - Production config validation that fails closed on placeholder credentials, missing storage, mismatched network, and unsafe binds.
-- `zinder-ingest backfill --wallet-serving` to seed the historical floor required by lightwalletd-compatible bootstrap, validated end-to-end on testnet against Zashi on 2026-04-29 (see [Findings from Android wallet integration](android-wallet-integration-findings.md)).
+- `zinder-ingest backfill --wallet-serving` to seed the historical floor required by lightwalletd-compatible bootstrap, verified end-to-end on testnet against Zashi (see [Findings from Android wallet integration](android-wallet-integration-findings.md)).
 - Plaintext h2c on every gRPC port, including the public client port; the private `IngestControl` plane is governed by [ADR-0009](../adrs/0009-ingest-control-transport-security.md).
 
 What Zinder does not ship, by deliberate v1 scope cut (`README.md` and [PRD-0001](../prd-0001-zinder-indexer.md)): public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting.
@@ -41,7 +41,7 @@ What Zinder does not ship, by deliberate v1 scope cut (`README.md` and [PRD-0001
 | Public reachability                                              | yes                                   | localhost-only by default                            | host on a public VM or container                                      |
 | Rate limiting and abuse control                                  | yes (proxy-level)                     | no                                                   | configure in the proxy layer                                          |
 | Wallet-bootstrap dataset depth                                   | yes                                   | only after `zinder-ingest backfill --wallet-serving` | run ingest in wallet-serving mode                                     |
-| `GetAddressUtxos`, `GetAddressUtxosStream`, `taddrSupport: true` | yes                                   | wired (per the 2026-04-29 re-test)                   | none in code; the store must satisfy the wallet-serving floor         |
+| `GetAddressUtxos`, `GetAddressUtxosStream`, `taddrSupport: true` | yes                                   | wired                                                | none in code; the store must satisfy the wallet-serving floor         |
 | Send path with low expiry-window risk                            | yes                                   | depends on `tip-follow` lag                          | monitor writer-tip vs. node-tip and surface a typed not-ready cause   |
 
 Six of the eight gaps are operator-side glue. The wallet-bootstrap depth and the send-path tip-lag concerns are operational, not code.
@@ -87,7 +87,7 @@ Single-host mainnet pilot. Multi-host shapes follow [ADR-0007](../adrs/0007-mult
    Caddy provisions Let's Encrypt automatically; nginx and traefik need explicit ACME or cert-file configuration plus `grpc_pass` (nginx) or `h2c` scheme (traefik) for the upstream.
 5. Add proxy-level rate limiting and abuse rules. Zinder does not implement these.
 6. Verify the endpoint with the lightwalletd `GetLightdInfo` method through `grpcurl`. The response should report a non-zero `block_height` and `taddrSupport: true` once `--wallet-serving` ingest catches up.
-7. Wire alerting on `zinder_readiness_state`, `zinder_ingest_writer_tip_height`, and the writer-vs-node tip gap so the send-path failure mode in [Findings from Android wallet integration](android-wallet-integration-findings.md) (2026-05-07) surfaces as a typed not-ready cause rather than as silent send rejections.
+7. Wire alerting on `zinder_readiness_state`, `zinder_ingest_writer_tip_height`, and the writer-vs-node tip gap so the tip-follow lag failure mode in [Findings from Android wallet integration](android-wallet-integration-findings.md) surfaces as a typed not-ready cause rather than as silent send rejections.
 
 ## Wallet-side integration
 
@@ -104,7 +104,8 @@ For internal pilots fronted by a private CA (the `zcashtestnetInternalDebug` fla
 A deployment may claim Zashi or Zodl compatibility only when the conditions in [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) are met:
 
 - The serving store covers the wallet-serving history floor (`zinder-ingest backfill --wallet-serving`).
-- The transparent UTXO surface in [Wallet data plane §Transparent Address UTXOs](../architecture/wallet-data-plane.md#transparent-address-utxos) is implemented end-to-end. The 2026-04-29 re-test in [Findings from Android wallet integration](android-wallet-integration-findings.md) confirms the code path is wired.
+- The transparent UTXO surface in [Wallet data plane §Transparent Address UTXOs](../architecture/wallet-data-plane.md#transparent-address-utxos) is implemented end-to-end. [Findings from Android wallet integration](android-wallet-integration-findings.md) confirms the code path is verified against the SDK.
+- `GetMempoolStream` and `GetMempoolTx` are mapped over the native mempool index and event log when the claim includes pending-transaction UX.
 - TLS in front of the compat process is verified against a real Zashi or `zcash-android-wallet-sdk` endpoint, not just the Go `lightwalletd/testclient`.
 
-After M3, mempool compatibility adds the `GetMempoolStream` and `GetMempoolTx` mapping requirement per the same section. Until M3, a deployment can serve sync and broadcast but not pending-transaction UX. The 2026-05-07 send-path finding remains an operational concern at any milestone: tip-follow lag exceeding the SDK's expiry-height window breaks send even when every other surface looks healthy.
+Tip-follow lag remains an operational concern: when the gap exceeds the SDK's expiry-height window, sends fail at consensus while every other surface looks healthy.

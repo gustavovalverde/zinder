@@ -79,7 +79,7 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows that previously used near-tip finalized backfill switch to explicit disposable stores or tip-follow.
+- Local test workflows use explicit disposable stores or tip-follow rather than near-tip finalized backfill.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:

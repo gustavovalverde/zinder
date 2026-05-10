@@ -23,7 +23,7 @@ The minimum production architecture has two services:
 - `zinder-ingest`: the write-owning chain ingestion plane. It follows one or more upstream node sources, builds canonical chain artifacts, handles reorgs, maintains the finalized store and reorg window, and publishes queryable epochs.
 - `zinder-query`: the read-serving data plane. It exposes wallet-facing and application-facing APIs from epoch-bound indexed state. It does not follow upstream nodes directly, does not perform chain commits, does not own migrations, and does not open live canonical storage as primary or bypass `ChainEpochReadApi` in production.
 
-The planned extension service is:
+The optional extension service is:
 
 - `zinder-derive`: a replayable downstream derived-index plane for explorer, analytics, compliance, or ecosystem-specific views. It consumes canonical artifacts from `zinder-ingest` and can be rebuilt without changing the canonical ingest path.
 
@@ -80,19 +80,16 @@ Zinder should also include workspace crates for domain types, storage contracts,
   the owner of storage, upstream node clients, migrations, or compact-block construction.
 - `zinder-derive` is optional in v1 and must consume canonical artifacts rather than upstream node RPCs directly.
 - A local development command may compose ingest and query in one process, but production documentation and configuration must keep them as separate services.
-- Committed chain transitions and replay streams use the `ChainEvent` and `ChainEventEnvelope` vocabulary. Source-observation event types land with the streaming follower; until then, ingest drives the source synchronously.
+- Committed chain transitions and replay streams use the `ChainEvent` and `ChainEventEnvelope` vocabulary. Source observations are normalized by `NodeSource`; ingest may obtain them synchronously or from stream-backed sources without changing the emitted `ChainEvent` vocabulary.
 - The canonical read boundary is a `ChainEpoch`, identified by tip hash, tip height, finalized height, and artifact schema version.
 - Query responses that require chain consistency must read from one epoch. Mixing latest values from different epochs is a correctness bug.
 - The reorg window must be explicit. Finalized data and non-finalized data must have separate storage contracts.
 - Mempool state must be epoch-bound or event-bound. Insert-only mempool caches are not sufficient.
-- The first product milestone is shielded wallet read sync: parser-backed compact
-  blocks, latest block metadata, tree state, latest tree state, subtree roots,
-  lightd info, and lightwalletd-compatible range serving from one chain epoch.
-  Android/Zashi serving claims are stricter and are owned by
-  [Wallet data plane §External Wallet Compatibility Claims](architecture/wallet-data-plane.md#external-wallet-compatibility-claims).
-- The second milestone is chain-event replay, typed broadcast, and the typed Rust consumer surface: `WalletQuery.ChainEvents`, `WalletQuery.BroadcastTransaction`, the `zinder-client` Rust crate exporting `ChainIndex` (see [Wallet data plane](architecture/wallet-data-plane.md) and [Chain events](architecture/chain-events.md)). Together these close the largest cluster of Zallet integration TODOs and validate the central architectural bet (atomic snapshot plus durable chain notifications) end-to-end.
-- The third milestone is the queryable mempool surface ([ADR-0010](adrs/0010-mempool-topology-and-retention.md)): `WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`, in-memory `MempoolIndex`, and persistent `MempoolEventLog`. Closes Zallet `#139`, `#403`, and the chain-tip-change workaround. Capability-gated source: streaming when Zebra exposes its indexer port, polling otherwise. Product consumer roles for Zallet, Zashi/Zodl, lightwalletd clients, Zebra, Zaino, and explorers are canonical in [Wallet data plane §Mempool Snapshot and Subscription](architecture/wallet-data-plane.md#mempool-snapshot-and-subscription).
-- The fourth milestone is the transparent-address artifact surface following the [extending-artifacts cookbook](architecture/extending-artifacts.md): paginated `GetTaddressTxids`-equivalent and `GetAddressUtxos`-equivalent native methods, end-to-end through the new artifact-family seam. The minimal `GetAddressUtxos[Stream]` path may be pulled forward when Zashi compatibility is the release target; full transparent history and balance remain a broader transparent-address milestone. Proves that adding a canonical artifact family does not require central enum edits and unblocks t-address wallets and explorers.
+- The V1 wallet contract is one surface composed of four parts that share `WalletQuery`, `WalletQueryApi`, and `zinder-client::ChainIndex` as their typed seam:
+  - **Shielded read sync.** Parser-backed compact blocks, latest block metadata, tree state, latest tree state, subtree roots, lightd info, and lightwalletd-compatible range serving from one chain epoch. Android/Zashi serving claims are stricter and are owned by [Wallet data plane §External Wallet Compatibility Claims](architecture/wallet-data-plane.md#external-wallet-compatibility-claims).
+  - **Chain notifications and broadcast.** `WalletQuery.ChainEvents`, `WalletQuery.BroadcastTransaction`, and the `zinder-client` crate exporting `ChainIndex` (see [Wallet data plane](architecture/wallet-data-plane.md) and [Chain events](architecture/chain-events.md)). The pair closes the largest cluster of Zallet integration TODOs and validates the central architectural bet: atomic snapshots plus durable chain notifications.
+  - **Queryable mempool.** `WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`, the in-memory `MempoolIndex`, and the persistent `MempoolEventLog` per [ADR-0010](adrs/0010-mempool-topology-and-retention.md). Capability-gated source selection: streaming when Zebra exposes its indexer port, polling otherwise. Consumer roles for Zallet, Zashi/Zodl, lightwalletd clients, Zebra, Zaino, and explorers are canonical in [Wallet data plane §Mempool Snapshot and Subscription](architecture/wallet-data-plane.md#mempool-snapshot-and-subscription).
+  - **Transparent-address artifacts.** Paginated `GetTaddressTxids`-equivalent and `GetAddressUtxos`-equivalent native methods, transparent balance, prevout resolution, and lightwalletd-compatible projections, all wired through the [extending-artifacts cookbook](architecture/extending-artifacts.md). The surface unblocks t-address wallets and explorers and demonstrates that adding a canonical artifact family does not require central enum edits.
 - The compact block builder is part of ingestion because it derives wallet artifacts from chain data. The wallet data plane serves those artifacts; it does not build them on demand from arbitrary upstream node reads.
 - The compact block builder uses maintained Zcash consensus parsing primitives
   rather than a new hand-rolled parser. `zebra-chain` is the Zebra-aligned
@@ -128,7 +125,3 @@ Zinder should also include workspace crates for domain types, storage contracts,
 - Zinder v1 does not need a generic multi-chain indexing framework.
 - Zinder v1 does not need a distributed query network, token incentives, or hosted marketplace.
 - Zinder v1 should not implement analytics-specific derived indexes until the canonical artifact and query boundaries are stable.
-
-## Further Notes
-
-The Sora/Soramitsu reference remains a research input, not an architectural dependency. Public research found high-level evidence of Soramitsu blockchain products and external claims about custom indexing services, but not enough primary technical detail to copy a concrete architecture. Before implementation, maintainers should map any internal Sora indexer documentation or code examples into the research survey and explicitly decide which patterns apply to Zcash.

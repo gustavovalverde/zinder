@@ -124,7 +124,7 @@ fn block_range_decodes_pool_type_filters() -> eyre::Result<()> {
 #[test]
 fn lightd_info_decodes_protocol_version_fields() -> eyre::Result<()> {
     let lightd_info = lightwalletd::LightdInfo {
-        version: "zinder-m1".to_owned(),
+        version: "zinder-v1".to_owned(),
         vendor: "zinder".to_owned(),
         taddr_support: false,
         chain_name: "regtest".to_owned(),

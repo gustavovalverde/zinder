@@ -116,13 +116,12 @@ remains a single `BlockArtifact` per block. If repeated parsing becomes the
 larger cost, the implementation may promote a dedicated `BlockHeader`
 artifact without changing the public vocabulary.
 
-`BlockSelector` is `#[non_exhaustive]`. Future non-best-chain `(txid, block_hash)`
+`BlockSelector` is `#[non_exhaustive]`. Non-best-chain `(txid, block_hash)`
 lookup is a *separate method*, not a third selector arm. That form is a
 non-best-chain transaction lookup and has different retention, secondary-reader,
-and explorer semantics than ordinary wallet sync. It is deferred until
-explorer parity or zcashd-compat parity becomes an explicitly named milestone.
-Until then, `Transaction` / `TransactionStatus` answers against the visible
-canonical chain plus the live mempool.
+and explorer semantics than ordinary wallet sync. `Transaction` /
+`TransactionStatus` answers against the visible canonical chain plus the live
+mempool; a non-best-chain lookup must add its own named API surface.
 
 ## Transaction Status and Enrichment
 
@@ -332,6 +331,30 @@ be deterministically ordered and capped as one result set. `maxEntries = 0`
 uses the adapter's configured default bound rather than becoming an unbounded
 query.
 
+## Transparent Address Tx History
+
+Transaction-history reads return the txids that touch a given transparent
+address within an inclusive height range. The native surface is
+`WalletQuery.TransparentAddressTxIdsInRange`, a server-streamed page-bounded
+read; the matching Rust API is
+`ChainIndex::transparent_address_tx_ids_in_range` (plus the `_at_epoch`
+companion). The compatibility adapter implements `GetTaddressTxids` and
+`GetTaddressTransactions` over the same native method.
+
+Both surfaces are backed by the canonical `TransparentAddressTxIndex`
+artifact family (one row per `(address, transaction)` pair) following the
+address-keyed dynamic-filter reorg pattern. Capability
+`wallet.address.transparent_history_v1` is advertised on every deployment that
+can serve the read. Cursor-based pagination uses `StreamCursorTokenV1` with the
+`TransparentHistory` family flag (nibble `0x3`); the `descending` bit selects
+newest-first iteration. Cursor cadence on the streaming surface follows the
+same rule as `TransparentAddressUtxosStream`: only the terminal chunk carries
+a non-empty resume cursor.
+
+The full artifact-build path (column family, ingest hook, key shape,
+adapter wiring) is the canonical worked example in
+[Extending artifacts §A worked example: transparent address tx index](extending-artifacts.md#a-worked-example-transparent-address-tx-index).
+
 ## Transparent Prevout Resolution
 
 Transparent prevout resolution turns an `OutPoint` (a `(transaction_id, output_index)` pair) into the `TxOut` that funds the referenced input. Two paired RPCs cover both chain views:
@@ -427,10 +450,10 @@ The upstream Go `lightwalletd/testclient` remains smoke coverage for the basic
 compat surface. It is not a substitute for an Android SDK or Zashi bootstrap
 test when the release claim names those clients.
 
-After M3, a deployment may claim Android SDK or Zashi/Zodl mempool
-compatibility only when `GetMempoolStream` and `GetMempoolTx` are mapped over
-the native mempool index and event log, and an SDK or app flow has observed mempool
-transactions against that endpoint. A sync-only Zashi proof does not establish
+A deployment may claim Android SDK or Zashi/Zodl mempool compatibility only
+when `GetMempoolStream` and `GetMempoolTx` are mapped over the native mempool
+index and event log, and an SDK or app flow has observed mempool transactions
+against that endpoint. A sync-only Zashi proof does not establish
 pending-transaction UX.
 
 ## Query Consistency
@@ -476,8 +499,7 @@ test runs (5 warm, 1 with a cold first-call cache effect): "P50" is the median,
 | `compact_block_range` | 50 blocks | ~915 µs | ~179 µs | ~205 µs | ~205 µs |
 | `compact_block_range` | 1000 blocks | <2 s (synthetic) | ~3.07 ms | ~3.26 ms | ~3.26 ms |
 | `tree_state_at` | one height | ~97 µs | ~58 µs | ~69 µs | ~69 µs |
-| `subtree_roots` | 1..=8 entries from checkpoint | TBD | ~11 µs | ~12 µs | ~12 µs |
-| `transaction` | by id | TBD | TBD | TBD | TBD |
+| `subtree_roots` | 1..=8 entries from checkpoint | n/a | ~11 µs | ~12 µs | ~12 µs |
 
 The mainnet `subtree_roots` row times the checkpoint-bootstrapped read shape: querying from `start_index = checkpoint_completed_subtree_count` with `max_entries = 8`. Subtree roots completed before the checkpoint are not in the store; operators must seed them out-of-band if a wallet needs them.
 

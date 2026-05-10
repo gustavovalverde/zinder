@@ -41,7 +41,7 @@ The release-engineering gap: a release candidate cannot be certified as "no pari
 Each consumer gets a per-consumer test module under `crates/zinder-client/tests/parity/`:
 
 - `parity/zashi.rs` — exercises lightwalletd-compat surfaces Zashi hits today (`GetBlockRange`, `GetCompactBlock`, `GetSubtreeRoots`, `GetTreeState`, `GetMempoolTx`, `GetLightdInfo`). Asserts the typed shape and the proto field-for-field contract.
-- `parity/zallet.rs` — exercises `ChainIndex` methods Zallet's planned migration depends on (`block_id_by_selector`, `transaction_by_id`, `tree_state_at`, `chain_events`, `subtree_roots_in_range`). Asserts the typed `IndexerError` variants downstream consumers can match against.
+- `parity/zallet.rs` — exercises `ChainIndex` methods Zallet depends on (`block_id_by_selector`, `transaction_by_id`, `tree_state_at`, `chain_events`, `subtree_roots_in_range`). Asserts the typed `IndexerError` variants downstream consumers can match against.
 - `parity/lightwalletd_operators.rs` — exercises lightwalletd compat surfaces public operators expose (`GetLightdInfo` non-empty fields, `GetAddressUtxos`, `GetTaddressTxids`, `GetTaddressBalance`).
 - `parity/explorers.rs` — exercises native `WalletQuery` and federated `derive.explorer.*` surfaces typed for explorer use cases (`TransparentAddressBalance`, `BlockHeaderBySelector`).
 
@@ -109,7 +109,7 @@ Recording a Zaino response stream and asserting Zinder-vs-Zaino byte-equivalence
 
 ## Out of Scope
 
-- **Live consumer SDK runs.** Deferred to a future `ci-parity-live` profile; v1 stays at fixture-based shape assertions.
+- **Live consumer SDK runs.** Not part of the v1 parity tier; the v2 `ci-parity-live` extension sequenced after the tier shape stabilizes (see *Alternatives Considered*) is the path that adds them. v1 stays at fixture-based shape assertions.
 - **Cross-version parity (Zinder vN vs. vN-1).** A separate concern; the existing `wallet.events.chain_v1` style capability versioning carries the cross-version contract, not this tier.
 - **Performance parity.** `ci-perf` already covers per-method latency budgets; `ci-parity` does not duplicate them.
 - **Mainnet certification.** Mainnet T3 lives in `ci-live` per ADR-0006; `ci-parity` does not require mainnet access.

@@ -161,7 +161,6 @@ Tradeoffs:
 
 - Should the first source backend required for v1 be Zebra JSON-RPC, Zebra indexer gRPC, Zebra ReadState, or a capability-gated combination? Capability-gated combination (per [Node source boundary §Capability Model](../architecture/node-source-boundary.md#capability-model) and [Public interfaces §Capability Discovery](../architecture/public-interfaces.md#capability-discovery)); JSON-RPC remains as the universal fallback when streaming is unavailable.
 - Should transaction broadcast live in `zinder-query` only, or should it call a narrow `zinder-ingest` network facade? Resolved: broadcast is a `zinder-query` method that delegates to `zinder-source::TransactionBroadcaster`, with a typed `TransactionBroadcastDisabled` for read-only deployments.
-- Which Sora/Soramitsu indexer references are available for primary-source comparison?
 - Should v1 mempool serving use a snapshot-only surface or a snapshot-plus-events surface? Resolved by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md): snapshot plus events, as complementary surfaces.
 - When should writer fencing or leader election become part of v1 operations?
 - When does multi-process query mode replace the v1 in-process `ChainStore` exception? Resolved by [ADR-0007: Multi-process storage access](../adrs/0007-multi-process-storage-access.md): production readers open `SecondaryChainStore` with a process-unique secondary path; subscriptions travel over gRPC.

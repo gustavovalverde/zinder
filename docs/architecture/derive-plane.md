@@ -69,7 +69,7 @@ For views that need full block bodies, full transaction data, or cross-block agg
 
 This channel is used for one-time replay (initial backfill, full rebuild) and for occasional historical reads. Steady-state operation should use Channel A or B. A derive consumer that pulls from Channel C continuously is a smell: the data should probably be carried in `ChainEvents` instead, or the view is in the wrong plane.
 
-A fresh derive consumer whose persisted cursor sits below the upstream's retention floor needs a cold-start path that drains `WalletQuery.compact_block_range` for the gap and then attaches to the live `WalletQuery.ChainEvents` stream without dropping or duplicating events. The shipped consumers do not yet need this path (the explorer balance handler is stateless), so no helper is currently provided; future stateful consumers will need to implement it.
+A fresh derive consumer whose persisted cursor sits below the upstream's retention floor needs a cold-start path that drains `WalletQuery.compact_block_range` for the gap and then attaches to the live `WalletQuery.ChainEvents` stream without dropping or duplicating events. Stateful derive consumers own this path; the framework provides Channel A's atomic-cursor contract, the consumer provides the gap-fill loop and the seam that joins it to the live stream. The shipped explorer balance handler is stateless and so does not need it.
 
 ### What the derive plane must not consume
 
@@ -127,7 +127,7 @@ The metrics surface reflects this: `zinder-derive` consumers emit their own read
 
 Every derive view is rebuildable. The contract:
 
-- The view's state is a deterministic function of `ChainEvents` plus canonical artifacts up to some cursor. After M3, views that include unconfirmed activity may also include `MempoolEvents`.
+- The view's state is a deterministic function of `ChainEvents` plus canonical artifacts up to some cursor. Views that include unconfirmed activity may also include `MempoolEvents`.
 - Given the same input stream, the view produces the same output. No wall-clock dependence, no entropy, no non-determinism.
 - The view's storage carries its own schema fingerprint. Schema changes in the derive view are independent of canonical schema changes.
 
@@ -176,7 +176,7 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 ## Out of scope (for now)
 
 - **Federation across multiple derive consumers.** A single client query that joins data across `derive.explorer` and `derive.analytics` is not supported. Clients call each consumer separately and reconcile if needed.
-- **Extraction of the consumer SDK into a separate crate.** Backfill-then-attach, the cursor-persisting `ChainEvents` subscriber, and the mempool-events subscriber are shipped today as in-process helpers under `services/zinder-derive/src/consumer/` (entry points: `run_chain_events_subscriber`, `run_mempool_events_subscriber`, `backfill_then_attach`). Extraction to a dedicated `zinder-derive-sdk` crate is deferred until M6+ adds a second derive consumer that justifies the split.
+- **Extraction of the consumer SDK into a separate crate.** Backfill-then-attach, the cursor-persisting `ChainEvents` subscriber, and the mempool-events subscriber are shipped today as in-process helpers under `services/zinder-derive/src/consumer/` (entry points: `run_chain_events_subscriber`, `run_mempool_events_subscriber`, `backfill_then_attach`). Extraction to a dedicated `zinder-derive-sdk` crate waits until a second derive consumer justifies the split.
 - **Derive consumers that require upstream node data not in canonical artifacts.** If a use case appears (e.g. mempool fee rates that Zinder does not currently surface), the canonical artifact extends first; derive consumers do not bypass.
 
 ## Cross-references

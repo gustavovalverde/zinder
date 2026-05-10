@@ -1,7 +1,5 @@
 //! Per-crate acceptance binary that aggregates `tests/integration/` and
-//! `tests/live/` modules per the workspace test-tier convention ([ADR-0006]).
-//!
-//! [ADR-0006]: ../../docs/adrs/0006-test-tiers-and-live-config.md
+//! `tests/live/` modules under the workspace test-tier convention.
 
 mod common;
 mod integration;

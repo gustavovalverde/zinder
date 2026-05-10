@@ -614,9 +614,12 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
 /// - The persistent event log records all three transitions with strictly
 ///   monotonic sequence numbers and distinct cursors.
 ///
-/// The live counterpart (broadcast a tx, mine it, reorg the block out via
-/// `invalidateblock`, observe the source's reorg events) is deferred until
-/// the broadcast cycle is unblocked.
+/// The live broadcast-and-reorg gate lives in
+/// `tests/live/mempool_broadcast_cycle.rs`. That test verifies Zebra's
+/// observed `invalidateblock` semantics (the tx disappears, and Zinder does
+/// not synthesize an `Added` from the reverted block); this synthetic
+/// integration test covers the symmetric case where the source explicitly
+/// re-emits an `Added` after the reorg.
 #[allow(
     clippy::too_many_lines,
     reason = "End-to-end reorg flow: source setup, applier, orchestrator, mine event, reorg event, assertions."

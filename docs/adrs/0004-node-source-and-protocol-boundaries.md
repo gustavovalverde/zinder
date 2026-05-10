@@ -147,7 +147,7 @@ Advertised capabilities:
 - `finalized_height`
 - `readiness_probe`
 - `transaction_broadcast`
-- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and (in M3) `MempoolChange` gRPC streams can be consumed.
+- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and `MempoolChange` gRPC streams can be consumed.
 - `node.spending_tx_lookup` — Zebra's nullifier-to-spending-tx index is available behind `--features indexer`.
 - `node.openrpc_discovery` — `rpc.discover` was called and the upstream node's capability surface was parsed.
 - `node.json_rpc` — JSON-RPC source is the active backend.

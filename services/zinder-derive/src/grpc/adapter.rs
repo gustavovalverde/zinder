@@ -3,14 +3,13 @@
 //! Serves [`ExplorerQuery::ServerInfo`] (advertising
 //! [`DERIVE_EXPLORER_READY_CAPABILITY`]) and
 //! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
-//! request time: confirmed totals are summed from canonical transparent UTXO
-//! artifacts (via `WalletQuery`) and the mempool overlay is composed from
-//! the live mempool point lookups (also via `WalletQuery`). No dedicated
-//! balance column family lives in `zinder-derive`; a per-block accumulator
-//! is reserved as a future read-path optimization that would not change the
-//! public wire shape.
+//! request time per ADR-0014: confirmed totals are summed from canonical
+//! transparent UTXO artifacts (via `WalletQuery`) and the mempool overlay is
+//! composed from the live mempool point lookups (also via `WalletQuery`).
+//! The derive plane owns no balance column family; the wire shape is the
+//! durable contract.
 
-use tonic::{Request, Response, Status, transport::Channel};
+use tonic::{Request, Response, Status};
 use zinder_proto::v1::{
     explorer::{
         ExplorerServerCapabilities, ServerInfoRequest, ServerInfoResponse,
@@ -154,21 +153,25 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 /// Shape C reads canonical UTXOs and the mempool overlay per address, so an
 /// unbounded list would let one request fan out into thousands of
 /// `WalletQuery` round-trips. The cap mirrors the bounded-page rule used by
-/// the rest of the transparent-address surface.
-const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: usize = 256;
+/// the rest of the transparent-address surface. `u32` matches the
+/// `address_count` field on the response so the bound check happens in the
+/// wire type's native width.
+const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
 
 async fn compute_transparent_address_balance(
     client: &mut WalletQueryClient<AuthenticatedChannel>,
     request: TransparentAddressBalanceRequest,
 ) -> Result<TransparentAddressBalanceResponse, Status> {
-    if request.addresses.len() > MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES {
-        return Err(Status::invalid_argument(format!(
-            "addresses list of {} exceeds the per-request cap of {}",
-            request.addresses.len(),
-            MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-        )));
-    }
-    let address_count = u32::try_from(request.addresses.len()).unwrap_or(u32::MAX);
+    let address_count = u32::try_from(request.addresses.len())
+        .ok()
+        .filter(|count| *count <= MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES)
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "addresses list of {} exceeds the per-request cap of {}",
+                request.addresses.len(),
+                MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+            ))
+        })?;
     let at_epoch = request.at_epoch.clone();
 
     let mut confirmed_zat: u64 = 0;
@@ -208,7 +211,7 @@ async fn compute_transparent_address_balance(
         }
         for output in &mempool_outputs.outputs {
             unconfirmed_delta_zat =
-                unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat));
+                unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat)?);
         }
 
         for utxo in &utxos_response.utxos {
@@ -225,7 +228,7 @@ async fn compute_transparent_address_balance(
                 .into_inner();
             if spend_response.spend.is_some() {
                 unconfirmed_delta_zat =
-                    unconfirmed_delta_zat.saturating_sub(value_zat_to_signed(utxo.value_zat));
+                    unconfirmed_delta_zat.saturating_sub(value_zat_to_signed(utxo.value_zat)?);
             }
         }
     }
@@ -241,8 +244,17 @@ async fn compute_transparent_address_balance(
     })
 }
 
-fn value_zat_to_signed(value_zat: u64) -> i64 {
-    i64::try_from(value_zat).unwrap_or(i64::MAX)
+/// Converts a wire `u64` Zatoshi value to the signed accumulator width.
+///
+/// Zcash's hardcoded supply cap (`MAX_MONEY = 21,000,000 * 10^8` zat) fits
+/// well inside `i64::MAX`, so a `u64` value that does not fit is upstream
+/// data corruption and surfaces as `data_loss` rather than silent saturation.
+fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
+    i64::try_from(value_zat).map_err(|_| {
+        Status::data_loss(format!(
+            "WalletQuery returned value_zat {value_zat} exceeding i64::MAX"
+        ))
+    })
 }
 
 async fn connect_wallet_query(
@@ -262,9 +274,3 @@ async fn connect_wallet_query(
 fn connect_error_to_status(error: BearerTokenConnectError) -> Status {
     Status::unavailable(format!("WalletQuery endpoint unreachable: {error}"))
 }
-
-#[allow(
-    dead_code,
-    reason = "Channel reservation: kept so that future builds that pool channels keep the same import shape"
-)]
-type _ChannelReservation = Channel;
