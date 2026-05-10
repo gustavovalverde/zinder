@@ -6,11 +6,10 @@
 //! address. The artifact carries the position metadata needed to construct
 //! stable per-tx links without a follow-up call.
 //!
-//! Storage uses the dynamic-filter visibility pattern from M4 Slice A's
-//! transparent UTXO family: rows are written and never physically deleted on
-//! reorg; visibility is enforced at read time via the trailing
-//! `chain_epoch_id` source-epoch filter and `block_is_visible` against the
-//! row's `block_hash`.
+//! Storage uses dynamic-filter visibility: rows are written and never
+//! physically deleted on reorg. Visibility is enforced at read time via the
+//! trailing `chain_epoch_id` source-epoch filter and `block_is_visible`
+//! against the row's `block_hash`.
 
 use crate::{BlockHash, BlockHeight, TransactionId, TransparentAddressScriptHash};
 

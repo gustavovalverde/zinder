@@ -1,9 +1,9 @@
 //! Federation primitive for proxying typed `WalletQuery` RPCs to derive-plane
 //! consumers (`zinder-derive`).
 //!
-//! [`DeriveProxy`] is the canonical entry point for every M6+ derive consumer
-//! that federates an RPC under `WalletQuery`. It owns the four concerns each
-//! derive proxy needs to share to avoid copy-pasted federation bodies:
+//! [`DeriveProxy`] is the federation entry point for any `WalletQuery.*`
+//! method that delegates to a derive consumer. It owns the four concerns
+//! each federation body would otherwise duplicate:
 //!
 //! - Endpoint and bearer-token configuration for the underlying gRPC channel.
 //! - Lazy connection construction (one tonic channel per call today;
@@ -16,35 +16,18 @@
 //!   [`crate::WalletQueryGrpcAdapter`] can suppress the federated method's
 //!   capability string when the proxy is unconfigured or unhealthy.
 //!
-//! Per [docs/architecture/derive-plane.md] and the M5 Slice B contract,
-//! every federated `WalletQuery.*` method that proxies to `ExplorerQuery.*`
-//! advertises its capability under the `derive.{consumer}.{capability}_v{N}`
-//! namespace, never `wallet.*`. The capability advertisement is gated on
-//! [`DeriveProxy::is_ready`]; `ServerInfo` does not advertise the capability
-//! when the proxy is unconfigured.
+//! Federated methods advertise their capability under
+//! `derive.{consumer}.{capability}_v{N}` rather than `wallet.*`: the
+//! namespace reflects data ownership, not RPC location. Capability
+//! advertisement is gated on [`DeriveProxy::is_ready`]; `ServerInfo` does
+//! not advertise the capability when the proxy is unconfigured.
 //!
-//! ## Adding a derive consumer
-//!
-//! M6+ consumers (analytics, future tax, etc.) construct their own
-//! `DeriveProxy<Client>` parameterized over the consumer's generated tonic
-//! client. The supplied `construct_client` function pointer turns an
-//! [`AuthenticatedChannel`] into the typed client; the rest of the
-//! federation logic is shared.
-//!
-//! ```ignore
-//! // Hypothetical M6+ analytics proxy:
-//! let analytics_proxy = DeriveProxy::<AnalyticsQueryClient<AuthenticatedChannel>>::new(
-//!     DeriveProxyConfig {
-//!         endpoint: analytics_endpoint,
-//!         bearer_token: shared_bearer_token,
-//!         capability: "derive.analytics.activity_feed_v1",
-//!     },
-//!     AnalyticsQueryClient::new,
-//! );
-//! ```
-//!
-//! Each proxy has its own readiness gauge. A binary running multiple derive
-//! consumers (explorer + analytics) spawns one probe loop per proxy.
+//! Each derive consumer constructs its own `DeriveProxy<Client>`
+//! parameterized over the consumer's generated tonic client. The supplied
+//! `construct_client` function pointer turns an [`AuthenticatedChannel`]
+//! into the typed client; the rest of the federation logic is shared.
+//! A binary running multiple derive consumers spawns one probe loop per
+//! proxy.
 
 use std::{
     future::Future,
@@ -124,11 +107,11 @@ struct DeriveReadinessGaugeInner {
 /// Federation proxy that forwards a typed `WalletQuery` RPC to a derive-plane
 /// consumer.
 ///
-/// Generic over `Client` so each derive consumer (M5 explorer, future M6+
-/// analytics, etc.) supplies its own generated tonic client type. The shared
-/// [`forward`](Self::forward) helper opens an authenticated channel, hands it
-/// to the caller-supplied closure, and maps connection failures into a
-/// `Status::unavailable` carrying `derive_unavailable` semantics.
+/// Generic over `Client` so each derive consumer supplies its own generated
+/// tonic client type. The shared [`forward`](Self::forward) helper opens an
+/// authenticated channel, hands it to the caller-supplied closure, and maps
+/// connection failures into a `Status::unavailable` carrying
+/// `derive_unavailable` semantics.
 #[derive(Clone, Debug)]
 pub struct DeriveProxy<Client> {
     config: DeriveProxyConfig,

@@ -129,12 +129,12 @@ fn commit_source_event(
         }
     };
 
-    // Per ADR-0010 §Implementation, every typed envelope must pass through
-    // the durable event log before consumers can observe it through the
-    // live index. If we mutated the index first and the append failed, a
-    // reader could see an entry in the live mempool that no
-    // `MempoolEvents` cursor will ever replay (or, for terminal events, see
-    // the entry vanish without a `Mined`/`Invalidated` resolution).
+    // Every typed envelope must pass through the durable event log before
+    // consumers can observe it through the live index. If we mutated the
+    // index first and the append failed, a reader could see an entry in
+    // the live mempool that no `MempoolEvents` cursor will ever replay
+    // (or, for terminal events, see the entry vanish without a `Mined` or
+    // `Invalidated` resolution).
     //
     // The orchestrator is single-tasked so the no-op predicate observes
     // the same index state that the subsequent apply will mutate; there is

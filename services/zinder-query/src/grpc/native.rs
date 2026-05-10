@@ -245,7 +245,6 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
 /// Resolves a batch of canonical-chain transparent outpoints to their
 /// referenced outputs and encodes the native wallet response.
 ///
-/// closes: G18
 pub async fn transparent_prevouts_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     outpoints: Vec<TransparentOutPoint>,

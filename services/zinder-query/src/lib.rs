@@ -124,12 +124,11 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ///
     /// Reads each unique `transaction_id` once from the canonical
     /// transaction artifact and indexes into the transaction's `vout` list
-    /// (Shape C compute-at-read-time per `docs/specs/m6-prevout-resolution.md`
-    /// D3). Outpoints that do not resolve at the response's [`ChainEpoch`]
-    /// return an entry with `prevout = None`. The response preserves input
-    /// order; duplicate outpoints emit duplicate entries.
+    /// (compute-at-read-time, no dedicated column family). Outpoints that
+    /// do not resolve at the response's [`ChainEpoch`] return an entry with
+    /// `prevout = None`. The response preserves input order; duplicate
+    /// outpoints emit duplicate entries.
     ///
-    /// closes: G18
     async fn transparent_prevouts(
         &self,
         outpoints: Vec<TransparentOutPoint>,

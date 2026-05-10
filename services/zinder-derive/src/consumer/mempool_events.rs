@@ -4,9 +4,9 @@
 //! subscriber takes any stream of `MempoolEventEnvelope` items and dispatches
 //! the typed variant to the consumer along with a [`DeriveConsumerCtx`] that
 //! carries a fresh [`WriteBatch`]; the SDK appends the cursor advance to the
-//! same batch and commits atomically. Mempool retention is shorter than chain
-//! retention (per ADR-0010), so consumers that fall behind for longer than
-//! the retention window receive `DeriveError::Upstream` with
+//! same batch and commits atomically. Mempool retention is shorter than
+//! chain retention, so consumers that fall behind for longer than the
+//! retention window receive `DeriveError::Upstream` with
 //! `MempoolCursorExpired` from the server side and decide on their own
 //! whether to drop and rebuild.
 

@@ -2,10 +2,7 @@
 //! variant declared in `zinder_client::IndexerError`.
 //!
 //! Constants live in `zinder-core` so every crate that constructs or matches
-//! on the typed error variant uses the same string literal. The CI walker at
-//! `crates/zinder-proto/tests/integration/gap_doc_walker.rs` verifies the
-//! variant carries the canonical refusal of the `IndexerError::NotFound`
-//! generic-resource collapse.
+//! on the typed error variant uses the same string literal.
 //!
 //! [`IndexerError::ArtifactUnavailable`]: https://docs.rs/zinder-client/latest/zinder_client/enum.IndexerError.html#variant.ArtifactUnavailable
 

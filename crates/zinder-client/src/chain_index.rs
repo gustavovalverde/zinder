@@ -59,7 +59,6 @@ pub struct ChainEventEnvelope {
 
 /// Canonical chain transition carried by [`ChainEventEnvelope`].
 ///
-/// closes: G20
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
@@ -343,7 +342,6 @@ pub struct TransparentAddressUtxoStreamItem {
 /// `zinder_proto::*` types appear only in adapter modules, never on this
 /// public Rust API.
 ///
-/// refuses: A5
 #[async_trait]
 pub trait ChainIndex: Send + Sync + 'static {
     /// Returns the server capability descriptor when the implementation has a
@@ -355,7 +353,6 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the latest visible block identity.
     ///
-    /// closes: G15
     async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError>;
 
     /// Resolves a block selector against the canonical best chain.
@@ -367,7 +364,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// selector addresses a block that is not visible at the request's
     /// chain epoch (reorged out or never indexed).
     ///
-    /// closes: G2
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
@@ -379,8 +375,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// The Zinder header shape is independent of the lightwalletd compact
     /// header and the upstream node's JSON-RPC `getblockheader` shape.
     ///
-    /// closes: G4
-    /// refuses: A2
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
@@ -406,7 +400,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// `at_epoch = None` resolves to the live tip; `Some(epoch)` pins the
     /// read to that chain epoch.
     ///
-    /// closes: G17
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -421,8 +414,6 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Reads subtree roots for a bounded range.
     ///
-    /// closes: G16
-    /// closes: G21
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
@@ -435,9 +426,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// chain has no record. `Some(epoch)` pins the read to that epoch and
     /// never consults mempool state.
     ///
-    /// closes: G3
-    /// closes: G13
-    /// refuses: A1
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -446,7 +434,6 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Broadcasts raw transaction bytes without mutating canonical storage.
     ///
-    /// closes: G19
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
@@ -483,7 +470,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// Returns whether `transaction_id` is currently visible in the live
     /// mempool index.
     ///
-    /// closes: G7
     async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
 
     /// Reads a bounded page of unspent transparent outputs.
@@ -512,7 +498,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// Bounded by the request's `max_entries`; values larger than the
     /// server's configured cap are silently clamped to that cap.
     ///
-    /// closes: G6
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: TransparentMempoolOutputsRequest,
@@ -531,7 +516,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// reachable surface this as
     /// [`IndexerError::ServiceUnavailable`]/derive-unavailable.
     ///
-    /// closes: G1
     async fn transparent_address_balance(
         &self,
         addresses: &[TransparentAddressScriptHash],
@@ -543,7 +527,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// `None` when the canonical chain at the response's epoch does not
     /// have the referenced output.
     ///
-    /// closes: G18
     async fn transparent_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -554,7 +537,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// when an outpoint references an output of an unconfirmed mempool
     /// transaction (chained-mempool flows).
     ///
-    /// closes: G18
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],

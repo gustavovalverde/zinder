@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-//! Network-agnostic acceptance for the M4 transparent UTXO + tx-history
+//! Network-agnostic acceptance for the transparent-UTXO + tx-history
 //! surfaces.
 //!
 //! The test backfills a small window ending at the upstream tip on whatever

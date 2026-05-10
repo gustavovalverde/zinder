@@ -1,14 +1,14 @@
 //! Coordination point between the mempool orchestrator and the tip-follow
 //! readiness state machine.
 //!
-//! Per ADR-0010 §Implementation, the writer must finish rebuilding the live
-//! `MempoolIndex` before signalling `ready`. After a writer restart the index
-//! is empty until the orchestrator successfully opens a `MempoolSource`
-//! stream and (for the streaming backend) receives the upstream snapshot, or
-//! (for the polling backend) completes its first poll cycle. Both backends
-//! signal readiness by reporting
-//! [`MempoolOrchestratorEventOutcome::SourceStreamOpened`] after their first
-//! successful subscribe.
+//! The writer must finish rebuilding the live `MempoolIndex` before
+//! signalling `ready`. After a writer restart the index is empty until the
+//! orchestrator successfully opens a `MempoolSource` stream and (for the
+//! streaming backend) receives the upstream snapshot, or (for the polling
+//! backend) completes its first poll cycle. Both backends signal readiness
+//! by reporting
+//! [`MempoolOrchestratorEventOutcome::SourceStreamOpened`] after their
+//! first successful subscribe.
 //!
 //! [`MempoolReadyGate`] is a sticky `false → true` watch that the
 //! tip-follow readiness state machine consults before flipping to

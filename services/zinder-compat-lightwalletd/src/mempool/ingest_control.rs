@@ -10,9 +10,9 @@
 //! Each [`IngestControlMempoolSurface::mempool_snapshot_page`] and
 //! [`IngestControlMempoolSurface::mempool_events`] call opens a fresh gRPC
 //! channel via [`connect_authenticated_channel`] and drops it when the call
-//! returns. This is intentional per ADR-0010: the alternative
-//! (long-lived shared channel) requires reconnection-state machinery and a
-//! liveness-probe loop that the on-demand model side-steps.
+//! returns. The alternative (a long-lived shared channel) requires
+//! reconnection-state machinery and a liveness-probe loop that the
+//! on-demand model side-steps.
 //!
 //! With N concurrent lightwalletd `GetMempoolStream` clients there are N
 //! concurrent `IngestControl` `MempoolEvents` subscriptions on the writer.

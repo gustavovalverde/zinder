@@ -27,7 +27,6 @@ pub enum IndexerError {
     /// a new top-level variant. Constants for `family` live in
     /// [`zinder_core::artifact_family`].
     ///
-    /// closes: G14
     #[error("artifact unavailable in family {family}: key {key}")]
     ArtifactUnavailable {
         /// Canonical family label (see [`zinder_core::artifact_family`]).

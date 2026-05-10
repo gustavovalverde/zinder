@@ -1,27 +1,21 @@
 //! Derive-consumer trait, typed event wrappers, and subscription helpers.
 //!
-//! Every derive consumer (the M5 balance accumulator, future M6+ analytics
-//! views) implements [`DeriveConsumer`]. The trait is the seam between the
-//! consumer-agnostic infrastructure in `zinder-derive` (store, `ChainEvents`
-//! subscriber, backfill helper, ops surface) and the consumer-specific
+//! Every derive consumer implements [`DeriveConsumer`]. The trait is the seam
+//! between the consumer-agnostic infrastructure in `zinder-derive` (store,
+//! `ChainEvents` subscriber, mempool subscriber) and the consumer-specific
 //! aggregation logic that lives in each consumer module.
 //!
-//! Three submodules layer subscriber primitives on top of the trait:
+//! Two submodules layer subscriber primitives on top of the trait:
 //!
 //! - The chain-events subscriber drives a `WalletQuery.ChainEvents`
 //!   subscription with cursor persistence and dispatches each envelope to
 //!   the consumer's `apply_chain_committed` / `apply_chain_reorged` hooks.
 //!   Public entry point: [`crate::run_chain_events_subscriber`].
-//! - The backfill helper implements the M5 D12 backfill-then-attach
-//!   contract for fresh consumers whose persisted cursor sits below the
-//!   upstream's retention floor. Public entry point:
-//!   [`crate::backfill_then_attach`].
 //! - The mempool-events subscriber drives a `WalletQuery.MempoolEvents`
 //!   subscription with cursor persistence for consumers that observe
 //!   unconfirmed activity. Public entry point:
 //!   [`crate::run_mempool_events_subscriber`].
 
-pub(crate) mod backfill;
 pub(crate) mod chain_events;
 pub(crate) mod mempool_events;
 
@@ -147,12 +141,10 @@ pub struct CommittedRange {
 
 /// Trait every derive consumer implements.
 ///
-/// The infrastructure in
-/// [`crate::run_chain_events_subscriber`] and
-/// [`crate::backfill_then_attach`] dispatches typed committed and reorged
-/// events to implementers; consumers stage their state writes through the
-/// [`DeriveConsumerCtx::batch`] handle so the SDK can commit consumer
-/// writes and the cursor advance atomically.
+/// The infrastructure in [`crate::run_chain_events_subscriber`] dispatches
+/// typed committed and reorged events to implementers; consumers stage their
+/// state writes through the [`DeriveConsumerCtx::batch`] handle so the SDK can
+/// commit consumer writes and the cursor advance atomically.
 ///
 /// The trait is async because most implementations need to read previous
 /// running totals from the same [`DeriveStore`] they write to, which crosses
@@ -185,9 +177,9 @@ pub trait DeriveConsumer: Send + Sync {
 ///
 /// Separate from [`DeriveConsumer`] because mempool events have different
 /// retention, ordering, and semantic content than chain events. A consumer
-/// can implement both traits if it observes both streams; the M5 balance
-/// accumulator implements neither (Shape C is stateless and reads at
-/// request time).
+/// can implement both traits if it observes both streams; the explorer
+/// transparent-balance handler implements neither because it reads canonical
+/// UTXOs and live mempool point lookups at request time.
 #[async_trait]
 pub trait DeriveMempoolConsumer: Send + Sync {
     /// Stable consumer identity used for cursor and metadata key prefixes.

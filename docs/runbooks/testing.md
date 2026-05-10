@@ -182,7 +182,7 @@ ZINDER_TEST_LIVE=1 \
 Currently-mainnet-only tests are:
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`backfills_last_1000_blocks_from_checkpoint`, plus the M5 federated balance
+`backfills_last_1000_blocks_from_checkpoint`, plus the federated balance
 read-only confirmations under `services/zinder-derive/tests/live/`.
 
 ## Performance calibration (T2 + live latency)

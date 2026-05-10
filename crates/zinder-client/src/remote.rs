@@ -54,7 +54,6 @@ pub struct RemoteOpenOptions {
 /// [Service operations §Zallet with Zinder](../../../docs/architecture/service-operations.md#zallet-with-zinder).
 /// `LocalChainIndex` is the colocated optimization for advanced operators.
 ///
-/// closes: G12
 #[derive(Clone)]
 pub struct RemoteChainIndex {
     client: Arc<Mutex<WalletQueryClient<Channel>>>,
@@ -568,7 +567,6 @@ impl ChainIndex for RemoteChainIndex {
         transparent_address_balance_from_message(self.network, response)
     }
 
-    /// closes: G18
     async fn transparent_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -589,7 +587,6 @@ impl ChainIndex for RemoteChainIndex {
         transparent_prevouts_response_from_message(self.network, response)
     }
 
-    /// closes: G18
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],

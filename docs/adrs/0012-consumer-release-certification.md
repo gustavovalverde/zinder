@@ -2,10 +2,10 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Proposed |
+| Status | Accepted (2026-05-10) |
 | Product | Zinder |
 | Domain | Test infrastructure, release engineering, consumer-side parity |
-| Related | [ADR-0006: Test tiers and unified live-test config](0006-test-tiers-and-live-config.md), [ADR-0008: Consumer-neutral wallet data plane](0008-consumer-neutral-wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Closing the Zaino surface gap §G11](../reference/closing-the-zaino-surface-gap.md) |
+| Related | [ADR-0006: Test tiers and unified live-test config](0006-test-tiers-and-live-config.md), [ADR-0008: Consumer-neutral wallet data plane](0008-consumer-neutral-wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md) |
 
 ## Context
 
@@ -17,7 +17,7 @@
 
 None of those tiers answers the consumer-facing question: **does Zinder serve consumer X without a parity regression versus the prior-art Zaino surface?**
 
-[Gap doc G11](../reference/closing-the-zaino-surface-gap.md) names this gap. The four named consumers ([ADR-0008](0008-consumer-neutral-wallet-data-plane.md)) each exercise a different public contract:
+The four named consumers ([ADR-0008](0008-consumer-neutral-wallet-data-plane.md)) each exercise a different public contract:
 
 - **Zashi / Zodl** (mobile, via `zcash-android-wallet-sdk`): exercises `zinder-compat-lightwalletd::CompactTxStreamer`.
 - **Zallet** (desktop, future Rust consumer of `zinder-client::ChainIndex`).
@@ -45,7 +45,7 @@ Each consumer gets a per-consumer test module under `crates/zinder-client/tests/
 - `parity/lightwalletd_operators.rs` — exercises lightwalletd compat surfaces public operators expose (`GetLightdInfo` non-empty fields, `GetAddressUtxos`, `GetTaddressTxids`, `GetTaddressBalance`).
 - `parity/explorers.rs` — exercises native `WalletQuery` and federated `derive.explorer.*` surfaces typed for explorer use cases (`TransparentAddressBalance`, `BlockHeaderBySelector`).
 
-Each module asserts shape only, not behavioral equivalence with Zaino. "Parity" here means "the typed Zinder method returns the consumer-expected shape" — not "Zinder bytewise matches Zaino at the wire." The latter standard is unattainable when Zinder deliberately refuses Zaino's anti-patterns ([gap doc §A1-A5](../reference/closing-the-zaino-surface-gap.md#anti-patterns-zinder-refuses-to-replicate)).
+Each module asserts shape only, not behavioral equivalence with Zaino. "Parity" here means "the typed Zinder method returns the consumer-expected shape", not "Zinder bytewise matches Zaino at the wire." The latter standard is unattainable when Zinder deliberately refuses Zaino's anti-patterns (see [Extending the wallet data plane §Anti-patterns to refuse](../architecture/extending-the-wallet-data-plane.md#anti-patterns-to-refuse)).
 
 ### Failure semantics
 
@@ -77,8 +77,8 @@ Each module asserts shape only, not behavioral equivalence with Zaino. "Parity" 
 
 ### Implementation
 
-- One-time scaffold in `crates/zinder-client/tests/parity/` per Phase 4 PR8 of the surface-gap close-out plan.
-- Each new closed gap appends an assertion to the relevant per-consumer module. The pattern: read the gap row's `closes:` tag in code, mirror the assertion in the parity module.
+- The scaffold lives in `crates/zinder-client/tests/parity/` with one module per named consumer.
+- Each new public surface that a consumer depends on appends an assertion to the relevant per-consumer module.
 - The `assert_wallet_chain_index_methods_compile` pattern from `crates/zinder-client/tests/integration/capability_coverage.rs` is mirrored per consumer for compile-time enforcement of trait surface presence.
 
 ### Testing
@@ -105,7 +105,7 @@ Adding parity assertions inline in `ci` couples release-gate concerns with per-P
 
 ### Build a Zaino reference recording and assert byte-equivalence
 
-Recording a Zaino response stream and asserting Zinder-vs-Zaino byte-equivalence would be a strong claim. It is unworkable because Zinder deliberately refuses several Zaino shapes (see [gap doc §A1-A5](../reference/closing-the-zaino-surface-gap.md#anti-patterns-zinder-refuses-to-replicate)). The "no parity regression" claim is shaped against the consumer's expectations, not against Zaino's specific bytes.
+Recording a Zaino response stream and asserting Zinder-vs-Zaino byte-equivalence would be a strong claim. It is unworkable because Zinder deliberately refuses several Zaino shapes (see [Extending the wallet data plane §Anti-patterns to refuse](../architecture/extending-the-wallet-data-plane.md#anti-patterns-to-refuse)). The "no parity regression" claim is shaped against the consumer's expectations, not against Zaino's specific bytes.
 
 ## Out of Scope
 

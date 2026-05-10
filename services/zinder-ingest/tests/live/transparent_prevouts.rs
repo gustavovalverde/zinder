@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-//! Network-agnostic live acceptance for the M6 prevout-resolution surface.
+//! Network-agnostic live acceptance for the prevout-resolution surface.
 //!
 //! The test backfills a small window ending at the upstream tip on whatever
 //! network the operator points at (regtest, testnet, or mainnet), samples the
@@ -16,10 +16,10 @@
 //! - duplicate request entries emit duplicate response entries in input order.
 //!
 //! The sampled "coinbase output" is just a stable, easy-to-find transparent
-//! output on every network. M6's surface resolves any [`TransparentOutPoint`]
-//! to its referenced [`TransparentPrevout`] regardless of whether the `OutPoint`
-//! has been spent; what consumers do with the result (label it "prevout",
-//! "txout", or "utxo") is their concern.
+//! output on every network. The prevout surface resolves any
+//! [`TransparentOutPoint`] to its referenced [`TransparentPrevout`]
+//! regardless of whether the `OutPoint` has been spent; what consumers do
+//! with the result (label it "prevout", "txout", or "utxo") is their concern.
 //!
 //! Mainnet runs require explicit opt-in via `ZINDER_NETWORK=zcash-mainnet`
 //! and the runtime gate [`require_live_for`].
@@ -42,7 +42,7 @@ use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_fr
 
 /// Number of blocks below the tip to backfill.
 ///
-/// Mirrors the M4 transparent-address live test's depth: small enough to keep
+/// Mirrors the transparent-address live test's depth: small enough to keep
 /// the test under a minute against mainnet; large enough that the sampled
 /// coinbase has been finalized by the time the wallet API reads it back.
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;

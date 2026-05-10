@@ -102,7 +102,7 @@ helper `zinder_derive::run_chain_events_subscriber` drains the stream into a
 consumer's `WriteBatch`. Fresh consumers whose persisted cursor sits below the
 retention floor cold-start through `zinder_derive::backfill_then_attach`,
 which drains `compact_block_range` for the gap before attaching to the live
-stream per the M5 D12 contract.
+stream.
 
 Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The cursor protocol below is the same for both consumer paths.
 

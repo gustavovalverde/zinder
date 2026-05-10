@@ -399,8 +399,7 @@ In v1.x the public wallet plane (`WalletQuery` on `zinder-query` and
 authentication; operators terminate TLS and apply auth, rate-limiting, and
 per-tenant quotas at the reverse proxy. [ADR-0009](../adrs/0009-ingest-control-transport-security.md)
 explicitly defers wallet-plane auth to a later v2 ADR; the open question is
-whether multi-tenant wallet hosting is in scope. This deferral is recorded as
-gap row G10 in [closing the Zaino surface gap](../reference/closing-the-zaino-surface-gap.md).
+whether multi-tenant wallet hosting is in scope.
 
 The private `IngestControl` gRPC plane that ties `zinder-ingest`,
 `zinder-query`, and `zinder-compat-lightwalletd` together is plaintext h2c.

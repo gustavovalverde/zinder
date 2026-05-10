@@ -3,8 +3,8 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-//! Network-agnostic acceptance for the M5 Slice B federated transparent
-//! address balance read path.
+//! Network-agnostic acceptance for the federated transparent-address
+//! balance read path.
 //!
 //! The test backfills a small window ending at the upstream tip, samples one
 //! transparent coinbase output from the tip block, derives its

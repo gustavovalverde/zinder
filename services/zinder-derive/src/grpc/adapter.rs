@@ -1,15 +1,14 @@
 //! `ExplorerQuery` gRPC adapter.
 //!
-//! Slice A serves [`ExplorerQuery::ServerInfo`], advertising the static
-//! capability [`DERIVE_EXPLORER_READY_CAPABILITY`] once the consumer
-//! infrastructure is alive. Slice B layers
-//! [`ExplorerQuery::TransparentAddressBalance`] onto the same adapter using
-//! the Shape C compute path documented in ADR-0013 (storage and read-path)
-//! and ADR-0014 (compute-at-read-time): confirmed totals are summed at read
-//! time from canonical transparent UTXO artifacts (via `WalletQuery`), and
-//! the mempool overlay is computed from M3's existing mempool point lookups
-//! (also via `WalletQuery`). The accumulator-backed Shape A path is a future
-//! read-path optimization that does not change the public wire shape.
+//! Serves [`ExplorerQuery::ServerInfo`] (advertising
+//! [`DERIVE_EXPLORER_READY_CAPABILITY`]) and
+//! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
+//! request time: confirmed totals are summed from canonical transparent UTXO
+//! artifacts (via `WalletQuery`) and the mempool overlay is composed from
+//! the live mempool point lookups (also via `WalletQuery`). No dedicated
+//! balance column family lives in `zinder-derive`; a per-block accumulator
+//! is reserved as a future read-path optimization that would not change the
+//! public wire shape.
 
 use tonic::{Request, Response, Status, transport::Channel};
 use zinder_proto::v1::{
@@ -28,9 +27,8 @@ use zinder_runtime::{
 
 /// Capability advertised once the derive consumer infrastructure is alive.
 ///
-/// Slice A advertises this string unconditionally (the binary boots ready);
-/// Slice B continues to advertise it because the balance read path is itself
-/// stateless against the derive store today.
+/// Always advertised: the balance read path is stateless against the derive
+/// store, so the binary is ready as soon as it boots.
 pub const DERIVE_EXPLORER_READY_CAPABILITY: &str = "derive.explorer.ready_v1";
 
 /// Capability advertised when the explorer-balance read path is reachable.
@@ -81,8 +79,8 @@ impl ExplorerQueryGrpcAdapter {
 
     /// Configures the `WalletQuery` endpoint the balance handler reads from.
     ///
-    /// The same endpoint serves canonical transparent UTXOs and the M3
-    /// mempool point lookups that Shape C composes into the balance response.
+    /// The same endpoint serves canonical transparent UTXOs and the live
+    /// mempool point lookups composed into the balance response.
     #[must_use]
     pub fn with_wallet_query_endpoint(mut self, endpoint: String) -> Self {
         self.wallet_query_endpoint = Some(endpoint);

@@ -58,8 +58,8 @@ impl ChainEventStreamFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MempoolEventStreamFamily {
     /// Single mempool event family (flag `0x2`). Reserved nibble values
-    /// `0x3..0xF` are available for future M3 extensions (e.g. a
-    /// transparent-only mempool family).
+    /// `0x3..0xF` are available for future mempool-stream variants (e.g. a
+    /// transparent-only family).
     Mempool,
 }
 

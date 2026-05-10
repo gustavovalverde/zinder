@@ -1,23 +1,24 @@
 //! Transparent prevout read-model.
 //!
-//! Per [docs/specs/m6-prevout-resolution.md] D2 and D3, the wire surface for
-//! prevout resolution returns intrinsic output data ([`TransparentPrevout`])
-//! per requested outpoint, in input order, bound to one [`ChainEpoch`]. The
-//! identifying outpoint stays on the owning [`TransparentPrevoutEntry`] so
-//! the inner payload carries no redundant fields.
+//! The wire surface for prevout resolution returns intrinsic output data
+//! ([`TransparentPrevout`]) per requested outpoint, in input order, bound
+//! to one [`ChainEpoch`]. The identifying outpoint stays on the owning
+//! [`TransparentPrevoutEntry`] so the inner payload carries no redundant
+//! fields.
 //!
-//! Slice 1 (canonical): `WalletQuery.TransparentPrevouts` reads from
-//! `TransactionArtifact.payload_bytes` (Shape C compute-at-read-time) and
-//! never touches a dedicated column family.
+//! Canonical: `WalletQuery.TransparentPrevouts` reads from
+//! `TransactionArtifact.payload_bytes` (compute-at-read-time) and never
+//! touches a dedicated column family.
 //!
-//! Slice 2 (mempool): `WalletQuery.TransparentMempoolPrevouts` reads from
-//! the writer-owned `MempoolIndex`. The mempool variant binds to the chain
+//! Mempool: `WalletQuery.TransparentMempoolPrevouts` reads from the
+//! writer-owned `MempoolIndex`. The mempool variant binds to the chain
 //! epoch visible at lookup time without supporting an `at_epoch` pin.
 //!
 //! Absent `prevout` per entry means the canonical chain at the bound epoch
 //! (canonical) or the live mempool index (mempool) does not contain the
 //! referenced output. Richer not-found discrimination is reserved for a
-//! future revision; v1 follows the M3 mempool precedent of `optional T`.
+//! future revision; v1 returns `optional T` for consistency with the rest
+//! of the wallet API.
 
 use crate::{ChainEpoch, TransparentOutPoint};
 
@@ -51,7 +52,6 @@ pub struct TransparentPrevoutEntry {
 
 /// Canonical-chain prevout resolution response bound to one chain epoch.
 ///
-/// closes: G18
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentPrevoutsResponse {
     /// Chain epoch the response binds to. Every entry's `prevout` (when
@@ -65,7 +65,6 @@ pub struct TransparentPrevoutsResponse {
 /// Live-mempool prevout resolution response bound to the chain epoch
 /// visible at lookup time.
 ///
-/// closes: G18
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentMempoolPrevoutsResponse {
     /// Chain epoch visible at lookup time.

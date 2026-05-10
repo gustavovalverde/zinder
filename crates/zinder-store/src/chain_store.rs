@@ -1277,9 +1277,9 @@ impl ChainStoreInner {
         // column family with gaps where the deletes physically already
         // happened but the floor never advanced; without this branch, the
         // floor would stay stuck and readers could observe a partially
-        // pruned tail (per ADR-0010 §Implementation: "every prune call
-        // updates `oldest_retained_mempool_event_sequence` atomically with
-        // the column-family delete batch").
+        // pruned tail. Every prune call updates
+        // `oldest_retained_mempool_event_sequence` atomically with the
+        // column-family delete batch.
         let floor_advances = new_oldest_retained != oldest_retained_sequence;
         if floor_advances || !scan.deletes.is_empty() {
             let _control_guard = self.inner.lock_control();

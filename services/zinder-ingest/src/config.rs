@@ -37,7 +37,7 @@ const DEFAULT_CURSOR_AT_RISK_WARNING_HOURS: u64 = 24;
 const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
 const DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS: u64 = 24;
 const DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 30_000;
-// Per ADR-0010 the default warning fires at 80% of the shorter window.
+// Default warning fires at 80% of the shorter retention window.
 // 20% of `DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES` (60) is 12 minutes.
 const DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES: u64 = 12;
 

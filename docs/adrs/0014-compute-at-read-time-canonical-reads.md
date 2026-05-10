@@ -2,10 +2,10 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Proposed |
+| Status | Accepted (2026-05-10) |
 | Product | Zinder |
 | Domain | Wallet data plane read-path implementation strategy |
-| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Extending artifacts](../architecture/extending-artifacts.md), [Extending the wallet data plane](../architecture/extending-the-wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Closing the Zaino surface gap §G18](../reference/closing-the-zaino-surface-gap.md), [Lessons from Zaino §Pattern 4](../reference/lessons-from-zaino.md), [ADR-0001](0001-rocksdb-canonical-store.md), [ADR-0002](0002-boundary-specific-serialization.md), [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0013](0013-derive-plane-instantiation-and-transparent-address-balance.md) |
+| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Extending artifacts](../architecture/extending-artifacts.md), [Extending the wallet data plane](../architecture/extending-the-wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Lessons from Zaino §Pattern 4](../reference/lessons-from-zaino.md), [ADR-0001](0001-rocksdb-canonical-store.md), [ADR-0002](0002-boundary-specific-serialization.md), [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0013](0013-derive-plane-instantiation-and-transparent-address-balance.md) |
 
 ## Context
 
@@ -15,13 +15,16 @@ Three storage shapes can serve a typed canonical-chain read whose underlying dat
 - **Shape B: extend an existing artifact.** Augment a shipped artifact with new fields (offset tables, per-output projections, side payloads) so the read can slice into it efficiently. Touches every existing artifact write path; forces a storage migration on every shipped store; ties future evolution to the existing artifact's schema.
 - **Shape C: compute at read time.** Read an existing canonical artifact's payload bytes and synthesize the typed read-model on the fly. Zero new storage. Read latency is bounded by the parse cost of the underlying artifact (microseconds for typical transactions; low milliseconds for batched reads at the per-request cap).
 
-M5 Slice B introduced Shape C as a one-off: federated `TransparentAddressBalance` reads canonical UTXO artifacts (M4) and M3 mempool point lookups, summing at the gRPC adapter without committing a balance accumulator column family ([ADR-0013 §Storage and read-path](0013-derive-plane-instantiation-and-transparent-address-balance.md#storage-and-read-path)). The decision was framed as a milestone-specific trade-off: the operational cost of a balance-specific column family was unmotivated by the available consumer evidence.
+Two shipped methods follow Shape C:
 
-M6 Slice 2 introduces the same pattern for a different surface: `WalletQuery.TransparentPrevouts` deserializes `TransactionArtifact.payload_bytes` via `zinder_source::transparent_prevout_from_raw_transaction_bytes` and indexes into the transaction's `vout` list. The same reasoning applies (no consumer evidence justifies the operational cost of a dedicated `OutPoint`-keyed column family today; the realistic workload is bounded by the per-request cap and the typical transaction size).
+- The federated `TransparentAddressBalance` reads canonical UTXO artifacts and live mempool point lookups, summing at the gRPC adapter without committing a balance accumulator column family ([ADR-0013 §Storage and read-path](0013-derive-plane-instantiation-and-transparent-address-balance.md#storage-and-read-path)).
+- `WalletQuery.TransparentPrevouts` deserializes `TransactionArtifact.payload_bytes` via `zinder_source::transparent_prevout_from_raw_transaction_bytes` and indexes into the transaction's `vout` list.
 
-Two instances is the threshold the project's lifecycle rule names for ADR promotion: "ADRs lock contracts that have been proven in code" ([docs/README.md §Document lifecycles](../README.md#document-lifecycles)). Without an ADR, every future contributor weighing canonical-vs-derive-vs-compute-at-read-time will rediscover the trade-offs from scratch and risk a different answer for analogous cases. Shipping the pattern as a *named contract* prevents drift and gives future contributors a single place to reason about when to apply it.
+Both methods make the same trade-off: the operational cost of a dedicated column family is unmotivated by the available consumer evidence, and the realistic workload is bounded by the per-request cap and the typical transaction size.
 
-The pattern also has a non-obvious *durability property* that needs to be locked: a future promotion from Shape C to Shape A must not change the public contract. If a Shape A landing required a capability-string bump or a wire-shape change, every consumer would have to re-gate or re-deserialize, forcing operator-side coordination that has nothing to do with the storage decision. The contract surface and the storage shape must be independently evolvable.
+Without an ADR, every future contributor weighing canonical-vs-derive-vs-compute-at-read-time would rediscover the trade-offs from scratch and risk a different answer for analogous cases. The pattern as a *named contract* prevents drift.
+
+The pattern has a non-obvious *durability property* that needs to be locked: a future promotion from Shape C to Shape A must not change the public contract. If a Shape A landing required a capability-string bump or a wire-shape change, every consumer would have to re-gate or re-deserialize, forcing operator-side coordination that has nothing to do with the storage decision. The contract surface and the storage shape must be independently evolvable.
 
 ## Decision
 
@@ -49,8 +52,8 @@ A new method authored under this pattern starts at Shape C and may, when telemet
 
 The handler reads existing canonical artifacts, parses their payload bytes if needed, and assembles the typed response in process. The parse helper lives in `zinder-source` (the boundary that owns Zebra-type translation) so the rest of the read path stays in `zinder-core` vocabulary. Examples:
 
-- M5 Slice B: `services/zinder-derive/src/grpc/adapter.rs::compute_transparent_address_balance` reads canonical UTXO artifacts and M3 mempool point lookups via `WalletQuery`.
-- M6 Slice 2: `WalletQueryApi::transparent_prevouts` reads `TransactionArtifact` and calls `zinder_source::transparent_prevout_from_raw_transaction_bytes`.
+- `services/zinder-derive/src/grpc/adapter.rs::compute_transparent_address_balance` reads canonical UTXO artifacts and live mempool point lookups via `WalletQuery`.
+- `WalletQueryApi::transparent_prevouts` reads `TransactionArtifact` and calls `zinder_source::transparent_prevout_from_raw_transaction_bytes`.
 
 #### Shape B: extend an existing artifact
 
@@ -64,7 +67,7 @@ A new column family keyed by the read's primary key, carrying a typed payload, w
 - A real consumer's workload is materially affected (not a synthetic benchmark or a hypothetical workload), AND
 - The storage cost of the column family is justified against the gain.
 
-When Shape A lands, the public wire shape and the capability string are unchanged. The Shape C path becomes a fallback for cache misses (or is removed once the column family is fully populated). The migration is operator-side only: existing stores re-bootstrap to populate the new column family per [M4 §D11](../specs/m4-transparent-address.md) precedent.
+When Shape A lands, the public wire shape and the capability string are unchanged. The Shape C path becomes a fallback for cache misses (or is removed once the column family is fully populated). The migration is operator-side only: existing stores re-bootstrap to populate the new column family the same way new artifact families are populated on rollout.
 
 ### Public-contract invariance
 
@@ -88,15 +91,15 @@ Future helpers follow the same shape: take raw bytes plus a typed selector (heig
 
 ### Per-request batching cap
 
-Methods that batch under this pattern share a per-request cap of `MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256` outpoints (or the analog for the method's primary input). Requests above the cap are silently truncated to the first N entries. The cap mirrors the M5 balance address cap so DX is uniform across batched wallet-plane reads.
+Methods that batch under this pattern share a per-request cap of `MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256` outpoints (or the analog for the method's primary input). Requests above the cap are silently truncated to the first N entries. Every batched wallet-plane read uses the same cap so DX stays uniform.
 
 ### Anti-pattern refusals
 
-Methods authored under this pattern refuse the same anti-patterns the rest of the wallet data plane refuses:
+Methods authored under this pattern refuse the same anti-patterns the rest of the wallet data plane refuses (see [Extending the wallet data plane §Anti-patterns to refuse](../architecture/extending-the-wallet-data-plane.md#anti-patterns-to-refuse)):
 
-- **A1 (verbosity integer)** and **A2 (verbosity boolean)**: the typed return shape is the canonical shape; there is no flag to switch between compact and full responses.
-- **A4 (sentinel-overloaded inputs)**: the request validates inputs at the wallet adapter boundary. The coinbase sentinel outpoint is rejected with `INVALID_ARGUMENT` at the wallet adapter; consumers filter sentinels at the request boundary.
-- **A5 (`zaino_proto::*` types on the Rust API)**: the `ChainIndex` trait takes and returns only `zinder-core` types. The parse helper in `zinder-source` is the boundary where Zebra-type vocabulary terminates.
+- **Verbosity integer / verbose boolean**: the typed return shape is the canonical shape; there is no flag to switch between compact and full responses.
+- **Sentinel-overloaded inputs**: the request validates inputs at the wallet adapter boundary. The coinbase sentinel outpoint is rejected with `INVALID_ARGUMENT` at the wallet adapter; consumers filter sentinels at the request boundary.
+- **`zaino_proto::*` types on the Rust API**: the `ChainIndex` trait takes and returns only `zinder-core` types. The parse helper in `zinder-source` is the boundary where Zebra-type vocabulary terminates.
 
 ## Consequences
 
@@ -118,18 +121,18 @@ Methods authored under this pattern refuse the same anti-patterns the rest of th
 
 ## Worked examples
 
-- **M5 Slice B**: `WalletQuery.TransparentAddressBalance` (federated). Shape C reads canonical UTXOs and M3 mempool point lookups at request time. Shape A (per-block accumulator column family) is reserved.
-- **M6 Slice 2**: `WalletQuery.TransparentPrevouts` (canonical, direct). Shape C reads `TransactionArtifact.payload_bytes` and parses via `zinder_source::transparent_prevout_from_raw_transaction_bytes`. Shape A (dedicated `OutPoint`-keyed column family) is reserved.
-- **M6 Slice 3**: `WalletQuery.TransparentMempoolPrevouts` (live mempool). Reads `MempoolEntry.transparent_outputs` directly; no parsing because the mempool ingest path pre-extracts transparent outputs at admission time. This is a degenerate Shape C (the work is done at ingest, not at read).
+- **`WalletQuery.TransparentAddressBalance`** (federated): Shape C reads canonical UTXOs and live mempool point lookups at request time. Shape A (per-block accumulator column family) is reserved.
+- **`WalletQuery.TransparentPrevouts`** (canonical, direct): Shape C reads `TransactionArtifact.payload_bytes` and parses via `zinder_source::transparent_prevout_from_raw_transaction_bytes`. Shape A (dedicated `OutPoint`-keyed column family) is reserved.
+- **`WalletQuery.TransparentMempoolPrevouts`** (live mempool): reads `MempoolEntry.transparent_outputs` directly; no parsing because the mempool ingest path pre-extracts transparent outputs at admission time. A degenerate Shape C (the work is done at ingest, not at read).
 
 ## Cross-references
 
 - [Wallet data plane](../architecture/wallet-data-plane.md): the architecture doc this ADR makes durable.
-- [Extending the wallet data plane](../architecture/extending-the-wallet-data-plane.md): the cookbook for new typed reads. Worked Example 4 is the M6 prevout pair under this pattern.
+- [Extending the wallet data plane](../architecture/extending-the-wallet-data-plane.md): the cookbook for new typed reads.
 - [Extending artifacts](../architecture/extending-artifacts.md): the companion cookbook for new artifact families (the case this ADR is *not* about).
 - [Public interfaces §Capability discovery](../architecture/public-interfaces.md#capability-discovery): the capability-string contract this ADR's invariance rule depends on.
 - [Lessons from Zaino §Pattern 4](../reference/lessons-from-zaino.md): the upstream anti-pattern this ADR avoids.
 - [ADR-0001](0001-rocksdb-canonical-store.md): the canonical RocksDB store this ADR's Shape A column families would extend.
 - [ADR-0002](0002-boundary-specific-serialization.md): the boundary-specific serialization rule the parse helpers in `zinder-source` honor.
 - [ADR-0003](0003-canonical-storage-access-boundary.md): the epoch read API every Shape C handler uses.
-- [ADR-0013 §Storage and read-path](0013-derive-plane-instantiation-and-transparent-address-balance.md#storage-and-read-path): the first instance of the pattern; this ADR generalizes the M5 design note into a workspace-wide contract.
+- [ADR-0013 §Storage and read-path](0013-derive-plane-instantiation-and-transparent-address-balance.md#storage-and-read-path): the transparent-address balance instance of the pattern.

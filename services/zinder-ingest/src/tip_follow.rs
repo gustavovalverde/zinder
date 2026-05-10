@@ -87,9 +87,9 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 /// `mempool_ready_gate` is consulted when the lag-based computation would
 /// otherwise flip readiness to `Ready`. While the gate is unprimed, the
 /// readiness state stays in `Syncing` so consumers do not observe a
-/// "ready" writer that has not yet rebuilt its in-process mempool index
-/// (per ADR-0010 §Implementation). Pass `None` for callers that do not
-/// run the mempool orchestrator (tests, backfill).
+/// "ready" writer that has not yet rebuilt its in-process mempool index.
+/// Pass `None` for callers that do not run the mempool orchestrator
+/// (tests, backfill).
 #[allow(
     clippy::too_many_arguments,
     reason = "tip-follow's caller-owned dependencies are deliberately exposed as positional parameters; bundling them into an orchestration struct adds one indirection without changing the binding count callers must make."

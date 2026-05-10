@@ -280,7 +280,6 @@ impl IngestControl for IngestControlGrpcAdapter {
         ))
     }
 
-    /// closes: G18
     async fn transparent_mempool_prevouts(
         &self,
         request: Request<wallet::TransparentMempoolPrevoutsRequest>,

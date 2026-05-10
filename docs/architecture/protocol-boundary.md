@@ -86,7 +86,7 @@ The current native wallet read-sync surface is:
 - `zinder_proto::v1::wallet::wallet_query_server::WalletQuery`
 - `zinder_proto::v1::wallet::wallet_query_client::WalletQueryClient`
 
-M2 adds the following native wallet messages and RPCs:
+The native wallet protocol carries the following messages and RPCs in addition to the read-sync surface:
 
 - `zinder_proto::v1::wallet::BroadcastTransactionRequest`
 - `zinder_proto::v1::wallet::BroadcastTransactionResponse`
@@ -94,9 +94,6 @@ M2 adds the following native wallet messages and RPCs:
 - `zinder_proto::v1::wallet::ChainEventEnvelope`
 - `zinder_proto::v1::wallet::ChainCommitted`
 - `zinder_proto::v1::wallet::ChainReorged`
-
-M3 reserves, but does not expose in M2, the following native wallet messages and RPCs:
-
 - `zinder_proto::v1::wallet::MempoolEventsRequest`
 - `zinder_proto::v1::wallet::MempoolEventEnvelope`
 - `zinder_proto::v1::wallet::MempoolSnapshotRequest`
@@ -114,9 +111,9 @@ The current native network service exposes Zinder concepts:
 - `TreeState`, `LatestTreeState`, `SubtreeRoots`
 - `ServerInfo`
 
-M2 adds `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) and [§D2](../public-interfaces.md). M3 adds `MempoolEvents` and `MempoolSnapshot` per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
 
-Native M2 read requests that depend on canonical chain state carry an optional
+Native read requests that depend on canonical chain state carry an optional
 `at_epoch` field. When it is absent, the server answers from the visible epoch
 at request time. When it is present, the server must answer from that exact
 `ChainEpoch` or return `Code::FailedPrecondition` with a structured

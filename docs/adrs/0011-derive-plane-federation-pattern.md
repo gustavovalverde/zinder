@@ -2,14 +2,14 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Proposed |
+| Status | Accepted (2026-05-10) |
 | Product | Zinder |
 | Domain | Cross-process query federation, derive-plane consumer integration |
 | Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Derive plane](../architecture/derive-plane.md), [Public interfaces](../architecture/public-interfaces.md), [ADR-0008](0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](0009-ingest-control-transport-security.md), [ADR-0013](0013-derive-plane-instantiation-and-transparent-address-balance.md) |
 
 ## Context
 
-`zinder-derive` is a separate process from `zinder-query` ([ADR-0008](0008-consumer-neutral-wallet-data-plane.md), [derive-plane.md](../architecture/derive-plane.md)). M5 Slice B introduces the first real consumer that federates an `ExplorerQuery` RPC under `WalletQuery` (`TransparentAddressBalance`). Future M6+ consumers (analytics, tax, others) will follow the same pattern: a typed `WalletQuery.*` method whose body proxies to the consumer's gRPC service.
+`zinder-derive` is a separate process from `zinder-query` ([ADR-0008](0008-consumer-neutral-wallet-data-plane.md), [derive-plane.md](../architecture/derive-plane.md)). Federated `WalletQuery.*` methods proxy to the derive consumer's gRPC service rather than to a colocated handler.
 
 Without an enforced shape for federation, three drifts are likely:
 
@@ -17,7 +17,7 @@ Without an enforced shape for federation, three drifts are likely:
 - **Capability-namespace creep.** A federated method served on `WalletQuery` looks like a wallet capability. Without a hard rule, a contributor advertises it as `wallet.*`, breaking the architecture spine that says derive consumers own the `derive.*` namespace ([public-interfaces.md §Capability Discovery](../architecture/public-interfaces.md#capability-discovery)).
 - **Probe ad-hocing.** Each federated method probes its consumer's readiness on its own timer, in its own format, with its own threshold. Operators tuning probe intervals must touch every consumer.
 
-The Phase 3 mempool point lookup proxy (`WalletQuery → IngestControl`) sets a different precedent: the writer-side handler is colocated with the live mempool, and the proxy body is a few lines because the bearer-token + connect helper is already shared. The derive plane is structurally different: each derive consumer has its own readiness lifecycle (a `ChainEvents` backfill that takes minutes for new accumulators), its own capability, and its own gRPC client type, none of which the chain plane has to model.
+The mempool point-lookup proxy (`WalletQuery → IngestControl`) is structurally different: the writer-side handler is colocated with the live mempool, and the proxy body is a few lines because the bearer-token + connect helper is already shared. Each derive consumer has its own readiness lifecycle (a `ChainEvents` backfill that can take minutes for new accumulators), its own capability, and its own gRPC client type, none of which the chain plane has to model.
 
 ## Decision
 
@@ -64,7 +64,7 @@ async fn transparent_address_balance(&self, request: Request<...>) -> Result<...
 }
 ```
 
-Adding M6+ consumers means adding one `DeriveProxy<C>` field per consumer (parameterized over the consumer's generated client type) and one closure body per federated method. There is no `proxy_to_analytics`, `proxy_to_tax`, etc.; the federation primitive is generic.
+Adding new consumers means adding one `DeriveProxy<C>` field per consumer (parameterized over the consumer's generated client type) and one closure body per federated method. There is no `proxy_to_analytics`, `proxy_to_tax`, etc.; the federation primitive is generic.
 
 ### Capability namespace rule
 
@@ -103,7 +103,7 @@ Probe cadence is operator-tunable through `derive_probe_interval` (default 5s, c
 
 - `DeriveProxy::forward` returns `Status::unavailable` when the readiness gauge reports not-ready; this is exercised by `derive_proxy::tests::forward_returns_unavailable_when_proxy_not_ready` in `services/zinder-query/src/derive_proxy.rs`.
 - The probe loop drives the gauge on every tick; covered by `derive_proxy::tests::probe_loop_updates_gauge_on_each_tick`.
-- Slice B's federated `WalletQuery.TransparentAddressBalance` integration test (added with M5 Slice B) asserts capability gating end-to-end: the proxy is configured, the probe is scripted to flip ready/not-ready, and the federated `ServerInfo` response is asserted before and after each transition.
+- The federated `WalletQuery.TransparentAddressBalance` integration test asserts capability gating end-to-end: the proxy is configured, the probe is scripted to flip ready/not-ready, and the federated `ServerInfo` response is asserted before and after each transition.
 
 ## Alternatives Considered
 
@@ -125,10 +125,5 @@ Rejected. Each derive consumer has its own client type, its own capability, and 
 
 ## Out of Scope
 
-- The actual M5 Slice B balance-accumulator implementation (the consumer of this primitive). That is the next deliverable; this ADR captures the federation pattern Slice B and every subsequent consumer reuses.
 - TLS-terminated derive plane. ADR-0009 covers transport security for the writer-side ingest control plane; the derive proxy reuses `connect_authenticated_channel` and inherits the same posture. Public-internet TLS for derive consumers is a separate ADR if a deployment ever requires it.
-- A standardized derive-consumer SDK as a separate crate. Per the M5 Slice A pattern, derive helpers live in `services/zinder-derive/src/consumer/` until M6+ adds a second consumer that justifies extraction.
-
-## ADR sequencing
-
-This ADR lands ahead of M5 Slice B; the implementation it describes is the load-bearing prerequisite. ADR-0012 (M5 Slice B promotion) and any future ADR-0013 (M5 derive-plane storage shape) ship after the balance accumulator is in production and the assumptions baked into this ADR have been validated against a real consumer.
+- A standardized derive-consumer SDK as a separate crate. Derive helpers live in `services/zinder-derive/src/consumer/` until a second consumer beyond explorer justifies extraction.

@@ -51,11 +51,11 @@ Artifact bytes follow [ADR-0002](../adrs/0002-boundary-specific-serialization.md
 - Durable storage-control records use storage-specific protobuf messages, not RPC messages.
 - Derived read caches may experiment with `rkyv` only after the validation gate in ADR-0002.
 
-Artifact builders consume normalized source values. They must not hand-parse consensus-critical block headers, transaction bytes, or compact-block wire payloads. For the M1 wallet-sync slice, parsing belongs behind maintained Zcash consensus primitives inside `zinder-source` or ingestion adapters; generated protocol payloads belong in `zinder-proto`. The current parser boundary is `zebra-chain`, with a root-manifest `core2` source patch only to satisfy Zebra's current transitive `equihash` resolver path.
+Artifact builders consume normalized source values. They must not hand-parse consensus-critical block headers, transaction bytes, or compact-block wire payloads. Parsing belongs behind maintained Zcash consensus primitives inside `zinder-source` or ingestion adapters; generated protocol payloads belong in `zinder-proto`. The current parser boundary is `zebra-chain`, with a root-manifest `core2` source patch only to satisfy Zebra's current transitive `equihash` resolver path.
 
 ## Real Compact Block Construction
 
-The compact-block builder is the first M1 ingestion boundary because wallets
+The compact-block builder is the primary ingestion boundary because wallets
 cannot sync from empty protobuf shells.
 
 The builder must:

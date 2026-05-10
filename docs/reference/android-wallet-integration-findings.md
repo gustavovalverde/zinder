@@ -497,7 +497,7 @@ described above, reproduces the same server-side `NOT_FOUND`.
 
 This section records why Android SDK and Zashi/Zodl appear in the M3 mempool
 consumer map. The canonical product contract remains
-[Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription-m3);
+[Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription);
 this page only keeps the local source evidence.
 
 - The Android SDK's

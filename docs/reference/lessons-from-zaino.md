@@ -432,7 +432,7 @@ When a Zinder PR adds a new public type, configuration field, RPC method, or sto
 
 When a user files a feature request, the maintainer should check whether the request maps onto an open seam in the section above. If it does, the request should be expressible as an additive change. If it does not, the request requires an architecture decision before implementation.
 
-For the concrete-shape companion to this document, see [Closing the Zaino Surface Gap §Anti-Patterns Zinder Refuses to Replicate](closing-the-zaino-surface-gap.md#anti-patterns-zinder-refuses-to-replicate). The patterns above describe abstract design pressures; the anti-patterns section enumerates five specific Zaino shapes (verbosity integers, "verbose" booleans, string-keyed pool discriminants, sentinel-overloaded `BlockId`, `zaino_proto::*` types on the Rust API) that Zinder will not replicate, with `wallet/zallet/` evidence for each. A reviewer who sees one of those shapes in a PR should link the matching anti-pattern row, not (only) the pattern here.
+For concrete refusal examples (verbosity integers, "verbose" booleans, string-keyed pool discriminants, sentinel-overloaded `BlockId`, `zaino_proto::*` types on the Rust API), see [Extending the wallet data plane §Anti-patterns to refuse](../architecture/extending-the-wallet-data-plane.md#anti-patterns-to-refuse). The patterns above describe abstract design pressures; that section binds them to specific Zinder code shapes.
 
 ## Closing Note
 

@@ -69,12 +69,12 @@ For views that need full block bodies, full transaction data, or cross-block agg
 
 This channel is used for one-time replay (initial backfill, full rebuild) and for occasional historical reads. Steady-state operation should use Channel A or B. A derive consumer that pulls from Channel C continuously is a smell: the data should probably be carried in `ChainEvents` instead, or the view is in the wrong plane.
 
-The Channel C → Channel A handoff is mediated by `zinder_derive::backfill_then_attach`. The helper probes the live stream for the earliest retained envelope, drains `compact_block_range` for the gap below the retention floor, dispatches each block as a synthetic `ChainCommittedEvent`, and resumes the live subscriber using the probe's first envelope as the cursor anchor. Per the M5 D12 contract, this is the canonical cold-start path every fresh derive consumer follows.
+A fresh derive consumer whose persisted cursor sits below the upstream's retention floor needs a cold-start path that drains `WalletQuery.compact_block_range` for the gap and then attaches to the live `WalletQuery.ChainEvents` stream without dropping or duplicating events. The shipped consumers do not yet need this path (the explorer balance handler is stateless), so no helper is currently provided; future stateful consumers will need to implement it.
 
 ### What the derive plane must not consume
 
 - **Upstream node RPCs directly.** `zinder-derive` does not import `zinder-source`. It does not call Zebra. The upstream node is upstream of `zinder-ingest`, not of the derive plane. This rule is structural: the derive plane assumes Zinder canonical data is the source of truth.
-- **Live primary store handles in production.** A derive consumer that opens `PrimaryChainStore` or bypasses `ChainEventEnvelope` / immutable snapshots is breaking [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). M1 in-process composition is the only exception.
+- **Live primary store handles in production.** A derive consumer that opens `PrimaryChainStore` or bypasses `ChainEventEnvelope` / immutable snapshots is breaking [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). In-process composition during local development is the only exception.
 - **`zinder-ingest` internals.** No reaching into `IngestArtifactBuilder`, no shared `chain_event_writer`, no co-process write lock on RocksDB.
 
 ## Output contract
@@ -91,7 +91,7 @@ The service's capability strings use the `derive.<consumer>.<capability>_v{N}` n
 
 For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in `services/zinder-derive` (or a dedicated derive crate) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) is owned by [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) and lives in `services/zinder-query/src/derive_proxy.rs`; every federated derive method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
 
-The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance` (M5 Slice B), which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-derive`. The federated capability `derive.explorer.transparent_balance_v1` is advertised on `WalletQuery.ServerInfo` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `derive.explorer.ready_v1` ready inside the configured window.
+The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-derive`. The federated capability `derive.explorer.transparent_balance_v1` is advertised on `WalletQuery.ServerInfo` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `derive.explorer.ready_v1` ready inside the configured window.
 
 This shape is reserved for views that wallets and applications consume *as if* they were canonical. The `derive.*` capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 

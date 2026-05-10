@@ -13,7 +13,7 @@ Optimization order:
 
 ## Vocabulary
 
-Use these names consistently. When a term is marked as M2 or M3, it is canonical vocabulary for that milestone but must not be advertised through `ServerCapabilities` until the owning implementation lands.
+Use these names consistently across modules, RPCs, errors, and configuration.
 
 ### Product and runtimes
 
@@ -36,20 +36,20 @@ Use these names consistently. When a term is marked as M2 or M3, it is canonical
 | `ChainEpochReader` | In-process read view pinned to one `ChainEpoch` |
 | `ChainEpochReadApi` | Internal read API for epoch-bound canonical reads |
 | `ChainEvent` | Post-commit canonical transition emitted by `zinder-ingest` |
-| `ChainEventEnvelope` | Cursor-bound chain-event message carried over the ingest subscription plane and exposed natively on `WalletQuery.ChainEvents` in M2 |
+| `ChainEventEnvelope` | Cursor-bound chain-event message carried over the ingest subscription plane and exposed natively on `WalletQuery.ChainEvents` |
 | `ChainTipMetadata` | Chain-derived counters at the visible tip (Sapling and Orchard tree sizes) |
 | `BlockArtifact` | Durable artifact derived from a block |
 | `CompactBlockArtifact` | Wallet-oriented compact block artifact |
 | `BlockId` | Stable block identity (`{ height: BlockHeight, hash: BlockHash }`); lives in `zinder-core` and is the canonical (height, hash) pair across the source boundary, the wallet protocol, and the reader API |
 | `FinalizedBlockStore` | Storage boundary for finalized chain data |
 | `ReorgWindow` | Non-finalized range where reorgs are expected and supported |
-| `MempoolEntry` | M3 term for one transaction currently observed in the mempool |
-| `MempoolEvent` | M3 typed mempool transition (`Added`, `Invalidated`, `Mined`) carried in the event log |
-| `MempoolEventEnvelope` | M3 cursor-bound mempool-event message exposed natively on `WalletQuery.MempoolEvents` |
-| `MempoolSnapshotView` | M3 bounded, pageable point-in-time projection of the live mempool with `snapshot_age_millis` |
-| `TransparentMempoolOutputsRequest` | M3 bounded transparent-address request for outputs currently visible in the mempool index |
-| `TransparentMempoolOutput` | M3 transparent output currently visible in the mempool index |
-| `TransparentMempoolSpend` | M3 transparent outpoint-spend relationship currently visible in the mempool index |
+| `MempoolEntry` | One transaction currently observed in the mempool |
+| `MempoolEvent` | Typed mempool transition (`Added`, `Invalidated`, `Mined`) carried in the event log |
+| `MempoolEventEnvelope` | Cursor-bound mempool-event message exposed natively on `WalletQuery.MempoolEvents` |
+| `MempoolSnapshotView` | Bounded, pageable point-in-time projection of the live mempool with `snapshot_age_millis` |
+| `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
+| `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
+| `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
 
 ### Source Boundary
 
@@ -58,7 +58,7 @@ Use these names consistently. When a term is marked as M2 or M3, it is canonical
 | `NodeSource` | Rust trait for configured source adapters in `zinder-source` |
 | `NodeCapabilities` | Capability descriptor detected from the selected source |
 | `NodeAuth` | Typed source authentication configuration |
-| `MempoolSourceEvent` | M3 source-level mempool observation normalized from source streams or polling diffs |
+| `MempoolSourceEvent` | Source-level mempool observation normalized from source streams or polling diffs |
 | `TransactionBroadcaster` | Source-backed transaction broadcast boundary implemented by source adapters |
 | `TransactionBroadcastResult` | Typed accepted, duplicate, invalid-encoding, rejected, or unknown broadcast outcome |
 | `RawTransactionBytes` | Raw serialized transaction bytes submitted by a wallet |
@@ -74,12 +74,12 @@ Use these names consistently. When a term is marked as M2 or M3, it is canonical
 | `CompactBlockRangeChunk` | Native wallet protocol stream item for one compact block bound to one chain epoch |
 | `TreeStateResponse` | Native wallet protocol response for one commitment tree-state artifact |
 | `SubtreeRootsResponse` | Native wallet protocol response for Sapling or Orchard subtree roots |
-| `BroadcastTransactionRequest` | M2 native wallet protocol request to submit a raw transaction |
-| `BroadcastTransactionResponse` | M2 native wallet protocol typed broadcast outcome |
-| `ChainEventsRequest` | M2 native wallet protocol request for `WalletQuery.ChainEvents` chain-event subscription |
-| `MempoolEventsRequest` | M3 native wallet protocol request for `WalletQuery.MempoolEvents` mempool-event subscription |
-| `MempoolSnapshotRequest` | M3 native wallet protocol request for `WalletQuery.MempoolSnapshot` |
-| `MempoolSnapshotResponse` | M3 native wallet protocol response carrying the live mempool view |
+| `BroadcastTransactionRequest` | Native wallet protocol request to submit a raw transaction |
+| `BroadcastTransactionResponse` | Native wallet protocol typed broadcast outcome |
+| `ChainEventsRequest` | Native wallet protocol request for `WalletQuery.ChainEvents` chain-event subscription |
+| `MempoolEventsRequest` | Native wallet protocol request for `WalletQuery.MempoolEvents` mempool-event subscription |
+| `MempoolSnapshotRequest` | Native wallet protocol request for `WalletQuery.MempoolSnapshot` |
+| `MempoolSnapshotResponse` | Native wallet protocol response carrying the live mempool view |
 | `ServerInfoRequest` | Native wallet protocol capability-descriptor request |
 | `ServerInfoResponse` | Native wallet protocol capability-descriptor response |
 | `ServerCapabilities` | Capability descriptor advertised by `zinder-query` to clients |
@@ -100,15 +100,14 @@ Use these names consistently. When a term is marked as M2 or M3, it is canonical
 | `MempoolConsumerEvent` | Typed wrapper around one `MempoolEventEnvelope`, carrying borrowed transaction-id and raw-transaction-bytes slices for the duration of the apply call |
 | `run_chain_events_subscriber` | Drains a `Stream<ChainEventEnvelope>` into a `DeriveConsumer`, persisting the cursor atomically with consumer writes after every envelope |
 | `run_mempool_events_subscriber` | Mirror of the chain-events subscriber for `MempoolEventEnvelope` streams and `DeriveMempoolConsumer` |
-| `backfill_then_attach` | M5 D12 contract entry point: probes the upstream's earliest retained envelope, drains `compact_block_range` for the gap below the retention floor, then attaches to the live stream |
 
 ### Cursors, events, errors
 
 | Term | Meaning |
 |------|---------|
 | `StreamCursorTokenV1` | Opaque cursor body for chain-event subscriptions; fork-aware, encodes epoch id, last visible block hash, in-epoch offset, and stream-family tag |
-| `MempoolStreamCursorV1` | M3 opaque cursor body for mempool-event subscriptions |
-| `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Finalized`; `Mempool` is a reserved M3 family code, not an active chain-event family) |
+| `MempoolStreamCursorV1` | Opaque cursor body for mempool-event subscriptions |
+| `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Finalized`; `Mempool` is a reserved family code, not an active chain-event family) |
 | `ArtifactFamily` | Open-ended enum naming an artifact family in storage and query errors |
 | `ArtifactKey` | Open-ended enum union of keys used to look up an artifact (`BlockHeight`, `TransactionId`, `SubtreeRootIndex`, `BlockTransactionIndex`, future variants) |
 
@@ -501,9 +500,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-Reserved capability strings (named but not yet in `ZINDER_CAPABILITIES`; the named milestone adds them):
-
-- `wallet.address.transparent_balance_v1` (added when transparent-address balance lands)
+Transparent-address balance is exposed under `derive.explorer.transparent_balance_v1` (federated through `WalletQuery.ServerInfo` when the derive proxy is reachable); there is no `wallet.*` balance capability.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are

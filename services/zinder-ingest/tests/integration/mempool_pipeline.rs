@@ -603,11 +603,10 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
 /// block N and then block N is reorged out, returning the tx to the
 /// upstream node's mempool.
 ///
-/// This is the orchestrator-side half of M3 spec gate #3 ("verify Zinder
-/// follows upstream node mempool observations instead of synthesizing
-/// mempool entries from reverted blocks"). The structural invariant
-/// is that nothing in the chain ingest path emits mempool events; this
-/// test additionally proves that the index handles the re-entry sequence
+/// The structural invariant is that nothing in the chain ingest path emits
+/// mempool events; Zinder must follow upstream node mempool observations
+/// rather than synthesizing entries from reverted blocks. This test
+/// additionally proves that the index handles the re-entry sequence
 /// correctly:
 /// - The mined tx is absent from the live index.
 /// - A subsequent Added re-emission re-inserts the entry cleanly,
@@ -766,8 +765,8 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
     Ok(())
 }
 
-/// Phase 3 — `IngestControl.TransparentMempoolOutputsByAddress` returns the
-/// outputs of an admitted mempool entry that fund the requested address, and
+/// `IngestControl.TransparentMempoolOutputsByAddress` returns the outputs
+/// of an admitted mempool entry that fund the requested address, and
 /// returns an empty list for an address with no mempool footprint.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_serves_transparent_mempool_outputs_by_address() -> Result<()> {
@@ -822,9 +821,9 @@ async fn ingest_control_serves_transparent_mempool_outputs_by_address() -> Resul
     Ok(())
 }
 
-/// Phase 3 — `IngestControl.TransparentMempoolSpendByOutpoint` returns the
-/// mempool spend that consumes the requested outpoint, and `None` for an
-/// outpoint that is not being spent in the mempool.
+/// `IngestControl.TransparentMempoolSpendByOutpoint` returns the mempool
+/// spend that consumes the requested outpoint, and `None` for an outpoint
+/// that is not being spent in the mempool.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result<()> {
     use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolSpendByOutpointRequest};
@@ -880,9 +879,9 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
     Ok(())
 }
 
-/// M6 Slice 3 — `IngestControl.TransparentMempoolPrevouts` resolves the
-/// outputs of mempool transactions into per-entry prevouts in input order,
-/// returning `None` for outpoints that reference unknown transactions or
+/// `IngestControl.TransparentMempoolPrevouts` resolves the outputs of
+/// mempool transactions into per-entry prevouts in input order, returning
+/// `None` for outpoints that reference unknown transactions or
 /// out-of-bounds output indices.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
@@ -945,9 +944,9 @@ async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
     Ok(())
 }
 
-/// Phase 3 — `MempoolMinedEvent.block_hash` rides the wire alongside
-/// `mined_height`. Source-driven enrichment: the canonical event log persists
-/// the source-observed block hash and the gRPC stream replays it verbatim.
+/// `MempoolMinedEvent.block_hash` rides the wire alongside `mined_height`.
+/// Source-driven enrichment: the canonical event log persists the
+/// source-observed block hash and the gRPC stream replays it verbatim.
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_mined_event_block_hash_rides_the_wire() -> Result<()> {
     use zinder_core::BlockHash;

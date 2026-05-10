@@ -34,16 +34,6 @@ pub enum DeriveError {
     /// Cursor delivered by upstream did not match the persisted cursor.
     #[error("derive cursor mismatch: persisted cursor disagrees with upstream stream resume")]
     CursorMismatch,
-    /// Channel C backfill could not advance because upstream lost the gap.
-    #[error(
-        "derive backfill gap unrecoverable: persisted={persisted}, oldest_retained={oldest_retained}"
-    )]
-    BackfillGapUnrecoverable {
-        /// The last height the consumer persisted before going offline.
-        persisted: u32,
-        /// The oldest height upstream still retains.
-        oldest_retained: u32,
-    },
 }
 
 /// `RocksDB`-shaped failure surfaced from `DeriveStore`.

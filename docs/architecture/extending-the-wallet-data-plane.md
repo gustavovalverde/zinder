@@ -56,8 +56,6 @@ Add `async fn method_name(&self, ...) -> Result<ReturnType, IndexerError>` to th
 - Methods that return paged data define the view struct and cursor newtype in this same file.
 - Default-body methods (e.g. `chain_events` calling `chain_events_for_family`) live here.
 
-Add `/// closes: G{N}` doc comments referencing the gap row(s) the method closes. The walker test at `crates/zinder-proto/tests/integration/gap_doc_walker.rs` enforces that every closed gap row has a tagged closure.
-
 ### Step 4 — LocalChainIndex implementation
 
 File: `crates/zinder-client/src/local.rs`
@@ -251,29 +249,26 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 
 Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md).
 
-## Three discipline gates
+## Two discipline gates
 
 CI tests that catch the most common close-out mistakes:
 
 1. **Capability coverage**: `crates/zinder-client/tests/integration/capability_coverage.rs`. Compile-time and runtime: every string in `ZINDER_CAPABILITIES` has a row in `EXPECTED_METHOD_NAMES`; `assert_wallet_chain_index_methods_compile<T>` references each method by function-item, so renaming a method breaks the build.
 2. **Capability docs**: `crates/zinder-proto/tests/integration/capability_docs.rs`. Parses the `<!-- capability-list:*:start/end -->` blocks in `public-interfaces.md` and `testing.md` and asserts set-equality with `ZINDER_CAPABILITIES`.
-3. **Gap doc walker**: `crates/zinder-proto/tests/integration/gap_doc_walker.rs`. Walks the workspace for `/// gap:`, `/// closes:`, `/// refuses:` doc-comment tags and asserts they reference existing rows in [`closing-the-zaino-surface-gap.md`](../reference/closing-the-zaino-surface-gap.md), and that every `✓ closed` gap row has a `closes:` tag in code.
 
 A close-out PR that fails any of these has not landed correctly.
 
 ## Anti-patterns to refuse
 
-The five anti-patterns defined in [`closing-the-zaino-surface-gap.md` §Anti-Patterns Zinder Refuses to Replicate](../reference/closing-the-zaino-surface-gap.md#anti-patterns-zinder-refuses-to-replicate) bind every PR. Sites that refuse an anti-pattern carry a `/// refuses: A{N}` tag.
+The wallet data plane refuses these specific Zaino-era shapes. A PR proposing any of them must explain why the case is different from the documented refusal.
 
 | Anti-pattern | Refusal in code |
 |---|---|
-| A1: verbosity integer | `transaction_by_id` returns typed `TxStatus`, no `verbose: u64` parameter |
-| A2: verbose boolean | `block_header_by_selector` returns typed `BlockHeaderInfo`, no `verbose: bool` |
-| A3: string-keyed pool | `ShieldedProtocol` enum at every layer |
-| A4: sentinel-overloaded `BlockId` | `BlockSelector` oneof; `BlockId` is return-only |
-| A5: `zaino_proto::*` types on Rust API | `ChainIndex` trait takes / returns `zinder-core` types only |
-
-A PR proposing any of these shapes must cite the matching row and explain why this case is different from the documented refusal.
+| Verbosity integer | `transaction_by_id` returns typed `TxStatus`, no `verbose: u64` parameter |
+| Verbose boolean | `block_header_by_selector` returns typed `BlockHeaderInfo`, no `verbose: bool` |
+| String-keyed pool | `ShieldedProtocol` enum at every layer |
+| Sentinel-overloaded `BlockId` | `BlockSelector` oneof; `BlockId` is return-only |
+| `zaino_proto::*` types on Rust API | `ChainIndex` trait takes / returns `zinder-core` types only |
 
 ## Worked examples
 
@@ -283,7 +278,7 @@ A non-federated typed read with a new core type.
 
 - Step 1: `wallet.proto` adds `BlockHeaderBySelectorRequest` (selector + chain_epoch_id) and `BlockHeaderResponse` (chain_epoch + BlockHeaderInfo).
 - Step 2: `crates/zinder-core/src/block_header_info.rs` adds the `BlockHeaderInfo` read-model struct parsed from `BlockArtifact`.
-- Step 3: `ChainIndex::block_header_by_selector(selector, at_epoch)` on the trait, tagged `closes: G4` and `refuses: A2`.
+- Step 3: `ChainIndex::block_header_by_selector(selector, at_epoch)` on the trait.
 - Steps 4-5: `LocalChainIndex` resolves selector to height via `block_hash_index` column family then reads the `BlockArtifact`; `RemoteChainIndex` calls the gRPC method.
 - Steps 6-8: `WalletQueryApi::block_header_by_selector`, native encoder, adapter handler.
 - Step 9: capability `wallet.read.block_header_by_selector_v1`.
@@ -293,7 +288,7 @@ A non-federated typed read with a new core type.
 
 ### Example 2 — `TransactionStatusResponse` (Primitive B)
 
-Wire envelope evolution + response enrichment. The path adds the `chain_epoch`-bound `MinedDetails::from_response_epoch` constructor (the entropy gate) plus a `oneof status` discriminated wire shape (mined / in_mempool / conflicting). Capability `wallet.read.transaction_by_id_v1` mutates in place because no consumers had shipped yet. Three gap rows close as one wire change (G3 + G7 + G13 + partly G5).
+Wire envelope evolution + response enrichment. The path adds the `chain_epoch`-bound `MinedDetails::from_response_epoch` constructor (the entropy gate) plus a `oneof status` discriminated wire shape (mined / in_mempool / conflicting). Capability `wallet.read.transaction_by_id_v1` mutates in place because no consumers had shipped yet.
 
 ### Example 3 — `TransparentAddressBalance` (Primitive D)
 
@@ -305,20 +300,20 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F6: capabilities `derive.explorer.ready_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
-The compute shape is Shape C (compute at read time, federated UTXO sum + M3 mempool overlay) per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md); the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape ([ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)).
+The compute shape is Shape C (compute at read time, federated UTXO sum + live mempool overlay) per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md); the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape ([ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)).
 
-### Example 4 — `TransparentPrevouts` and `TransparentMempoolPrevouts` (M6)
+### Example 4 — `TransparentPrevouts` and `TransparentMempoolPrevouts`
 
 A pair of canonical wallet-plane reads that resolve outpoints to their referenced outputs. Both share the new wire-level `OutPoint` message, the `TransparentPrevout` payload, and a `repeated TransparentPrevoutEntry` response shape with `optional TransparentPrevout prevout` per entry.
 
 - The canonical method reads `TransactionArtifact.payload_bytes` and uses `zinder_source::transparent_prevout_from_raw_transaction_bytes` to extract one output by index. Shape C compute-at-read-time; no new column family.
 - The mempool method reads `MempoolEntry.transparent_outputs` through `MempoolIndex::transparent_prevouts_by_outpoints`. Proxied through `IngestControl` because secondary readers cannot observe live writer state.
-- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256`) and the same coinbase-sentinel rejection (anti-pattern A4 refused at the wallet adapter).
+- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256`) and reject the coinbase sentinel outpoint at the wallet adapter.
 - Capability strings: `wallet.read.transparent_prevouts_v1` (canonical) and `wallet.mempool.transparent_prevouts_v1` (mempool).
 - `ChainIndex` exposes three methods: `transparent_prevouts`, `transparent_prevouts_at_epoch`, `transparent_mempool_prevouts`.
 - No compat-shim counterpart: `CompactTxStreamer` has no prevout endpoint, and the cookbook forbids inventing one.
 
-This is the second worked example of the **compute-at-read-time pattern** (`zinder-source::transparent_prevout_from_raw_transaction_bytes` parses an existing `TransactionArtifact` payload at read time without committing new storage). M5 Slice B was the first instance (federated-balance Shape C); M6 generalizes the pattern for direct wallet-data-plane reads. [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) makes the pattern durable: the public wire shape and the capability string never depend on the storage shape, so a future Shape A landing (a dedicated `OutPoint`-keyed column family) does not bump the capability or change the response message.
+[ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) locks the **compute-at-read-time pattern**: a parse helper in `zinder-source` extracts the requested view from an existing artifact's payload at read time without committing new storage. The public wire shape and capability string never depend on the storage shape, so a future Shape A landing (a dedicated column family) would not bump the capability or change the response message.
 
 ## Common mistakes
 
@@ -329,7 +324,6 @@ Each entry references the discipline gate that catches it.
 - **Putting a federated method under `wallet.*` instead of `derive.{consumer}.*`.** Fails per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) capability-coverage assertions.
 - **Computing `confirmations` or `block_time` from a re-read latest tip.** Violates the response enrichment rule. Use `MinedDetails::from_response_epoch` or analogous epoch-bound constructor.
 - **Returning a `tonic::Status` or `zinder_proto::*` type from `ChainIndex`.** Violates the rule that the trait takes / returns only `zinder-core` types. Add a `from_status` mapping at the adapter boundary.
-- **Closing a gap without adding a `/// closes: G{N}` tag.** Fails the gap doc walker test. Add the tag in the same commit as the closing implementation.
 
 ## Cross-references
 
@@ -339,4 +333,3 @@ Each entry references the discipline gate that catches it.
 - [Extending artifacts](extending-artifacts.md): companion cookbook for new artifact families.
 - [Derive plane](derive-plane.md): federation overview.
 - [ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md): the federation primitive.
-- [Closing the Zaino surface gap](../reference/closing-the-zaino-surface-gap.md): gap inventory + anti-patterns + tag conventions.

@@ -548,7 +548,6 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    /// closes: G18
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],
@@ -558,7 +557,6 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    /// closes: G18
     async fn transparent_prevouts(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],

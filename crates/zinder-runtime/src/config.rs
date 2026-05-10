@@ -10,7 +10,7 @@
 //! `ZINDER_TEST_LIVE` gate (and other `ZINDER_TEST_*` knobs like
 //! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config (per
-//! [ADR-0012](../../../docs/adrs/0012-test-tiers-and-live-config.md)).
+//! [ADR-0006](../../../docs/adrs/0006-test-tiers-and-live-config.md)).
 
 use std::{collections::HashMap, path::PathBuf};
 

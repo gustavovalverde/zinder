@@ -7,18 +7,13 @@
 //! views, precomputed aggregates, and explorer-shaped reads that should not
 //! live in the canonical wallet data plane.
 //!
-//! See `docs/architecture/derive-plane.md` for the architectural backdrop and
-//! `docs/adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md`
-//! for the milestone that introduces this crate.
+//! See `docs/architecture/derive-plane.md` for the architectural backdrop.
 
 mod consumer;
 mod error;
 mod grpc;
 mod store;
 
-pub use consumer::backfill::{
-    BackfillPrepareError, BackfillThenAttachConfig, BackfillThenAttachOutcome, backfill_then_attach,
-};
 pub use consumer::chain_events::{ChainEventsRunOutcome, run as run_chain_events_subscriber};
 pub use consumer::mempool_events::{MempoolEventsRunOutcome, run as run_mempool_events_subscriber};
 pub use consumer::{

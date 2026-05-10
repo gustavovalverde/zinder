@@ -20,7 +20,7 @@ If any of these are false, you may not be adding an artifact family. Common alte
 | Situation | Right shape | Wrong shape |
 |-----------|-------------|-------------|
 | Adding a precomputed totals table for explorer dashboards | `zinder-derive` materialized view consumed via `ChainEvents` | Canonical artifact family |
-| Adding fee-rate ordering to mempool transactions | M3 `zinder-derive` view over `MempoolEvents` | Canonical mempool artifact |
+| Adding fee-rate ordering to mempool transactions | `zinder-derive` view over `MempoolEvents` | Canonical mempool artifact |
 | Adding a new field to per-block metadata | Extend `BlockArtifact`'s payload with the new field, bump artifact schema version | New artifact family |
 | Adding transparent address transaction history | New canonical artifact family with `ArtifactKey::TransparentAddress` | Compat-shim-only feature, derive view, ad-hoc index |
 | Adding transparent address UTXO lookup for Zashi compatibility | New canonical transparent UTXO artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
@@ -306,7 +306,7 @@ If the artifact changes the on-disk shape of an existing artifact, [ADR-0002](..
 
 ## A worked example: transparent address tx index
 
-To make the cookbook concrete, here is the path for adding `TransparentAddressTxIndex` (which is on the post-M3 transparent-address roadmap and would close [Zaino `#789`](https://github.com/zingolabs/zaino/issues/789) for paginated `GetTaddressTxids`).
+To make the cookbook concrete, here is the path for `TransparentAddressTxIndex` (the artifact family that backs paginated `GetTaddressTxids`, addressing [Zaino `#789`](https://github.com/zingolabs/zaino/issues/789)).
 
 The Android/Zashi transparent UTXO artifact follows the same seven-step path,
 but its priority and capability are different: it is release-gated by

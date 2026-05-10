@@ -5,9 +5,9 @@
 
 //! Live regtest broadcast cycle.
 //!
-//! Closes M3's last gap: a transparent v5 transaction signed inside Zinder,
-//! broadcast through Zebra's `sendrawtransaction`, and observed back through
-//! the mempool source as `MempoolSourceEvent::Added`. The signer lives in
+//! Signs a transparent v5 transaction inside Zinder, broadcasts it through
+//! Zebra's `sendrawtransaction`, and observes it back through the mempool
+//! source as `MempoolSourceEvent::Added`. The signer lives in
 //! `zinder-testkit` ([`TransparentTestKey`]); the broadcaster lives in
 //! `zinder-source` (`ZebraJsonRpcSource: TransactionBroadcaster`).
 //!

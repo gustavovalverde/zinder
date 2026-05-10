@@ -13,7 +13,6 @@ pub const SUBTREE_LEAF_COUNT: u32 = 1 << 16;
 
 /// Shielded note commitment protocol.
 ///
-/// refuses: A3
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ShieldedProtocol {

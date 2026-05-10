@@ -114,7 +114,7 @@ The workspace should keep cross-service code deep and named by domain:
 - `zinder-store`: durable storage contracts, fixed key and envelope formats, storage-control protos, migrations, epoch snapshots, and `ChainEpochReader`.
 - `zinder-source`: upstream node clients and source adapters.
 - `zinder-proto`: generated gRPC types, vendored Zcash wallet protos, internal Zinder protos, and native Zinder protos.
-- `zinder-client`: typed Rust client surface for in-process consumers (Zallet) per [M2 spec §D5](../specs/m2-push-primitive.md#d5-typed-rust-client-zinder-client-was-adr-0007). Exports the `ChainIndex` trait, typed `TxStatus`, `TransactionBroadcastResult`, `IndexerError`, and `ChainEpoch`-pinned reads. Wraps `WalletQueryApi` directly without a tonic round-trip.
+- `zinder-client`: typed Rust client surface for in-process consumers (Zallet). Exports the `ChainIndex` trait, typed `TxStatus`, `TransactionBroadcastResult`, `IndexerError`, and `ChainEpoch`-pinned reads. Wraps `WalletQueryApi` directly without a tonic round-trip.
 - `zinder-testkit`: deterministic source, chain, reorg, and wallet API fixtures.
 
 Do not create `zinder-common`, `zinder-utils`, or `zinder-service`. If a cross-service module cannot be named by its domain, the boundary is not understood yet.
@@ -164,4 +164,4 @@ Tradeoffs:
 - Which Sora/Soramitsu indexer references are available for primary-source comparison?
 - Should v1 mempool serving use a snapshot-only surface or a snapshot-plus-events surface? Resolved by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md): snapshot plus events, as complementary surfaces.
 - When should writer fencing or leader election become part of v1 operations?
-- When does multi-process query mode replace the M1 in-process `ChainStore` exception? Resolved by [ADR-0013: Multi-process storage access](../adrs/0013-multi-process-storage-access.md): production readers open `SecondaryChainStore` with a process-unique secondary path; subscriptions travel over gRPC.
+- When does multi-process query mode replace the v1 in-process `ChainStore` exception? Resolved by [ADR-0007: Multi-process storage access](../adrs/0007-multi-process-storage-access.md): production readers open `SecondaryChainStore` with a process-unique secondary path; subscriptions travel over gRPC.

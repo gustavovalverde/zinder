@@ -9,7 +9,7 @@
 
 ## Context
 
-[ADR-0007](0007-multi-process-storage-access.md) settles the writer / secondary-reader topology for canonical chain state. M3 introduces a parallel mempool surface that is structurally similar (writer-owned live state, reader-owned secondary access) but differs in three ways the chain-state design did not have to answer:
+[ADR-0007](0007-multi-process-storage-access.md) settles the writer / secondary-reader topology for canonical chain state. The mempool surface is structurally similar (writer-owned live state, reader-owned secondary access) but differs in three ways the chain-state design did not have to answer:
 
 - A mempool transaction's lifetime is bounded by network behavior, not by chain commits. Retention is per-variant: a `Mined` event is interesting only until the wallet has resynced past the height; an `Invalidated` event is interesting until the wallet has decided whether to rebroadcast; an `Added` event is only interesting while the transaction is still in the mempool.
 - The live `MempoolIndex` cannot be a column-family read. It is in-process state computed from a streaming source, and a secondary RocksDB reader cannot observe it without a control-plane handoff. Chain state has the inverse property: the visible epoch is precisely what the canonical store records.
@@ -20,7 +20,7 @@ The decisions to record here are:
 1. The split between in-memory `MempoolIndex` (live state) and persistent `MempoolEventLog` (history + cursor resume) and why the canonical store carries the latter but not the former.
 2. The `IngestControlMempoolSurface` topology: secondary readers and the lightwalletd compat shim consume the writer's mempool through the same `IngestControl` endpoint that already serves chain events, instead of opening a second source connection.
 3. The two-tier retention windows, their defaults, and the readiness causes they emit when retention is approaching exhaustion.
-4. The `TxStatus::InMempool(MempoolEntry)` shape change that retires the M2 string-matching workaround.
+4. The `TxStatus::InMempool(MempoolEntry)` shape change that retires the prior string-matching workaround.
 
 ## Decision
 
@@ -76,7 +76,7 @@ Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_
 
 ### `TxStatus::InMempool` carries the hydrated entry, not a string
 
-M2 consumers (notably Zallet) detected "this transaction is in the mempool" by string-matching the human-readable error returned for `transaction_by_id` when the canonical chain had no record. M3 retires that workaround:
+Earlier consumers (notably Zallet) detected "this transaction is in the mempool" by string-matching the human-readable error returned for `transaction_by_id` when the canonical chain had no record. The current shape retires that workaround:
 
 ```rust
 pub enum TxStatus {
@@ -88,7 +88,7 @@ pub enum TxStatus {
 
 The `MempoolEntry` carries the hydrated transaction, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes. Consumers no longer parse error strings; the type tells them everything `transaction_by_id` saw.
 
-This is a breaking change for any client that built against the M2 shape. Zinder treats it as required for product correctness, not deferrable to a major version: the string-matching workaround was always a temporary affordance.
+This is a breaking change for any client that built against the prior shape. Zinder treats it as required for product correctness, not deferrable to a major version: the string-matching workaround was always a temporary affordance.
 
 ## Consequences
 

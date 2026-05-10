@@ -151,11 +151,11 @@ Advertised capabilities:
 - `node.spending_tx_lookup` — Zebra's nullifier-to-spending-tx index is available behind `--features indexer`.
 - `node.openrpc_discovery` — `rpc.discover` was called and the upstream node's capability surface was parsed.
 - `node.json_rpc` — JSON-RPC source is the active backend.
-- `mempool_stream` — internal M3 source capability for Zebra `MempoolChange`; not a public wallet capability and not advertised before M3 consumes it.
+- `mempool_stream` — internal source capability for Zebra `MempoolChange`; not a public wallet capability.
 
 New capability names appear in `NodeCapability` only when a real consumer reads them; aspirational vocabulary stays out.
 
-Capability discovery happens in the `connect_node` startup phase. The Zebra JSON-RPC adapter calls `rpc.discover` (Zebra v4.2+) and parses the OpenRPC method list. Required methods for the M1 surface (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and readiness advances no further than `node_capability_missing`.
+Capability discovery happens in the `connect_node` startup phase. The Zebra JSON-RPC adapter calls `rpc.discover` (Zebra v4.2+) and parses the OpenRPC method list. The required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and readiness advances no further than `node_capability_missing`.
 
 Capability discovery for Zebra indexer gRPC and zcashd JSON-RPC follows the same pattern: probe by attempting a no-op subscription or by method-probing `getnetworkinfo`. Version strings may be logged and included in diagnostics, but they are not the primary compatibility contract.
 

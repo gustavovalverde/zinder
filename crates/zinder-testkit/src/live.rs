@@ -1,11 +1,11 @@
 //! Live-node test gating helpers.
 //!
-//! Live tests live under each crate's `tests/live/` submodule per [ADR-0012].
+//! Live tests live under each crate's `tests/live/` submodule per [ADR-0006].
 //! They reuse the production `ZINDER_NETWORK` and `ZINDER_NODE__*` env-var
 //! schema instead of inventing a parallel namespace, plus a single
 //! `ZINDER_TEST_LIVE=1` opt-in gate.
 //!
-//! [ADR-0012]: ../../../../docs/adrs/0012-test-tiers-and-live-config.md
+//! [ADR-0006]: ../../../../docs/adrs/0006-test-tiers-and-live-config.md
 //!
 //! # Usage
 //!

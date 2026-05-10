@@ -47,7 +47,6 @@ Living external references that constrain Zinder's design. Refreshed as the upst
 - [Serving Zebra and Zallet](reference/serving-zebra-and-zallet.md): the integration audit between the upstream node and full-node wallet.
 - [Findings from Android wallet integration](reference/android-wallet-integration-findings.md): observed behavior of `zcash-android-wallet-sdk` against `zinder-compat-lightwalletd`.
 - [Serving public lightwalletd clients](reference/serving-public-lightwalletd-clients.md): operator gap analysis vs. community-run servers like `zec.rocks` and the deployment recipe to match them.
-- [Closing the Zaino surface gap](reference/closing-the-zaino-surface-gap.md): cross-consumer gap inventory of what Zinder still needs to ship before Zaino consumers (Zallet, Zashi/Zodl, public lightwalletd, explorers) can replace Zaino without a parity regression.
 
 ## Runbooks
 
@@ -55,17 +54,16 @@ Operational procedures for running Zinder against the workspace and external sys
 
 - [Testing](runbooks/testing.md): T0–T3 test tiers, the default validation gate, live regtest/testnet/mainnet sweeps, end-to-end runs against Zallet and the Android SDK through the lightwalletd compat shim, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
 
-## Specs (in flight)
+## Specs
 
-Mutable working documents for un-shipped multi-PR work. When a spec's work lands, its locked decisions promote to one or more ADRs and the spec is deleted.
+Mutable working documents for un-shipped multi-PR work live in `docs/specs/`. When a spec's work lands, its locked decisions promote to one or more ADRs (or to architecture-doc sections) and the spec is deleted. No specs are currently in flight.
 
-- [M4: Transparent-address artifact surface](specs/m4-transparent-address.md): native `WalletQuery.TransparentAddressUtxos[Stream]` and `TransparentAddressTxIdsInRange`, the matching `ChainIndex` methods, lightwalletd `GetTaddressTxids` / `GetTaddressTransactions`, and the new tx-history canonical artifact family.
+Where retired specs' decisions live:
 
-Recently retired specs and where their decisions live:
-
-- **M5 transparent-address balance + derive-plane instantiation**: split across [ADR-0011](adrs/0011-derive-plane-federation-pattern.md) (federation primitive), [ADR-0013](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) (operational topology, consumer SDK contract, balance wire shape), and [ADR-0014](adrs/0014-compute-at-read-time-canonical-reads.md) (the compute-at-read-time pattern the balance handler uses).
-- **M6 prevout resolution**: locked into [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md).
-- **M3 mempool**: locked into [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
+- **Transparent-address artifact surface (`TransparentAddressUtxos[Stream]`, `TransparentAddressTxIdsInRange`, the new tx-history artifact family)**: documented in [Extending artifacts](architecture/extending-artifacts.md) (the canonical worked example) and [Wallet data plane](architecture/wallet-data-plane.md) (wire shapes and capability strings).
+- **Transparent-address balance + derive-plane instantiation**: split across [ADR-0011](adrs/0011-derive-plane-federation-pattern.md) (federation primitive), [ADR-0013](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) (operational topology, balance wire shape), and [ADR-0014](adrs/0014-compute-at-read-time-canonical-reads.md) (the compute-at-read-time pattern).
+- **Prevout resolution**: locked into [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md).
+- **Mempool topology**: locked into [ADR-0010: Mempool topology and retention](adrs/0010-mempool-topology-and-retention.md), with cursor-format coverage in [ADR-0005](adrs/0005-chain-event-cursor-sequence.md) and ingest-control transport security in [ADR-0009](adrs/0009-ingest-control-transport-security.md).
 
 ## Vocabulary and naming rules
 

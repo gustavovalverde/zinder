@@ -93,5 +93,5 @@ Upstream-node fallback is rejected. It would blur the source of truth, make read
 - Zashi-only endpoint behavior.
 - A separate per-wallet coverage profile.
 - Public by-address shielded queries.
-- Mempool UTXO completeness; M3 owns mempool indexing.
+- Mempool UTXO completeness; the mempool surface owns mempool indexing.
 - Cross-host read-replica architecture.

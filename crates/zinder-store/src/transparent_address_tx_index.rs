@@ -1,9 +1,8 @@
 //! Transparent-address tx-history index read traits.
 //!
-//! Storage uses dynamic-filter visibility (the same pattern the M4 Slice A
-//! transparent UTXO family follows): rows are written and never physically
-//! deleted on reorg; visibility is enforced at read time through the
-//! trailing `chain_epoch_id` source-epoch filter and `block_is_visible`
+//! Storage uses dynamic-filter visibility: rows are written and never
+//! physically deleted on reorg. Visibility is enforced at read time through
+//! the trailing `chain_epoch_id` source-epoch filter and `block_is_visible`
 //! against the row's stored `block_hash`.
 
 use std::num::NonZeroU32;

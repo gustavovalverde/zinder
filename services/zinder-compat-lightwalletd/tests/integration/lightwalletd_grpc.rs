@@ -36,9 +36,9 @@ const DEFAULT_TREE_STATE_PAYLOAD: &[u8] =
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "M1 acceptance test keeps the read-sync RPC matrix together."
+    reason = "Acceptance test keeps the read-sync RPC matrix together."
 )]
-async fn lightwalletd_adapter_serves_m1_read_sync_methods() -> eyre::Result<()> {
+async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let adapter =
         LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()));

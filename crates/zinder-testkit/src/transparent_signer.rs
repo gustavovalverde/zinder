@@ -6,8 +6,8 @@
 //! the test-only path that skips Sapling/Orchard provers; transparent-only
 //! transactions never invoke them.
 //!
-//! The signer exists to close M3's regtest broadcast cycle without depending
-//! on Zallet (Zallet v0.1.0-alpha.3 is shielded-first, Zebra refuses
+//! The signer exists for the regtest broadcast cycle without depending on
+//! Zallet (Zallet v0.1.0-alpha.3 is shielded-first, Zebra refuses
 //! non-transparent miner addresses). It is unsuitable for any production
 //! signing path: every secret derivation flows through `mock_build`'s
 //! deterministic RNG and the test-vector code paths.

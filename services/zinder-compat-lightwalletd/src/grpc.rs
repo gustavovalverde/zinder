@@ -49,10 +49,6 @@ pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.s
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 
-// Intentionally unimplemented until the owning milestones land:
-// transparent balance waits for the full transparent-address surface;
-// mempool transaction streams wait for M3.
-
 /// Runtime options for [`LightwalletdGrpcAdapter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LightwalletdCompatibilityOptions {
@@ -476,7 +472,6 @@ where
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
 
-    /// closes: G8
     async fn get_mempool_tx(
         &self,
         request: Request<lightwalletd::GetMempoolTxRequest>,
@@ -640,7 +635,6 @@ where
         Ok(Response::new(stream_items(replies)))
     }
 
-    /// closes: G9
     async fn get_lightd_info(
         &self,
         _request: Request<lightwalletd::Empty>,
@@ -1217,10 +1211,10 @@ fn display_transaction_id(transaction_id: zinder_core::TransactionId) -> String 
 /// Projects the structured native balance response into the lightwalletd
 /// `Balance { value_zat: int64 }` shape.
 ///
-/// Lightwalletd's wire shape predates the confirmed/unconfirmed split that
-/// M5's native API exposes. The compat shim drops `unconfirmed_delta_zat`
-/// because the legacy proto cannot carry it; clients that want the full
-/// split must speak the native `WalletQuery.TransparentAddressBalance`.
+/// Lightwalletd's wire shape predates the confirmed/unconfirmed split the
+/// native API exposes. The compat shim drops `unconfirmed_delta_zat` because
+/// the legacy proto cannot carry it; clients that want the full split must
+/// speak the native `WalletQuery.TransparentAddressBalance`.
 async fn balance_response_from_proxy(
     explorer_proxy: Option<&DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
     address_strings: Vec<String>,

@@ -169,7 +169,7 @@ silent widening is not allowed.
 
 ## Chain-Event Subscription
 
-Wallet sync needs durable chain-state notifications. `WalletQuery.ChainEvents` is the M2 native subscription that delivers `ChainEventEnvelope` messages to wallet clients in `event_sequence` order, settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). Chain ingestion already produces these envelopes at every canonical commit; this RPC is the wire boundary that exposes them to wallet clients without requiring them to poll latest-block metadata or infer tip changes from unrelated stream lifecycles.
+Wallet sync needs durable chain-state notifications. `WalletQuery.ChainEvents` is the native subscription that delivers `ChainEventEnvelope` messages to wallet clients in `event_sequence` order, settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). Chain ingestion already produces these envelopes at every canonical commit; this RPC is the wire boundary that exposes them to wallet clients without requiring them to poll latest-block metadata or infer tip changes from unrelated stream lifecycles.
 
 The contract:
 
@@ -185,19 +185,19 @@ Two cursor varieties are advertised under capability string `wallet.events.chain
 
 The lightwalletd compatibility shim does not expose this subscription. The vendored `CompactTxStreamer` proto has no equivalent method, and ADR-0004 forbids inventing parallel surfaces in the compat layer. Wallet clients on the lightwalletd contract continue to use `GetLatestBlock` polling. Native Zinder clients receive the subscription contract from day one.
 
-## Mempool Snapshot and Subscription (M3)
+## Mempool Snapshot and Subscription
 
-Mempool surfaces are owned by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes. M2 reserved the vocabulary and capability strings so M3 would not invent conflicting names.
+Mempool surfaces are owned by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes.
 
-M3 is the unconfirmed-transaction contract for several Zcash ecosystem
-products, but each product consumes a different boundary. This table is the
-canonical product map; reference documents carry the line-numbered source
-evidence and observed wallet-run details.
+The unconfirmed-transaction contract serves several Zcash ecosystem products,
+but each product consumes a different boundary. This table is the canonical
+product map; reference documents carry the line-numbered source evidence and
+observed wallet-run details.
 
-| Ecosystem product | Zinder relationship | M3 enables | Required boundary |
+| Ecosystem product | Zinder relationship | What the mempool surface enables | Required boundary |
 | ----------------- | ------------------- | ---------- | ----------------- |
 | Zallet (`zcash/wallet`) | Primary native Rust consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and removal of the "mempool stream closed means tip changed" workaround | `zinder-client::ChainIndex` plus native `WalletQuery`; no dependency on the lightwalletd compatibility adapter |
-| Zashi/Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native M3 index and event log |
+| Zashi/Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
 | Existing lightwalletd clients and operators | Migration consumers | Backend option for clients that already speak `CompactTxStreamer`, including current mempool methods and transaction submission behavior | Compatibility adapter only; no upstream node calls, no independent storage, and no Zinder-only method extensions in the lightwalletd proto |
 | Block explorers and analytics | Application or `zinder-derive` consumers | Live mempool pages, pending transaction lifecycle, pending transparent address/outpoint overlays, and "mempool in sync" status | Native `WalletQuery` or replayable `zinder-derive` views; full explorer parity also needs transparent history and balance |
 | Zebra | Upstream node source, not a Zinder client | Keeps wallet and explorer indexing outside the node while reusing Zebra's verified mempool observations | `zinder-source` consumes Zebra `MempoolChange` when available, or falls back to `getrawmempool` polling |
@@ -207,11 +207,11 @@ Three architectural consequences follow from that map:
 
 - The canonical path is `NodeSource -> MempoolSourceEvent -> MempoolIndex + MempoolEventLog -> WalletQuery -> adapters`. Compatibility methods translate over that path; they do not own their own mempool cache.
 - Source observations must become hydrated `MempoolEntry` records before they reach public APIs. Zebra's streaming mempool event carries transaction hash and auth digest, so raw transaction fetching and compact-transaction construction belong in the source/ingest path, not in `zinder-compat-lightwalletd`.
-- Native M3 does not inherit lightwalletd's stream-close lifecycle. `MempoolEvents` stream end means disconnect or shutdown. Chain-tip changes are delivered through `ChainEvents`.
+- The native mempool surface does not inherit lightwalletd's stream-close lifecycle. `MempoolEvents` stream end means disconnect or shutdown. Chain-tip changes are delivered through `ChainEvents`.
 - The public server-observed type is `MempoolEntry`, not `PendingTransaction`. A pending transaction is a wallet-local UX state: it can include a transaction that was created locally but never accepted by the network.
-- Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zashi/Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means M3 plus the transparent history and balance surfaces needed for address-oriented views.
+- Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zashi/Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means the mempool surface plus the transparent history and balance surfaces needed for address-oriented views.
 
-The M3 native protocol exposes two complementary methods:
+The native protocol exposes two complementary mempool methods:
 
 - **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold.
 - **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via `MempoolStreamCursorV1`.
@@ -341,13 +341,13 @@ Transparent prevout resolution turns an `OutPoint` (a `(transaction_id, output_i
 
 Every response binds to a `ChainEpoch` (canonical: the read's epoch; mempool: the writer's epoch visible at lookup time), then carries `repeated TransparentPrevoutEntry entries` in input order. Each entry has the request's `OutPoint` and an `optional TransparentPrevout prevout`; absence means the canonical chain at the bound epoch (canonical) or the live mempool index (mempool) does not have the referenced output. The inner `TransparentPrevout` carries `value_zat: uint64` and `script_pub_key: bytes`; identifying fields stay on the entry's `outpoint` so the inner payload carries no redundant fields. Duplicate request outpoints emit duplicate entries.
 
-The shared `OutPoint` proto message is the canonical wire-level outpoint shape across every wallet-plane RPC keyed by `(transaction_id, output_index)`. M3's `TransparentMempoolSpendByOutpoint` was retrofitted onto the shared message in M6 Slice 1; future outpoint-keyed RPCs reuse it without inventing parallel shapes (see [Anti-Pattern A4: Sentinel-overloaded `BlockId`](../reference/closing-the-zaino-surface-gap.md#a4-sentinel-overloaded-blockid--height-0-hash-bytes-)).
+The shared `OutPoint` proto message is the canonical wire-level outpoint shape across every wallet-plane RPC keyed by `(transaction_id, output_index)`. `TransparentMempoolSpendByOutpoint` and the prevout-resolution surfaces use the same message; future outpoint-keyed RPCs reuse it without inventing parallel shapes. The coinbase sentinel outpoint (`transaction_id = 0x00..00`, `output_index = u32::MAX`) is rejected at the wallet adapter rather than carried as a magic value.
 
-Both methods cap the request at `MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256` outpoints, mirroring the M5 balance address cap. Requests above the cap are silently truncated to the first 256 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary (Zallet's `view_transaction.rs` is the canonical example). Anti-pattern A4 is refused at this site.
+Both methods cap the request at `MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256` outpoints, matching the transparent-address balance address cap. Requests above the cap are silently truncated to the first 256 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary (Zallet's `view_transaction.rs` is the canonical example).
 
-The `ChainIndex` Rust API exposes three methods: `transparent_prevouts(outpoints, at_epoch)`, `transparent_prevouts_at_epoch` is the explicit-epoch shape (M5 companion-method convention), and `transparent_mempool_prevouts(outpoints)` (no epoch pin per the live-state convention). `LocalChainIndex` reads the canonical method directly from the secondary store; the mempool method delegates to `RemoteChainIndex`. The capability-coverage test asserts both methods exist for any consumer advertising the corresponding capability strings.
+The `ChainIndex` Rust API exposes three methods: `transparent_prevouts(outpoints, at_epoch)`, `transparent_prevouts_at_epoch` (the explicit-epoch shape), and `transparent_mempool_prevouts(outpoints)` (no epoch pin, per the live-state convention). `LocalChainIndex` reads the canonical method directly from the secondary store; the mempool method delegates to `RemoteChainIndex`. The capability-coverage test asserts both methods exist for any consumer advertising the corresponding capability strings.
 
-There is no lightwalletd-compat counterpart: `CompactTxStreamer` has no prevout endpoint, and inventing a parallel surface is forbidden by [Service boundaries §Anti-Patterns](service-boundaries.md#anti-patterns). M6 is native-only.
+The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevout endpoint, and inventing a parallel surface is forbidden by [Service boundaries §Anti-Patterns](service-boundaries.md#anti-patterns).
 
 ## Transparent Address Balance
 
@@ -429,7 +429,7 @@ test when the release claim names those clients.
 
 After M3, a deployment may claim Android SDK or Zashi/Zodl mempool
 compatibility only when `GetMempoolStream` and `GetMempoolTx` are mapped over
-the native M3 index and event log, and an SDK or app flow has observed mempool
+the native mempool index and event log, and an SDK or app flow has observed mempool
 transactions against that endpoint. A sync-only Zashi proof does not establish
 pending-transaction UX.
 

@@ -6,7 +6,7 @@
 | Audience | Zinder maintainers, contributors |
 | Sources | Local Zebra, Zallet, Zaino, lightwalletd, Android SDK, and Zodl source trees as of 2026-04-29; GitHub issues for Zebra and Zallet |
 | Related | [PRD-0001](../prd-0001-zinder-indexer.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md), [Lessons from Zaino](lessons-from-zaino.md), [Wallet Data Plane](../architecture/wallet-data-plane.md), [Chain Ingestion](../architecture/chain-ingestion.md), [Chain events](../architecture/chain-events.md) |
-| Last refresh | 2026-05-09: §Part B "What Zinder Currently Provides Against These Contracts" refreshed after M3 mempool, M4 Slice A (transparent UTXOs), M4 Slice B (transparent tx history), and M5 Slice A foundation shipped. The cross-consumer gap inventory now lives in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md); this document continues to carry the Zebra-side and Zallet-side integration evidence. <br> 2026-04-29: M3 mempool consumer roles re-checked against local Zebra, Zallet, Zaino, lightwalletd, Android SDK, and Zodl source trees. |
+| Last refresh | 2026-05-10 |
 
 ## Purpose
 
@@ -19,8 +19,8 @@ Zinder sits between the upstream node and downstream wallet consumers:
 
 This document captures what each side has stated, implied, or implemented as a contract; where Zinder needs different guarantees from the current indexer boundary; and how Zinder's existing decisions already serve those guarantees or still need to.
 
-The broader ecosystem product map for M3 mempool lives in
-[Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription-m3).
+The broader ecosystem product map for the mempool surfaces lives in
+[Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription).
 This page remains the evidence trail for the Zebra/Zallet part of that map; it
 does not duplicate the Android/Zodl or explorer contract tables.
 
@@ -216,7 +216,7 @@ This is not a wire-protocol decision; it is a Rust-API decision in `zinder-query
 Zallet's `#136`, `#159`, and the `Notify` workaround at `components/sync.rs:115-119` all come from conflating "new block" with "stream closed". Zinder's [Chain events](../architecture/chain-events.md) vocabulary distinguishes `ChainSourceEvent`, `ChainEvent`, and `ChainEventEnvelope`; the wallet data plane should expose at least:
 
 - A chain-event subscription consumers can resume from a cursor. Closing the stream means the consumer disconnected, never "a new block arrived." [Wallet data plane §Chain-Event Subscription](../architecture/wallet-data-plane.md#chain-event-subscription) defines this as `WalletQuery.ChainEvents`.
-- A separate M3 mempool subscription with typed `MempoolChange { Added | Invalidated | Mined }` events (mirroring Zebra's `MempoolChangeKind`).
+- A separate mempool subscription with typed `MempoolChange { Added | Invalidated | Mined }` events (mirroring Zebra's `MempoolChangeKind`).
 
 This is also the right granularity for Zallet's `#403` (rebroadcast detection) because `MempoolChange::Invalidated` carries the eviction reason. The existing `ChainEvent::ChainReorged { reverted, committed }` shape (in `chain-events.md`) collapses Zallet's N-round-trip `find_fork` walk at `components/sync/steps.rs:156-187` into a single envelope: receive event, `db_data.truncate_to_height(reverted.from_height - 1)`, resume scan. The 10-block safety margin at `components/sync.rs:265` becomes unnecessary.
 
@@ -251,7 +251,7 @@ the Rust `WalletQueryApi` boundary. Both share the same generated code path.
 
 ## What Zinder Currently Provides Against These Contracts
 
-This subsection is a 2026-05-09 audit of the Zinder code in this repository against the contracts above. It is a point-in-time snapshot; the source of truth is `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto` for the native surface and `services/zinder-compat-lightwalletd/src/grpc.rs` for the lightwalletd-compatible surface. Cross-consumer gap inventory and per-consumer prioritization live in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md); this section is the Zallet-specific snapshot.
+This subsection is a point-in-time audit of the Zinder code against the contracts above. The source of truth is `crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto` for the native surface and `services/zinder-compat-lightwalletd/src/grpc.rs` for the lightwalletd-compatible surface.
 
 Zinder's durable direction is now [ADR-0008: Consumer-neutral wallet data
 plane](../adrs/0008-consumer-neutral-wallet-data-plane.md): compatibility
@@ -266,21 +266,18 @@ Implemented end-to-end:
 - `LatestBlock`, `CompactBlock`, `CompactBlockRange` (server streaming, capped by `max_compact_block_range` with default `1000`).
 - `Transaction` by transaction id.
 - `TreeState` by height, `LatestTreeState`, `SubtreeRoots` (paged, request-bounded).
-- `BroadcastTransaction` with typed accepted/duplicate/invalid-encoding/rejected/unknown outcomes (M3, gated on `[node]` config).
+- `BroadcastTransaction` with typed accepted/duplicate/invalid-encoding/rejected/unknown outcomes (gated on `[node]` config).
 - `ChainEvents` server-streaming with replayable `StreamCursorTokenV1` cursors and Tip/Finalized families.
-- `MempoolSnapshot` and `MempoolEvents` (M3): bounded snapshot plus replayable `Added`/`Invalidated`/`Mined` events with `MempoolStreamCursorV1` resumption.
-- `TransparentAddressUtxos` and `TransparentAddressUtxosStream` (M4 Slice A): paged and streaming UTXO reads keyed by either `script_hash` or base58 `address` through the shared `AddressLookup` selector.
-- `TransparentAddressTxIdsInRange` (M4 Slice B): server-streamed transparent-address tx-history index with ascending or descending iteration.
+- `MempoolSnapshot` and `MempoolEvents`: bounded snapshot plus replayable `Added`/`Invalidated`/`Mined` events with `MempoolStreamCursorV1` resumption.
+- `TransparentAddressUtxos` and `TransparentAddressUtxosStream`: paged and streaming UTXO reads keyed by either `script_hash` or base58 `address` through the shared `AddressLookup` selector.
+- `TransparentAddressTxIdsInRange`: server-streamed transparent-address tx-history index with ascending or descending iteration.
 - `ServerInfo` returning the `ServerCapabilities` descriptor with capability strings and node-side capabilities.
 
 Every response carries the `ChainEpoch` it was answered from, and native read requests accept an optional `at_epoch` pin. This satisfies the atomic-snapshot contract for multi-call wallet flows: a client can call `LatestBlock`, persist the returned `ChainEpoch`, and require `CompactBlockRange`, `TreeState`, `LatestTreeState`, `SubtreeRoots`, `Transaction`, `TransparentAddressUtxos`, and `TransparentAddressTxIdsInRange` to answer from that same epoch.
 
 Not yet on the native surface:
 
-- Enriched transaction response. `Transaction` returns the artifact bytes; it does not yet carry `(consensus_branch_id, block_time, confirmations)`, which Zallet currently reconstructs from `RawTransaction` via the workaround at `wallet/zallet/src/components/sync.rs:647-660`. Tracked as G3 in [Closing the Zaino surface gap](closing-the-zaino-surface-gap.md).
-- Transparent-address balance. `TransparentAddressBalance` is reserved for M5 Slice B; M5 Slice A foundation (`services/zinder-derive` deployable, capability `derive.explorer.ready_v1`) shipped 2026-05-08. Tracked as G1.
-- Native gRPC transaction-status shape and focused transparent-mempool point lookups. The decision is to expose a status-bearing transaction response plus transparent mempool output/spend lookups, rather than making non-Rust clients page `MempoolSnapshot` for single-answer questions. Tracked as G6 and G7.
-- Best-chain hash-to-height resolver and typed block-header read model. Compact-block reads stay height-first; hash-only compatibility reads resolve through the canonical resolver; non-best-chain `(txid, block_hash)` lookup is deferred until explorer or zcashd-compat parity becomes a named milestone. Tracked as G2 and G4.
+- `getrawtransaction(txid, blockhash)` form (non-best-chain transaction lookup) is deferred until explorer or zcashd-compat parity becomes a named milestone.
 
 ### Lightwalletd compat (`zinder_proto::compat::lightwalletd`)
 
@@ -288,21 +285,20 @@ Implemented end-to-end in `services/zinder-compat-lightwalletd/src/grpc.rs`:
 
 - `GetLatestBlock`, `GetBlock`, `GetBlockRange`, `GetBlockNullifiers`, `GetBlockRangeNullifiers`.
 - `GetTransaction` by hash and by block index.
-- `GetTreeState` by height, `GetLatestTreeState`. Hash-only lookup returns `Status::unimplemented`; tracked as G2.
+- `GetTreeState` by height, `GetLatestTreeState`.
 - `GetSubtreeRoots`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS` rather than treated as unbounded.
-- `GetAddressUtxos`, `GetAddressUtxosStream`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS` and results are served from stored transparent UTXO artifacts (M4 Slice A).
-- `GetTaddressTxids`, `GetTaddressTransactions` (M4 Slice B). Both consume the bounded `TransparentAddressTxIdsInRange` native surface; `GetTaddressTxids` returns txid bytes in `RawTransaction.data` (matching the upstream lightwalletd-go quirk), `GetTaddressTransactions` fetches and returns full raw transaction bytes.
+- `GetAddressUtxos`, `GetAddressUtxosStream`. `maxEntries = 0` is clamped to `DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS` and results are served from stored transparent UTXO artifacts.
+- `GetTaddressTxids`, `GetTaddressTransactions`. Both consume the bounded `TransparentAddressTxIdsInRange` native surface; `GetTaddressTxids` returns txid bytes in `RawTransaction.data` (matching the upstream lightwalletd-go quirk), `GetTaddressTransactions` fetches and returns full raw transaction bytes.
 - `SendTransaction`, gated on the `[node]` configuration block.
-- `GetMempoolTx`, `GetMempoolStream` (M3). Both gated on the adapter's `mempool_surface` option; `Status::unavailable` without it. With it, `GetMempoolStream` closes cleanly on tip change when a `tip_change_watcher` is wired, preserving the lightwalletd Go server's de-facto contract.
-- `GetLightdInfo`. Several fields (`zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, `upgrade_height`) are populated as empty strings or zero; `taddr_support` is `true` because the UTXO stream is backed by stored transparent artifacts. Tracked as G9.
+- `GetMempoolTx`, `GetMempoolStream`. Both gated on the adapter's `mempool_surface` option; `Status::unavailable` without it. With it, `GetMempoolStream` closes cleanly on tip change when a `tip_change_watcher` is wired, preserving the lightwalletd Go server's de-facto contract.
+- `GetLightdInfo`. Several fields (`zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, `upgrade_height`) are populated as empty strings or zero; `taddr_support` is `true` because the UTXO stream is backed by stored transparent artifacts.
 - `Ping`.
 
 Returning `Status::unimplemented` today:
 
-| Compat method | Returns | Owning gap |
-| ------------- | ------- | ---------- |
-| `GetTaddressBalance`, `GetTaddressBalanceStream` | `Status::unimplemented` | G1 (M5 Slice B) |
-| `GetBlock` / `GetTreeState` with hash-only `BlockID` | `Status::unimplemented` | G2 |
+| Compat method | Returns |
+| ------------- | ------- |
+| (no compat methods currently return `Status::unimplemented` after the prevout, balance, and selector surfaces shipped) ||
 
 Android SDK and Zashi compatibility details are owned by
 [Findings from Android wallet integration](android-wallet-integration-findings.md)

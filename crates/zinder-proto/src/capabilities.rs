@@ -1,15 +1,15 @@
 //! Zinder capability strings advertised through `WalletQuery.ServerInfo`.
 //!
 //! Capability strings are exact-match. New methods on `WalletQuery` add a
-//! capability string here in the same change. The `capability-coverage` CI job
-//! asserts that every RPC has a corresponding entry. The full protocol
-//! contract is in
-//! [docs/specs/m2-push-primitive.md §D4](../../docs/specs/m2-push-primitive.md#d4-capability-descriptor-was-adr-0010).
+//! capability string here in the same change. The `capability-coverage` CI
+//! job asserts that every RPC has a corresponding entry. The full protocol
+//! contract is in [Public interfaces §Capability
+//! Discovery](../../docs/architecture/public-interfaces.md#capability-discovery).
 //!
-//! Capability naming follows `domain.subdomain.capability_name_v{N}`. Versioned
-//! suffixes are part of the capability identity; a `_v2` capability is a
-//! separate string from its `_v1` predecessor and may coexist during a
-//! deprecation window.
+//! Capability naming follows `domain.subdomain.capability_name_v{N}`.
+//! Versioned suffixes are part of the capability identity; a `_v2`
+//! capability is a separate string from its `_v1` predecessor and may
+//! coexist during a deprecation window.
 
 use crate::v1::wallet::ServerCapabilities;
 

@@ -97,11 +97,11 @@ Advertised capabilities:
 - `finalized_height`
 - `readiness_probe`
 - `transaction_broadcast`
-- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and, in M3, `MempoolChange` gRPC streams can be consumed.
+- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and `MempoolChange` gRPC streams can be consumed.
 - `node.spending_tx_lookup` — Zebra's nullifier-to-spending-tx index is available behind `--features indexer`.
 - `node.openrpc_discovery` — `rpc.discover` was called and the upstream-node capability surface was parsed.
 - `node.json_rpc` — JSON-RPC source is the active backend.
-- `mempool_stream` — internal M3 source capability for Zebra `MempoolChange`; not a public wallet capability and not advertised before M3 consumes it.
+- `mempool_stream` — internal source capability for Zebra `MempoolChange`; not a public wallet capability.
 
 New capability names are added to `NodeCapability` when a real consumer reads the capability; aspirational vocabulary is not pre-declared.
 
@@ -130,7 +130,7 @@ Version strings may be logged and included in diagnostics, but they are not the 
 - **Streaming backend** (preferred): consumes Zebra's `MempoolChange` gRPC stream. Requires `node.streaming_source`. Maps `ADDED` → `Added`, `INVALIDATED` → `Invalidated`, `MINED` → `Mined`. Sub-second latency.
 - **Polling backend** (fallback): calls `getrawmempool` on `[mempool] poll_interval_ms` (default 10000) and diffs successive responses to synthesize `Added` and `Invalidated` events. `Mined` events are inferred from chain commits, not from `getrawmempool`. Default-second latency.
 
-The backend choice is invisible to clients except through the `mempool_snapshot_age_ms` metric after M3 lands. Operators choose the backend by configuring whether Zebra runs with `--features indexer`; Zinder does not require the streaming backend. `wallet.snapshot.mempool_v1` and `wallet.events.mempool_v1` are advertised only when the public M3 methods, storage, and retention path exist.
+The backend choice is invisible to clients except through the `mempool_snapshot_age_ms` metric. Operators choose the backend by configuring whether Zebra runs with `--features indexer`; Zinder does not require the streaming backend. `wallet.snapshot.mempool_v1` and `wallet.events.mempool_v1` are advertised when the public mempool methods, storage, and retention path are reachable.
 
 Reorg interaction: Zinder's mempool reflects Zebra's `MempoolChange` directly. When a `ChainReorged` event fires in `zinder-ingest`, mempool state is **not** synthesized from the reverted block; Zinder waits for Zebra to emit corresponding `MempoolSourceEvent` values. This avoids the Zaino phantom-mempool-entry bug class.
 
