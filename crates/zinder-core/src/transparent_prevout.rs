@@ -6,13 +6,13 @@
 //! [`TransparentPrevoutEntry`] so the inner payload carries no redundant
 //! fields.
 //!
-//! Canonical: `WalletQuery.TransparentPrevouts` reads from
-//! `TransactionArtifact.payload_bytes` (compute-at-read-time) and never
-//! touches a dedicated column family.
-//!
-//! Mempool: `WalletQuery.TransparentMempoolPrevouts` reads from the
-//! writer-owned `MempoolIndex`. The mempool variant binds to the chain
-//! epoch visible at lookup time without supporting an `at_epoch` pin.
+//! Canonical and mempool prevout resolution share the same response shape
+//! ([`TransparentPrevoutsResponse`]). The two RPCs differ at the request
+//! boundary: the canonical surface accepts an optional `at_epoch` pin while
+//! the mempool surface always binds to the chain epoch visible at lookup
+//! time. Source-of-truth differs too: canonical reads parse
+//! `TransactionArtifact.payload_bytes` (compute-at-read-time); mempool reads
+//! consult the writer-owned `MempoolIndex` directly.
 //!
 //! Absent `prevout` per entry means the canonical chain at the bound epoch
 //! (canonical) or the live mempool index (mempool) does not contain the
@@ -57,8 +57,11 @@ pub struct TransparentPrevoutEntry {
     pub prevout: Option<TransparentPrevout>,
 }
 
-/// Canonical-chain prevout resolution response bound to one chain epoch.
+/// Prevout-resolution response bound to one chain epoch.
 ///
+/// Used by both `WalletQuery.TransparentPrevouts` (canonical, accepts
+/// `at_epoch`) and `WalletQuery.TransparentMempoolPrevouts` (live mempool,
+/// always binds to the chain epoch visible at lookup time).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentPrevoutsResponse {
     /// Chain epoch the response binds to. Every entry's `prevout` (when
@@ -66,16 +69,5 @@ pub struct TransparentPrevoutsResponse {
     pub chain_epoch: ChainEpoch,
     /// Per-outpoint resolution result, in input order. Length matches
     /// the request's outpoint list after server-side truncation.
-    pub entries: Vec<TransparentPrevoutEntry>,
-}
-
-/// Live-mempool prevout resolution response bound to the chain epoch
-/// visible at lookup time.
-///
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentMempoolPrevoutsResponse {
-    /// Chain epoch visible at lookup time.
-    pub chain_epoch: ChainEpoch,
-    /// Per-outpoint resolution result, in input order.
     pub entries: Vec<TransparentPrevoutEntry>,
 }

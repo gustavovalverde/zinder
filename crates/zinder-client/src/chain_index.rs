@@ -10,8 +10,8 @@ use zinder_core::{
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolPrevoutsResponse, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
+    TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -543,7 +543,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentMempoolPrevoutsResponse, IndexerError>;
+    ) -> Result<TransparentPrevoutsResponse, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

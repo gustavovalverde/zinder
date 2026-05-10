@@ -16,7 +16,7 @@ use zinder_core::{
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevout, TransparentPrevoutEntry, TransparentPrevoutsResponse, TxStatus,
+    TransparentPrevoutsResponse, TxStatus,
 };
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
@@ -31,7 +31,7 @@ use crate::{
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
-    chain_event_envelope_message, outpoint_message,
+    chain_event_envelope_message, outpoint_message, transparent_prevout_entry_message,
 };
 
 /// Operator-configured snapshot used to build the `ServerCapabilities` descriptor.
@@ -387,31 +387,13 @@ pub fn build_transparent_address_utxos_stream_chunk(
 fn build_transparent_prevouts_response(
     response: TransparentPrevoutsResponse,
 ) -> wallet::TransparentPrevoutsResponse {
-    let chain_epoch = build_chain_epoch_message(response.chain_epoch);
-    let entries = response
-        .entries
-        .into_iter()
-        .map(build_transparent_prevout_entry_message)
-        .collect();
     wallet::TransparentPrevoutsResponse {
-        chain_epoch: Some(chain_epoch),
-        entries,
-    }
-}
-
-fn build_transparent_prevout_entry_message(
-    entry: TransparentPrevoutEntry,
-) -> wallet::TransparentPrevoutEntry {
-    wallet::TransparentPrevoutEntry {
-        outpoint: Some(outpoint_message(&entry.outpoint)),
-        prevout: entry.prevout.map(build_transparent_prevout_message),
-    }
-}
-
-fn build_transparent_prevout_message(prevout: TransparentPrevout) -> wallet::TransparentPrevout {
-    wallet::TransparentPrevout {
-        value_zat: prevout.value_zat,
-        script_pub_key: prevout.script_pub_key,
+        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        entries: response
+            .entries
+            .into_iter()
+            .map(transparent_prevout_entry_message)
+            .collect(),
     }
 }
 

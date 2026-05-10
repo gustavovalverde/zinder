@@ -104,6 +104,13 @@ pub fn require_live_mainnet() -> eyre::Result<LiveTestEnv> {
     require_live_for(&[Network::ZcashMainnet])
 }
 
+/// Reads a required environment variable, returning a wrapped error when it
+/// is unset. Use for live-test inputs the operator must supply explicitly
+/// (binary path, marker fragment, additional CLI args).
+pub fn require_env(name: &str) -> eyre::Result<String> {
+    std::env::var(name).wrap_err_with(|| format!("missing required env var {name}"))
+}
+
 /// One-time test bootstrap.
 ///
 /// Installs the `color-eyre` panic hook and a `tracing-subscriber` writer.

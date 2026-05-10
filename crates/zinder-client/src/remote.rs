@@ -15,8 +15,8 @@ use zinder_core::{
     SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolPrevoutsResponse, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
+    TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, ServerCapabilities, wallet_query_client::WalletQueryClient};
 use zinder_store::{
@@ -590,7 +590,7 @@ impl ChainIndex for RemoteChainIndex {
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentMempoolPrevoutsResponse, IndexerError> {
+    ) -> Result<TransparentPrevoutsResponse, IndexerError> {
         let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
         let request = wallet::TransparentMempoolPrevoutsRequest {
             outpoints: wire_outpoints,
@@ -602,52 +602,8 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(IndexerError::from_status)?
             .into_inner();
-        transparent_mempool_prevouts_response_from_message(self.network, response)
+        transparent_prevouts_response_from_message(self.network, response)
     }
-}
-
-fn transparent_mempool_prevouts_response_from_message(
-    expected_network: Network,
-    message: wallet::TransparentMempoolPrevoutsResponse,
-) -> Result<TransparentMempoolPrevoutsResponse, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
-    let entries = message
-        .entries
-        .into_iter()
-        .map(transparent_mempool_prevout_entry_from_message)
-        .collect::<Result<Vec<_>, IndexerError>>()?;
-    Ok(TransparentMempoolPrevoutsResponse {
-        chain_epoch,
-        entries,
-    })
-}
-
-fn transparent_mempool_prevout_entry_from_message(
-    message: wallet::TransparentMempoolPrevoutEntry,
-) -> Result<zinder_core::TransparentPrevoutEntry, IndexerError> {
-    let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed(
-            "transparent_mempool_prevout_entry.outpoint",
-            "field is missing",
-        )
-    })?;
-    let transaction_id = TransactionId::from_bytes(fixed_32_bytes(
-        "transparent_mempool_prevout_entry.outpoint.transaction_id",
-        outpoint_message.transaction_id,
-    )?);
-    let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
-    let prevout = message
-        .prevout
-        .map(|prevout_message| zinder_core::TransparentPrevout {
-            value_zat: prevout_message.value_zat,
-            script_pub_key: prevout_message.script_pub_key,
-        });
-    Ok(zinder_core::TransparentPrevoutEntry { outpoint, prevout })
 }
 
 fn transparent_prevouts_response_from_message(

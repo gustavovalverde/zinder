@@ -21,9 +21,11 @@ use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
-    StreamCursorTokenV1, chain_epoch_message, chain_event_envelope_message, mempool_entry_message,
-    mempool_event_envelope_message, run_chain_event_stream, status_from_store_error,
+    StreamCursorTokenV1, chain_epoch_message, chain_event_envelope_message,
+    chain_event_stream_family_from_message, mempool_entry_message, mempool_event_envelope_message,
+    run_chain_event_stream, status_from_store_error, stream_cursor_from_message_bytes,
     transparent_mempool_output_message, transparent_mempool_spend_message,
+    transparent_prevout_entry_message,
 };
 
 use crate::mempool::MempoolIndex;
@@ -147,8 +149,9 @@ impl IngestControl for IngestControlGrpcAdapter {
         request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
         let request = request.into_inner();
-        let from_cursor = cursor_from_request(request.from_cursor);
-        let family = chain_event_stream_family_from_request(request.family)?;
+        let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
+        let family = chain_event_stream_family_from_message(request.family)
+            .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
         let store = self.store.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
         tokio::spawn(run_chain_event_stream(
@@ -175,11 +178,14 @@ impl IngestControl for IngestControlGrpcAdapter {
             .current_chain_epoch()
             .map_err(|error| status_from_store_error(&error))?
             .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
-        let snapshot_sequence = self
-            .store
-            .mempool_event_retention_report()
-            .map(|report| report.current_event_sequence)
-            .map_err(|error| status_from_store_error(&error))?;
+        let store_for_retention = self.store.clone();
+        let retention_report = tokio::task::spawn_blocking(move || {
+            store_for_retention.mempool_event_retention_report()
+        })
+        .await
+        .map_err(|join_error| Status::unavailable(join_error.to_string()))?
+        .map_err(|error| status_from_store_error(&error))?;
+        let snapshot_sequence = retention_report.current_event_sequence;
         let snapshot_cursor =
             decode_mempool_snapshot_cursor(&request.from_cursor, snapshot_sequence)?;
         let snapshot_page = mempool_index.snapshot_page(
@@ -218,7 +224,7 @@ impl IngestControl for IngestControlGrpcAdapter {
         }
         let store = self.store.clone();
         let request = request.into_inner();
-        let from_cursor = cursor_from_request(request.from_cursor);
+        let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
         let (event_sender, event_receiver) = mpsc::channel(16);
         tokio::spawn(stream_mempool_events(store, from_cursor, event_sender));
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
@@ -283,7 +289,7 @@ impl IngestControl for IngestControlGrpcAdapter {
     async fn transparent_mempool_prevouts(
         &self,
         request: Request<wallet::TransparentMempoolPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
         let mempool_index = self
             .mempool_index
             .as_ref()
@@ -303,24 +309,12 @@ impl IngestControl for IngestControlGrpcAdapter {
         let entries = mempool_index
             .transparent_prevouts_by_outpoints(&outpoints)
             .into_iter()
-            .map(transparent_mempool_prevout_entry_message)
+            .map(transparent_prevout_entry_message)
             .collect();
-        Ok(Response::new(wallet::TransparentMempoolPrevoutsResponse {
+        Ok(Response::new(wallet::TransparentPrevoutsResponse {
             chain_epoch: Some(chain_epoch_message(chain_epoch)),
             entries,
         }))
-    }
-}
-
-fn transparent_mempool_prevout_entry_message(
-    entry: zinder_core::TransparentPrevoutEntry,
-) -> wallet::TransparentMempoolPrevoutEntry {
-    wallet::TransparentMempoolPrevoutEntry {
-        outpoint: Some(zinder_store::outpoint_message(&entry.outpoint)),
-        prevout: entry.prevout.map(|prevout| wallet::TransparentPrevout {
-            value_zat: prevout.value_zat,
-            script_pub_key: prevout.script_pub_key,
-        }),
     }
 }
 
@@ -541,24 +535,6 @@ fn status_from_chain_event_encode_error(error: ChainEventEncodeError) -> Status 
     match error {
         ChainEventEncodeError::UnsupportedChainEvent { event } => Status::unavailable(event),
         _ => Status::unavailable("unknown chain event encode error"),
-    }
-}
-
-fn cursor_from_request(cursor_bytes: Vec<u8>) -> Option<StreamCursorTokenV1> {
-    if cursor_bytes.is_empty() {
-        None
-    } else {
-        Some(StreamCursorTokenV1::from_bytes(cursor_bytes))
-    }
-}
-
-fn chain_event_stream_family_from_request(family: i32) -> Result<ChainEventStreamFamily, Status> {
-    match wallet::ChainEventStreamFamily::try_from(family) {
-        Ok(wallet::ChainEventStreamFamily::Tip) => Ok(ChainEventStreamFamily::Tip),
-        Ok(wallet::ChainEventStreamFamily::Finalized) => Ok(ChainEventStreamFamily::Finalized),
-        Err(_) => Err(Status::invalid_argument(
-            "chain-event stream family is unknown",
-        )),
     }
 }
 

@@ -123,7 +123,7 @@ Methods authored under this pattern refuse the same anti-patterns the rest of th
 
 - **`WalletQuery.TransparentAddressBalance`** (federated): Shape C reads canonical UTXOs and live mempool point lookups at request time. Shape A (per-block accumulator column family) is reserved.
 - **`WalletQuery.TransparentPrevouts`** (canonical, direct): Shape C reads `TransactionArtifact.payload_bytes` and parses via `zinder_source::transparent_prevout_from_raw_transaction_bytes`. Shape A (dedicated `OutPoint`-keyed column family) is reserved.
-- **`WalletQuery.TransparentMempoolPrevouts`** (live mempool): reads `MempoolEntry.transparent_outputs` directly; no parsing because the mempool ingest path pre-extracts transparent outputs at admission time. A degenerate Shape C (the work is done at ingest, not at read).
+- **`WalletQuery.TransparentMempoolPrevouts`** (live mempool): reads `MempoolEntry.transparent_outputs` directly; no parsing because the mempool ingest path pre-extracts transparent outputs at admission time. A degenerate Shape C (the work is done at ingest, not at read). Returns the same `TransparentPrevoutsResponse` shape as the canonical surface so consumers decode both through one path; the surfaces differ at the request boundary (`at_epoch` accepted on canonical, omitted on mempool).
 
 ## Cross-references
 

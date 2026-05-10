@@ -767,39 +767,18 @@ message TransparentPrevoutsResponse {
   repeated TransparentPrevoutEntry entries = 2;
 }
 
-// One entry in a [`TransparentMempoolPrevouts`] response, in input-order.
-message TransparentMempoolPrevoutEntry {
-  // Outpoint requested by the caller.
-  OutPoint outpoint = 1;
-
-  // Resolved prevout, when the outpoint references an unconfirmed
-  // mempool transaction's output that is currently visible. Absent
-  // means the mempool index does not have the referenced output
-  // (transaction not in mempool, or output index out of bounds).
-  optional TransparentPrevout prevout = 2;
-}
-
 // Batched request for live mempool transparent prevout resolution.
 //
 // Mempool reads are not chain-epoch-pinnable; the request omits
 // `at_epoch` and the response binds to the chain epoch visible at
-// lookup time.
+// lookup time. The reply uses the same [`TransparentPrevoutsResponse`]
+// shape as the canonical surface so consumers share one decoder.
 message TransparentMempoolPrevoutsRequest {
   // Outpoints to resolve against the live mempool index. Bounded
   // server-side to a hard cap; requests above the cap are silently
   // truncated to the first N entries. The coinbase sentinel is
   // rejected with `INVALID_ARGUMENT`.
   repeated OutPoint outpoints = 1;
-}
-
-// Response for [`TransparentMempoolPrevouts`] bound to the chain
-// epoch visible at lookup time.
-message TransparentMempoolPrevoutsResponse {
-  // Chain epoch visible at lookup time.
-  ChainEpoch chain_epoch = 1;
-
-  // Per-outpoint resolution result, in input order.
-  repeated TransparentMempoolPrevoutEntry entries = 2;
 }
 
 // Mempool-event stream family. Reserved for future extensions; today only
@@ -1111,7 +1090,7 @@ service WalletQuery {
   // referenced outputs. Used by chained-mempool-tx flows where the
   // creating transaction has not yet confirmed.
   rpc TransparentMempoolPrevouts(TransparentMempoolPrevoutsRequest)
-      returns (TransparentMempoolPrevoutsResponse);
+      returns (TransparentPrevoutsResponse);
 
   // Return unspent transparent outputs for one transparent address.
   rpc TransparentAddressUtxos(TransparentAddressUtxosRequest)

@@ -19,7 +19,8 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_ch
 
 use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge};
 use zinder_store::{
-    ChainEventStreamFamily, StreamCursorTokenV1, chain_epoch_from_message, run_chain_event_stream,
+    StreamCursorTokenV1, chain_epoch_from_message, chain_event_stream_family_from_message,
+    run_chain_event_stream, stream_cursor_from_message_bytes,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -332,8 +333,9 @@ where
         }
 
         let request = request.into_inner();
-        let from_cursor = cursor_from_request(request.from_cursor);
-        let family = chain_event_stream_family_from_request(request.family)?;
+        let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
+        let family = chain_event_stream_family_from_message(request.family)
+            .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
         let query_api = self.query_api.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
         tokio::spawn(run_chain_event_stream(
@@ -441,7 +443,7 @@ where
     async fn transparent_mempool_prevouts(
         &self,
         request: Request<wallet::TransparentMempoolPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolPrevoutsResponse>, Status> {
+    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
         let request_inner = request.get_ref();
         reject_coinbase_sentinels(&request_inner.outpoints)?;
         let endpoint = self.require_ingest_control_proxy_endpoint(
@@ -809,23 +811,5 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
             "shielded_protocol must be specified",
         )),
         Err(_) => Err(Status::invalid_argument("shielded_protocol is unknown")),
-    }
-}
-
-fn cursor_from_request(cursor_bytes: Vec<u8>) -> Option<StreamCursorTokenV1> {
-    if cursor_bytes.is_empty() {
-        None
-    } else {
-        Some(StreamCursorTokenV1::from_bytes(cursor_bytes))
-    }
-}
-
-fn chain_event_stream_family_from_request(family: i32) -> Result<ChainEventStreamFamily, Status> {
-    match wallet::ChainEventStreamFamily::try_from(family) {
-        Ok(wallet::ChainEventStreamFamily::Tip) => Ok(ChainEventStreamFamily::Tip),
-        Ok(wallet::ChainEventStreamFamily::Finalized) => Ok(ChainEventStreamFamily::Finalized),
-        Err(_) => Err(Status::invalid_argument(
-            "chain-event stream family is unknown",
-        )),
     }
 }

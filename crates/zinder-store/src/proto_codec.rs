@@ -5,13 +5,13 @@ use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes,
     TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, UnixTimestampMillis,
+    TransparentOutPoint, TransparentPrevout, TransparentPrevoutEntry, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
 
 use crate::{
-    ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
-    MempoolEventEnvelope, StreamCursorTokenV1,
+    ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventStreamFamily,
+    ChainRangeReverted, MempoolEvent, MempoolEventEnvelope, StreamCursorTokenV1,
 };
 
 /// Error returned when a store chain event cannot be represented on the v1 wallet proto.
@@ -159,6 +159,58 @@ pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
     wallet::OutPoint {
         transaction_id: outpoint.transaction_id.as_bytes().into(),
         output_index: outpoint.output_index,
+    }
+}
+
+/// Encodes a [`TransparentPrevout`] into the wallet protocol message.
+#[must_use]
+pub fn transparent_prevout_message(prevout: TransparentPrevout) -> wallet::TransparentPrevout {
+    wallet::TransparentPrevout {
+        value_zat: prevout.value_zat,
+        script_pub_key: prevout.script_pub_key,
+    }
+}
+
+/// Encodes a [`TransparentPrevoutEntry`] into the wallet protocol message.
+///
+/// Used by both the canonical `WalletQuery.TransparentPrevouts` surface and
+/// the live-mempool `WalletQuery.TransparentMempoolPrevouts` surface, so the
+/// two sides share one wire shape and one encoder.
+#[must_use]
+pub fn transparent_prevout_entry_message(
+    entry: TransparentPrevoutEntry,
+) -> wallet::TransparentPrevoutEntry {
+    wallet::TransparentPrevoutEntry {
+        outpoint: Some(outpoint_message(&entry.outpoint)),
+        prevout: entry.prevout.map(transparent_prevout_message),
+    }
+}
+
+/// Decodes a stream cursor from the bytes carried by a request message.
+///
+/// Empty bytes encode "no cursor" (start at the beginning of the stream);
+/// every other value materializes a [`StreamCursorTokenV1`] without
+/// validating its envelope. Validation happens at the seek site.
+#[must_use]
+pub fn stream_cursor_from_message_bytes(cursor_bytes: Vec<u8>) -> Option<StreamCursorTokenV1> {
+    if cursor_bytes.is_empty() {
+        None
+    } else {
+        Some(StreamCursorTokenV1::from_bytes(cursor_bytes))
+    }
+}
+
+/// Decodes the chain-event stream family carried by a request message.
+///
+/// The wire field is the integer encoding of `wallet::ChainEventStreamFamily`.
+/// Returns `None` for any unknown integer; callers map that to an
+/// `INVALID_ARGUMENT` diagnostic at the transport boundary.
+#[must_use]
+pub fn chain_event_stream_family_from_message(family: i32) -> Option<ChainEventStreamFamily> {
+    match wallet::ChainEventStreamFamily::try_from(family) {
+        Ok(wallet::ChainEventStreamFamily::Tip) => Some(ChainEventStreamFamily::Tip),
+        Ok(wallet::ChainEventStreamFamily::Finalized) => Some(ChainEventStreamFamily::Finalized),
+        Err(_) => None,
     }
 }
 

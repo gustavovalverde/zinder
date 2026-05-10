@@ -25,6 +25,7 @@ zinder-store.workspace = true
 [dev-dependencies]
 eyre.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
 zinder-query.workspace = true
 zinder-testkit.workspace = true

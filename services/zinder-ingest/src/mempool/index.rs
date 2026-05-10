@@ -61,6 +61,7 @@ struct MempoolIndexState {
         TransparentAddressScriptHash,
         HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     >,
+    output_by_outpoint: HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     spend_by_outpoint: HashMap<TransparentOutPoint, TransactionId>,
     last_updated_at: UnixTimestampMillis,
 }
@@ -70,6 +71,7 @@ impl Default for MempoolIndexState {
         Self {
             entries: HashMap::new(),
             outputs_by_address: HashMap::new(),
+            output_by_outpoint: HashMap::new(),
             spend_by_outpoint: HashMap::new(),
             last_updated_at: UnixTimestampMillis::now(),
         }
@@ -186,14 +188,8 @@ impl MempoolIndex {
             .iter()
             .map(|outpoint| {
                 let prevout = state
-                    .entries
-                    .get(&outpoint.transaction_id)
-                    .and_then(|entry| {
-                        entry
-                            .transparent_outputs
-                            .iter()
-                            .find(|mempool_output| mempool_output.outpoint == *outpoint)
-                    })
+                    .output_by_outpoint
+                    .get(outpoint)
                     .map(|mempool_output| TransparentPrevout {
                         value_zat: mempool_output.value_zat,
                         script_pub_key: mempool_output.script_pub_key.clone(),
@@ -263,15 +259,21 @@ impl MempoolIndex {
         });
         let bound = u32_to_usize(max_entries);
         let end_index = start_index.saturating_add(bound).min(entries.len());
-        let page_entries = entries[start_index..end_index].to_vec();
-        let next_after_transaction_id = if end_index < entries.len() {
-            page_entries.last().map(|entry| entry.transaction_id)
+        let has_more = end_index < entries.len();
+
+        // Reuse the sorted vec for the page: trim the tail past end_index,
+        // then shift the head out via drain. Avoids the second Vec allocation
+        // an `entries[start..end].to_vec()` would force.
+        entries.truncate(end_index);
+        entries.drain(..start_index);
+        let next_after_transaction_id = if has_more {
+            entries.last().map(|entry| entry.transaction_id)
         } else {
             None
         };
 
         MempoolSnapshotPage {
-            entries: page_entries,
+            entries,
             next_after_transaction_id,
             last_updated_at,
         }
@@ -292,6 +294,9 @@ fn index_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry)
             .outputs_by_address
             .entry(transparent_output.address_script_hash)
             .or_default()
+            .insert(transparent_output.outpoint, transparent_output.clone());
+        state
+            .output_by_outpoint
             .insert(transparent_output.outpoint, transparent_output.clone());
     }
     for transparent_spend in &entry.transparent_spends {
@@ -314,6 +319,9 @@ fn unindex_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntr
                     .remove(&transparent_output.address_script_hash);
             }
         }
+        state
+            .output_by_outpoint
+            .remove(&transparent_output.outpoint);
     }
     for transparent_spend in &entry.transparent_spends {
         state

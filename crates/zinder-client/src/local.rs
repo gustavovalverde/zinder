@@ -551,7 +551,7 @@ impl ChainIndex for LocalChainIndex {
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],
-    ) -> Result<zinder_core::TransparentMempoolPrevoutsResponse, IndexerError> {
+    ) -> Result<zinder_core::TransparentPrevoutsResponse, IndexerError> {
         self.remote("transparent_mempool_prevouts")?
             .transparent_mempool_prevouts(outpoints)
             .await

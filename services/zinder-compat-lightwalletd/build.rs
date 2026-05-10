@@ -5,15 +5,32 @@
 use std::process::Command;
 
 fn main() {
-    let git_hash = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|hash| hash.trim().to_owned())
-        .unwrap_or_default();
+    let git_hash = git_command(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=ZINDER_GIT_COMMIT={git_hash}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+
+    // Watch the files git updates as commits land or refs repack so the
+    // recorded hash stays current. `.git/HEAD` flips on checkout, the
+    // per-branch ref file moves on every commit, and `packed-refs` is what
+    // git fetch/push update when refs are compacted.
+    if let Some(git_dir) = git_command(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        println!("cargo:rerun-if-changed={git_dir}/packed-refs");
+        if let Some(symbolic_ref) = git_command(&["symbolic-ref", "-q", "HEAD"]) {
+            println!("cargo:rerun-if-changed={git_dir}/{symbolic_ref}");
+        }
+    }
+}
+
+fn git_command(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
