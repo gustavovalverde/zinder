@@ -189,7 +189,8 @@ Prometheus loads `observability/prometheus/rules/zinder-readiness.yml`. The
 local rules cover:
 
 - scrape targets down
-- non-ready readiness causes
+- traffic-blocking readiness causes
+- traffic-safe readiness warnings
 - secondary replica lag
 - node RPC errors
 - wallet-query p95 above 250ms
@@ -202,7 +203,8 @@ local rules cover:
 The bundled dashboard highlights multi-process storage-access signals that
 should make writer, secondary-reader, and replica-lag failures easy to spot:
 
-- `Non-Ready Services`: red when any service reports a non-ready readiness cause.
+- `Traffic-Blocking Services`: red when any service reports a readiness cause
+  that should fail load-balancer readiness.
 - `Storage Access Availability`: red when writer-status serving, writer-status
   fetching, or secondary visibility is unavailable over the last five minutes.
 - `Replica Lag`: chain-epoch lag from readiness and secondary catchup.

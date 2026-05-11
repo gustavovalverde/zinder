@@ -5,8 +5,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
+use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    OpsServer, Readiness, cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
+    BearerToken, OpsServer, Readiness, cancel_on_ctrl_c, connect_authenticated_channel,
+    install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::SecondaryChainStore;
@@ -14,6 +16,8 @@ use zinder_store::SecondaryChainStore;
 mod config;
 
 use config::{QueryConfig, QueryConfigError, QueryConfigOverrides};
+
+const EXPLORER_TRANSPARENT_BALANCE_CAPABILITY: &str = "derive.explorer.transparent_balance_v1";
 
 #[derive(Parser)]
 #[command(name = "zinder-query")]
@@ -59,6 +63,16 @@ struct Cli {
     /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
+    /// `zinder-derive` `ExplorerQuery` endpoint used for federated balance reads.
+    #[arg(long = "derive-explorer-endpoint")]
+    derive_explorer_endpoint: Option<String>,
+    /// Path to a file containing the shared-secret bearer token used by the
+    /// `ExplorerQuery` endpoint. Required when `zinder-derive` enforces auth.
+    #[arg(long = "derive-explorer-token-path")]
+    derive_explorer_token_path: Option<PathBuf>,
+    /// Cadence for probing the `ExplorerQuery` capability descriptor.
+    #[arg(long = "derive-explorer-probe-interval-ms")]
+    derive_explorer_probe_interval_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -122,6 +136,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let broadcaster = build_broadcaster(query_config.broadcaster.as_ref())?;
     let transaction_broadcast_enabled = broadcaster.is_some();
     let wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
+    let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
         network: query_config.network.name().to_owned(),
         transaction_broadcast_enabled,
@@ -136,12 +151,39 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             server_info,
             query_config.ingest_control_addr.clone(),
         );
+        if let Some(explorer_config) = query_config.explorer_derive.clone() {
+            let explorer_proxy = zinder_query::DeriveProxy::new(
+                zinder_query::DeriveProxyConfig {
+                    endpoint: explorer_config.endpoint.clone(),
+                    bearer_token: explorer_config.bearer_token.clone(),
+                    capability: EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
+                },
+                ExplorerQueryClient::new,
+            );
+            let readiness = explorer_proxy.readiness();
+            let endpoint = explorer_config.endpoint.clone();
+            let bearer_token = explorer_config.bearer_token.clone();
+            let _derive_probe_handle = zinder_query::spawn_derive_readiness_probe(
+                readiness,
+                move || probe_explorer_capability(endpoint.clone(), bearer_token.clone()),
+                zinder_query::DeriveReadinessProbeConfig {
+                    probe_interval: explorer_config.probe_interval,
+                },
+                cancel.clone(),
+            );
+            tracing::info!(
+                target: "zinder::query",
+                event = "derive_explorer_proxy_configured",
+                endpoint = %explorer_config.endpoint,
+                "derive-plane explorer proxy configured"
+            );
+            adapter = adapter.with_explorer_proxy(explorer_proxy);
+        }
         if let Some(token) = query_config.ingest_control_bearer_token.clone() {
             adapter = adapter.with_ingest_control_bearer_token(token);
         }
         adapter
     };
-    let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
         store,
@@ -206,6 +248,25 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     }
 
     server_result.map_err(QueryConfigError::Transport)
+}
+
+async fn probe_explorer_capability(endpoint: String, bearer_token: Option<BearerToken>) -> bool {
+    let Ok(channel) = connect_authenticated_channel(&endpoint, bearer_token.as_ref()).await else {
+        return false;
+    };
+    let mut client = ExplorerQueryClient::new(channel);
+    let Ok(response) = client.server_info(ServerInfoRequest {}).await else {
+        return false;
+    };
+    response
+        .into_inner()
+        .capabilities
+        .is_some_and(|capabilities| {
+            capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == EXPLORER_TRANSPARENT_BALANCE_CAPABILITY)
+        })
 }
 
 fn spawn_grpc_health_reporter(
@@ -310,6 +371,9 @@ impl From<Cli> for QueryConfigOverrides {
             mempool_invalidated_retention_hours: cli.mempool_invalidated_retention_hours,
             listen_addr: cli.listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
+            derive_explorer_endpoint: cli.derive_explorer_endpoint,
+            derive_explorer_token_path: cli.derive_explorer_token_path,
+            derive_explorer_probe_interval_ms: cli.derive_explorer_probe_interval_ms,
         }
     }
 }

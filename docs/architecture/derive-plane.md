@@ -157,12 +157,15 @@ Configuration follows the canonical TOML conventions ([Public Interfaces §Confi
 [derive.explorer]
 listen_addr = "127.0.0.1:9068"
 storage_path = "/var/lib/zinder-derive-explorer"
+token_path = "/run/secrets/zinder-derive-explorer-token"
 chain_events_endpoint = "https://zinder.example:9067"  # zinder-query gRPC
 chain_events_cursor_persist_path = "/var/lib/zinder-derive-explorer/cursor"
 
 [derive.explorer.retention]
 view_retention_days = 365
 ```
+
+When `derive.explorer.token_path` is set, `zinder-derive` enforces the same shared-secret bearer-token interceptor used by private Zinder control planes. The matching `zinder-query` process must point its `[derive.explorer] token_path` at the same secret before it advertises federated derive capabilities.
 
 Sensitive upstream node credentials never reach the derive plane. The derive plane authenticates against `zinder-query`, not against Zebra.
 

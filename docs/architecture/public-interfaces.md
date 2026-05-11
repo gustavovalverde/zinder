@@ -507,12 +507,27 @@ such as raw-transaction streams or compact-transaction streams. Those are
 compatibility adapter views derived from `MempoolSnapshot` and `MempoolEvents`;
 the native capability vocabulary stays on snapshot and event semantics.
 
-Source capability strings live under `ServerCapabilities.node.capabilities`:
+`ServerCapabilities.node.capabilities` is reserved for source capability
+snapshots when the runtime can pass the source probe result to the query
+service. Today's storage-only `zinder-query` adapter does not call upstream
+nodes, so it returns an empty node-capability list by default rather than
+guessing.
 
-- `node.streaming_source` (advertised when ingest consumes Zebra's gRPC indexer stream)
-- `node.spending_tx_lookup` (advertised when Zebra's `--features indexer` is detected)
-- `node.openrpc_discovery` (advertised when a JSON-RPC source successfully parses `rpc.discover`)
-- `node.json_rpc` (advertised when JSON-RPC is the active source backend)
+The current `zinder-source::NodeCapability` diagnostic names are:
+
+- `best_chain_blocks`
+- `tip_id`
+- `tree_state`
+- `subtree_roots`
+- `finalized_height`
+- `readiness_probe`
+- `transaction_broadcast`
+- `json_rpc`
+- `openrpc_discovery`
+
+Do not advertise future source capabilities such as block-stream ingestion or
+spending-transaction lookup until the source adapter and runtime wiring both
+exist.
 
 ### Deprecation policy
 

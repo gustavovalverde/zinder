@@ -27,6 +27,8 @@ eyre.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
+zebra-chain.workspace = true
+zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
 

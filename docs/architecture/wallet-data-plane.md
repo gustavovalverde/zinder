@@ -388,7 +388,7 @@ The `ChainIndex` Rust API exposes `transparent_address_balance(addresses, at_epo
 
 ## Capability Discovery
 
-`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. New methods land with new capability strings; deprecated capabilities continue to be advertised alongside their replacement until the documented removal version. The `node` field of the descriptor carries upstream-node capabilities detected by `zinder-source` (e.g. `node.streaming_source`, `node.spending_tx_lookup`), giving operators a single picture of the deployment's read surface.
+`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. New methods land with new capability strings; deprecated capabilities continue to be advertised alongside their replacement until the documented removal version. The descriptor's `node` field is reserved for upstream-node capability snapshots, but storage-only `zinder-query` deployments leave it empty unless a runtime handoff supplies source probe results.
 
 ## In-Process Rust API
 

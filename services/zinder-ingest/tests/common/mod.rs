@@ -793,6 +793,17 @@ pub(crate) struct BackfillConfigToml<'fields> {
     pub(crate) allow_near_tip_finalize: bool,
 }
 
+/// Builder for a wallet-serving TOML config file used by the CLI live tests.
+pub(crate) struct WalletServingBackfillConfigToml<'fields> {
+    pub(crate) network_name: &'fields str,
+    pub(crate) json_rpc_addr: &'fields str,
+    pub(crate) node_auth_username: &'fields str,
+    pub(crate) node_auth_password: &'fields str,
+    pub(crate) storage_path: &'fields Path,
+    pub(crate) to_height: u32,
+    pub(crate) request_timeout_secs: u64,
+}
+
 /// Renders a `BackfillConfigToml` into the TOML shape `zinder-ingest` accepts.
 pub(crate) fn backfill_config_toml(config_toml: &BackfillConfigToml<'_>) -> Result<String> {
     Ok(format!(
@@ -829,6 +840,45 @@ allow_near_tip_finalize = {}
         config_toml.from_height,
         config_toml.to_height,
         config_toml.allow_near_tip_finalize
+    ))
+}
+
+/// Renders a wallet-serving `BackfillConfigToml` into the TOML shape
+/// `zinder-ingest` accepts.
+pub(crate) fn wallet_serving_backfill_config_toml(
+    config_toml: &WalletServingBackfillConfigToml<'_>,
+) -> Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "{}"
+
+[node]
+source = "zebra-json-rpc"
+json_rpc_addr = "{}"
+request_timeout_secs = {}
+
+[node.auth]
+method = "basic"
+username = "{}"
+password = "{}"
+
+[storage]
+path = "{}"
+
+[ingest]
+commit_batch_blocks = 50
+
+[backfill]
+coverage = "wallet-serving"
+to_height = {}
+"#,
+        config_toml.network_name,
+        config_toml.json_rpc_addr,
+        config_toml.request_timeout_secs,
+        config_toml.node_auth_username,
+        config_toml.node_auth_password,
+        path_str(config_toml.storage_path)?,
+        config_toml.to_height,
     ))
 }
 

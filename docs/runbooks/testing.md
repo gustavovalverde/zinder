@@ -3,8 +3,9 @@
 Operational procedures for validating Zinder against its workspace, real Zebra
 nodes, and external wallet applications. The structural rules behind the test
 tiers live in [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) and
-[ADR-0007](../adrs/0007-multi-process-storage-access.md); this document is the
-step-by-step guide for actually running them.
+[ADR-0007](../adrs/0007-multi-process-storage-access.md); the consumer release
+gate lives in [ADR-0012](../adrs/0012-consumer-release-certification.md). This
+document is the step-by-step guide for actually running them.
 
 ## Test tier matrix
 
@@ -13,6 +14,7 @@ step-by-step guide for actually running them.
 | T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
+| Release parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Release / tag pipeline | Consumer-shaped request and error-shape regressions for Zashi/Zodl, Zallet, public lightwalletd operators, and explorers |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
 | T3 Zallet live | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | Release / integration certification | Real Zallet binary using Zinder's native contract |
 | External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
@@ -24,6 +26,10 @@ targets Zinder is available. Every live test additionally carries
 `#[ignore = LIVE_TEST_IGNORE_REASON]` and a runtime
 `zinder_testkit::live::require_live()` check, so a stray `cargo test` cannot
 talk to a node by accident.
+
+`ci-parity` is fixture-backed and does not require `ZINDER_TEST_LIVE`. Treat it
+as a release-certification gate for consumer-shaped contracts, not as a
+replacement for live SDK, Zallet, or network validation.
 
 ## Default validation gate (T0 + T1 + T2 + format/lint/docs)
 
@@ -45,6 +51,30 @@ git diff --check
 Expected outcome: every command exits zero. The full suite runs in ~5 minutes
 on a developer laptop. If `cargo machete` reports unused dependencies on a
 crate you did not touch, treat it as a pre-existing finding, not a blocker.
+
+## Release parity gate (consumer-shaped fixtures)
+
+Run before tagging a release, and after any change that touches a consumer-facing
+wire contract or compatibility adapter:
+
+```bash
+cargo nextest run --profile=ci-parity
+```
+
+Expected outcome: every `parity::` module exits zero and the report is archived
+with the release evidence. This profile is organized by consumer:
+
+- `parity/zashi.rs` covers the lightwalletd-compatible shapes Zashi/Zodl and the
+  Android SDK hit today.
+- `parity/zallet.rs` covers the Zinder-native `WalletQuery` shape consumed by
+  Zallet.
+- `parity/lightwalletd_operators.rs` covers public lightwalletd operator
+  expectations.
+- `parity/explorers.rs` covers explorer-facing transparent-address read shapes.
+
+Do not use `ci-parity` as proof that a real consumer SDK or binary works. It
+proves the fixture-backed request and error shapes that must stay stable before
+the slower external runs start.
 
 ## T3: Live regtest sweep
 
@@ -449,6 +479,23 @@ What to validate by hand:
   resulting `SendResponse.error_code` matches the documented scheme
   (`0`, `-22`, `-26`, `-27`, `-1`).
 
+For production Zashi/Zodl claims, keep the evidence stricter:
+
+- Create-new-wallet bootstrap reaches the compat endpoint's advertised tip
+  without protocol-shape errors.
+- Restore/import and resync flows either request tree state and subtree roots at
+  or above the wallet-serving store floor, or fail only with the documented
+  strict `NOT_FOUND` unsupported-floor case. Unknown tree-state or subtree-root
+  gaps are release blockers, not acceptable follow-up notes.
+- `GetAddressUtxosStream` is backed by stored transparent UTXO artifacts.
+  Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
+  not satisfy the wallet-serving contract.
+- Pending-transaction UX requires both mempool surfaces: `GetMempoolTx` returns
+  the compact transaction while pending, and `GetMempoolStream` emits the raw
+  transaction before closing on the mining tip change.
+- Send tests record writer-tip lag at submission time. A success when the writer
+  is outside the wallet expiry window is not production evidence.
+
 Reference comparison points: `zec.rocks` for public lightwalletd behavior,
 the existing `wallet_sdk_scan.rs` for the in-process baseline.
 
@@ -460,16 +507,22 @@ For new wire shapes that no Rust client consumes yet (`BlockSelector`,
 scripted version of every probe below is at
 [`scripts/native-grpc-smoke.sh`](../../scripts/native-grpc-smoke.sh) and
 takes one optional positional argument (the `host:port` of a running
-`zinder-query`):
+`zinder-query`). By default, it probes the latest visible block so it works
+against checkpoint-bootstrapped stores. Set `ZINDER_QUERY_HEIGHT` when you need
+to pin the probe to a specific artifact height:
 
 ```bash
 scripts/native-grpc-smoke.sh 127.0.0.1:9069
 ```
 
-The script verifies the capability descriptor matches `ZINDER_CAPABILITIES`
-exactly, exercises `LatestBlock`, both `BlockIdBySelector` arms (height +
-hash round-trip), `BlockHeaderBySelector`, and asserts the `Transaction`
-NotFound mapping. Exit code zero is the contract; any drift fails CI.
+The script verifies the standalone `WalletQuery` capability baseline, exercises
+`LatestBlock`, both `BlockIdBySelector` arms (height + hash round-trip),
+`BlockHeaderBySelector`, and asserts the `Transaction` NotFound mapping. Exit
+code zero is the contract; any drift fails CI. The
+`derive.explorer.transparent_balance_v1` capability is conditional on a fresh
+derive proxy. Set `ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE=1` when the query
+process is started with `zinder-derive` and the smoke should require that
+capability too.
 
 ### Bring up `zinder-query`
 
@@ -527,6 +580,10 @@ derive.explorer.ready_v1
 derive.explorer.transparent_balance_v1
 ```
 <!-- capability-list:testing-runbook:end -->
+
+Standalone `zinder-query` processes advertise the list above minus
+`derive.explorer.transparent_balance_v1` until the configured derive proxy is
+reachable and fresh.
 
 ### `BlockSelector` smoke
 
@@ -588,9 +645,66 @@ cargo nextest run --profile=ci-live -E 'test(<failing_test>)' \
 
 The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
 
+## Ecosystem validation queue
+
+Use this queue when closing the remaining ecosystem gaps after the default and
+live-node gates are already green. Each item points at the owning detail instead
+of repeating the full procedure here. Keep the evidence artifacts in `.tmp/`
+unless the result changes a durable claim, in which case update the referenced
+architecture or reference page.
+
+| Gap | Friction | Run shape | Pass condition | Evidence to keep | Owning detail |
+| --- | -------- | --------- | -------------- | ---------------- | ------------- |
+| Full wallet-serving testnet backfill | Medium | Against a synced testnet Zebra, run `zinder-ingest backfill --wallet-serving` to a safe height, then `tip-follow`, `zinder-query`, and `zinder-compat-lightwalletd` over the same store. | Store covers the wallet-serving floor, readers open from secondaries, `/readyz` reports ready or bounded syncing, `GetLightdInfo` reports a non-zero height and `taddrSupport: true`. | Ingest and reader logs, `/readyz` JSON, `GetLightdInfo` output, first and last ingested heights. | [Android findings §Reproduction](../reference/android-wallet-integration-findings.md#reproduction), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
+| Android SDK / Zashi bootstrap and restore | Medium | Point the SDK demo app or Zashi/Zodl at the testnet compat endpoint. Exercise create-new-wallet first, then restore/import or resync against the same serving store. | Create-new-wallet and restored/resync wallets reach the chain tip when requested tree-state and subtree-root heights are at or above the store floor. Below-floor requests fail only as the documented strict `NOT_FOUND` unsupported-floor case; unknown tree-state or subtree-root gaps are blockers. | `adb logcat`, SDK/Zashi endpoint config diff, wallet-visible height, store floor, requested tree-state/subtree-root heights, `GetAddressUtxosStream` sample. | [External integration: Zashi / Android SDK](#external-integration-zashi--android-sdk), [Android findings §Open questions](../reference/android-wallet-integration-findings.md#open-questions) |
+| Send plus mempool end-to-end | Medium | With `tip-follow` and the mempool surface running, open the mempool stream, then submit a self-send from a real wallet through `zinder-compat-lightwalletd`. | `SendTransaction` returns the expected success mapping. `GetMempoolStream` emits `RawTransaction`, stays open while the tx is pending, and closes on mining. `GetMempoolTx` returns the compact tx while pending and empties after mining. Wallet scan-back observes the mined tx, and writer-tip lag stays inside the wallet expiry window. | Wallet logs, compat logs, mempool stream excerpt, `GetMempoolTx` before/after output, txid, mined height, `/readyz` lag sample at submit time. | [Android findings §Why mempool compatibility belongs in the wallet contract](../reference/android-wallet-integration-findings.md#why-mempool-compatibility-belongs-in-the-wallet-contract), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
+| Real Zallet native-contract gate | Medium | Start a Zinder-native `zinder-query` integration target, then run `cargo nextest run --profile=ci-zallet-live --run-ignored=all` with `ZINDER_TEST_ZALLET*` pointing at a real Zallet binary and config. | The gate proves the Zallet config targets Zinder's native contract, rejects embedded-Zaino validator config, and observes the required Zallet command output. | Zallet config path, command output, nextest result, `zinder-query` logs. | [T3: Real Zallet binary gate](#t3-real-zallet-binary-gate), [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder) |
+| Mainnet bounded live sweep | Low when local mainnet is synced | Run the mainnet-only `ci-live` tests against the local operator-hosted Zebra before attempting longer sessions. Prefer targeted filters first, then the full live profile if the node is healthy. | Mainnet-only tests pass on `ZINDER_NETWORK=zcash-mainnet`; non-mainnet tests either pass or skip for the documented reason. No test mutates mainnet state. | Nextest output, Zebra tip height, tested block range, node auth source used. | [T3: Live mainnet](#t3-live-mainnet-operator-hosted-zebra), [ADR-0006 §Open mainnet infrastructure questions](../adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions) |
+| lightwalletd / Zaino comparative parity | Medium | Run the same lightwalletd-compatible probes or wallet flow against Zinder and a known lightwalletd or Zaino endpoint. Include `GetBlockRange`, transaction lookup, transparent history, UTXO, mempool, and send shapes that the release claim names. | Zinder returns compatible response and error shapes where the lightwalletd contract applies. Any intentional difference is documented against the native contract or compatibility adapter. Hot-path timings stay inside the published budgets. | Per-method request/response summaries, error codes, timing samples, endpoint versions. | [Lessons from Zaino §Pattern 6](../reference/lessons-from-zaino.md#pattern-6-performance-as-a-sequential-implementation), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
+| Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real SDK or Zashi/Zodl endpoint validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Serving public lightwalletd clients §Operator recipe](../reference/serving-public-lightwalletd-clients.md#operator-recipe), [Service operations §Deployment guidance](../architecture/service-operations.md#deployment-guidance) |
+| Observability and readiness warning semantics | Low | Run `scripts/observability-smoke.sh run` against regtest or a bounded public-network smoke. Inspect `/readyz`, Prometheus, and Grafana readiness panels after traffic generation. | Traffic-blocking readiness causes are zero. `cursor_at_risk` and `mempool_cursor_at_risk` are classified as warnings: `/readyz` still returns HTTP 200 with `"status": "ready"`, and metrics/dashboards expose the warning separately from load-balancer failure. | `.tmp/observability/reports/latest-readiness.json`, latest readiness Markdown, Prometheus query output, Grafana screenshot or panel JSON, service logs. | [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness), [Observability smoke](../../observability/README.md) |
+| Backup, restore, and rolling restart | Low for smoke, medium for a long-running store | Run `scripts/observability-smoke.sh run` with the default backup restore enabled, or manually run `zinder-ingest backup --to <path>` and serve the checkpoint through a restored `zinder-query`. Restart query/compat, then restart ingest and verify readers catch up. | Restored `zinder-query` serves `WalletQuery/LatestBlock` at the checkpointed height, secondaries reopen from the restored or live store, restart/shutdown is clean, and a second writer cannot silently take over an already-open primary store. | Backup path, restore `LatestBlock` output, restart logs, `/readyz` after each restart, second-primary failure output. | [Service operations §Production Configuration](../architecture/service-operations.md#production-configuration), [Service operations §Recovery](../architecture/service-operations.md#recovery), [Observability smoke](../../observability/README.md) |
+| Long soak | High | Run `tip-follow`, `zinder-query`, `zinder-compat-lightwalletd`, and any derive or mempool surface needed by the claim for several hours or longer while scraping metrics. Exercise read streams during the run. | No unexplained readiness flaps, writer-tip and reader lag stay bounded, cursor-retention and RocksDB alerts stay quiet, memory growth is explainable, and restart/shutdown is clean. | Metrics scrape, readiness samples, process logs, memory/RSS samples, final restart result. | [Service operations §Validation Tiers](../architecture/service-operations.md#validation-tiers), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
+| Release evidence manifest | Low | Before declaring a release candidate production-ready, collect the commands, versions, network, node tip, consumer versions, and artifact paths from the rows above into one file under `.tmp/production-readiness/<run-id>/manifest.md` or `.json`. | A reviewer can replay the certification story without chat history: every claimed consumer, network, command, binary version, and evidence artifact has a path and pass/fail result. | Manifest file, command transcript, commit SHA, binary versions, Zebra version and tip height, SDK/Zodl/Zallet versions. | [ADR-0012](../adrs/0012-consumer-release-certification.md), this runbook |
+
+## Production release certification checklist
+
+Use this checklist only when the goal is a production-readiness or release claim.
+For ordinary code changes, use the shorter pre-flight checklist below.
+
+- [ ] Default validation gate is green.
+- [ ] `cargo nextest run --profile=ci-parity` is green and its report is archived
+      with the release evidence.
+- [ ] T3 regtest is green with Zebra indexer gRPC enabled.
+- [ ] Testnet live sweep is green for every wallet-serving claim in the release.
+- [ ] Mainnet read-only targeted tests are green when the release makes a mainnet
+      readiness claim.
+- [ ] Full wallet-serving backfill and `tip-follow` evidence exists for the target
+      network, including store floor, tip height, `/readyz`, and reader secondary
+      state.
+- [ ] Zashi/Zodl or Android SDK bootstrap, restore/resync, transparent UTXO, send,
+      and mempool evidence is green when claiming lightwalletd-compatible wallet
+      support.
+- [ ] Real Zallet binary gate is green when claiming Zallet support; the config
+      must target Zinder's native contract and must reject embedded-Zaino
+      validator config.
+- [ ] Public deployment audit is green: TLS on the public wallet endpoint, no
+      public plaintext gRPC, no public ops endpoints, no public `IngestControl`,
+      rate limiting present, filesystem permissions restricted, and secrets
+      redacted in logs and `--print-config`.
+- [ ] Observability smoke or calibration report exists, with zero traffic-blocking
+      readiness causes and warning causes classified separately.
+- [ ] Backup restore and restart evidence exists for the store used in the claim.
+- [ ] Long soak evidence exists when the release touches ingestion, storage,
+      mempool, compatibility serving, or public deployment shape.
+- [ ] A release evidence manifest points to every command, version, network,
+      artifact, and pass/fail result used for the claim.
+
 ## Pre-flight checklist (before declaring a change shipped)
 
 - [ ] Default validation gate green (`cargo fmt`/`cargo clippy`/`cargo nextest run --profile=ci`/`cargo nextest run --profile=ci-perf`/`cargo doc`/`cargo deny`).
+- [ ] If the change touched a consumer-facing wire contract or compatibility
+      adapter: `cargo nextest run --profile=ci-parity`.
 - [ ] Live regtest sweep green (`ci-live` profile against z3, with indexer
       gRPC env). Three mainnet-only failures are expected and acceptable.
 - [ ] If the change claims Zallet compatibility: real Zallet binary gate green
@@ -605,6 +719,9 @@ The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
 - [ ] If the change altered storage byte layout: `cargo mutants` against
       `chain_store.rs` and `chain_store/validation.rs` is a healthy plus
       coverage run via `cargo llvm-cov`.
+- [ ] If the change altered readiness, metrics, backup, restart, or deployment
+      configuration: run the relevant observability or deployment row from the
+      ecosystem validation queue.
 - [ ] If the change is mainnet-relevant: filed against the open
       [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) mainnet
       infrastructure work, not retrofitted into the default matrix.
@@ -614,7 +731,11 @@ The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
 - [ADR-0006: Test tiers and live config](../adrs/0006-test-tiers-and-live-config.md) — the structural rules.
 - [ADR-0007: Multi-process storage access](../adrs/0007-multi-process-storage-access.md) — secondary catchup and writer-status semantics that some live tests verify.
 - [ADR-0009: IngestControl transport security](../adrs/0009-ingest-control-transport-security.md) — the bearer-token contract referenced in the external-integration conventions.
+- [ADR-0012: Consumer release certification](../adrs/0012-consumer-release-certification.md) — the `ci-parity` profile and release evidence contract.
 - [Service operations](../architecture/service-operations.md) — the operator-facing deployment story; the external-integration recipes here use its single-host, single-store conventions. For multi-host or multi-process deployments, follow that doc's recipes instead.
 - [Wallet data plane](../architecture/wallet-data-plane.md) — the wire surface the external integration tests exercise.
+- [Android wallet integration findings](../reference/android-wallet-integration-findings.md) — the verified SDK/Zashi reproduction path, deployment implications, and unresolved wallet-serving questions.
+- [Serving public lightwalletd clients](../reference/serving-public-lightwalletd-clients.md) — the public endpoint, TLS, rate-limit, and operator gap checklist for lightwalletd-compatible wallets.
 - [Lessons from Zaino](../reference/lessons-from-zaino.md) — comparison points for "is this behavior right" judgment calls during external-integration testing.
+- [Observability smoke](../../observability/README.md) — the local metrics, readiness, and backup-restore evidence harness.
 - [`scripts/native-grpc-smoke.sh`](../../scripts/native-grpc-smoke.sh) — the scripted version of the manual `grpcurl` recipes below, callable from CI or a dev shell.

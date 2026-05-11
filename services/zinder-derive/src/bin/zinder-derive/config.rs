@@ -5,7 +5,10 @@ use std::{net::SocketAddr, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_runtime::{ConfigError, ConfigLoader, NetworkSection, NetworkToml, require_field};
+use zinder_runtime::{
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
+    require_field,
+};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9069";
@@ -17,6 +20,8 @@ pub(crate) struct DeriveConfig {
     pub(crate) storage_path: PathBuf,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) token_path: Option<PathBuf>,
+    pub(crate) bearer_token: Option<BearerToken>,
     /// Wallet-query endpoint that backs the Shape C balance read path.
     /// Empty string means the federated balance method is unavailable; the
     /// `derive.explorer.transparent_balance_v1` capability is omitted.
@@ -30,6 +35,7 @@ pub(crate) struct DeriveConfigOverrides {
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) token_path: Option<PathBuf>,
     pub(crate) wallet_query_endpoint: Option<String>,
 }
 
@@ -50,6 +56,9 @@ pub(crate) enum DeriveConfigError {
 
     #[error("gRPC reflection initialization failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
+
+    #[error("invalid derive explorer bearer token: {0}")]
+    BearerToken(#[from] BearerTokenError),
 }
 
 /// Loads and validates derive configuration from defaults, file, environment, and CLI overrides.
@@ -68,6 +77,7 @@ pub(crate) fn load_derive_config(
             "derive.explorer.listen_addr",
             overrides.listen_addr.map(|addr| addr.to_string()),
         )?
+        .with_override_path_if("derive.explorer.token_path", overrides.token_path)?
         .with_override_if(
             "ops.listen_addr",
             overrides.ops_listen_addr.map(|addr| addr.to_string()),
@@ -106,6 +116,7 @@ struct DeriveSection {
 struct DeriveExplorerSection {
     listen_addr: Option<String>,
     storage_path: Option<String>,
+    token_path: Option<PathBuf>,
     wallet_query_endpoint: Option<String>,
 }
 
@@ -131,6 +142,8 @@ struct DeriveToml {
 struct DeriveExplorerToml {
     listen_addr: String,
     storage_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_path: Option<String>,
     wallet_query_endpoint: String,
 }
 
@@ -147,6 +160,10 @@ impl DeriveConfigToml {
                 explorer: DeriveExplorerToml {
                     listen_addr: config.listen_addr.to_string(),
                     storage_path: config.storage_path.to_string_lossy().into_owned(),
+                    token_path: config
+                        .token_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
                     wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
                 },
             },
@@ -174,6 +191,11 @@ fn resolve_derive_config(raw: DeriveRawConfig) -> Result<DeriveConfig, DeriveCon
         "derive.explorer.storage_path",
     )?;
     let storage_path = PathBuf::from(storage_path_text);
+    let token_path = raw.derive.explorer.token_path;
+    let bearer_token = token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
     let ops_listen_addr = match raw.ops.listen_addr.as_deref() {
         Some(text) if !text.is_empty() => Some(
             text.parse::<SocketAddr>()
@@ -191,6 +213,8 @@ fn resolve_derive_config(raw: DeriveRawConfig) -> Result<DeriveConfig, DeriveCon
         storage_path,
         listen_addr,
         ops_listen_addr,
+        token_path,
+        bearer_token,
         wallet_query_endpoint,
     })
 }

@@ -662,13 +662,13 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(zinder_readiness_state{cause!=\"ready\"})",
-          "legendFormat": "non-ready services",
+          "expr": "sum(zinder_readiness_state{cause!~\"^(ready|cursor_at_risk|mempool_cursor_at_risk|mempool_source_unavailable|mempool_hydration_lagging)$\"})",
+          "legendFormat": "traffic-blocking services",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Non-Ready Services",
+      "title": "Traffic-Blocking Services",
       "type": "stat"
     },
     {

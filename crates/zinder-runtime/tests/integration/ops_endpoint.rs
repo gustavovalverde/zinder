@@ -6,6 +6,26 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
 use zinder_runtime::{OpsServer, Readiness, ReadinessCause, ReadinessState, spawn_ops_endpoint};
 
+async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
+    let client = Client::builder(TokioExecutor::new()).build_http::<String>();
+    let response = client
+        .get(format!("http://{listen_addr}{path}").parse()?)
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
+async fn get_text(listen_addr: SocketAddr, path: &str) -> Result<(u16, String)> {
+    let client = Client::builder(TokioExecutor::new()).build_http::<String>();
+    let response = client
+        .get(format!("http://{listen_addr}{path}").parse()?)
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok((status, String::from_utf8(body.to_vec())?))
+}
+
 #[tokio::test]
 async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -24,39 +44,23 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let client = Client::builder(TokioExecutor::new()).build_http::<String>();
+    let (status, _healthz_value) = get_json(listen_addr, "/healthz").await?;
+    assert_eq!(status, 200);
 
-    let healthz = client
-        .get(format!("http://{listen_addr}/healthz").parse()?)
-        .await?;
-    assert_eq!(healthz.status(), 200);
-
-    let readyz = client
-        .get(format!("http://{listen_addr}/readyz").parse()?)
-        .await?;
-    assert_eq!(readyz.status(), 200);
-    let readyz_body = readyz.into_body().collect().await?.to_bytes();
-    let readyz_value: serde_json::Value = serde_json::from_slice(&readyz_body)?;
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 200);
     assert_eq!(readyz_value["status"], "ready");
     assert_eq!(readyz_value["cause"], "ready");
     assert_eq!(readyz_value["current_height"], 7);
 
     readiness.set(ReadinessState::not_ready(ReadinessCause::NodeUnavailable));
-    let readyz = client
-        .get(format!("http://{listen_addr}/readyz").parse()?)
-        .await?;
-    assert_eq!(readyz.status(), 503);
-    let readyz_body = readyz.into_body().collect().await?.to_bytes();
-    let readyz_value: serde_json::Value = serde_json::from_slice(&readyz_body)?;
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 503);
     assert_eq!(readyz_value["status"], "not_ready");
     assert_eq!(readyz_value["cause"], "node_unavailable");
 
-    let metrics = client
-        .get(format!("http://{listen_addr}/metrics").parse()?)
-        .await?;
-    assert_eq!(metrics.status(), 200);
-    let metrics_body = metrics.into_body().collect().await?.to_bytes();
-    let metrics_text = String::from_utf8(metrics_body.to_vec())?;
+    let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
+    assert_eq!(status, 200);
     assert!(
         metrics_text.contains("zinder_build_info{"),
         "{metrics_text}"
@@ -85,6 +89,19 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     assert!(
         metrics_text.contains("zinder_readiness_replica_lag_chain_epochs"),
         "{metrics_text}"
+    );
+
+    readiness.set(ReadinessState::mempool_cursor_at_risk(50, 60, Some(7)));
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 200);
+    assert_eq!(readyz_value["status"], "ready");
+    assert_eq!(
+        readyz_value["cause"]["mempool_cursor_at_risk"]["oldest_retained_age_minutes"],
+        50
+    );
+    assert_eq!(
+        readyz_value["cause"]["mempool_cursor_at_risk"]["retention_minutes"],
+        60
     );
 
     server_handle.shutdown().await;

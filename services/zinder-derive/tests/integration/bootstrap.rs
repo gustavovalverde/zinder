@@ -11,7 +11,7 @@ use std::time::Duration;
 use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use zinder_derive::{
     DERIVE_EXPLORER_READY_CAPABILITY, DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
     ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
@@ -100,6 +100,71 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .err()
         .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
     assert_eq!(status.code(), tonic::Code::Unavailable);
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result<()> {
+    use std::str::FromStr as _;
+    use zinder_runtime::{BearerToken, BearerTokenClientInterceptor};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let server_token =
+        BearerToken::from_str("expected").map_err(|error| eyre!("token parse: {error}"))?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: "zcash-regtest".to_owned(),
+    })
+    .with_bearer_token(server_token.clone());
+    let server_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+
+    let unauthenticated_channel = await_with_retry(server_addr).await?;
+    let mut unauthenticated_client = ExplorerQueryClient::new(unauthenticated_channel);
+    let unauthenticated_outcome = unauthenticated_client
+        .server_info(ServerInfoRequest {})
+        .await;
+    let unauthenticated_status = unauthenticated_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected unauthenticated rejection"))?;
+    assert_eq!(unauthenticated_status.code(), tonic::Code::Unauthenticated);
+
+    let wrong_token =
+        BearerToken::from_str("wrong").map_err(|error| eyre!("token parse: {error}"))?;
+    let wrong_channel = Endpoint::from_shared(format!("http://{server_addr}"))?
+        .connect()
+        .await?;
+    let wrong_interceptor = BearerTokenClientInterceptor::new(Some(&wrong_token))
+        .map_err(|error| eyre!("interceptor build: {error}"))?;
+    let mut wrong_client = ExplorerQueryClient::with_interceptor(wrong_channel, wrong_interceptor);
+    let wrong_outcome = wrong_client.server_info(ServerInfoRequest {}).await;
+    let wrong_status = wrong_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected wrong-token rejection"))?;
+    assert_eq!(wrong_status.code(), tonic::Code::Unauthenticated);
+
+    let correct_channel = Endpoint::from_shared(format!("http://{server_addr}"))?
+        .connect()
+        .await?;
+    let correct_interceptor = BearerTokenClientInterceptor::new(Some(&server_token))
+        .map_err(|error| eyre!("interceptor build: {error}"))?;
+    let mut correct_client =
+        ExplorerQueryClient::with_interceptor(correct_channel, correct_interceptor);
+    let correct_response = correct_client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner();
+    let correct_capabilities = correct_response
+        .capabilities
+        .ok_or_else(|| eyre!("server info missing capabilities envelope"))?;
+    assert_eq!(correct_capabilities.network, "zcash-regtest");
 
     server_handle.abort();
     let _ = server_handle.await;

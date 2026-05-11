@@ -16,13 +16,17 @@ use zinder_core::{
     SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_proto::v1::{
+    explorer::explorer_query_client::ExplorerQueryClient,
     ingest::{
         WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletQueryOptions};
+use zinder_query::{
+    DeriveProxy, DeriveProxyConfig, DeriveReadinessGauge, ServerInfoSettings, WalletQuery,
+    WalletQueryGrpcAdapter, WalletQueryOptions,
+};
 use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
 use zinder_testkit::{MockTransactionBroadcaster, StoreFixture};
 
@@ -482,6 +486,52 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
     Ok(())
 }
 
+#[tokio::test]
+async fn native_grpc_service_gates_federated_derive_capability_on_readiness() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
+    let readiness = DeriveReadinessGauge::new();
+    let explorer_proxy = DeriveProxy::with_readiness(
+        DeriveProxyConfig {
+            endpoint: "http://127.0.0.1:0".to_owned(),
+            bearer_token: None,
+            capability: "derive.explorer.transparent_balance_v1",
+        },
+        readiness.clone(),
+        ExplorerQueryClient::new,
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default())
+        .with_explorer_proxy(explorer_proxy);
+
+    let initial_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    assert!(
+        !has_capability(
+            &initial_capabilities,
+            "derive.explorer.transparent_balance_v1"
+        ),
+        "derive capability must be omitted before the readiness probe succeeds"
+    );
+
+    readiness.mark_ready();
+    let ready_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    assert!(has_capability(
+        &ready_capabilities,
+        "derive.explorer.transparent_balance_v1"
+    ));
+
+    readiness.mark_not_ready();
+    let not_ready_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    assert!(
+        !has_capability(
+            &not_ready_capabilities,
+            "derive.explorer.transparent_balance_v1"
+        ),
+        "derive capability must be removed after the readiness probe fails"
+    );
+
+    Ok(())
+}
+
 struct StoredWalletArtifacts {
     chain_epoch: ChainEpoch,
     compact_block: CompactBlockArtifact,
@@ -645,6 +695,16 @@ fn has_capability(capabilities: &wallet::ServerCapabilities, capability: &str) -
         .capabilities
         .iter()
         .any(|advertised| advertised == capability)
+}
+
+async fn wallet_server_capabilities(
+    grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
+) -> eyre::Result<wallet::ServerCapabilities> {
+    WalletQueryService::server_info(grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+        .await?
+        .into_inner()
+        .capabilities
+        .ok_or_else(|| eyre!("missing wallet server capabilities"))
 }
 
 fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {

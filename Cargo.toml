@@ -37,7 +37,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client"] }
 metrics = "0.24.4"
-metrics-exporter-prometheus = { version = "0.18.2", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
 prost = "0.14.3"
 prost-build = "0.14.3"

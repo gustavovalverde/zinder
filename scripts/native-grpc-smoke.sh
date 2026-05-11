@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
 # Smoke-test the native `zinder-query` gRPC surface against an already-running
-# query process. Validates the capability descriptor matches `ZINDER_CAPABILITIES`
-# (sourced from the compiled binary) and exercises the read-path RPCs that the
-# wire surface most depends on (`BlockIdBySelector`, `BlockHeaderBySelector`,
-# `LatestBlock`, `Transaction`).
+# query process. Validates the baseline capability descriptor for a standalone
+# query process and exercises the read-path RPCs that the wire surface most
+# depends on (`BlockIdBySelector`, `BlockHeaderBySelector`, `LatestBlock`,
+# `Transaction`).
 #
 # Usage:
 #   scripts/native-grpc-smoke.sh [<query-addr>]
 #
 # Defaults: query-addr=127.0.0.1:9069. Override per env:
-#   ZINDER_QUERY_GRPC_ADDR  (host:port for the native gRPC endpoint)
-#   ZINDER_QUERY_HEIGHT     (block height to probe; default 1)
+#   ZINDER_QUERY_GRPC_ADDR                     (host:port for the native gRPC endpoint)
+#   ZINDER_QUERY_HEIGHT                        (block height to probe; default latest visible block)
+#   ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE   (require derive balance capability when set to 1)
 #
 # Exit codes:
 #   0  all probes passed
@@ -26,7 +27,8 @@ WALLET_PROTO="${PROTO_DIR}/zinder/v1/wallet/wallet.proto"
 CAPABILITIES_RS="${ROOT_DIR}/crates/zinder-proto/src/capabilities.rs"
 
 QUERY_ADDR="${1:-${ZINDER_QUERY_GRPC_ADDR:-127.0.0.1:9069}}"
-HEIGHT="${ZINDER_QUERY_HEIGHT:-1}"
+HEIGHT="${ZINDER_QUERY_HEIGHT:-}"
+EXPECT_DERIVE_BALANCE="${ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE:-0}"
 
 log() {
   printf '[native-grpc-smoke] %s\n' "$*"
@@ -59,15 +61,21 @@ require_command jq
 [[ -f "${WALLET_PROTO}" ]] || die "wallet.proto not found at ${WALLET_PROTO}" 2
 [[ -f "${CAPABILITIES_RS}" ]] || die "capabilities.rs not found at ${CAPABILITIES_RS}" 2
 
-log "endpoint=${QUERY_ADDR} height=${HEIGHT}"
+log "endpoint=${QUERY_ADDR} height=${HEIGHT:-latest}"
 
-# 1. Capability descriptor parity with ZINDER_CAPABILITIES.
+# 1. Capability descriptor parity with the standalone WalletQuery baseline.
 log "probe ServerInfo"
 server_info=$(grpc_call "zinder.v1.wallet.WalletQuery/ServerInfo" || die "ServerInfo unreachable")
 
 advertised=$(jq -r '.capabilities.capabilities[]?' <<<"${server_info}" | sort)
 expected=$(grep -E '^[[:space:]]*"[a-z][^"]+",' "${CAPABILITIES_RS}" \
-  | sed -E 's/^[[:space:]]*"([^"]+)".*$/\1/' | sort)
+  | sed -E 's/^[[:space:]]*"([^"]+)".*$/\1/' \
+  | grep -vx 'derive.explorer.transparent_balance_v1' \
+  | sort)
+
+if [[ "${EXPECT_DERIVE_BALANCE}" == "1" ]]; then
+  expected=$(printf '%s\n%s\n' "${expected}" "derive.explorer.transparent_balance_v1" | sort)
+fi
 
 if [[ -z "${expected}" ]]; then
   die "could not parse expected capability list from ${CAPABILITIES_RS}"
@@ -82,7 +90,7 @@ if [[ -n "${missing}" || -n "${extra}" ]]; then
   [[ -n "${extra}" ]] && printf '  extra on server:     %s\n' "${extra}" >&2
   exit 1
 fi
-log "ServerInfo capabilities match ZINDER_CAPABILITIES ($(echo "${expected}" | wc -l | tr -d ' ') entries)"
+log "ServerInfo capabilities match standalone WalletQuery baseline ($(echo "${expected}" | wc -l | tr -d ' ') entries)"
 
 # 2. LatestBlock — round-trip the visible chain epoch.
 log "probe LatestBlock"
@@ -90,6 +98,10 @@ latest=$(grpc_call "zinder.v1.wallet.WalletQuery/LatestBlock" || die "LatestBloc
 latest_height=$(jq -r '.latestBlock.height // empty' <<<"${latest}")
 [[ -n "${latest_height}" ]] || die "LatestBlock did not return a height: ${latest}"
 log "LatestBlock.height=${latest_height}"
+if [[ -z "${HEIGHT}" ]]; then
+  HEIGHT="${latest_height}"
+  log "probe height defaulted to LatestBlock.height=${HEIGHT}"
+fi
 
 # 3. BlockIdBySelector by height.
 log "probe BlockIdBySelector (height=${HEIGHT})"

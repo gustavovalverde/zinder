@@ -5,7 +5,41 @@
 //! not byte-equivalence with Zaino (which Zinder deliberately refuses for
 //! the documented anti-patterns).
 
+use std::time::Duration;
+
+use zinder_client::{BlockHeight, ChainEpochId, LocalChainIndex, LocalOpenOptions, Network};
+use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT};
+use zinder_testkit::{ChainFixture, StoreFixture};
+
+const PARITY_TREE_STATE_PAYLOAD: &[u8] =
+    br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{"finalState":"000000"}},"orchard":{"commitments":{"finalState":"111111"}}}"#;
+
 mod explorers;
 mod lightwalletd_operators;
 mod zallet;
 mod zashi;
+
+fn parity_chain_fixture(block_count: u32) -> ChainFixture {
+    ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(block_count)
+        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0))
+        .with_tree_state_payload_at(BlockHeight::new(block_count), PARITY_TREE_STATE_PAYLOAD)
+}
+
+fn committed_store_fixture(chain_fixture: &ChainFixture) -> eyre::Result<StoreFixture> {
+    Ok(StoreFixture::with_chain_committed(
+        chain_fixture,
+        ChainEpochId::new(1),
+    )?)
+}
+
+async fn open_local_chain_index(store_fixture: &StoreFixture) -> eyre::Result<LocalChainIndex> {
+    Ok(LocalChainIndex::open(LocalOpenOptions {
+        storage_path: store_fixture.tempdir_path().to_path_buf(),
+        secondary_path: store_fixture.tempdir_path().join("parity-secondary"),
+        network: Network::ZcashRegtest,
+        subscription_endpoint: None,
+        catchup_interval: Duration::from_millis(20),
+    })
+    .await?)
+}

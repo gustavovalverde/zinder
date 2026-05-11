@@ -35,6 +35,10 @@ struct Cli {
     /// `ExplorerQuery` gRPC listen address, such as 127.0.0.1:9068.
     #[arg(long = "listen-addr")]
     listen_addr: Option<SocketAddr>,
+    /// Path to a file containing the shared-secret bearer token enforced by
+    /// the `ExplorerQuery` endpoint.
+    #[arg(long = "derive-explorer-token-path")]
+    derive_explorer_token_path: Option<PathBuf>,
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
@@ -100,6 +104,9 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     if let Some(endpoint) = derive_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
+    if let Some(token) = derive_config.bearer_token.clone() {
+        grpc_adapter = grpc_adapter.with_bearer_token(token);
+    }
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     readiness.set(ReadinessState::ready(None));
@@ -164,6 +171,7 @@ impl From<Cli> for DeriveConfigOverrides {
             storage_path: cli.storage_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
+            token_path: cli.derive_explorer_token_path,
             wallet_query_endpoint: cli.wallet_query_endpoint,
         }
     }

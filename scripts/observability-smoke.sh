@@ -49,6 +49,8 @@ REPORT_JSON_PATH=""
 REPORT_MARKDOWN_PATH=""
 RUN_ID=""
 STARTED_PROCESS_PID=""
+TRAFFIC_READY_READINESS_CAUSES='^(ready|cursor_at_risk|mempool_cursor_at_risk|mempool_source_unavailable|mempool_hydration_lagging)$'
+READINESS_WARNING_CAUSES='^(cursor_at_risk|mempool_cursor_at_risk|mempool_source_unavailable|mempool_hydration_lagging)$'
 
 log() {
   printf '[zinder-observability] %s\n' "$*"
@@ -845,7 +847,8 @@ write_readiness_report() {
   local report_query_metrics_url
   local report_compat_metrics_url
   local report_targets_up
-  local report_non_ready_services
+  local report_traffic_blocking_services
+  local report_readiness_warning_services
   local report_readiness_sync_lag_blocks
   local report_readiness_replica_lag_chain_epochs
   local report_wallet_query_p95_seconds
@@ -873,7 +876,8 @@ write_readiness_report() {
   report_query_metrics_url="http://$(local_url_addr "$QUERY_OPS_ADDR")/metrics"
   report_compat_metrics_url="http://$(local_url_addr "$COMPAT_OPS_ADDR")/metrics"
   report_targets_up="$(prometheus_max_value 'sum(up{stack="zinder-local"})')"
-  report_non_ready_services="$(prometheus_max_value 'sum(zinder_readiness_state{cause!="ready"} == 1) or vector(0)')"
+  report_traffic_blocking_services="$(prometheus_max_value "sum(zinder_readiness_state{cause!~\"${TRAFFIC_READY_READINESS_CAUSES}\"} == 1) or vector(0)")"
+  report_readiness_warning_services="$(prometheus_max_value "sum(zinder_readiness_state{cause=~\"${READINESS_WARNING_CAUSES}\"} == 1) or vector(0)")"
   report_readiness_sync_lag_blocks="$(prometheus_max_value 'max(zinder_readiness_sync_lag_blocks)')"
   report_readiness_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_readiness_replica_lag_chain_epochs)')"
   report_wallet_query_p95_seconds="$(prometheus_max_value 'max(zinder_query_request_duration_seconds{quantile="0.95"})')"
@@ -906,7 +910,8 @@ write_readiness_report() {
   export REPORT_QUERY_METRICS_URL="$report_query_metrics_url"
   export REPORT_COMPAT_METRICS_URL="$report_compat_metrics_url"
   export REPORT_TARGETS_UP="$report_targets_up"
-  export REPORT_NON_READY_SERVICES="$report_non_ready_services"
+  export REPORT_TRAFFIC_BLOCKING_SERVICES="$report_traffic_blocking_services"
+  export REPORT_READINESS_WARNING_SERVICES="$report_readiness_warning_services"
   export REPORT_READINESS_SYNC_LAG_BLOCKS="$report_readiness_sync_lag_blocks"
   export REPORT_READINESS_REPLICA_LAG_CHAIN_EPOCHS="$report_readiness_replica_lag_chain_epochs"
   export REPORT_WALLET_QUERY_P95_SECONDS="$report_wallet_query_p95_seconds"
@@ -957,7 +962,8 @@ report = {
     "measurements": {
         "backfill_seconds": metric("REPORT_BACKFILL_SECONDS"),
         "targets_up": metric("REPORT_TARGETS_UP"),
-        "non_ready_services": metric("REPORT_NON_READY_SERVICES"),
+        "traffic_blocking_services": metric("REPORT_TRAFFIC_BLOCKING_SERVICES"),
+        "readiness_warning_services": metric("REPORT_READINESS_WARNING_SERVICES"),
         "readiness_sync_lag_blocks": metric("REPORT_READINESS_SYNC_LAG_BLOCKS"),
         "readiness_replica_lag_chain_epochs": metric("REPORT_READINESS_REPLICA_LAG_CHAIN_EPOCHS"),
         "wallet_query_p95_max_seconds": metric("REPORT_WALLET_QUERY_P95_SECONDS"),
@@ -998,7 +1004,8 @@ lines = [
     f"- Backfill range: `{report['checkpoint']['backfill_from_height']}..{report['checkpoint']['backfill_to_height']}`",
     f"- Backfill duration: `{measurements['backfill_seconds']}` seconds",
     f"- Targets up: `{measurements['targets_up']}`",
-    f"- Non-ready services: `{measurements['non_ready_services']}`",
+    f"- Traffic-blocking services: `{measurements['traffic_blocking_services']}`",
+    f"- Readiness warning services: `{measurements['readiness_warning_services']}`",
     f"- Sync lag: `{measurements['readiness_sync_lag_blocks']}` blocks",
     f"- Replica lag: `{measurements['readiness_replica_lag_chain_epochs']}` chain epochs",
     f"- Wallet query p95 max: `{measurements['wallet_query_p95_max_seconds']}` seconds",

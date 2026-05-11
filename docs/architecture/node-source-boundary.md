@@ -86,9 +86,9 @@ The ingest state machine does not depend on dynamic dispatch just because runtim
 
 ## Capability Model
 
-Adapters expose capabilities instead of requiring exact upstream-node versions. The internal `NodeCapabilities` is mirrored to the public `ServerCapabilities.node` field returned by `WalletQuery.ServerInfo`, so operators and clients see one coherent picture of "what does this Zinder deployment support."
+Adapters expose capabilities instead of requiring exact upstream-node versions. `NodeCapabilities` is the source-boundary diagnostic contract used by ingest, readiness, and source tests. It is not automatically mirrored into `WalletQuery.ServerInfo` in storage-only query deployments because `zinder-query` does not call upstream nodes. The `ServerCapabilities.node` field is reserved for a source capability snapshot once the runtime has an explicit handoff from the source-owning process.
 
-Advertised capabilities:
+Current `NodeCapability` names:
 
 - `best_chain_blocks`
 - `tip_id`
@@ -97,18 +97,15 @@ Advertised capabilities:
 - `finalized_height`
 - `readiness_probe`
 - `transaction_broadcast`
-- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and `MempoolChange` gRPC streams can be consumed.
-- `node.spending_tx_lookup` — Zebra's nullifier-to-spending-tx index is available behind `--features indexer`.
-- `node.openrpc_discovery` — `rpc.discover` was called and the upstream-node capability surface was parsed.
-- `node.json_rpc` — JSON-RPC source is the active backend.
-- `mempool_stream` — internal source capability for Zebra `MempoolChange`; not a public wallet capability.
+- `json_rpc`
+- `openrpc_discovery`
 
 New capability names are added to `NodeCapability` when a real consumer reads the capability; aspirational vocabulary is not pre-declared.
 
 Capability discovery happens at startup in the `connect_node` phase. The probe is implementation-specific per backend:
 
 - **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. Optional methods (`getrawmempool`, etc.) are advertised but not required.
-- **Zebra indexer gRPC**: detect feature presence by attempting a no-op subscription and observing whether the gRPC port is reachable. Signal `node.streaming_source` and `node.spending_tx_lookup` only when confirmed.
+- **Zebra indexer gRPC**: the mempool adapter detects feature presence by opening the configured gRPC stream. A block-streaming source and spending-transaction lookup capability are future extensions; they must add real `NodeCapability` variants and runtime wiring in the same change.
 - **zcashd JSON-RPC**: future. Capability probe via `getnetworkinfo` and method probing.
 
 Startup validates required capabilities before ingestion mutates state. Missing or contradictory capabilities produce typed errors:
@@ -127,7 +124,7 @@ Version strings may be logged and included in diagnostics, but they are not the 
 
 `zinder-source` produces `MempoolSourceEvent` values consumed by `zinder-ingest` (see [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)). Two backends are supported, selected by capability discovery:
 
-- **Streaming backend** (preferred): consumes Zebra's `MempoolChange` gRPC stream. Requires `node.streaming_source`. Maps `ADDED` → `Added`, `INVALIDATED` → `Invalidated`, `MINED` → `Mined`. Sub-second latency.
+- **Streaming backend** (preferred): consumes Zebra's `MempoolChange` gRPC stream when an indexer gRPC endpoint is configured. It reports `MempoolSourceCapabilities::streaming()` internally. Maps `ADDED` → `Added`, `INVALIDATED` → `Invalidated`, `MINED` → `Mined`. Sub-second latency.
 - **Polling backend** (fallback): calls `getrawmempool` on `[mempool] poll_interval_ms` (default 10000) and diffs successive responses to synthesize `Added` and `Invalidated` events. `Mined` events are inferred from chain commits, not from `getrawmempool`. Default-second latency.
 
 The backend choice is invisible to clients except through the `mempool_snapshot_age_ms` metric. Operators choose the backend by configuring whether Zebra runs with `--features indexer`; Zinder does not require the streaming backend. `wallet.snapshot.mempool_v1` and `wallet.events.mempool_v1` are advertised when the public mempool methods, storage, and retention path are reachable.

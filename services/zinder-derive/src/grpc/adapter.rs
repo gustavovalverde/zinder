@@ -9,7 +9,7 @@
 //! The derive plane owns no balance column family; the wire shape is the
 //! durable contract.
 
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_proto::v1::{
     explorer::{
         ExplorerServerCapabilities, ServerInfoRequest, ServerInfoResponse,
@@ -21,7 +21,8 @@ use zinder_proto::v1::{
     },
 };
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, BearerTokenConnectError, connect_authenticated_channel,
+    AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
+    connect_authenticated_channel,
 };
 
 /// Capability advertised once the derive consumer infrastructure is alive.
@@ -63,6 +64,7 @@ pub struct ExplorerQueryGrpcAdapter {
     settings: ExplorerServerInfoSettings,
     wallet_query_endpoint: Option<String>,
     wallet_query_bearer_token: Option<BearerToken>,
+    bearer_token: Option<BearerToken>,
 }
 
 impl ExplorerQueryGrpcAdapter {
@@ -73,6 +75,7 @@ impl ExplorerQueryGrpcAdapter {
             settings,
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
+            bearer_token: None,
         }
     }
 
@@ -93,11 +96,25 @@ impl ExplorerQueryGrpcAdapter {
         self
     }
 
+    /// Wires a shared-secret bearer token into the explorer-query adapter.
+    ///
+    /// When set, every gRPC request must carry an `authorization: Bearer
+    /// <token>` metadata header that matches `bearer_token`. When unset,
+    /// localhost-only deployments stay open by default.
+    #[must_use]
+    pub fn with_bearer_token(mut self, bearer_token: BearerToken) -> Self {
+        self.bearer_token = Some(bearer_token);
+        self
+    }
+
     /// Wraps the adapter into a tonic [`ExplorerQueryServer`] ready to be
     /// added to a `tonic::transport::Server` builder.
     #[must_use]
-    pub fn into_server(self) -> ExplorerQueryServer<Self> {
-        ExplorerQueryServer::new(self)
+    pub fn into_server(
+        self,
+    ) -> InterceptedService<ExplorerQueryServer<Self>, BearerTokenServerInterceptor> {
+        let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
+        ExplorerQueryServer::with_interceptor(self, interceptor)
     }
 
     fn advertised_capabilities(&self) -> Vec<String> {

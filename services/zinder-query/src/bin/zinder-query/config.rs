@@ -33,9 +33,19 @@ pub(crate) struct QueryConfig {
     pub(crate) mempool_invalidated_retention_seconds: u64,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) grpc: QueryGrpcConfig,
+    pub(crate) explorer_derive: Option<ExplorerDeriveConfig>,
     /// Optional node broadcaster. Network must match `QueryConfig.network`
     /// when present; the resolver enforces this.
     pub(crate) broadcaster: Option<NodeTarget>,
+}
+
+/// Resolved derive-plane explorer proxy configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct ExplorerDeriveConfig {
+    pub(crate) endpoint: String,
+    pub(crate) token_path: Option<PathBuf>,
+    pub(crate) bearer_token: Option<BearerToken>,
+    pub(crate) probe_interval: Duration,
 }
 
 /// Resolved gRPC runtime options.
@@ -65,6 +75,9 @@ pub(crate) struct QueryConfigOverrides {
     pub(crate) mempool_invalidated_retention_hours: Option<u64>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) node_json_rpc_addr: Option<String>,
+    pub(crate) derive_explorer_endpoint: Option<String>,
+    pub(crate) derive_explorer_token_path: Option<PathBuf>,
+    pub(crate) derive_explorer_probe_interval_ms: Option<u64>,
 }
 
 /// Error returned while resolving query configuration or running the gRPC server.
@@ -137,6 +150,18 @@ pub(crate) fn load_query_config(
             overrides.listen_addr.map(|addr| addr.to_string()),
         )?
         .with_override_if("node.json_rpc_addr", overrides.node_json_rpc_addr)?
+        .with_override_if(
+            "derive.explorer.endpoint",
+            overrides.derive_explorer_endpoint,
+        )?
+        .with_override_path_if(
+            "derive.explorer.token_path",
+            overrides.derive_explorer_token_path,
+        )?
+        .with_override_if(
+            "derive.explorer.probe_interval_ms",
+            overrides.derive_explorer_probe_interval_ms,
+        )?
         .load()?;
 
     resolve_query_config(raw_config)
@@ -156,6 +181,7 @@ struct QueryRawConfig {
     storage: StorageSection,
     query: QuerySection,
     node: NodeSection,
+    derive: QueryDeriveSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -184,6 +210,20 @@ struct QuerySection {
 struct QueryGrpcSection {
     enable_reflection: Option<bool>,
     enable_health: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QueryDeriveSection {
+    explorer: QueryDeriveExplorerSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QueryDeriveExplorerSection {
+    endpoint: Option<String>,
+    token_path: Option<PathBuf>,
+    probe_interval_ms: Option<u64>,
 }
 
 fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
@@ -235,6 +275,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     let enable_health = require_field(config.query.grpc.enable_health, "query.grpc.enable_health")?;
     let broadcaster =
         NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
+    let explorer_derive = resolve_explorer_derive_config(config.derive.explorer)?;
 
     Ok(QueryConfig {
         network,
@@ -253,8 +294,43 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
             enable_reflection,
             enable_health,
         },
+        explorer_derive,
         broadcaster,
     })
+}
+
+fn resolve_explorer_derive_config(
+    config: QueryDeriveExplorerSection,
+) -> Result<Option<ExplorerDeriveConfig>, QueryConfigError> {
+    let Some(endpoint) = config.endpoint else {
+        return Ok(None);
+    };
+    tonic::transport::Endpoint::from_shared(endpoint.clone()).map_err(|source| {
+        ConfigError::invalid(format!(
+            "derive.explorer.endpoint {endpoint} is not a tonic endpoint: {source}"
+        ))
+    })?;
+    let probe_interval_ms = config.probe_interval_ms.unwrap_or_else(|| {
+        u64::try_from(zinder_query::DEFAULT_DERIVE_PROBE_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+    });
+    if probe_interval_ms == 0 {
+        return Err(ConfigError::invalid(
+            "derive.explorer.probe_interval_ms must be greater than zero",
+        )
+        .into());
+    }
+    let token_path = config.token_path;
+    let bearer_token = token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
+
+    Ok(Some(ExplorerDeriveConfig {
+        endpoint,
+        token_path,
+        bearer_token,
+        probe_interval: Duration::from_millis(probe_interval_ms),
+    }))
 }
 
 fn resolve_retention_advertisement(storage: &StorageSection) -> RetentionAdvertisementSeconds {
@@ -280,6 +356,8 @@ struct QueryConfigToml {
     network: NetworkToml,
     storage: StorageToml,
     query: QueryToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derive: Option<QueryDeriveToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<NodeToml>,
 }
@@ -313,6 +391,10 @@ impl QueryConfigToml {
                     enable_health: config.grpc.enable_health,
                 },
             },
+            derive: config
+                .explorer_derive
+                .as_ref()
+                .map(QueryDeriveToml::from_explorer_config),
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
         }
     }
@@ -342,4 +424,32 @@ struct QueryToml {
 struct QueryGrpcToml {
     enable_reflection: bool,
     enable_health: bool,
+}
+
+#[derive(Serialize)]
+struct QueryDeriveToml {
+    explorer: QueryDeriveExplorerToml,
+}
+
+impl QueryDeriveToml {
+    fn from_explorer_config(config: &ExplorerDeriveConfig) -> Self {
+        Self {
+            explorer: QueryDeriveExplorerToml {
+                endpoint: config.endpoint.clone(),
+                token_path: config
+                    .token_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                probe_interval_ms: duration_as_millis_u64(config.probe_interval),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct QueryDeriveExplorerToml {
+    endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_path: Option<String>,
+    probe_interval_ms: u64,
 }

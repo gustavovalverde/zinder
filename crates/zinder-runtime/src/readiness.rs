@@ -130,6 +130,23 @@ impl ReadinessCause {
             Self::ShuttingDown => "shutting_down",
         }
     }
+
+    /// Returns whether this cause still permits production traffic.
+    ///
+    /// Warning causes remain operator-actionable through `/readyz` and
+    /// `zinder_readiness_state`, but they must not make load balancer probes
+    /// fail while the service can still safely serve requests.
+    #[must_use]
+    pub const fn permits_traffic(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready
+                | Self::CursorAtRisk { .. }
+                | Self::MempoolCursorAtRisk { .. }
+                | Self::MempoolSourceUnavailable
+                | Self::MempoolHydrationLagging { .. }
+        )
+    }
 }
 
 /// Snapshot of the current readiness state surfaced to operators.
@@ -190,7 +207,7 @@ impl Readiness {
     pub fn report(&self) -> ReadinessReport {
         let state = *self.inner.lock();
         ReadinessReport {
-            is_ready: matches!(state.cause, ReadinessCause::Ready),
+            is_ready: state.cause.permits_traffic(),
             cause: state.cause,
             current_height: state.current_height,
             target_height: state.target_height,
@@ -373,12 +390,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_marks_ready_only_for_ready_cause() {
+    fn report_marks_ready_for_ready_cause() {
         let readiness = Readiness::new(ReadinessState::ready(Some(10)));
         let report = readiness.report();
         assert!(report.is_ready);
         assert!(matches!(report.cause, ReadinessCause::Ready));
         assert_eq!(report.current_height, Some(10));
+    }
+
+    #[test]
+    fn warning_causes_remain_ready_for_traffic() {
+        let warning_states = [
+            ReadinessState::cursor_at_risk(145, 168, Some(100)),
+            ReadinessState::mempool_cursor_at_risk(49, 60, Some(100)),
+            ReadinessState::mempool_source_unavailable(Some(100)),
+            ReadinessState::mempool_hydration_lagging(3, Some(100)),
+        ];
+
+        for state in warning_states {
+            let report = Readiness::new(state).report();
+            assert!(
+                report.is_ready,
+                "warning cause {:?} must not fail traffic readiness",
+                report.cause
+            );
+            assert_eq!(report.current_height, Some(100));
+        }
     }
 
     #[test]
@@ -438,7 +475,7 @@ mod tests {
     fn cursor_at_risk_carries_retention_window() {
         let readiness = Readiness::new(ReadinessState::cursor_at_risk(145, 168, Some(100)));
         let report = readiness.report();
-        assert!(!report.is_ready);
+        assert!(report.is_ready);
         assert!(matches!(
             report.cause,
             ReadinessCause::CursorAtRisk {

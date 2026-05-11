@@ -58,7 +58,7 @@ Required readiness causes:
 - `mempool_hydration_lagging` — hydration of `MempoolChange::ADDED` notifications via `getrawtransaction` is falling behind the source's emission rate; the index and event log will skip events older than the lag threshold and surface them as missing rather than out-of-order. Operators check upstream JSON-RPC latency and the `zinder_node_request_duration_seconds{operation="get_raw_transaction"}` series
 - `shutting_down` — graceful shutdown in progress; new traffic is rejected
 
-`cursor_at_risk` is informational, not failure: load balancers and orchestrators should treat it as "drain, do not fail." Health-check probes that flip to "unhealthy" on any non-`ready` cause will overreact to this signal. The intent is that operators see the warning before consumers are forcibly expired.
+`cursor_at_risk` and `mempool_*` causes are informational warnings, not traffic-blocking failures: load balancers and orchestrators should treat them as "drain or investigate, do not fail." `/readyz` still returns HTTP 200 and `"status": "ready"` for these causes, while the structured `cause` and `zinder_readiness_state` metric keep the operator-actionable signal visible. Health-check probes that flip to "unhealthy" on any non-`ready` cause will overreact to this signal. The intent is that operators see the warning before consumers are forcibly expired or mempool UX degrades.
 
 `zinder-ingest` readiness is capped by upstream node readiness. If the selected upstream node cannot answer, reports not ready, lacks a required capability, or has unreadable cookie-auth material, Zinder reports a typed not-ready cause instead of accepting traffic.
 

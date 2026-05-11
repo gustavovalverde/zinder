@@ -136,9 +136,9 @@ Forbidden:
 
 ## Capability Model
 
-Adapters expose capabilities instead of requiring exact upstream-node versions. The internal `NodeCapabilities` set is mirrored to the public `ServerCapabilities.node` field returned by `WalletQuery.ServerInfo`, so operators and clients see one coherent picture of what the deployment supports.
+Adapters expose capabilities instead of requiring exact upstream-node versions. The original intent was to mirror `NodeCapabilities` into the public `ServerCapabilities.node` field. Current storage-only `zinder-query` deployments do not call upstream nodes, so the public node descriptor remains empty unless a runtime source snapshot is explicitly handed to query.
 
-Advertised capabilities:
+Current `NodeCapability` names:
 
 - `best_chain_blocks`
 - `tip_id`
@@ -147,11 +147,8 @@ Advertised capabilities:
 - `finalized_height`
 - `readiness_probe`
 - `transaction_broadcast`
-- `node.streaming_source` — Zebra `--features indexer` is detected; `NonFinalizedStateChange` and `MempoolChange` gRPC streams can be consumed.
-- `node.spending_tx_lookup` — Zebra's nullifier-to-spending-tx index is available behind `--features indexer`.
-- `node.openrpc_discovery` — `rpc.discover` was called and the upstream node's capability surface was parsed.
-- `node.json_rpc` — JSON-RPC source is the active backend.
-- `mempool_stream` — internal source capability for Zebra `MempoolChange`; not a public wallet capability.
+- `json_rpc`
+- `openrpc_discovery`
 
 New capability names appear in `NodeCapability` only when a real consumer reads them; aspirational vocabulary stays out.
 

@@ -27,18 +27,20 @@
 use std::time::{Duration, Instant};
 
 use eyre::{Result, eyre};
+use serde::Deserialize;
 use tokio_stream::StreamExt as _;
-use zebra_chain::block::Block as ZebraBlock;
-use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::{
-    BroadcastAccepted, Network, RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+    BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes, TransactionBroadcastResult,
+    TransactionId, UnixTimestampMillis,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
     NodeSource, TransactionBroadcaster, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_testkit::live::{init, require_live_for};
-use zinder_testkit::{P2pkhSpendArgs, TransparentAddress, TransparentTestKey};
+use zinder_testkit::{
+    P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+};
 
 use crate::common::regtest_generate_blocks;
 
@@ -60,6 +62,10 @@ const MEMPOOL_POLL_INTERVAL: Duration = Duration::from_millis(250);
     clippy::wildcard_enum_match_arm,
     reason = "TransactionBroadcastResult is #[non_exhaustive]; the broadcast match collapses every non-Accepted variant into a single test failure"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The live broadcast gate keeps fund selection, broadcast retry, and mempool observation in one auditable path."
+)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_source() -> Result<()>
@@ -78,60 +84,62 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
 
     let json_rpc = zebra_source(&env)?;
 
-    // Snapshot the tip before mining so we know which block to inspect for
-    // the test address's coinbase. This lets the test work against a regtest
-    // sidecar that already has a non-genesis chain state.
-    let tip_before = json_rpc.tip_id().await?.height;
+    let coinbase = locate_spendable_test_coinbase(&env, &json_rpc, &test_address).await?;
 
-    // Mine 101 blocks so the next block's coinbase has 100 confirmations and
-    // is spendable in a tx targeting `tip_before + 102`.
-    regtest_generate_blocks(&env, 101).await?;
+    let mut last_known_rejection = None;
+    for attempt in 0_u64..3 {
+        let recipient_address = scratch_recipient_address(
+            &test_key,
+            UnixTimestampMillis::now().value().saturating_add(attempt),
+        );
+        let raw_tx = test_key
+            .build_p2pkh_spend(&P2pkhSpendArgs {
+                coinbase_txid_be: coinbase.txid_be,
+                coinbase_vout: coinbase.vout,
+                coinbase_value_zats: coinbase.value_zats,
+                recipient: &recipient_address,
+                target_height: coinbase.target_height,
+            })
+            .map_err(|error| eyre!("transparent signer rejected the spend: {error}"))?;
 
-    let funded_height = zinder_core::BlockHeight::new(tip_before.value() + 1);
-    let target_height = tip_before.value() + 102;
-    let coinbase = locate_test_coinbase(&json_rpc, &test_key, &test_address, funded_height).await?;
+        let mempool_source = JsonRpcMempoolSource::with_options(
+            json_rpc.clone(),
+            JsonRpcMempoolSourceOptions {
+                poll_interval: MEMPOOL_POLL_INTERVAL,
+                event_channel_capacity: 16,
+            },
+        );
+        let mut event_stream = mempool_source.events().await?;
 
-    let recipient_address = scratch_recipient_address(&test_key);
-    let raw_tx = test_key
-        .build_p2pkh_spend(&P2pkhSpendArgs {
-            coinbase_txid_be: coinbase.txid_be,
-            coinbase_vout: coinbase.vout,
-            coinbase_value_zats: coinbase.value_zats,
-            recipient: &recipient_address,
-            target_height,
-        })
-        .map_err(|error| eyre!("transparent signer rejected the spend: {error}"))?;
+        let broadcast_outcome = json_rpc
+            .broadcast_transaction(RawTransactionBytes::new(raw_tx))
+            .await?;
+        let broadcast_txid = match &broadcast_outcome {
+            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
+                *transaction_id
+            }
+            _ if is_known_transaction_rejection(&broadcast_outcome) => {
+                last_known_rejection = Some(format!("{broadcast_outcome:?}"));
+                continue;
+            }
+            _ => {
+                return Err(eyre!(
+                    "Zebra rejected the signed transparent v5 transaction: {broadcast_outcome:?}"
+                ));
+            }
+        };
+        tracing::info!(
+            target: "zinder::live",
+            event = "broadcast_cycle_sendrawtransaction_accepted",
+            broadcast_txid = %hex::encode(broadcast_txid.as_bytes()),
+            "Zebra accepted the signed transparent v5 spend"
+        );
 
-    let mempool_source = JsonRpcMempoolSource::with_options(
-        json_rpc.clone(),
-        JsonRpcMempoolSourceOptions {
-            poll_interval: MEMPOOL_POLL_INTERVAL,
-            event_channel_capacity: 16,
-        },
-    );
-    let mut event_stream = mempool_source.events().await?;
-
-    let broadcast_outcome = json_rpc
-        .broadcast_transaction(RawTransactionBytes::new(raw_tx))
-        .await?;
-    let broadcast_txid = match &broadcast_outcome {
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
-            *transaction_id
-        }
-        _ => {
-            return Err(eyre!(
-                "Zebra rejected the signed transparent v5 transaction: {broadcast_outcome:?}"
-            ));
-        }
-    };
-    tracing::info!(
-        target: "zinder::live",
-        event = "broadcast_cycle_sendrawtransaction_accepted",
-        broadcast_txid = %hex::encode(broadcast_txid.as_bytes()),
-        "Zebra accepted the signed transparent v5 spend"
-    );
-
-    let added_entry = wait_for_added(&mut event_stream, broadcast_txid, MEMPOOL_OBSERVE_TIMEOUT)
+        let added_entry = wait_for_added(
+            &mut event_stream,
+            broadcast_txid,
+            MEMPOOL_OBSERVE_TIMEOUT,
+        )
         .await
         .map_err(|error| {
             eyre!(
@@ -141,15 +149,22 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
             )
         })?;
 
-    assert_eq!(
-        added_entry.transaction_id, broadcast_txid,
-        "polling source surfaced a different txid than sendrawtransaction returned"
-    );
-    assert!(
-        !added_entry.raw_transaction_bytes.as_slice().is_empty(),
-        "Added envelope must hydrate raw transaction bytes"
-    );
-    Ok(())
+        assert_eq!(
+            added_entry.transaction_id, broadcast_txid,
+            "polling source surfaced a different txid than sendrawtransaction returned"
+        );
+        assert!(
+            !added_entry.raw_transaction_bytes.as_slice().is_empty(),
+            "Added envelope must hydrate raw transaction bytes"
+        );
+        regtest_generate_blocks(&env, 1).await?;
+        return Ok(());
+    }
+
+    Err(eyre!(
+        "Zebra kept reporting the signed transparent v5 transaction as already known: {}",
+        last_known_rejection.unwrap_or_else(|| "no rejection captured".to_owned())
+    ))
 }
 
 fn zebra_source(env: &zinder_testkit::live::LiveTestEnv) -> Result<ZebraJsonRpcSource> {
@@ -168,68 +183,171 @@ struct TestCoinbase {
     txid_be: [u8; 32],
     vout: u32,
     value_zats: u64,
+    target_height: u32,
 }
 
-async fn locate_test_coinbase(
-    json_rpc: &ZebraJsonRpcSource,
-    test_key: &TransparentTestKey,
-    test_address: &str,
-    starting_height: zinder_core::BlockHeight,
-) -> Result<TestCoinbase> {
-    let block = json_rpc
-        .fetch_block_by_height(starting_height)
-        .await
-        .map_err(|error| {
-            eyre!(
-                "fetch_block_by_height({}) failed: {error}",
-                starting_height.value()
-            )
-        })?;
-    let parsed_block: ZebraBlock = block
-        .raw_block_bytes
-        .as_slice()
-        .zcash_deserialize_into()
-        .map_err(|error| eyre!("zebra-chain block parse failed: {error}"))?;
-    let coinbase_tx = parsed_block
-        .transactions
-        .first()
-        .ok_or_else(|| eyre!("block has no coinbase transaction"))?;
-    let expected_script_bytes = test_key.address_script_bytes();
-    let txid_be: [u8; 32] = coinbase_tx.hash().0;
+#[derive(Debug, Deserialize)]
+struct ZebraAddressUtxo {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
+    satoshis: u64,
+    height: u32,
+}
 
-    for (vout_index, output) in coinbase_tx.outputs().iter().enumerate() {
-        if output.lock_script.as_raw_bytes() == expected_script_bytes.as_slice() {
-            let value_zats = u64::try_from(i64::from(output.value))
-                .map_err(|error| eyre!("coinbase output value did not fit u64: {error}"))?;
-            let vout = u32::try_from(vout_index)
-                .map_err(|error| eyre!("coinbase output index did not fit u32: {error}"))?;
-            return Ok(TestCoinbase {
-                txid_be,
-                vout,
-                value_zats,
-            });
-        }
+async fn locate_spendable_test_coinbase(
+    env: &zinder_testkit::live::LiveTestEnv,
+    json_rpc: &ZebraJsonRpcSource,
+    test_address: &str,
+) -> Result<TestCoinbase> {
+    if let Some(coinbase) = select_spendable_test_coinbase(env, json_rpc, test_address).await? {
+        return Ok(coinbase);
     }
 
-    Err(eyre!(
-        "block {} has no coinbase output paying to the test address {test_address}; \
-         configure Zebra `[mining] miner_address` to that value and restart the sidecar so \
-         coinbase outputs accumulate at the test address",
-        starting_height.value()
-    ))
+    regtest_generate_blocks(env, 101).await?;
+    select_spendable_test_coinbase(env, json_rpc, test_address)
+        .await?
+        .ok_or_else(|| {
+            eyre!(
+                "no matured UTXO for test address {test_address} exceeds the ZIP-317 fee; \
+                 configure Zebra `[mining] miner_address` to that value and restart from a \
+                 fresh or funded regtest sidecar"
+            )
+        })
+}
+
+async fn select_spendable_test_coinbase(
+    env: &zinder_testkit::live::LiveTestEnv,
+    json_rpc: &ZebraJsonRpcSource,
+    test_address: &str,
+) -> Result<Option<TestCoinbase>> {
+    let tip_height = json_rpc.tip_id().await?.height;
+    let target_height = tip_height.value().saturating_add(1);
+    let maturity_cutoff = target_height.saturating_sub(100);
+    let mut utxos = fetch_address_utxos(env, test_address).await?;
+    utxos.sort_by_key(|utxo| (utxo.height, utxo.satoshis));
+    utxos.reverse();
+
+    for utxo in utxos {
+        if utxo.height <= maturity_cutoff
+            && utxo.satoshis > ZIP317_FEE_ONE_IN_ONE_OUT_ZATS
+            && address_utxo_is_unspent(env, &utxo).await?
+        {
+            return Ok(Some(TestCoinbase {
+                txid_be: display_txid_to_wire_bytes(&utxo.txid)?,
+                vout: utxo.output_index,
+                value_zats: utxo.satoshis,
+                target_height,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+async fn fetch_address_utxos(
+    env: &zinder_testkit::live::LiveTestEnv,
+    test_address: &str,
+) -> Result<Vec<ZebraAddressUtxo>> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":[{{"addresses":["{test_address}"]}}]}}"#
+    );
+    let output = tokio::process::Command::new("curl")
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body)
+        .arg(env.target.json_rpc_addr.as_str())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "getaddressutxos curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| eyre!("getaddressutxos response is not JSON: {error}; body={body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!("getaddressutxos RPC returned error: {error_field}"));
+    }
+    let result_field = parsed
+        .get("result")
+        .ok_or_else(|| eyre!("getaddressutxos response missing result field; body={body}"))?;
+    serde_json::from_value(result_field.clone())
+        .map_err(|error| eyre!("getaddressutxos result shape is invalid: {error}; body={body}"))
+}
+
+async fn address_utxo_is_unspent(
+    env: &zinder_testkit::live::LiveTestEnv,
+    utxo: &ZebraAddressUtxo,
+) -> Result<bool> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"gettxout","params":["{}",{}]}}"#,
+        utxo.txid, utxo.output_index
+    );
+    let output = tokio::process::Command::new("curl")
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body)
+        .arg(env.target.json_rpc_addr.as_str())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "gettxout curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| eyre!("gettxout response is not JSON: {error}; body={body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!("gettxout RPC returned error: {error_field}"));
+    }
+    Ok(parsed
+        .get("result")
+        .is_some_and(|rpc_result| !rpc_result.is_null()))
+}
+
+fn display_txid_to_wire_bytes(txid: &str) -> Result<[u8; 32]> {
+    let mut bytes: [u8; 32] = hex::decode(txid)?.try_into().map_err(|decoded: Vec<u8>| {
+        eyre!("txid decoded to {} bytes, expected 32", decoded.len())
+    })?;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+fn is_known_transaction_rejection(outcome: &TransactionBroadcastResult) -> bool {
+    matches!(
+        outcome,
+        TransactionBroadcastResult::Rejected(BroadcastRejected { message, .. })
+            if message.contains("already queued for download")
+                || message.contains("transaction is already in state")
+    )
 }
 
 /// Returns a deterministic recipient address distinct from the funded test
 /// address so that the spend's outputs are unambiguously identifiable.
-fn scratch_recipient_address(test_key: &TransparentTestKey) -> TransparentAddress {
+fn scratch_recipient_address(test_key: &TransparentTestKey, salt: u64) -> TransparentAddress {
     // Take the funded address's pubkey hash and XOR every byte with 0xFF so
     // the recipient differs but stays a valid p2pkh.
     let funded_hash = match test_key.address() {
         TransparentAddress::PublicKeyHash(hash) | TransparentAddress::ScriptHash(hash) => *hash,
     };
+    let salt_bytes = salt.to_le_bytes();
     let mut scratch = [0_u8; 20];
     for (index, byte) in funded_hash.iter().enumerate() {
-        scratch[index] = byte ^ 0xFF;
+        scratch[index] = byte ^ 0xFF ^ salt_bytes[index % salt_bytes.len()];
     }
     TransparentAddress::PublicKeyHash(scratch)
 }
@@ -393,22 +511,17 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
 
     let json_rpc = zebra_source(&env)?;
 
-    let tip_before = json_rpc.tip_id().await?.height;
+    let coinbase = locate_spendable_test_coinbase(&env, &json_rpc, &test_address).await?;
 
-    regtest_generate_blocks(&env, 101).await?;
-
-    let funded_height = zinder_core::BlockHeight::new(tip_before.value() + 1);
-    let target_height = tip_before.value() + 102;
-    let coinbase = locate_test_coinbase(&json_rpc, &test_key, &test_address, funded_height).await?;
-
-    let recipient_address = scratch_recipient_address(&test_key);
+    let recipient_address =
+        scratch_recipient_address(&test_key, UnixTimestampMillis::now().value());
     let raw_tx = test_key
         .build_p2pkh_spend(&P2pkhSpendArgs {
             coinbase_txid_be: coinbase.txid_be,
             coinbase_vout: coinbase.vout,
             coinbase_value_zats: coinbase.value_zats,
             recipient: &recipient_address,
-            target_height,
+            target_height: coinbase.target_height,
         })
         .map_err(|error| eyre!("transparent signer rejected the spend: {error}"))?;
 
@@ -490,7 +603,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
             coinbase_vout: coinbase.vout,
             coinbase_value_zats: coinbase.value_zats,
             recipient: &recipient_address,
-            target_height,
+            target_height: coinbase.target_height,
         })
         .map_err(|error| eyre!("transparent signer rejected the rebroadcast: {error}"))?;
     let rebroadcast_outcome = json_rpc
@@ -529,5 +642,6 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
     // fails, the test result already passed/failed on the substantive
     // assertion.
     let _ = rpc_reconsider_block(&env, &mined_block_hash).await;
+    let _ = regtest_generate_blocks(&env, 1).await;
     Ok(())
 }

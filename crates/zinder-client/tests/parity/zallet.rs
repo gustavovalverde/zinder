@@ -6,7 +6,13 @@
 //! Renaming or removing any referenced method makes this module fail to
 //! compile, gating Zallet's migration confidence at build time.
 
-use zinder_client::{ChainIndex, LocalChainIndex, RemoteChainIndex};
+use eyre::eyre;
+use zinder_client::{
+    BlockHeight, BlockSelector, ChainIndex, LocalChainIndex, RawTransactionBytes, RemoteChainIndex,
+    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionId, TxStatus,
+};
+
+use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zallet_migration() {
@@ -32,4 +38,80 @@ fn parity_chain_index_surface_compiles_for_zallet_migration() {
     }
     assert_compiles::<LocalChainIndex>();
     assert_compiles::<RemoteChainIndex>();
+}
+
+#[tokio::test]
+async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x42; 32]);
+    let base_fixture = parity_chain_fixture(2);
+    let transaction_block = base_fixture
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("fixture must contain block 2"))?;
+    let transaction_block_height = transaction_block.height;
+    let transaction_block_hash = transaction_block.hash;
+    let transaction = TransactionArtifact::new(
+        transaction_id,
+        transaction_block_height,
+        transaction_block_hash,
+        b"zallet-transaction-payload".to_vec(),
+    );
+    let chain_fixture = base_fixture.with_transaction_artifact(transaction.clone());
+    let store_fixture = committed_store_fixture(&chain_fixture)?;
+    let chain_index = open_local_chain_index(&store_fixture).await?;
+
+    let current_epoch = chain_index.current_epoch().await?;
+    let latest_block = chain_index.latest_block(Some(current_epoch)).await?;
+    let resolved_by_height = chain_index
+        .block_id_by_selector(
+            BlockSelector::Height(BlockHeight::new(2)),
+            Some(current_epoch),
+        )
+        .await?;
+    let resolved_by_hash = chain_index
+        .block_id_by_selector(
+            BlockSelector::Hash(transaction_block_hash),
+            Some(current_epoch),
+        )
+        .await?;
+    let tree_state = chain_index
+        .tree_state_at(BlockHeight::new(2), Some(current_epoch))
+        .await?;
+    let subtree_roots = chain_index
+        .subtree_roots_in_range(
+            SubtreeRootRange::new(
+                zinder_client::ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(0),
+                std::num::NonZeroU32::MIN,
+            ),
+            Some(current_epoch),
+        )
+        .await?;
+    let mined_status = chain_index
+        .transaction_by_id(transaction_id, Some(current_epoch))
+        .await?;
+    let missing_status = chain_index
+        .transaction_by_id(TransactionId::from_bytes([0x24; 32]), Some(current_epoch))
+        .await?;
+
+    assert_eq!(latest_block, resolved_by_height);
+    assert_eq!(latest_block, resolved_by_hash);
+    assert_eq!(tree_state.height, BlockHeight::new(2));
+    assert_eq!(tree_state.block_hash, transaction_block_hash);
+    assert_eq!(subtree_roots.len(), 1);
+    let TxStatus::Mined(mined) = mined_status else {
+        return Err(eyre!("expected mined transaction, got {mined_status:?}"));
+    };
+    assert_eq!(mined.artifact, transaction);
+    assert_eq!(mined.details.confirmations, 1);
+    assert_eq!(missing_status, TxStatus::NotFound);
+    assert!(matches!(
+        chain_index
+            .broadcast_transaction(RawTransactionBytes::new(vec![0x00]))
+            .await,
+        Err(zinder_client::IndexerError::RemoteEndpointUnconfigured {
+            operation: "broadcast_transaction"
+        })
+    ));
+
+    Ok(())
 }

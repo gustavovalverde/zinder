@@ -556,14 +556,13 @@ message DeprecatedCapability {
   string deprecation_notice = 4;
 }
 
-// Upstream node capability descriptor mirroring zinder-source detection.
+// Upstream node capability descriptor. Storage-only query deployments may
+// leave this empty when the query service has no source probe snapshot.
 message NodeCapabilitiesDescriptor {
   // Node-reported semantic version, when available.
   optional string version = 1;
 
-  // Node-side capability strings ("node.streaming_source",
-  // "node.spending_tx_lookup", "node.openrpc_discovery",
-  // "node.json_rpc").
+  // Source capability strings captured from the source-owning process.
   repeated string capabilities = 2;
 }
 

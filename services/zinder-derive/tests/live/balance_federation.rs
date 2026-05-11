@@ -31,6 +31,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use eyre::{Result, eyre};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
@@ -61,7 +62,9 @@ use zinder_source::{
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
-use zinder_testkit::{P2pkhSpendArgs, TransparentAddress, TransparentTestKey};
+use zinder_testkit::{
+    P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+};
 
 use crate::common::{
     fetch_live_tip_height, live_backfill_config, regtest_generate_blocks,
@@ -272,7 +275,7 @@ async fn backfill_and_sample_tip_coinbase(
         &storage_path,
         from_height,
         tip_height,
-        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid test batch size"))?,
+        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
@@ -348,6 +351,7 @@ async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
     let fixture = MempoolOverlayFixture::open(&env, &test_key, &test_address).await?;
     let outcome = assert_baseline_then_overlay(&fixture).await;
     fixture.shutdown().await;
+    let _ = regtest_generate_blocks(&env, 1).await;
     outcome
 }
 
@@ -369,26 +373,20 @@ impl MempoolOverlayFixture {
         test_address: &str,
     ) -> Result<Self> {
         let json_rpc = zebra_source(env)?;
-        let tip_before = json_rpc.tip_id().await?.height;
-        regtest_generate_blocks(env, MEMPOOL_OVERLAY_MINE_COUNT).await?;
-        let funded_height = BlockHeight::new(tip_before.value() + 1);
-        let target_height = tip_before.value() + MEMPOOL_OVERLAY_MINE_COUNT + 1;
-        let coinbase =
-            locate_test_coinbase(&json_rpc, test_key, test_address, funded_height).await?;
-        let (tempdir, store) = backfill_after_mining(env, tip_before).await?;
-
-        let recipient = scratch_recipient_address(test_key);
+        let coinbase = locate_spendable_test_coinbase(env, &json_rpc, test_address).await?;
+        let recipient = scratch_recipient_address(test_key, UnixTimestampMillis::now().value());
         let raw_tx = test_key
             .build_p2pkh_spend(&P2pkhSpendArgs {
                 coinbase_txid_be: coinbase.txid_be,
                 coinbase_vout: coinbase.vout,
                 coinbase_value_zats: coinbase.value_zats,
                 recipient: &recipient,
-                target_height,
+                target_height: coinbase.target_height,
             })
             .map_err(|error| eyre!("transparent signer rejected the spend: {error}"))?;
         let address_script_hash = sha256_address_script_hash(&test_key.address_script_bytes());
         let broadcast_txid = broadcast_signed_spend(&json_rpc, raw_tx.clone()).await?;
+        let (tempdir, store) = backfill_from_coinbase(env, coinbase.height).await?;
         let mempool_index = MempoolIndex::new();
         let visible_chain_epoch = visible_chain_epoch(&store)?;
         let pending_entry = hydrate_and_apply_pending_spend(
@@ -497,59 +495,167 @@ struct TestCoinbase {
     txid_be: [u8; 32],
     vout: u32,
     value_zats: u64,
+    height: BlockHeight,
+    target_height: u32,
 }
 
-async fn locate_test_coinbase(
+#[derive(Debug, Deserialize)]
+struct ZebraAddressUtxo {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
+    satoshis: u64,
+    height: u32,
+}
+
+async fn locate_spendable_test_coinbase(
+    env: &LiveTestEnv,
     json_rpc: &ZebraJsonRpcSource,
-    test_key: &TransparentTestKey,
     test_address: &str,
-    funded_height: BlockHeight,
 ) -> Result<TestCoinbase> {
-    let block = json_rpc.fetch_block_by_height(funded_height).await?;
-    let parsed: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
-    let coinbase_tx = parsed
-        .transactions
-        .first()
-        .ok_or_else(|| eyre!("block has no coinbase transaction"))?;
-    let txid_be: [u8; 32] = coinbase_tx.hash().0;
-    let expected_script = test_key.address_script_bytes();
-    for (vout_index, output) in coinbase_tx.outputs().iter().enumerate() {
-        if output.lock_script.as_raw_bytes() == expected_script.as_slice() {
-            let value_zats = u64::try_from(i64::from(output.value))
-                .map_err(|error| eyre!("coinbase output value did not fit u64: {error}"))?;
-            let vout = u32::try_from(vout_index)
-                .map_err(|error| eyre!("coinbase output index did not fit u32: {error}"))?;
-            return Ok(TestCoinbase {
-                txid_be,
-                vout,
-                value_zats,
-            });
+    if let Some(coinbase) = select_spendable_test_coinbase(env, json_rpc, test_address).await? {
+        return Ok(coinbase);
+    }
+
+    regtest_generate_blocks(env, MEMPOOL_OVERLAY_MINE_COUNT).await?;
+    select_spendable_test_coinbase(env, json_rpc, test_address)
+        .await?
+        .ok_or_else(|| {
+            eyre!(
+                "no matured UTXO for test address {test_address} exceeds the ZIP-317 fee; \
+                 configure Zebra `[mining] miner_address` to that value and restart from a \
+                 fresh or funded regtest sidecar"
+            )
+        })
+}
+
+async fn select_spendable_test_coinbase(
+    env: &LiveTestEnv,
+    json_rpc: &ZebraJsonRpcSource,
+    test_address: &str,
+) -> Result<Option<TestCoinbase>> {
+    let tip_height = json_rpc.tip_id().await?.height;
+    let target_height = tip_height.value().saturating_add(1);
+    let maturity_cutoff = target_height.saturating_sub(100);
+    let mut utxos = fetch_address_utxos(env, test_address).await?;
+    utxos.sort_by_key(|utxo| (utxo.height, utxo.satoshis));
+    utxos.reverse();
+
+    for utxo in utxos {
+        if utxo.height <= maturity_cutoff
+            && utxo.satoshis > ZIP317_FEE_ONE_IN_ONE_OUT_ZATS
+            && address_utxo_is_unspent(env, &utxo).await?
+        {
+            return Ok(Some(TestCoinbase {
+                txid_be: display_txid_to_wire_bytes(&utxo.txid)?,
+                vout: utxo.output_index,
+                value_zats: utxo.satoshis,
+                height: BlockHeight::new(utxo.height),
+                target_height,
+            }));
         }
     }
-    Err(eyre!(
-        "block {} has no coinbase output paying to the test address {test_address}; \
-         configure Zebra `[mining] miner_address` to that value and restart the sidecar",
-        funded_height.value()
-    ))
+    Ok(None)
 }
 
-fn scratch_recipient_address(test_key: &TransparentTestKey) -> TransparentAddress {
+async fn fetch_address_utxos(
+    env: &LiveTestEnv,
+    test_address: &str,
+) -> Result<Vec<ZebraAddressUtxo>> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":[{{"addresses":["{test_address}"]}}]}}"#
+    );
+    let output = tokio::process::Command::new("curl")
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body)
+        .arg(env.target.json_rpc_addr.as_str())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "getaddressutxos curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| eyre!("getaddressutxos response is not JSON: {error}; body={body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!("getaddressutxos RPC returned error: {error_field}"));
+    }
+    let result_field = parsed
+        .get("result")
+        .ok_or_else(|| eyre!("getaddressutxos response missing result field; body={body}"))?;
+    serde_json::from_value(result_field.clone())
+        .map_err(|error| eyre!("getaddressutxos result shape is invalid: {error}; body={body}"))
+}
+
+async fn address_utxo_is_unspent(env: &LiveTestEnv, utxo: &ZebraAddressUtxo) -> Result<bool> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"gettxout","params":["{}",{}]}}"#,
+        utxo.txid, utxo.output_index
+    );
+    let output = tokio::process::Command::new("curl")
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body)
+        .arg(env.target.json_rpc_addr.as_str())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "gettxout curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| eyre!("gettxout response is not JSON: {error}; body={body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!("gettxout RPC returned error: {error_field}"));
+    }
+    Ok(parsed
+        .get("result")
+        .is_some_and(|rpc_result| !rpc_result.is_null()))
+}
+
+fn display_txid_to_wire_bytes(txid: &str) -> Result<[u8; 32]> {
+    let mut bytes: [u8; 32] = hex::decode(txid)?.try_into().map_err(|decoded: Vec<u8>| {
+        eyre!("txid decoded to {} bytes, expected 32", decoded.len())
+    })?;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+fn scratch_recipient_address(test_key: &TransparentTestKey, salt: u64) -> TransparentAddress {
     let funded_hash = match test_key.address() {
         TransparentAddress::PublicKeyHash(hash) | TransparentAddress::ScriptHash(hash) => *hash,
     };
+    let salt_bytes = salt.to_le_bytes();
     let mut scratch = [0_u8; 20];
     for (index, byte) in funded_hash.iter().enumerate() {
-        scratch[index] = byte ^ 0xFF;
+        scratch[index] = byte ^ 0xFF ^ salt_bytes[index % salt_bytes.len()];
     }
     TransparentAddress::PublicKeyHash(scratch)
 }
 
-async fn backfill_after_mining(
+async fn backfill_from_coinbase(
     env: &LiveTestEnv,
-    tip_before_mining: BlockHeight,
+    coinbase_height: BlockHeight,
 ) -> Result<(TempDir, PrimaryChainStore)> {
     let tip_height = fetch_live_tip_height(env).await?;
-    let checkpoint_height = tip_before_mining;
+    let checkpoint_height = BlockHeight::new(coinbase_height.value().saturating_sub(1));
     let from_height = BlockHeight::new(checkpoint_height.value() + 1);
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
@@ -558,8 +664,12 @@ async fn backfill_after_mining(
         &storage_path,
         from_height,
         tip_height,
-        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid test batch size"))?,
+        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+    );
+    backfill_config.node.request_timeout = std::cmp::max(
+        backfill_config.node.request_timeout,
+        Duration::from_secs(90),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
