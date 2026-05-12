@@ -309,7 +309,7 @@ async fn fetch_raw_transaction_bytes_returns_none_for_unknown_txid() -> Result<(
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo() -> Result<()> {
+async fn fetch_network_upgrade_activations_matches_running_node_getblockchaininfo() -> Result<()> {
     let _guard = init();
     let env = zinder_testkit::live::require_live_for(&[
         Network::ZcashRegtest,
@@ -317,14 +317,14 @@ async fn fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo()
         Network::ZcashMainnet,
     ])?;
     let source = zebra_source(&env)?;
-    let schedule = source.fetch_network_upgrade_schedule().await?;
+    let activations = source.fetch_network_upgrade_activations().await?;
 
     assert_eq!(
-        schedule.network(),
+        activations.network(),
         env.network(),
-        "the schedule must carry the same network identifier the source was built with"
+        "the table must carry the same network identifier the source was built with"
     );
-    let Some(sapling) = schedule.activation_height_of("Sapling") else {
+    let Some(sapling) = activations.activation_height_by_name("Sapling") else {
         return Err(eyre!(
             "running node did not advertise Sapling in getblockchaininfo.upgrades; \
              every Zinder-supported network activates Sapling at or above height 1"
@@ -337,28 +337,28 @@ async fn fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo()
     );
 
     let tip = NodeSource::tip_id(&source).await?.height;
-    let branch_at_tip = schedule.consensus_branch_id_at(tip);
+    let branch_at_tip = activations.consensus_branch_id_at(tip);
     if tip.value() >= sapling.value() {
         assert_ne!(
             branch_at_tip,
             0,
             "after Sapling, consensus_branch_id_at(tip) must be non-zero; \
-             tip={}, sapling={}, schedule={:?}",
+             tip={}, sapling={}, activations={:?}",
             tip.value(),
             sapling.value(),
-            schedule.activations(),
+            activations.activations(),
         );
     }
-    let Some(current) = schedule.current_at(tip) else {
+    let Some(active) = activations.active_at(tip) else {
         return Err(eyre!(
-            "tip {} is below the first activation in the schedule; \
-             the schedule must cover at least pre-Overwinter through the active upgrade",
+            "tip {} is below the first activation in the table; \
+             the table must cover at least pre-Overwinter through the active upgrade",
             tip.value()
         ));
     };
     assert!(
-        !current.name.is_empty(),
-        "current_at(tip).name must be a non-empty upgrade name; got empty string"
+        !active.name.is_empty(),
+        "active_at(tip).name must be a non-empty upgrade name; got empty string"
     );
     Ok(())
 }

@@ -13,9 +13,9 @@ use zebra_chain::{
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
-    CompactBlockArtifact, Network, NetworkUpgradeSchedule, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId, TransparentAddressTxIndexArtifact, TxStatus,
+    CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
+    TransactionBroadcastResult, TransactionId, TransparentAddressTxIndexArtifact, TxStatus,
 };
 use zinder_proto::compat::lightwalletd::{
     self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
@@ -76,7 +76,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
     explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
-    network_upgrade_schedule: Option<Arc<NetworkUpgradeSchedule>>,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
 impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<QueryApi> {
@@ -89,8 +89,8 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
             .field("explorer_proxy", &self.explorer_proxy.is_some())
             .field(
-                "network_upgrade_schedule",
-                &self.network_upgrade_schedule.is_some(),
+                "network_upgrade_activations",
+                &self.network_upgrade_activations.network(),
             )
             .finish()
     }
@@ -99,19 +99,34 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// Creates a lightwalletd-compatible gRPC adapter.
     ///
+    /// `network_upgrade_activations` carries the node-discovered upgrade
+    /// table that backs `GetLightdInfo`'s `consensusBranchId`,
+    /// `upgradeName`, and `upgradeHeight` fields. In production it is
+    /// shared via
+    /// `ZebraJsonRpcSource::discover_network_upgrade_activations`; tests use
+    /// `zinder_testkit::sample_regtest_upgrade_activations`.
+    ///
     /// The returned adapter does not advertise mempool surfaces. Pair the
     /// adapter with [`LightwalletdGrpcAdapter::with_mempool_surface`] to
     /// expose `GetMempoolStream` and `GetMempoolTx`; without one, both
     /// methods return `Status::unavailable`.
     #[must_use]
-    pub fn new(query_api: QueryApi) -> Self {
-        Self::with_options(query_api, LightwalletdCompatibilityOptions::default())
+    pub fn new(
+        query_api: QueryApi,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Self {
+        Self::with_options(
+            query_api,
+            network_upgrade_activations,
+            LightwalletdCompatibilityOptions::default(),
+        )
     }
 
     /// Creates a lightwalletd-compatible gRPC adapter with explicit options.
     #[must_use]
     pub const fn with_options(
         query_api: QueryApi,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
         options: LightwalletdCompatibilityOptions,
     ) -> Self {
         Self {
@@ -120,22 +135,8 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             mempool_surface: None,
             tip_change_watcher: None,
             explorer_proxy: None,
-            network_upgrade_schedule: None,
+            network_upgrade_activations,
         }
-    }
-
-    /// Wires the node-discovered network upgrade schedule into the adapter.
-    ///
-    /// The schedule populates `GetLightdInfo`'s `consensusBranchId`,
-    /// `upgradeName`, and `upgradeHeight` fields with values that reflect
-    /// the running node's actual activation configuration (mainnet, testnet,
-    /// regtest, or custom testnet). Without a schedule, `GetLightdInfo`
-    /// returns `Status::failed_precondition`; in production the binary main
-    /// is responsible for wiring one in at startup.
-    #[must_use]
-    pub fn with_network_upgrade_schedule(mut self, schedule: Arc<NetworkUpgradeSchedule>) -> Self {
-        self.network_upgrade_schedule = Some(schedule);
-        self
     }
 
     /// Wires a mempool read surface into the adapter.
@@ -656,25 +657,20 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
-        let schedule = self.network_upgrade_schedule.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "network upgrade schedule is not configured; the compat shim binary must call \
-                 `with_network_upgrade_schedule` at startup",
-            )
-        })?;
+        let activations = self.network_upgrade_activations.as_ref();
         let latest_block = self
             .query_api
             .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        if latest_block.chain_epoch.network != schedule.network() {
+        if latest_block.chain_epoch.network != activations.network() {
             return Err(Status::failed_precondition(
-                "network upgrade schedule does not match the chain epoch network",
+                "network upgrade activations do not match the chain epoch network",
             ));
         }
 
         Ok(Response::new(lightd_info(
-            schedule.as_ref(),
+            activations,
             latest_block.height,
         )?))
     }
@@ -1104,10 +1100,10 @@ fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd:
 }
 
 fn lightd_info(
-    schedule: &NetworkUpgradeSchedule,
+    activations: &NetworkUpgradeActivations,
     tip_height: BlockHeight,
 ) -> Result<lightwalletd::LightdInfo, Status> {
-    let current = schedule.current_at(tip_height);
+    let current = activations.active_at(tip_height);
     let consensus_branch_id = current.map_or_else(
         || "00000000".to_owned(),
         |activation| format!("{:08x}", activation.branch_id),
@@ -1118,15 +1114,15 @@ fn lightd_info(
     let upgrade_height = current.map_or(0, |activation| {
         u64::from(activation.activation_height.value())
     });
-    let sapling_activation_height = schedule
-        .activation_height_of("Sapling")
+    let sapling_activation_height = activations
+        .activation_height_by_name("Sapling")
         .map_or(0, |height| u64::from(height.value()));
 
     Ok(lightwalletd::LightdInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         vendor: "Zinder".to_owned(),
         taddr_support: true,
-        chain_name: lightwalletd_chain_name(schedule.network())?.to_owned(),
+        chain_name: lightwalletd_chain_name(activations.network())?.to_owned(),
         sapling_activation_height,
         consensus_branch_id,
         block_height: u64::from(tip_height.value()),

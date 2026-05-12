@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use eyre::eyre;
 use tokio::net::TcpListener;
@@ -17,7 +17,7 @@ use zinder_client::{
 };
 use zinder_core::TransparentAddressTxIndexArtifact;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_testkit::{ChainFixture, StoreFixture};
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xEF; 32];
 
@@ -193,7 +193,11 @@ async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> 
         );
     }
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
     let remote = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -207,6 +211,7 @@ async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> 
         network: Network::ZcashRegtest,
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?;
     Ok(ChainIndexFixtures {

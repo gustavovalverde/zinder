@@ -14,11 +14,12 @@
 //! CI workers. Tight per-percentile numbers live in
 //! [`docs/architecture/wallet-data-plane.md`] under §Published Budgets.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
 use zinder_query::{WalletQuery, WalletQueryApi};
-use zinder_testkit::{ChainFixture, StoreFixture};
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 const PERF_SMOKE_BLOCK_COUNT: u32 = 1_000;
 const PERF_SMOKE_RANGE_BUDGET: Duration = Duration::from_secs(2);
@@ -29,7 +30,11 @@ async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::R
     let chain_fixture =
         ChainFixture::new(Network::ZcashRegtest).extend_blocks(PERF_SMOKE_BLOCK_COUNT);
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
 
     let start = Instant::now();
     let response = wallet_query
@@ -58,7 +63,11 @@ async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::R
 #[tokio::test(flavor = "multi_thread")]
 async fn latest_block_stays_under_budget() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
 
     let start = Instant::now();
     let response = wallet_query.latest_block(None).await?;

@@ -26,6 +26,7 @@ use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
     PrimaryChainStore,
 };
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 #[tokio::test]
 #[allow(
@@ -98,7 +99,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         "bootstrap epoch plus first backfilled block must both publish events"
     );
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let unavailable = match wallet_query.compact_block_at(checkpoint_height, None).await {
         Ok(response) => {
             return Err(eyre!(

@@ -945,7 +945,7 @@ async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result
 }
 
 #[tokio::test]
-async fn fetch_network_upgrade_schedule_parses_getblockchaininfo_upgrades() -> eyre::Result<()> {
+async fn fetch_network_upgrade_activations_parses_getblockchaininfo_upgrades() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start(vec![RpcReply::result(json!({
         "upgrades": {
             "76b809bb": {
@@ -967,29 +967,33 @@ async fn fetch_network_upgrade_schedule_parses_getblockchaininfo_upgrades() -> e
         Duration::from_secs(5),
     )?;
 
-    let schedule = source.fetch_network_upgrade_schedule().await?;
+    let activations = source.fetch_network_upgrade_activations().await?;
     let _requests = server.join()?;
 
-    assert_eq!(schedule.network(), Network::ZcashTestnet);
+    assert_eq!(activations.network(), Network::ZcashTestnet);
     assert_eq!(
-        schedule.activation_height_of("Sapling"),
+        activations.activation_height_by_name("Sapling"),
         Some(zinder_core::BlockHeight::new(280_000))
     );
     assert_eq!(
-        schedule.activation_height_of("NU5"),
+        activations.activation_height_by_name("NU5"),
         Some(zinder_core::BlockHeight::new(1_842_420))
     );
     assert_eq!(
-        schedule.activation_height_of_branch(0x76b8_09bb),
+        activations.activation_height_by_branch_id(0x76b8_09bb),
         Some(zinder_core::BlockHeight::new(280_000))
     );
     assert_eq!(
-        schedule.consensus_branch_id_at(zinder_core::BlockHeight::new(2_000_000)),
+        activations.consensus_branch_id_at(zinder_core::BlockHeight::new(2_000_000)),
         0xc2d6_d0b4
     );
+    let earliest = activations
+        .earliest_wallet_servable_activation()
+        .ok_or_else(|| eyre::eyre!("Sapling and NU5 must yield an earliest activation"))?;
+    assert_eq!(earliest.name, "Sapling");
     assert_eq!(
-        schedule.wallet_serving_floor(),
-        Some(zinder_core::BlockHeight::new(280_000))
+        earliest.activation_height,
+        zinder_core::BlockHeight::new(280_000)
     );
     Ok(())
 }

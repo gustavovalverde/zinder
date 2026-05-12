@@ -28,6 +28,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::{Result, eyre};
@@ -64,7 +65,7 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::{
     P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
-    local_network_from_schedule,
+    local_network_from_activations, sample_regtest_upgrade_activations,
 };
 
 use crate::common::{
@@ -140,7 +141,11 @@ impl FederatedBalanceFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
         let (tempdir, store, sample) = backfill_and_sample_tip_coinbase(env).await?;
-        let wallet_query = WalletQuery::new(store.clone(), ());
+        let wallet_query = WalletQuery::new(
+            store.clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        );
         let utxos = wallet_query
             .transparent_address_utxos(
                 zinder_query::TransparentAddressUtxosRequest {
@@ -349,12 +354,12 @@ async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
         false,
     );
     let schedule = zebra_source_from_backfill(&probe_config)?
-        .fetch_network_upgrade_schedule()
+        .fetch_network_upgrade_activations()
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
         &MEMPOOL_OVERLAY_TEST_SEED,
-        local_network_from_schedule(&schedule),
+        local_network_from_activations(&schedule),
     )
     .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();
@@ -412,7 +417,11 @@ impl MempoolOverlayFixture {
             visible_chain_epoch,
         )?;
 
-        let wallet_query = WalletQuery::new(store.clone(), ());
+        let wallet_query = WalletQuery::new(
+            store.clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        );
         let (ingest_control_addr, ingest_control_handle) =
             serve_ingest_control_grpc(env.network(), store, mempool_index.clone()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =

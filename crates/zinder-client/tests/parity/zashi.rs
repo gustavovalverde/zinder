@@ -7,12 +7,14 @@
 //!
 //! Cross-references: [Android wallet integration findings](../../../../docs/reference/android-wallet-integration-findings.md).
 
+use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_client::{ChainIndex, LocalChainIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use super::{committed_store_fixture, parity_chain_fixture};
 
@@ -36,11 +38,18 @@ fn parity_chain_index_surface_compiles_for_zashi_use_cases() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Parity acceptance scenario covers the full lightwalletd scan surface in one auditable flow."
+)]
 async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     let chain_fixture = parity_chain_fixture(2);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let adapter =
-        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()));
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone()),
+        activations,
+    );
 
     let latest_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))

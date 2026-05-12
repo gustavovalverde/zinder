@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use eyre::eyre;
 use tokio_stream::StreamExt as _;
@@ -12,7 +12,7 @@ use zinder_client::{
     Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
     TransactionId, TxStatus,
 };
-use zinder_testkit::{ChainFixture, StoreFixture};
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 #[tokio::test]
 async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Result<()> {
@@ -36,6 +36,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         network: Network::ZcashRegtest,
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?;
 

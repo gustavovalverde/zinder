@@ -3,6 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::eyre;
@@ -14,7 +15,9 @@ use zinder_client::{
     RemoteChainIndex, RemoteOpenOptions, TransactionBroadcastResult, TransactionId,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_testkit::{ChainFixture, MockTransactionBroadcaster, StoreFixture};
+use zinder_testkit::{
+    ChainFixture, MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
+};
 
 #[tokio::test]
 async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::Result<()> {
@@ -23,7 +26,11 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
     let transaction_id = TransactionId::from_bytes([0x66; 32]);
     let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), broadcaster);
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        broadcaster,
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
     let grpc_adapter = WalletQueryGrpcAdapter::new(
         wallet_query,
         ServerInfoSettings {

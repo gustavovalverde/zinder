@@ -4,6 +4,7 @@
 )]
 
 use eyre::eyre;
+use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
     BlockHeight, ChainEpoch, TransactionArtifact, TransactionId, TransparentOutPoint,
@@ -13,7 +14,7 @@ use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryG
 use zinder_store::ChainEpochArtifacts;
 use zinder_testkit::{
     P2pkhSpendArgs, StoreFixture, TransparentAddress as TestkitTransparentAddress,
-    TransparentTestKey,
+    TransparentTestKey, sample_regtest_upgrade_activations,
 };
 
 use crate::common::synthetic_chain_epoch;
@@ -60,7 +61,7 @@ async fn transparent_prevouts_resolves_known_outpoint() -> eyre::Result<()> {
             .with_transactions(vec![transaction]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transparent_prevouts(
             vec![TransparentOutPoint::new(transaction_id, 0)],
@@ -94,7 +95,7 @@ async fn transparent_prevouts_returns_none_for_unknown_transaction() -> eyre::Re
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transparent_prevouts(
             vec![TransparentOutPoint::new(
@@ -126,7 +127,7 @@ async fn transparent_prevouts_returns_none_for_out_of_bounds_index() -> eyre::Re
             .with_transactions(vec![transaction]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transparent_prevouts(
             vec![TransparentOutPoint::new(transaction_id, 99)],
@@ -152,7 +153,7 @@ async fn transparent_mempool_prevouts_grpc_rejects_coinbase_sentinel() -> eyre::
         vec![block],
         vec![compact_block],
     ))?;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let request = Request::new(wallet::TransparentMempoolPrevoutsRequest {
@@ -185,7 +186,7 @@ async fn transparent_prevouts_grpc_rejects_coinbase_sentinel() -> eyre::Result<(
         vec![block],
         vec![compact_block],
     ))?;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let request = Request::new(wallet::TransparentPrevoutsRequest {
@@ -222,7 +223,7 @@ async fn transparent_prevouts_preserves_input_order_and_dedupes_reads() -> eyre:
             .with_transactions(vec![transaction]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let outpoints = vec![
         TransparentOutPoint::new(transaction_id, 0),
         TransparentOutPoint::new(TransactionId::from_bytes([0xEE; 32]), 0),

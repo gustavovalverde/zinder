@@ -6,6 +6,7 @@
 //!
 //! Cross-references: [Serving public lightwalletd clients](../../../../docs/reference/serving-public-lightwalletd-clients.md).
 
+use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zebra_chain::{
@@ -18,7 +19,7 @@ use zinder_client::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{WalletQuery, transparent_address_script_hash};
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use super::{committed_store_fixture, parity_chain_fixture};
 
@@ -43,10 +44,14 @@ fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
 #[tokio::test]
 async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<()> {
     let fixture = public_operator_fixture()?;
-    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
-        fixture.store_fixture.chain_store().clone(),
-        (),
-    ));
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            fixture.store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
 
     let utxo_request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![fixture.address.clone()],

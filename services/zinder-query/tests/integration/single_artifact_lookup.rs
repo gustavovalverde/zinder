@@ -4,13 +4,14 @@
 )]
 
 use eyre::eyre;
+use std::sync::Arc;
 use zinder_core::{
     ArtifactSchemaVersion, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TransactionArtifact, TransactionId, TxStatus, UnixTimestampMillis,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
 
@@ -26,7 +27,7 @@ async fn compact_block_at_returns_indexed_block() -> eyre::Result<()> {
         vec![compact_block.clone()],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .compact_block_at(BlockHeight::new(1), None)
         .await?;
@@ -49,7 +50,7 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query
         .compact_block_at(BlockHeight::new(99), None)
         .await
@@ -88,7 +89,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
             }),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query.compact_block_at(checkpoint_height, None).await {
         Ok(response) => return Err(eyre!("expected unavailable, got {response:?}")),
         Err(error) => error,
@@ -117,7 +118,7 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
             .with_transactions(vec![transaction.clone()]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query.transaction(transaction_id, None).await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
@@ -141,7 +142,7 @@ async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transaction(TransactionId::from_bytes([0xCD; 32]), None)
         .await?;

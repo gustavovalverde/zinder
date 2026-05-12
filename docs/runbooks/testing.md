@@ -841,11 +841,11 @@ Zinder bug surfaced by this run (closed by [ADR-0015](../adrs/0015-network-param
   library defaults), which leaves NU5/NU6/NU6\_1 unset; `NetworkUpgrade::current`
   fell back to Canopy at height 1. The same wrong branch ID flowed into
   `MinedDetails.consensus_branch_id` on the wallet read path. Fix: Zinder
-  now discovers the schedule from the running node at startup and carries it
-  as `Arc<NetworkUpgradeSchedule>` through every consumer; see
+  now discovers the upgrade activations from the running node at startup and
+  carries them as `Arc<NetworkUpgradeActivations>` through every consumer; see
   [ADR-0015](../adrs/0015-network-parameter-discovery.md). Regression
   guarded by the live test
-  `live::zebra_json_rpc::fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo`
+  `live::zebra_json_rpc::fetch_network_upgrade_activations_matches_running_node_getblockchaininfo`
   in `crates/zinder-source/tests/live/zebra_json_rpc.rs`.
 
 Volume difference on `GetTaddressTxids`/`GetTaddressTransactions` is the
@@ -889,12 +889,12 @@ Closes the regtest `GetLightdInfo` active-upgrade bug described above and
 validates the end-to-end fix on all three supported networks. Architecture
 locked into [ADR-0015](../adrs/0015-network-parameter-discovery.md):
 per-network consensus parameters are discovered from the running node at
-startup and shared as `Arc<NetworkUpgradeSchedule>`; the static
+startup and shared as `Arc<NetworkUpgradeActivations>`; the static
 `OnceLock<ZebraNetwork>` and the free `consensus_branch_id_at(network,
 height)` are gone.
 
 Live regression test result
-(`live::zebra_json_rpc::fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo`):
+(`live::zebra_json_rpc::fetch_network_upgrade_activations_matches_running_node_getblockchaininfo`):
 
 | Network | Tip | Result |
 |---------|-----|--------|

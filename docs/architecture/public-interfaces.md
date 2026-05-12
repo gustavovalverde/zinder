@@ -50,8 +50,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
 | `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
 | `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
-| `NetworkUpgradeSchedule` | Node-discovered consensus upgrade schedule (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeSchedule>` from process startup. Source of truth for `consensus_branch_id_at`, `current_at`, and `sapling_activation_height` across the compat shim, native query API, and signer testkit. See [ADR-0015](../adrs/0015-network-parameter-discovery.md). |
-| `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeSchedule` — `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
+| `NetworkUpgradeActivations` | Node-discovered consensus upgrade table (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeActivations>` from process startup. Source of truth for `consensus_branch_id_at`, `active_at`, and Sapling activation height across the compat shim, native query API, and signer testkit. Required at construction by every consumer: see [ADR-0015](../adrs/0015-network-parameter-discovery.md). |
+| `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeActivations` table: `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
 
 ### Source Boundary
 

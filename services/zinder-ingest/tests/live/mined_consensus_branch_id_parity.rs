@@ -5,20 +5,20 @@
 
 //! Live regression: `MinedDetails.consensus_branch_id` returned by the typed
 //! `WalletQueryApi::transaction` lookup matches what the running node's
-//! upgrade schedule says is active at the mined height.
+//! upgrade activations say is active at the mined height.
 //!
 //! Closes the wire-level gap left open by `lightwalletd_grpc` integration
 //! tests, which only exercise the in-process adapter against a synthetic
-//! schedule. This test follows the end-to-end production path:
+//! table. This test follows the end-to-end production path:
 //!
-//! 1. Fetch the schedule from the running Zebra via
-//!    `ZebraJsonRpcSource::fetch_network_upgrade_schedule()`.
+//! 1. Fetch the activations from the running Zebra via
+//!    `ZebraJsonRpcSource::fetch_network_upgrade_activations()`.
 //! 2. Backfill a small near-tip window through `zinder-ingest`.
-//! 3. Open `zinder-query::WalletQuery` with the discovered schedule.
+//! 3. Open `zinder-query::WalletQuery` with the discovered activations.
 //! 4. Pick the tip block's coinbase via
 //!    `WalletQueryApi::transaction_at_block_index(tip, 0)`.
 //! 5. Look up that txid via `WalletQueryApi::transaction(...)`.
-//! 6. Assert `MinedDetails.consensus_branch_id == schedule.consensus_branch_id_at(mined_height)`.
+//! 6. Assert `MinedDetails.consensus_branch_id == activations.consensus_branch_id_at(mined_height)`.
 //!
 //! Pins the regtest active-upgrade fix from [ADR-0015] in CI and proves
 //! parity on testnet and mainnet by opting in via `require_live_for`.
@@ -26,7 +26,6 @@
 //! [ADR-0015]: ../../../docs/adrs/0015-network-parameter-discovery.md
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -47,7 +46,7 @@ const NEAR_TIP_DEPTH_BLOCKS: u32 = 16;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn mined_details_consensus_branch_id_matches_node_upgrade_schedule() -> Result<()> {
+async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() -> Result<()> {
     let _guard = init();
     let env = require_live_for(&[
         Network::ZcashRegtest,
@@ -84,7 +83,9 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_schedule() -> Re
         true,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
-    let schedule = Arc::new(source.fetch_network_upgrade_schedule().await?);
+    let activations = source
+        .discover_network_upgrade_activations("zinder-ingest-tests")
+        .await?;
     if let Some(checkpoint_height) = checkpoint_height {
         backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
@@ -94,7 +95,7 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_schedule() -> Re
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let wallet_query = WalletQuery::new(store, ()).with_network_upgrade_schedule(schedule.clone());
+    let wallet_query = WalletQuery::new(store, (), activations.clone());
 
     let coinbase_transaction = wallet_query
         .transaction_at_block_index(tip_height, 0, None)
@@ -124,12 +125,12 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_schedule() -> Re
         block_height, coinbase_block_height,
         "TxStatus::Mined artifact block_height must match the coinbase's block height"
     );
-    let expected_branch_id = schedule.consensus_branch_id_at(coinbase_block_height);
+    let expected_branch_id = activations.consensus_branch_id_at(coinbase_block_height);
     assert_eq!(
         details.consensus_branch_id,
         expected_branch_id,
-        "MinedDetails.consensus_branch_id must match the schedule's branch id at the mined height \
-         (mined_height={}, schedule_says={:#010x}, MinedDetails_says={:#010x})",
+        "MinedDetails.consensus_branch_id must match the activations' branch id at the mined \
+         height (mined_height={}, activations_say={:#010x}, MinedDetails_says={:#010x})",
         coinbase_block_height.value(),
         expected_branch_id,
         details.consensus_branch_id,

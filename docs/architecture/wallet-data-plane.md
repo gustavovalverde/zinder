@@ -148,12 +148,12 @@ block_time)` is the **only** public constructor in `zinder-core`. Callers
 cannot construct `MinedDetails` without the response's `ChainEpoch` in scope,
 so the racy `tip_height - block_height` confirmations computation is
 prevented by construction. `consensus_branch_id` is resolved from the
-process-startup `Arc<NetworkUpgradeSchedule>` discovered via
-`ZebraJsonRpcSource::fetch_network_upgrade_schedule()`: callers invoke
-`schedule.consensus_branch_id_at(height)`, which returns
-`PRE_OVERWINTER_BRANCH_ID` for heights below the earliest activation. When
-the process started without `[node]` configured, the field defaults to
-`PRE_OVERWINTER_BRANCH_ID` and a one-time warning fires at startup; see
+process-startup `Arc<NetworkUpgradeActivations>` discovered via
+`ZebraJsonRpcSource::discover_network_upgrade_activations()`: callers invoke
+`activations.consensus_branch_id_at(height)`, which returns
+`PRE_OVERWINTER_BRANCH_ID` for heights below the earliest activation. The
+service binary refuses to start when `[node]` is not configured, so the
+field always reflects a real node-discovered table at request time; see
 [ADR-0015](../adrs/0015-network-parameter-discovery.md). `block_time` is
 parsed from the stored `BlockArtifact` through
 `zinder_source::block_header_info_from_raw_block_bytes` and falls back to `0`

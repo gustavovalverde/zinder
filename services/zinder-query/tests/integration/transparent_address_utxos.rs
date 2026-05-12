@@ -4,6 +4,7 @@
 )]
 
 use eyre::eyre;
+use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 use tonic_types::StatusExt;
@@ -16,7 +17,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::synthetic_chain_epoch;
 
@@ -32,7 +33,7 @@ async fn transparent_address_utxos_round_trip_through_native_grpc() -> eyre::Res
     let store = store_fixture.chain_store().clone();
     let stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 3)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let response = WalletQueryService::transparent_address_utxos(
@@ -86,7 +87,7 @@ async fn transparent_address_utxos_paginates_with_cursor() -> eyre::Result<()> {
     let store = store_fixture.chain_store().clone();
     let stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 4)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let first_page = WalletQueryService::transparent_address_utxos(
@@ -140,7 +141,7 @@ async fn transparent_address_utxos_clamps_oversized_page_request() -> eyre::Resu
     let store = store_fixture.chain_store().clone();
     let _stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 1001)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let response = WalletQueryService::transparent_address_utxos(
@@ -175,7 +176,7 @@ async fn transparent_address_utxos_rejects_invalid_address_selector() -> eyre::R
     let store = store_fixture.chain_store().clone();
     let _ = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 1)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let status = match WalletQueryService::transparent_address_utxos(

@@ -23,7 +23,7 @@
 //! and `workflow_dispatch` in CI; the runtime gate is
 //! [`require_live_for`].
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ use zinder_query::{
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
@@ -64,7 +65,7 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     let network = env.network();
     let (storage_path_owner, store, sample) = backfill_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     assert_utxo_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_round_trip(&wallet_query, &sample).await?;

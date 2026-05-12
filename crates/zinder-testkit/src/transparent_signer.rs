@@ -16,13 +16,16 @@
 //!
 //! [`regtest_local_network`] returns the [`LocalNetwork`] shape ZFND's `z3`
 //! regtest sidecar is configured with by default (`overwinter..canopy = 1`,
-//! `nu5 = 2`, `nu6 = 2`, later upgrades unset). Intended for in-process
-//! unit-test fixtures that do not broadcast to a live node.
+//! `nu5 = 2`, `nu6 = 2`, later upgrades unset). It is derived from
+//! [`crate::network_upgrade_fixtures::sample_regtest_upgrade_activations`]
+//! so the two fixtures cannot drift apart. Intended for in-process unit-test
+//! fixtures that do not broadcast to a live node.
 //!
 //! Live tests that broadcast through Zebra must derive the [`LocalNetwork`]
 //! from the running node instead, via
-//! [`crate::network_upgrade_fixtures::local_network_from_schedule`] applied
-//! to a `ZebraJsonRpcSource::fetch_network_upgrade_schedule()` result.
+//! [`crate::network_upgrade_fixtures::local_network_from_activations`]
+//! applied to a
+//! `ZebraJsonRpcSource::fetch_network_upgrade_activations()` result.
 //! Mismatched activation heights produce an `incorrect consensus branch id`
 //! rejection from Zebra's mempool.
 
@@ -278,22 +281,19 @@ impl std::fmt::Debug for TransparentTestKey {
 /// Activation heights for the `z3` regtest sidecar:
 /// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, later upgrades unset.
 ///
-/// Intended for unit-test fixtures that do not broadcast. Live tests that
-/// broadcast through Zebra must derive the [`LocalNetwork`] from the
-/// running node, via
-/// [`crate::network_upgrade_fixtures::local_network_from_schedule`].
+/// Derived from
+/// [`crate::network_upgrade_fixtures::sample_regtest_upgrade_activations`]
+/// via
+/// [`crate::network_upgrade_fixtures::local_network_from_activations`] so
+/// the two fixtures cannot drift apart. Intended for unit-test fixtures
+/// that do not broadcast. Live tests that broadcast through Zebra must
+/// derive the [`LocalNetwork`] from the running node, via
+/// [`crate::network_upgrade_fixtures::local_network_from_activations`].
 #[must_use]
 pub fn regtest_local_network() -> LocalNetwork {
-    LocalNetwork {
-        overwinter: Some(BlockHeight::from_u32(1)),
-        sapling: Some(BlockHeight::from_u32(1)),
-        blossom: Some(BlockHeight::from_u32(1)),
-        heartwood: Some(BlockHeight::from_u32(1)),
-        canopy: Some(BlockHeight::from_u32(1)),
-        nu5: Some(BlockHeight::from_u32(2)),
-        nu6: Some(BlockHeight::from_u32(2)),
-        nu6_1: None,
-    }
+    crate::network_upgrade_fixtures::local_network_from_activations(
+        &crate::network_upgrade_fixtures::sample_regtest_upgrade_activations(),
+    )
 }
 
 fn zatoshis_from_u64(zats: u64) -> Result<Zatoshis, TransparentSignerError> {

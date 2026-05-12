@@ -25,6 +25,7 @@
 //! and the runtime gate [`require_live_for`].
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
@@ -37,6 +38,7 @@ use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
@@ -59,7 +61,7 @@ async fn sampled_coinbase_outpoint_resolves_through_transparent_prevouts() -> Re
     let network = env.network();
     let (storage_path_owner, store, sample) = backfill_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     assert_known_outpoint_resolves(&wallet_query, &sample).await?;
     assert_unknown_outpoint_returns_none(&wallet_query).await?;

@@ -3,6 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
+use std::sync::Arc;
 use std::{fs, io, num::NonZeroU32};
 
 use eyre::{Result, eyre};
@@ -12,6 +13,7 @@ use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::NodeSource;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     BackfillConfigToml, WalletServingBackfillConfigToml, assert_native_wallet_read_responses,
@@ -105,10 +107,11 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
         true,
     );
     let source = zebra_source_from_backfill(&probe_config)?;
-    let schedule = source.fetch_network_upgrade_schedule().await?;
-    let wallet_serving_floor = schedule
-        .wallet_serving_floor()
-        .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    let wallet_serving_floor = activations
+        .earliest_wallet_servable_activation()
+        .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?
+        .activation_height;
     if wallet_serving_floor == BlockHeight::new(0) {
         return Err(eyre!("wallet-serving floor cannot be genesis"));
     }
@@ -189,7 +192,7 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
         assert_eq!(tip_tree_state.height, to_height);
     }
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let latest_block = wallet_query.latest_block(None).await?;
     assert_eq!(latest_block.height, to_height);
     let compact_blocks = wallet_query

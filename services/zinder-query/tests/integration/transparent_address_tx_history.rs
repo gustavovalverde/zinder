@@ -3,6 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_core::{
@@ -17,7 +18,7 @@ use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, PrimaryChainStore, ReorgWindowChange,
 };
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
 
@@ -30,7 +31,7 @@ async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 5)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
@@ -73,7 +74,7 @@ async fn transparent_address_tx_ids_in_range_supports_descending() -> eyre::Resu
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 4)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
@@ -112,7 +113,7 @@ async fn transparent_address_tx_ids_cursor_preserves_descending_direction() -> e
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 4)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let first_page =
@@ -150,7 +151,7 @@ async fn transparent_address_tx_ids_clamps_oversized_page_request() -> eyre::Res
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 1001)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let chunks = collect_tx_history_chunks(
@@ -174,7 +175,7 @@ async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() ->
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_reorged_tx_index_rows(&store, address_script_hash)?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let chunks =

@@ -328,11 +328,11 @@ async fn resolve_backfill_coverage(
         return Ok(());
     }
 
-    let schedule = source
-        .fetch_network_upgrade_schedule()
+    let activations = source
+        .fetch_network_upgrade_activations()
         .await
         .map_err(IngestError::from)?;
-    let Some(wallet_serving_floor) = schedule.wallet_serving_floor() else {
+    let Some(earliest) = activations.earliest_wallet_servable_activation() else {
         return Err(
             IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
                 reason: "getblockchaininfo did not advertise Sapling or NU5 activation heights",
@@ -340,6 +340,7 @@ async fn resolve_backfill_coverage(
             .into(),
         );
     };
+    let wallet_serving_floor = earliest.activation_height;
     if wallet_serving_floor == BlockHeight::new(0) {
         return Err(
             IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
@@ -357,12 +358,7 @@ async fn resolve_backfill_coverage(
         event = "wallet_serving_backfill_floor_resolved",
         from_height = wallet_serving_floor.value(),
         checkpoint_height = checkpoint_height.value(),
-        sapling_activation_height = schedule
-            .activation_height_of("Sapling")
-            .map(zinder_core::BlockHeight::value),
-        nu5_activation_height = schedule
-            .activation_height_of("NU5")
-            .map(zinder_core::BlockHeight::value),
+        earliest_upgrade = %earliest.name,
         "resolved wallet-serving backfill floor from node activation heights"
     );
 

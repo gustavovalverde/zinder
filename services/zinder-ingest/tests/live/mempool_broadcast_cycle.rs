@@ -40,7 +40,7 @@ use zinder_source::{
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{
     P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
-    local_network_from_schedule,
+    local_network_from_activations,
 };
 
 use crate::common::regtest_generate_blocks;
@@ -75,12 +75,12 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
     let env = require_live_for(&[Network::ZcashRegtest])?;
     let json_rpc = zebra_source(&env)?;
     let schedule = json_rpc
-        .fetch_network_upgrade_schedule()
+        .fetch_network_upgrade_activations()
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
         &BROADCAST_TEST_SEED,
-        local_network_from_schedule(&schedule),
+        local_network_from_activations(&schedule),
     )
     .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();
@@ -508,12 +508,12 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
     let env = require_live_for(&[Network::ZcashRegtest])?;
     let json_rpc = zebra_source(&env)?;
     let schedule = json_rpc
-        .fetch_network_upgrade_schedule()
+        .fetch_network_upgrade_activations()
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
         &BROADCAST_TEST_SEED,
-        local_network_from_schedule(&schedule),
+        local_network_from_activations(&schedule),
     )
     .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();

@@ -4,6 +4,7 @@
 )]
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -13,6 +14,7 @@ use zinder_ingest::{BackfillOutcome, backfill};
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
@@ -55,7 +57,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let measurement_start = std::time::Instant::now();
     let _latest = wallet_query.latest_block(None).await?;
@@ -178,7 +180,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let measurement_start = std::time::Instant::now();
     let _latest = wallet_query.latest_block(None).await?;

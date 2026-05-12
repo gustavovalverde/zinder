@@ -156,13 +156,13 @@ from index 0 and tree states at flow-selected anchor heights without hitting a
 recent-checkpoint store gap. Do not encode public-network activation constants
 inside Zinder docs or config examples; the upstream node remains the source of
 truth, including Regtest and custom Testnet activation schedules. The shared
-[`NetworkUpgradeSchedule`](public-interfaces.md#networkupgradeschedule) is the
+[`NetworkUpgradeActivations`](public-interfaces.md#networkupgradeactivations) is the
 in-process carrier: every component that needs an activation height, the
-current upgrade name, or a consensus branch id (the lightwalletd
+active upgrade name, or a consensus branch id (the lightwalletd
 `GetLightdInfo` shim and the native `MinedDetails.consensus_branch_id` read
 path included) reads it from a process-startup
-`Arc<NetworkUpgradeSchedule>` populated by
-`ZebraJsonRpcSource::fetch_network_upgrade_schedule()`, never from
+`Arc<NetworkUpgradeActivations>` populated by
+`ZebraJsonRpcSource::discover_network_upgrade_activations()`, never from
 library-default constants. See
 [ADR-0015](../adrs/0015-network-parameter-discovery.md).
 

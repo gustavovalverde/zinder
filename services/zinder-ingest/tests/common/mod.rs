@@ -10,7 +10,7 @@
     reason = "Each live test file consumes only a subset of the common helpers."
 )]
 
-use std::{num::NonZeroU32, path::Path, process::Command, time::Duration};
+use std::{num::NonZeroU32, path::Path, process::Command, sync::Arc, time::Duration};
 
 use eyre::{Result, eyre};
 use prost::Message;
@@ -39,6 +39,7 @@ use zinder_query::{
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 /// Builds a `BackfillConfig` from a resolved live-test env plus per-test
 /// runtime knobs.
@@ -190,7 +191,11 @@ pub(crate) async fn assert_native_wallet_read_responses(
     start_height: u32,
     end_height: u32,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(store.clone(), ());
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
     assert_native_compact_block_range_chunks(&wallet_query, network, start_height, end_height)
         .await?;
     assert_native_latest_block_response(&wallet_query, network, end_height).await?;
@@ -209,8 +214,13 @@ pub(crate) async fn assert_lightwalletd_send_transaction_classifies_invalid(
     backfill_config: &BackfillConfig,
 ) -> Result<()> {
     let source = zebra_source_from_backfill(backfill_config)?;
-    let wallet_query = WalletQuery::new(store.clone(), source);
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query);
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        source,
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let grpc_adapter =
+        LightwalletdGrpcAdapter::new(wallet_query, Arc::new(sample_regtest_upgrade_activations()));
 
     let response = LightwalletdCompactTxStreamer::send_transaction(
         &grpc_adapter,
@@ -239,8 +249,13 @@ async fn assert_lightwalletd_compat_responses(
     start_height: u32,
     end_height: u32,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(store.clone(), ());
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query);
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let grpc_adapter =
+        LightwalletdGrpcAdapter::new(wallet_query, Arc::new(sample_regtest_upgrade_activations()));
 
     assert_lightwalletd_trait_responses(&grpc_adapter, network, start_height, end_height).await?;
     assert_generated_lightwalletd_client_responses(store, network, start_height, end_height)
@@ -341,7 +356,15 @@ async fn assert_generated_lightwalletd_client_responses(
 ) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(store.clone(), ())).into_server();
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store.clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter)
@@ -411,7 +434,11 @@ async fn assert_native_wallet_grpc_responses(
     start_height: u32,
     end_height: u32,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(store.clone(), ());
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let latest_block = WalletQueryService::latest_block(

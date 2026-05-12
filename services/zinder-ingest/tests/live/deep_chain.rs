@@ -4,6 +4,7 @@
 )]
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use prost::Message;
@@ -19,6 +20,7 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_query::WalletQuery;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
@@ -58,7 +60,14 @@ async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let lightwalletd_adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(store.clone(), ()));
+    let lightwalletd_adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store.clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
 
     for height_value in [1_u32, 5, tip_height.value() / 2, tip_height.value()] {
         let response = lightwalletd_adapter

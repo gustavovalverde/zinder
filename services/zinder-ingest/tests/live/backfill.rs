@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::{io, num::NonZeroU32};
+use std::{io, num::NonZeroU32, sync::Arc};
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -15,6 +15,7 @@ use zinder_ingest::{BackfillOutcome, backfill};
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     assert_lightwalletd_send_transaction_classifies_invalid, assert_native_wallet_read_responses,
@@ -205,7 +206,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
         ));
     }
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let measurement_start = std::time::Instant::now();
     let _latest = wallet_query.latest_block(None).await?;

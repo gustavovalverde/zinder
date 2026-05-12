@@ -22,7 +22,7 @@ use serde_json::Value;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, Network,
-    NetworkUpgradeActivation, NetworkUpgradeSchedule, RawTransactionBytes, ShieldedProtocol,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 
@@ -194,17 +194,17 @@ impl ZebraJsonRpcSource {
         ))
     }
 
-    /// Fetches the node-advertised network upgrade schedule.
+    /// Fetches the node-advertised network upgrade activations.
     ///
     /// The values come from Zebra's `getblockchaininfo.upgrades` field so
     /// custom Testnet and Regtest activation schedules stay node-owned, per
-    /// [`docs/architecture/chain-ingestion.md`][cha]. The returned schedule
-    /// carries the same `network` identifier as this source.
+    /// [`../../../docs/architecture/chain-ingestion.md`][cha]. The returned
+    /// table carries the same `network` identifier as this source.
     ///
-    /// [cha]: https://github.com/zcashfoundation/zinder/blob/main/docs/architecture/chain-ingestion.md
-    pub async fn fetch_network_upgrade_schedule(
+    /// [cha]: ../../../docs/architecture/chain-ingestion.md
+    pub async fn fetch_network_upgrade_activations(
         &self,
-    ) -> Result<NetworkUpgradeSchedule, SourceError> {
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
         let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
             .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
                 SourceError::NodeUnavailable {
@@ -231,10 +231,10 @@ impl ZebraJsonRpcSource {
             })
             .collect::<Result<Vec<_>, SourceError>>()?;
 
-        NetworkUpgradeSchedule::new(self.network, activations).map_err(|error| {
+        NetworkUpgradeActivations::new(self.network, activations).map_err(|error| {
             tracing::warn!(
                 target: "zinder::source",
-                event = "network_upgrade_schedule_duplicate_branch_id",
+                event = "network_upgrade_activations_duplicate_branch_id",
                 error = %error,
                 "Zebra getblockchaininfo upgrades advertised a duplicate branch id"
             );
@@ -242,6 +242,32 @@ impl ZebraJsonRpcSource {
                 reason: "getblockchaininfo upgrades advertised duplicate consensus branch ids",
             }
         })
+    }
+
+    /// Discovers the node-advertised upgrade activations and wraps them for
+    /// process-wide sharing.
+    ///
+    /// Convenience wrapper that calls
+    /// [`Self::fetch_network_upgrade_activations`], wraps the result in an
+    /// [`Arc`], and emits a structured `network_upgrade_activations_discovered`
+    /// log event tagged with `target`. The four service binaries
+    /// (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`,
+    /// `zinder-derive`) share this one entry point so the discovery event
+    /// shape stays consistent across the workspace.
+    pub async fn discover_network_upgrade_activations(
+        &self,
+        target: &'static str,
+    ) -> Result<Arc<NetworkUpgradeActivations>, SourceError> {
+        let activations = Arc::new(self.fetch_network_upgrade_activations().await?);
+        tracing::info!(
+            target: "zinder::source",
+            event = "network_upgrade_activations_discovered",
+            service = target,
+            network = ?activations.network(),
+            advertised = activations.activations().len(),
+            "discovered network upgrade activations from running node"
+        );
+        Ok(activations)
     }
 
     /// Probes the node's `rpc.discover` (`OpenRPC`) endpoint and updates

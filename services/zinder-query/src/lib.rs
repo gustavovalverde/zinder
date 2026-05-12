@@ -14,12 +14,11 @@ use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
     BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeSchedule,
-    PRE_OVERWINTER_BRANCH_ID, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutEntry,
-    TransparentPrevoutsResponse, TxStatus,
+    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentPrevoutEntry, TransparentPrevoutsResponse, TxStatus,
 };
 use zinder_source::{
     SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes,
@@ -194,7 +193,7 @@ pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     read_api: ReadApi,
     transaction_broadcaster: Broadcaster,
     options: WalletQueryOptions,
-    network_upgrade_schedule: Option<Arc<NetworkUpgradeSchedule>>,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
 /// Default maximum compact-block count returned by one range call.
@@ -216,12 +215,25 @@ impl Default for WalletQueryOptions {
 }
 
 impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
-    /// Creates a wallet query boundary backed by `read_api` and `transaction_broadcaster`.
+    /// Creates a wallet query boundary backed by `read_api` and
+    /// `transaction_broadcaster`.
+    ///
+    /// `network_upgrade_activations` is the node-discovered upgrade table
+    /// that populates `MinedDetails.consensus_branch_id` for mined
+    /// transactions with the value actually active at the mined height on
+    /// the configured network. In production it is shared via
+    /// `ZebraJsonRpcSource::discover_network_upgrade_activations`; tests use
+    /// `zinder_testkit::sample_regtest_upgrade_activations`.
     #[must_use]
-    pub fn new(read_api: ReadApi, transaction_broadcaster: Broadcaster) -> Self {
+    pub fn new(
+        read_api: ReadApi,
+        transaction_broadcaster: Broadcaster,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Self {
         Self::with_options(
             read_api,
             transaction_broadcaster,
+            network_upgrade_activations,
             WalletQueryOptions::default(),
         )
     }
@@ -231,29 +243,15 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     pub const fn with_options(
         read_api: ReadApi,
         transaction_broadcaster: Broadcaster,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
         options: WalletQueryOptions,
     ) -> Self {
         Self {
             read_api,
             transaction_broadcaster,
             options,
-            network_upgrade_schedule: None,
+            network_upgrade_activations,
         }
-    }
-
-    /// Wires the node-discovered network upgrade schedule into the query
-    /// boundary. The schedule populates `MinedDetails.consensus_branch_id`
-    /// for mined transactions with the value actually active at the mined
-    /// height on the configured network.
-    ///
-    /// Without a schedule, `consensus_branch_id` defaults to
-    /// [`PRE_OVERWINTER_BRANCH_ID`]. In production the binary main is
-    /// responsible for wiring one in at startup; test fixtures may omit it
-    /// when the test does not assert on `consensus_branch_id`.
-    #[must_use]
-    pub fn with_network_upgrade_schedule(mut self, schedule: Arc<NetworkUpgradeSchedule>) -> Self {
-        self.network_upgrade_schedule = Some(schedule);
-        self
     }
 }
 
@@ -373,7 +371,7 @@ where
     ) -> Result<TransactionStatus, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
-        let schedule = self.network_upgrade_schedule.clone();
+        let activations = self.network_upgrade_activations.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
@@ -394,11 +392,7 @@ where
                     .map(|header| header.block_time)
                 })
                 .unwrap_or_default();
-            let consensus_branch_id = schedule
-                .as_deref()
-                .map_or(PRE_OVERWINTER_BRANCH_ID, |schedule| {
-                    schedule.consensus_branch_id_at(artifact.block_height)
-                });
+            let consensus_branch_id = activations.consensus_branch_id_at(artifact.block_height);
             let details = MinedDetails::from_response_epoch(
                 &chain_epoch,
                 artifact.block_height,

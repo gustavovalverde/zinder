@@ -19,7 +19,7 @@ use zinder_store::{
     ChainEpochArtifacts, ChainEpochReadApi, ChainEpochReader, ChainEventEnvelope,
     ChainEventHistoryRequest, PrimaryChainStore, StoreError,
 };
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
 
@@ -45,7 +45,8 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
             vec![second_compact_block],
         )),
     );
-    let wallet_query = WalletQuery::new(read_api, ());
+    let wallet_query =
+        WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let compact_block_range = wallet_query
         .compact_block_range(
@@ -85,7 +86,8 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
             vec![second_compact_block],
         )),
     );
-    let wallet_query = WalletQuery::new(read_api, ());
+    let wallet_query =
+        WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let response = latest_block_response(&wallet_query, None).await?;
     let response_chain_epoch = response
@@ -128,7 +130,8 @@ async fn tree_state_response_stays_bound_to_reader_epoch_if_current_epoch_advanc
             vec![second_compact_block],
         )),
     );
-    let wallet_query = WalletQuery::new(read_api, ());
+    let wallet_query =
+        WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let response = tree_state_response(&wallet_query, first_tree_state.height, None).await?;
     let response_chain_epoch = response
@@ -169,7 +172,8 @@ async fn latest_tree_state_response_stays_bound_to_reader_epoch_if_current_epoch
             vec![second_compact_block],
         )),
     );
-    let wallet_query = WalletQuery::new(read_api, ());
+    let wallet_query =
+        WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let response = latest_tree_state_response(&wallet_query, None).await?;
     let response_chain_epoch = response
@@ -210,7 +214,8 @@ async fn subtree_roots_response_stays_bound_to_reader_epoch_if_current_epoch_adv
             vec![second_compact_block],
         )),
     );
-    let wallet_query = WalletQuery::new(read_api, ());
+    let wallet_query =
+        WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let response = subtree_roots_response(
         &wallet_query,

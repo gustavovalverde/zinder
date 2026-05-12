@@ -1,6 +1,6 @@
 //! Zinder wallet query gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
@@ -140,25 +140,22 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .map(|epoch| epoch.tip_height.value());
     let broadcaster = build_broadcaster(query_config.broadcaster.as_ref()).await?;
     let transaction_broadcast_enabled = broadcaster.is_some();
-    let network_upgrade_schedule = if let Some(source) = broadcaster.as_ref() {
-        Some(Arc::new(
-            source
-                .fetch_network_upgrade_schedule()
-                .await
-                .map_err(|source| QueryConfigError::Source(Box::new(source)))?,
-        ))
-    } else {
-        tracing::warn!(
-            target: "zinder::query",
-            event = "consensus_branch_id_schedule_unavailable",
-            "MinedDetails.consensus_branch_id defaults to PRE_OVERWINTER_BRANCH_ID because [node] is not configured"
-        );
-        None
+    let network_upgrade_activations = match broadcaster.as_ref() {
+        Some(source) => source
+            .discover_network_upgrade_activations("zinder-query")
+            .await
+            .map_err(|error| QueryConfigError::Source(Box::new(error)))?,
+        None => {
+            return Err(QueryConfigError::Source(Box::new(
+                zinder_source::SourceError::SourceProtocolMismatch {
+                    reason: "[node] section is required so the consensus branch id schedule \
+                             can be discovered at startup",
+                },
+            )));
+        }
     };
-    let mut wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
-    if let Some(schedule) = network_upgrade_schedule {
-        wallet_query = wallet_query.with_network_upgrade_schedule(schedule);
-    }
+    let wallet_query =
+        zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations);
     let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
         network: query_config.network.name().to_owned(),

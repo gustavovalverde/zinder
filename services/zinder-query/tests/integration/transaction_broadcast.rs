@@ -4,13 +4,16 @@
 )]
 
 use eyre::eyre;
+use std::sync::Arc;
 use zinder_core::{
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected, Network,
     RawTransactionBytes, TransactionBroadcastResult, TransactionId,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
 use zinder_source::SourceError;
-use zinder_testkit::{MockTransactionBroadcaster, StoreFixture};
+use zinder_testkit::{
+    MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
+};
 
 #[tokio::test]
 async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
@@ -20,6 +23,7 @@ async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
         mock_broadcaster.clone(),
+        Arc::new(sample_regtest_upgrade_activations()),
     );
 
     let broadcast_result = wallet_query
@@ -60,6 +64,7 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
         let wallet_query = WalletQuery::new(
             store_fixture.chain_store().clone(),
             MockTransactionBroadcaster::returning(expected_broadcast_result.clone()),
+            Arc::new(sample_regtest_upgrade_activations()),
         );
 
         let broadcast_result = wallet_query
@@ -78,6 +83,7 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
         MockTransactionBroadcaster::node_unavailable("node is offline", true),
+        Arc::new(sample_regtest_upgrade_activations()),
     );
 
     let error = match wallet_query
@@ -114,6 +120,7 @@ async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()>
     let wallet_query = WalletQuery::new(
         store.clone(),
         MockTransactionBroadcaster::accepted(transaction_id),
+        Arc::new(sample_regtest_upgrade_activations()),
     );
 
     let broadcast_result = wallet_query
@@ -134,7 +141,11 @@ async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()>
 #[tokio::test]
 async fn read_only_wallet_query_reports_broadcast_disabled() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
-    let wallet_query = WalletQuery::new(store_fixture.chain_store().clone(), ());
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
 
     let error = match wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x05]))

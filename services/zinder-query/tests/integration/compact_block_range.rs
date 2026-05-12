@@ -4,6 +4,7 @@
 )]
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use eyre::eyre;
 use prost::Message;
@@ -18,7 +19,7 @@ use zinder_query::{
     latest_block_response, latest_tree_state_response, subtree_roots_response, tree_state_response,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
 
@@ -40,7 +41,7 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
         vec![second_compact_block.clone()],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
         .compact_block_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
@@ -69,7 +70,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         vec![compact_block.clone()],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
         .compact_block_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
@@ -147,7 +148,7 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = latest_block_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::LatestBlockResponse::decode(encoded_response.as_slice())?;
@@ -183,7 +184,7 @@ async fn tree_state_response_uses_native_wallet_proto_shape() -> eyre::Result<()
             .with_tree_states(vec![tree_state.clone()]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = tree_state_response(&wallet_query, BlockHeight::new(1), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
@@ -219,7 +220,7 @@ async fn latest_tree_state_response_uses_tip_tree_state() -> eyre::Result<()> {
             .with_tree_states(vec![tree_state.clone()]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = latest_tree_state_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
@@ -247,7 +248,7 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = subtree_roots_response(
         &wallet_query,
         SubtreeRootRange::new(
@@ -282,7 +283,7 @@ async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missi
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match subtree_roots_response(
         &wallet_query,
         SubtreeRootRange::new(
@@ -332,7 +333,7 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = subtree_roots_response(
         &wallet_query,
         SubtreeRootRange::new(
@@ -401,7 +402,7 @@ async fn subtree_roots_response_uses_stored_tip_metadata_not_compact_block_paylo
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .subtree_roots(
             SubtreeRootRange::new(
@@ -431,7 +432,7 @@ async fn compact_block_range_reports_unavailable_artifact_without_node_repair() 
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query
         .compact_block_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
@@ -471,7 +472,7 @@ async fn tree_state_response_reports_unavailable_artifact_without_node_repair() 
         vec![compact_block],
     ))?;
 
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match tree_state_response(&wallet_query, BlockHeight::new(1), None).await {
         Ok(tree_state_response) => {
             return Err(eyre!(
@@ -496,7 +497,7 @@ async fn tree_state_response_reports_unavailable_artifact_without_node_repair() 
 async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let error = match wallet_query
         .compact_block_range(
@@ -523,6 +524,7 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
     let wallet_query = WalletQuery::with_options(
         store,
         (),
+        Arc::new(sample_regtest_upgrade_activations()),
         WalletQueryOptions {
             max_compact_block_range: NonZeroU32::new(1)
                 .ok_or_else(|| eyre!("invalid range limit"))?,

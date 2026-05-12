@@ -33,6 +33,7 @@
 
 use eyre::eyre;
 use prost::Message;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, transport::Server};
@@ -50,7 +51,9 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::WalletQuery;
-use zinder_testkit::{ChainFixture, FixtureBlock, StoreFixture};
+use zinder_testkit::{
+    ChainFixture, FixtureBlock, StoreFixture, sample_regtest_upgrade_activations,
+};
 
 const SDK_SCAN_BLOCK_COUNT: u32 = 10;
 const SDK_SCAN_SAPLING_TREE_SIZE: u32 = SUBTREE_LEAF_COUNT;
@@ -60,9 +63,15 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
     let store_fixture = sdk_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter =
-        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()))
-            .into_server();
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter)
@@ -119,9 +128,15 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
     let store_fixture = sdk_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter =
-        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()))
-            .into_server();
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter)

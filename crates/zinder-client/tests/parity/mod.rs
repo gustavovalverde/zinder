@@ -5,11 +5,11 @@
 //! not byte-equivalence with Zaino (which Zinder deliberately refuses for
 //! the documented anti-patterns).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use zinder_client::{BlockHeight, ChainEpochId, LocalChainIndex, LocalOpenOptions, Network};
 use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT};
-use zinder_testkit::{ChainFixture, StoreFixture};
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 const PARITY_TREE_STATE_PAYLOAD: &[u8] =
     br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{"finalState":"000000"}},"orchard":{"commitments":{"finalState":"111111"}}}"#;
@@ -40,6 +40,7 @@ async fn open_local_chain_index(store_fixture: &StoreFixture) -> eyre::Result<Lo
         network: Network::ZcashRegtest,
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?)
 }

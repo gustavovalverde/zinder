@@ -14,6 +14,7 @@
 //! address is logged by the test on startup.
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
@@ -23,8 +24,8 @@ use zinder_core::{BlockHeight, Network};
 use zinder_ingest::{BackfillOutcome, backfill};
 use zinder_query::{TransparentAddressUtxosRequest, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
-use zinder_testkit::TransparentTestKey;
 use zinder_testkit::live::{init, require_live_for};
+use zinder_testkit::{TransparentTestKey, sample_regtest_upgrade_activations};
 
 use crate::common::{
     fetch_live_tip_height, live_backfill_config, regtest_generate_blocks,
@@ -74,7 +75,7 @@ async fn transparent_address_utxos_surface_through_typed_wallet_query() -> Resul
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let wallet_query = WalletQuery::new(store, ());
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let mut hasher = Sha256::new();
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
