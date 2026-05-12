@@ -134,6 +134,68 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
     Ok(NodeSource::tip_id(&probe_source).await?.height)
 }
 
+/// Calls a raw Zebra JSON-RPC method by name.
+///
+/// Returns the `result` field as a `serde_json::Value`. Live tests use this
+/// to drive RPCs the production `NodeSource` trait does not expose (regtest
+/// `generate`, `invalidateblock`, `reconsiderblock`, `getblockhash`).
+///
+/// The Zebra sidecar is expected to be reachable at
+/// `env.target.json_rpc_addr` with whatever auth is configured for the
+/// node target; the basic-auth credentials carried by `env.target.node_auth`
+/// are passed through as the `-u` argument when present so the same helper
+/// works against a sidecar configured with `ZEBRA_RPC__ENABLE_COOKIE_AUTH=false`
+/// and a `username:password` pair (the default ZFND `z3` setup).
+pub(crate) async fn regtest_json_rpc_call(
+    env: &LiveTestEnv,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use secrecy::ExposeSecret;
+    use zinder_source::NodeAuth;
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let mut command = tokio::process::Command::new("curl");
+    command
+        .arg("-s")
+        .args(["-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .arg("-d")
+        .arg(&body);
+    if let NodeAuth::Basic { username, password } = &env.target.node_auth {
+        command
+            .arg("-u")
+            .arg(format!("{username}:{}", password.expose_secret()));
+    }
+    command.arg(env.target.json_rpc_addr.as_str());
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "{method} curl exited with status {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let response_body = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&response_body)
+        .map_err(|error| eyre!("{method} response is not JSON: {error}; body={response_body}"))?;
+    if let Some(error_field) = parsed.get("error")
+        && !error_field.is_null()
+    {
+        return Err(eyre!("{method} RPC returned error: {error_field}"));
+    }
+    parsed
+        .get("result")
+        .cloned()
+        .ok_or_else(|| eyre!("{method} response missing result field; body={response_body}"))
+}
+
 /// Calls Zebra's regtest-only `generate` JSON-RPC to mine `block_count` empty
 /// blocks. Returns the list of newly mined block hashes.
 ///
@@ -145,42 +207,41 @@ pub(crate) async fn regtest_generate_blocks(
     env: &LiveTestEnv,
     block_count: u32,
 ) -> Result<Vec<String>> {
-    let body =
-        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{block_count}]}}"#);
-    let output = tokio::process::Command::new("curl")
-        .arg("-s")
-        .args(["-X", "POST"])
-        .args(["-H", "content-type: application/json"])
-        .arg("-d")
-        .arg(&body)
-        .arg(env.target.json_rpc_addr.as_str())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(eyre!(
-            "regtest generate({block_count}) curl exited with status {:?}: stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let body = String::from_utf8(output.stdout)?;
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|error| eyre!("regtest generate response is not JSON: {error}; body={body}"))?;
-    if let Some(error_field) = parsed.get("error")
-        && !error_field.is_null()
-    {
-        return Err(eyre!(
-            "regtest generate({block_count}) RPC returned error: {error_field}"
-        ));
-    }
-    let result_field = parsed
-        .get("result")
-        .ok_or_else(|| eyre!("regtest generate response missing result field; body={body}"))?;
-    let block_hashes: Vec<String> =
-        serde_json::from_value(result_field.clone()).map_err(|error| {
-            eyre!("regtest generate result is not a list of block hashes: {error}; body={body}")
-        })?;
+    let rpc_result =
+        regtest_json_rpc_call(env, "generate", serde_json::json!([block_count])).await?;
+    let block_hashes: Vec<String> = serde_json::from_value(rpc_result)
+        .map_err(|error| eyre!("regtest generate result is not a list of block hashes: {error}"))?;
     Ok(block_hashes)
+}
+
+/// Calls Zebra's regtest-only `invalidateblock` JSON-RPC.
+///
+/// Drops the named block from the canonical chain along with every
+/// descendant, so the tip rolls back to the block's parent. Used by
+/// reorg-sweep live tests to force `ChainReorged` chain events.
+pub(crate) async fn rpc_invalidate_block(env: &LiveTestEnv, block_hash_hex: &str) -> Result<()> {
+    regtest_json_rpc_call(env, "invalidateblock", serde_json::json!([block_hash_hex])).await?;
+    Ok(())
+}
+
+/// Calls Zebra's regtest-only `reconsiderblock` JSON-RPC.
+///
+/// Restores a block previously marked invalid via `invalidateblock`.
+/// Best-effort cleanup helper for reorg-sweep tests that want to leave the
+/// sidecar in a clean state for subsequent runs.
+pub(crate) async fn rpc_reconsider_block(env: &LiveTestEnv, block_hash_hex: &str) -> Result<()> {
+    regtest_json_rpc_call(env, "reconsiderblock", serde_json::json!([block_hash_hex])).await?;
+    Ok(())
+}
+
+/// Calls Zebra's `getblockhash` JSON-RPC and returns the canonical block
+/// hash at `height` in Zebra's display (big-endian) encoding.
+pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> Result<String> {
+    let rpc_result =
+        regtest_json_rpc_call(env, "getblockhash", serde_json::json!([height])).await?;
+    let block_hash: String = serde_json::from_value(rpc_result)
+        .map_err(|error| eyre!("getblockhash result is not a hex string: {error}"))?;
+    Ok(block_hash)
 }
 
 /// Asserts that the backfilled store answers every wallet read RPC consistently

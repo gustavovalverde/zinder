@@ -43,7 +43,7 @@ use zinder_testkit::{
     local_network_from_activations,
 };
 
-use crate::common::regtest_generate_blocks;
+use crate::common::{regtest_generate_blocks, rpc_invalidate_block, rpc_reconsider_block};
 
 /// Test seed used to derive the regtest broadcast cycle's transparent
 /// account key. Operators configure their Zebra `miner_address` to the
@@ -428,68 +428,6 @@ async fn wait_for_mined(
     Err(eyre!(
         "deadline elapsed without observing Mined for the broadcast txid"
     ))
-}
-
-async fn rpc_invalidate_block(
-    env: &zinder_testkit::live::LiveTestEnv,
-    block_hash_hex: &str,
-) -> Result<()> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"invalidateblock","params":["{block_hash_hex}"]}}"#
-    );
-    let output = tokio::process::Command::new("curl")
-        .arg("-s")
-        .args(["-X", "POST"])
-        .args(["-H", "content-type: application/json"])
-        .arg("-d")
-        .arg(&body)
-        .arg(env.target.json_rpc_addr.as_str())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(eyre!(
-            "invalidateblock({block_hash_hex}) curl exited with status {:?}: stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let body = String::from_utf8(output.stdout)?;
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|error| eyre!("invalidateblock response is not JSON: {error}; body={body}"))?;
-    if let Some(error_field) = parsed.get("error")
-        && !error_field.is_null()
-    {
-        return Err(eyre!(
-            "invalidateblock({block_hash_hex}) RPC returned error: {error_field}"
-        ));
-    }
-    Ok(())
-}
-
-async fn rpc_reconsider_block(
-    env: &zinder_testkit::live::LiveTestEnv,
-    block_hash_hex: &str,
-) -> Result<()> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"reconsiderblock","params":["{block_hash_hex}"]}}"#
-    );
-    let output = tokio::process::Command::new("curl")
-        .arg("-s")
-        .args(["-X", "POST"])
-        .args(["-H", "content-type: application/json"])
-        .arg("-d")
-        .arg(&body)
-        .arg(env.target.json_rpc_addr.as_str())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(eyre!(
-            "reconsiderblock({block_hash_hex}) curl exited with status {:?}: stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(())
 }
 
 #[allow(

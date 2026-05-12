@@ -4,6 +4,7 @@ mod native_grpc;
 mod query_epoch_consistency;
 mod readiness_refresh;
 mod single_artifact_lookup;
+mod stream_cancellation;
 mod transaction_broadcast;
 mod transparent_address_tx_history;
 mod transparent_address_utxos;

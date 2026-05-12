@@ -103,6 +103,55 @@ fn secondary_open_rejects_network_mismatch() -> eyre::Result<()> {
 }
 
 #[test]
+fn secondary_continues_serving_after_primary_drops() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let primary_path = tempdir.path().join("primary");
+    let secondary_path = tempdir.path().join("secondary-query");
+
+    // Phase 1: open the primary, commit two epochs, drop the primary
+    // handle. This stands in for an unclean writer shutdown (process
+    // crash, SIGKILL, host failure): readers that come up afterward must
+    // still see the last durable state.
+    let final_epoch = {
+        let primary = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
+        let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
+        primary.commit_chain_epoch(ChainEpochArtifacts::new(
+            first_epoch,
+            vec![first_block],
+            vec![first_compact_block],
+        ))?;
+        let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
+        primary.commit_chain_epoch(ChainEpochArtifacts::new(
+            second_epoch,
+            vec![second_block],
+            vec![second_compact_block],
+        ))?;
+        second_epoch
+    };
+
+    // Phase 2: a fresh secondary opened against the now-closed primary
+    // serves the last committed epoch without needing the primary to
+    // come back up.
+    let secondary = SecondaryChainStore::open(
+        &primary_path,
+        &secondary_path,
+        ChainStoreOptions::for_local_tests(),
+    )?;
+    assert_eq!(secondary.current_chain_epoch()?, Some(final_epoch));
+    let reader = secondary.current_chain_epoch_reader()?;
+    assert_eq!(reader.chain_epoch(), final_epoch);
+    assert!(reader.block_at(BlockHeight::new(2))?.is_some());
+
+    // Phase 3: a new primary opened against the same path resumes from
+    // the durable state. Validates that an operator restart after a
+    // crash does not regress to genesis.
+    let restarted_primary =
+        PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
+    assert_eq!(restarted_primary.current_chain_epoch()?, Some(final_epoch));
+    Ok(())
+}
+
+#[test]
 fn checkpoint_round_trip_preserves_visible_epoch() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let primary_path = tempdir.path().join("primary");

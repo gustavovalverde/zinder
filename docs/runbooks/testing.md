@@ -45,12 +45,20 @@ cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
 cargo machete
+scripts/runbook-lint.sh docs/runbooks/testing.md
 git diff --check
 ```
 
 Expected outcome: every command exits zero. The full suite runs in ~5 minutes
 on a developer laptop. If `cargo machete` reports unused dependencies on a
 crate you did not touch, treat it as a pre-existing finding, not a blocker.
+
+`scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
+through `bash -n` (syntax-only mode) so a typo or unclosed quote in an
+operator recipe fails CI immediately rather than ambushing an on-call
+engineer. It does not execute the blocks; running them still requires the
+documented prerequisites. See [Runbook self-test](#runbook-self-test)
+below for the full contract.
 
 ## Release parity gate (consumer-shaped fixtures)
 
@@ -220,6 +228,220 @@ Currently-mainnet-only tests are:
 `tip_id_advances_above_one_million`,
 `backfills_last_1000_blocks_from_checkpoint`, plus the federated balance
 read-only confirmations under `services/zinder-derive/tests/live/`.
+
+## T3: Reorg sweep
+
+Forces canonical-chain reorgs on the running regtest sidecar via
+`invalidateblock`/`reconsiderblock` and asserts that the writer's
+`IngestControl.ChainEvents` stream emits a `ChainReorged` envelope whose
+reverted range covers the invalidated heights. Catches drift between
+Zebra's chain rollback and Zinder's reorg-detection logic at the seam
+between `tip_follow` and `PrimaryChainStore::commit_chain_epoch`.
+
+```bash
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-regtest \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=zebra \
+  ZINDER_NODE__AUTH__PASSWORD=zebra \
+  cargo nextest run --profile=ci-live -E 'test(/^live::reorg_sweep::/)' \
+    --run-ignored=all
+```
+
+What it covers (file:
+[`services/zinder-ingest/tests/live/reorg_sweep.rs`](../../services/zinder-ingest/tests/live/reorg_sweep.rs)):
+
+- `single_block_reorg_surfaces_chain_reorged_envelope`: invalidates the
+  current tip, mines two replacement blocks, asserts a `ChainReorged`
+  envelope appears on the IngestControl stream whose `reverted.start_height`
+  equals the invalidated height.
+- `three_block_reorg_covers_full_reverted_range`: invalidates the block
+  three heights below tip, mines five replacement blocks, asserts the
+  reverted range spans exactly three heights.
+
+These tests join the `node-mutating` group in `.config/nextest.toml`; they
+serialize against the broadcast cycle and indexer-restart tests so they
+can share the regtest sidecar without racing. Mainnet/testnet reorgs are
+not exercised — forcing reorgs on a real network is destructive and
+out of scope for this gate.
+
+Known follow-up: a near-window-edge reorg (depth approaching
+`reorg_window_blocks`) would catch budget-boundary bugs in the reorg
+machinery. It needs the writer's reorg window configured small enough
+that the test finishes quickly; tracked but not yet wired in.
+
+## T3: Network upgrade boundary crossing
+
+Pins the per-height consensus-branch-id contract across a network
+upgrade activation. The single-tip
+[`mined_consensus_branch_id_parity`](../../services/zinder-ingest/tests/live/mined_consensus_branch_id_parity.rs)
+test only samples the chain tip; this companion samples three heights
+that straddle the latest reachable activation, so a regression in
+[ADR-0015](../adrs/0015-network-parameter-discovery.md)'s discovery path
+or in how `MinedDetails.consensus_branch_id` is populated surfaces here
+even when the tip happens to be in a "stable" upgrade window.
+
+```bash
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-regtest \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=zebra \
+  ZINDER_NODE__AUTH__PASSWORD=zebra \
+  cargo nextest run --profile=ci-live \
+    -E 'test(/^live::network_upgrade_boundary::/)' --run-ignored=all
+```
+
+The same invocation works for testnet (`ZINDER_NETWORK=zcash-testnet`,
+target activation = NU6.1 at height 3,536,500) and mainnet
+(`ZINDER_NETWORK=zcash-mainnet`, target activation = NU6.1 at height
+3,146,400). On testnet/mainnet the test anchors a checkpoint just below
+the activation so the backfill window stays at three blocks.
+
+File:
+[`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).
+
+## T3: Writer fencing and crash recovery
+
+Multi-process storage access is the production deployment shape per
+[ADR-0007](../adrs/0007-multi-process-storage-access.md): one
+`zinder-ingest` primary writer plus N `zinder-query` and
+`zinder-compat-lightwalletd` secondary readers. This section validates
+both the structural fencing (RocksDB primary lock) and the
+operationally critical "writer crashed, readers survive" semantic.
+
+### Automated coverage
+
+Three integration tests under
+[`crates/zinder-store/tests/integration/primary_secondary.rs`](../../crates/zinder-store/tests/integration/primary_secondary.rs)
+run with every `cargo nextest run --profile=ci`:
+
+- `second_primary_open_returns_primary_already_open` — proves a second
+  writer cannot silently take over an already-open primary store; the
+  RocksDB lock surfaces as `StoreError::PrimaryAlreadyOpen`.
+- `secondary_continues_serving_after_primary_drops` — opens a primary,
+  commits two epochs, drops the primary handle, then asserts a fresh
+  secondary opened against the same path serves the last-committed
+  epoch without the primary coming back up. Phase 3 of the same test
+  asserts a restarted primary resumes from the durable state.
+- `secondary_catches_up_after_primary_commits` — the live-writer
+  catchup baseline; pre-existing.
+
+### Manual reproduction: kill -9 mid-commit
+
+Use this when changing storage commit paths or the
+`PrimaryChainStore::commit_chain_epoch` body. The automated test cannot
+exercise unclean shutdown mid-batch because dropping the handle in
+process closes RocksDB cleanly.
+
+```bash
+# Terminal 1: start tip-follow against z3 regtest.
+mkdir -p .tmp
+rm -rf .tmp/regtest.zinder-store
+cargo run --release --bin zinder-ingest -- \
+  --config .tmp/regtest.ingest.toml tip-follow &
+INGEST_PID=$!
+
+# Terminal 1 (after a few blocks commit): SIGKILL the writer mid-flight.
+sleep 5
+kill -9 "$INGEST_PID"
+wait "$INGEST_PID" 2>/dev/null || true
+
+# Reopen and assert state is consistent. The reopen must succeed and the
+# cursor must point at a durable height; if reopen fails with
+# SchemaMismatch / corruption, that's a real defect.
+cargo run --release --bin zinder-ingest -- \
+  --config .tmp/regtest.ingest.toml print-config
+cargo run --release --bin zinder-query -- \
+  --config .tmp/regtest.reader.toml --listen-addr 127.0.0.1:9069 &
+QUERY_PID=$!
+sleep 2
+grpcurl -plaintext \
+  -import-path crates/zinder-proto/proto \
+  -proto crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto \
+  127.0.0.1:9069 zinder.v1.wallet.WalletQuery/LatestBlock
+kill "$QUERY_PID" 2>/dev/null || true
+```
+
+Expected: `LatestBlock` returns a real chain epoch. RocksDB's WAL replay
+restores any in-flight committed batch on reopen; partial commits are
+visible only after their write batch is durably persisted, so the
+reopened tip is always at-or-below the last batch the writer signaled
+durable.
+
+### Manual reproduction: second-writer fencing across processes
+
+```bash
+cargo run --release --bin zinder-ingest -- \
+  --config .tmp/regtest.ingest.toml tip-follow &
+sleep 2
+# This second invocation must fail with PrimaryAlreadyOpen (LOCK file in
+# .tmp/regtest.zinder-store/LOCK). If it succeeds, the fencing contract
+# is broken.
+cargo run --release --bin zinder-ingest -- \
+  --config .tmp/regtest.ingest.toml tip-follow
+```
+
+Expected: the second `zinder-ingest` process exits non-zero with an
+error message naming the LOCK path. The first process continues
+uninterrupted.
+
+## Concurrent readers and stream cancellation
+
+Production deployments fan a single `zinder-query` server out behind
+multiple `zinder-compat-lightwalletd` processes (per
+[service-operations](../architecture/service-operations.md)). The gRPC
+adapter must (a) serve concurrent streamed reads without serializing
+them, and (b) clean up server-side resources when a client disconnects
+mid-stream.
+
+### Automated coverage
+
+Two integration tests under
+[`services/zinder-query/tests/integration/stream_cancellation.rs`](../../services/zinder-query/tests/integration/stream_cancellation.rs)
+run with every `cargo nextest run --profile=ci`:
+
+- `dropping_compact_block_range_stream_does_not_break_subsequent_requests`
+  — opens a `compact_block_range` stream, reads one chunk, drops it,
+  then opens a second stream and drains it. Asserts the server stays
+  responsive after a mid-stream cancellation.
+- `parallel_compact_block_range_readers_all_drain_to_completion` —
+  spawns 16 concurrent clients each draining the full committed range
+  and asserts every reader finishes within a 20-second deadline.
+
+### Manual reproduction: N concurrent compat readers
+
+Operator-grade reproduction needs a real backfilled store plus a real
+gRPC client. Two terminals:
+
+```bash
+# Terminal 1: serve over a populated store.
+cargo run --release --bin zinder-compat-lightwalletd -- \
+  --config .tmp/regtest.reader.toml \
+  --secondary-path .tmp/regtest.compat-secondary \
+  --listen-addr 127.0.0.1:9067
+
+# Terminal 2: fan out N parallel GetBlockRange calls.
+for reader_index in $(seq 1 10); do
+  grpcurl -plaintext \
+    -import-path crates/zinder-proto/proto/compat/lightwalletd \
+    -proto crates/zinder-proto/proto/compat/lightwalletd/service.proto \
+    -d '{"start":{"height":1},"end":{"height":100}}' \
+    127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange \
+    > ".tmp/reader-$reader_index.out" &
+done
+wait
+wc -l .tmp/reader-*.out
+```
+
+Expected: every reader receives a non-zero number of lines, no
+`-1`/transport errors, and no reader hangs past the others.
+
+Known follow-up: a slow-consumer test that opens a stream, pauses
+between reads, and asserts the server's per-stream memory stays
+bounded. That requires runtime memory introspection beyond what the
+gRPC contract surfaces; tracked but not yet wired in.
 
 ## Performance calibration (T2 + live latency)
 
@@ -449,8 +671,9 @@ cargo run --release --bin zinder-compat-lightwalletd -- \
 
 ```bash
 # Terminal 3: a lightwalletd-compatible wallet or SDK pointing at the compat shim
-# Configure the endpoint to http://127.0.0.1:9067.
-<wallet-or-sdk-command>
+# Configure the endpoint to http://127.0.0.1:9067, then run the wallet/SDK
+# command (Zashi adb command, Android demo, zec-rocks-grpcurl probe, etc.):
+#   ./run-wallet-against http://127.0.0.1:9067
 ```
 
 What this catches that the deterministic test does not:
@@ -705,12 +928,23 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 
 ## Pre-flight checklist (before declaring a change shipped)
 
-- [ ] Default validation gate green (`cargo fmt`/`cargo clippy`/`cargo nextest run --profile=ci`/`cargo nextest run --profile=ci-perf`/`cargo doc`/`cargo deny`).
+- [ ] Default validation gate green (`cargo fmt`/`cargo clippy`/`cargo nextest run --profile=ci`/`cargo nextest run --profile=ci-perf`/`cargo doc`/`cargo deny`/`scripts/runbook-lint.sh`).
 - [ ] If the change touched a consumer-facing wire contract or compatibility
       adapter: `cargo nextest run --profile=ci-parity`.
 - [ ] Live regtest sweep green (`ci-live` profile against z3, with indexer
-      gRPC env). Hosted-network-only gates are expected to refuse regtest and
-      should be rerun against testnet or mainnet.
+      gRPC env), including
+      [Reorg sweep](#t3-reorg-sweep),
+      [Network upgrade boundary crossing](#t3-network-upgrade-boundary-crossing),
+      and [Writer fencing and crash recovery](#t3-writer-fencing-and-crash-recovery)
+      where applicable. Hosted-network-only gates are expected to refuse regtest
+      and should be rerun against testnet or mainnet.
+- [ ] If the change touched storage commit, schema, or multi-process semantics:
+      the [Writer fencing and crash recovery](#t3-writer-fencing-and-crash-recovery)
+      `kill -9` and second-writer recipes have been replayed locally.
+- [ ] If the change touched a streamed gRPC surface or the
+      `zinder-compat-lightwalletd` adapter: the
+      [Concurrent readers and stream cancellation](#concurrent-readers-and-stream-cancellation)
+      tests have been replayed.
 - [ ] If the change claims Zallet compatibility: real Zallet binary gate green
       (`ci-zallet-live` with `ZINDER_TEST_ZALLET*` env against the Zinder-native
       contract).
@@ -946,6 +1180,35 @@ After the runs above. Each cross-refs the section that owns the procedure.
   builds use embedded Zaino, which the gate intentionally rejects. Tracked as
   upstream dependency on a Zinder-native Zallet branch. See
   [T3: Real Zallet binary gate](#t3-real-zallet-binary-gate).
+
+## Runbook self-test
+
+This runbook is operator-facing, dense, and changes often. Three classes
+of drift are easy to introduce and expensive to discover during an
+incident: a typo in a fenced shell command, a profile name that no
+longer matches `.config/nextest.toml`, or a capability list that has
+fallen behind `ZINDER_CAPABILITIES`. Each is caught by a piece of the
+standard validation gate.
+
+| Drift class | How it's caught | Where |
+| ----------- | --------------- | ----- |
+| Bash syntax in a fenced `bash` block | `scripts/runbook-lint.sh` runs every block through `bash -n`. Wired into the default validation gate above. | [`scripts/runbook-lint.sh`](../../scripts/runbook-lint.sh) |
+| Profile-name drift between this runbook and `.config/nextest.toml` | `testing_runbook_profile_names_exist_in_nextest_toml` asserts every `--profile=<name>` quoted in this file resolves to a real `[profile.<name>]` section. | [`crates/zinder-proto/tests/integration/capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs) |
+| Default-filter drift between this runbook and `.config/nextest.toml` | `testing_runbook_default_filter_mirrors_nextest_toml` asserts the quoted expression matches the canonical one. | Same file. |
+| Capability-list drift between this runbook and `ZINDER_CAPABILITIES` | `testing_runbook_capability_list_mirrors_zinder_capabilities` asserts the list under the `<!-- capability-list:testing-runbook -->` markers matches the constant. | Same file. |
+
+All four checks ship with the default `cargo nextest run --profile=ci`
+invocation; no separate runbook-self-test profile is needed. When you
+add a new fenced command, profile, or capability, the corresponding
+check fires on the next CI run if the runbook and code diverge.
+
+To extend the self-test (for example, to gate a new profile name or a
+new doc embedded constant), add an entry to
+`RUNBOOK_REFERENCED_PROFILES` (or a peer constant) in
+[`capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs)
+and let the existing assertion shape catch drift. The runbook-lint
+script needs no changes for new blocks — it discovers them by markdown
+fence syntax.
 
 ## Cross-references
 

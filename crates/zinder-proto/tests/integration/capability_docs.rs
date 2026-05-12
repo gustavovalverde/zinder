@@ -11,11 +11,20 @@ use zinder_proto::ZINDER_CAPABILITIES;
 const PUBLIC_INTERFACES_DOC: &str =
     include_str!("../../../../docs/architecture/public-interfaces.md");
 const TESTING_RUNBOOK_DOC: &str = include_str!("../../../../docs/runbooks/testing.md");
+const NEXTEST_TOML: &str = include_str!("../../../../.config/nextest.toml");
 
 const PUBLIC_INTERFACES_START: &str = "<!-- capability-list:public-interfaces:start -->";
 const PUBLIC_INTERFACES_END: &str = "<!-- capability-list:public-interfaces:end -->";
 const TESTING_RUNBOOK_START: &str = "<!-- capability-list:testing-runbook:start -->";
 const TESTING_RUNBOOK_END: &str = "<!-- capability-list:testing-runbook:end -->";
+
+/// `--profile=<name>` invocations the testing runbook quotes.
+///
+/// Each must resolve to an existing `[profile.<name>]` section in
+/// `.config/nextest.toml` so an operator following the runbook hits a
+/// real profile.
+const RUNBOOK_REFERENCED_PROFILES: &[&str] =
+    &["ci", "ci-perf", "ci-live", "ci-zallet-live", "ci-parity"];
 
 #[test]
 fn public_interfaces_capability_list_mirrors_zinder_capabilities() -> Result<()> {
@@ -35,6 +44,57 @@ fn testing_runbook_capability_list_mirrors_zinder_capabilities() -> Result<()> {
         TESTING_RUNBOOK_START,
         TESTING_RUNBOOK_END,
     )
+}
+
+#[test]
+fn testing_runbook_default_filter_mirrors_nextest_toml() -> Result<()> {
+    let quoted = TESTING_RUNBOOK_DOC
+        .lines()
+        .find(|line| line.contains("default-filter = "))
+        .ok_or_else(|| eyre!("testing.md must quote the default-filter line"))?
+        .trim()
+        .trim_start_matches('`')
+        .trim_end_matches('`');
+    let toml_default_profile = NEXTEST_TOML
+        .split("[profile.default]")
+        .nth(1)
+        .ok_or_else(|| eyre!(".config/nextest.toml must declare [profile.default]"))?
+        .split("[profile.")
+        .next()
+        .ok_or_else(|| eyre!("could not isolate the default profile section"))?;
+    let toml_default_filter = toml_default_profile
+        .lines()
+        .find(|line| line.trim_start().starts_with("default-filter = "))
+        .ok_or_else(|| eyre!("default profile must set default-filter"))?
+        .trim();
+    assert!(
+        quoted.contains(toml_default_filter) || toml_default_filter.contains(quoted),
+        "default-filter quoted in docs/runbooks/testing.md does not match \
+         the value in .config/nextest.toml.\n  runbook: {quoted}\n  nextest: {toml_default_filter}\n\
+         When you change the default-filter expression in either place, \
+         update the other so operators do not chase a stale invocation."
+    );
+    Ok(())
+}
+
+#[test]
+fn testing_runbook_profile_names_exist_in_nextest_toml() {
+    for profile in RUNBOOK_REFERENCED_PROFILES {
+        let toml_marker = format!("[profile.{profile}]");
+        assert!(
+            NEXTEST_TOML.contains(&toml_marker),
+            "testing.md references `--profile={profile}` but .config/nextest.toml \
+             has no {toml_marker} section. Either add the profile or remove the \
+             reference from the runbook."
+        );
+        let runbook_marker = format!("--profile={profile}");
+        assert!(
+            TESTING_RUNBOOK_DOC.contains(&runbook_marker),
+            "expected the testing runbook to mention --profile={profile}; \
+             if the profile is intentionally workspace-only and not part of \
+             the runbook contract, drop it from RUNBOOK_REFERENCED_PROFILES."
+        );
+    }
 }
 
 fn assert_capability_list_matches(
