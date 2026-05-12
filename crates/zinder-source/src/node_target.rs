@@ -27,6 +27,7 @@ use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
+use zinder_core::wire::decode_zinder_native_chain_name;
 
 use crate::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 
@@ -143,9 +144,11 @@ impl NodeTarget {
     /// env-var schema serves production and tests.
     pub fn from_environment() -> Result<Self, NodeConfigError> {
         let network_name = read_required("ZINDER_NETWORK")?;
-        let network = Network::from_name(&network_name).ok_or(NodeConfigError::Invalid {
-            reason: "ZINDER_NETWORK must be zcash-mainnet, zcash-testnet, or zcash-regtest",
-        })?;
+        let network = decode_zinder_native_chain_name(&network_name).ok().ok_or(
+            NodeConfigError::Invalid {
+                reason: "ZINDER_NETWORK must be zcash-mainnet, zcash-testnet, or zcash-regtest",
+            },
+        )?;
 
         let section = NodeSection {
             json_rpc_addr: read_optional("ZINDER_NODE__JSON_RPC_ADDR"),

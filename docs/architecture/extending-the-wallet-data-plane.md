@@ -216,7 +216,7 @@ In the binary's startup (`services/zinder-query/src/bin/zinder-query/main.rs`): 
 
 File: `crates/zinder-proto/src/capabilities.rs`
 
-- `derive.<consumer>.ready_v1`: advertised by the derive service's own `ServerInfo`; the readiness probe polls for this string.
+- `derive.<consumer>.server_info_v1`: advertised by the derive service's own `ServerInfo`; the readiness probe polls for this string.
 - `derive.<consumer>.<method>_v1`: advertised by `zinder-query` when the readiness gauge is `true`.
 
 ### F7. Compat shim derive wiring (if applicable)
@@ -297,7 +297,7 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F1: `ExplorerQuery.TransparentAddressBalance` proto.
 - F2-F4: `DeriveProxy<ExplorerQueryClient<...>>` field on `WalletQueryGrpcAdapter`, builder, ServerInfo capability gating.
 - F5: `spawn_derive_readiness_probe` in `zinder-query` startup.
-- F6: capabilities `derive.explorer.ready_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
+- F6: capabilities `derive.explorer.server_info_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
 The compute shape is Shape C (compute at read time, federated UTXO sum + live mempool overlay) per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md); the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape ([ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)).

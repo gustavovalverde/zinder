@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use eyre::eyre;
 use prost::Message;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
@@ -97,7 +98,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
     assert_eq!(
         response_chain_epoch.network_name,
-        chain_epoch.network.name()
+        encode_zinder_native_chain_name(chain_epoch.network)
     );
     assert_eq!(
         response_chain_epoch.tip_height,
@@ -561,7 +562,7 @@ fn compact_block_range_chunk(
     wallet::CompactBlockRangeChunk {
         chain_epoch: Some(wallet::ChainEpoch {
             chain_epoch_id: chain_epoch.id.value(),
-            network_name: chain_epoch.network.name().to_owned(),
+            network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
             tip_height: chain_epoch.tip_height.value(),
             tip_hash: chain_epoch.tip_hash.as_bytes().into(),
             finalized_height: chain_epoch.finalized_height.value(),

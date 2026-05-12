@@ -9,11 +9,10 @@ use crate::NodeCapability;
 #[derive(Debug, Error)]
 pub enum SourceError {
     /// Display-order block hash hex could not be decoded.
-    #[error("block hash is not valid hex")]
+    #[error("block hash is not valid hex: {reason}")]
     InvalidBlockHashHex {
         /// Hex decoding failure.
-        #[source]
-        source: hex::FromHexError,
+        reason: String,
     },
 
     /// Raw block hex returned by the node could not be decoded.
@@ -44,11 +43,10 @@ pub enum SourceError {
     },
 
     /// Display-order transaction id hex could not be decoded.
-    #[error("transaction id is not valid hex")]
+    #[error("transaction id is not valid hex: {reason}")]
     InvalidTransactionIdHex {
         /// Hex decoding failure.
-        #[source]
-        source: hex::FromHexError,
+        reason: String,
     },
 
     /// Display-order transaction id decoded to the wrong byte length.

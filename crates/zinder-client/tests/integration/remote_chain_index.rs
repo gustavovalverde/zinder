@@ -13,7 +13,9 @@ use tonic::transport::Server;
 use zinder_client::{
     BlockHeight, BlockHeightRange, ChainEvent, ChainIndex, Network, RawTransactionBytes,
     RemoteChainIndex, RemoteOpenOptions, TransactionBroadcastResult, TransactionId,
+    WALLET_BROADCAST_TRANSACTION_V1,
 };
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
@@ -69,12 +71,15 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         .await?
         .ok_or_else(|| eyre!("chain-events stream closed before first event"))??;
 
-    assert_eq!(server_info.network, Network::ZcashRegtest.name());
+    assert_eq!(
+        server_info.network,
+        encode_zinder_native_chain_name(Network::ZcashRegtest)
+    );
     assert!(
         server_info
             .capabilities
             .iter()
-            .any(|capability| capability == "wallet.broadcast.transaction_v1")
+            .any(|capability| capability == WALLET_BROADCAST_TRANSACTION_V1)
     );
     assert_eq!(current_epoch.tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height, BlockHeight::new(1));

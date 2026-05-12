@@ -22,10 +22,7 @@ pub use consumer::{
     MempoolConsumerEventVariant, RevertedRange,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
-pub use grpc::{
-    DERIVE_EXPLORER_READY_CAPABILITY, DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
-    ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
-};
+pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 pub use store::{
     DERIVE_SCHEMA_VERSION, DeriveCursorEntry, DeriveStore, DeriveStoreOptions, DeriveStoreTable,
 };

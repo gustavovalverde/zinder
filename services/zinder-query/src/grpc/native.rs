@@ -6,10 +6,9 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
-use sha2::{Digest, Sha256};
-use zebra_chain::{
-    parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
-};
+use std::num::NonZeroU32;
+
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network,
@@ -17,10 +16,13 @@ use zinder_core::{
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
     TransparentPrevoutsResponse, TxStatus,
+    wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
+use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::wallet;
+use zinder_source::transparent_address_matches_network;
 
 use crate::{
     BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, LatestBlock,
@@ -112,8 +114,8 @@ pub fn build_server_capabilities_message(
 
 fn capability_enabled(capability: &&str, settings: &ServerInfoSettings) -> bool {
     match *capability {
-        "wallet.broadcast.transaction_v1" => settings.transaction_broadcast_enabled,
-        "wallet.events.chain_v1" => settings.chain_events_enabled,
+        WALLET_BROADCAST_TRANSACTION_V1 => settings.transaction_broadcast_enabled,
+        WALLET_EVENTS_CHAIN_V1 => settings.chain_events_enabled,
         _ => true,
     }
 }
@@ -269,6 +271,106 @@ pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
         .map(build_transparent_address_utxos_response)
 }
 
+/// Per-request address cap for [`transparent_address_confirmed_balance_response`].
+///
+/// Mirrors the cap the federated derive plane enforces in
+/// `services/zinder-derive/src/grpc/adapter.rs`. Each address fans out into a
+/// paginated UTXO scan; without a cap one request could fan out into thousands
+/// of column-family seeks.
+pub const MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST: u32 = 256;
+
+/// Per-address page size used when draining UTXOs for balance computation.
+///
+/// The native UTXO RPC pages with cursors. The balance helper drains the
+/// stream for each address; this constant bounds how many UTXOs the helper
+/// asks for per round-trip. A large page reduces round-trips for whale
+/// addresses; the value mirrors `DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS` in
+/// `crates/zinder-query/src/grpc/adapter.rs`.
+const TRANSPARENT_BALANCE_UTXO_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Aggregates confirmed transparent balance across the requested addresses by
+/// draining canonical UTXOs at one chain epoch and summing `value_zat`.
+///
+/// Pins the read to `at_epoch` when supplied so the response is reproducible
+/// across pages; otherwise the first page binds the epoch and the loop
+/// reuses it across every subsequent page and address. Returns a
+/// [`wallet::TransparentAddressBalanceResponse`] with `unconfirmed_delta_zat`
+/// fixed at zero; the mempool overlay belongs to the derive plane, not this
+/// path. The accumulator saturates at [`u64::MAX`] in keeping with the rest
+/// of the wallet read surface; Zcash's hardcoded `MAX_MONEY` (21M * 10^8 zat)
+/// fits comfortably inside `u64::MAX` so saturation only triggers on upstream
+/// data corruption.
+///
+/// # Errors
+///
+/// Returns [`QueryError::InvalidAddress`] when the input contains no
+/// addresses, exceeds [`MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST`], or
+/// fails address-network validation. Propagates the underlying
+/// [`QueryError`] from each UTXO page lookup.
+pub async fn transparent_address_confirmed_balance_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    addresses: Vec<wallet::AddressLookup>,
+    network: Network,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::TransparentAddressBalanceResponse, QueryError> {
+    if addresses.is_empty() {
+        return Err(QueryError::InvalidAddress {
+            reason: "addresses list must not be empty",
+        });
+    }
+    let address_count = u32::try_from(addresses.len())
+        .ok()
+        .filter(|count| *count <= MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST)
+        .ok_or(QueryError::InvalidAddress {
+            reason: "addresses list exceeds the per-request balance cap",
+        })?;
+
+    let mut confirmed_zat: u64 = 0;
+    let mut pinned_epoch = at_epoch;
+    let mut chain_epoch: Option<ChainEpoch> = None;
+    for address in addresses {
+        let address_script_hash = address_lookup_to_script_hash(Some(address), network)?;
+        let mut from_cursor: Option<StreamCursorTokenV1> = None;
+        loop {
+            let request = TransparentAddressUtxosRequest {
+                address_script_hash,
+                start_height: BlockHeight::new(0),
+                max_entries: TRANSPARENT_BALANCE_UTXO_PAGE_SIZE,
+                from_cursor: from_cursor.clone(),
+            };
+            let page = query_api
+                .transparent_address_utxos(request, pinned_epoch)
+                .await?;
+            // Pin every subsequent page (and every later address) to the
+            // first observed epoch so the response is reproducible.
+            if pinned_epoch.is_none() {
+                pinned_epoch = Some(page.chain_epoch);
+            }
+            chain_epoch = Some(page.chain_epoch);
+            for utxo in &page.utxos {
+                confirmed_zat = confirmed_zat.saturating_add(utxo.value_zat);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            from_cursor = Some(next_cursor);
+        }
+    }
+
+    // The non-empty-addresses guard at the top ensures the loop pinned
+    // `chain_epoch`; the `ok_or` surfaces a typed error if a future refactor
+    // ever drops that invariant.
+    let chain_epoch = chain_epoch.ok_or(QueryError::InvalidAddress {
+        reason: "balance scan produced no chain epoch",
+    })?;
+    Ok(wallet::TransparentAddressBalanceResponse {
+        confirmed_zat,
+        unconfirmed_delta_zat: 0,
+        address_count,
+        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+    })
+}
+
 /// Resolves a `wallet::AddressLookup` oneof to the typed
 /// `TransparentAddressScriptHash`. String addresses are parsed against
 /// `network` and SHA-256-hashed; raw script-hash bytes are taken verbatim.
@@ -310,33 +412,10 @@ pub fn address_lookup_to_script_hash(
                     reason: "transparent address does not produce a receivable script",
                 });
             }
-            Ok(transparent_address_script_hash(&script_pub_key))
+            Ok(TransparentAddressScriptHash::of_script_pub_key(
+                &script_pub_key,
+            ))
         }
-    }
-}
-
-/// SHA-256 of a transparent scriptPubKey, materialized as the typed
-/// `TransparentAddressScriptHash`.
-#[must_use]
-pub fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
-    let mut hasher = Sha256::new();
-    hasher.update(script_pub_key);
-    TransparentAddressScriptHash::from_bytes(hasher.finalize().into())
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Network is non_exhaustive; future variants must fail closed against transparent address validation until they are explicitly handled"
-)]
-fn transparent_address_matches_network(address_kind: ZebraNetworkKind, network: Network) -> bool {
-    match network {
-        Network::ZcashMainnet => address_kind == ZebraNetworkKind::Mainnet,
-        Network::ZcashTestnet => address_kind == ZebraNetworkKind::Testnet,
-        Network::ZcashRegtest => matches!(
-            address_kind,
-            ZebraNetworkKind::Testnet | ZebraNetworkKind::Regtest
-        ),
-        _ => false,
     }
 }
 
@@ -362,10 +441,10 @@ pub fn build_transparent_address_tx_ids_chunk(
 ) -> wallet::TransparentAddressTxIdsChunk {
     wallet::TransparentAddressTxIdsChunk {
         chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
-        transaction_id: artifact.transaction_id.as_bytes().to_vec(),
+        transaction_id: encode_internal_transaction_id(artifact.transaction_id).to_vec(),
         block_height: artifact.block_height.value(),
         tx_index_in_block: artifact.tx_index_in_block,
-        block_hash: artifact.block_hash.as_bytes().to_vec(),
+        block_hash: encode_internal_block_hash(artifact.block_hash).to_vec(),
         cursor,
     }
 }
@@ -424,7 +503,7 @@ fn build_transparent_address_utxo_message(
         outpoint: Some(outpoint_message(&utxo.outpoint)),
         value_zat: utxo.value_zat,
         block_height: utxo.block_height.value(),
-        block_hash: utxo.block_hash.as_bytes().to_vec(),
+        block_hash: encode_internal_block_hash(utxo.block_hash).to_vec(),
     }
 }
 
@@ -457,7 +536,7 @@ fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::B
                 header.block_id.height,
                 header.block_id.hash,
             )),
-            previous_block_hash: header.previous_block_hash.as_bytes().to_vec(),
+            previous_block_hash: encode_internal_block_hash(header.previous_block_hash).to_vec(),
             merkle_root_hash: header.merkle_root_hash.to_vec(),
             commitment_bytes: header.commitment_bytes.to_vec(),
             block_time: header.block_time,
@@ -523,9 +602,9 @@ fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
 
 fn build_transaction_message(transaction: TransactionArtifact) -> wallet::Transaction {
     wallet::Transaction {
-        transaction_id: transaction.transaction_id.as_bytes().into(),
+        transaction_id: encode_internal_transaction_id(transaction.transaction_id).into(),
         block_height: transaction.block_height.value(),
-        block_hash: transaction.block_hash.as_bytes().into(),
+        block_hash: encode_internal_block_hash(transaction.block_hash).into(),
         payload_bytes: transaction.payload_bytes,
     }
 }
@@ -534,7 +613,7 @@ fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse
     wallet::TreeStateResponse {
         chain_epoch: Some(build_chain_epoch_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),
-        block_hash: tree_state.block_hash.as_bytes().into(),
+        block_hash: encode_internal_block_hash(tree_state.block_hash).into(),
         payload_bytes: tree_state.payload_bytes,
     }
 }
@@ -588,7 +667,7 @@ fn build_broadcast_transaction_response(
 
 fn build_broadcast_accepted_message(accepted: BroadcastAccepted) -> wallet::BroadcastAccepted {
     wallet::BroadcastAccepted {
-        transaction_id: accepted.transaction_id.as_bytes().into(),
+        transaction_id: encode_internal_transaction_id(accepted.transaction_id).into(),
     }
 }
 
@@ -651,7 +730,7 @@ fn build_block_metadata_message(
 ) -> wallet::BlockMetadata {
     wallet::BlockMetadata {
         height: height.value(),
-        block_hash: block_hash.as_bytes().into(),
+        block_hash: encode_internal_block_hash(block_hash).into(),
     }
 }
 
@@ -660,7 +739,7 @@ pub(crate) fn build_compact_block_message(
 ) -> wallet::CompactBlock {
     wallet::CompactBlock {
         height: compact_block.height.value(),
-        block_hash: compact_block.block_hash.as_bytes().into(),
+        block_hash: encode_internal_block_hash(compact_block.block_hash).into(),
         payload_bytes: compact_block.payload_bytes,
     }
 }
@@ -669,7 +748,8 @@ fn build_subtree_root_message(subtree_root: &SubtreeRootArtifact) -> wallet::Sub
     wallet::SubtreeRoot {
         subtree_index: subtree_root.subtree_index.value(),
         root_hash: subtree_root.root_hash.as_bytes().into(),
-        completing_block_hash: subtree_root.completing_block_hash.as_bytes().into(),
+        completing_block_hash: encode_internal_block_hash(subtree_root.completing_block_hash)
+            .into(),
         completing_block_height: subtree_root.completing_block_height.value(),
     }
 }

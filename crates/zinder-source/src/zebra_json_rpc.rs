@@ -29,7 +29,7 @@ use zinder_core::{
 use crate::{
     NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainCheckpoint,
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
-    decode_display_block_hash, source_block::decode_display_hash_32,
+    decode_display_block_hash, source_block::wire_error_to_transaction_id_error,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -978,12 +978,8 @@ fn validate_zebra_tree_state(
 fn decode_display_transaction_id(
     display_transaction_id: &str,
 ) -> Result<TransactionId, SourceError> {
-    decode_display_hash_32(
-        display_transaction_id,
-        |source| SourceError::InvalidTransactionIdHex { source },
-        |byte_count| SourceError::InvalidTransactionIdLength { byte_count },
-    )
-    .map(TransactionId::from_bytes)
+    zinder_core::wire::decode_display_transaction_id_hex(display_transaction_id)
+        .map_err(wire_error_to_transaction_id_error)
 }
 
 /// Encodes a [`TransactionId`] as a Zebra-display-order hex string for
@@ -992,9 +988,7 @@ fn decode_display_transaction_id(
 /// Internal Zinder storage holds canonical (network-order) txid bytes;
 /// Zebra's RPC surface accepts and returns display-order (reversed) hex.
 fn display_order_transaction_id_hex(transaction_id: TransactionId) -> String {
-    let mut display_bytes = transaction_id.as_bytes();
-    display_bytes.reverse();
-    hex::encode(display_bytes)
+    zinder_core::wire::encode_display_transaction_id_hex(transaction_id)
 }
 
 fn decode_subtree_root_hash(root_hash: &str) -> Result<SubtreeRootHash, SourceError> {

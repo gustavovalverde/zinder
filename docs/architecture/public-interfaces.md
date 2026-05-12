@@ -496,13 +496,14 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.read.transparent_prevouts_v1`
 - `wallet.address.transparent_utxos_v1`
 - `wallet.address.transparent_history_v1`
-- `derive.explorer.ready_v1`
+- `wallet.address.transparent_balance_v1`
+- `derive.explorer.server_info_v1`
 - `derive.explorer.transparent_balance_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-Transparent-address balance is exposed under `derive.explorer.transparent_balance_v1` (federated through `WalletQuery.ServerInfo` when the derive proxy is reachable); there is no `wallet.*` balance capability.
+`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent UTXO column family, no mempool overlay). `derive.explorer.transparent_balance_v1` coexists with it when `zinder-derive` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the derive capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are
@@ -534,6 +535,22 @@ exist.
 ### Deprecation policy
 
 When a capability is deprecated, `capabilities` continues to advertise it, and a parallel `deprecated_capabilities` list names the replacement and earliest removal version. Clients compatible with the deprecated capability keep working; clients reading the deprecation list can plan migration. Capabilities are not silently removed.
+
+## Wire Conventions
+
+Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by concept (`transaction_id`, `block_hash`, `chain_name`, `branch_id`), not by dialect; every dialect for one concept shares one file. The decision is locked in [ADR-0016](../adrs/0016-wire-conventions-and-zebra-alignment.md).
+
+When adding a new wire field or a new ingress dialect, locate or add a function in that module before writing any boundary code. The following inline forms are forbidden anywhere outside the wire module:
+
+- `transaction_id.as_bytes()` and `block_hash.as_bytes()` at a wire boundary. Use `encode_internal_transaction_id` or `encode_internal_block_hash`.
+- `format!("{:08x}", branch_id)` for wire output. Use `encode_branch_id_hex`.
+- Inline hex-string transaction id or block hash decode. Use `decode_display_*_hex`.
+- Hardcoded capability literals. Import the `pub const` from [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs).
+- Duplicate `Network` to wire-string tables. Use `encode_bip70_chain_name` (`"main"`/`"test"`, BIP70/lightwalletd/Zebra JSON-RPC) or `encode_zinder_native_chain_name` (`"zcash-mainnet"`/`"zcash-testnet"`/`"zcash-regtest"`, native config and protobuf).
+
+Two integration tests enforce the rules on every CI invocation: [`crates/zinder-core/tests/integration/wire_invariants.rs`](../../crates/zinder-core/tests/integration/wire_invariants.rs) and [`crates/zinder-proto/tests/integration/capability_string_uniqueness.rs`](../../crates/zinder-proto/tests/integration/capability_string_uniqueness.rs).
+
+Decode failures return `zinder_core::wire::WireDecodeError`. Encode operations are infallible by construction.
 
 ## Rust API Shape
 

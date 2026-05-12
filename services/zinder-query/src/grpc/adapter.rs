@@ -5,10 +5,14 @@ use std::{num::NonZeroU32, pin::Pin};
 use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
+use zinder_core::wire::{decode_zinder_native_chain_name, encode_internal_transaction_id};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
     MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
+};
+use zinder_proto::capabilities::{
+    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -36,7 +40,8 @@ use super::native::{
     build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
     chain_events_response, compact_block_response, latest_block_response,
     latest_tree_state_response, subtree_roots_response, transaction_response,
-    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
+    transparent_address_confirmed_balance_response, transparent_address_utxos_response,
+    transparent_prevouts_response, tree_state_response,
 };
 use super::status_from_query_error;
 
@@ -554,37 +559,79 @@ where
         &self,
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
-        let proxy = self.explorer_proxy.as_ref().ok_or_else(|| {
-            Status::unavailable(
-                "TransparentAddressBalance requires the derive-plane explorer proxy; \
-                 configure the zinder-derive endpoint",
-            )
-        })?;
-        proxy
-            .forward(request, |mut client, request| async move {
-                client.transparent_address_balance(request).await
+        // Prefer the federated derive plane when configured and ready: it adds
+        // the mempool overlay that canonical-only compute cannot supply. Fall
+        // back to the always-on canonical-confirmed-balance path otherwise so
+        // the RPC stays answerable without `zinder-derive`. See ADR-0017.
+        if let Some(proxy) = self
+            .explorer_proxy
+            .as_ref()
+            .filter(|proxy| proxy.is_ready())
+        {
+            return proxy
+                .forward(request, |mut client, request| async move {
+                    client.transparent_address_balance(request).await
+                })
+                .await;
+        }
+
+        let network = self.server_info_network()?;
+        let inner = request.into_inner();
+        let at_epoch = inner
+            .at_epoch
+            .map(|message| {
+                chain_epoch_from_message(message)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))
             })
-            .await
+            .transpose()?;
+        transparent_address_confirmed_balance_response(
+            &self.query_api,
+            inner.addresses,
+            network,
+            at_epoch,
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
     }
 
     async fn server_info(
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
+        // Two coexisting capabilities advertise the same RPC under different
+        // semantics:
+        //   * `wallet.address.transparent_balance_v1` is always-on. It signals
+        //     the canonical-confirmed-balance compute path that
+        //     `WalletQuery.TransparentAddressBalance` answers when the derive
+        //     plane is unavailable.
+        //   * `derive.explorer.transparent_balance_v1` coexists when the
+        //     derive plane is configured and ready. It signals that the same
+        //     response additionally carries the live mempool overlay in
+        //     `unconfirmed_delta_zat`.
         let mut capabilities = build_server_capabilities_message(&self.server_info);
-        let federated_balance_capability = self
+        let federated_capability = self
             .explorer_proxy
             .as_ref()
             .filter(|proxy| proxy.is_ready())
             .map(|proxy| proxy.capability().to_owned());
-        if let Some(capability) = federated_balance_capability {
+        if let Some(capability) = federated_capability {
             if !capabilities.capabilities.contains(&capability) {
                 capabilities.capabilities.push(capability);
             }
         } else {
             capabilities
                 .capabilities
-                .retain(|advertised| advertised != "derive.explorer.transparent_balance_v1");
+                .retain(|advertised| advertised != DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1);
+        }
+        if !capabilities
+            .capabilities
+            .iter()
+            .any(|advertised| advertised == WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)
+        {
+            capabilities
+                .capabilities
+                .push(WALLET_ADDRESS_TRANSPARENT_BALANCE_V1.to_owned());
         }
         Ok(Response::new(wallet::ServerInfoResponse {
             capabilities: Some(capabilities),
@@ -656,12 +703,14 @@ fn clamp_max_entries(requested: NonZeroU32, cap: NonZeroU32) -> NonZeroU32 {
 
 impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     fn server_info_network(&self) -> Result<Network, Status> {
-        Network::from_name(&self.server_info.network).ok_or_else(|| {
-            Status::internal(format!(
-                "server network identifier {} is not recognized",
-                self.server_info.network
-            ))
-        })
+        decode_zinder_native_chain_name(&self.server_info.network)
+            .ok()
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "server network identifier {} is not recognized",
+                    self.server_info.network
+                ))
+            })
     }
 
     fn require_ingest_control_proxy_endpoint(
@@ -740,7 +789,7 @@ fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<Transactio
 ///
 fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Status> {
     let sentinel = TransparentOutPoint::COINBASE_SENTINEL;
-    let sentinel_transaction_id = sentinel.transaction_id.as_bytes();
+    let sentinel_transaction_id = encode_internal_transaction_id(sentinel.transaction_id);
     for (request_index, outpoint) in outpoints.iter().enumerate() {
         if outpoint.transaction_id.as_slice() == sentinel_transaction_id.as_slice()
             && outpoint.output_index == sentinel.output_index

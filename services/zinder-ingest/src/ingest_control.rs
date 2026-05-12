@@ -6,6 +6,7 @@ use std::{pin::Pin, time::Instant};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     ChainEpoch, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
@@ -130,7 +131,7 @@ impl IngestControl for IngestControlGrpcAdapter {
                     record_empty_writer_progress(self.network);
                 }
                 Ok(Response::new(WriterStatusResponse {
-                    network_name: self.network.name().to_owned(),
+                    network_name: encode_zinder_native_chain_name(self.network).to_owned(),
                     latest_writer_chain_epoch_id: chain_epoch.map(|epoch| epoch.id.value()),
                     latest_writer_tip_height: chain_epoch.map(|epoch| epoch.tip_height.value()),
                     latest_writer_finalized_height: chain_epoch
@@ -239,7 +240,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
         let request = request.into_inner();
-        let address_script_hash = address_lookup_to_script_hash_typed(request.address)?;
+        let address_script_hash = script_hash_from_lookup(request.address)?;
         let max_entries = bounded_point_lookup_max_entries(request.max_entries);
         let chain_epoch = self
             .store
@@ -337,7 +338,14 @@ const fn bounded_point_lookup_max_entries(requested: Option<u32>) -> u32 {
     }
 }
 
-fn address_lookup_to_script_hash_typed(
+/// Decode an [`wallet::AddressLookup`] into a [`TransparentAddressScriptHash`],
+/// rejecting the parsed-`Address` selector.
+///
+/// The ingest control-plane accepts only the script-hash form; callers must
+/// pre-resolve transparent addresses through `WalletQueryApi`. Parsing
+/// addresses here would couple ingest to `zebra-chain` for a selector that
+/// never appears in practice on this surface.
+fn script_hash_from_lookup(
     address: Option<wallet::AddressLookup>,
 ) -> Result<TransparentAddressScriptHash, Status> {
     let lookup = address.ok_or_else(|| Status::invalid_argument("address selector is required"))?;
@@ -566,22 +574,22 @@ fn record_writer_status_request_outcome(
 fn record_writer_progress(chain_epoch: ChainEpoch) {
     metrics::gauge!(
         "zinder_ingest_writer_has_chain_epoch",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(1.0);
     metrics::gauge!(
         "zinder_ingest_writer_chain_epoch_id",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u64_to_f64(chain_epoch.id.value()));
     metrics::gauge!(
         "zinder_ingest_writer_tip_height",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.tip_height.value()));
     metrics::gauge!(
         "zinder_ingest_writer_finalized_height",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.finalized_height.value()));
 }
@@ -589,22 +597,22 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
 fn record_empty_writer_progress(network: Network) {
     metrics::gauge!(
         "zinder_ingest_writer_has_chain_epoch",
-        "network" => network.name()
+        "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);
     metrics::gauge!(
         "zinder_ingest_writer_chain_epoch_id",
-        "network" => network.name()
+        "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);
     metrics::gauge!(
         "zinder_ingest_writer_tip_height",
-        "network" => network.name()
+        "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);
     metrics::gauge!(
         "zinder_ingest_writer_finalized_height",
-        "network" => network.name()
+        "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);
 }

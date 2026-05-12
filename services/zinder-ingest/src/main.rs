@@ -18,6 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
 
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_ingest::{
     BackfillOutcome, IngestControlGrpcAdapter, IngestError, MempoolIndex,
     MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill,
@@ -255,7 +256,11 @@ async fn run_backfill(
     let mut command_config = config::load_backfill_config(config_path, args.into())?;
     let readiness = Readiness::default();
     let ops_handle = ops_listen_addr.map(|listen_addr| {
-        spawn_ingest_ops(listen_addr, command_config.node.network.name(), &readiness)
+        spawn_ingest_ops(
+            listen_addr,
+            encode_zinder_native_chain_name(command_config.node.network),
+            &readiness,
+        )
     });
     let source =
         zebra_json_rpc_source_for_target(command_config.node_source, &command_config.node)?;
@@ -473,7 +478,7 @@ async fn run_tip_follow(
     let ops_handle = ops_listen_addr.map(|listen_addr| {
         spawn_ingest_ops(
             listen_addr,
-            tip_follow_config.node.network.name(),
+            encode_zinder_native_chain_name(tip_follow_config.node.network),
             &readiness,
         )
     });
@@ -518,7 +523,7 @@ async fn run_tip_follow(
     tracing::info!(
         target: "zinder::ingest",
         event = "tip_follow_started",
-        network = tip_follow_config.node.network.name(),
+        network = encode_zinder_native_chain_name(tip_follow_config.node.network),
         json_rpc_addr = tip_follow_config.node.json_rpc_addr.as_str(),
         reorg_window_blocks = tip_follow_config.reorg_window_blocks,
         lag_threshold_blocks = tip_follow_config.lag_threshold_blocks,
@@ -867,7 +872,7 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
     tracing::info!(
         target: "zinder::ingest",
         event = "backup_created",
-        network = backup_config.network.name(),
+        network = encode_zinder_native_chain_name(backup_config.network),
         storage_path = %backup_config.storage_path.display(),
         checkpoint_path = %backup_config.to_path.display(),
         "backup checkpoint created"
@@ -883,14 +888,14 @@ fn record_backup_outcome(
 ) {
     metrics::histogram!(
         "zinder_ingest_backup_duration_seconds",
-        "network" => network.name(),
+        "network" => encode_zinder_native_chain_name(network),
         "status" => outcome_status(backup_outcome),
         "error_class" => ingest_config_error_class(backup_outcome.as_ref().err())
     )
     .record(started_at.elapsed());
     metrics::counter!(
         "zinder_ingest_backup_total",
-        "network" => network.name(),
+        "network" => encode_zinder_native_chain_name(network),
         "status" => outcome_status(backup_outcome),
         "error_class" => ingest_config_error_class(backup_outcome.as_ref().err())
     )
@@ -898,7 +903,7 @@ fn record_backup_outcome(
     if backup_outcome.is_ok() {
         metrics::gauge!(
             "zinder_ingest_backup_last_success_unix_seconds",
-            "network" => network.name()
+            "network" => encode_zinder_native_chain_name(network)
         )
         .set(current_unix_seconds_f64());
     }

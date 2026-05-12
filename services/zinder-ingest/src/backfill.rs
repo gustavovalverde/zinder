@@ -455,6 +455,7 @@ mod tests {
     use zinder_core::{
         BlockArtifact, BlockHash, BlockId, CompactBlockArtifact, SUBTREE_LEAF_COUNT,
         ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, UnixTimestampMillis,
+        wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::{
         ChainMetadata, CompactBlock as LightwalletdCompactBlock,
@@ -1228,7 +1229,7 @@ mod tests {
         LightwalletdCompactBlock {
             proto_version: 1,
             height: u64::from(height.value()),
-            hash: block_hash.as_bytes().into(),
+            hash: encode_internal_block_hash(block_hash).into(),
             prev_hash: vec![0; 32],
             time: 1_774_668_400,
             header: Vec::new(),

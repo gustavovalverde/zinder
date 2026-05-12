@@ -1,8 +1,9 @@
 //! Build script for Zinder-owned protobuf modules.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let descriptor_set_path =
-        std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("zinder_v1_descriptor.bin");
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    let descriptor_set_path = out_dir.join("zinder_v1_descriptor.bin");
+    let compat_descriptor_set_path = out_dir.join("lightwalletd_compat_descriptor.bin");
     let compat_proto_dir = "proto/compat/lightwalletd";
     let compat_commit_file = format!("{compat_proto_dir}/COMMIT");
     let native_proto_dir = "proto";
@@ -46,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&compat_descriptor_set_path)
         .compile_protos(&compat_proto_files, &compat_include_dirs)?;
     tonic_prost_build::configure()
         .build_server(true)

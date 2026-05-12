@@ -4,7 +4,6 @@ use std::fmt;
 
 use prost::Message;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zebra_chain::{
     block::Block as ZebraBlock,
@@ -16,6 +15,7 @@ use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
     ShieldedProtocol, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
     TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
+    wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
@@ -366,8 +366,8 @@ fn build_compact_block_artifact(
     let compact_block = CompactBlock {
         proto_version: LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION,
         height: u64::from(source_block.height.value()),
-        hash: source_block.hash.as_bytes().to_vec(),
-        prev_hash: source_block.parent_hash.as_bytes().to_vec(),
+        hash: encode_internal_block_hash(source_block.hash).to_vec(),
+        prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
         time: source_block.block_time_seconds,
         header: block_header_bytes,
         vtx: compact_transactions,
@@ -616,7 +616,7 @@ fn transparent_utxo_artifacts(
             let output_index = u32::try_from(output_index)
                 .map_err(|_| ArtifactDeriveError::TransparentOutputIndexOverflow)?;
             transparent_address_utxos.push(TransparentAddressUtxoArtifact::new(
-                transparent_address_script_hash(&output.script_pub_key),
+                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key),
                 output.script_pub_key.clone(),
                 TransparentOutPoint::new(transaction_id, output_index),
                 output.value,
@@ -653,7 +653,8 @@ pub(crate) fn transparent_address_tx_index_artifacts(
                 field: "transparent transaction index",
             })?;
         for output in &transaction.vout {
-            let address_script_hash = transparent_address_script_hash(&output.script_pub_key);
+            let address_script_hash =
+                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
             if emitted.insert((address_script_hash, tx_index_in_block)) {
                 artifacts.push(zinder_core::TransparentAddressTxIndexArtifact::new(
                     address_script_hash,
@@ -697,16 +698,6 @@ pub(crate) fn transparent_address_tx_index_spend_candidates(
     }
 
     Ok(spend_candidates)
-}
-
-/// Hashes a transparent `scriptPubKey` into the canonical
-/// [`TransparentAddressScriptHash`] used for index lookups.
-pub(crate) fn transparent_address_script_hash(
-    script_pub_key: &[u8],
-) -> TransparentAddressScriptHash {
-    let mut hasher = Sha256::new();
-    hasher.update(script_pub_key);
-    TransparentAddressScriptHash::from_bytes(hasher.finalize().into())
 }
 
 fn transaction_id_from_compact_tx(

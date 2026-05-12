@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, ChainEpochId, Network};
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
 use zinder_runtime::{
@@ -174,12 +175,12 @@ impl WriterStatusUpstream {
                 });
             }
         };
-        if response.network_name != self.network.name() {
+        if response.network_name != encode_zinder_native_chain_name(self.network) {
             self.client = None;
             return Err(WriterStatusFetchError::NetworkMismatch {
                 endpoint: self.endpoint.clone(),
                 method: WRITER_STATUS_METHOD,
-                expected: self.network.name(),
+                expected: encode_zinder_native_chain_name(self.network),
                 actual: response.network_name,
             });
         }

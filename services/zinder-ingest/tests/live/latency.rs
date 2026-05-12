@@ -9,6 +9,7 @@ use std::sync::Arc;
 use eyre::{Result, eyre};
 use tempfile::tempdir;
 use zinder_core::Network;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange};
 use zinder_ingest::{BackfillOutcome, backfill};
 use zinder_query::{WalletQuery, WalletQueryApi};
@@ -117,7 +118,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
             "live_latency_baseline network={} tip={} latest_block={}us compact_block_at={}us \
              compact_block_range_50={}us tree_state_at={}us transaction_avg={}us \
              (n={} total={}us)",
-            env.network().name(),
+            encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
             latest_block_micros,
             compact_block_at_micros,
@@ -230,7 +231,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
              backfill={}us latest_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_{}={}us tree_state_at={}us \
              transaction_avg={}us (n={} total={}us)",
-            env.network().name(),
+            encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
             checkpoint_height.value(),
             backfill_micros,

@@ -2,7 +2,4 @@
 
 mod adapter;
 
-pub use adapter::{
-    DERIVE_EXPLORER_READY_CAPABILITY, DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
-    ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
-};
+pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};

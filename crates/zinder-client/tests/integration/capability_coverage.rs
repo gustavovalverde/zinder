@@ -22,65 +22,75 @@
 //! by the consuming derive crate; this test treats them as opaque table
 //! entries.
 
-use zinder_client::{ChainIndex, ZINDER_CAPABILITIES};
+use zinder_client::{
+    ChainIndex, DERIVE_EXPLORER_SERVER_INFO_V1, DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+    WALLET_ADDRESS_TRANSPARENT_UTXOS_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
+    WALLET_EVENTS_MEMPOOL_V1, WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+    WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1, WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
+    WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+    WALLET_READ_COMPACT_BLOCK_AT_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V1,
+    WALLET_READ_LATEST_BLOCK_V1, WALLET_READ_LATEST_TREE_STATE_V1, WALLET_READ_SERVER_INFO_V1,
+    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
+    WALLET_READ_TRANSPARENT_PREVOUTS_V1, WALLET_READ_TREE_STATE_AT_V1, WALLET_SNAPSHOT_MEMPOOL_V1,
+    ZINDER_CAPABILITIES,
+};
 
 /// Capability-to-method coverage table. The `ChainIndex` trait surface is
 /// reflected by name; the test walks `ZINDER_CAPABILITIES` and asserts every
 /// entry has a corresponding row here.
 const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
-    ("wallet.read.latest_block_v1", "latest_block"),
+    (WALLET_READ_LATEST_BLOCK_V1, "latest_block"),
+    (WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, "block_id_by_selector"),
     (
-        "wallet.read.block_id_by_selector_v1",
-        "block_id_by_selector",
-    ),
-    (
-        "wallet.read.block_header_by_selector_v1",
+        WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
         "block_header_by_selector",
     ),
-    ("wallet.read.compact_block_at_v1", "compact_block_at"),
+    (WALLET_READ_COMPACT_BLOCK_AT_V1, "compact_block_at"),
     (
-        "wallet.read.compact_block_range_v1",
+        WALLET_READ_COMPACT_BLOCK_RANGE_V1,
         "compact_blocks_in_range",
     ),
-    ("wallet.read.tree_state_at_v1", "tree_state_at"),
-    ("wallet.read.latest_tree_state_v1", "latest_tree_state"),
+    (WALLET_READ_TREE_STATE_AT_V1, "tree_state_at"),
+    (WALLET_READ_LATEST_TREE_STATE_V1, "latest_tree_state"),
     (
-        "wallet.read.subtree_roots_in_range_v1",
+        WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
         "subtree_roots_in_range",
     ),
-    ("wallet.read.transaction_by_id_v1", "transaction_by_id"),
-    ("wallet.read.server_info_v1", "server_info"),
-    ("wallet.broadcast.transaction_v1", "broadcast_transaction"),
-    ("wallet.events.chain_v1", "chain_events"),
-    ("wallet.snapshot.mempool_v1", "mempool_snapshot"),
-    ("wallet.events.mempool_v1", "mempool_events"),
+    (WALLET_READ_TRANSACTION_BY_ID_V1, "transaction_by_id"),
+    (WALLET_READ_SERVER_INFO_V1, "server_info"),
+    (WALLET_BROADCAST_TRANSACTION_V1, "broadcast_transaction"),
+    (WALLET_EVENTS_CHAIN_V1, "chain_events"),
+    (WALLET_SNAPSHOT_MEMPOOL_V1, "mempool_snapshot"),
+    (WALLET_EVENTS_MEMPOOL_V1, "mempool_events"),
     (
-        "wallet.mempool.transparent_outputs_by_address_v1",
+        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
         "transparent_mempool_outputs_by_address",
     ),
     (
-        "wallet.mempool.transparent_spend_by_outpoint_v1",
+        WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
         "transparent_mempool_spend_by_outpoint",
     ),
     (
-        "wallet.mempool.transparent_prevouts_v1",
+        WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1,
         "transparent_mempool_prevouts",
     ),
+    (WALLET_READ_TRANSPARENT_PREVOUTS_V1, "transparent_prevouts"),
     (
-        "wallet.read.transparent_prevouts_v1",
-        "transparent_prevouts",
-    ),
-    (
-        "wallet.address.transparent_utxos_v1",
+        WALLET_ADDRESS_TRANSPARENT_UTXOS_V1,
         "transparent_address_utxos",
     ),
     (
-        "wallet.address.transparent_history_v1",
+        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         "transparent_address_tx_ids_in_range",
     ),
-    ("derive.explorer.ready_v1", "explorer_server_info"),
     (
-        "derive.explorer.transparent_balance_v1",
+        WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+        "transparent_address_balance",
+    ),
+    (DERIVE_EXPLORER_SERVER_INFO_V1, "explorer_server_info"),
+    (
+        DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
         "transparent_address_balance",
     ),
 ];

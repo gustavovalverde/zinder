@@ -1,6 +1,7 @@
 //! Zinder derive-plane gRPC server entry point.
 
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -98,7 +99,7 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     let _store = DeriveStore::open(&derive_config.storage_path, DeriveStoreOptions::default())
         .map_err(DeriveConfigError::Store)?;
     let server_info = ExplorerServerInfoSettings {
-        network: derive_config.network.name().to_owned(),
+        network: encode_zinder_native_chain_name(derive_config.network).to_owned(),
     };
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info);
     if let Some(endpoint) = derive_config.wallet_query_endpoint.clone() {
@@ -114,7 +115,7 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     tracing::info!(
         target: "zinder::derive",
         event = "derive_started",
-        network = derive_config.network.name(),
+        network = encode_zinder_native_chain_name(derive_config.network),
         listen_addr = %derive_config.listen_addr,
         storage_path = %derive_config.storage_path.display(),
         "explorer query gRPC server started"
@@ -148,7 +149,7 @@ fn spawn_ops(
         OpsServer {
             service_name: "zinder-derive",
             service_version: env!("CARGO_PKG_VERSION"),
-            network_name: derive_config.network.name(),
+            network_name: encode_zinder_native_chain_name(derive_config.network),
         },
         readiness.clone(),
     )

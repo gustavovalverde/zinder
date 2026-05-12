@@ -19,6 +19,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Request, transport::Server};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+use zinder_core::wire::encode_bip70_chain_name;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockHeight, BlockHeightRange, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
@@ -378,10 +380,10 @@ async fn assert_lightwalletd_trait_responses(
             .height,
         u64::from(start_height)
     );
-    assert_eq!(latest_tree_state.network, lightwalletd_chain_name(network)?);
+    assert_eq!(latest_tree_state.network, encode_bip70_chain_name(network));
     assert_eq!(latest_tree_state.height, u64::from(end_height));
     assert_eq!(lightd_info.vendor, "Zinder");
-    assert_eq!(lightd_info.chain_name, lightwalletd_chain_name(network)?);
+    assert_eq!(lightd_info.chain_name, encode_bip70_chain_name(network));
     assert_eq!(lightd_info.block_height, u64::from(end_height));
     assert_eq!(
         lightd_info.lightwallet_protocol_version,
@@ -470,7 +472,7 @@ async fn assert_generated_lightwalletd_client_responses(
         compact_blocks.len(),
         usize::try_from(end_height - start_height + 1)?
     );
-    assert_eq!(latest_tree_state.network, lightwalletd_chain_name(network)?);
+    assert_eq!(latest_tree_state.network, encode_bip70_chain_name(network));
     assert_eq!(latest_tree_state.height, u64::from(end_height));
     assert!(!latest_tree_state.hash.is_empty());
 
@@ -610,21 +612,6 @@ where
     Ok(values)
 }
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "non-exhaustive core networks must fail closed until lightwalletd mapping exists"
-)]
-fn lightwalletd_chain_name(network: Network) -> Result<&'static str> {
-    match network {
-        Network::ZcashMainnet => Ok("main"),
-        Network::ZcashTestnet => Ok("test"),
-        Network::ZcashRegtest => Ok("regtest"),
-        _ => Err(eyre!(
-            "network is not supported by lightwalletd compatibility"
-        )),
-    }
-}
-
 trait HasNativeGrpcChainEpoch {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch>;
 }
@@ -662,7 +649,10 @@ fn assert_native_grpc_response_epoch(
         .chain_epoch()
         .ok_or_else(|| eyre!("native gRPC response missing chain epoch"))?;
 
-    assert_eq!(chain_epoch.network_name, network.name());
+    assert_eq!(
+        chain_epoch.network_name,
+        encode_zinder_native_chain_name(network)
+    );
     assert_eq!(chain_epoch.tip_height, end_height);
     Ok(())
 }
@@ -696,7 +686,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
         let chunk = wallet::CompactBlockRangeChunk {
             chain_epoch: Some(wallet::ChainEpoch {
                 chain_epoch_id: range_chain_epoch.id.value(),
-                network_name: range_chain_epoch.network.name().to_owned(),
+                network_name: encode_zinder_native_chain_name(range_chain_epoch.network).to_owned(),
                 tip_height: range_chain_epoch.tip_height.value(),
                 tip_hash: range_chain_epoch.tip_hash.as_bytes().into(),
                 finalized_height: range_chain_epoch.finalized_height.value(),
@@ -727,7 +717,10 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
             .compact_block
             .ok_or_else(|| eyre!("native compact-block chunk missing compact block"))?;
 
-        assert_eq!(chunk_chain_epoch.network_name, network.name());
+        assert_eq!(
+            chunk_chain_epoch.network_name,
+            encode_zinder_native_chain_name(network)
+        );
         assert_eq!(chunk_chain_epoch.tip_height, end_height);
         assert_eq!(compact_block.height, height);
         assert!(!compact_block.payload_bytes.is_empty());
@@ -784,7 +777,10 @@ async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
         .latest_block
         .ok_or_else(|| eyre!("native response missing latest block"))?;
 
-    assert_eq!(response_chain_epoch.network_name, network.name());
+    assert_eq!(
+        response_chain_epoch.network_name,
+        encode_zinder_native_chain_name(network)
+    );
     assert_eq!(response_chain_epoch.tip_height, end_height);
     assert_eq!(latest_block.height, end_height);
     assert!(!latest_block.block_hash.is_empty());
@@ -803,7 +799,10 @@ async fn assert_native_tree_state_response<QueryApi: WalletQueryApi>(
         .chain_epoch
         .ok_or_else(|| eyre!("native response missing chain epoch"))?;
 
-    assert_eq!(response_chain_epoch.network_name, network.name());
+    assert_eq!(
+        response_chain_epoch.network_name,
+        encode_zinder_native_chain_name(network)
+    );
     assert_eq!(response_chain_epoch.tip_height, end_height);
     assert_eq!(decoded_response.height, end_height);
     assert!(!decoded_response.block_hash.is_empty());
@@ -823,7 +822,10 @@ async fn assert_native_latest_tree_state_response<QueryApi: WalletQueryApi>(
         .chain_epoch
         .ok_or_else(|| eyre!("native latest tree-state response missing chain epoch"))?;
 
-    assert_eq!(response_chain_epoch.network_name, network.name());
+    assert_eq!(
+        response_chain_epoch.network_name,
+        encode_zinder_native_chain_name(network)
+    );
     assert_eq!(response_chain_epoch.tip_height, end_height);
     assert_eq!(decoded_response.height, end_height);
     assert!(!decoded_response.block_hash.is_empty());
@@ -852,7 +854,10 @@ async fn assert_native_subtree_roots_response<QueryApi: WalletQueryApi>(
             .chain_epoch
             .ok_or_else(|| eyre!("native subtree-roots response missing chain epoch"))?;
 
-        assert_eq!(response_chain_epoch.network_name, network.name());
+        assert_eq!(
+            response_chain_epoch.network_name,
+            encode_zinder_native_chain_name(network)
+        );
         assert_eq!(decoded_response.start_index, 0);
         assert!(decoded_response.subtree_roots.is_empty());
     }

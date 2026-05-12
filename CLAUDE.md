@@ -119,6 +119,7 @@ Practical effects:
 - Use `#[non_exhaustive]` for public enums expected to gain variants.
 - Supported build targets must have a pointer width of at least 32 bits; `zinder-core` enforces this so infallible `u32` to `usize` conversions stay honest.
 - "Service" means a deployable runtime, not a Rust trait or struct name. Do not create types named `*Service`, `*Manager`, `*Handler`, `*Helper`, or modules named `utils`, `common`, `helpers`. Full vocabulary in [public-interfaces.md](docs/architecture/public-interfaces.md).
+- Wire-boundary identifier translations live in `crates/zinder-core/src/wire/` (pure-domain helpers) and `crates/zinder-proto/src/wire/` (proto-enum mappings). Adding a new wire field starts there: locate or add a function for the concept, then call it from the boundary. Inline `transaction_id.as_bytes()`, inline `format!("{:08x}", ...)`, hardcoded capability literals, and duplicate `Network` to wire-string tables outside those modules are forbidden patterns (see [ADR-0016](docs/adrs/0016-wire-conventions-and-zebra-alignment.md); enforced by `wire_invariants.rs` and `capability_string_uniqueness.rs` on every `cargo nextest run --profile=ci`).
 
 ## Protobuf Generation
 

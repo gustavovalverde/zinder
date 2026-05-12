@@ -1,6 +1,7 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -169,14 +170,22 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_started",
-        network = lightwalletd_config.network.name(),
+        network = encode_zinder_native_chain_name(lightwalletd_config.network),
         listen_addr = %lightwalletd_config.listen_addr,
         visible_height = ?visible_height,
         "lightwalletd-compatible gRPC server started"
     );
 
+    // Expose `grpc.reflection.v1.ServerReflection` so legacy lightwalletd
+    // wallets and `grpcurl` can discover the served `CompactTxStreamer`
+    // surface without an out-of-band proto.
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
     let server_result = tonic::transport::Server::builder()
         .add_service(grpc_adapter.into_server())
+        .add_service(reflection_service)
         .serve_with_shutdown(lightwalletd_config.listen_addr, cancel.cancelled_owned())
         .await;
 
@@ -254,7 +263,7 @@ fn spawn_ops(
         OpsServer {
             service_name: "zinder-compat-lightwalletd",
             service_version: env!("CARGO_PKG_VERSION"),
-            network_name: lightwalletd_config.network.name(),
+            network_name: encode_zinder_native_chain_name(lightwalletd_config.network),
         },
         readiness.clone(),
     )

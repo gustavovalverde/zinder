@@ -41,14 +41,15 @@ pub use derive_proxy::{
 };
 
 pub use grpc::{
-    ServerInfoSettings, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_server_capabilities_message,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
-    chain_events_response, compact_block_response, latest_block_response,
-    latest_tree_state_response, status_from_query_error, subtree_roots_response,
-    transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
-    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
+    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
+    build_server_capabilities_message, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
+    latest_block_response, latest_tree_state_response, status_from_query_error,
+    subtree_roots_response, transaction_response, transparent_address_confirmed_balance_response,
+    transparent_address_tx_ids_response, transparent_address_utxos_response,
+    transparent_prevouts_response, tree_state_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,

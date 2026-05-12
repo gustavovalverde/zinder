@@ -3,6 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     Network, UnixTimestampMillis,
@@ -27,7 +28,10 @@ fn chain_epoch_carries_the_visible_consistency_boundary() {
 
     assert_eq!(chain_epoch.id, ChainEpochId::new(1));
     assert_eq!(chain_epoch.network, Network::ZcashRegtest);
-    assert_eq!(chain_epoch.network.name(), "zcash-regtest");
+    assert_eq!(
+        encode_zinder_native_chain_name(chain_epoch.network),
+        "zcash-regtest"
+    );
     assert_eq!(chain_epoch.tip_height, BlockHeight::new(2));
     assert_eq!(chain_epoch.tip_hash, tip_hash);
     assert_eq!(chain_epoch.finalized_height, BlockHeight::new(1));

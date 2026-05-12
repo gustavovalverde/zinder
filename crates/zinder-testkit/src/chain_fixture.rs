@@ -18,7 +18,7 @@ use zinder_core::{
     CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
     SubtreeRootIndex, TransactionArtifact, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
-    UnixTimestampMillis,
+    UnixTimestampMillis, wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
@@ -86,8 +86,8 @@ impl FixtureBlock {
         LightwalletdCompactBlock {
             proto_version: FIXTURE_LIGHTWALLETD_PROTO_VERSION,
             height: u64::from(self.height.value()),
-            hash: self.hash.as_bytes().to_vec(),
-            prev_hash: self.parent_hash.as_bytes().to_vec(),
+            hash: encode_internal_block_hash(self.hash).to_vec(),
+            prev_hash: encode_internal_block_hash(self.parent_hash).to_vec(),
             time: self.block_time_seconds,
             header: Vec::new(),
             vtx: Vec::new(),

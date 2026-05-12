@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, transport::Channel};
+use zinder_core::wire::{
+    decode_zinder_native_chain_name, encode_internal_block_hash, encode_internal_transaction_id,
+    encode_zinder_native_chain_name,
+};
 use zinder_core::{
     BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
     CompactBlockArtifact, ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network,
@@ -291,7 +295,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .await
             .transaction(Request::new(wallet::TransactionRequest {
-                transaction_id: transaction_id.as_bytes().to_vec(),
+                transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
@@ -736,7 +740,7 @@ impl RemoteChainIndex {
 }
 
 fn ensure_network_name(expected: Network, actual_name: &str) -> Result<(), IndexerError> {
-    let Some(actual) = Network::from_name(actual_name) else {
+    let Some(actual) = decode_zinder_native_chain_name(actual_name).ok() else {
         return Err(IndexerError::NetworkMismatch {
             expected,
             actual: actual_name.to_owned(),
@@ -770,11 +774,11 @@ fn decode_error_to_indexer_error(error: MempoolDecodeError) -> IndexerError {
 fn chain_epoch_to_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
-        network_name: chain_epoch.network.name().to_owned(),
+        network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
-        tip_hash: chain_epoch.tip_hash.as_bytes().to_vec(),
+        tip_hash: encode_internal_block_hash(chain_epoch.tip_hash).to_vec(),
         finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: chain_epoch.finalized_hash.as_bytes().to_vec(),
+        finalized_hash: encode_internal_block_hash(chain_epoch.finalized_hash).to_vec(),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -1122,7 +1126,7 @@ fn block_selector_to_message(
     let inner = match selector {
         BlockSelector::Height(height) => wallet::block_selector::Selector::Height(height.value()),
         BlockSelector::Hash(hash) => {
-            wallet::block_selector::Selector::Hash(hash.as_bytes().to_vec())
+            wallet::block_selector::Selector::Hash(encode_internal_block_hash(hash).to_vec())
         }
         _ => {
             return Err(IndexerError::invalid_request(

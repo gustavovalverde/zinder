@@ -3,6 +3,7 @@ mod compact_block_range;
 mod native_grpc;
 mod query_epoch_consistency;
 mod readiness_refresh;
+mod reflection;
 mod single_artifact_lookup;
 mod stream_cancellation;
 mod transaction_broadcast;

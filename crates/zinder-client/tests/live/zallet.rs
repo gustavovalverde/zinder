@@ -11,6 +11,7 @@ use std::{
 
 use eyre::{WrapErr, eyre};
 use zinder_core::Network;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_testkit::live::{init, require_env, require_live_for};
 
 const ENABLE_ZALLET_GATE: &str = "ZINDER_TEST_ZALLET";
@@ -53,7 +54,10 @@ fn zallet_binary_runs_against_zinder_native_contract() -> eyre::Result<()> {
     let zallet_args = require_args()?;
     let output = Command::new(&zallet_binary)
         .args(&zallet_args)
-        .env("ZINDER_NETWORK", live_env.network().name())
+        .env(
+            "ZINDER_NETWORK",
+            encode_zinder_native_chain_name(live_env.network()),
+        )
         .output()
         .wrap_err_with(|| format!("failed to execute {zallet_binary}"))?;
 

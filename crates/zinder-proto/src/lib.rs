@@ -7,8 +7,21 @@ pub mod capabilities;
 pub use capabilities::{CapabilityDescriptor, ZINDER_CAPABILITIES};
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
+///
+/// Wire it into `tonic_reflection::server::Builder::configure().register_encoded_file_descriptor_set(...)`
+/// to expose `grpc.reflection.v1.ServerReflection` on the native query server.
 pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/zinder_v1_descriptor.bin"));
+
+/// Encoded descriptor set for the vendored lightwalletd compatibility schemas.
+///
+/// Mirrors [`ZINDER_V1_FILE_DESCRIPTOR_SET`] for the compat shim's
+/// `CompactTxStreamer` surface so legacy wallets can discover the served
+/// service via gRPC reflection.
+pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/lightwalletd_compat_descriptor.bin"
+));
 
 /// Native Zinder protocol modules.
 pub mod v1 {

@@ -14,6 +14,7 @@ mod source_block;
 mod source_error;
 mod source_subtree_root;
 mod source_transaction;
+mod transparent_address;
 mod zebra_indexer_mempool;
 mod zebra_json_rpc;
 
@@ -38,6 +39,7 @@ pub use source_block::{
 pub use source_error::SourceError;
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::transparent_prevout_from_raw_transaction_bytes;
+pub use transparent_address::transparent_address_matches_network;
 pub use zebra_indexer_mempool::{
     ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget,
 };

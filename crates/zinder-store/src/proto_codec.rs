@@ -1,10 +1,14 @@
 //! Protobuf encoders and decoders for store-owned chain-event values.
 
 use thiserror::Error;
+use zinder_core::wire::{
+    decode_zinder_native_chain_name, encode_internal_block_hash, encode_internal_transaction_id,
+    encode_zinder_native_chain_name,
+};
 use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes,
-    TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
+    ChainTipMetadata, MempoolEntry, MempoolEvictionReason, RawTransactionBytes, TransactionId,
+    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
     TransparentOutPoint, TransparentPrevout, TransparentPrevoutEntry, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
@@ -83,7 +87,7 @@ fn chain_range_reverted_message(reverted: ChainRangeReverted) -> wallet::ChainRa
 #[must_use]
 pub fn mempool_entry_message(entry: &MempoolEntry) -> wallet::MempoolEntry {
     wallet::MempoolEntry {
-        transaction_id: entry.transaction_id.as_bytes().into(),
+        transaction_id: encode_internal_transaction_id(entry.transaction_id).into(),
         auth_digest: entry
             .auth_digest
             .map(|digest| digest.as_bytes().into())
@@ -123,7 +127,7 @@ pub fn mempool_event_envelope_message(
             transaction_id,
             reason,
         } => wallet::mempool_event_envelope::Event::Invalidated(wallet::MempoolInvalidatedEvent {
-            transaction_id: transaction_id.as_bytes().into(),
+            transaction_id: encode_internal_transaction_id(*transaction_id).into(),
             reason: mempool_eviction_reason_message(*reason).into(),
         }),
         MempoolEvent::Mined {
@@ -131,13 +135,13 @@ pub fn mempool_event_envelope_message(
             mined_height,
             block_hash,
         } => wallet::mempool_event_envelope::Event::Mined(wallet::MempoolMinedEvent {
-            transaction_id: transaction_id.as_bytes().into(),
+            transaction_id: encode_internal_transaction_id(*transaction_id).into(),
             mined_height: mined_height.value(),
-            block_hash: block_hash.as_bytes().into(),
+            block_hash: encode_internal_block_hash(*block_hash).into(),
         }),
         MempoolEvent::Suppressed { transaction_id } => {
             wallet::mempool_event_envelope::Event::Suppressed(wallet::MempoolSuppressedEvent {
-                transaction_id: transaction_id.as_bytes().into(),
+                transaction_id: encode_internal_transaction_id(*transaction_id).into(),
             })
         }
         _ => {
@@ -162,7 +166,7 @@ pub fn mempool_event_envelope_message(
 #[must_use]
 pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
     wallet::OutPoint {
-        transaction_id: outpoint.transaction_id.as_bytes().into(),
+        transaction_id: encode_internal_transaction_id(outpoint.transaction_id).into(),
         output_index: outpoint.output_index,
     }
 }
@@ -244,7 +248,10 @@ pub fn transparent_mempool_spend_message(
 ) -> wallet::TransparentMempoolSpend {
     wallet::TransparentMempoolSpend {
         spent_outpoint: Some(outpoint_message(&transparent_spend.spent_outpoint)),
-        spending_transaction_id: transparent_spend.spending_transaction_id.as_bytes().into(),
+        spending_transaction_id: encode_internal_transaction_id(
+            transparent_spend.spending_transaction_id,
+        )
+        .into(),
     }
 }
 
@@ -268,11 +275,11 @@ const fn mempool_eviction_reason_message(
 pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
-        network_name: chain_epoch.network.name().to_owned(),
+        network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
-        tip_hash: chain_epoch.tip_hash.as_bytes().into(),
+        tip_hash: encode_internal_block_hash(chain_epoch.tip_hash).into(),
         finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: chain_epoch.finalized_hash.as_bytes().into(),
+        finalized_hash: encode_internal_block_hash(chain_epoch.finalized_hash).into(),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -347,12 +354,12 @@ impl MempoolDecodeError {
 pub fn chain_epoch_from_message(
     message: wallet::ChainEpoch,
 ) -> Result<ChainEpoch, MempoolDecodeError> {
-    let network = Network::from_name(&message.network_name).ok_or_else(|| {
-        MempoolDecodeError::UnknownNetwork {
+    let network = decode_zinder_native_chain_name(&message.network_name)
+        .ok()
+        .ok_or_else(|| MempoolDecodeError::UnknownNetwork {
             field: "chain_epoch.network_name",
             network_name: message.network_name.clone(),
-        }
-    })?;
+        })?;
     let artifact_schema_version = u16::try_from(message.artifact_schema_version).map_err(|_| {
         MempoolDecodeError::Overflow {
             field: "chain_epoch.artifact_schema_version",

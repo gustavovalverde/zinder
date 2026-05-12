@@ -801,7 +801,8 @@ wallet.mempool.transparent_prevouts_v1
 wallet.read.transparent_prevouts_v1
 wallet.address.transparent_utxos_v1
 wallet.address.transparent_history_v1
-derive.explorer.ready_v1
+wallet.address.transparent_balance_v1
+derive.explorer.server_info_v1
 derive.explorer.transparent_balance_v1
 ```
 <!-- capability-list:testing-runbook:end -->

@@ -21,6 +21,7 @@ mod transparent_address_tx_index;
 mod transparent_prevout;
 mod transparent_utxo;
 mod tree_state;
+pub mod wire;
 
 pub use block_artifact::{BlockArtifact, CompactBlockArtifact};
 pub use block_header::BlockHeaderInfo;

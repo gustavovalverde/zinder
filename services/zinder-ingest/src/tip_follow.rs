@@ -686,7 +686,10 @@ mod tests {
     use async_trait::async_trait;
     use prost::Message;
     use tempfile::tempdir;
-    use zinder_core::{BlockArtifact, CompactBlockArtifact, SubtreeRootHash, SubtreeRootIndex};
+    use zinder_core::{
+        BlockArtifact, CompactBlockArtifact, SubtreeRootHash, SubtreeRootIndex,
+        wire::encode_internal_block_hash,
+    };
     use zinder_proto::compat::lightwalletd::{
         ChainMetadata, CompactBlock as LightwalletdCompactBlock,
     };
@@ -1158,7 +1161,7 @@ mod tests {
         LightwalletdCompactBlock {
             proto_version: 1,
             height: u64::from(height.value()),
-            hash: block_hash.as_bytes().into(),
+            hash: encode_internal_block_hash(block_hash).into(),
             prev_hash: Vec::new(),
             time: 1_774_668_400,
             header: Vec::new(),

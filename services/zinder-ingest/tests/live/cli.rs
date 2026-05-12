@@ -8,6 +8,7 @@ use std::{fs, io, num::NonZeroU32};
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange, Network};
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::NodeSource;
@@ -41,7 +42,7 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
     fs::write(
         &config_path,
         backfill_config_toml(&BackfillConfigToml {
-            network_name: env.network().name(),
+            network_name: encode_zinder_native_chain_name(env.network()),
             json_rpc_addr: &env.target.json_rpc_addr,
             node_auth_username: username,
             node_auth_password: password,
@@ -133,7 +134,7 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
     fs::write(
         &config_path,
         wallet_serving_backfill_config_toml(&WalletServingBackfillConfigToml {
-            network_name: env.network().name(),
+            network_name: encode_zinder_native_chain_name(env.network()),
             json_rpc_addr: &env.target.json_rpc_addr,
             node_auth_username: username,
             node_auth_password: password,

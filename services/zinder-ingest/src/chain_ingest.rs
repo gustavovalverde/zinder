@@ -16,12 +16,13 @@ use thiserror::Error;
 use zebra_chain::{
     serialization::ZcashDeserializeInto, transaction::Transaction as ZebraTransaction,
 };
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, TransactionArtifact, TransactionId, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
-    TreeStateArtifact, UnixTimestampMillis,
+    SubtreeRootIndex, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{NodeSource, SourceBlock, SourceError, SourceSubtreeRoots};
 use zinder_store::{
@@ -813,7 +814,7 @@ fn append_transparent_spend_tx_index_artifacts(
             continue;
         };
         let address_script_hash =
-            crate::artifact_builder::transparent_address_script_hash(script_pub_key.as_slice());
+            TransparentAddressScriptHash::of_script_pub_key(script_pub_key.as_slice());
         if emitted.insert((
             address_script_hash,
             candidate.block_height,
@@ -990,7 +991,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 target: "zinder::ingest",
                 event = "chain_committed",
                 chain_epoch_id = chain_epoch.id.value(),
-                network = chain_epoch.network.name(),
+                network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.tip_hash),
                 finalized_height = chain_epoch.finalized_height.value(),
@@ -1008,7 +1009,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 target: "zinder::ingest",
                 event = "chain_reorged",
                 chain_epoch_id = chain_epoch.id.value(),
-                network = chain_epoch.network.name(),
+                network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.tip_hash),
                 finalized_height = chain_epoch.finalized_height.value(),
@@ -1035,17 +1036,17 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
 fn record_writer_progress(chain_epoch: ChainEpoch) {
     metrics::gauge!(
         "zinder_ingest_writer_chain_epoch_id",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u64_to_f64(chain_epoch.id.value()));
     metrics::gauge!(
         "zinder_ingest_writer_tip_height",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.tip_height.value()));
     metrics::gauge!(
         "zinder_ingest_writer_finalized_height",
-        "network" => chain_epoch.network.name()
+        "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.finalized_height.value()));
 }
@@ -1133,10 +1134,7 @@ mod tests {
     use zinder_testkit::StoreFixture;
 
     use super::*;
-    use crate::{
-        artifact_builder::transparent_address_script_hash, derive_compact_block_artifact,
-        derive_transaction_artifacts,
-    };
+    use crate::{derive_compact_block_artifact, derive_transaction_artifacts};
 
     #[test]
     fn commit_ingest_batch_indexes_transparent_spend_only_history() -> Result<(), Box<dyn Error>> {
@@ -1209,7 +1207,8 @@ mod tests {
             .ok_or("fixture block must contain a transaction")?
             .transaction_id;
         let script_pub_key = first_transparent_output_script_pub_key(&prevout_block)?;
-        let address_script_hash = transparent_address_script_hash(script_pub_key.as_slice());
+        let address_script_hash =
+            TransparentAddressScriptHash::of_script_pub_key(script_pub_key.as_slice());
 
         let store_fixture = StoreFixture::open()?;
         let store = store_fixture.chain_store().clone();

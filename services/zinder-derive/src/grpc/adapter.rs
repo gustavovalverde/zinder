@@ -1,7 +1,7 @@
 //! `ExplorerQuery` gRPC adapter.
 //!
 //! Serves [`ExplorerQuery::ServerInfo`] (advertising
-//! [`DERIVE_EXPLORER_READY_CAPABILITY`]) and
+//! [`DERIVE_EXPLORER_SERVER_INFO_V1`]) and
 //! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
 //! request time per ADR-0014: confirmed totals are summed from canonical
 //! transparent UTXO artifacts (via `WalletQuery`) and the mempool overlay is
@@ -10,6 +10,9 @@
 //! durable contract.
 
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use zinder_proto::capabilities::{
+    DERIVE_EXPLORER_SERVER_INFO_V1, DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+};
 use zinder_proto::v1::{
     explorer::{
         ExplorerServerCapabilities, ServerInfoRequest, ServerInfoResponse,
@@ -24,19 +27,6 @@ use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
     connect_authenticated_channel,
 };
-
-/// Capability advertised once the derive consumer infrastructure is alive.
-///
-/// Always advertised: the balance read path is stateless against the derive
-/// store, so the binary is ready as soon as it boots.
-pub const DERIVE_EXPLORER_READY_CAPABILITY: &str = "derive.explorer.ready_v1";
-
-/// Capability advertised when the explorer-balance read path is reachable.
-///
-/// Advertisement is gated on a configured `WalletQuery` endpoint; deployments
-/// without the federation wired omit this string from `ServerInfo`.
-pub const DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY: &str =
-    "derive.explorer.transparent_balance_v1";
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Debug)]
@@ -118,9 +108,9 @@ impl ExplorerQueryGrpcAdapter {
     }
 
     fn advertised_capabilities(&self) -> Vec<String> {
-        let mut capabilities = vec![DERIVE_EXPLORER_READY_CAPABILITY.to_owned()];
+        let mut capabilities = vec![DERIVE_EXPLORER_SERVER_INFO_V1.to_owned()];
         if self.wallet_query_endpoint.is_some() {
-            capabilities.push(DERIVE_EXPLORER_TRANSPARENT_BALANCE_CAPABILITY.to_owned());
+            capabilities.push(DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1.to_owned());
         }
         capabilities
     }

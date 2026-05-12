@@ -39,6 +39,8 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0013: Derive-plane instantiation and transparent address balance read-path](adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)
 - [ADR-0014: Compute-at-read-time read-path pattern for canonical reads](adrs/0014-compute-at-read-time-canonical-reads.md)
 - [ADR-0015: Per-network consensus parameters discovered from the running node](adrs/0015-network-parameter-discovery.md)
+- [ADR-0016: Centralized wire conventions and Zebra-aligned vocabulary](adrs/0016-wire-conventions-and-zebra-alignment.md)
+- [ADR-0017: Compute-at-read-time at the compat boundary](adrs/0017-compute-at-read-time-at-the-compat-boundary.md)
 
 ## Reference
 

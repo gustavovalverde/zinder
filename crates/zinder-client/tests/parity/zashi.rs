@@ -119,7 +119,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(tree_state.orchard_tree, "111111");
     assert_eq!(subtree_root.completing_block_height, 2);
     assert_eq!(lightd_info.vendor, "Zinder");
-    assert_eq!(lightd_info.chain_name, "regtest");
+    assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, latest_block.height);
     assert_eq!(lightd_info.estimated_height, latest_block.height);
     assert_eq!(

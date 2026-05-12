@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockHash, BlockHeight, Network, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
@@ -75,7 +76,7 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     tracing::info!(
         target: "zinder::live",
         event = "transparent_address_surface_validated",
-        network = %network.name(),
+        network = %encode_zinder_native_chain_name(network),
         height = sample.block_height.value(),
         "transparent address surface validated against live node"
     );
@@ -104,7 +105,7 @@ async fn backfill_and_sample_tip_coinbase(
             "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}; \
              upstream node is not synced or {network} is too young",
             tip_height.value(),
-            network = env.network().name(),
+            network = encode_zinder_native_chain_name(env.network()),
         ));
     }
     let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);

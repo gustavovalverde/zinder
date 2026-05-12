@@ -58,6 +58,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error("invalid ingest-control bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),
+
+    #[error("gRPC reflection service build failed: {0}")]
+    Reflection(#[from] tonic_reflection::server::Error),
 }
 
 /// Loads and validates lightwalletd compat configuration.

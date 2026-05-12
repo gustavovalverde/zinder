@@ -310,13 +310,15 @@ async fn assert_compact_block_carries_indexed_transactions(
         compact_block.height
     );
     for compact_tx in &compact_block.vtx {
-        let mut display_txid = compact_tx.txid.clone();
-        display_txid.reverse();
+        // Lightwalletd `bytes` fields carry Zcash internal little-endian txids
+        // (`frontend/service.go:792`: "When expressed as bytes, a txid must
+        // be little-endian"). `TxFilter.hash` takes the same byte order.
+        // Round-trip the txid bytes unchanged.
         let response = client
             .get_transaction(Request::new(lightwalletd::TxFilter {
                 block: None,
                 index: 0,
-                hash: display_txid,
+                hash: compact_tx.txid.clone(),
             }))
             .await?
             .into_inner();

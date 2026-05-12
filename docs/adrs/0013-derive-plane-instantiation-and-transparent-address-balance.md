@@ -35,7 +35,7 @@ The federated path between `zinder-query` and `zinder-derive` is owned by the [A
 
 Derive-plane capabilities use the `derive.{consumer}.{capability}_v{N}` prefix even when the RPC method is federated under `WalletQuery`. The explorer consumer advertises:
 
-- `derive.explorer.ready_v1`: indicates `zinder-derive` is up. Advertised on `ExplorerQuery.ServerInfo`.
+- `derive.explorer.server_info_v1`: indicates `zinder-derive` is up. Advertised on `ExplorerQuery.ServerInfo`.
 - `derive.explorer.transparent_balance_v1`: indicates the balance handler is reachable. Advertised on **both** `ExplorerQuery.ServerInfo` (direct) and `WalletQuery.ServerInfo` (federated, only when `zinder-derive` is reachable per the [ADR-0011](0011-derive-plane-federation-pattern.md) readiness gauge).
 
 There is no `wallet.*` capability for balance. Native consumers gating on capability strings see `derive.explorer.transparent_balance_v1` regardless of which gRPC surface they use. The capability-coverage test asserts the `derive.*` namespace maps to `ExplorerQuery` methods and federated `WalletQuery` methods.

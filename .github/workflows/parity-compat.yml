@@ -1,0 +1,131 @@
+name: parity-compat
+
+# T3 (live) parity diff between Zinder's `zinder-compat-lightwalletd` and the
+# upstream `electriccoinco/lightwalletd` Go reference, both pointed at the
+# same regtest Zebra node. Lands as a recurring schedule plus manual
+# dispatch; per-PR gating is advisory until the harness has a stable
+# regression baseline (per ADR-0012 §Open mainnet infrastructure questions).
+#
+# Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
+
+on:
+  schedule:
+    - cron: "47 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "services/zinder-compat-lightwalletd/**"
+      - "crates/zinder-proto/proto/compat/lightwalletd/**"
+      - "services/zinder-query/**"
+      - "crates/zinder-core/src/wire/**"
+      - "crates/zinder-proto/src/capabilities.rs"
+      - ".github/workflows/parity-compat.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NEXTEST_VERSION: "0.9.116"
+  PROTOC_VERSION: "29.3"
+  ZEBRA_REGTEST_RPC_PORT: "39232"
+  ZINDER_COMPAT_PORT: "9087"
+  LIGHTWALLETD_REFERENCE_PORT: "9088"
+
+jobs:
+  parity-regtest:
+    name: parity diff (regtest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      zebra:
+        image: zfnd/zebra:latest
+        ports:
+          - 39232:39232
+        env:
+          ZEBRA_NETWORK: Regtest
+        options: >-
+          --health-cmd "wget -q -O- http://localhost:39232 || true"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+      lightwalletd-reference:
+        image: electriccoinco/lightwalletd:latest
+        ports:
+          - 9088:9067
+        env:
+          LIGHTWALLETD_GRPC_BIND_ADDR: "0.0.0.0:9067"
+          LIGHTWALLETD_ZCASHD_RPC_HOST: zebra
+          LIGHTWALLETD_ZCASHD_RPC_PORT: "39232"
+          LIGHTWALLETD_ZCASHD_RPC_USER: zebra
+          LIGHTWALLETD_ZCASHD_RPC_PASSWORD: zebra
+          LIGHTWALLETD_NO_TLS_VERY_INSECURE: "true"
+        options: >-
+          --health-cmd "true"
+          --health-interval 15s
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      - name: Build Zinder binaries
+        run: cargo build --release -p zinder-ingest -p zinder-query -p zinder-compat-lightwalletd
+
+      - name: Start Zinder pipeline (ingest + query + compat-shim)
+        env:
+          ZINDER_NETWORK: zcash-regtest
+          ZINDER_NODE__JSON_RPC_ADDR: "http://127.0.0.1:39232"
+          ZINDER_NODE__AUTH__METHOD: basic
+          ZINDER_NODE__AUTH__USERNAME: zebra
+          ZINDER_NODE__AUTH__PASSWORD: zebra
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/parity-store
+          ./target/release/zinder-ingest --storage-path .tmp/parity-store &
+          INGEST_PID=$!
+          sleep 5
+          ./target/release/zinder-query --storage-path .tmp/parity-store --listen-addr 127.0.0.1:9086 &
+          QUERY_PID=$!
+          ./target/release/zinder-compat-lightwalletd --storage-path .tmp/parity-store --listen-addr 127.0.0.1:9087 &
+          COMPAT_PID=$!
+          echo "ingest=$INGEST_PID query=$QUERY_PID compat=$COMPAT_PID" > .tmp/parity.pids
+          sleep 20
+
+      - name: Run parity diff
+        env:
+          ZINDER_TEST_LIVE: "1"
+          ZINDER_NETWORK: zcash-regtest
+          ZINDER_NODE__JSON_RPC_ADDR: "http://127.0.0.1:39232"
+          ZINDER_NODE__AUTH__METHOD: basic
+          ZINDER_NODE__AUTH__USERNAME: zebra
+          ZINDER_NODE__AUTH__PASSWORD: zebra
+          ZINDER_TEST_PARITY_ZINDER_ADDR: "http://127.0.0.1:9087"
+          ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: "http://127.0.0.1:9088"
+        run: |
+          cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+            -E 'test(/^live::parity_against_lightwalletd::/)'
+
+      - name: Stop Zinder pipeline
+        if: always()
+        run: |
+          if [ -f .tmp/parity.pids ]; then
+            cat .tmp/parity.pids
+            kill $(grep -oE '[0-9]+' .tmp/parity.pids | tr '\n' ' ') 2>/dev/null || true
+          fi

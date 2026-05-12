@@ -5,7 +5,6 @@
 
 use eyre::eyre;
 use prost::Message;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -116,7 +115,9 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     assert_eq!(subtree_roots.len(), 1);
     assert_eq!(subtree_roots[0].completing_block_height, 1);
     assert_eq!(lightd_info.vendor, "Zinder");
-    assert_eq!(lightd_info.chain_name, "regtest");
+    // Regtest collapses to "test" per BIP70 (Zebra's NetworkKind::bip70_network_name).
+    // Wallet SDKs match `chainName` against ID_TESTNET, which is "test".
+    assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, 1);
     assert_eq!(lightd_info.estimated_height, 1);
     assert_eq!(
@@ -154,7 +155,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             (
                 vec![
                     TransparentAddressUtxoArtifact::new(
-                        transparent_address_script_hash(&script_pub_key),
+                        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                         script_pub_key.clone(),
                         unspent_outpoint,
                         12,
@@ -162,7 +163,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
                         block.hash,
                     ),
                     TransparentAddressUtxoArtifact::new(
-                        transparent_address_script_hash(&script_pub_key),
+                        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                         script_pub_key.clone(),
                         spent_outpoint,
                         13,
@@ -219,6 +220,82 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
     Ok(())
 }
 
+/// Regression: txid bytes emitted by `GetAddressUtxos` must be accepted verbatim
+/// by `GetTransaction(TxFilter { hash, ... })`. The 2026-05-12 parity run
+/// surfaced a `NotFound` when wallets rebound the bytes round-trip; the cause
+/// was an unnecessary byte reversal at the input handler. Lightwalletd-go
+/// documents the wire contract at `frontend/service.go:792`: txid `bytes`
+/// fields are Zcash internal little-endian, the same byte order
+/// [`TransactionId::as_bytes`] returns.
+#[tokio::test]
+async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() -> eyre::Result<()> {
+    let transparent_address =
+        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x44; 20]);
+    let address = transparent_address.to_string();
+    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
+    let transaction_id = TransactionId::from_bytes([0x77; 32]);
+    let transaction_payload = b"round-trip-transaction-bytes".to_vec();
+    let store_fixture = acceptance_store_fixture_with_transactions_and_transparent(
+        DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        |block| {
+            vec![TransactionArtifact::new(
+                transaction_id,
+                block.height,
+                block.hash,
+                transaction_payload.clone(),
+            )]
+        },
+        |block| {
+            (
+                vec![TransparentAddressUtxoArtifact::new(
+                    TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+                    script_pub_key.clone(),
+                    TransparentOutPoint::new(transaction_id, 0),
+                    21,
+                    block.height,
+                    block.hash,
+                )],
+                Vec::new(),
+            )
+        },
+    )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let utxos = adapter
+        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
+            addresses: vec![address],
+            start_height: 1,
+            max_entries: 10,
+        }))
+        .await?
+        .into_inner();
+    let utxo = utxos
+        .address_utxos
+        .first()
+        .ok_or_else(|| eyre!("expected one UTXO in the round-trip fixture"))?;
+
+    let transaction = adapter
+        .get_transaction(Request::new(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: utxo.txid.clone(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(transaction.height, 1);
+    assert_eq!(transaction.data, transaction_payload);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Result<()> {
     let transparent_address_a =
@@ -239,7 +316,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
             (
                 vec![
                     TransparentAddressUtxoArtifact::new(
-                        transparent_address_script_hash(&script_pub_key_a),
+                        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_a),
                         script_pub_key_a.clone(),
                         TransparentOutPoint::new(truncated_transaction_id, 0),
                         30,
@@ -247,7 +324,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                         block.hash,
                     ),
                     TransparentAddressUtxoArtifact::new(
-                        transparent_address_script_hash(&script_pub_key_b),
+                        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
                         TransparentOutPoint::new(first_transaction_id, 0),
                         10,
@@ -255,7 +332,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                         block.hash,
                     ),
                     TransparentAddressUtxoArtifact::new(
-                        transparent_address_script_hash(&script_pub_key_b),
+                        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
                         TransparentOutPoint::new(second_transaction_id, 1),
                         20,
@@ -312,7 +389,7 @@ async fn get_taddress_history_drains_native_pages() -> eyre::Result<()> {
         ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x31; 20]);
     let address = transparent_address.to_string();
     let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = transparent_address_script_hash(&script_pub_key);
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let store_fixture = acceptance_store_fixture_with_transactions_and_tx_history(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
         |block| {
@@ -1139,10 +1216,4 @@ fn tx_id_for_index(index: u32) -> TransactionId {
 
 fn tx_payload_for_index(index: u32) -> Vec<u8> {
     format!("tx-payload-{index}").into_bytes()
-}
-
-fn transparent_address_script_hash(script_pub_key: &[u8]) -> TransparentAddressScriptHash {
-    let mut hasher = Sha256::new();
-    hasher.update(script_pub_key);
-    TransparentAddressScriptHash::from_bytes(hasher.finalize().into())
 }

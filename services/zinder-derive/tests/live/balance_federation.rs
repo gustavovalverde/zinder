@@ -42,6 +42,7 @@ use tonic::Request;
 use tonic::transport::Channel;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockHeight, BroadcastAccepted, ChainEpoch, ChainEpochId, Network, RawTransactionBytes,
     TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash, UnixTimestampMillis,
@@ -114,7 +115,7 @@ async fn federated_balance_matches_utxo_sum_for_sampled_coinbase_address() -> Re
     tracing::info!(
         target: "zinder::live",
         event = "federated_balance_validated",
-        network = %fixture.network.name(),
+        network = %encode_zinder_native_chain_name(fixture.network),
         height = fixture.sample_block_height.value(),
         confirmed_zat = response.confirmed_zat,
         chain_epoch_id = chain_epoch.chain_epoch_id,
@@ -170,7 +171,7 @@ impl FederatedBalanceFixture {
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
         let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-            network: network.name().to_owned(),
+            network: encode_zinder_native_chain_name(network).to_owned(),
         })
         .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
         Ok(Self {
@@ -268,7 +269,7 @@ async fn backfill_and_sample_tip_coinbase(
             "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}; \
              upstream node is not synced or {network} is too young",
             tip_height.value(),
-            network = env.network().name(),
+            network = encode_zinder_native_chain_name(env.network()),
         ));
     }
     let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
@@ -290,7 +291,7 @@ async fn backfill_and_sample_tip_coinbase(
     let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
         return Err(eyre!(
             "expected committed backfill outcome against live {network}",
-            network = env.network().name(),
+            network = encode_zinder_native_chain_name(env.network()),
         ));
     };
 
@@ -427,7 +428,7 @@ impl MempoolOverlayFixture {
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
         let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-            network: env.network().name().to_owned(),
+            network: encode_zinder_native_chain_name(env.network()).to_owned(),
         })
         .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
         Ok(Self {

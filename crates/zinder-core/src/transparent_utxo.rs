@@ -1,5 +1,7 @@
 //! Transparent UTXO artifact values.
 
+use sha2::{Digest, Sha256};
+
 use crate::{BlockHash, BlockHeight, TransactionId};
 
 /// Hash of a transparent address `scriptPubKey`.
@@ -17,6 +19,20 @@ impl TransparentAddressScriptHash {
     #[must_use]
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// Hashes a transparent `scriptPubKey` into its canonical
+    /// [`TransparentAddressScriptHash`].
+    ///
+    /// Used by every transparent-address index entry and by every wallet read
+    /// surface that maps a parsed `zebra_chain::transparent::Address` back to
+    /// the storage-side script hash. The hash is SHA-256 over the raw
+    /// `scriptPubKey` bytes.
+    #[must_use]
+    pub fn of_script_pub_key(script_pub_key: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(script_pub_key);
+        Self::from_bytes(hasher.finalize().into())
     }
 }
 

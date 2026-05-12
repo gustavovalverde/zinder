@@ -17,7 +17,6 @@ config.workspace = true
 metrics.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
-sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tokio-stream.workspace = true

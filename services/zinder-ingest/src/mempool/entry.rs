@@ -23,12 +23,12 @@ use zebra_chain::serialization::ZcashDeserializeInto;
 use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zebra_chain::transparent::Input as ZebraTransparentInput;
 use zinder_core::{
-    ChainEpoch, MempoolEntry, TransactionId, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint,
+    ChainEpoch, MempoolEntry, TransactionId, TransparentAddressScriptHash,
+    TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint,
 };
 use zinder_source::MempoolSourceEntry;
 
-use crate::artifact_builder::{compact_transaction, transparent_address_script_hash};
+use crate::artifact_builder::compact_transaction;
 
 /// Error returned while finalizing a [`MempoolEntry`] from a source entry.
 #[derive(Debug, Error)]
@@ -98,7 +98,7 @@ fn build_transparent_mempool_outputs(
             .map_err(|_| MempoolEntryBuildError::TransparentOutputIndexOverflow)?;
         let script_pub_key = transparent_output.lock_script.as_raw_bytes().to_vec();
         transparent_outputs.push(TransparentMempoolOutput {
-            address_script_hash: transparent_address_script_hash(&script_pub_key),
+            address_script_hash: TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
             script_pub_key,
             outpoint: TransparentOutPoint::new(transaction_id, output_index),
             value_zat: u64::from(transparent_output.value()),

@@ -12,9 +12,13 @@ use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     ChainEpoch, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
+};
+use zinder_proto::capabilities::{
+    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -469,11 +473,11 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
 
     assert!(has_capability(
         &read_only_capabilities,
-        "wallet.events.chain_v1"
+        WALLET_EVENTS_CHAIN_V1
     ));
     assert!(!has_capability(
         &read_only_capabilities,
-        "wallet.broadcast.transaction_v1"
+        WALLET_BROADCAST_TRANSACTION_V1
     ));
 
     let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x33; 32]));
@@ -500,7 +504,7 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
 
     assert!(has_capability(
         &broadcast_capabilities,
-        "wallet.broadcast.transaction_v1"
+        WALLET_BROADCAST_TRANSACTION_V1
     ));
 
     Ok(())
@@ -519,7 +523,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
         DeriveProxyConfig {
             endpoint: "http://127.0.0.1:0".to_owned(),
             bearer_token: None,
-            capability: "derive.explorer.transparent_balance_v1",
+            capability: DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
         },
         readiness.clone(),
         ExplorerQueryClient::new,
@@ -531,7 +535,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     assert!(
         !has_capability(
             &initial_capabilities,
-            "derive.explorer.transparent_balance_v1"
+            DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
         ),
         "derive capability must be omitted before the readiness probe succeeds"
     );
@@ -540,7 +544,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     let ready_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
     assert!(has_capability(
         &ready_capabilities,
-        "derive.explorer.transparent_balance_v1"
+        DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
     ));
 
     readiness.mark_not_ready();
@@ -548,7 +552,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     assert!(
         !has_capability(
             &not_ready_capabilities,
-            "derive.explorer.transparent_balance_v1"
+            DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
         ),
         "derive capability must be removed after the readiness probe fails"
     );
@@ -734,7 +738,7 @@ async fn wallet_server_capabilities(
 fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
-        network_name: chain_epoch.network.name().to_owned(),
+        network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
         tip_hash: chain_epoch.tip_hash.as_bytes().to_vec(),
         finalized_height: chain_epoch.finalized_height.value(),

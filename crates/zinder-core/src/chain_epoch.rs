@@ -21,16 +21,6 @@ impl Network {
         }
     }
 
-    /// Returns the public configuration name for this network.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::ZcashMainnet => "zcash-mainnet",
-            Self::ZcashTestnet => "zcash-testnet",
-            Self::ZcashRegtest => "zcash-regtest",
-        }
-    }
-
     /// Resolves a storage key network identifier into a known network.
     #[must_use]
     pub const fn from_id(network_id: u32) -> Option<Self> {
@@ -38,17 +28,6 @@ impl Network {
             1 => Some(Self::ZcashMainnet),
             2 => Some(Self::ZcashTestnet),
             3 => Some(Self::ZcashRegtest),
-            _ => None,
-        }
-    }
-
-    /// Resolves a public configuration name into a known network.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "zcash-mainnet" => Some(Self::ZcashMainnet),
-            "zcash-testnet" => Some(Self::ZcashTestnet),
-            "zcash-regtest" => Some(Self::ZcashRegtest),
             _ => None,
         }
     }

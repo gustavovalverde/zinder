@@ -1,10 +1,12 @@
 //! Zinder wallet query gRPC server entry point.
 
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
+use zinder_proto::capabilities::DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
     BearerToken, OpsServer, Readiness, cancel_on_ctrl_c, connect_authenticated_channel,
@@ -18,8 +20,6 @@ use zinder_store::SecondaryChainStore;
 mod config;
 
 use config::{QueryConfig, QueryConfigError, QueryConfigOverrides};
-
-const EXPLORER_TRANSPARENT_BALANCE_CAPABILITY: &str = "derive.explorer.transparent_balance_v1";
 
 const REQUIRED_BROADCASTER_NODE_CAPABILITIES: &[NodeCapability] =
     &[NodeCapability::TransactionBroadcast];
@@ -158,7 +158,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations);
     let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
-        network: query_config.network.name().to_owned(),
+        network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         transaction_broadcast_enabled,
         chain_event_retention_seconds: query_config.chain_event_retention_seconds,
         mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds,
@@ -176,7 +176,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
                 zinder_query::DeriveProxyConfig {
                     endpoint: explorer_config.endpoint.clone(),
                     bearer_token: explorer_config.bearer_token.clone(),
-                    capability: EXPLORER_TRANSPARENT_BALANCE_CAPABILITY,
+                    capability: DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
                 },
                 ExplorerQueryClient::new,
             );
@@ -242,7 +242,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     tracing::info!(
         target: "zinder::query",
         event = "query_started",
-        network = query_config.network.name(),
+        network = encode_zinder_native_chain_name(query_config.network),
         listen_addr = %query_config.listen_addr,
         visible_height = ?visible_height,
         grpc_reflection_enabled = query_config.grpc.enable_reflection,
@@ -285,7 +285,7 @@ async fn probe_explorer_capability(endpoint: String, bearer_token: Option<Bearer
             capabilities
                 .capabilities
                 .iter()
-                .any(|capability| capability == EXPLORER_TRANSPARENT_BALANCE_CAPABILITY)
+                .any(|capability| capability == DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1)
         })
 }
 
@@ -402,7 +402,7 @@ fn spawn_ops(
         OpsServer {
             service_name: "zinder-query",
             service_version: env!("CARGO_PKG_VERSION"),
-            network_name: query_config.network.name(),
+            network_name: encode_zinder_native_chain_name(query_config.network),
         },
         readiness.clone(),
     )

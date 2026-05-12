@@ -14,11 +14,12 @@ use zebra_chain::{
 };
 use zinder_client::{
     ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionArtifact, TransactionId,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentOutPoint,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
-use zinder_query::{WalletQuery, transparent_address_script_hash};
+use zinder_query::WalletQuery;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use super::{committed_store_fixture, parity_chain_fixture};
@@ -128,7 +129,7 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
         ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x11; 20]);
     let address = transparent_address.to_string();
     let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = transparent_address_script_hash(&script_pub_key);
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let transaction_id = TransactionId::from_bytes([0x55; 32]);
     let base_fixture = parity_chain_fixture(1);
     let block = base_fixture

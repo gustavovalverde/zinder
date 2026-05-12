@@ -167,36 +167,61 @@ impl SourceBlock {
 }
 
 /// Decodes an RPC display-order block hash into canonical little-endian bytes.
+///
+/// Delegates to [`zinder_core::wire::decode_display_block_hash_hex`] for the
+/// hex parsing and byte reversal; this function exists to map the wire error
+/// to a typed [`SourceError`] variant the metrics layer aggregates on.
 pub fn decode_display_block_hash(display_hash: &str) -> Result<BlockHash, SourceError> {
-    decode_display_hash_32(
-        display_hash,
-        |source| SourceError::InvalidBlockHashHex { source },
-        |byte_count| SourceError::InvalidBlockHashLength { byte_count },
-    )
-    .map(BlockHash::from_bytes)
+    zinder_core::wire::decode_display_block_hash_hex(display_hash)
+        .map_err(wire_error_to_block_hash_error)
 }
 
 /// Encodes a canonical little-endian block hash as RPC display-order hex.
 #[must_use]
 pub fn encode_display_block_hash(hash: BlockHash) -> String {
-    let mut hash_bytes = hash.as_bytes();
-    hash_bytes.reverse();
-    hex::encode(hash_bytes)
+    zinder_core::wire::encode_display_block_hash_hex(hash)
 }
 
-pub(crate) fn decode_display_hash_32(
-    display_hash: &str,
-    invalid_hex: impl FnOnce(hex::FromHexError) -> SourceError,
-    invalid_length: impl FnOnce(usize) -> SourceError,
-) -> Result<[u8; 32], SourceError> {
-    if display_hash.len() != 64 && display_hash.len().is_multiple_of(2) {
-        return Err(invalid_length(display_hash.len() / 2));
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "WireDecodeError is #[non_exhaustive]; the catch-all maps future variants to a typed SourceError without losing the underlying message"
+)]
+fn wire_error_to_block_hash_error(wire_error: zinder_core::wire::WireDecodeError) -> SourceError {
+    match wire_error {
+        zinder_core::wire::WireDecodeError::InvalidLength { actual, .. } => {
+            SourceError::InvalidBlockHashLength {
+                byte_count: actual / 2,
+            }
+        }
+        zinder_core::wire::WireDecodeError::InvalidHex { reason } => {
+            SourceError::InvalidBlockHashHex { reason }
+        }
+        other => SourceError::InvalidBlockHashHex {
+            reason: other.to_string(),
+        },
     }
+}
 
-    let mut hash_bytes = [0; 32];
-    hex::decode_to_slice(display_hash, &mut hash_bytes).map_err(invalid_hex)?;
-    hash_bytes.reverse();
-    Ok(hash_bytes)
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "WireDecodeError is #[non_exhaustive]; the catch-all maps future variants to a typed SourceError without losing the underlying message"
+)]
+pub(crate) fn wire_error_to_transaction_id_error(
+    wire_error: zinder_core::wire::WireDecodeError,
+) -> SourceError {
+    match wire_error {
+        zinder_core::wire::WireDecodeError::InvalidLength { actual, .. } => {
+            SourceError::InvalidTransactionIdLength {
+                byte_count: actual / 2,
+            }
+        }
+        zinder_core::wire::WireDecodeError::InvalidHex { reason } => {
+            SourceError::InvalidTransactionIdHex { reason }
+        }
+        other => SourceError::InvalidTransactionIdHex {
+            reason: other.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]

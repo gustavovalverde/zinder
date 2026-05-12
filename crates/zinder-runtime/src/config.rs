@@ -20,6 +20,7 @@ use ::config::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use zinder_core::Network;
+use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
 use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
 
 const ENV_PREFIX: &str = "ZINDER_";
@@ -210,7 +211,7 @@ impl NetworkSection {
     /// [`ConfigError::MissingField`] / [`ConfigError::Invalid`].
     pub fn resolve(self) -> Result<Network, ConfigError> {
         let name = require_field(self.name, "network.name")?;
-        Network::from_name(&name).ok_or_else(|| {
+        decode_zinder_native_chain_name(&name).ok().ok_or_else(|| {
             ConfigError::invalid(format!(
                 "unknown network: {name}; expected zcash-mainnet, zcash-testnet, or zcash-regtest"
             ))
@@ -337,7 +338,7 @@ impl NetworkToml {
     #[must_use]
     pub const fn from_network(network: Network) -> Self {
         Self {
-            name: network.name(),
+            name: encode_zinder_native_chain_name(network),
         }
     }
 }

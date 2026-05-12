@@ -13,34 +13,93 @@
 
 use crate::v1::wallet::ServerCapabilities;
 
+/// Capability advertised for `WalletQuery.LatestBlock`.
+pub const WALLET_READ_LATEST_BLOCK_V1: &str = "wallet.read.latest_block_v1";
+/// Capability advertised for `WalletQuery.BlockIdBySelector`.
+pub const WALLET_READ_BLOCK_ID_BY_SELECTOR_V1: &str = "wallet.read.block_id_by_selector_v1";
+/// Capability advertised for `WalletQuery.BlockHeaderBySelector`.
+pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_header_by_selector_v1";
+/// Capability advertised for `WalletQuery.CompactBlock`.
+pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
+/// Capability advertised for `WalletQuery.CompactBlockRange`.
+pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
+/// Capability advertised for `WalletQuery.TreeState`.
+pub const WALLET_READ_TREE_STATE_AT_V1: &str = "wallet.read.tree_state_at_v1";
+/// Capability advertised for `WalletQuery.LatestTreeState`.
+pub const WALLET_READ_LATEST_TREE_STATE_V1: &str = "wallet.read.latest_tree_state_v1";
+/// Capability advertised for `WalletQuery.SubtreeRoots`.
+pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
+/// Capability advertised for `WalletQuery.Transaction`.
+pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_id_v1";
+/// Capability advertised for `WalletQuery.ServerInfo`.
+pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
+/// Capability advertised for `WalletQuery.TransparentPrevouts`.
+pub const WALLET_READ_TRANSPARENT_PREVOUTS_V1: &str = "wallet.read.transparent_prevouts_v1";
+/// Capability advertised for `WalletQuery.BroadcastTransaction`.
+pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
+/// Capability advertised for `WalletQuery.ChainEvents`.
+pub const WALLET_EVENTS_CHAIN_V1: &str = "wallet.events.chain_v1";
+/// Capability advertised for `WalletQuery.MempoolSnapshot`.
+pub const WALLET_SNAPSHOT_MEMPOOL_V1: &str = "wallet.snapshot.mempool_v1";
+/// Capability advertised for `WalletQuery.MempoolEvents`.
+pub const WALLET_EVENTS_MEMPOOL_V1: &str = "wallet.events.mempool_v1";
+/// Capability advertised for `WalletQuery.TransparentMempoolOutputsByAddress`.
+pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1: &str =
+    "wallet.mempool.transparent_outputs_by_address_v1";
+/// Capability advertised for `WalletQuery.TransparentMempoolSpendByOutpoint`.
+pub const WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1: &str =
+    "wallet.mempool.transparent_spend_by_outpoint_v1";
+/// Capability advertised for `WalletQuery.TransparentMempoolPrevouts`.
+pub const WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1: &str = "wallet.mempool.transparent_prevouts_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressUtxos[Stream]`.
+pub const WALLET_ADDRESS_TRANSPARENT_UTXOS_V1: &str = "wallet.address.transparent_utxos_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
+pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
+/// Always-on canonical-confirmed-balance path for `WalletQuery.TransparentAddressBalance`.
+///
+/// Advertised whenever the deployment exposes the RPC. Clients that need the
+/// mempool overlay must additionally check for
+/// [`DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1`]; the wallet capability alone
+/// signals confirmed totals computed from canonical UTXOs.
+pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
+/// Capability advertised for `ExplorerQuery.ServerInfo`.
+pub const DERIVE_EXPLORER_SERVER_INFO_V1: &str = "derive.explorer.server_info_v1";
+/// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
+///
+/// Coexists with [`WALLET_ADDRESS_TRANSPARENT_BALANCE_V1`] when the derive
+/// plane is configured and ready. Signals that the same response carries the
+/// live mempool overlay in `unconfirmed_delta_zat`.
+pub const DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1: &str = "derive.explorer.transparent_balance_v1";
+
 /// Active capability strings advertised by a Zinder deployment.
 ///
 /// Adding a `WalletQuery` RPC requires extending this list. Removing a
 /// capability is a deprecation step under the capability-descriptor contract
 /// (see [Public interfaces §Capability Discovery](../../docs/architecture/public-interfaces.md#capability-discovery)).
 pub const ZINDER_CAPABILITIES: &[&str] = &[
-    "wallet.read.latest_block_v1",
-    "wallet.read.block_id_by_selector_v1",
-    "wallet.read.block_header_by_selector_v1",
-    "wallet.read.compact_block_at_v1",
-    "wallet.read.compact_block_range_v1",
-    "wallet.read.tree_state_at_v1",
-    "wallet.read.latest_tree_state_v1",
-    "wallet.read.subtree_roots_in_range_v1",
-    "wallet.read.transaction_by_id_v1",
-    "wallet.read.server_info_v1",
-    "wallet.broadcast.transaction_v1",
-    "wallet.events.chain_v1",
-    "wallet.snapshot.mempool_v1",
-    "wallet.events.mempool_v1",
-    "wallet.mempool.transparent_outputs_by_address_v1",
-    "wallet.mempool.transparent_spend_by_outpoint_v1",
-    "wallet.mempool.transparent_prevouts_v1",
-    "wallet.read.transparent_prevouts_v1",
-    "wallet.address.transparent_utxos_v1",
-    "wallet.address.transparent_history_v1",
-    "derive.explorer.ready_v1",
-    "derive.explorer.transparent_balance_v1",
+    WALLET_READ_LATEST_BLOCK_V1,
+    WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+    WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+    WALLET_READ_COMPACT_BLOCK_AT_V1,
+    WALLET_READ_COMPACT_BLOCK_RANGE_V1,
+    WALLET_READ_TREE_STATE_AT_V1,
+    WALLET_READ_LATEST_TREE_STATE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+    WALLET_READ_TRANSACTION_BY_ID_V1,
+    WALLET_READ_SERVER_INFO_V1,
+    WALLET_BROADCAST_TRANSACTION_V1,
+    WALLET_EVENTS_CHAIN_V1,
+    WALLET_SNAPSHOT_MEMPOOL_V1,
+    WALLET_EVENTS_MEMPOOL_V1,
+    WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+    WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
+    WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1,
+    WALLET_READ_TRANSPARENT_PREVOUTS_V1,
+    WALLET_ADDRESS_TRANSPARENT_UTXOS_V1,
+    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+    DERIVE_EXPLORER_SERVER_INFO_V1,
+    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
 ];
 
 /// Helpers for client-side capability discovery.

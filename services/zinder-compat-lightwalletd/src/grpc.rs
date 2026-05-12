@@ -7,29 +7,31 @@ use serde_json::Value;
 use tokio_stream::StreamExt as _;
 use tokio_stream::{self as stream};
 use tonic::{Request, Response, Status};
-use zebra_chain::{
-    parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
-};
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
+use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
     CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
-    TransactionBroadcastResult, TransactionId, TransparentAddressTxIndexArtifact, TxStatus,
+    TransactionBroadcastResult, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TxStatus,
+    wire::{
+        decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
+        encode_display_block_hash_hex, encode_display_transaction_id_hex,
+        encode_internal_block_hash, encode_internal_transaction_id,
+    },
 };
 use zinder_proto::compat::lightwalletd::{
     self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
 };
-use zinder_proto::v1::{
-    explorer::explorer_query_client::ExplorerQueryClient,
-    wallet::{self as wallet_proto, TransparentAddressBalanceRequest, address_lookup},
-};
+use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    DeriveProxy, SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
     TransparentAddressUtxosRequest, TreeState, WalletQueryApi, status_from_query_error,
-    transparent_address_script_hash,
+    transparent_address_confirmed_balance_response,
 };
-use zinder_runtime::AuthenticatedChannel;
+use zinder_source::transparent_address_matches_network;
 use zinder_store::MempoolEvent;
 
 use crate::mempool::{
@@ -75,7 +77,6 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -87,7 +88,6 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
-            .field("explorer_proxy", &self.explorer_proxy.is_some())
             .field(
                 "network_upgrade_activations",
                 &self.network_upgrade_activations.network(),
@@ -134,7 +134,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
-            explorer_proxy: None,
             network_upgrade_activations,
         }
     }
@@ -152,22 +151,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_tip_change_watcher(mut self, watcher: SharedTipChangeWatcher) -> Self {
         self.tip_change_watcher = Some(watcher);
-        self
-    }
-
-    /// Wires the derive-plane explorer proxy that backs
-    /// `GetTaddressBalance` and `GetTaddressBalanceStream`.
-    ///
-    /// Without an explorer proxy both balance methods return
-    /// `UNAVAILABLE`. The proxy's readiness gauge gates the call: a
-    /// configured-but-not-ready proxy still surfaces `UNAVAILABLE` so the
-    /// compat shim never serves a stale-or-zero balance under cold-start.
-    #[must_use]
-    pub fn with_explorer_proxy(
-        mut self,
-        explorer_proxy: DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>,
-    ) -> Self {
-        self.explorer_proxy = Some(explorer_proxy);
         self
     }
 
@@ -258,6 +241,47 @@ where
         replies.truncate(u32_to_usize(max_entries.get()));
         Ok(replies)
     }
+
+    /// Returns lightwalletd `Balance { value_zat: int64 }` computed from the
+    /// canonical transparent UTXO column family.
+    ///
+    /// The compat shim answers `GetTaddressBalance` directly from canonical
+    /// artifacts (ADR-0017): the legacy proto carries one signed `value_zat`
+    /// field that wallets interpret as confirmed balance. The richer native
+    /// `WalletQuery.TransparentAddressBalance` adds a mempool overlay through
+    /// the optional derive plane and is the right surface for clients that
+    /// need pending deltas.
+    async fn compat_balance_response(
+        &self,
+        addresses: Vec<String>,
+    ) -> Result<Response<lightwalletd::Balance>, Status> {
+        let latest_block = self
+            .query_api
+            .latest_block(None)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let address_lookups = addresses
+            .into_iter()
+            .map(|address| wallet_proto::AddressLookup {
+                selector: Some(address_lookup::Selector::Address(address)),
+            })
+            .collect();
+        let balance = transparent_address_confirmed_balance_response(
+            &self.query_api,
+            address_lookups,
+            latest_block.chain_epoch.network,
+            Some(latest_block.chain_epoch),
+        )
+        .await
+        .map_err(|error| status_from_query_error(&error))?;
+        let value_zat = i64::try_from(balance.confirmed_zat).map_err(|_| {
+            Status::out_of_range(
+                "transparent address confirmed balance exceeds i64::MAX; \
+                 use the native WalletQuery.TransparentAddressBalance surface",
+            )
+        })?;
+        Ok(Response::new(lightwalletd::Balance { value_zat }))
+    }
 }
 
 #[tonic::async_trait]
@@ -277,7 +301,7 @@ where
 
         Ok(Response::new(lightwalletd::BlockId {
             height: u64::from(latest_block.height.value()),
-            hash: latest_block.block_hash.as_bytes().to_vec(),
+            hash: encode_internal_block_hash(latest_block.block_hash).to_vec(),
         }))
     }
 
@@ -372,7 +396,8 @@ where
                 .map_err(|error| status_from_query_error(&error))?
                 .transaction
         } else {
-            let transaction_id = transaction_id_from_lightwalletd_hash(&filter.hash)?;
+            let transaction_id = decode_internal_transaction_id(&filter.hash)
+                .map_err(|error| wire_decode_error_to_status(&error))?;
             let response = self
                 .query_api
                 .transaction(transaction_id, None)
@@ -424,7 +449,7 @@ where
         .await?;
         let raw_transactions = history.into_iter().map(|artifact| {
             Ok(lightwalletd::RawTransaction {
-                data: artifact.transaction_id.as_bytes().to_vec(),
+                data: encode_internal_transaction_id(artifact.transaction_id).to_vec(),
                 height: u64::from(artifact.block_height.value()),
             })
         });
@@ -472,7 +497,7 @@ where
         request: Request<lightwalletd::AddressList>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         let addresses = request.into_inner().addresses;
-        balance_response_from_proxy(self.explorer_proxy.as_ref(), addresses).await
+        self.compat_balance_response(addresses).await
     }
 
     async fn get_taddress_balance_stream(
@@ -485,7 +510,7 @@ where
             let address = received?;
             addresses.push(address.address);
         }
-        balance_response_from_proxy(self.explorer_proxy.as_ref(), addresses).await
+        self.compat_balance_response(addresses).await
     }
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
@@ -511,7 +536,7 @@ where
                 .map_err(status_from_mempool_surface_error)?;
             for entry in snapshot_page.entries {
                 if txid_matches_excluded_suffix(
-                    &entry.transaction_id.as_bytes(),
+                    &encode_internal_transaction_id(entry.transaction_id),
                     &exclude_txid_suffixes,
                 ) {
                     continue;
@@ -669,10 +694,7 @@ where
             ));
         }
 
-        Ok(Response::new(lightd_info(
-            activations,
-            latest_block.height,
-        )?))
+        Ok(Response::new(lightd_info(activations, latest_block.height)))
     }
 
     async fn ping(
@@ -890,14 +912,15 @@ fn block_height_from_id(block_id: &lightwalletd::BlockId) -> Result<BlockHeight,
     Ok(BlockHeight::new(height))
 }
 
-fn transaction_id_from_lightwalletd_hash(hash: &[u8]) -> Result<TransactionId, Status> {
-    let mut bytes: [u8; 32] = hash
-        .try_into()
-        .map_err(|_| Status::invalid_argument("transaction hash must be 32 bytes"))?;
-    // Lightwalletd encodes transaction hashes in display order; canonical
-    // TransactionId bytes are the internal little-endian byte order.
-    bytes.reverse();
-    Ok(TransactionId::from_bytes(bytes))
+/// Convert a [`WireDecodeError`] into a tonic [`Status`] for the
+/// lightwalletd-compatibility surface.
+///
+/// Length and hex-decoding failures map to `INVALID_ARGUMENT` (the caller
+/// supplied a malformed byte or string field). Enum and dialect-string
+/// failures use the same code: the caller's wire input did not match any
+/// known value for the surface they targeted.
+fn wire_decode_error_to_status(error: &WireDecodeError) -> Status {
+    Status::invalid_argument(error.to_string())
 }
 
 fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Status> {
@@ -927,7 +950,7 @@ fn transparent_address_tx_history_request(
             "transparent address does not produce a receivable script",
         ));
     }
-    let address_script_hash = transparent_address_script_hash(&script_pub_key);
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let range = filter
         .range
         .as_ref()
@@ -982,29 +1005,11 @@ fn transparent_address_utxos_request(
     }
 
     Ok(TransparentAddressUtxosRequest {
-        address_script_hash: transparent_address_script_hash(&script_pub_key),
+        address_script_hash: TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
         start_height,
         max_entries,
         from_cursor: None,
     })
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Network is non_exhaustive; future variants must fail closed against transparent address validation until they are explicitly handled"
-)]
-fn transparent_address_matches_network(address_kind: ZebraNetworkKind, network: Network) -> bool {
-    match network {
-        Network::ZcashMainnet => address_kind == ZebraNetworkKind::Mainnet,
-        Network::ZcashTestnet => address_kind == ZebraNetworkKind::Testnet,
-        Network::ZcashRegtest => {
-            matches!(
-                address_kind,
-                ZebraNetworkKind::Testnet | ZebraNetworkKind::Regtest
-            )
-        }
-        _ => false,
-    }
 }
 
 fn lightwalletd_address_utxos(
@@ -1017,7 +1022,7 @@ fn lightwalletd_address_utxos(
         .map(|utxo| {
             Ok(lightwalletd::GetAddressUtxosReply {
                 address: address.to_owned(),
-                txid: utxo.outpoint.transaction_id.as_bytes().to_vec(),
+                txid: encode_internal_transaction_id(utxo.outpoint.transaction_id).to_vec(),
                 index: i32::try_from(utxo.outpoint.output_index)
                     .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,
                 script: utxo.script_pub_key.clone(),
@@ -1035,9 +1040,9 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeS
     })?;
 
     Ok(lightwalletd::TreeState {
-        network: lightwalletd_chain_name(tree_state.chain_epoch.network)?.to_owned(),
+        network: encode_bip70_chain_name(tree_state.chain_epoch.network).to_owned(),
         height: u64::from(tree_state.height.value()),
-        hash: display_block_hash(tree_state.block_hash),
+        hash: encode_display_block_hash_hex(tree_state.block_hash),
         time: tree_state_time(&payload)?,
         sapling_tree: tree_state_pool_final_state(&payload, "sapling")?,
         orchard_tree: tree_state_pool_final_state(&payload, "orchard")?,
@@ -1093,7 +1098,8 @@ fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd:
         .iter()
         .map(|subtree_root| lightwalletd::SubtreeRoot {
             root_hash: subtree_root.root_hash.as_bytes().to_vec(),
-            completing_block_hash: subtree_root.completing_block_hash.as_bytes().to_vec(),
+            completing_block_hash: encode_internal_block_hash(subtree_root.completing_block_hash)
+                .to_vec(),
             completing_block_height: u64::from(subtree_root.completing_block_height.value()),
         })
         .collect()
@@ -1102,11 +1108,11 @@ fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd:
 fn lightd_info(
     activations: &NetworkUpgradeActivations,
     tip_height: BlockHeight,
-) -> Result<lightwalletd::LightdInfo, Status> {
+) -> lightwalletd::LightdInfo {
     let current = activations.active_at(tip_height);
     let consensus_branch_id = current.map_or_else(
         || "00000000".to_owned(),
-        |activation| format!("{:08x}", activation.branch_id),
+        |activation| encode_branch_id_hex(activation.branch_id),
     );
     let upgrade_name = current
         .map(|activation| activation.name.clone())
@@ -1118,11 +1124,11 @@ fn lightd_info(
         .activation_height_by_name("Sapling")
         .map_or(0, |height| u64::from(height.value()));
 
-    Ok(lightwalletd::LightdInfo {
+    lightwalletd::LightdInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         vendor: "Zinder".to_owned(),
         taddr_support: true,
-        chain_name: lightwalletd_chain_name(activations.network())?.to_owned(),
+        chain_name: encode_bip70_chain_name(activations.network()).to_owned(),
         sapling_activation_height,
         consensus_branch_id,
         block_height: u64::from(tip_height.value()),
@@ -1143,7 +1149,7 @@ fn lightd_info(
         upgrade_name,
         upgrade_height,
         lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
-    })
+    }
 }
 
 /// Maps a typed broadcast outcome to the lightwalletd `SendResponse` shape.
@@ -1171,7 +1177,7 @@ fn send_response_from_broadcast_result(
         TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
             lightwalletd::SendResponse {
                 error_code: 0,
-                error_message: display_transaction_id(transaction_id),
+                error_message: encode_display_transaction_id_hex(transaction_id),
             }
         }
         TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
@@ -1215,58 +1221,10 @@ fn classified_send_error_code(reported_code: Option<i64>, default_code: i32) -> 
         .unwrap_or(default_code)
 }
 
-fn display_block_hash(block_hash: zinder_core::BlockHash) -> String {
-    let mut bytes = block_hash.as_bytes();
-    bytes.reverse();
-    hex::encode(bytes)
-}
-
-fn display_transaction_id(transaction_id: zinder_core::TransactionId) -> String {
-    let mut bytes = transaction_id.as_bytes();
-    bytes.reverse();
-    hex::encode(bytes)
-}
-
 #[allow(
     clippy::cast_possible_truncation,
     reason = "zinder-core rejects targets with pointer widths below 32 bits"
 )]
-/// Projects the structured native balance response into the lightwalletd
-/// `Balance { value_zat: int64 }` shape.
-///
-/// Lightwalletd's wire shape predates the confirmed/unconfirmed split the
-/// native API exposes. The compat shim drops `unconfirmed_delta_zat` because
-/// the legacy proto cannot carry it; clients that want the full split must
-/// speak the native `WalletQuery.TransparentAddressBalance`.
-async fn balance_response_from_proxy(
-    explorer_proxy: Option<&DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
-    address_strings: Vec<String>,
-) -> Result<Response<lightwalletd::Balance>, Status> {
-    let proxy = explorer_proxy.ok_or_else(|| {
-        Status::unavailable(
-            "GetTaddressBalance requires the derive-plane explorer proxy; \
-             configure the zinder-derive endpoint",
-        )
-    })?;
-    let request = TransparentAddressBalanceRequest {
-        addresses: address_strings
-            .into_iter()
-            .map(|address| wallet_proto::AddressLookup {
-                selector: Some(address_lookup::Selector::Address(address)),
-            })
-            .collect(),
-        at_epoch: None,
-    };
-    let response = proxy
-        .forward(Request::new(request), |mut client, request| async move {
-            client.transparent_address_balance(request).await
-        })
-        .await?
-        .into_inner();
-    let value_zat = i64::try_from(response.confirmed_zat).unwrap_or(i64::MAX);
-    Ok(Response::new(lightwalletd::Balance { value_zat }))
-}
-
 const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }
@@ -1275,17 +1233,6 @@ const fn u32_to_usize(count: u32) -> usize {
     clippy::wildcard_enum_match_arm,
     reason = "non-exhaustive core networks must fail closed until lightwalletd mapping exists"
 )]
-fn lightwalletd_chain_name(network: Network) -> Result<&'static str, Status> {
-    match network {
-        Network::ZcashMainnet => Ok("main"),
-        Network::ZcashTestnet => Ok("test"),
-        Network::ZcashRegtest => Ok("regtest"),
-        _ => Err(Status::failed_precondition(
-            "network is not supported by lightwalletd compatibility",
-        )),
-    }
-}
-
 fn close_mempool_stream_on_tip_change<S>(
     raw_transaction_stream: S,
     watcher: SharedTipChangeWatcher,

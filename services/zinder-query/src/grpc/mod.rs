@@ -5,19 +5,22 @@ mod native;
 
 use tonic::{Code, Status};
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation, StatusExt};
+use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_store::status_from_store_error;
 
 use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
+    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings,
+    address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_server_capabilities_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
     latest_block_response, latest_tree_state_response, subtree_roots_response,
-    transaction_response, transparent_address_script_hash, transparent_address_tx_ids_response,
-    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
+    transaction_response, transparent_address_confirmed_balance_response,
+    transparent_address_tx_ids_response, transparent_address_utxos_response,
+    transparent_prevouts_response, tree_state_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -134,7 +137,7 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
         QueryError::TransactionBroadcastDisabled => {
             ErrorDetails::with_precondition_failure_violation(
                 "TRANSACTION_BROADCAST_DISABLED",
-                "wallet.broadcast.transaction_v1",
+                WALLET_BROADCAST_TRANSACTION_V1,
                 "transaction broadcast is not configured for this deployment",
             )
         }
