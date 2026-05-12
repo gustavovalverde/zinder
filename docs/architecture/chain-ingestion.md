@@ -155,7 +155,16 @@ advertises, so fresh lightwalletd-compatible wallets can request subtree roots
 from index 0 and tree states at flow-selected anchor heights without hitting a
 recent-checkpoint store gap. Do not encode public-network activation constants
 inside Zinder docs or config examples; the upstream node remains the source of
-truth, including Regtest and custom Testnet activation schedules.
+truth, including Regtest and custom Testnet activation schedules. The shared
+[`NetworkUpgradeSchedule`](public-interfaces.md#networkupgradeschedule) is the
+in-process carrier: every component that needs an activation height, the
+current upgrade name, or a consensus branch id (the lightwalletd
+`GetLightdInfo` shim and the native `MinedDetails.consensus_branch_id` read
+path included) reads it from a process-startup
+`Arc<NetworkUpgradeSchedule>` populated by
+`ZebraJsonRpcSource::fetch_network_upgrade_schedule()`, never from
+library-default constants. See
+[ADR-0015](../adrs/0015-network-parameter-discovery.md).
 
 The derived floor does not relax the finality bound on the backfill end height.
 Serving-store backfills should stop at the latest height outside the configured

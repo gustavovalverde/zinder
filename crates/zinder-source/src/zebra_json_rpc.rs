@@ -21,14 +21,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, Network,
+    NetworkUpgradeActivation, NetworkUpgradeSchedule, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 
 use crate::{
     NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainCheckpoint,
-    SourceError, SourceNetworkUpgradeHeights, SourceSubtreeRoot, SourceSubtreeRoots,
-    TransactionBroadcaster, decode_display_block_hash, source_block::decode_display_hash_32,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
+    decode_display_block_hash, source_block::decode_display_hash_32,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -193,13 +194,17 @@ impl ZebraJsonRpcSource {
         ))
     }
 
-    /// Fetches node-advertised network upgrade activation heights.
+    /// Fetches the node-advertised network upgrade schedule.
     ///
     /// The values come from Zebra's `getblockchaininfo.upgrades` field so
-    /// custom Testnet and Regtest activation heights stay node-owned.
-    pub async fn fetch_network_upgrade_activation_heights(
+    /// custom Testnet and Regtest activation schedules stay node-owned, per
+    /// [`docs/architecture/chain-ingestion.md`][cha]. The returned schedule
+    /// carries the same `network` identifier as this source.
+    ///
+    /// [cha]: https://github.com/zcashfoundation/zinder/blob/main/docs/architecture/chain-ingestion.md
+    pub async fn fetch_network_upgrade_schedule(
         &self,
-    ) -> Result<SourceNetworkUpgradeHeights, SourceError> {
+    ) -> Result<NetworkUpgradeSchedule, SourceError> {
         let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
             .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
                 SourceError::NodeUnavailable {
@@ -209,10 +214,34 @@ impl ZebraJsonRpcSource {
             })
             .await?;
 
-        Ok(SourceNetworkUpgradeHeights::new(
-            activation_height_by_name(&blockchain_info.upgrades, "sapling"),
-            activation_height_by_name(&blockchain_info.upgrades, "nu5"),
-        ))
+        let activations = blockchain_info
+            .upgrades
+            .iter()
+            .map(|(branch_id_hex, upgrade)| {
+                let branch_id = u32::from_str_radix(branch_id_hex, 16).map_err(|_| {
+                    SourceError::SourceProtocolMismatch {
+                        reason: "getblockchaininfo upgrades carried a non-hex branch id key",
+                    }
+                })?;
+                Ok(NetworkUpgradeActivation {
+                    branch_id,
+                    activation_height: BlockHeight::new(upgrade.activation_height),
+                    name: upgrade.name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, SourceError>>()?;
+
+        NetworkUpgradeSchedule::new(self.network, activations).map_err(|error| {
+            tracing::warn!(
+                target: "zinder::source",
+                event = "network_upgrade_schedule_duplicate_branch_id",
+                error = %error,
+                "Zebra getblockchaininfo upgrades advertised a duplicate branch id"
+            );
+            SourceError::SourceProtocolMismatch {
+                reason: "getblockchaininfo upgrades advertised duplicate consensus branch ids",
+            }
+        })
     }
 
     /// Probes the node's `rpc.discover` (`OpenRPC`) endpoint and updates
@@ -1063,16 +1092,6 @@ struct ZebraNetworkUpgradeInfo {
     name: String,
     #[serde(rename = "activationheight")]
     activation_height: u32,
-}
-
-fn activation_height_by_name(
-    upgrades: &std::collections::BTreeMap<String, ZebraNetworkUpgradeInfo>,
-    name: &str,
-) -> Option<BlockHeight> {
-    upgrades
-        .values()
-        .find(|upgrade| upgrade.name.eq_ignore_ascii_case(name))
-        .map(|upgrade| BlockHeight::new(upgrade.activation_height))
 }
 
 /// Zebra omits `sapling`/`orchard` from `trees` on regtest blocks with no

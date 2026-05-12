@@ -42,6 +42,7 @@ pub mod live;
 pub mod mock_mempool_source;
 pub mod mock_node_source;
 pub mod mock_transaction_broadcaster;
+pub mod network_upgrade_fixtures;
 pub mod store_fixture;
 pub mod transparent_signer;
 
@@ -51,6 +52,7 @@ pub use mock_mempool_source::{
 };
 pub use mock_node_source::{MockNodeSource, NodeFailureScript};
 pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
+pub use network_upgrade_fixtures::{local_network_from_schedule, sample_regtest_upgrade_schedule};
 pub use store_fixture::StoreFixture;
 pub use transparent_signer::{
     LocalNetwork, P2pkhSpendArgs, TransparentAddress, TransparentSignerError, TransparentTestKey,

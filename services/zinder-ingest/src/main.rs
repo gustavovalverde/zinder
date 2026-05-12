@@ -30,8 +30,9 @@ use zinder_runtime::{
     install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{
-    JsonRpcMempoolSource, MempoolSource, NodeTarget, ZebraIndexerMempoolSource,
-    ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeTarget,
+    ZebraIndexerMempoolSource, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
@@ -39,6 +40,13 @@ mod cli;
 mod config;
 
 const MEMPOOL_ORCHESTRATOR_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
+    NodeCapability::JsonRpc,
+    NodeCapability::BestChainBlocks,
+    NodeCapability::TipId,
+    NodeCapability::TreeState,
+    NodeCapability::SubtreeRoots,
+];
 
 #[derive(Parser)]
 #[command(name = "zinder-ingest")]
@@ -251,7 +259,7 @@ async fn run_backfill(
     });
     let source =
         zebra_json_rpc_source_for_target(command_config.node_source, &command_config.node)?;
-    probe_node_capabilities(&source).await;
+    ensure_node_capabilities(&source, &readiness).await?;
     resolve_backfill_coverage(&mut command_config, &source).await?;
     let checkpoint = if let Some(checkpoint_height) = command_config.checkpoint_height {
         let checkpoint = source
@@ -320,11 +328,11 @@ async fn resolve_backfill_coverage(
         return Ok(());
     }
 
-    let activation_heights = source
-        .fetch_network_upgrade_activation_heights()
+    let schedule = source
+        .fetch_network_upgrade_schedule()
         .await
         .map_err(IngestError::from)?;
-    let Some(wallet_serving_floor) = activation_heights.wallet_serving_floor() else {
+    let Some(wallet_serving_floor) = schedule.wallet_serving_floor() else {
         return Err(
             IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
                 reason: "getblockchaininfo did not advertise Sapling or NU5 activation heights",
@@ -349,39 +357,90 @@ async fn resolve_backfill_coverage(
         event = "wallet_serving_backfill_floor_resolved",
         from_height = wallet_serving_floor.value(),
         checkpoint_height = checkpoint_height.value(),
-        sapling_activation_height = activation_heights
-            .sapling
+        sapling_activation_height = schedule
+            .activation_height_of("Sapling")
             .map(zinder_core::BlockHeight::value),
-        nu5_activation_height = activation_heights.nu5.map(zinder_core::BlockHeight::value),
+        nu5_activation_height = schedule
+            .activation_height_of("NU5")
+            .map(zinder_core::BlockHeight::value),
         "resolved wallet-serving backfill floor from node activation heights"
     );
 
     Ok(())
 }
 
-async fn probe_node_capabilities(source: &ZebraJsonRpcSource) {
-    match source.probe_capabilities().await {
-        Ok(probed_capabilities) => {
-            let advertised: Vec<&'static str> = probed_capabilities
-                .iter()
-                .map(zinder_source::NodeCapability::name)
-                .collect();
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "node_capabilities_probed",
-                advertised = ?advertised,
-                "node advertised capabilities discovered via rpc.discover"
-            );
-        }
+/// Probes upstream node capabilities and verifies the ingest-required set.
+///
+/// On `Err`, transitions `readiness` into the failure cause
+/// (`NodeUnavailable` for transport-level failures,
+/// `node_capability_missing` for a missing required capability) so the ops
+/// endpoint surfaces the same diagnosis the caller will exit with.
+async fn ensure_node_capabilities(
+    source: &ZebraJsonRpcSource,
+    readiness: &Readiness,
+) -> Result<(), IngestConfigError> {
+    let probed_capabilities = match source.probe_capabilities().await {
+        Ok(probed_capabilities) => probed_capabilities,
         Err(probe_error) => {
+            readiness.set(ReadinessState::not_ready(ReadinessCause::NodeUnavailable));
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "node_capability_probe_failed",
                 error = %probe_error,
-                "node capability probe failed; continuing with baseline capabilities"
+                "node capability probe failed"
+            );
+            return Err(IngestError::from(probe_error).into());
+        }
+    };
+
+    let advertised: Vec<&'static str> = probed_capabilities
+        .iter()
+        .map(zinder_source::NodeCapability::name)
+        .collect();
+    if probed_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "node_capabilities_probed",
+            advertised = ?advertised,
+            "node advertised capabilities discovered via rpc.discover"
+        );
+    } else {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "node_capability_probe_fallback",
+            advertised = ?advertised,
+            "node capability probe used baseline capabilities because rpc.discover was unavailable"
+        );
+    }
+
+    if let Err(error) = require_ingest_node_capabilities(probed_capabilities) {
+        if let zinder_source::SourceError::NodeCapabilityMissing { capability } = &error {
+            readiness.set(ReadinessState::node_capability_missing(capability.name()));
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "node_capability_missing",
+                capability = capability.name(),
+                "upstream node is missing a capability required by ingestion"
             );
         }
+        return Err(IngestError::from(error).into());
     }
+
+    Ok(())
+}
+
+fn require_ingest_node_capabilities(
+    capabilities: NodeCapabilities,
+) -> Result<(), zinder_source::SourceError> {
+    for required in REQUIRED_INGEST_NODE_CAPABILITIES {
+        if !capabilities.supports(*required) {
+            return Err(zinder_source::SourceError::NodeCapabilityMissing {
+                capability: *required,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn zebra_json_rpc_source_for_target(
@@ -486,7 +545,7 @@ async fn run_tip_follow(
         "tip-follow started"
     );
 
-    probe_node_capabilities(&source).await;
+    ensure_node_capabilities(&source, &readiness).await?;
     readiness.set(ReadinessState::syncing(None, None, None));
     let tip_follow_outcome = tip_follow_with_primary_store(
         &tip_follow_config,
@@ -961,5 +1020,48 @@ impl From<BackupArgs> for BackupConfigOverrides {
             storage_path: args.storage_path,
             to_path: args.to_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NodeCapabilities, NodeCapability, ZebraJsonRpcSource, require_ingest_node_capabilities,
+    };
+
+    #[test]
+    fn ingest_capability_validation_accepts_zebra_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = ZebraJsonRpcSource::baseline_capabilities();
+
+        require_ingest_node_capabilities(capabilities)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_capability_validation_rejects_missing_tree_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = NodeCapabilities::new([
+            NodeCapability::JsonRpc,
+            NodeCapability::BestChainBlocks,
+            NodeCapability::TipId,
+            NodeCapability::SubtreeRoots,
+        ])?;
+
+        let Err(error) = require_ingest_node_capabilities(capabilities) else {
+            return Err(Box::new(std::io::Error::other(
+                "missing tree-state support passed startup validation",
+            )));
+        };
+
+        assert!(matches!(
+            error,
+            zinder_source::SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::TreeState,
+            }
+        ));
+
+        Ok(())
     }
 }

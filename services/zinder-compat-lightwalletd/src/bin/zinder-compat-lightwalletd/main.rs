@@ -113,6 +113,21 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map_err(LightwalletdConfigError::Store)?
         .map(|epoch| epoch.tip_height.value());
     let broadcaster = build_broadcaster(lightwalletd_config.broadcaster.as_ref())?;
+    let network_upgrade_schedule = if let Some(source) = broadcaster.as_ref() {
+        Some(Arc::new(
+            source
+                .fetch_network_upgrade_schedule()
+                .await
+                .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?,
+        ))
+    } else {
+        tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "lightd_info_schedule_unavailable",
+            "GetLightdInfo will return Status::failed_precondition because [node] is not configured"
+        );
+        None
+    };
     let wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
@@ -129,9 +144,12 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.ingest_control_bearer_token.clone(),
         cancel.clone(),
     );
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query)
+    let mut grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query)
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
+    if let Some(schedule) = network_upgrade_schedule {
+        grpc_adapter = grpc_adapter.with_network_upgrade_schedule(schedule);
+    }
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
         store,
         readiness.clone(),

@@ -237,7 +237,7 @@ Implemented end-to-end:
 - `LatestBlock`, `CompactBlock`, `CompactBlockRange` (server streaming, capped by `max_compact_block_range` with default `1000`).
 - `Transaction` by transaction id.
 - `TreeState` by height, `LatestTreeState`, `SubtreeRoots` (paged, request-bounded).
-- `BroadcastTransaction` with typed accepted/duplicate/invalid-encoding/rejected/unknown outcomes (gated on `[node]` config).
+- `BroadcastTransaction` with typed accepted/duplicate/invalid-encoding/rejected/unknown outcomes (gated on `[node]` config plus the source-advertised `transaction_broadcast` capability).
 - `ChainEvents` server-streaming with replayable `StreamCursorTokenV1` cursors and Tip/Finalized families.
 - `MempoolSnapshot` and `MempoolEvents`: bounded snapshot plus replayable `Added`/`Invalidated`/`Mined` events with `MempoolStreamCursorV1` resumption.
 - `TransparentAddressUtxos` and `TransparentAddressUtxosStream`: paged and streaming UTXO reads keyed by either `script_hash` or base58 `address` through the shared `AddressLookup` selector.
@@ -287,4 +287,4 @@ and the canonical claim in
 | Fixed-height variants of every chain query | Done | Heighted reads, transaction queries, transparent UTXO reads, and transparent tx-history reads accept request-side `ChainEpoch` pins on both native and typed Rust surfaces |
 | Compact block streaming with batch range fetch | Done | `CompactBlockRange` streams up to `max_compact_block_range` per request, bounded |
 | Transparent-address read surface | Done | `TransparentAddressUtxos[Stream]`, `TransparentAddressTxIdsInRange`, `TransparentAddressBalance`, matching `ChainIndex` methods, lightwalletd-compat `GetAddressUtxos*`, `GetTaddressTxids`, `GetTaddressTransactions`, and `GetTaddressBalance*` |
-| Transaction broadcast | Done | Native `BroadcastTransaction` with typed outcomes; compat `SendTransaction` maps onto the same path; gated on `[node]` config |
+| Transaction broadcast | Done | Native `BroadcastTransaction` with typed outcomes; compat `SendTransaction` maps onto the same path; gated on `[node]` config plus the source-advertised `transaction_broadcast` capability |

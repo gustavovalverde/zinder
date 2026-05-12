@@ -147,9 +147,15 @@ response/read-model values, not persisted transaction-artifact fields.
 block_time)` is the **only** public constructor in `zinder-core`. Callers
 cannot construct `MinedDetails` without the response's `ChainEpoch` in scope,
 so the racy `tip_height - block_height` confirmations computation is
-prevented by construction. `consensus_branch_id` comes from
-`zinder_source::consensus_branch_id_at(network, height)` (zebra-chain network
-upgrades); `block_time` is parsed from the stored `BlockArtifact` through
+prevented by construction. `consensus_branch_id` is resolved from the
+process-startup `Arc<NetworkUpgradeSchedule>` discovered via
+`ZebraJsonRpcSource::fetch_network_upgrade_schedule()`: callers invoke
+`schedule.consensus_branch_id_at(height)`, which returns
+`PRE_OVERWINTER_BRANCH_ID` for heights below the earliest activation. When
+the process started without `[node]` configured, the field defaults to
+`PRE_OVERWINTER_BRANCH_ID` and a one-time warning fires at startup; see
+[ADR-0015](../adrs/0015-network-parameter-discovery.md). `block_time` is
+parsed from the stored `BlockArtifact` through
 `zinder_source::block_header_info_from_raw_block_bytes` and falls back to `0`
 when the block payload cannot be parsed.
 
@@ -403,6 +409,7 @@ Transaction broadcast is a network operation, not a canonical chain commit.
 `zinder-query` may expose transaction broadcast because wallets expect a single endpoint. This is wallet operation parity, not part of the minimum read-only shielded sync surface. The broadcast path must:
 
 - Forward the raw transaction to a configured network or upstream node path.
+- Advertise `wallet.broadcast.transaction_v1` only after the configured source probe reports `transaction_broadcast`.
 - Return `TransactionBroadcastResult` with accepted, duplicate, invalid-encoding, rejected, or unknown outcomes.
 - Avoid writing canonical chain state.
 - Rely on ingestion to observe the transaction later in mempool or block data.

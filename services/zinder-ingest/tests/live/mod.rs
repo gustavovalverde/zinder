@@ -4,6 +4,7 @@ mod deep_chain;
 mod latency;
 mod mempool_broadcast_cycle;
 mod mempool_pipeline;
+mod mined_consensus_branch_id_parity;
 mod tip_follow;
 mod transparent_address_surface;
 mod transparent_address_utxos;

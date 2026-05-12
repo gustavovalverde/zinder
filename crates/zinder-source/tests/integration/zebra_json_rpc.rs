@@ -945,8 +945,7 @@ async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result
 }
 
 #[tokio::test]
-async fn fetch_network_upgrade_activation_heights_parses_getblockchaininfo_upgrades()
--> eyre::Result<()> {
+async fn fetch_network_upgrade_schedule_parses_getblockchaininfo_upgrades() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start(vec![RpcReply::result(json!({
         "upgrades": {
             "76b809bb": {
@@ -968,19 +967,28 @@ async fn fetch_network_upgrade_activation_heights_parses_getblockchaininfo_upgra
         Duration::from_secs(5),
     )?;
 
-    let activation_heights = source.fetch_network_upgrade_activation_heights().await?;
+    let schedule = source.fetch_network_upgrade_schedule().await?;
     let _requests = server.join()?;
 
+    assert_eq!(schedule.network(), Network::ZcashTestnet);
     assert_eq!(
-        activation_heights.sapling,
+        schedule.activation_height_of("Sapling"),
         Some(zinder_core::BlockHeight::new(280_000))
     );
     assert_eq!(
-        activation_heights.nu5,
+        schedule.activation_height_of("NU5"),
         Some(zinder_core::BlockHeight::new(1_842_420))
     );
     assert_eq!(
-        activation_heights.wallet_serving_floor(),
+        schedule.activation_height_of_branch(0x76b8_09bb),
+        Some(zinder_core::BlockHeight::new(280_000))
+    );
+    assert_eq!(
+        schedule.consensus_branch_id_at(zinder_core::BlockHeight::new(2_000_000)),
+        0xc2d6_d0b4
+    );
+    assert_eq!(
+        schedule.wallet_serving_floor(),
         Some(zinder_core::BlockHeight::new(280_000))
     );
     Ok(())

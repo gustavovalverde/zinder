@@ -3,11 +3,7 @@
 use std::io::Cursor;
 
 use zebra_chain::{
-    block::{
-        Block as ZebraBlock, Header as ZebraBlockHeader, Height as ZebraBlockHeight,
-        merkle::Root as ZebraMerkleRoot,
-    },
-    parameters::{Network as ZebraNetwork, NetworkUpgrade, testnet::RegtestParameters},
+    block::{Block as ZebraBlock, Header as ZebraBlockHeader, merkle::Root as ZebraMerkleRoot},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
 };
 use zinder_core::{BlockHash, BlockHeaderInfo, BlockHeight, BlockId, Network};
@@ -168,51 +164,6 @@ impl SourceBlock {
         self.tree_state_payload_bytes = Some(tree_state_payload_bytes.into());
         self
     }
-}
-
-/// Returns the cached Zebra network parameters for a Zinder [`Network`],
-/// or [`None`] when the network has no Zebra mapping.
-///
-/// The Zebra parameter objects build their full upgrade activation list
-/// at construction; consumers that call into `NetworkUpgrade::current`
-/// or `sapling_activation_height` per request would otherwise rebuild
-/// the activation list on every call.
-#[must_use]
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Network is #[non_exhaustive]; future networks need an explicit Zebra mapping decision before zebra_network can answer for them."
-)]
-pub fn zebra_network(network: Network) -> Option<&'static ZebraNetwork> {
-    use std::sync::OnceLock;
-
-    static MAINNET: OnceLock<ZebraNetwork> = OnceLock::new();
-    static TESTNET: OnceLock<ZebraNetwork> = OnceLock::new();
-    static REGTEST: OnceLock<ZebraNetwork> = OnceLock::new();
-
-    match network {
-        Network::ZcashMainnet => Some(MAINNET.get_or_init(|| ZebraNetwork::Mainnet)),
-        Network::ZcashTestnet => Some(TESTNET.get_or_init(ZebraNetwork::new_default_testnet)),
-        Network::ZcashRegtest => {
-            Some(REGTEST.get_or_init(|| ZebraNetwork::new_regtest(RegtestParameters::default())))
-        }
-        _ => None,
-    }
-}
-
-/// Returns the consensus branch identifier active at `height` on `network`.
-///
-/// Returns zero when the network has no activated upgrade at this height
-/// (pre-Overwinter); for the wallet read model, `0` is the documented
-/// "no branch id" wire value.
-#[must_use]
-pub fn consensus_branch_id_at(network: Network, height: BlockHeight) -> u32 {
-    let Some(zebra_network) = zebra_network(network) else {
-        return 0;
-    };
-    let zebra_height = ZebraBlockHeight(height.value());
-    NetworkUpgrade::current(zebra_network, zebra_height)
-        .branch_id()
-        .map_or(0, u32::from)
 }
 
 /// Decodes an RPC display-order block hash into canonical little-endian bytes.

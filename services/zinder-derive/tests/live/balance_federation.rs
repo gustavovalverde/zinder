@@ -64,6 +64,7 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::{
     P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    local_network_from_schedule,
 };
 
 use crate::common::{
@@ -339,8 +340,23 @@ const MEMPOOL_OVERLAY_MINE_COUNT: u32 = 101;
 async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
     let _guard = init();
     let env = require_live_for(&[Network::ZcashRegtest])?;
-    let test_key = TransparentTestKey::from_seed(&MEMPOOL_OVERLAY_TEST_SEED)
-        .map_err(|error| eyre!("could not derive test key: {error}"))?;
+    let probe_config = live_backfill_config(
+        &env,
+        std::path::Path::new("/tmp/zinder-mempool-overlay-schedule-probe"),
+        BlockHeight::new(1),
+        BlockHeight::new(1),
+        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid probe batch size"))?,
+        false,
+    );
+    let schedule = zebra_source_from_backfill(&probe_config)?
+        .fetch_network_upgrade_schedule()
+        .await
+        .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
+    let test_key = TransparentTestKey::from_seed_with_local_network(
+        &MEMPOOL_OVERLAY_TEST_SEED,
+        local_network_from_schedule(&schedule),
+    )
+    .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();
     tracing::info!(
         target: "zinder::live",

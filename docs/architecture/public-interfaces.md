@@ -50,6 +50,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
 | `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
 | `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
+| `NetworkUpgradeSchedule` | Node-discovered consensus upgrade schedule (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeSchedule>` from process startup. Source of truth for `consensus_branch_id_at`, `current_at`, and `sapling_activation_height` across the compat shim, native query API, and signer testkit. See [ADR-0015](../adrs/0015-network-parameter-discovery.md). |
+| `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeSchedule` — `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
 
 ### Source Boundary
 
@@ -498,7 +500,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `derive.explorer.transparent_balance_v1`
 <!-- capability-list:public-interfaces:end -->
 
-`wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
+`wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
 Transparent-address balance is exposed under `derive.explorer.transparent_balance_v1` (federated through `WalletQuery.ServerInfo` when the derive proxy is reachable); there is no `wallet.*` balance capability.
 

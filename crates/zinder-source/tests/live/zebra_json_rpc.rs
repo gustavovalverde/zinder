@@ -306,3 +306,59 @@ async fn fetch_raw_transaction_bytes_returns_none_for_unknown_txid() -> Result<(
     assert!(bytes.is_none());
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo() -> Result<()> {
+    let _guard = init();
+    let env = zinder_testkit::live::require_live_for(&[
+        Network::ZcashRegtest,
+        Network::ZcashTestnet,
+        Network::ZcashMainnet,
+    ])?;
+    let source = zebra_source(&env)?;
+    let schedule = source.fetch_network_upgrade_schedule().await?;
+
+    assert_eq!(
+        schedule.network(),
+        env.network(),
+        "the schedule must carry the same network identifier the source was built with"
+    );
+    let Some(sapling) = schedule.activation_height_of("Sapling") else {
+        return Err(eyre!(
+            "running node did not advertise Sapling in getblockchaininfo.upgrades; \
+             every Zinder-supported network activates Sapling at or above height 1"
+        ));
+    };
+    assert!(
+        sapling.value() >= 1,
+        "Sapling activation height must be at least 1; got {}",
+        sapling.value()
+    );
+
+    let tip = NodeSource::tip_id(&source).await?.height;
+    let branch_at_tip = schedule.consensus_branch_id_at(tip);
+    if tip.value() >= sapling.value() {
+        assert_ne!(
+            branch_at_tip,
+            0,
+            "after Sapling, consensus_branch_id_at(tip) must be non-zero; \
+             tip={}, sapling={}, schedule={:?}",
+            tip.value(),
+            sapling.value(),
+            schedule.activations(),
+        );
+    }
+    let Some(current) = schedule.current_at(tip) else {
+        return Err(eyre!(
+            "tip {} is below the first activation in the schedule; \
+             the schedule must cover at least pre-Overwinter through the active upgrade",
+            tip.value()
+        ));
+    };
+    assert!(
+        !current.name.is_empty(),
+        "current_at(tip).name must be a non-empty upgrade name; got empty string"
+    );
+    Ok(())
+}

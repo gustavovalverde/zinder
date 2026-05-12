@@ -13,6 +13,7 @@ mod block_header;
 mod block_id;
 mod chain_epoch;
 mod mempool;
+mod network_upgrade_schedule;
 mod subtree_root;
 mod transaction;
 mod transparent_address_balance;
@@ -31,6 +32,10 @@ pub use chain_epoch::{
 pub use mempool::{
     MempoolEntry, MempoolEvictionReason, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+};
+pub use network_upgrade_schedule::{
+    NetworkUpgradeActivation, NetworkUpgradeSchedule, NetworkUpgradeScheduleError,
+    PRE_OVERWINTER_BRANCH_ID,
 };
 pub use subtree_root::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,

@@ -135,12 +135,14 @@ ZINDER_TEST_LIVE=1 \
 ```
 
 Expected outcome on a healthy regtest with the indexer gRPC port set: all
-regtest-targeted tests pass in ~30 s. The only failures in a full regtest
-`ci-live` invocation should be the mainnet-only tests
+regtest-targeted tests pass in ~30 s. A full regtest `ci-live` invocation also
+contains hosted-network checks that deliberately refuse to run on regtest:
+the mainnet-only tests
 (`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`backfills_last_1000_blocks_from_checkpoint`); they refuse to run on regtest
-by design.
+`backfills_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
+(`cli_backfills_bounded_wallet_serving_floor_from_config`,
+`checkpoint_bounded_read_endpoint_latency_baseline`).
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three additional tests skip:
 `zebra_indexer_mempool_*` and
@@ -626,6 +628,7 @@ debugging code.
 | -------------- | ----- | ------ |
 | `set ZINDER_TEST_LIVE=1 plus ZINDER_NETWORK and ZINDER_NODE__* env vars` | Opt-in missing | Add the env vars; not a real failure |
 | `live test allowed only on [ZcashMainnet]` | Mainnet-only gate | Expected on regtest/testnet; refuse to bypass |
+| `live test allowed only on [ZcashTestnet, ZcashMainnet]` | Hosted-network-only gate | Expected on regtest; rerun against testnet or mainnet |
 | `requires ZINDER_NODE__INDEXER_GRPC_ADDR` | Indexer-feature missing | Restart Zebra with `ZEBRA_RPC__INDEXER_LISTEN_ADDR` and add the env var |
 | `connection refused` / `transport error` | Sidecar not running | Restart z3 / verify ports |
 | `chain_epoch.network does not match` | Wrong network | Check `ZINDER_NETWORK` matches the running Zebra |
@@ -706,7 +709,8 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] If the change touched a consumer-facing wire contract or compatibility
       adapter: `cargo nextest run --profile=ci-parity`.
 - [ ] Live regtest sweep green (`ci-live` profile against z3, with indexer
-      gRPC env). Three mainnet-only failures are expected and acceptable.
+      gRPC env). Hosted-network-only gates are expected to refuse regtest and
+      should be rerun against testnet or mainnet.
 - [ ] If the change claims Zallet compatibility: real Zallet binary gate green
       (`ci-zallet-live` with `ZINDER_TEST_ZALLET*` env against the Zinder-native
       contract).
@@ -725,6 +729,223 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] If the change is mainnet-relevant: filed against the open
       [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) mainnet
       infrastructure work, not retrofitted into the default matrix.
+
+## Latest local validation log
+
+Pointer to the most recent end-to-end validation run that exercises consumers
+beyond the automated gates. Each run produces a manifest under the gitignored
+`.tmp/production-readiness/<run-id>/` per the *Release evidence manifest* row in
+[Ecosystem validation queue](#ecosystem-validation-queue). Overwrite this
+section when a newer run lands; the runbook is procedural, so only the latest
+run lives here.
+
+### Run `20260511T2242Z-zashi-zodl`
+
+- Date: `2026-05-11`
+- Commit: `e5e2ced` on `main`
+- Network: `zcash-testnet`
+- Operator-local manifest (gitignored): `.tmp/production-readiness/20260511T2242Z-zashi-zodl/manifest.md`
+
+What passed:
+
+- Every automated gate was green at this commit: the default validation gate,
+  `ci-parity`, regtest and testnet `ci-live`, mainnet read-only checks, the
+  mainnet 1,000-block calibration, the balance federation checks on testnet,
+  mainnet, and regtest, and the observability smoke including backup restore.
+- Two end-to-end sends from Zashi/Zodl on a Pixel 10 Pro through
+  `zinder-compat-lightwalletd`:
+  - Send 1, txid `edd8f9f1ffc0bb65d4e2f2b22607383af1c213405748baba4c64e145a961e0be`,
+    mined at height `4006672`.
+  - Send 2, txid `c8c8fd9830a311583e59c29348ec15ef49ce173350779774bf36985ab34ac9be`,
+    observed pending in `GetMempoolTx` at poll `173`, then mined at height
+    `4006680`.
+- Pending mempool surfaces stayed consistent across the Send 2 window:
+  `GetMempoolTx` was non-empty while pending and empty post-mine, and the
+  native Zinder mempool snapshot `entryCount` transitioned `1` to `0`.
+- Post-mine cleanup was clean: Zebra mempool size `0`, both `zinder-ingest`
+  and `zinder-compat-lightwalletd` readiness `ready`.
+- `GetLightdInfo` on the compat endpoint: `vendor = "Zinder"`,
+  `chainName = "test"`, `blockHeight = 4006676`, `taddrSupport = true`.
+
+### Follow-up run `20260512T0643Z-mempool-stream`
+
+- Date: `2026-05-12`
+- Network: `zcash-regtest`
+- Operator-local manifest (gitignored): `.tmp/production-readiness/20260512T0643Z-mempool-stream/manifest.md`
+
+Closes the *Non-empty `GetMempoolStream` byte capture* residual from the run
+above. Phone-backed testnet captures remain structurally unwinnable for the
+lightwalletd stream: testnet block time averages ~75 s, the lightwalletd
+`GetMempoolStream` projection in
+[`services/zinder-compat-lightwalletd/src/grpc.rs`](../../services/zinder-compat-lightwalletd/src/grpc.rs)
+anchors at the snapshot sequence at stream-open time and closes on the first
+observed best-chain tip change, and Zashi's Orchard tx-build runs ~60–120 s
+end-to-end. The stream closes before the user's tx reaches the mempool. The
+compat shim is network-agnostic, so a regtest capture is sufficient for the
+wire-contract gate.
+
+What passed on regtest:
+
+- Stream emitted one `RawTransaction`: 207-byte V5 transparent tx, height
+  `7403`. Stream closed cleanly (`exit 0`) when the test mined block `7404`.
+- Block `7404` contains the broadcast tx (1-in/1-out V5) alongside the
+  coinbase.
+- The capture used a temporary, env-gated sleep in
+  `broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_source`
+  to hold the broadcast in mempool past the running ingest's default 5 s
+  mempool poll interval. That hook was reverted; the long-term mechanism for
+  asserting the lightwalletd `GetMempoolStream` contract is a dedicated live
+  test (filed separately).
+
+### Follow-up run `20260512T0709Z-zaino-parity`
+
+- Date: `2026-05-12`
+- Network: `zcash-regtest`
+- Operator-local manifest (gitignored): `.tmp/production-readiness/20260512T0709Z-zaino-parity/manifest.md`
+
+Closes the *Comparative parity against an external lightwalletd or Zaino
+endpoint* residual. Probed Zinder's compat shim (`127.0.0.1:9067`, plaintext)
+side-by-side with `z3_regtest_sidecar_zaino` (`127.0.0.1:38137`, TLS,
+self-signed) using identical `grpcurl` payloads against the same z3 regtest
+Zebra. Both endpoints saw the same chain state (tip `7404`).
+
+Surfaces that match: `GetLatestBlock`, `GetLatestTreeState`, `GetTreeState`,
+`GetMempoolTx`, `GetMempoolStream`, `GetSubtreeRoots` (sapling, orchard).
+
+Major interop divergences (manifest has the full matrix):
+
+- **Zaino `GetBlock` returns stub blocks** on regtest at every probed height,
+  with no `header` and no `vtx`. Any lightwalletd-compatible wallet that scans
+  via `GetBlock`/`GetBlockRange` is unusable against this Zaino instance.
+  Zinder returns the full compact block.
+- **`TxFilter.hash` byte-order convention diverges.** Zinder accepts display
+  (big-endian) order matching the upstream Go lightwalletd reference and the
+  byte order Zashi/Zodl/librustzcash use; Zaino accepts wire (little-endian)
+  order, the same convention used by `CompactTx.txid` (where the spec
+  mandates protocol order). A client built for one indexer fails on the
+  other.
+- **Zaino leaks Rust type names into `Internal` gRPC errors.** `GetTransaction`
+  (unknown) returns `... core::convert::Infallible error: RPC Error (code: -5)
+  ...` and `SendTransaction` (malformed) returns
+  `... zaino_fetch::jsonrpsee::response::SendTransactionError error: RPC Error
+  (code: -22) ...`. Zinder maps these to clean `NotFound` and the documented
+  `SendResponse{ errorCode, errorMessage }` shape respectively.
+
+Zinder bug surfaced by this run (closed by [ADR-0015](../adrs/0015-network-parameter-discovery.md)):
+
+- `GetLightdInfo` on regtest reported the wrong **active upgrade**:
+  `consensusBranchId = e9ff75a6` (Canopy), `upgradeName = Canopy`,
+  `upgradeHeight = 1`, while Zaino on the same node correctly reported
+  `c8e71055` (NU6) at `2`. Root cause: the static `OnceLock<ZebraNetwork>`
+  singleton was seeded from `RegtestParameters::default()` (zebra-chain
+  library defaults), which leaves NU5/NU6/NU6\_1 unset; `NetworkUpgrade::current`
+  fell back to Canopy at height 1. The same wrong branch ID flowed into
+  `MinedDetails.consensus_branch_id` on the wallet read path. Fix: Zinder
+  now discovers the schedule from the running node at startup and carries it
+  as `Arc<NetworkUpgradeSchedule>` through every consumer; see
+  [ADR-0015](../adrs/0015-network-parameter-discovery.md). Regression
+  guarded by the live test
+  `live::zebra_json_rpc::fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo`
+  in `crates/zinder-source/tests/live/zebra_json_rpc.rs`.
+
+Volume difference on `GetTaddressTxids`/`GetTaddressTransactions` is the
+documented wallet-serving floor (53 records from `7352`–`7404` vs Zaino's
+7,354 from `127`–`7404`) and is intentional per [External integration: Zashi
+/ Android SDK](#external-integration-zashi--android-sdk).
+
+### Follow-up run `20260512T0715Z-tls-validation`
+
+- Date: `2026-05-12`
+- Network: `zcash-regtest`
+- Operator-local manifest (gitignored): `.tmp/production-readiness/20260512T0715Z-tls-validation/manifest.md`
+
+Closes the *Public TLS endpoint validation* residual using the topology
+documented in [Serving public lightwalletd clients §Operator recipe](../reference/serving-public-lightwalletd-clients.md#operator-recipe):
+Caddy terminates HTTPS on `:9443`, forwards `h2c` to
+`zinder-compat-lightwalletd` at `127.0.0.1:9067`. Caddy provisions an
+internal-CA cert on-demand for `localhost`. The same Caddyfile drops in for a
+public deployment by swapping `tls internal` for an email address (Let's
+Encrypt) and replacing `localhost` with the real hostname.
+
+Eight RPCs probed plaintext vs TLS-fronted (`GetLightdInfo`, `GetLatestBlock`,
+`GetMempoolTx`, `GetBlock(h=7404)`, `GetTreeState(h=7404)`, `GetTransaction`
+with known display-order txid, `GetTransaction` with unknown txid,
+`SendTransaction` with malformed bytes). Every response byte-identical across
+the proxy. `Via: 2.0 Caddy` header on responses; ALPN negotiates `h2`;
+HTTP/3 advertised via `Alt-Svc`. `IngestControl` (`127.0.0.1:9100`) was not
+fronted by Caddy.
+
+The Caddyfile and probe outputs are operator-local at
+`.tmp/observability/Caddyfile-tls-validation` and
+`.tmp/observability/evidence/20260512T0715Z-tls-validation/`.
+
+### Follow-up run `20260512T0847Z-network-schedule-fix`
+
+- Date: `2026-05-12`
+- Networks: `zcash-regtest`, `zcash-testnet`, `zcash-mainnet`
+- Operator-local manifest (gitignored): `.tmp/production-readiness/20260512T0847Z-network-schedule-fix/manifest.md`
+
+Closes the regtest `GetLightdInfo` active-upgrade bug described above and
+validates the end-to-end fix on all three supported networks. Architecture
+locked into [ADR-0015](../adrs/0015-network-parameter-discovery.md):
+per-network consensus parameters are discovered from the running node at
+startup and shared as `Arc<NetworkUpgradeSchedule>`; the static
+`OnceLock<ZebraNetwork>` and the free `consensus_branch_id_at(network,
+height)` are gone.
+
+Live regression test result
+(`live::zebra_json_rpc::fetch_network_upgrade_schedule_matches_running_node_getblockchaininfo`):
+
+| Network | Tip | Result |
+|---------|-----|--------|
+| regtest | 7,404 | PASS |
+| testnet | 4,007,339 | PASS |
+| mainnet | 3,339,611 | PASS |
+
+Wire-level `GetLightdInfo` parity against the running Zebra's
+`getblockchaininfo` for each network, with the post-fix `target/release`
+binaries running in the observability (regtest), testnet, and a one-shot
+mainnet verification stack:
+
+| Network | `consensusBranchId` (Zinder = Zebra `chaintip`) | `upgradeName` | `upgradeHeight` | `saplingActivationHeight` |
+|---------|-------------------------------------------------|---------------|-----------------|----------------------------|
+| regtest | `c8e71055` (NU6) | `NU6` | 2 | 1 |
+| testnet | `4dec4df0` (NU6.1) | `NU6.1` | 3,536,500 | 280,000 |
+| mainnet | `4dec4df0` (NU6.1) | `NU6.1` | 3,146,400 | 419,200 |
+
+Every wire field matches the running Zebra exactly. The `upgradeName`
+formatting also improved across the board: pre-fix Zinder returned the
+zebra-chain library's `Debug` rendering (e.g. `Nu6_1`); post-fix Zinder
+carries the node's canonical `name` field verbatim (e.g. `NU6.1`), matching
+the lightwalletd-go reference behavior.
+
+A second live regression now pins the wallet-read path as well:
+`live::mined_consensus_branch_id_parity::mined_details_consensus_branch_id_matches_node_upgrade_schedule`
+in
+[`services/zinder-ingest/tests/live/mined_consensus_branch_id_parity.rs`](../../services/zinder-ingest/tests/live/mined_consensus_branch_id_parity.rs)
+backfills a small near-tip window through `zinder-ingest`, opens
+`zinder-query::WalletQuery` with the live-discovered schedule, looks up the
+tip coinbase via `WalletQueryApi::transaction(...)`, and asserts that
+`MinedDetails.consensus_branch_id ==
+schedule.consensus_branch_id_at(mined_height)`. This closes the gap left
+open by the `lightwalletd_grpc` integration tests, which only exercise the
+in-process adapter against a synthetic schedule.
+
+| Network | Tip at run-time | Result |
+|---------|-----------------|--------|
+| regtest | 7,404 | PASS |
+| testnet | 4,007,360 | PASS |
+| mainnet | 3,339,637 | PASS |
+
+### Residual gates
+
+After the runs above. Each cross-refs the section that owns the procedure.
+
+- **Real Zallet binary gate.** Not runnable in this stack: no
+  `ZINDER_TEST_ZALLET*` env and no `zallet` binary on `PATH`. Public Zallet
+  builds use embedded Zaino, which the gate intentionally rejects. Tracked as
+  upstream dependency on a Zinder-native Zallet branch. See
+  [T3: Real Zallet binary gate](#t3-real-zallet-binary-gate).
 
 ## Cross-references
 

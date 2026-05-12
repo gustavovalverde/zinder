@@ -1,6 +1,6 @@
 //! Zinder wallet query gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
 use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
@@ -10,7 +10,9 @@ use zinder_runtime::{
     BearerToken, OpsServer, Readiness, cancel_on_ctrl_c, connect_authenticated_channel,
     install_tracing_subscriber, spawn_ops_endpoint,
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{
+    NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+};
 use zinder_store::SecondaryChainStore;
 
 mod config;
@@ -18,6 +20,9 @@ mod config;
 use config::{QueryConfig, QueryConfigError, QueryConfigOverrides};
 
 const EXPLORER_TRANSPARENT_BALANCE_CAPABILITY: &str = "derive.explorer.transparent_balance_v1";
+
+const REQUIRED_BROADCASTER_NODE_CAPABILITIES: &[NodeCapability] =
+    &[NodeCapability::TransactionBroadcast];
 
 #[derive(Parser)]
 #[command(name = "zinder-query")]
@@ -133,9 +138,27 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .current_chain_epoch()
         .map_err(QueryConfigError::Store)?
         .map(|epoch| epoch.tip_height.value());
-    let broadcaster = build_broadcaster(query_config.broadcaster.as_ref())?;
+    let broadcaster = build_broadcaster(query_config.broadcaster.as_ref()).await?;
     let transaction_broadcast_enabled = broadcaster.is_some();
-    let wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
+    let network_upgrade_schedule = if let Some(source) = broadcaster.as_ref() {
+        Some(Arc::new(
+            source
+                .fetch_network_upgrade_schedule()
+                .await
+                .map_err(|source| QueryConfigError::Source(Box::new(source)))?,
+        ))
+    } else {
+        tracing::warn!(
+            target: "zinder::query",
+            event = "consensus_branch_id_schedule_unavailable",
+            "MinedDetails.consensus_branch_id defaults to PRE_OVERWINTER_BRANCH_ID because [node] is not configured"
+        );
+        None
+    };
+    let mut wallet_query = zinder_query::WalletQuery::new(store.clone(), broadcaster);
+    if let Some(schedule) = network_upgrade_schedule {
+        wallet_query = wallet_query.with_network_upgrade_schedule(schedule);
+    }
     let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
         network: query_config.network.name().to_owned(),
@@ -300,7 +323,7 @@ async fn update_grpc_health(
     reporter.set_service_status(service_name, status).await;
 }
 
-fn build_broadcaster(
+async fn build_broadcaster(
     broadcaster_target: Option<&zinder_source::NodeTarget>,
 ) -> Result<Option<ZebraJsonRpcSource>, QueryConfigError> {
     let Some(target) = broadcaster_target else {
@@ -323,6 +346,32 @@ fn build_broadcaster(
     )
     .map_err(|source| QueryConfigError::Source(Box::new(source)))?;
 
+    let capabilities = source
+        .probe_capabilities()
+        .await
+        .map_err(|source| QueryConfigError::Source(Box::new(source)))?;
+    let advertised: Vec<&'static str> = capabilities
+        .iter()
+        .map(zinder_source::NodeCapability::name)
+        .collect();
+    if capabilities.supports(NodeCapability::OpenRpcDiscovery) {
+        tracing::info!(
+            target: "zinder::query",
+            event = "transaction_broadcast_capabilities_probed",
+            advertised = ?advertised,
+            "transaction broadcast node capabilities discovered via rpc.discover"
+        );
+    } else {
+        tracing::warn!(
+            target: "zinder::query",
+            event = "transaction_broadcast_capabilities_probe_fallback",
+            advertised = ?advertised,
+            "transaction broadcast node capability probe used baseline capabilities because rpc.discover was unavailable"
+        );
+    }
+    require_broadcaster_node_capabilities(capabilities)
+        .map_err(|source| QueryConfigError::Source(Box::new(source)))?;
+
     tracing::info!(
         target: "zinder::query",
         event = "transaction_broadcast_enabled",
@@ -330,6 +379,20 @@ fn build_broadcaster(
         "transaction broadcast enabled via Zebra JSON-RPC"
     );
     Ok(Some(source))
+}
+
+fn require_broadcaster_node_capabilities(
+    capabilities: NodeCapabilities,
+) -> Result<(), zinder_source::SourceError> {
+    for required in REQUIRED_BROADCASTER_NODE_CAPABILITIES {
+        if !capabilities.supports(*required) {
+            return Err(zinder_source::SourceError::NodeCapabilityMissing {
+                capability: *required,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn spawn_ops(
@@ -375,5 +438,49 @@ impl From<Cli> for QueryConfigOverrides {
             derive_explorer_token_path: cli.derive_explorer_token_path,
             derive_explorer_probe_interval_ms: cli.derive_explorer_probe_interval_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NodeCapabilities, NodeCapability, ZebraJsonRpcSource, require_broadcaster_node_capabilities,
+    };
+
+    #[test]
+    fn broadcaster_capability_validation_accepts_zebra_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = ZebraJsonRpcSource::baseline_capabilities();
+
+        require_broadcaster_node_capabilities(capabilities)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn broadcaster_capability_validation_rejects_missing_sendrawtransaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = NodeCapabilities::new([
+            NodeCapability::JsonRpc,
+            NodeCapability::BestChainBlocks,
+            NodeCapability::TipId,
+            NodeCapability::TreeState,
+            NodeCapability::SubtreeRoots,
+        ])?;
+
+        let Err(error) = require_broadcaster_node_capabilities(capabilities) else {
+            return Err(Box::new(std::io::Error::other(
+                "missing transaction-broadcast support passed startup validation",
+            )));
+        };
+
+        assert!(matches!(
+            error,
+            zinder_source::SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::TransactionBroadcast,
+            }
+        ));
+
+        Ok(())
     }
 }

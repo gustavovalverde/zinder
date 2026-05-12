@@ -1,6 +1,6 @@
 //! Local secondary-reader implementation of the chain-index contract.
 
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
@@ -8,14 +8,13 @@ use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TreeStateArtifact, TxStatus,
+    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, NetworkUpgradeSchedule,
+    PRE_OVERWINTER_BRANCH_ID, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::ServerCapabilities;
 use zinder_source::{
-    block_header_info_from_raw_block_bytes, consensus_branch_id_at,
-    transparent_prevout_from_raw_transaction_bytes,
+    block_header_info_from_raw_block_bytes, transparent_prevout_from_raw_transaction_bytes,
 };
 use zinder_store::{
     BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
@@ -50,6 +49,7 @@ pub struct LocalChainIndex {
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
+    network_upgrade_schedule: Option<Arc<NetworkUpgradeSchedule>>,
 }
 
 impl LocalChainIndex {
@@ -99,7 +99,20 @@ impl LocalChainIndex {
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
+            network_upgrade_schedule: None,
         })
+    }
+
+    /// Wires the node-discovered network upgrade schedule into the index so
+    /// `MinedDetails.consensus_branch_id` on `transaction_by_id` responses
+    /// reflects the schedule active on the configured network.
+    ///
+    /// Without a schedule, `consensus_branch_id` defaults to
+    /// [`PRE_OVERWINTER_BRANCH_ID`].
+    #[must_use]
+    pub fn with_network_upgrade_schedule(mut self, schedule: Arc<NetworkUpgradeSchedule>) -> Self {
+        self.network_upgrade_schedule = Some(schedule);
+        self
     }
 
     async fn read_at_epoch<Output>(
@@ -310,6 +323,7 @@ impl ChainIndex for LocalChainIndex {
         transaction_id: TransactionId,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TxStatus, IndexerError> {
+        let schedule = self.network_upgrade_schedule.clone();
         let mined_outcome = self
             .read_at_epoch(at_epoch, move |reader| {
                 let Some(artifact) = reader
@@ -331,8 +345,11 @@ impl ChainIndex for LocalChainIndex {
                         .map(|header| header.block_time)
                     })
                     .unwrap_or_default();
-                let consensus_branch_id =
-                    consensus_branch_id_at(chain_epoch.network, artifact.block_height);
+                let consensus_branch_id = schedule
+                    .as_deref()
+                    .map_or(PRE_OVERWINTER_BRANCH_ID, |schedule| {
+                        schedule.consensus_branch_id_at(artifact.block_height)
+                    });
                 let details = MinedDetails::from_response_epoch(
                     &chain_epoch,
                     artifact.block_height,

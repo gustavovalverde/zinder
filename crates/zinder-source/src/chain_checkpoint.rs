@@ -37,32 +37,3 @@ impl SourceChainCheckpoint {
         }
     }
 }
-
-/// Node-advertised activation heights needed by wallet-serving backfill.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceNetworkUpgradeHeights {
-    /// Sapling activation height, when advertised by the node.
-    pub sapling: Option<BlockHeight>,
-    /// NU5 activation height, when advertised by the node.
-    pub nu5: Option<BlockHeight>,
-}
-
-impl SourceNetworkUpgradeHeights {
-    /// Creates an activation-height observation.
-    #[must_use]
-    pub const fn new(sapling: Option<BlockHeight>, nu5: Option<BlockHeight>) -> Self {
-        Self { sapling, nu5 }
-    }
-
-    /// Returns the earliest activation height needed to serve lightwalletd
-    /// wallets from a fresh install.
-    #[must_use]
-    pub const fn wallet_serving_floor(self) -> Option<BlockHeight> {
-        match (self.sapling, self.nu5) {
-            (Some(sapling), Some(nu5)) if sapling.value() <= nu5.value() => Some(sapling),
-            (Some(_) | None, Some(nu5)) => Some(nu5),
-            (Some(sapling), None) => Some(sapling),
-            (None, None) => None,
-        }
-    }
-}

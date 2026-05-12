@@ -17,7 +17,7 @@ mod source_transaction;
 mod zebra_indexer_mempool;
 mod zebra_json_rpc;
 
-pub use chain_checkpoint::{SourceChainCheckpoint, SourceNetworkUpgradeHeights};
+pub use chain_checkpoint::SourceChainCheckpoint;
 pub use json_rpc_mempool::{
     DEFAULT_MEMPOOL_POLL_INTERVAL, JsonRpcMempoolSource, JsonRpcMempoolSourceOptions,
 };
@@ -32,8 +32,8 @@ pub use node_target::{
     DEFAULT_NODE_REQUEST_TIMEOUT_SECS, NodeAuthSection, NodeConfigError, NodeSection, NodeTarget,
 };
 pub use source_block::{
-    SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes, consensus_branch_id_at,
-    decode_display_block_hash, encode_display_block_hash, zebra_network,
+    SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes,
+    decode_display_block_hash, encode_display_block_hash,
 };
 pub use source_error::SourceError;
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};

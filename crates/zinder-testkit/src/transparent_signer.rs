@@ -14,13 +14,17 @@
 //!
 //! # Activation heights
 //!
-//! [`regtest_local_network`] returns the activation heights used by ZFND's
-//! `z3` regtest sidecar (`overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`,
-//! later upgrades unset). Mismatched heights produce an
-//! `incorrect consensus branch id` rejection from Zebra's mempool.
-//! Operators with a different regtest shape pass their own
-//! [`zcash_protocol::local_consensus::LocalNetwork`] through
-//! [`TransparentTestKey::with_local_network`].
+//! [`regtest_local_network`] returns the [`LocalNetwork`] shape ZFND's `z3`
+//! regtest sidecar is configured with by default (`overwinter..canopy = 1`,
+//! `nu5 = 2`, `nu6 = 2`, later upgrades unset). Intended for in-process
+//! unit-test fixtures that do not broadcast to a live node.
+//!
+//! Live tests that broadcast through Zebra must derive the [`LocalNetwork`]
+//! from the running node instead, via
+//! [`crate::network_upgrade_fixtures::local_network_from_schedule`] applied
+//! to a `ZebraJsonRpcSource::fetch_network_upgrade_schedule()` result.
+//! Mismatched activation heights produce an `incorrect consensus branch id`
+//! rejection from Zebra's mempool.
 
 use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1};
@@ -273,6 +277,11 @@ impl std::fmt::Debug for TransparentTestKey {
 
 /// Activation heights for the `z3` regtest sidecar:
 /// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, later upgrades unset.
+///
+/// Intended for unit-test fixtures that do not broadcast. Live tests that
+/// broadcast through Zebra must derive the [`LocalNetwork`] from the
+/// running node, via
+/// [`crate::network_upgrade_fixtures::local_network_from_schedule`].
 #[must_use]
 pub fn regtest_local_network() -> LocalNetwork {
     LocalNetwork {

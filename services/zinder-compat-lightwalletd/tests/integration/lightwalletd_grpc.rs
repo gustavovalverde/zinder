@@ -6,6 +6,7 @@
 use eyre::eyre;
 use prost::Message;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, transport::Server};
@@ -25,8 +26,11 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
     compact_tx_streamer_server::CompactTxStreamer,
 };
+
 use zinder_query::WalletQuery;
-use zinder_testkit::{ChainFixture, MockTransactionBroadcaster, StoreFixture};
+use zinder_testkit::{
+    ChainFixture, MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_schedule,
+};
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
 const SAPLING_SUBTREE_ROOT_HASH: [u8; 32] = [7; 32];
@@ -41,7 +45,8 @@ const DEFAULT_TREE_STATE_PAYLOAD: &[u8] =
 async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let adapter =
-        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()));
+        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()))
+            .with_network_upgrade_schedule(Arc::new(sample_regtest_upgrade_schedule()));
 
     let latest_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
@@ -169,7 +174,8 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         },
     )?;
     let adapter =
-        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()));
+        LightwalletdGrpcAdapter::new(WalletQuery::new(store_fixture.chain_store().clone(), ()))
+            .with_network_upgrade_schedule(Arc::new(sample_regtest_upgrade_schedule()));
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],

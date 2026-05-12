@@ -105,8 +105,8 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
         true,
     );
     let source = zebra_source_from_backfill(&probe_config)?;
-    let activation_heights = source.fetch_network_upgrade_activation_heights().await?;
-    let wallet_serving_floor = activation_heights
+    let schedule = source.fetch_network_upgrade_schedule().await?;
+    let wallet_serving_floor = schedule
         .wallet_serving_floor()
         .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?;
     if wallet_serving_floor == BlockHeight::new(0) {
