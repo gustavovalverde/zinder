@@ -195,7 +195,7 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
     );
     assert!(matches!(
         committed.event,
-        ChainEvent::TipAdvanced { committed }
+        ChainEvent::ChainCommitted { committed }
             if committed.chain_epoch == finalized_epoch
                 && committed.block_range.start == BlockHeight::new(2)
                 && committed.block_range.end == BlockHeight::new(2)

@@ -1306,6 +1306,7 @@ impl ChainStoreInner {
             pruned_added_count: scan.pruned_added,
             pruned_mined_count: scan.pruned_mined,
             pruned_invalidated_count: scan.pruned_invalidated,
+            pruned_suppressed_count: scan.pruned_suppressed,
         })
     }
 
@@ -1329,6 +1330,7 @@ impl ChainStoreInner {
             pruned_added_count: 0,
             pruned_mined_count: 0,
             pruned_invalidated_count: 0,
+            pruned_suppressed_count: 0,
         })
     }
 
@@ -1602,7 +1604,7 @@ fn build_chain_event(
         }
         ReorgWindowChange::Unchanged
         | ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::FinalizeThrough { .. } => ChainEvent::TipAdvanced { committed },
+        | ReorgWindowChange::FinalizeThrough { .. } => ChainEvent::ChainCommitted { committed },
     };
 
     Ok(event)
@@ -1648,7 +1650,7 @@ fn chain_event_matches_family(
         ChainEventStreamFamily::Tip => true,
         ChainEventStreamFamily::Finalized => {
             event_envelope.chain_epoch.tip_height <= event_envelope.finalized_height
-                && matches!(&event_envelope.event, ChainEvent::TipAdvanced { .. })
+                && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
         }
     }
 }
@@ -2261,6 +2263,7 @@ struct MempoolPruneScan {
     pruned_added: u64,
     pruned_mined: u64,
     pruned_invalidated: u64,
+    pruned_suppressed: u64,
     new_oldest_retained: Option<u64>,
 }
 
@@ -2275,6 +2278,7 @@ fn scan_mempool_events_for_pruning(
     let mut pruned_added = 0_u64;
     let mut pruned_mined = 0_u64;
     let mut pruned_invalidated = 0_u64;
+    let mut pruned_suppressed = 0_u64;
     let mut new_oldest_retained: Option<u64> = None;
     let mut iter_error: Option<StoreError> = None;
 
@@ -2312,7 +2316,9 @@ fn scan_mempool_events_for_pruning(
             let retention_window = match kind {
                 MempoolEventKind::Added => retention.added_retention,
                 MempoolEventKind::Mined => retention.mined_retention,
-                MempoolEventKind::Invalidated => retention.invalidated_retention,
+                MempoolEventKind::Invalidated | MempoolEventKind::Suppressed => {
+                    retention.invalidated_retention
+                }
             };
             let should_prune =
                 retention_window.is_some_and(|window| age_exceeds_window(now, observed_at, window));
@@ -2326,6 +2332,9 @@ fn scan_mempool_events_for_pruning(
                     MempoolEventKind::Mined => pruned_mined = pruned_mined.saturating_add(1),
                     MempoolEventKind::Invalidated => {
                         pruned_invalidated = pruned_invalidated.saturating_add(1);
+                    }
+                    MempoolEventKind::Suppressed => {
+                        pruned_suppressed = pruned_suppressed.saturating_add(1);
                     }
                 }
             } else if new_oldest_retained.is_none() {
@@ -2343,6 +2352,7 @@ fn scan_mempool_events_for_pruning(
         pruned_added,
         pruned_mined,
         pruned_invalidated,
+        pruned_suppressed,
         new_oldest_retained,
     })
 }

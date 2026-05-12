@@ -1,8 +1,14 @@
 //! Transaction identity, submission, and durable artifact values.
 
-use crate::{BlockHash, BlockHeight, ChainEpoch, MempoolEntry};
+use crate::{BlockHash, BlockHeight, ChainEpoch, ConsensusBranchId, MempoolEntry};
 
 /// Zcash transaction identifier bytes.
+///
+/// Pre-v5 transactions use the `SHA256d` hash of the serialized transaction;
+/// v5+ transactions use the `BLAKE2b-256` `txid_digest` defined by ZIP-244.
+/// Both forms are 32 bytes and are addressed as the same canonical
+/// identifier on the wire and in storage; Zinder treats the bytes as opaque
+/// and does not recompute them.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TransactionId([u8; 32]);
 
@@ -144,7 +150,7 @@ pub struct TransactionArtifact {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MinedDetails {
     /// Consensus branch identifier in effect at the mined height.
-    pub consensus_branch_id: u32,
+    pub consensus_branch_id: ConsensusBranchId,
     /// Block-time as Unix seconds, taken from the mined block header.
     pub block_time: i64,
     /// Confirmations: `tip_height - mined_height + 1`, bound to the
@@ -165,7 +171,7 @@ impl MinedDetails {
     pub fn from_response_epoch(
         epoch: &ChainEpoch,
         mined_height: BlockHeight,
-        consensus_branch_id: u32,
+        consensus_branch_id: ConsensusBranchId,
         block_time: i64,
     ) -> Self {
         let tip = epoch.tip_height.value();

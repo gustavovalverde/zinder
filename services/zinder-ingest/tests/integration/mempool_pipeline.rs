@@ -559,6 +559,7 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
             MempoolEvent::Added { .. } => "added",
             MempoolEvent::Invalidated { .. } => "invalidated",
             MempoolEvent::Mined { .. } => "mined",
+            MempoolEvent::Suppressed { .. } => "suppressed",
             _ => "other",
         })
         .collect();

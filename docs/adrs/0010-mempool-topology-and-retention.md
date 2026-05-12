@@ -74,6 +74,14 @@ These three causes are documented in [Service operations §Health and Readiness]
 
 Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_cursor` is below `oldest_retained_mempool_event_sequence` receives `MempoolCursorExpired` carrying the current floor, mapped to gRPC `FailedPrecondition` with a `PreconditionFailure` detail. The consumer must resnapshot, not retry the same cursor.
 
+### Suppression (ZIP-401 `RecentlyEvicted`) is wired but reserved
+
+`MempoolSuppressedEvent` is the wire surface for the case where the upstream node refuses to admit a transaction Zinder would otherwise publish as an `Added` event. ZIP-401 defines the only documented cause today: the node remembers a recently evicted txid and drops re-broadcast attempts silently. Suppression differs from invalidation: the transaction never entered the live index.
+
+The wire variant, the canonical `MempoolEvent::Suppressed` variant, the persistent event-record encoding, and the proto codec round-trip are wired. Source-side emission is reserved: the upstream node must expose pre-admission rejects before `zinder-ingest` produces this event. The variant is present so external integrators can subscribe today and the contract stays stable when the source side lands.
+
+Suppression shares the `invalidated_retention` window. The lifecycle signal is the same ("this txid is not coming through this node"), and exposing a separate `suppressed_retention` knob would add an operator surface for an event that never fires today. The retention report carries a `pruned_suppressed_count` so the per-variant counts stay honest when emission begins.
+
 ### `TxStatus::InMempool` carries the hydrated entry, not a string
 
 Earlier consumers (notably Zallet) detected "this transaction is in the mempool" by string-matching the human-readable error returned for `transaction_by_id` when the canonical chain had no record. The current shape retires that workaround:
@@ -138,6 +146,10 @@ Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the
   block_hash }`), and the orchestrator passes the value through without a chain-
   store fallback lookup. Lifecycle consumers receive the full mined block identity
   in one cursor delivery.
+- `MempoolSuppressedEvent` is wired on the wire, on the canonical
+  `MempoolEvent::Suppressed` variant, and through the persistent event log,
+  with `pruned_suppressed_count` on the retention report. Source-side emission
+  is reserved per the §Suppression decision above.
 - `WalletQuery.TransparentMempoolOutputsByAddress` and
   `WalletQuery.TransparentMempoolSpendByOutpoint` mirror the typed
   `ChainIndex` mempool point lookups onto the gRPC wire. Both proxy through

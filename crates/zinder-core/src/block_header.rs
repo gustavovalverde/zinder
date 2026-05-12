@@ -17,10 +17,12 @@ pub struct BlockHeaderInfo {
     /// Merkle root of the transactions in this block.
     pub merkle_root_hash: [u8; 32],
     /// Block-commitment bytes. Interpretation depends on the block height
-    /// and network upgrade (final Sapling root, hashChainHistoryRoot,
-    /// or hashBlockCommitments). Callers that need the typed commitment
-    /// must derive it from the network and height; this read model
-    /// surfaces the raw 32-byte field as written in the block header.
+    /// and network upgrade: `hashFinalSaplingRoot` (Sapling through
+    /// pre-Heartwood), `hashChainHistoryRoot` (Heartwood through pre-NU5,
+    /// ZIP-221), or `hashBlockCommitments` (NU5 onward, ZIP-244 §3.2).
+    /// Callers that need the typed commitment must derive it from the
+    /// network and height; this read model surfaces the raw 32-byte field
+    /// as written in the block header.
     pub commitment_bytes: [u8; 32],
     /// Block-time as Unix seconds.
     pub block_time: i64,

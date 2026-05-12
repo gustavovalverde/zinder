@@ -66,8 +66,8 @@ impl ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip.
-    TipAdvanced {
+    /// A non-reorg commit advanced the canonical tip or finalized prefix.
+    ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
@@ -81,13 +81,13 @@ pub enum ChainEvent {
 }
 
 impl ChainEvent {
-    /// Returns `true` when this event represents a non-reorg tip advance.
+    /// Returns `true` when this event is the [`Self::ChainCommitted`] variant.
     ///
     /// Convenience for consumers that need a single boolean for tip-change
     /// notifications without `match`-ing on every variant.
     #[must_use]
-    pub const fn is_tip_advance(&self) -> bool {
-        matches!(self, Self::TipAdvanced { .. })
+    pub const fn is_chain_committed(&self) -> bool {
+        matches!(self, Self::ChainCommitted { .. })
     }
 }
 

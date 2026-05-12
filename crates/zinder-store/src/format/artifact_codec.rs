@@ -196,6 +196,7 @@ pub(crate) enum MempoolEventKind {
     Added,
     Invalidated,
     Mined,
+    Suppressed,
 }
 
 impl MempoolEventKind {
@@ -204,6 +205,7 @@ impl MempoolEventKind {
             MEMPOOL_EVENT_KIND_ADDED => Some(Self::Added),
             MEMPOOL_EVENT_KIND_INVALIDATED => Some(Self::Invalidated),
             MEMPOOL_EVENT_KIND_MINED => Some(Self::Mined),
+            MEMPOOL_EVENT_KIND_SUPPRESSED => Some(Self::Suppressed),
             _ => None,
         }
     }
@@ -216,6 +218,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
             added: Some(mempool_entry_record(entry)),
             invalidated: None,
             mined: None,
+            suppressed: None,
         },
         MempoolEvent::Invalidated {
             transaction_id,
@@ -228,6 +231,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
                 reason_id: mempool_eviction_reason_id(*reason),
             }),
             mined: None,
+            suppressed: None,
         },
         MempoolEvent::Mined {
             transaction_id,
@@ -241,6 +245,16 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
                 transaction_id: transaction_id.as_bytes().to_vec(),
                 mined_height: mined_height.value(),
                 block_hash: block_hash.as_bytes().to_vec(),
+            }),
+            suppressed: None,
+        },
+        MempoolEvent::Suppressed { transaction_id } => MempoolEventRecord {
+            event_kind: MEMPOOL_EVENT_KIND_SUPPRESSED,
+            added: None,
+            invalidated: None,
+            mined: None,
+            suppressed: Some(MempoolSuppressedRecord {
+                transaction_id: transaction_id.as_bytes().to_vec(),
             }),
         },
         // The Rust enum is `#[non_exhaustive]`; future variants force a
@@ -305,6 +319,20 @@ fn decode_mempool_event_record(
                     ArtifactFamily::MempoolEvent,
                     key,
                     &mined.block_hash,
+                )?,
+            })
+        }
+        MempoolEventKind::Suppressed => {
+            let suppressed = record.suppressed.ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "suppressed mempool event is missing payload",
+            })?;
+            Ok(MempoolEvent::Suppressed {
+                transaction_id: decode_transaction_id_for_family(
+                    ArtifactFamily::MempoolEvent,
+                    key,
+                    &suppressed.transaction_id,
                 )?,
             })
         }
@@ -924,7 +952,7 @@ fn decode_chain_epoch_record(
 
 fn chain_event_record(event: &ChainEvent) -> ChainEventRecord {
     match event {
-        ChainEvent::TipAdvanced { committed } => ChainEventRecord {
+        ChainEvent::ChainCommitted { committed } => ChainEventRecord {
             event_kind: CHAIN_EVENT_KIND_COMMITTED,
             committed: Some(chain_epoch_committed_record(committed)),
             reverted: None,
@@ -955,7 +983,7 @@ fn decode_chain_event_record(
                 })
                 .and_then(|record| decode_chain_epoch_committed_record(key, record))?;
 
-            Ok(ChainEvent::TipAdvanced { committed })
+            Ok(ChainEvent::ChainCommitted { committed })
         }
         CHAIN_EVENT_KIND_REORGED => {
             let reverted = event_record
@@ -1364,6 +1392,7 @@ struct TransparentAddressTxIndexArtifactRecord {
 const MEMPOOL_EVENT_KIND_ADDED: u32 = 1;
 const MEMPOOL_EVENT_KIND_INVALIDATED: u32 = 2;
 const MEMPOOL_EVENT_KIND_MINED: u32 = 3;
+const MEMPOOL_EVENT_KIND_SUPPRESSED: u32 = 4;
 
 #[derive(Clone, PartialEq, Message)]
 struct MempoolEventEnvelopeRecord {
@@ -1385,6 +1414,14 @@ struct MempoolEventRecord {
     invalidated: Option<MempoolInvalidatedRecord>,
     #[prost(message, optional, tag = "4")]
     mined: Option<MempoolMinedRecord>,
+    #[prost(message, optional, tag = "5")]
+    suppressed: Option<MempoolSuppressedRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MempoolSuppressedRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

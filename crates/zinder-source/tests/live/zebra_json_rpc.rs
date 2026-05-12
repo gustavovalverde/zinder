@@ -341,7 +341,7 @@ async fn fetch_network_upgrade_activations_matches_running_node_getblockchaininf
     if tip.value() >= sapling.value() {
         assert_ne!(
             branch_at_tip,
-            0,
+            zinder_core::ConsensusBranchId::PRE_OVERWINTER,
             "after Sapling, consensus_branch_id_at(tip) must be non-zero; \
              tip={}, sapling={}, activations={:?}",
             tip.value(),

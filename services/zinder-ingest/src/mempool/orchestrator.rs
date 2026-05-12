@@ -162,7 +162,10 @@ fn would_be_noop(mempool_index: &MempoolIndex, event: &MempoolEvent) -> bool {
         | MempoolEvent::Mined { transaction_id, .. } => {
             !mempool_index.is_in_mempool(*transaction_id)
         }
-        _ => true,
+        // Suppressed transactions never enter the in-memory index; the
+        // wildcard captures future variants Zinder hasn't taught the
+        // orchestrator about yet.
+        MempoolEvent::Suppressed { .. } | _ => true,
     }
 }
 
@@ -223,7 +226,10 @@ fn apply_to_index(mempool_index: &MempoolIndex, event: MempoolEvent) -> MempoolA
             mempool_index.apply_invalidated(transaction_id)
         }
         MempoolEvent::Mined { transaction_id, .. } => mempool_index.apply_mined(transaction_id),
-        _ => MempoolApplyOutcome::NoChange,
+        // Suppressed transactions never entered the live index; the
+        // wildcard captures future variants Zinder hasn't taught the
+        // orchestrator about yet.
+        MempoolEvent::Suppressed { .. } | _ => MempoolApplyOutcome::NoChange,
     }
 }
 

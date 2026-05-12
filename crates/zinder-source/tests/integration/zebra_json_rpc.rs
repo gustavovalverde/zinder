@@ -980,12 +980,13 @@ async fn fetch_network_upgrade_activations_parses_getblockchaininfo_upgrades() -
         Some(zinder_core::BlockHeight::new(1_842_420))
     );
     assert_eq!(
-        activations.activation_height_by_branch_id(0x76b8_09bb),
+        activations
+            .activation_height_by_branch_id(zinder_core::ConsensusBranchId::new(0x76b8_09bb)),
         Some(zinder_core::BlockHeight::new(280_000))
     );
     assert_eq!(
         activations.consensus_branch_id_at(zinder_core::BlockHeight::new(2_000_000)),
-        0xc2d6_d0b4
+        zinder_core::ConsensusBranchId::new(0xc2d6_d0b4)
     );
     let earliest = activations
         .earliest_wallet_servable_activation()

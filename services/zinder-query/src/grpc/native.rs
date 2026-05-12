@@ -515,7 +515,7 @@ fn build_transaction_status_response(
 
 fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
     wallet::MinedDetails {
-        consensus_branch_id: details.consensus_branch_id,
+        consensus_branch_id: details.consensus_branch_id.value(),
         block_time: details.block_time,
         confirmations: details.confirmations,
     }

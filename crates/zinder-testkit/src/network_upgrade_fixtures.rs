@@ -28,7 +28,8 @@
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::local_consensus::LocalNetwork;
 use zinder_core::{
-    BlockHeight as CoreBlockHeight, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    BlockHeight as CoreBlockHeight, ConsensusBranchId, NetworkUpgradeActivation,
+    NetworkUpgradeActivations,
 };
 
 /// Sample regtest [`NetworkUpgradeActivations`] for in-process tests.
@@ -48,37 +49,37 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
         zinder_core::Network::ZcashRegtest,
         vec![
             NetworkUpgradeActivation {
-                branch_id: 0x5ba8_1b19,
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
                 activation_height: CoreBlockHeight::new(1),
                 name: "Overwinter".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0x76b8_09bb,
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
                 activation_height: CoreBlockHeight::new(1),
                 name: "Sapling".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0x2bb4_0e60,
+                branch_id: ConsensusBranchId::new(0x2bb4_0e60),
                 activation_height: CoreBlockHeight::new(1),
                 name: "Blossom".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0xf5b9_230b,
+                branch_id: ConsensusBranchId::new(0xf5b9_230b),
                 activation_height: CoreBlockHeight::new(1),
                 name: "Heartwood".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0xe9ff_75a6,
+                branch_id: ConsensusBranchId::new(0xe9ff_75a6),
                 activation_height: CoreBlockHeight::new(1),
                 name: "Canopy".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0xc2d6_d0b4,
+                branch_id: ConsensusBranchId::new(0xc2d6_d0b4),
                 activation_height: CoreBlockHeight::new(2),
                 name: "NU5".to_owned(),
             },
             NetworkUpgradeActivation {
-                branch_id: 0xc8e7_1055,
+                branch_id: ConsensusBranchId::new(0xc8e7_1055),
                 activation_height: CoreBlockHeight::new(2),
                 name: "NU6".to_owned(),
             },

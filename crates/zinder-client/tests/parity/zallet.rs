@@ -33,7 +33,7 @@ fn parity_chain_index_surface_compiles_for_zallet_migration() {
         let _ = T::subtree_roots_in_range;
         // typed RawTransactionBytes
         let _ = T::broadcast_transaction;
-        // TipAdvanced as a typed signal in chain_events
+        // ChainCommitted as a typed signal in chain_events
         let _ = T::chain_events;
     }
     assert_compiles::<LocalChainIndex>();

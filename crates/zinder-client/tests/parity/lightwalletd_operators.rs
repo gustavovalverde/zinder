@@ -34,7 +34,7 @@ fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
         let _ = T::subtree_roots_in_range;
         // SendTransaction typed bytes path
         let _ = T::broadcast_transaction;
-        // TipAdvanced typed signal for the live chain-event stream
+        // ChainCommitted typed signal for the live chain-event stream
         let _ = T::chain_events;
     }
     assert_compiles::<LocalChainIndex>();

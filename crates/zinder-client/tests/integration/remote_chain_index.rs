@@ -85,7 +85,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     );
     assert!(matches!(
         first_event.event,
-        ChainEvent::TipAdvanced { committed }
+        ChainEvent::ChainCommitted { committed }
             if committed.block_range.start == BlockHeight::new(1)
     ));
     assert!(!first_event.cursor.as_bytes().is_empty());

@@ -470,8 +470,13 @@ message ChainRangeReverted {
   uint32 end_height = 3;
 }
 
-// Tip-advance chain event: a non-reorg commit that advanced the canonical tip.
-message TipAdvanced {
+// Chain-committed event.
+//
+// Carries a non-reorg commit that advanced the canonical tip or finalized
+// prefix. The architectural-spine name; preferred over "tip-advance"
+// because Zinder commits to either the tip or the finalized height under
+// the same event variant.
+message ChainCommitted {
   ChainEpochCommitted committed = 1;
 }
 
@@ -496,8 +501,8 @@ message ChainEventEnvelope {
   uint32 finalized_height = 4;
 
   oneof event {
-    TipAdvanced tip_advanced = 10;
-    ChainReorged reorged = 11;
+    ChainCommitted chain_committed = 10;
+    ChainReorged chain_reorged = 11;
   }
 }
 
@@ -828,6 +833,23 @@ message MempoolMinedEvent {
   bytes block_hash = 3;
 }
 
+// Mempool-admission suppression observed by Zinder.
+//
+// Emitted when the upstream node refuses to admit a transaction that Zinder
+// would otherwise publish as an `Added` event. The documented cause is
+// ZIP-401 RecentlyEvicted: the node remembers a recently evicted txid and
+// drops re-broadcast attempts silently. Suppression differs from
+// invalidation: the transaction never entered the live index.
+//
+// Source-side emission is reserved. The wire surface and store-side event
+// log accept this variant today so external integrators can subscribe; the
+// upstream node must expose pre-admission rejects before Zinder populates
+// the event. See ADR-0010 §Suppression.
+message MempoolSuppressedEvent {
+  // Identifier of the suppressed transaction.
+  bytes transaction_id = 1;
+}
+
 // Cursor-bound mempool event envelope.
 message MempoolEventEnvelope {
   // Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
@@ -844,6 +866,7 @@ message MempoolEventEnvelope {
     MempoolAddedEvent added = 10;
     MempoolInvalidatedEvent invalidated = 11;
     MempoolMinedEvent mined = 12;
+    MempoolSuppressedEvent suppressed = 13;
   }
 }
 

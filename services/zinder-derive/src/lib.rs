@@ -17,9 +17,9 @@ mod store;
 pub use consumer::chain_events::{ChainEventsRunOutcome, run as run_chain_events_subscriber};
 pub use consumer::mempool_events::{MempoolEventsRunOutcome, run as run_mempool_events_subscriber};
 pub use consumer::{
-    ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    RevertedRange, TipAdvancedEvent,
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
+    DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent,
+    MempoolConsumerEventVariant, RevertedRange,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use grpc::{

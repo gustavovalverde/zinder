@@ -3,7 +3,9 @@
 //! Mempool events mirror the source-observed transitions: an `Added`
 //! variant carries a hydrated [`MempoolEntry`]; `Invalidated` and `Mined`
 //! variants carry the affected transaction id with a reason or mined
-//! height. The envelope binds the event to its cursor token, monotonic
+//! height. `Suppressed` carries the txid when the upstream node refuses
+//! admission (ZIP-401 `RecentlyEvicted`; source-side emission reserved per
+//! ADR-0010). The envelope binds the event to its cursor token, monotonic
 //! sequence, and source-observation timestamp.
 
 use zinder_core::{BlockHash, BlockHeight, MempoolEntry, MempoolEvictionReason, TransactionId};
@@ -68,6 +70,15 @@ pub enum MempoolEvent {
         /// track lifecycle without a follow-up tip read.
         block_hash: BlockHash,
     },
+    /// Upstream node refused admission of the transaction. Reserved for
+    /// ZIP-401 `RecentlyEvicted` (the node drops re-broadcasts of a txid it
+    /// recently evicted). The variant is wired through the wire and event
+    /// log so external integrators can subscribe; source-side emission is
+    /// pending node-side visibility per ADR-0010 §Suppression.
+    Suppressed {
+        /// Identifier of the suppressed transaction.
+        transaction_id: TransactionId,
+    },
 }
 
 impl MempoolEvent {
@@ -76,9 +87,9 @@ impl MempoolEvent {
     pub fn transaction_id(&self) -> TransactionId {
         match self {
             Self::Added { entry } => entry.transaction_id,
-            Self::Invalidated { transaction_id, .. } | Self::Mined { transaction_id, .. } => {
-                *transaction_id
-            }
+            Self::Invalidated { transaction_id, .. }
+            | Self::Mined { transaction_id, .. }
+            | Self::Suppressed { transaction_id } => *transaction_id,
         }
     }
 }

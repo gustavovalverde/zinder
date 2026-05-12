@@ -35,15 +35,15 @@ pub fn chain_event_envelope_message(
     event_envelope: &ChainEventEnvelope,
 ) -> Result<wallet::ChainEventEnvelope, ChainEventEncodeError> {
     let event = match &event_envelope.event {
-        ChainEvent::TipAdvanced { committed } => {
-            wallet::chain_event_envelope::Event::TipAdvanced(wallet::TipAdvanced {
+        ChainEvent::ChainCommitted { committed } => {
+            wallet::chain_event_envelope::Event::ChainCommitted(wallet::ChainCommitted {
                 committed: Some(chain_epoch_committed_message(*committed)),
             })
         }
         ChainEvent::ChainReorged {
             reverted,
             committed,
-        } => wallet::chain_event_envelope::Event::Reorged(wallet::ChainReorged {
+        } => wallet::chain_event_envelope::Event::ChainReorged(wallet::ChainReorged {
             reverted: Some(chain_range_reverted_message(*reverted)),
             committed: Some(chain_epoch_committed_message(*committed)),
         }),
@@ -135,6 +135,11 @@ pub fn mempool_event_envelope_message(
             mined_height: mined_height.value(),
             block_hash: block_hash.as_bytes().into(),
         }),
+        MempoolEvent::Suppressed { transaction_id } => {
+            wallet::mempool_event_envelope::Event::Suppressed(wallet::MempoolSuppressedEvent {
+                transaction_id: transaction_id.as_bytes().into(),
+            })
+        }
         _ => {
             return Err(ChainEventEncodeError::UnsupportedChainEvent {
                 event: "unknown mempool event variant",
@@ -453,6 +458,12 @@ pub fn mempool_event_envelope_from_message(
             block_hash: block_hash_from_bytes(
                 "mempool_event_envelope.mined.block_hash",
                 mined.block_hash,
+            )?,
+        },
+        wallet::mempool_event_envelope::Event::Suppressed(suppressed) => MempoolEvent::Suppressed {
+            transaction_id: transaction_id_from_bytes(
+                "mempool_event_envelope.suppressed.transaction_id",
+                suppressed.transaction_id,
             )?,
         },
     };

@@ -265,7 +265,7 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
     );
     assert!(matches!(
         first_event.event,
-        Some(wallet::chain_event_envelope::Event::TipAdvanced(committed))
+        Some(wallet::chain_event_envelope::Event::ChainCommitted(committed))
             if committed.committed.as_ref().is_some_and(|inner| {
                 inner.start_height == 1 && inner.end_height == 1
             })
@@ -390,8 +390,8 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
             orchard_commitment_tree_size: 0,
         }),
         finalized_height: 4,
-        event: Some(wallet::chain_event_envelope::Event::TipAdvanced(
-            wallet::TipAdvanced {
+        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
+            wallet::ChainCommitted {
                 committed: Some(wallet::ChainEpochCommitted {
                     chain_epoch: Some(wallet::ChainEpoch {
                         chain_epoch_id: 11,

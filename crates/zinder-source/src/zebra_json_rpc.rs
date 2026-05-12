@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, Network,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ConsensusBranchId, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
@@ -218,13 +218,13 @@ impl ZebraJsonRpcSource {
             .upgrades
             .iter()
             .map(|(branch_id_hex, upgrade)| {
-                let branch_id = u32::from_str_radix(branch_id_hex, 16).map_err(|_| {
+                let branch_id_value = u32::from_str_radix(branch_id_hex, 16).map_err(|_| {
                     SourceError::SourceProtocolMismatch {
                         reason: "getblockchaininfo upgrades carried a non-hex branch id key",
                     }
                 })?;
                 Ok(NetworkUpgradeActivation {
-                    branch_id,
+                    branch_id: ConsensusBranchId::new(branch_id_value),
                     activation_height: BlockHeight::new(upgrade.activation_height),
                     name: upgrade.name.clone(),
                 })

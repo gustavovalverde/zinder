@@ -680,6 +680,29 @@ Every new public runtime, crate, or protocol type answers:
 
 If the answer is unclear, the boundary is not ready.
 
+## ZIP cross-reference
+
+Zinder's vocabulary is the durable spine; this table is how to read each term in the context of the Zcash improvement proposals it touches. Each row points to the canonical ZIP that defines the concept and notes whether Zinder re-exposes the same name, picks a richer domain name, or deliberately leaves the concept out of scope.
+
+| Zinder term | ZIP | Treatment |
+|---|---|---|
+| `TransactionId` (32-byte canonical) | [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) `txid_digest` (v5+); pre-v5 SHA256d | Same bytes; derivation differs by tx version. Zinder treats the value as opaque; the doc comment in `zinder-core::transaction.rs` records the split. |
+| `AuthDigest` | [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) `auth_digest` | Aligned (v5+ only; `Option`-gated on pre-v5). |
+| `ConsensusBranchId` | [ZIP-200](https://github.com/zcash/zips/blob/main/zips/zip-0200.rst) `CONSENSUS_BRANCH_ID` | Aligned (newtype over `u32`; rendered as `{:#010x}` to match `getblockchaininfo`). |
+| `NetworkUpgradeActivation.name` | [ZIP-252](https://github.com/zcash/zips/blob/main/zips/zip-0252.rst) `NU5`, [ZIP-253](https://github.com/zcash/zips/blob/main/zips/zip-0253.md) `NU6`, NU6.1, NU7 | Carried verbatim from the node per [ADR-0015](../adrs/0015-network-parameter-discovery.md); no Zinder-side enum. |
+| `BlockHeaderInfo.commitment_bytes` | [ZIP-221](https://github.com/zcash/zips/blob/main/zips/zip-0221.rst) `hashChainHistoryRoot`, [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) §3.2 `hashBlockCommitments` | Single raw 32-byte field; interpretation depends on height + upgrade. Doc comment records all three possible meanings (`hashFinalSaplingRoot`, `hashChainHistoryRoot`, `hashBlockCommitments`). |
+| `MempoolEvictionReason::Expired` | [ZIP-203](https://github.com/zcash/zips/blob/main/zips/zip-0203.rst) `nExpiryHeight` | Aligned (expiry surfaced as a removal reason, not the raw header field). |
+| `MempoolEvictionReason::LowFee` | [ZIP-401](https://github.com/zcash/zips/blob/main/zips/zip-0401.rst) `low_fee_penalty` | Aligned. |
+| `MempoolEvent::Suppressed` | [ZIP-401](https://github.com/zcash/zips/blob/main/zips/zip-0401.rst) `RecentlyEvicted` | Wire and Rust shape wired; source-side emission reserved per [ADR-0010 §Suppression](../adrs/0010-mempool-topology-and-retention.md#suppression-zip-401-recentlyevicted-is-wired-but-reserved). |
+| `CompactTxStreamer`, `CompactBlock`, `CompactTx`, `BlockID`, `ChainSpec` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) | Vendored verbatim into `proto/compat/lightwalletd/`, pinned to the upstream commit in `LIGHTWALLETD_PROTOCOL_COMMIT`. Compat layer maps Zinder's `Network` strings to lightwalletd's `chainName` (`"main"`/`"test"`). |
+| `BlockSelector`, `BlockMetadata` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `BlockID` | Intentional improvement: split request shape (oneof `height_or_hash`) from response shape (typed `BlockMetadata`); response uses `uint32` height and `block_hash` instead of `uint64` + `hash`. |
+| `ServerCapabilities.network` (`"zcash-mainnet"`, `"zcash-testnet"`, `"zcash-regtest"`) | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `ChainSpec` | Intentional improvement: `ChainSpec` is structurally empty in ZIP-307; Zinder identifies the network with a machine-readable string. |
+| Transparent address selectors (`AddressLookup`) | [ZIP-316](https://github.com/zcash/zips/blob/main/zips/zip-0316.rst) `Receiver`, `Typecode` | Out of scope on the indexer side: Zinder accepts base58 P2PKH/P2SH addresses or a SHA-256 script-hash. UA parsing and receiver extraction are wallet responsibilities (consistent with [PRD §Out of scope](../prd-0001-zinder-indexer.md#out-of-scope)). |
+| Conventional/marginal fee surface | [ZIP-317](https://github.com/zcash/zips/blob/main/zips/zip-0317.rst) `conventional_fee`, `marginal_fee` | Not exposed. Fee estimation is a wallet concern; Zinder is an indexer. The compat `CompactTx.fee` field is inherited legacy from lightwalletd and is not re-typed. |
+| Chain value pools | [ZIP-209](https://github.com/zcash/zips/blob/main/zips/zip-0209.rst) Sprout/Sapling/Orchard chain value pool | Not exposed. Zebra enforces the invariant; Zinder does not re-account. |
+| Shielded scanning surfaces | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) §payment detection, [ZIP-302](https://github.com/zcash/zips/blob/main/zips/zip-0302.rst), [ZIP-310](https://github.com/zcash/zips/blob/main/zips/zip-0310.rst) | Out of scope (PRD: no server-side viewing-key custody, no memo decryption). |
+| Key derivation, mnemonics, payment URIs | [ZIP-32](https://github.com/zcash/zips/blob/main/zips/zip-0032.rst), [ZIP-339](https://github.com/zcash/zips/blob/main/zips/zip-0339.rst), [ZIP-321](https://github.com/zcash/zips/blob/main/zips/zip-0321.rst) | Out of scope. `zinder-testkit::transparent_signer` exists for test broadcast cycles only and is consumed exclusively under `[dev-dependencies]`. |
+
 ## Cross-references
 
 - [Extending Artifacts cookbook](extending-artifacts.md) — the agent-extensibility checklist for adding artifact families, RPC methods, and error variants.

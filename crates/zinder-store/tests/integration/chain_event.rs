@@ -417,7 +417,7 @@ fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: Chai
     );
     assert!(matches!(
         &event_envelope.event,
-        ChainEvent::TipAdvanced { committed } if committed.chain_epoch == chain_epoch
+        ChainEvent::ChainCommitted { committed } if committed.chain_epoch == chain_epoch
     ));
 }
 
@@ -448,7 +448,7 @@ impl TestDerivedConsumer {
     )]
     fn apply_event(&mut self, chain_event: &ChainEvent) {
         match chain_event {
-            ChainEvent::TipAdvanced { committed } => self.apply_committed(committed),
+            ChainEvent::ChainCommitted { committed } => self.apply_committed(committed),
             ChainEvent::ChainReorged {
                 reverted,
                 committed,

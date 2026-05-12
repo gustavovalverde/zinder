@@ -18,15 +18,15 @@ use tokio_stream::{Stream, StreamExt as _};
 use tonic::Status;
 use zinder_core::BlockHeight;
 use zinder_proto::v1::wallet::{
-    ChainEpochCommitted as WireChainEpochCommitted, ChainEventEnvelope,
-    ChainRangeReverted as WireChainRangeReverted, ChainReorged, TipAdvanced,
+    ChainCommitted, ChainEpochCommitted as WireChainEpochCommitted, ChainEventEnvelope,
+    ChainRangeReverted as WireChainRangeReverted, ChainReorged,
     chain_event_envelope::Event as WireChainEvent,
 };
 use zinder_store::{MempoolDecodeError, chain_epoch_from_message};
 
 use crate::consumer::{
-    ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx, RevertedRange,
-    TipAdvancedEvent,
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
+    RevertedRange,
 };
 use crate::error::DeriveError;
 use crate::store::{DeriveStore, DeriveStoreTable};
@@ -86,13 +86,13 @@ async fn dispatch<C: DeriveConsumer>(
             batch: &mut batch,
         };
         match decoded.event {
-            DecodedEvent::TipAdvanced(event) => {
+            DecodedEvent::ChainCommitted(event) => {
                 consumer
-                    .apply_tip_advanced(&event, &mut ctx)
+                    .apply_chain_committed(&event, &mut ctx)
                     .await
                     .map_err(DeriveError::Consumer)?;
             }
-            DecodedEvent::Reorged(event) => {
+            DecodedEvent::ChainReorged(event) => {
                 consumer
                     .apply_chain_reorged(event.as_ref(), &mut ctx)
                     .await
@@ -116,8 +116,8 @@ struct DecodedEnvelope {
 }
 
 enum DecodedEvent {
-    TipAdvanced(TipAdvancedEvent),
-    Reorged(Box<ChainReorgedEvent>),
+    ChainCommitted(ChainCommittedEvent),
+    ChainReorged(Box<ChainReorgedEvent>),
 }
 
 fn decode_envelope(envelope: ChainEventEnvelope) -> Result<DecodedEnvelope, MempoolDecodeError> {
@@ -137,18 +137,22 @@ fn decode_envelope(envelope: ChainEventEnvelope) -> Result<DecodedEnvelope, Memp
         field: "chain_event_envelope.event",
     })?;
     let decoded_event = match event {
-        WireChainEvent::TipAdvanced(committed) => DecodedEvent::TipAdvanced(decode_tip_advanced(
-            envelope.event_sequence,
-            chain_epoch,
-            finalized_height,
-            committed,
-        )?),
-        WireChainEvent::Reorged(reorged) => DecodedEvent::Reorged(Box::new(decode_reorged(
-            envelope.event_sequence,
-            chain_epoch,
-            finalized_height,
-            reorged,
-        )?)),
+        WireChainEvent::ChainCommitted(committed) => {
+            DecodedEvent::ChainCommitted(decode_chain_committed(
+                envelope.event_sequence,
+                chain_epoch,
+                finalized_height,
+                committed,
+            )?)
+        }
+        WireChainEvent::ChainReorged(reorged) => {
+            DecodedEvent::ChainReorged(Box::new(decode_reorged(
+                envelope.event_sequence,
+                chain_epoch,
+                finalized_height,
+                reorged,
+            )?))
+        }
     };
     Ok(DecodedEnvelope {
         cursor_bytes: envelope.cursor,
@@ -156,16 +160,16 @@ fn decode_envelope(envelope: ChainEventEnvelope) -> Result<DecodedEnvelope, Memp
     })
 }
 
-fn decode_tip_advanced(
+fn decode_chain_committed(
     event_sequence: u64,
     chain_epoch: zinder_core::ChainEpoch,
     finalized_height: BlockHeight,
-    wire: TipAdvanced,
-) -> Result<TipAdvancedEvent, MempoolDecodeError> {
+    wire: ChainCommitted,
+) -> Result<ChainCommittedEvent, MempoolDecodeError> {
     let payload = wire.committed.ok_or(MempoolDecodeError::MissingField {
-        field: "tip_advanced.committed",
+        field: "chain_committed.committed",
     })?;
-    Ok(TipAdvancedEvent {
+    Ok(ChainCommittedEvent {
         event_sequence,
         chain_epoch,
         finalized_height,
@@ -187,7 +191,7 @@ fn decode_reorged(
         field: "chain_reorged.committed",
     })?;
     let reverted = decode_reverted_range(reverted_wire)?;
-    let replacement = decode_tip_advanced_range(replacement_wire)?;
+    let replacement = decode_chain_committed_range(replacement_wire)?;
     Ok(ChainReorgedEvent {
         event_sequence,
         chain_epoch,
@@ -211,7 +215,7 @@ fn decode_reverted_range(
     })
 }
 
-fn decode_tip_advanced_range(
+fn decode_chain_committed_range(
     wire: WireChainEpochCommitted,
 ) -> Result<CommittedRange, MempoolDecodeError> {
     let chain_epoch_message = wire.chain_epoch.ok_or(MempoolDecodeError::MissingField {
@@ -262,7 +266,7 @@ mod tests {
         assert_eq!(outcome.last_event_sequence, Some(1));
         let calls = consumer.applied();
         assert_eq!(calls.len(), 1);
-        let AppliedCall::TipAdvanced(event) = &calls[0] else {
+        let AppliedCall::ChainCommitted(event) = &calls[0] else {
             return Err(eyre::eyre!("expected Committed call"));
         };
         assert_eq!(event.event_sequence, 1);
@@ -331,7 +335,7 @@ mod tests {
         let outcome = run(&mut consumer, &store, stream).await?;
         assert_eq!(outcome.applied_envelopes, 1);
         let calls = consumer.applied();
-        let AppliedCall::Reorged(event) = &calls[0] else {
+        let AppliedCall::ChainReorged(event) = &calls[0] else {
             return Err(eyre::eyre!("expected Reorged call"));
         };
         assert_eq!(event.reverted.start_height.value(), 10);
@@ -387,7 +391,7 @@ mod tests {
             event_sequence: sequence,
             chain_epoch: Some(chain_epoch_message(chain_epoch)),
             finalized_height: end,
-            event: Some(WireChainEvent::TipAdvanced(wallet::TipAdvanced {
+            event: Some(WireChainEvent::ChainCommitted(wallet::ChainCommitted {
                 committed: Some(wallet::ChainEpochCommitted {
                     chain_epoch: Some(chain_epoch_message(chain_epoch)),
                     start_height: start,
@@ -413,7 +417,7 @@ mod tests {
             event_sequence: fixture.sequence,
             chain_epoch: Some(chain_epoch_message(fixture.chain_epoch)),
             finalized_height: replacement_end,
-            event: Some(WireChainEvent::Reorged(wallet::ChainReorged {
+            event: Some(WireChainEvent::ChainReorged(wallet::ChainReorged {
                 reverted: Some(wallet::ChainRangeReverted {
                     chain_epoch: Some(chain_epoch_message(fixture.chain_epoch)),
                     start_height: reverted_start,
@@ -448,8 +452,8 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum AppliedCall {
-        TipAdvanced(TipAdvancedEvent),
-        Reorged(Box<ChainReorgedEvent>),
+        ChainCommitted(ChainCommittedEvent),
+        ChainReorged(Box<ChainReorgedEvent>),
     }
 
     #[derive(Debug)]
@@ -486,15 +490,17 @@ mod tests {
             self.name
         }
 
-        async fn apply_tip_advanced(
+        async fn apply_chain_committed(
             &mut self,
-            event: &TipAdvancedEvent,
+            event: &ChainCommittedEvent,
             _ctx: &mut DeriveConsumerCtx<'_>,
         ) -> Result<(), DeriveConsumerError> {
             if self.fail_first && std::mem::replace(&mut *self.first_call.lock(), false) {
                 return Err(Box::new(IntentionalFailure));
             }
-            self.applied.lock().push(AppliedCall::TipAdvanced(*event));
+            self.applied
+                .lock()
+                .push(AppliedCall::ChainCommitted(*event));
             Ok(())
         }
 
@@ -505,7 +511,7 @@ mod tests {
         ) -> Result<(), DeriveConsumerError> {
             self.applied
                 .lock()
-                .push(AppliedCall::Reorged(Box::new(*event)));
+                .push(AppliedCall::ChainReorged(Box::new(*event)));
             Ok(())
         }
     }

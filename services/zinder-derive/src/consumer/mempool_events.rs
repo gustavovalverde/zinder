@@ -109,6 +109,7 @@ fn build_consumer_event(
         WireMempoolEvent::Added(wire) => mempool_added_variant(wire)?,
         WireMempoolEvent::Invalidated(wire) => mempool_invalidated_variant(wire),
         WireMempoolEvent::Mined(wire) => mempool_mined_variant(wire),
+        WireMempoolEvent::Suppressed(wire) => mempool_suppressed_variant(wire),
     };
     Ok(MempoolConsumerEvent {
         event_sequence,
@@ -145,6 +146,14 @@ fn mempool_mined_variant(wire: &wallet::MempoolMinedEvent) -> MempoolConsumerEve
         transaction_id: wire.transaction_id.as_slice(),
         mined_height: BlockHeight::new(wire.mined_height),
         block_hash: wire.block_hash.as_slice(),
+    }
+}
+
+fn mempool_suppressed_variant(
+    wire: &wallet::MempoolSuppressedEvent,
+) -> MempoolConsumerEventVariant<'_> {
+    MempoolConsumerEventVariant::Suppressed {
+        transaction_id: wire.transaction_id.as_slice(),
     }
 }
 

@@ -10,7 +10,7 @@ use tokio_stream::StreamExt as _;
 use tonic::{Request, transport::Channel};
 use zinder_core::{
     BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    CompactBlockArtifact, MempoolEntry, MinedDetails, MinedTransaction, Network,
+    CompactBlockArtifact, ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
     SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
@@ -998,28 +998,32 @@ fn chain_event_envelope_from_message(
         .event
         .ok_or_else(|| IndexerError::malformed("event", "field is missing"))?
     {
-        wallet::chain_event_envelope::Event::TipAdvanced(tip_advanced) => ChainEvent::TipAdvanced {
-            committed: chain_epoch_committed_from_message(
-                expected_network,
-                tip_advanced.committed.ok_or_else(|| {
-                    IndexerError::malformed("tip_advanced.committed", "field is missing")
-                })?,
-            )?,
-        },
-        wallet::chain_event_envelope::Event::Reorged(reorged) => ChainEvent::ChainReorged {
-            reverted: chain_range_reverted_from_message(
-                expected_network,
-                reorged.reverted.ok_or_else(|| {
-                    IndexerError::malformed("reorged.reverted", "field is missing")
-                })?,
-            )?,
-            committed: chain_epoch_committed_from_message(
-                expected_network,
-                reorged.committed.ok_or_else(|| {
-                    IndexerError::malformed("reorged.committed", "field is missing")
-                })?,
-            )?,
-        },
+        wallet::chain_event_envelope::Event::ChainCommitted(chain_committed) => {
+            ChainEvent::ChainCommitted {
+                committed: chain_epoch_committed_from_message(
+                    expected_network,
+                    chain_committed.committed.ok_or_else(|| {
+                        IndexerError::malformed("chain_committed.committed", "field is missing")
+                    })?,
+                )?,
+            }
+        }
+        wallet::chain_event_envelope::Event::ChainReorged(chain_reorged) => {
+            ChainEvent::ChainReorged {
+                reverted: chain_range_reverted_from_message(
+                    expected_network,
+                    chain_reorged.reverted.ok_or_else(|| {
+                        IndexerError::malformed("chain_reorged.reverted", "field is missing")
+                    })?,
+                )?,
+                committed: chain_epoch_committed_from_message(
+                    expected_network,
+                    chain_reorged.committed.ok_or_else(|| {
+                        IndexerError::malformed("chain_reorged.committed", "field is missing")
+                    })?,
+                )?,
+            }
+        }
     };
 
     Ok(ChainEventEnvelope {
@@ -1154,7 +1158,7 @@ fn tx_status_from_message(
                 .details
                 .ok_or_else(|| IndexerError::malformed("mined.details", "field is missing"))?;
             let details = MinedDetails {
-                consensus_branch_id: details_message.consensus_branch_id,
+                consensus_branch_id: ConsensusBranchId::new(details_message.consensus_branch_id),
                 block_time: details_message.block_time,
                 confirmations: details_message.confirmations,
             };
@@ -1293,6 +1297,9 @@ fn mempool_event_envelope_from_message(
             mined_height,
             block_hash,
         },
+        zinder_store::MempoolEvent::Suppressed { transaction_id } => {
+            MempoolEvent::Suppressed { transaction_id }
+        }
         _ => {
             return Err(IndexerError::malformed(
                 "mempool_event",

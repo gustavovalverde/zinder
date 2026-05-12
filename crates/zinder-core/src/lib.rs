@@ -34,8 +34,8 @@ pub use mempool::{
     TransparentMempoolOutputsRequest, TransparentMempoolSpend,
 };
 pub use network_upgrade_activations::{
-    NetworkUpgradeActivation, NetworkUpgradeActivations, NetworkUpgradeActivationsError,
-    PRE_OVERWINTER_BRANCH_ID,
+    ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsError,
 };
 pub use subtree_root::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,

@@ -20,12 +20,51 @@ use std::fmt;
 
 use crate::chain_epoch::{BlockHeight, Network};
 
-/// Branch identifier value that represents the pre-Overwinter consensus rules.
+/// Zcash consensus branch identifier (ZIP-200 §`CONSENSUS_BRANCH_ID`).
 ///
-/// The wire protocol uses `0` to mean "no branch id is associated with this
-/// height" (block was mined before the first soft-fork). The wallet read API
-/// preserves the same convention.
-pub const PRE_OVERWINTER_BRANCH_ID: u32 = 0;
+/// Network upgrades stamp every block and transaction with a 32-bit branch
+/// identifier that anchors them to a specific set of consensus rules. Branch
+/// identifiers are global protocol constants: a given upgrade carries the
+/// same branch id on every network that adopts it, and Zinder treats the
+/// value as opaque material discovered from the running node.
+///
+/// The bytes flow through the wire (`uint32`) and through `getblockchaininfo`
+/// (hex string) unchanged; conversions happen at the boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConsensusBranchId(u32);
+
+impl ConsensusBranchId {
+    /// Branch identifier reserved for the pre-Overwinter consensus rules.
+    ///
+    /// The wire protocol uses `0` to mean "no branch id is associated with
+    /// this height" (block was mined before the first soft-fork). The
+    /// wallet read API preserves the same convention.
+    pub const PRE_OVERWINTER: Self = Self(0);
+
+    /// Wraps a raw branch identifier.
+    #[must_use]
+    pub const fn new(branch_id: u32) -> Self {
+        Self(branch_id)
+    }
+
+    /// Returns the raw 32-bit branch identifier.
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ConsensusBranchId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#010x}", self.0)
+    }
+}
+
+impl fmt::LowerHex for ConsensusBranchId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
 
 /// Concrete table of network upgrades active on a given Zcash network, as
 /// advertised by the running node.
@@ -48,7 +87,7 @@ pub struct NetworkUpgradeActivations {
 pub struct NetworkUpgradeActivation {
     /// The consensus branch identifier assigned to this upgrade. Stable for
     /// the lifetime of the upgrade across all networks that adopt it.
-    pub branch_id: u32,
+    pub branch_id: ConsensusBranchId,
     /// The block height at which this upgrade's rules first apply on the
     /// node's network.
     pub activation_height: BlockHeight,
@@ -67,7 +106,7 @@ pub enum NetworkUpgradeActivationsError {
     /// are global, so this indicates a malformed node response.
     DuplicateBranchId {
         /// The branch identifier that appeared more than once.
-        branch_id: u32,
+        branch_id: ConsensusBranchId,
     },
 }
 
@@ -76,7 +115,7 @@ impl fmt::Display for NetworkUpgradeActivationsError {
         match self {
             Self::DuplicateBranchId { branch_id } => write!(
                 formatter,
-                "duplicate consensus branch id {branch_id:#010x} in network upgrade activations"
+                "duplicate consensus branch id {branch_id} in network upgrade activations"
             ),
         }
     }
@@ -136,17 +175,22 @@ impl NetworkUpgradeActivations {
     }
 
     /// Returns the consensus branch identifier active at `height`, or
-    /// [`PRE_OVERWINTER_BRANCH_ID`] when no upgrade is active yet.
+    /// [`ConsensusBranchId::PRE_OVERWINTER`] when no upgrade is active yet.
     #[must_use]
-    pub fn consensus_branch_id_at(&self, height: BlockHeight) -> u32 {
+    pub fn consensus_branch_id_at(&self, height: BlockHeight) -> ConsensusBranchId {
         self.active_at(height)
-            .map_or(PRE_OVERWINTER_BRANCH_ID, |activation| activation.branch_id)
+            .map_or(ConsensusBranchId::PRE_OVERWINTER, |activation| {
+                activation.branch_id
+            })
     }
 
     /// Returns the activation height for a given branch identifier, if
     /// advertised.
     #[must_use]
-    pub fn activation_height_by_branch_id(&self, branch_id: u32) -> Option<BlockHeight> {
+    pub fn activation_height_by_branch_id(
+        &self,
+        branch_id: ConsensusBranchId,
+    ) -> Option<BlockHeight> {
         self.activations
             .iter()
             .find(|activation| activation.branch_id == branch_id)
@@ -208,17 +252,17 @@ mod tests {
             Network::ZcashRegtest,
             vec![
                 NetworkUpgradeActivation {
-                    branch_id: 0x76b8_09bb,
+                    branch_id: ConsensusBranchId::new(0x76b8_09bb),
                     activation_height: BlockHeight::new(1),
                     name: "Sapling".to_owned(),
                 },
                 NetworkUpgradeActivation {
-                    branch_id: 0xc2d6_d0b4,
+                    branch_id: ConsensusBranchId::new(0xc2d6_d0b4),
                     activation_height: BlockHeight::new(2),
                     name: "NU5".to_owned(),
                 },
                 NetworkUpgradeActivation {
-                    branch_id: 0xc8e7_1055,
+                    branch_id: ConsensusBranchId::new(0xc8e7_1055),
                     activation_height: BlockHeight::new(2),
                     name: "NU6".to_owned(),
                 },
@@ -239,7 +283,7 @@ mod tests {
         let current = activations
             .active_at(BlockHeight::new(7404))
             .ok_or("regtest tip must have at least one activation at or below")?;
-        assert_eq!(current.branch_id, 0xc8e7_1055);
+        assert_eq!(current.branch_id, ConsensusBranchId::new(0xc8e7_1055));
         assert_eq!(current.name, "NU6");
         Ok(())
     }
@@ -249,7 +293,7 @@ mod tests {
         let activations = sample_regtest_activations()?;
         assert_eq!(
             activations.consensus_branch_id_at(BlockHeight::new(0)),
-            PRE_OVERWINTER_BRANCH_ID
+            ConsensusBranchId::PRE_OVERWINTER
         );
         Ok(())
     }
@@ -259,7 +303,7 @@ mod tests {
         let activations = sample_regtest_activations()?;
         assert_eq!(
             activations.consensus_branch_id_at(BlockHeight::new(7404)),
-            0xc8e7_1055
+            ConsensusBranchId::new(0xc8e7_1055)
         );
         Ok(())
     }
@@ -268,11 +312,11 @@ mod tests {
     fn activation_height_by_branch_id_round_trips() -> TestResult {
         let activations = sample_regtest_activations()?;
         assert_eq!(
-            activations.activation_height_by_branch_id(0xc2d6_d0b4),
+            activations.activation_height_by_branch_id(ConsensusBranchId::new(0xc2d6_d0b4)),
             Some(BlockHeight::new(2))
         );
         assert_eq!(
-            activations.activation_height_by_branch_id(0xdead_beef),
+            activations.activation_height_by_branch_id(ConsensusBranchId::new(0xdead_beef)),
             None
         );
         Ok(())
@@ -298,12 +342,12 @@ mod tests {
             Network::ZcashRegtest,
             vec![
                 NetworkUpgradeActivation {
-                    branch_id: 0xc8e7_1055,
+                    branch_id: ConsensusBranchId::new(0xc8e7_1055),
                     activation_height: BlockHeight::new(1),
                     name: "First".to_owned(),
                 },
                 NetworkUpgradeActivation {
-                    branch_id: 0xc8e7_1055,
+                    branch_id: ConsensusBranchId::new(0xc8e7_1055),
                     activation_height: BlockHeight::new(2),
                     name: "Second".to_owned(),
                 },
@@ -312,7 +356,7 @@ mod tests {
         assert_eq!(
             outcome,
             Err(NetworkUpgradeActivationsError::DuplicateBranchId {
-                branch_id: 0xc8e7_1055,
+                branch_id: ConsensusBranchId::new(0xc8e7_1055),
             })
         );
     }
@@ -333,7 +377,7 @@ mod tests {
         let activations = NetworkUpgradeActivations::new(
             Network::ZcashRegtest,
             vec![NetworkUpgradeActivation {
-                branch_id: 0xc8e7_1055,
+                branch_id: ConsensusBranchId::new(0xc8e7_1055),
                 activation_height: BlockHeight::new(2),
                 name: "NU6".to_owned(),
             }],
@@ -348,12 +392,12 @@ mod tests {
             Network::ZcashRegtest,
             vec![
                 NetworkUpgradeActivation {
-                    branch_id: 0xc8e7_1055,
+                    branch_id: ConsensusBranchId::new(0xc8e7_1055),
                     activation_height: BlockHeight::new(2),
                     name: "NU6".to_owned(),
                 },
                 NetworkUpgradeActivation {
-                    branch_id: 0x76b8_09bb,
+                    branch_id: ConsensusBranchId::new(0x76b8_09bb),
                     activation_height: BlockHeight::new(1),
                     name: "Sapling".to_owned(),
                 },

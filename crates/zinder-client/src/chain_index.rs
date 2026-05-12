@@ -62,8 +62,8 @@ pub struct ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip.
-    TipAdvanced {
+    /// A non-reorg commit advanced the canonical tip or finalized prefix.
+    ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
@@ -77,13 +77,13 @@ pub enum ChainEvent {
 }
 
 impl ChainEvent {
-    /// Returns `true` when this event represents a non-reorg tip advance.
+    /// Returns `true` when this event is the [`Self::ChainCommitted`] variant.
     ///
     /// Convenience for consumers that need a single boolean for tip-change
     /// notifications without `match`-ing on every variant.
     #[must_use]
-    pub const fn is_tip_advance(&self) -> bool {
-        matches!(self, Self::TipAdvanced { .. })
+    pub const fn is_chain_committed(&self) -> bool {
+        matches!(self, Self::ChainCommitted { .. })
     }
 }
 
@@ -213,6 +213,14 @@ pub enum MempoolEvent {
         /// source. Lifecycle consumers can resolve mined block identity
         /// without a follow-up tip read.
         block_hash: BlockHash,
+    },
+    /// Upstream node refused admission of the transaction. Reserved for
+    /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
+    /// visibility per ADR-0010 §Suppression. Wallet integrators may subscribe
+    /// today but should not block on receiving this variant.
+    Suppressed {
+        /// Identifier of the suppressed transaction.
+        transaction_id: TransactionId,
     },
 }
 

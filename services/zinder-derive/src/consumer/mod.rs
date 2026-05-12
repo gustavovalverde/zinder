@@ -82,10 +82,10 @@ pub struct DeriveConsumerCtx<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
-/// Typed wrapper for a `TipAdvanced` chain event delivered to a consumer.
+/// Typed wrapper for a `ChainCommitted` chain event delivered to a consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct TipAdvancedEvent {
+pub struct ChainCommittedEvent {
     /// Monotonic event sequence the SDK uses for cursor accounting.
     pub event_sequence: u64,
     /// Chain epoch visible after the commit.
@@ -127,7 +127,7 @@ pub struct RevertedRange {
 }
 
 /// Committed block range carried by a [`ChainReorgedEvent`] or
-/// [`TipAdvancedEvent`].
+/// [`ChainCommittedEvent`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CommittedRange {
@@ -156,9 +156,9 @@ pub trait DeriveConsumer: Send + Sync {
 
     /// Apply a committed range. Stage state writes into `ctx.batch`; the SDK
     /// adds the cursor advance and commits atomically.
-    async fn apply_tip_advanced(
+    async fn apply_chain_committed(
         &mut self,
-        event: &TipAdvancedEvent,
+        event: &ChainCommittedEvent,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError>;
 
@@ -230,5 +230,12 @@ pub enum MempoolConsumerEventVariant<'a> {
         mined_height: BlockHeight,
         /// Hash of the mining block (32 bytes).
         block_hash: &'a [u8],
+    },
+    /// Upstream node refused admission of the transaction. Reserved for
+    /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
+    /// visibility per ADR-0010 §Suppression.
+    Suppressed {
+        /// Transaction id of the suppressed transaction.
+        transaction_id: &'a [u8],
     },
 }

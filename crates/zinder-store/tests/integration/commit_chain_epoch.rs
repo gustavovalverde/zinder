@@ -32,7 +32,7 @@ fn commit_chain_epoch_writes_artifacts_and_visible_epoch_atomically() -> eyre::R
     assert_eq!(committed.chain_epoch, chain_epoch);
     assert!(matches!(
         committed.event,
-        ChainEvent::TipAdvanced { committed }
+        ChainEvent::ChainCommitted { committed }
             if committed.chain_epoch == chain_epoch
     ));
     assert_eq!(store.current_chain_epoch()?, Some(chain_epoch));
