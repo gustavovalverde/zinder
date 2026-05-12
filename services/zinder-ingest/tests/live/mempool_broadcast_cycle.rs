@@ -232,7 +232,12 @@ async fn select_spendable_test_coinbase(
     let target_height = tip_height.value().saturating_add(1);
     let maturity_cutoff = target_height.saturating_sub(100);
     let mut utxos = fetch_address_utxos(env, test_address).await?;
-    utxos.sort_by_key(|utxo| (utxo.height, utxo.satoshis));
+    // Sort by satoshis descending so a long-running regtest sidecar (where
+    // earlier broadcast-cycle runs have already created tiny scratch UTXOs at
+    // recent heights) still resolves to a full-value coinbase output. A
+    // height-first sort selects the most recent scratch UTXO and shrinks each
+    // run's output toward dust until Zebra rejects it as non-standard.
+    utxos.sort_by_key(|utxo| utxo.satoshis);
     utxos.reverse();
 
     for utxo in utxos {

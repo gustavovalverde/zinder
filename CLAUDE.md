@@ -55,11 +55,16 @@ Regtest:
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
+
+Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three tests skip:
+`zebra_indexer_mempool_*` and
+`mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state`.
 
 Testnet (Zebra cookie auth):
 
@@ -68,10 +73,22 @@ cookie=$(docker exec <zebra_container> cat /var/run/auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
+  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:18155 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=${cookie%%:*} \
   ZINDER_NODE__AUTH__PASSWORD=${cookie#*:} \
   cargo nextest run --profile=ci-live --run-ignored=all
+```
+
+The parity-against-lightwalletd suite needs two more endpoints
+(a running Zinder compat shim and a reference `lightwalletd-go`,
+both pointed at the same Zebra):
+
+```bash
+ZINDER_TEST_PARITY_ZINDER_ADDR=http://127.0.0.1:9087 \
+ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR=http://127.0.0.1:9088 \
+  cargo nextest run --profile=ci-live --run-ignored=all \
+    -E 'test(/^live::parity_against_lightwalletd::/)'
 ```
 
 `require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. Local mainnet runs are supported against an operator-hosted Zebra; the CI matrix shape for T3 mainnet is still being finalized per [ADR-0006 §Open mainnet infrastructure questions](docs/adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions).

@@ -190,6 +190,7 @@ cookie=$(docker exec <zebra_container> cat /var/run/auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
+  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:18155 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=${cookie%%:*} \
   ZINDER_NODE__AUTH__PASSWORD=${cookie#*:} \
@@ -197,7 +198,9 @@ ZINDER_TEST_LIVE=1 \
 ```
 
 `require_live()` accepts testnet by default; nothing further to opt in. Tests
-that target only mainnet (see below) still skip.
+that target only mainnet (see below) still skip. Tests that exercise
+regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
+via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
 
 ## T3: Live mainnet (operator-hosted Zebra)
 
@@ -228,6 +231,33 @@ Currently-mainnet-only tests are:
 `tip_id_advances_above_one_million`,
 `backfills_last_1000_blocks_from_checkpoint`, plus the federated balance
 read-only confirmations under `services/zinder-derive/tests/live/`.
+
+## T3: Parity against a reference lightwalletd
+
+Compares `zinder-compat-lightwalletd` against
+`electriccoinco/lightwalletd:latest`, both pointed at the same Zebra.
+Catches drift in the wire-shape contract `LightdInfo`, `BlockId`,
+`CompactBlock`, and `RawTransaction` use across the two shims.
+
+These tests live in
+[`services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs`](../../services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs)
+and need both shims running on host-reachable ports. They skip when either
+env var is absent so the default `ci-live` invocation does not require a
+parity sidecar pair:
+
+```bash
+ZINDER_TEST_LIVE=1 \
+  ZINDER_TEST_PARITY_ZINDER_ADDR=http://127.0.0.1:9087 \
+  ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR=http://127.0.0.1:9088 \
+  cargo nextest run --profile=ci-live --run-ignored=all \
+    -E 'test(/^live::parity_against_lightwalletd::/)'
+```
+
+Operator-divergent fields (build metadata, version strings, donation
+address) are intentionally allow-listed; the assertions focus on the wire
+shape both shims must agree on. The fixture-backed `ci-parity` profile
+covers the same byte-shape contract without the running-binaries
+dependency and is the gate enforced on every CI run.
 
 ## T3: Reorg sweep
 

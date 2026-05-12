@@ -564,7 +564,10 @@ async fn select_spendable_test_coinbase(
     let target_height = tip_height.value().saturating_add(1);
     let maturity_cutoff = target_height.saturating_sub(100);
     let mut utxos = fetch_address_utxos(env, test_address).await?;
-    utxos.sort_by_key(|utxo| (utxo.height, utxo.satoshis));
+    // Largest UTXO first; see `mempool_broadcast_cycle::select_spendable_test_coinbase`
+    // for the rationale (height-first sort self-poisons after repeated runs leave
+    // scratch dust at recent heights ahead of the big coinbase outputs).
+    utxos.sort_by_key(|utxo| utxo.satoshis);
     utxos.reverse();
 
     for utxo in utxos {
