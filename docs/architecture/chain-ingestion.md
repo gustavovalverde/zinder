@@ -131,6 +131,15 @@ The processing model must stay the same. This follows the same principle as mode
 
 Source capability detection happens before processing starts. If the selected source cannot provide required data such as finalized height, chainwork, non-finalized blocks, or transaction broadcast support for the configured mode, ingestion fails closed with a typed startup or readiness cause.
 
+### Backfill throughput shape
+
+Historical backfill is bounded by JSON-RPC round-trip latency, not by upstream-node CPU. Two structural choices keep the throughput high enough for a multi-million-block sync to complete in single-digit hours rather than weeks:
+
+1. **Pipelined block fetches.** `backfill_from_source_with_store` keeps up to `BACKFILL_FETCH_CONCURRENCY` (32) `fetch_block_by_height` calls in flight via `futures_util::stream::iter(...).buffered(N)`. The stream preserves submission order, so artifact assembly and RocksDB writes stay strictly ordered; only the network-bound fetch path is concurrent.
+2. **Concurrent per-block RPCs.** `ZebraJsonRpcSource::fetch_block_by_height` resolves the anchor hash with one `getblockhash` call, then drives `getblockheader`, `getblock`, and `z_gettreestate` concurrently via `tokio::join!`. Per-block round-trip count drops from four sequential RTTs to one plus a parallel triple.
+
+[ADR-0023](../adrs/0023-pipelined-backfill-and-concurrent-block-fetch.md) records the rationale and the operational tuning advice. Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
+
 Historical backfill also fetches newly completed shielded subtree roots through
 the source boundary. The source adapter returns `z_getsubtreesbyindex`
 data without a completing block hash, so `zinder-ingest` binds each returned

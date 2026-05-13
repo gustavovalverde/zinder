@@ -1,5 +1,6 @@
 use std::{num::NonZeroU32, path::PathBuf};
 
+use futures_util::stream::StreamExt;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TreeStateArtifact,
@@ -16,6 +17,24 @@ use crate::chain_ingest::{
     fetch_block_with_retry, next_chain_epoch_id, next_chain_epoch_id_after,
     populate_subtree_root_artifacts,
 };
+
+/// Maximum number of historical block fetches kept in flight against the
+/// upstream node during backfill.
+///
+/// Zebra's JSON-RPC serves one fetch per request and each block requires four
+/// sequential calls (`getblockhash`, `getblockheader`, `getblock`,
+/// `z_gettreestate`). A serial backfill loop is bounded by the resulting
+/// round-trip latency: at ~10ms per call on a colocated `PaaS` network, the
+/// effective rate is ~25 blocks/sec, which is unacceptable for a multi-million
+/// block historical sync. The bottleneck is the network round trip, not the
+/// node's own cost-per-block, so concurrent fetches scale the throughput nearly
+/// linearly until the node's connection pool or CPU saturates.
+///
+/// 32 is the conservative ceiling that keeps the local socket budget low while
+/// extracting the bulk of the speedup. Operators that drive ingest against a
+/// dedicated node can raise this; operators sharing the node with other readers
+/// should not.
+const BACKFILL_FETCH_CONCURRENCY: usize = 32;
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -156,6 +175,10 @@ where
     .await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "pipelined fetch + ordered commit happens in one function so the back-pressure shape stays visible"
+)]
 async fn backfill_from_source_with_store<Source, Builder>(
     config: &BackfillConfig,
     source: &Source,
@@ -176,14 +199,27 @@ where
     let commit_batch_blocks = usize::try_from(config.commit_batch_blocks.get())
         .map_err(|_| IngestError::InvalidCommitBatchBlocks)?;
 
-    for height in BlockHeightRange::inclusive(backfill_start.from_height, config.to_height) {
-        let source_block = fetch_block_with_retry(
-            config.node.request_timeout,
-            source,
-            height,
-            &mut retry_state,
-        )
-        .await?;
+    // Pipeline the per-block fetches with bounded concurrency. The commit
+    // path stays strictly ordered because `buffered` yields completed
+    // futures in their submission order, so artifact assembly and RocksDB
+    // writes are unchanged. Each in-flight fetch gets its own retry state;
+    // the run-wide budget (`retry_state` above) still gates the
+    // subtree-root and finalization tail.
+    let request_timeout = config.node.request_timeout;
+    let mut block_stream = futures_util::stream::iter(BlockHeightRange::inclusive(
+        backfill_start.from_height,
+        config.to_height,
+    ))
+    .map(|height| {
+        let mut fetch_retry_state = IngestRetryState::default();
+        async move {
+            fetch_block_with_retry(request_timeout, source, height, &mut fetch_retry_state).await
+        }
+    })
+    .buffered(BACKFILL_FETCH_CONCURRENCY);
+
+    while let Some(fetch_result) = block_stream.next().await {
+        let source_block = fetch_result?;
         let built_artifacts = artifact_builder.build(&source_block)?;
 
         if let Some(tree_state_payload_bytes) = source_block.tree_state_payload_bytes {

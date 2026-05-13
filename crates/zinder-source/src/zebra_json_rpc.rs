@@ -528,13 +528,33 @@ impl NodeSource for ZebraJsonRpcSource {
             )
             .await?;
         let anchor_block_hash_bytes = decode_display_block_hash(&anchor_block_hash)?;
-        let header: ZebraBlockHeader = self
-            .call_typed(
-                "getblockheader",
-                positional_params([Value::from(anchor_block_hash.clone()), Value::from(true)])?,
-                block_unavailable,
-            )
-            .await?;
+
+        // `getblockheader`, `getblock`, and `z_gettreestate` all key on the
+        // same anchor hash and have no dependency on each other, so we drive
+        // them concurrently over the underlying HTTP/2 connection pool. This
+        // cuts the per-block round-trip count from four sequential calls to
+        // one (`getblockhash`) plus one parallel triple, which is the
+        // dominant cost when ingest runs against a colocated PaaS node.
+        let header_call = self.call_typed::<ZebraBlockHeader>(
+            "getblockheader",
+            positional_params([Value::from(anchor_block_hash.clone()), Value::from(true)])?,
+            block_unavailable,
+        );
+        let raw_block_call = self.call_typed::<String>(
+            "getblock",
+            positional_params([Value::from(anchor_block_hash.clone()), Value::from(0)])?,
+            block_unavailable,
+        );
+        let tree_state_call = self.call_typed::<Value>(
+            "z_gettreestate",
+            positional_params([Value::from(anchor_block_hash)])?,
+            block_unavailable,
+        );
+        let (header_result, raw_block_result, tree_state_result) =
+            tokio::join!(header_call, raw_block_call, tree_state_call);
+        let header = header_result?;
+        let raw_block_hex = raw_block_result?;
+        let tree_state = tree_state_result?;
 
         if header.height != height.value() {
             return Err(SourceError::SourceProtocolMismatch {
@@ -547,26 +567,11 @@ impl NodeSource for ZebraJsonRpcSource {
             });
         }
 
-        let raw_block_hex: String = self
-            .call_typed(
-                "getblock",
-                positional_params([Value::from(anchor_block_hash.clone()), Value::from(0)])?,
-                block_unavailable,
-            )
-            .await?;
         let raw_block_bytes = hex::decode(raw_block_hex)
             .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
         let source_block =
             SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes)?;
         validate_zebra_header(&source_block, &header)?;
-
-        let tree_state: Value = self
-            .call_typed(
-                "z_gettreestate",
-                positional_params([Value::from(anchor_block_hash)])?,
-                block_unavailable,
-            )
-            .await?;
         validate_zebra_tree_state(&tree_state, height, source_block.hash)?;
         // Store the logical tree-state response, not Zebra's original JSON
         // bytes. Do not use this payload as hash or signature material.

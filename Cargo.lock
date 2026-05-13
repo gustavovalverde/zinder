@@ -5179,6 +5179,7 @@ dependencies = [
  "clap",
  "config",
  "eyre",
+ "futures-util",
  "hex",
  "metrics",
  "parking_lot",
