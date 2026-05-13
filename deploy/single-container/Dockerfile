@@ -89,10 +89,18 @@ COPY deploy/single-container/services/user/contents.d           /etc/s6-overlay/
 COPY deploy/single-container/config.example.ingest.toml         /etc/zinder/config.example.ingest.toml
 COPY deploy/single-container/config.example.query.toml          /etc/zinder/config.example.query.toml
 
-RUN chmod +x /etc/s6-overlay/s6-rc.d/zinder-ingest/run \
-             /etc/s6-overlay/s6-rc.d/zinder-ingest/finish \
-             /etc/s6-overlay/s6-rc.d/zinder-query/run \
-             /etc/s6-overlay/s6-rc.d/zinder-query/finish
+# The run scripts launch each binary with `--config /etc/zinder/{ingest,query}.toml`.
+# Seed those paths from the example configs so the image is immediately runnable
+# on PaaS targets that drive every dynamic field through `ZINDER_*` env vars
+# without requiring a mounted config file (ADR-0018). Operators that ship their
+# own configs simply mount over these defaults.
+RUN cp /etc/zinder/config.example.ingest.toml /etc/zinder/ingest.toml \
+    && cp /etc/zinder/config.example.query.toml /etc/zinder/query.toml \
+    && chown zinder:zinder /etc/zinder/ingest.toml /etc/zinder/query.toml \
+    && chmod +x /etc/s6-overlay/s6-rc.d/zinder-ingest/run \
+                /etc/s6-overlay/s6-rc.d/zinder-ingest/finish \
+                /etc/s6-overlay/s6-rc.d/zinder-query/run \
+                /etc/s6-overlay/s6-rc.d/zinder-query/finish
 
 # Each service strict-parses its own TOML schema, so the writer's config
 # (`/etc/zinder/ingest.toml`) and the reader's config (`/etc/zinder/query.toml`)
