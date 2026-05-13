@@ -44,9 +44,16 @@ if [ ! -f "${STORE_PATH}/CURRENT" ] \
         bootstrap_to_height=$((node_tip - BOOTSTRAP_REORG_HEADROOM_BLOCKS))
         printf 'zinder-ingest/run: bootstrapping empty store via wallet-serving backfill (node_tip=%s to_height=%s)\n' \
             "${node_tip}" "${bootstrap_to_height}" >&2
+        # Bind the writer's loopback ops endpoint during backfill so
+        # operators can scrape `/metrics` and `/readyz` while the
+        # historical sync runs. Without this, the entire bootstrap
+        # window is observability-dark: the JSON-RPC fetch-latency and
+        # RocksDB commit-duration histograms are recorded internally
+        # but never exposed because no HTTP listener is bound.
         s6-setuidgid zinder \
             /usr/local/bin/zinder-ingest backfill \
             --config "${INGEST_CONFIG}" \
+            --ops-listen-addr 127.0.0.1:9105 \
             --wallet-serving \
             --to-height "${bootstrap_to_height}" \
             || printf 'zinder-ingest/run: backfill exited non-zero; continuing to tip-follow so the supervisor can surface the error\n' >&2
