@@ -8,7 +8,8 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
-use zinder_source::{NodeSource, NodeTarget, SourceBlock};
+use futures_util::stream::StreamExt;
+use zinder_source::{ChainTipNotificationStream, NodeSource, NodeTarget, SourceBlock};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
     ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -64,7 +65,7 @@ where
     validate_tip_follow_config(config)?;
 
     let store = open_tip_follow_store(config)?;
-    tip_follow_with_primary_store(config, source, store, readiness, None, cancel).await
+    tip_follow_with_primary_store(config, source, store, readiness, None, None, cancel).await
 }
 
 /// Opens the primary store with the tip-follow reorg-window policy.
@@ -100,6 +101,7 @@ pub async fn tip_follow_with_primary_store<Source>(
     store: PrimaryChainStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
+    chain_tip_stream: Option<ChainTipNotificationStream>,
     cancel: CancellationToken,
 ) -> Result<(), IngestError>
 where
@@ -108,10 +110,20 @@ where
     validate_tip_follow_config(config)?;
 
     let mut retry_state = IngestRetryState::default();
+    // When the upstream node exposes the gRPC `ChainTipChange` stream the
+    // tip-follow loop uses it as a push-based wake-up signal: each
+    // notification triggers an immediate `tip_follow_once`. The poll
+    // interval stays in the `select!` arm as a safety net so that a
+    // transient stream failure (broadcast lag, transport reset) cannot
+    // stall ingest beyond `config.poll_interval`. The first iteration
+    // still runs through the polling arm so cold-start catch-up against
+    // the current tip happens without waiting for a notification.
+    let mut chain_tip_stream = chain_tip_stream;
 
     loop {
         tokio::select! {
             () = cancel.cancelled() => return Ok(()),
+            () = wait_for_chain_tip_notification(&mut chain_tip_stream) => {}
             () = tokio::time::sleep(config.poll_interval) => {}
         }
 
@@ -187,6 +199,45 @@ fn compute_tip_follow_readiness_state(
             current_height,
             target_height,
         ))
+    }
+}
+
+async fn wait_for_chain_tip_notification(
+    chain_tip_stream: &mut Option<ChainTipNotificationStream>,
+) {
+    let Some(stream) = chain_tip_stream.as_mut() else {
+        // No streaming source configured. Park forever; the sibling
+        // `sleep(poll_interval)` arm of the surrounding `select!` is the
+        // sole wake-up signal in that mode.
+        std::future::pending::<()>().await;
+        return;
+    };
+    match stream.next().await {
+        Some(Ok(notification)) => {
+            tracing::debug!(
+                target: "zinder::ingest",
+                event = "chain_tip_notification_received",
+                height = notification.tip_id.height.value(),
+                "wakeup on Zebra chain_tip_change notification",
+            );
+        }
+        Some(Err(error)) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "chain_tip_notification_stream_error",
+                %error,
+                "chain_tip_change stream emitted an error; falling back to polling",
+            );
+            *chain_tip_stream = None;
+        }
+        None => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "chain_tip_notification_stream_ended",
+                "chain_tip_change stream ended; falling back to polling",
+            );
+            *chain_tip_stream = None;
+        }
     }
 }
 

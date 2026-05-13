@@ -766,6 +766,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::UnsupportedNodeAuth { .. }) => "unsupported_node_auth",
         Some(SourceError::MempoolStreamUnavailable { .. }) => "mempool_stream_unavailable",
         Some(SourceError::MempoolHydrationFailed { .. }) => "mempool_hydration_failed",
+        Some(SourceError::ChainTipStreamUnavailable { .. }) => "chain_tip_stream_unavailable",
         Some(
             SourceError::InvalidBlockHashHex { .. }
             | SourceError::InvalidRawBlockHex { .. }

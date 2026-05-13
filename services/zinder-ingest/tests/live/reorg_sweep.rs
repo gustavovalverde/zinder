@@ -145,6 +145,7 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
                 store,
                 &readiness,
                 None,
+                None,
                 cancel,
             )
             .await

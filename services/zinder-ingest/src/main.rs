@@ -31,9 +31,9 @@ use zinder_runtime::{
     cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{
-    JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeTarget,
-    ZebraIndexerMempoolSource, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
-    ZebraJsonRpcSourceOptions,
+    ChainTipNotificationStream, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
+    NodeCapability, NodeTarget, ZebraIndexerChainTipSource, ZebraIndexerMempoolSource,
+    ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
@@ -619,6 +619,7 @@ async fn run_tip_follow(
         cancel.clone(),
     );
     let mempool_source = build_mempool_source(&tip_follow_config.node, &source);
+    let chain_tip_stream = build_chain_tip_notification_stream(&tip_follow_config.node).await;
     let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
     let _mempool_orchestrator_handle = spawn_mempool_orchestrator(
         mempool_source,
@@ -663,6 +664,7 @@ async fn run_tip_follow(
         store,
         &readiness,
         Some(&mempool_ready_gate),
+        chain_tip_stream,
         cancel.clone(),
     )
     .await;
@@ -800,6 +802,35 @@ async fn spawn_ingest_control_endpoint(
         cancel: endpoint_cancel,
         join,
     })
+}
+
+async fn build_chain_tip_notification_stream(
+    node_target: &NodeTarget,
+) -> Option<ChainTipNotificationStream> {
+    let indexer_endpoint = node_target.indexer_grpc_addr.as_ref()?;
+    let target = ZebraIndexerSourceTarget::new(indexer_endpoint.clone());
+    match ZebraIndexerChainTipSource::new(target).subscribe().await {
+        Ok(stream) => {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "chain_tip_notification_source_selected",
+                backend = "zebra-indexer-grpc",
+                indexer_endpoint = %indexer_endpoint,
+                "subscribed to Zebra chain_tip_change stream; tip-follow wakeups are push-based"
+            );
+            Some(stream)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "chain_tip_notification_source_unavailable",
+                indexer_endpoint = %indexer_endpoint,
+                %error,
+                "Zebra chain_tip_change subscription failed; falling back to polling tip-follow"
+            );
+            None
+        }
+    }
 }
 
 fn build_mempool_source(

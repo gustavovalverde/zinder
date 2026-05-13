@@ -509,6 +509,7 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
                 store,
                 &readiness,
                 None,
+                None,
                 cancel,
             )
             .await

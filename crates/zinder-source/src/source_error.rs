@@ -205,6 +205,21 @@ pub enum SourceError {
         /// succeed later.
         is_retryable: bool,
     },
+
+    /// Upstream chain-tip notification stream is unavailable.
+    ///
+    /// Returned when the gRPC `ChainTipChange` subscription cannot be
+    /// established or terminates with a transport error. The ingest
+    /// tip-follow loop treats this as a signal to fall back to the
+    /// polling path on subsequent iterations and to attempt re-subscription
+    /// on the next wake-up.
+    #[error("upstream chain-tip notification stream is unavailable: {reason}")]
+    ChainTipStreamUnavailable {
+        /// Stream or transport failure reason.
+        reason: String,
+        /// Whether reconnecting can reasonably succeed later.
+        is_retryable: bool,
+    },
 }
 
 impl SourceError {
@@ -216,7 +231,8 @@ impl SourceError {
             | Self::BlockUnavailable { is_retryable, .. }
             | Self::SubtreeRootsUnavailable { is_retryable, .. }
             | Self::MempoolStreamUnavailable { is_retryable, .. }
-            | Self::MempoolHydrationFailed { is_retryable, .. } => *is_retryable,
+            | Self::MempoolHydrationFailed { is_retryable, .. }
+            | Self::ChainTipStreamUnavailable { is_retryable, .. } => *is_retryable,
             Self::InvalidBlockHashHex { .. }
             | Self::InvalidRawBlockHex { .. }
             | Self::InvalidRawTransactionHex { .. }

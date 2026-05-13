@@ -49,6 +49,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0021: `chain_events` address invalidation hint](adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)
 - [ADR-0022: Release artifact set and capability deprecation window](adrs/0022-release-artifact-set.md)
 - [ADR-0023: Pipelined backfill and concurrent block fetch](adrs/0023-pipelined-backfill-and-concurrent-block-fetch.md)
+- [ADR-0024: gRPC chain-tip notifications drive tip-follow wakeups](adrs/0024-grpc-chain-tip-notifications.md)
 
 ## Reference
 

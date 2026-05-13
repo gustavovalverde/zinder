@@ -140,6 +140,10 @@ Historical backfill is bounded by JSON-RPC round-trip latency, not by upstream-n
 
 [ADR-0023](../adrs/0023-pipelined-backfill-and-concurrent-block-fetch.md) records the rationale and the operational tuning advice. Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
 
+### Tip-follow wakeups
+
+Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure or a missed reconnect cannot stall ingest beyond `poll_interval_ms`. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only. [ADR-0024](../adrs/0024-grpc-chain-tip-notifications.md) records the rationale.
+
 Historical backfill also fetches newly completed shielded subtree roots through
 the source boundary. The source adapter returns `z_getsubtreesbyindex`
 data without a completing block hash, so `zinder-ingest` binds each returned
