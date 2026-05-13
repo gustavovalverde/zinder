@@ -7,6 +7,16 @@
 
 set -eu
 
+# Volume mounts on PaaS targets (Railway, Fly.io, Render) are bound onto
+# `/var/lib/zinder` after the image's own filesystem is materialized, and
+# the bind-mount root is owned by `root:root` regardless of what the image
+# baked. The zinder user (UID 1000) cannot create the RocksDB column-family
+# files under that ownership, so RocksDB::open fails with "storage is
+# unavailable". Repair ownership on every boot; the operation is a cheap
+# metadata-only chown on the volume's top-level entries and idempotent
+# across restarts.
+chown -R zinder:zinder /var/lib/zinder
+
 # Run as the unprivileged zinder user. s6-overlay's s6-setuidgid is the
 # idiomatic way to drop privileges inside a longrun script.
 #
