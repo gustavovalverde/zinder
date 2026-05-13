@@ -125,9 +125,7 @@ impl ZebraIndexerChainTipSource {
                     Err(status) => {
                         let _ = sender
                             .send(Err(SourceError::ChainTipStreamUnavailable {
-                                reason: format!(
-                                    "indexer chain_tip_change stream ended: {status}"
-                                ),
+                                reason: format!("indexer chain_tip_change stream ended: {status}"),
                                 is_retryable: true,
                             }))
                             .await;
@@ -141,22 +139,24 @@ impl ZebraIndexerChainTipSource {
     }
 
     async fn connect(&self) -> Result<IndexerClient<Channel>, SourceError> {
-        let endpoint = Endpoint::from_shared(self.target.endpoint_url.clone()).map_err(
-            |error| SourceError::ChainTipStreamUnavailable {
-                reason: format!("invalid indexer endpoint: {error}"),
-                is_retryable: false,
-            },
-        )?;
+        let endpoint =
+            Endpoint::from_shared(self.target.endpoint_url.clone()).map_err(|error| {
+                SourceError::ChainTipStreamUnavailable {
+                    reason: format!("invalid indexer endpoint: {error}"),
+                    is_retryable: false,
+                }
+            })?;
         let endpoint = endpoint
             .connect_timeout(self.options.connect_timeout)
             .timeout(self.options.request_timeout);
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|error| SourceError::ChainTipStreamUnavailable {
-                reason: format!("indexer endpoint connect failed: {error}"),
-                is_retryable: true,
-            })?;
+        let channel =
+            endpoint
+                .connect()
+                .await
+                .map_err(|error| SourceError::ChainTipStreamUnavailable {
+                    reason: format!("indexer endpoint connect failed: {error}"),
+                    is_retryable: true,
+                })?;
         Ok(IndexerClient::new(channel))
     }
 }

@@ -1,5 +1,6 @@
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
+use futures_util::stream::StreamExt;
 use prost::Message;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
@@ -8,7 +9,6 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
-use futures_util::stream::StreamExt;
 use zinder_source::{ChainTipNotificationStream, NodeSource, NodeTarget, SourceBlock};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,

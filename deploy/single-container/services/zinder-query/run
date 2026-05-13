@@ -14,8 +14,14 @@ set -eu
 
 INGEST_CONTROL_HOST=127.0.0.1
 INGEST_CONTROL_PORT=9100
-WAIT_DEADLINE_SECONDS=60
-WAIT_INTERVAL_SECONDS=1
+# Cold-boot bootstrap can run for many minutes (RocksDB CURRENT-marker is
+# missing, backfill scans hundreds of thousands of blocks) and the control
+# endpoint binds at the end of `start_api`, after backfill completes. The
+# old 60s budget was tuned for warm restarts and tore the container down
+# on every fresh volume. 600s covers a wallet-serving backfill from any
+# height on testnet without timing out on healthy nodes.
+WAIT_DEADLINE_SECONDS=600
+WAIT_INTERVAL_SECONDS=2
 
 elapsed=0
 until nc -z "$INGEST_CONTROL_HOST" "$INGEST_CONTROL_PORT"; do

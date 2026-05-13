@@ -47,6 +47,13 @@ pub(crate) struct BackfillCommandConfig {
     pub(crate) allow_near_tip_finalize: bool,
     pub(crate) checkpoint_height: Option<BlockHeight>,
     pub(crate) coverage: BackfillCoverage,
+    /// Optional `IngestControl` gRPC listen address. When set, the backfill writer binds
+    /// the control endpoint at start so colocated readers can connect immediately, even
+    /// while a long cold-resume scan is in progress. Defaults to the same socket
+    /// `tip-follow` uses (`DEFAULT_INGEST_CONTROL_LISTEN_ADDR`); set
+    /// `ingest.control.listen_addr = ""` in the backfill TOML to disable.
+    pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
+    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
 }
 
 impl BackfillCommandConfig {
@@ -489,6 +496,32 @@ fn resolve_backfill_config(
         .into());
     }
     let node_source = parse_node_source(&node_source_text)?;
+    let ingest_control_listen_addr_raw = config
+        .ingest
+        .control
+        .listen_addr
+        .clone()
+        .unwrap_or_else(|| DEFAULT_INGEST_CONTROL_LISTEN_ADDR.to_owned());
+    let ingest_control_listen_addr = if ingest_control_listen_addr_raw.trim().is_empty() {
+        None
+    } else {
+        Some(
+            ingest_control_listen_addr_raw
+                .parse::<SocketAddr>()
+                .map_err(|source| {
+                    ConfigError::invalid(format!(
+                        "ingest.control.listen_addr {ingest_control_listen_addr_raw} is not a socket address: {source}"
+                    ))
+                })?,
+        )
+    };
+    let ingest_control_bearer_token = config
+        .ingest
+        .control
+        .token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()?;
     let node_target =
         NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
 
@@ -502,6 +535,8 @@ fn resolve_backfill_config(
         allow_near_tip_finalize,
         checkpoint_height: config.backfill.checkpoint_height.map(BlockHeight::new),
         coverage,
+        ingest_control_listen_addr,
+        ingest_control_bearer_token,
     })
 }
 

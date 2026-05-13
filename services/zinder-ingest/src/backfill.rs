@@ -89,9 +89,33 @@ impl BackfillOutcome {
 }
 
 /// Runs a historical backfill and commits the requested range to canonical storage.
+///
+/// Opens the [`PrimaryChainStore`] internally; callers that want to share the store with
+/// other writers (e.g. an `IngestControl` gRPC server that reads chain events during
+/// backfill) should open the store themselves and call [`backfill_with_store`] instead.
 pub async fn backfill<Source>(
     config: &BackfillConfig,
     source: &Source,
+) -> Result<BackfillOutcome, IngestError>
+where
+    Source: NodeSource,
+{
+    let store_options = ChainStoreOptions::for_network(config.node.network);
+    let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
+    backfill_with_store(config, source, &store).await
+}
+
+/// Runs a historical backfill against a caller-owned [`PrimaryChainStore`].
+///
+/// The supplied store must have been opened with the same [`ChainStoreOptions`] backfill
+/// expects (`ChainStoreOptions::for_network(config.node.network)`); `RocksDB` enforces a
+/// single primary handle per database, so a caller that needs to expose readable surfaces
+/// (the `IngestControl` gRPC service) during backfill must open the store once and pass
+/// it to this entry point.
+pub async fn backfill_with_store<Source>(
+    config: &BackfillConfig,
+    source: &Source,
+    store: &PrimaryChainStore,
 ) -> Result<BackfillOutcome, IngestError>
 where
     Source: NodeSource,
@@ -112,9 +136,8 @@ where
         store_options.reorg_window_blocks,
     );
 
-    let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
-        &store,
+        store,
         config.node.network,
         config.checkpoint,
         config.from_height,
@@ -132,16 +155,10 @@ where
     let mut artifact_builder =
         IngestArtifactBuilder::with_initial_tip_metadata(backfill_start.initial_tip_metadata);
 
-    backfill_from_source_with_store(
-        config,
-        source,
-        &store,
-        &mut artifact_builder,
-        backfill_start,
-    )
-    .await
-    .map(Box::new)
-    .map(BackfillOutcome::Committed)
+    backfill_from_source_with_store(config, source, store, &mut artifact_builder, backfill_start)
+        .await
+        .map(Box::new)
+        .map(BackfillOutcome::Committed)
 }
 
 #[cfg(test)]

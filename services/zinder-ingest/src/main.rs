@@ -21,7 +21,7 @@ use zinder_core::BlockHeight;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_ingest::{
     BackfillOutcome, IngestControlGrpcAdapter, IngestError, MempoolIndex,
-    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill,
+    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill_with_store,
     mempool_ready_channel, open_tip_follow_store, run_mempool_orchestrator,
     spawn_chain_event_retention_task, spawn_mempool_event_retention_task,
     tip_follow_with_primary_store,
@@ -344,7 +344,32 @@ async fn run_backfill(
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::syncing(None, None, None));
-    let backfill_outcome = backfill(&backfill_config, &source).await?;
+
+    let cancel = CancellationToken::new();
+    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+
+    let store_options = zinder_store::ChainStoreOptions::for_network(backfill_config.node.network);
+    let store = zinder_store::PrimaryChainStore::open(&backfill_config.storage_path, store_options)
+        .map_err(IngestError::from)?;
+
+    let _ingest_control_handle =
+        if let Some(listen_addr) = command_config.ingest_control_listen_addr {
+            Some(
+                spawn_ingest_control_endpoint(IngestControlEndpointSpec {
+                    listen_addr,
+                    network: backfill_config.node.network,
+                    store: store.clone(),
+                    mempool_index: MempoolIndex::new(),
+                    bearer_token: command_config.ingest_control_bearer_token.clone(),
+                    cancel: cancel.clone(),
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+
+    let backfill_outcome = backfill_with_store(&backfill_config, &source, &store).await?;
 
     let chain_epoch = backfill_outcome.chain_epoch();
     readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
