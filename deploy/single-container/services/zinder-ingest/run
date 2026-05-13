@@ -1,9 +1,9 @@
 #!/command/with-contenv sh
 #
-# Supervises zinder-ingest tip-follow inside the single-container image.
-# s6 invokes this script and treats stdout/stderr as the service log; the
-# tracing subscriber installed by zinder-ingest writes structured events
-# directly to stderr, so no log-shipping fan-out is required.
+# Supervises zinder-ingest inside the single-container image. s6 invokes
+# this script and treats stdout/stderr as the service log; the tracing
+# subscriber installed by zinder-ingest writes structured events directly
+# to stderr, so no log-shipping fan-out is required.
 
 set -eu
 
@@ -17,6 +17,45 @@ set -eu
 # across restarts.
 chown -R zinder:zinder /var/lib/zinder
 
+INGEST_CONFIG=/etc/zinder/ingest.toml
+STORE_PATH=/var/lib/zinder/store
+BOOTSTRAP_REORG_HEADROOM_BLOCKS=200
+
+# Tip-follow commits one block per poll iteration, so syncing a fresh
+# store from genesis on a mature network takes weeks. The `backfill`
+# subcommand batches up to `commit_batch_blocks` blocks per epoch and
+# closes that gap in minutes-to-hours. Detect an uninitialized store
+# (no RocksDB CURRENT marker) and bootstrap it via wallet-serving
+# backfill before handing off to tip-follow. Operators that prefer
+# full historical coverage can set `ZINDER_BOOTSTRAP_DISABLED=1`.
+if [ ! -f "${STORE_PATH}/CURRENT" ] \
+        && [ -z "${ZINDER_BOOTSTRAP_DISABLED:-}" ] \
+        && [ -n "${ZINDER_NODE__JSON_RPC_ADDR:-}" ] \
+        && [ -n "${ZINDER_NODE__AUTH__COOKIE:-}" ]; then
+    node_tip=$(curl -sS --connect-timeout 10 --max-time 15 \
+        -u "${ZINDER_NODE__AUTH__COOKIE}" \
+        -H 'content-type: application/json' \
+        -d '{"jsonrpc":"1.0","id":"bootstrap","method":"getblockcount","params":[]}' \
+        "${ZINDER_NODE__JSON_RPC_ADDR}" \
+        | sed -n 's/.*"result":\([0-9][0-9]*\).*/\1/p')
+
+    if echo "${node_tip}" | grep -Eq '^[0-9]+$' \
+            && [ "${node_tip}" -gt "${BOOTSTRAP_REORG_HEADROOM_BLOCKS}" ]; then
+        bootstrap_to_height=$((node_tip - BOOTSTRAP_REORG_HEADROOM_BLOCKS))
+        printf 'zinder-ingest/run: bootstrapping empty store via wallet-serving backfill (node_tip=%s to_height=%s)\n' \
+            "${node_tip}" "${bootstrap_to_height}" >&2
+        s6-setuidgid zinder \
+            /usr/local/bin/zinder-ingest backfill \
+            --config "${INGEST_CONFIG}" \
+            --wallet-serving \
+            --to-height "${bootstrap_to_height}" \
+            || printf 'zinder-ingest/run: backfill exited non-zero; continuing to tip-follow so the supervisor can surface the error\n' >&2
+    else
+        printf 'zinder-ingest/run: skipping bootstrap (node_tip=%s); tip-follow will sync from genesis\n' \
+            "${node_tip:-<empty>}" >&2
+    fi
+fi
+
 # Run as the unprivileged zinder user. s6-overlay's s6-setuidgid is the
 # idiomatic way to drop privileges inside a longrun script.
 #
@@ -26,5 +65,5 @@ chown -R zinder:zinder /var/lib/zinder
 # `/etc/zinder/query.toml` for the reader.
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-ingest tip-follow \
-    --config /etc/zinder/ingest.toml \
+    --config "${INGEST_CONFIG}" \
     --ops-listen-addr 127.0.0.1:9105
