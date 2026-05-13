@@ -56,6 +56,7 @@ jobs:
             - path: crates/zinder-proto/proto
               excludes:
                 - crates/zinder-proto/proto/compat
+                - crates/zinder-proto/proto/external
           breaking:
             use:
               - PACKAGE

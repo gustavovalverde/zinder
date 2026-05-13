@@ -3,7 +3,14 @@ version: v2
 modules:
   - path: crates/zinder-proto/proto
     excludes:
+      # Vendored lightwalletd schemas. Upstream is the source of truth;
+      # we do not enforce Zinder lint rules on them.
       - crates/zinder-proto/proto/compat
+      # Vendored Zebra indexer schemas. Same rationale; their package
+      # `zebra.indexer.rpc` does not match the `external/zebra` directory
+      # layout we keep external protos under, so `PACKAGE_DIRECTORY_MATCH`
+      # would never pass.
+      - crates/zinder-proto/proto/external
 
 lint:
   use:
