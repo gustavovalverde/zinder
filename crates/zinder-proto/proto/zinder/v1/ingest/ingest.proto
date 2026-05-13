@@ -2,7 +2,22 @@ syntax = "proto3";
 
 package zinder.v1.ingest;
 
+import "zinder/v1/ops/server_info.proto";
 import "zinder/v1/wallet/wallet.proto";
+
+// IngestControl ServerInfo request. Same shape as every Zinder ServerInfo;
+// orchestrators that probe the writer's identity and capability set use
+// this rpc.
+message ServerInfoRequest {}
+
+// IngestControl ServerInfo response.
+//
+// Carries the cross-service `ops.ServerInfo` message. Operators probing
+// the writer get the same descriptor shape they get from WalletQuery,
+// without the wallet-specific retention or reorg-window fields.
+message ServerInfoResponse {
+  zinder.v1.ops.ServerInfo server_info = 1;
+}
 
 // Private ingest control-plane request for the writer's latest committed
 // chain epoch.
@@ -26,6 +41,10 @@ message WriterStatusResponse {
 
 // Private ingest control-plane RPCs for colocated read replicas.
 service IngestControl {
+  // Returns the writer's identity and capability set in the cross-service
+  // ops.ServerInfo shape.
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+
   // Returns the writer's latest committed chain epoch.
   rpc WriterStatus(WriterStatusRequest) returns (WriterStatusResponse);
 

@@ -11,3 +11,4 @@ mutants.out.old/
 coverage/
 *.profraw
 lcov.info
+/.claude/

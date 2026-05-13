@@ -1,0 +1,8 @@
+#!/command/with-contenv sh
+#
+# zinder-query exit handler: tear down the whole container if the reader
+# fails. The writer staying up alone is not a useful deployment state.
+
+set -eu
+exit_code="${1:-0}"
+exec s6-svscanctl -t /run/service

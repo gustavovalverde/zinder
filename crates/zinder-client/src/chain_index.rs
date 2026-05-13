@@ -13,7 +13,7 @@ use zinder_core::{
     TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
     TxStatus,
 };
-use zinder_proto::v1::wallet::ServerCapabilities;
+use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
 
 use crate::IndexerError;
@@ -351,15 +351,41 @@ pub struct TransparentAddressUtxoStreamItem {
 ///
 #[async_trait]
 pub trait ChainIndex: Send + Sync + 'static {
-    /// Returns the server capability descriptor when the implementation has a
+    /// Returns the wallet-plane server descriptor when the implementation has a
     /// service endpoint.
-    async fn server_info(&self) -> Result<ServerCapabilities, IndexerError>;
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let descriptor = client.server_info().await?;
+    /// # let _ = descriptor; Ok(()) }
+    /// ```
+    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError>;
 
     /// Returns the current visible chain epoch.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let epoch = client.current_epoch().await?;
+    /// # let _ = epoch; Ok(()) }
+    /// ```
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError>;
 
     /// Returns the latest visible block identity.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let block = client.latest_block(None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
     async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError>;
 
     /// Resolves a block selector against the canonical best chain.
@@ -371,6 +397,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// selector addresses a block that is not visible at the request's
     /// chain epoch (reorged out or never indexed).
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, BlockSelector, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let selector = BlockSelector::from_height(BlockHeight::new(0));
+    /// let block = client.block_id_by_selector(selector, None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
@@ -382,6 +417,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// The Zinder header shape is independent of the lightwalletd compact
     /// header and the upstream node's JSON-RPC `getblockheader` shape.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, BlockSelector, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let selector = BlockSelector::from_height(BlockHeight::new(0));
+    /// let header = client.block_header_by_selector(selector, None).await?;
+    /// # let _ = header; Ok(()) }
+    /// ```
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
@@ -389,6 +433,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<BlockHeaderInfo, IndexerError>;
 
     /// Reads one compact block artifact.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let block = client.compact_block_at(BlockHeight::new(0), None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
     async fn compact_block_at(
         &self,
         height: BlockHeight,
@@ -396,6 +449,16 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<CompactBlockArtifact, IndexerError>;
 
     /// Streams compact block artifacts for an inclusive range.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, BlockHeightRange, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let range = BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(0));
+    /// let stream = client.compact_blocks_in_range(range, None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -407,6 +470,14 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// `at_epoch = None` resolves to the live tip; `Some(epoch)` pins the
     /// read to that chain epoch.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let tree = client.tree_state_at(BlockHeight::new(0), None).await?;
+    /// # let _ = tree; Ok(()) }
+    /// ```
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -414,6 +485,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads the tree-state artifact at the visible tip.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let tree = client.latest_tree_state(None).await?;
+    /// # let _ = tree; Ok(()) }
+    /// ```
     async fn latest_tree_state(
         &self,
         at_epoch: Option<ChainEpoch>,
@@ -421,6 +501,23 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Reads subtree roots for a bounded range.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::num::NonZeroU32;
+    /// # use zinder_client::{
+    /// #     ChainIndex, IndexerError, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// # let Some(max_entries) = NonZeroU32::new(1) else { return Ok(()) };
+    /// let range = SubtreeRootRange::new(
+    ///     ShieldedProtocol::Sapling,
+    ///     SubtreeRootIndex::new(0),
+    ///     max_entries,
+    /// );
+    /// let roots = client.subtree_roots_in_range(range, None).await?;
+    /// # let _ = roots; Ok(()) }
+    /// ```
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
@@ -433,6 +530,16 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// chain has no record. `Some(epoch)` pins the read to that epoch and
     /// never consults mempool state.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let status = client
+    ///     .transaction_by_id(TransactionId::from_bytes([0u8; 32]), None)
+    ///     .await?;
+    /// # let _ = status; Ok(()) }
+    /// ```
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -441,12 +548,31 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Broadcasts raw transaction bytes without mutating canonical storage.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, RawTransactionBytes};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outcome = client
+    ///     .broadcast_transaction(RawTransactionBytes::new(Vec::<u8>::new()))
+    ///     .await?;
+    /// # let _ = outcome; Ok(()) }
+    /// ```
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastResult, IndexerError>;
 
     /// Streams tip-family chain events.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client.chain_events(None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn chain_events(
         &self,
         from_cursor: Option<ChainEventCursor>,
@@ -456,19 +582,89 @@ pub trait ChainIndex: Send + Sync + 'static {
     }
 
     /// Streams chain events for the requested family.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainEventStreamFamily, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client
+    ///     .chain_events_for_family(None, ChainEventStreamFamily::Tip)
+    ///     .await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn chain_events_for_family(
         &self,
         from_cursor: Option<ChainEventCursor>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEventStream, IndexerError>;
 
+    /// Streams chain events with a server-side address invalidation filter
+    /// applied (per [ADR-0021]).
+    ///
+    /// `address_filter` is a list of transparent t-addresses (canonical
+    /// Base58 form). An empty list disables filtering and delivers every
+    /// envelope. A non-empty list narrows commit envelopes to those whose
+    /// block range touches at least one of the supplied addresses; reorgs
+    /// always pass through regardless of filter. The cursor remains opaque;
+    /// clients re-derive per-address state from `compact_block_at` after
+    /// each received envelope.
+    ///
+    /// The default implementation falls back to
+    /// [`Self::chain_events_for_family`] (filter ignored) so backends like
+    /// `LocalChainIndex` that talk to storage directly continue to work;
+    /// remote backends that talk to a Zinder server push the filter
+    /// through to the wire.
+    ///
+    /// [ADR-0021]: ../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainEventStreamFamily, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client
+    ///     .chain_events_with_filter(None, ChainEventStreamFamily::Tip, Vec::new())
+    ///     .await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn chain_events_with_filter(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+        family: ChainEventStreamFamily,
+        address_filter: Vec<String>,
+    ) -> Result<ChainEventStream, IndexerError> {
+        let _ = address_filter;
+        self.chain_events_for_family(from_cursor, family).await
+    }
+
     /// Returns a bounded snapshot of the live mempool index.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, MempoolSnapshotRequest};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let snapshot = client
+    ///     .mempool_snapshot(MempoolSnapshotRequest::default())
+    ///     .await?;
+    /// # let _ = snapshot; Ok(()) }
+    /// ```
     async fn mempool_snapshot(
         &self,
         request: MempoolSnapshotRequest,
     ) -> Result<MempoolSnapshotView, IndexerError>;
 
     /// Streams replayable mempool events.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client.mempool_events(None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn mempool_events(
         &self,
         from_cursor: Option<MempoolEventCursor>,
@@ -477,9 +673,37 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// Returns whether `transaction_id` is currently visible in the live
     /// mempool index.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let present = client
+    ///     .is_in_mempool(TransactionId::from_bytes([0u8; 32]))
+    ///     .await?;
+    /// # let _ = present; Ok(()) }
+    /// ```
     async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
 
     /// Reads a bounded page of unspent transparent outputs.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash,
+    /// #     TransparentAddressUtxosQuery,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let query = TransparentAddressUtxosQuery {
+    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
+    ///     start_height: BlockHeight::new(0),
+    ///     max_entries: None,
+    ///     from_cursor: None,
+    /// };
+    /// let page = client.transparent_address_utxos(query, None).await?;
+    /// # let _ = page; Ok(()) }
+    /// ```
     async fn transparent_address_utxos(
         &self,
         query: TransparentAddressUtxosQuery,
@@ -487,6 +711,24 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<TransparentAddressUtxosView, IndexerError>;
 
     /// Streams unspent transparent outputs for one transparent address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash,
+    /// #     TransparentAddressUtxosQuery,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let query = TransparentAddressUtxosQuery {
+    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
+    ///     start_height: BlockHeight::new(0),
+    ///     max_entries: None,
+    ///     from_cursor: None,
+    /// };
+    /// let stream = client.transparent_address_utxos_stream(query, None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn transparent_address_utxos_stream(
         &self,
         query: TransparentAddressUtxosQuery,
@@ -494,6 +736,26 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<TransparentAddressUtxoStream, IndexerError>;
 
     /// Streams transparent-address tx-history index entries.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash,
+    /// #     TransparentAddressTxIdsQuery,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let query = TransparentAddressTxIdsQuery {
+    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
+    ///     start_height: BlockHeight::new(0),
+    ///     end_height: BlockHeight::new(0),
+    ///     max_entries: None,
+    ///     from_cursor: None,
+    ///     descending: false,
+    /// };
+    /// let stream = client.transparent_address_tx_ids_in_range(query, None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
@@ -505,6 +767,21 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// Bounded by the request's `max_entries`; values larger than the
     /// server's configured cap are silently clamped to that cap.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     ChainIndex, IndexerError, TransparentAddressScriptHash,
+    /// #     TransparentMempoolOutputsRequest,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let request = TransparentMempoolOutputsRequest {
+    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
+    ///     max_entries: 64,
+    /// };
+    /// let outputs = client.transparent_mempool_outputs_by_address(request).await?;
+    /// # let _ = outputs; Ok(()) }
+    /// ```
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: TransparentMempoolOutputsRequest,
@@ -512,6 +789,16 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the mempool spend that consumes `outpoint`, when one is
     /// present.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0);
+    /// let spend = client.transparent_mempool_spend_by_outpoint(outpoint).await?;
+    /// # let _ = spend; Ok(()) }
+    /// ```
     async fn transparent_mempool_spend_by_outpoint(
         &self,
         outpoint: TransparentOutPoint,
@@ -523,6 +810,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// reachable surface this as
     /// [`IndexerError::ServiceUnavailable`]/derive-unavailable.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransparentAddressScriptHash};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let addresses = [TransparentAddressScriptHash::from_bytes([0u8; 32])];
+    /// let balance = client.transparent_address_balance(&addresses, None).await?;
+    /// # let _ = balance; Ok(()) }
+    /// ```
     async fn transparent_address_balance(
         &self,
         addresses: &[TransparentAddressScriptHash],
@@ -538,6 +834,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// requests above
     /// [`zinder_core::MAX_TRANSPARENT_PREVOUTS_PER_REQUEST`].
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let prevouts = client.transparent_prevouts(&outpoints, None).await?;
+    /// # let _ = prevouts; Ok(()) }
+    /// ```
     async fn transparent_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -548,6 +853,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// when an outpoint references an output of an unconfirmed mempool
     /// transaction (chained-mempool flows).
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let prevouts = client.transparent_mempool_prevouts(&outpoints).await?;
+    /// # let _ = prevouts; Ok(()) }
+    /// ```
     async fn transparent_mempool_prevouts(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -555,6 +869,15 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::ChainIndex;
+    /// # fn demo<T: ChainIndex>(client: &T) {
+    /// let cadence = client.local_catchup_interval();
+    /// # let _ = cadence; }
+    /// ```
     fn local_catchup_interval(&self) -> Option<Duration> {
         None
     }

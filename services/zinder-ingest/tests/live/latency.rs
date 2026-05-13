@@ -33,7 +33,9 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     // The baseline backfills [1, tip], which only fits in CI budgets on
     // regtest. The hosted-network calibration is pending the
     // checkpoint-bounded backfill path (BackfillConfig::checkpoint).
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
 
     let tip_height = fetch_live_tip_height(&env).await?;
     if tip_height.value() < 50 {
@@ -140,7 +142,9 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
 )]
 async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])?;
+    let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
+        return Ok(());
+    };
 
     let tip_height = fetch_live_tip_height(&env).await?;
     if tip_height.value() <= HOSTED_BACKFILL_DEPTH_BLOCKS {

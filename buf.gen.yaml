@@ -1,0 +1,35 @@
+# buf generation config for the two release artifacts described in
+# docs/adrs/0022-release-artifact-set.md.
+#
+# Both artifacts are produced from the same proto module declared in
+# buf.yaml. The vendored lightwalletd schemas under proto/compat are
+# excluded; downstream consumers consuming `lightwalletd` already have
+# its public protocol.
+#
+# Build invocation (per-release; the CI workflow at
+# .github/workflows/release-api-docs.yml runs the same commands):
+#
+#   buf generate           # OpenAPI YAML into dist/openapi/
+#   buf build -o dist/zinder.v1.descriptor.bin
+#
+# The descriptor set artifact is built directly by `buf build` (no plugin);
+# the OpenAPI artifact uses the protoc-gen-openapiv2 plugin pinned below.
+
+version: v2
+
+clean: false
+
+plugins:
+  - remote: buf.build/grpc-ecosystem/openapiv2:v2.27.5
+    out: dist/openapi
+    opt:
+      - logtostderr=true
+      # OpenAPI 3.0 output. v2 plugin still emits OAS 2.0 by default; v3 is
+      # opt-in via openapi_naming_strategy/output_format. Default v2 output
+      # is the broadest-tooling baseline; ReDoc and Swagger UI both render
+      # it directly.
+      - output_format=yaml
+      - json_names_for_fields=true
+      - simple_operation_ids=false
+      - allow_repeated_fields_in_body=true
+      - generate_unbound_methods=true

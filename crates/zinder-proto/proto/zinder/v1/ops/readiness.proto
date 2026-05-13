@@ -1,0 +1,137 @@
+// Stable readiness-cause vocabulary for operator probes and gRPC consumers.
+//
+// The Rust hand-written `zinder_runtime::ReadinessCause` mirrors this enum
+// 1:1 through `From` impls. The proto enum is the documented source of
+// truth for the cause vocabulary; the Rust enum carries the struct-variant
+// payloads consumed by the existing `/readyz` JSON serializer.
+//
+// See:
+// - docs/architecture/service-operations.md (Health and Readiness)
+// - docs/adrs/0020-machine-readable-readiness-causes.md
+
+syntax = "proto3";
+
+package zinder.v1.ops;
+
+// Stable readiness cause. New causes are additive only and must reserve a
+// new scalar code; existing variants' semantics are stable within a major
+// version.
+enum ReadinessCause {
+  // Default scalar so unset fields do not silently match a real cause.
+  READINESS_CAUSE_UNSPECIFIED = 0;
+  // Service is starting up but has not yet completed initialization.
+  READINESS_CAUSE_STARTING = 1;
+  // Service is catching up to the upstream node tip or replaying state.
+  READINESS_CAUSE_SYNCING = 2;
+  // Service is healthy and accepting production traffic.
+  READINESS_CAUSE_READY = 3;
+  // Upstream node source is unavailable.
+  READINESS_CAUSE_NODE_UNAVAILABLE = 4;
+  // A required node capability is missing.
+  READINESS_CAUSE_NODE_CAPABILITY_MISSING = 5;
+  // Canonical storage is unavailable.
+  READINESS_CAUSE_STORAGE_UNAVAILABLE = 6;
+  // Persisted store schema is incompatible with this binary.
+  READINESS_CAUSE_SCHEMA_MISMATCH = 7;
+  // Reorg replacement crossed the configured non-finalized window.
+  READINESS_CAUSE_REORG_WINDOW_EXCEEDED = 8;
+  // A RocksDB secondary reader is behind the primary beyond the configured
+  // threshold.
+  READINESS_CAUSE_REPLICA_LAGGING = 9;
+  // The private ingest writer-status RPC cannot be reached.
+  READINESS_CAUSE_WRITER_STATUS_UNAVAILABLE = 10;
+  // Retained chain-event history is approaching the configured cursor-expiry
+  // window.
+  READINESS_CAUSE_CURSOR_AT_RISK = 11;
+  // Mempool retained-event history is approaching the configured retention
+  // window.
+  READINESS_CAUSE_MEMPOOL_CURSOR_AT_RISK = 12;
+  // Mempool source observation is unavailable.
+  READINESS_CAUSE_MEMPOOL_SOURCE_UNAVAILABLE = 13;
+  // Mempool source hydration is falling behind the source's emission rate.
+  READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING = 14;
+  // Service is shutting down and no longer accepting new traffic.
+  READINESS_CAUSE_SHUTTING_DOWN = 15;
+
+  // Reserved slots for additive growth. Removing a reserved range is a
+  // breaking change.
+  reserved 16 to 31;
+}
+
+// Snapshot of the current readiness state surfaced to operators and orchestrators.
+message ReadinessReport {
+  // Stable readiness cause.
+  ReadinessCause cause = 1;
+  // Current visible chain height when known.
+  optional uint32 current_height = 2;
+  // Node-observed target height when known.
+  optional uint32 target_height = 3;
+  // Operator-actionable detail tied to the active cause. Unset when the
+  // cause carries no auxiliary detail.
+  optional ReadinessCauseDetail detail = 4;
+}
+
+// Operator-actionable detail tied to a parametric readiness cause. The
+// active oneof variant must match the cause enum value or the report is
+// malformed.
+message ReadinessCauseDetail {
+  oneof payload {
+    SyncingDetail syncing = 1;
+    NodeCapabilityMissingDetail node_capability_missing = 2;
+    ReorgWindowExceededDetail reorg_window_exceeded = 3;
+    ReplicaLaggingDetail replica_lagging = 4;
+    CursorAtRiskDetail cursor_at_risk = 5;
+    MempoolCursorAtRiskDetail mempool_cursor_at_risk = 6;
+    MempoolHydrationLaggingDetail mempool_hydration_lagging = 7;
+  }
+}
+
+// Detail for READINESS_CAUSE_SYNCING.
+message SyncingDetail {
+  // Distance between the visible chain tip and the target tip when known.
+  optional uint64 lag_blocks = 1;
+}
+
+// Detail for READINESS_CAUSE_NODE_CAPABILITY_MISSING.
+message NodeCapabilityMissingDetail {
+  // Stable name of the missing capability (matches NodeCapability::name()).
+  string capability = 1;
+}
+
+// Detail for READINESS_CAUSE_REORG_WINDOW_EXCEEDED.
+message ReorgWindowExceededDetail {
+  // Number of replaced visible heights.
+  uint64 depth = 1;
+  // Configured non-finalized reorg window in blocks.
+  uint64 configured = 2;
+}
+
+// Detail for READINESS_CAUSE_REPLICA_LAGGING.
+message ReplicaLaggingDetail {
+  // Chain-epoch distance between the writer and this secondary reader.
+  uint64 lag_chain_epochs = 1;
+}
+
+// Detail for READINESS_CAUSE_CURSOR_AT_RISK.
+message CursorAtRiskDetail {
+  // Age of the oldest retained event, rounded down to whole hours.
+  uint64 oldest_retained_age_hours = 1;
+  // Configured retention window, rounded down to whole hours.
+  uint64 retention_hours = 2;
+}
+
+// Detail for READINESS_CAUSE_MEMPOOL_CURSOR_AT_RISK.
+message MempoolCursorAtRiskDetail {
+  // Age of the oldest retained mempool event, rounded down to whole minutes.
+  uint64 oldest_retained_age_minutes = 1;
+  // Shortest configured mempool retention window, rounded down to whole minutes.
+  uint64 retention_minutes = 2;
+}
+
+// Detail for READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING.
+message MempoolHydrationLaggingDetail {
+  // Total hydration failures observed since startup. Diagnostic only;
+  // operators should compare against zinder_mempool_hydration_failures_total
+  // for a rate.
+  uint64 recent_hydration_failures = 1;
+}

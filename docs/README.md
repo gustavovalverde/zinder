@@ -4,7 +4,9 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 
 ## Product and architecture
 
-- [Product requirements](prd-0001-zinder-indexer.md)
+- [PRD-0001: Zinder indexer product requirements](prd-0001-zinder-indexer.md)
+- [PRD-0002: v1 self-hosting and integration experience](prd-0002-self-hosting-and-integration-experience.md)
+- [What Zinder is and is not](architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
 - [RFC-0001: Service-Oriented Indexer Architecture](rfcs/0001-service-oriented-indexer-architecture.md)
 
 ## Architecture
@@ -41,11 +43,19 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0015: Per-network consensus parameters discovered from the running node](adrs/0015-network-parameter-discovery.md)
 - [ADR-0016: Centralized wire conventions and Zebra-aligned vocabulary](adrs/0016-wire-conventions-and-zebra-alignment.md)
 - [ADR-0017: Compute-at-read-time at the compat boundary](adrs/0017-compute-at-read-time-at-the-compat-boundary.md)
+- [ADR-0018: Environment variable secret policy](adrs/0018-environment-variable-secret-policy.md)
+- [ADR-0019: Typed gRPC error reason vocabulary](adrs/0019-typed-grpc-error-reason-vocabulary.md)
+- [ADR-0020: Machine-readable readiness causes](adrs/0020-machine-readable-readiness-causes.md)
+- [ADR-0021: `chain_events` address invalidation hint](adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)
+- [ADR-0022: Release artifact set and capability deprecation window](adrs/0022-release-artifact-set.md)
 
 ## Reference
 
-Living external references that constrain Zinder's design. Refreshed as the upstream world changes:
+Living external references that constrain Zinder's design plus integrator-facing patterns. Refreshed as the upstream world changes:
 
+- [Server-side wallet pattern](reference/server-side-wallet-pattern.md): the canonical recipe for building a server-side Zcash wallet on Zinder + librustzcash.
+- [Known consumers](reference/known-consumers.md): registry of named consumers and the integration shape each one uses.
+- [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 - [Lessons from Zaino](reference/lessons-from-zaino.md): prior-art lessons from Zaino's public tracker and how they inform Zinder's product guarantees.
 - [Serving Zebra and Zallet](reference/serving-zebra-and-zallet.md): the integration audit between the upstream node and full-node wallet.
 - [Findings from Android wallet integration](reference/android-wallet-integration-findings.md): observed behavior of `zcash-android-wallet-sdk` against `zinder-compat-lightwalletd`.
@@ -56,6 +66,8 @@ Living external references that constrain Zinder's design. Refreshed as the upst
 Operational procedures for running Zinder against the workspace and external systems. Edited in place when the procedure changes; never describes architectural intent (that role belongs to the architecture docs).
 
 - [Testing](runbooks/testing.md): T0–T3 test tiers, the default validation gate, live regtest/testnet/mainnet sweeps, end-to-end runs against Zallet and the Android SDK through the lightwalletd compat shim, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
+- [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd for self-hosted single-VM deployments.
+- [Deploying on Railway](runbooks/deploying-on-railway.md): single-container image on Railway / Fly.io / Render-style PaaS targets.
 
 ## Current Contracts
 

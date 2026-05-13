@@ -71,12 +71,16 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         .await?
         .ok_or_else(|| eyre!("chain-events stream closed before first event"))??;
 
+    let server_common = server_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("server_info missing common ops.ServerInfo"))?;
     assert_eq!(
-        server_info.network,
+        server_common.network,
         encode_zinder_native_chain_name(Network::ZcashRegtest)
     );
     assert!(
-        server_info
+        server_common
             .capabilities
             .iter()
             .any(|capability| capability == WALLET_BROADCAST_TRANSACTION_V1)

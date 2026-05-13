@@ -30,7 +30,7 @@ use zinder_proto::compat::lightwalletd::{
     self, BlockId, BlockRange, ChainSpec, Empty, TxFilter,
     compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_testkit::live::{init, require_env, require_live};
+use zinder_testkit::live::{init, optional_env, require_live};
 
 const PARITY_BLOCK_RANGE_END: u64 = 5;
 
@@ -38,8 +38,12 @@ const PARITY_BLOCK_RANGE_END: u64 = 5;
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
     let _guard = init();
-    let _env = require_live()?;
-    let (mut zinder, mut reference) = open_parity_clients().await?;
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
 
     let zinder_info = zinder.get_lightd_info(Empty {}).await?.into_inner();
     let reference_info = reference.get_lightd_info(Empty {}).await?.into_inner();
@@ -67,8 +71,12 @@ async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn latest_block_matches_reference() -> Result<()> {
     let _guard = init();
-    let _env = require_live()?;
-    let (mut zinder, mut reference) = open_parity_clients().await?;
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
 
     let zinder_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
     let reference_block = reference.get_latest_block(ChainSpec {}).await?.into_inner();
@@ -95,8 +103,12 @@ async fn latest_block_matches_reference() -> Result<()> {
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn compact_block_range_matches_reference_for_first_blocks() -> Result<()> {
     let _guard = init();
-    let _env = require_live()?;
-    let (mut zinder, mut reference) = open_parity_clients().await?;
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
 
     let request = || BlockRange {
         start: Some(BlockId {
@@ -145,8 +157,12 @@ async fn compact_block_range_matches_reference_for_first_blocks() -> Result<()> 
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn transaction_round_trips_through_get_transaction_by_hash() -> Result<()> {
     let _guard = init();
-    let _env = require_live()?;
-    let (mut zinder, mut reference) = open_parity_clients().await?;
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
 
     let block = zinder
         .get_block(BlockId {
@@ -182,15 +198,21 @@ async fn transaction_round_trips_through_get_transaction_by_hash() -> Result<()>
     Ok(())
 }
 
-async fn open_parity_clients() -> Result<(
-    CompactTxStreamerClient<tonic::transport::Channel>,
-    CompactTxStreamerClient<tonic::transport::Channel>,
-)> {
-    let zinder_addr = require_env("ZINDER_TEST_PARITY_ZINDER_ADDR")?;
-    let reference_addr = require_env("ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR")?;
+async fn open_parity_clients() -> Result<
+    Option<(
+        CompactTxStreamerClient<tonic::transport::Channel>,
+        CompactTxStreamerClient<tonic::transport::Channel>,
+    )>,
+> {
+    let Some(zinder_addr) = optional_env("ZINDER_TEST_PARITY_ZINDER_ADDR")? else {
+        return Ok(None);
+    };
+    let Some(reference_addr) = optional_env("ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR")? else {
+        return Ok(None);
+    };
     let zinder = CompactTxStreamerClient::new(Endpoint::new(zinder_addr)?.connect().await?);
     let reference = CompactTxStreamerClient::new(Endpoint::new(reference_addr)?.connect().await?);
-    Ok((zinder, reference))
+    Ok(Some((zinder, reference)))
 }
 
 async fn drain_block_range(

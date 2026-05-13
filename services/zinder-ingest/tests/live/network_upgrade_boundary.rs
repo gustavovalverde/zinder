@@ -61,11 +61,14 @@ const NEAR_BOUNDARY_DEPTH_BLOCKS: u32 = 16;
 )]
 async fn mined_consensus_branch_id_advances_across_latest_activation_height() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[
+    let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
 
     // Make sure regtest has at least one block above the activation window.
     let tip_before = fetch_live_tip_height(&env).await?;

@@ -8,6 +8,7 @@
 #   T2 perf         -> tests/perf/                      (ci-perf profile)
 #   T3 live         -> tests/live/                      (ci-live profile)
 #   T3 Zallet live  -> tests/live/zallet.rs             (ci-zallet-live profile)
+#   T3 deploy       -> tests/deploy/                    (ci-deploy profile)
 #   T4 parity       -> tests/parity/                    (ci-parity profile)
 #
 # default-filter is the structural boundary between tiers; #[ignore] is the
@@ -17,7 +18,7 @@
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 fail-fast = false
-default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"
+default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/) and not test(/^deploy::/)"
 
 [profile.ci]
 inherits = "default"
@@ -41,6 +42,24 @@ default-filter = "test(/^live::zallet::/)"
 retries = { count = 1, backoff = "exponential", delay = "5s" }
 slow-timeout = { period = "2m", terminate-after = 1 }
 junit = { path = "target/nextest/zallet-live.xml" }
+
+# Deployment-tier smoke tests build the actual `deploy/single-container`
+# image and exercise it end-to-end against the regtest sidecar. Slow and
+# Docker-dependent; the per-PR pipeline skips this profile, and the
+# nightly/release pipeline runs it on the matrix that has Docker available.
+# Tests live under `tests/deploy/` and are double-gated by
+# `#[ignore = DEPLOY_TEST_IGNORE_REASON]` plus a runtime `require_docker()`
+# probe so a developer machine without Docker silently skips instead of
+# failing the live-suite run.
+[profile.ci-deploy]
+default-filter = "test(/^deploy::/)"
+# The first invocation builds the deploy image from scratch (RocksDB + zstd-sys
+# go through bindgen, the Rust workspace compiles in release mode); the cold
+# build can run 10+ minutes on a clean cache. Subsequent invocations hit the
+# Docker layer cache and finish in seconds. Set the slow-timeout to 15m so
+# cold builds do not get killed on the first pass.
+slow-timeout = { period = "15m", terminate-after = 1 }
+junit = { path = "target/nextest/deploy.xml" }
 
 # Consumer-release certification tier per ADR-0012. Per-consumer parity
 # assertions live under `tests/parity/` in each crate that surfaces a public

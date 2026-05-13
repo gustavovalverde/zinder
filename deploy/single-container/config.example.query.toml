@@ -1,0 +1,27 @@
+# Reference `zinder-query` configuration for the single-container image
+# (mounted at /etc/zinder/query.toml).
+#
+# The reader points at the in-process IngestControl writer over loopback;
+# operators wanting cross-host topology should set
+# `storage.ingest_control_addr` to the writer's external URL and add a
+# shared-secret bearer token (ADR-0009).
+
+[network]
+name = "zcash-testnet"
+
+[node]
+json_rpc_addr = "http://zebra:8232"
+request_timeout_secs = 30
+
+[node.auth]
+method = "basic"
+username = "zebra"
+password = "REPLACE_VIA_ENV_VAR"
+
+[storage]
+path = "/var/lib/zinder/store"
+secondary_path = "/var/lib/zinder/secondary"
+ingest_control_addr = "http://127.0.0.1:9100"
+
+[query]
+listen_addr = "0.0.0.0:9101"

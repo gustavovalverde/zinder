@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package zinder.v1.wallet;
 
+import "zinder/v1/ops/server_info.proto";
+
 // A visible, internally consistent chain snapshot used to answer a wallet
 // query.
 message ChainEpoch {
@@ -444,6 +446,17 @@ message ChainEventsRequest {
   // Stream family for an empty cursor. When from_cursor is non-empty, the
   // cursor's encoded family is authoritative.
   ChainEventStreamFamily family = 2;
+
+  // Address-invalidation filter ([ADR-0021]). Empty disables filtering.
+  // When non-empty, the server narrows envelopes to commits whose block
+  // range touches at least one of these transparent addresses, plus every
+  // reorg (which always passes through regardless of filter). Cursor
+  // semantics are unchanged; clients still re-derive per-address state
+  // from the committed compact block. Addresses are encoded as the same
+  // dotted-canonical strings accepted by transparent-address queries.
+  //
+  // [ADR-0021]: ../../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md
+  repeated string address_filter = 3;
 }
 
 // Durable range committed by one chain event.
@@ -506,59 +519,38 @@ message ChainEventEnvelope {
   }
 }
 
-// Server capability descriptor advertised to clients for capability discovery.
-message ServerCapabilities {
-  // Network identifier: "zcash-mainnet", "zcash-testnet", "zcash-regtest".
-  string network = 1;
-
-  // Semver of the running zinder binary.
-  string service_version = 2;
+// Wallet-plane server descriptor returned by `WalletQuery.ServerInfo`.
+//
+// `common` carries the cross-service identity, capability set, and
+// deprecation metadata defined in [`zinder.v1.ops.ServerInfo`]. The
+// wallet-specific fields below describe operator configuration that
+// constrains a wallet consumer's behavior (retention windows, reorg
+// depth, upstream-node capability snapshot, vendored lightwalletd
+// protocol commit, canonical artifact schema version).
+message WalletServerInfo {
+  // Cross-service identity and capability descriptor.
+  zinder.v1.ops.ServerInfo common = 1;
 
   // Vendored lightwalletd protocol commit served by this deployment.
-  string lightwalletd_protocol_commit = 3;
+  string lightwalletd_protocol_commit = 2;
 
   // Canonical artifact schema version.
-  uint32 schema_version = 4;
+  uint32 schema_version = 3;
 
   // Configured non-finalized window depth, in blocks.
-  uint32 reorg_window_blocks = 5;
+  uint32 reorg_window_blocks = 4;
 
   // Chain-event retention window in seconds. 0 indicates unbounded retention
   // (development mode; rejected by --print-config in production).
-  uint64 chain_event_retention_seconds = 6;
+  uint64 chain_event_retention_seconds = 5;
 
-  // Mempool-event retention windows. 0 indicates the corresponding event
+  // Mempool retention windows in seconds. 0 indicates the corresponding event
   // family is not retained on this deployment.
-  uint64 mempool_mined_retention_seconds = 7;
-  uint64 mempool_invalidated_retention_seconds = 8;
-
-  // Active capability strings. Exact-match. Order is not significant.
-  repeated string capabilities = 9;
-
-  // Capabilities scheduled for removal in a future version.
-  repeated DeprecatedCapability deprecated_capabilities = 10;
+  uint64 mempool_mined_retention_seconds = 6;
+  uint64 mempool_invalidated_retention_seconds = 7;
 
   // Upstream node capabilities detected by zinder-source.
-  NodeCapabilitiesDescriptor node = 11;
-
-  // Operator MCP server endpoint. Reserved for descriptor-shape stability and
-  // unset in v1.
-  optional string mcp_endpoint = 12;
-}
-
-// Deprecation entry for a capability scheduled for removal.
-message DeprecatedCapability {
-  // The deprecated capability string.
-  string capability = 1;
-
-  // Replacement capability, if any.
-  optional string replaced_by = 2;
-
-  // Minimum semver at which removal may happen.
-  string earliest_removal_version = 3;
-
-  // Operator-facing deprecation message.
-  string deprecation_notice = 4;
+  NodeCapabilitiesDescriptor node = 8;
 }
 
 // Upstream node capability descriptor. Storage-only query deployments may
@@ -571,12 +563,12 @@ message NodeCapabilitiesDescriptor {
   repeated string capabilities = 2;
 }
 
-// Server capability descriptor request.
+// Server descriptor request.
 message ServerInfoRequest {}
 
-// Server capability descriptor response.
+// Server descriptor response.
 message ServerInfoResponse {
-  ServerCapabilities capabilities = 1;
+  WalletServerInfo info = 1;
 }
 
 // Reason a mempool transaction was removed without being mined.

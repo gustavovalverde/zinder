@@ -26,7 +26,7 @@ pub use mempool_source::{
     MempoolHydrationFailureReason, MempoolSource, MempoolSourceBackend, MempoolSourceCapabilities,
     MempoolSourceEntry, MempoolSourceEvent, MempoolSourceEventStream,
 };
-pub use node_auth::NodeAuth;
+pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};
 pub use node_source::{NodeSource, TransactionBroadcaster};
 pub use node_target::{

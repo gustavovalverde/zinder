@@ -24,7 +24,7 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_ch
 use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge};
 use zinder_store::{
     StreamCursorTokenV1, chain_epoch_from_message, chain_event_stream_family_from_message,
-    run_chain_event_stream, stream_cursor_from_message_bytes,
+    stream_cursor_from_message_bytes,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -33,15 +33,15 @@ use crate::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxosRequest, WalletQueryApi,
 };
 
+use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
     ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
-    build_compact_block_message, build_server_capabilities_message,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
-    chain_events_response, compact_block_response, latest_block_response,
-    latest_tree_state_response, subtree_roots_response, transaction_response,
-    transparent_address_confirmed_balance_response, transparent_address_utxos_response,
-    transparent_prevouts_response, tree_state_response,
+    build_compact_block_message, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_utxos_stream_chunk, build_wallet_server_info, compact_block_response,
+    latest_block_response, latest_tree_state_response, subtree_roots_response,
+    transaction_response, transparent_address_confirmed_balance_response,
+    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
 use super::status_from_query_error;
 
@@ -341,20 +341,12 @@ where
         let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
         let family = chain_event_stream_family_from_message(request.family)
             .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
+        let network = self.server_info_network()?;
+        let address_filter = decode_address_filter(request.address_filter, network)
+            .map_err(|error| status_from_query_error(&error))?;
         let query_api = self.query_api.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
-        tokio::spawn(run_chain_event_stream(
-            from_cursor,
-            move |cursor| {
-                let query_api = query_api.clone();
-                async move {
-                    chain_events_response(&query_api, cursor, family)
-                        .await
-                        .map_err(|error| status_from_query_error(&error))
-                }
-            },
-            event_sender,
-        ));
+        spawn_filtered_stream(query_api, from_cursor, family, address_filter, event_sender);
 
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
     }
@@ -609,32 +601,37 @@ where
         //     derive plane is configured and ready. It signals that the same
         //     response additionally carries the live mempool overlay in
         //     `unconfirmed_delta_zat`.
-        let mut capabilities = build_server_capabilities_message(&self.server_info);
+        let mut wallet_info = build_wallet_server_info(&self.server_info);
+        let Some(common) = wallet_info.common.as_mut() else {
+            return Err(Status::internal(
+                "build_wallet_server_info must populate ops.ServerInfo",
+            ));
+        };
         let federated_capability = self
             .explorer_proxy
             .as_ref()
             .filter(|proxy| proxy.is_ready())
             .map(|proxy| proxy.capability().to_owned());
         if let Some(capability) = federated_capability {
-            if !capabilities.capabilities.contains(&capability) {
-                capabilities.capabilities.push(capability);
+            if !common.capabilities.contains(&capability) {
+                common.capabilities.push(capability);
             }
         } else {
-            capabilities
+            common
                 .capabilities
                 .retain(|advertised| advertised != DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1);
         }
-        if !capabilities
+        if !common
             .capabilities
             .iter()
             .any(|advertised| advertised == WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)
         {
-            capabilities
+            common
                 .capabilities
                 .push(WALLET_ADDRESS_TRANSPARENT_BALANCE_V1.to_owned());
         }
         Ok(Response::new(wallet::ServerInfoResponse {
-            capabilities: Some(capabilities),
+            info: Some(wallet_info),
         }))
     }
 }

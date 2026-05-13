@@ -92,6 +92,7 @@ async fn ingest_control_streams_chain_events_from_primary_store() -> Result<()> 
         .chain_events(ChainEventsRequest {
             from_cursor: Vec::new(),
             family: ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         })
         .await?
         .into_inner();

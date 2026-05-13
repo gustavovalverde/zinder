@@ -72,7 +72,9 @@ const MEMPOOL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_source() -> Result<()>
 {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let json_rpc = zebra_source(&env)?;
     let schedule = json_rpc
         .fetch_network_upgrade_activations()
@@ -448,7 +450,9 @@ async fn wait_for_mined(
 async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempool_added()
 -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let json_rpc = zebra_source(&env)?;
     let schedule = json_rpc
         .fetch_network_upgrade_activations()

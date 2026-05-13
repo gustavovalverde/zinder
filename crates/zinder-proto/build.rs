@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_wallet_proto_dir = "proto/zinder/v1/wallet";
     let native_ingest_proto_dir = "proto/zinder/v1/ingest";
     let native_explorer_proto_dir = "proto/zinder/v1/explorer";
+    let native_ops_proto_dir = "proto/zinder/v1/ops";
     let zebra_indexer_proto_dir = "proto/external/zebra";
     let zebra_indexer_commit_file = format!("{zebra_indexer_proto_dir}/COMMIT");
     let compat_proto_files = [
@@ -20,6 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{native_wallet_proto_dir}/wallet.proto"),
         format!("{native_ingest_proto_dir}/ingest.proto"),
         format!("{native_explorer_proto_dir}/explorer.proto"),
+        format!("{native_ops_proto_dir}/readiness.proto"),
+        format!("{native_ops_proto_dir}/error.proto"),
+        format!("{native_ops_proto_dir}/server_info.proto"),
     ];
     let zebra_indexer_proto_files = [format!("{zebra_indexer_proto_dir}/indexer.proto")];
     let compat_include_dirs = [compat_proto_dir.to_owned()];

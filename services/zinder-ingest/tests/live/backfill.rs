@@ -19,14 +19,17 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     assert_lightwalletd_send_transaction_classifies_invalid, assert_native_wallet_read_responses,
-    fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
 };
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn backfills_initial_range() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
@@ -69,8 +72,21 @@ async fn backfills_initial_range() -> Result<()> {
     assert_eq!(compact_block.height, to_height);
     assert_eq!(tree_state.height, to_height);
     assert!(!tree_state.payload_bytes.is_empty());
-    assert_native_wallet_read_responses(&store, env.network(), 1, to_height.value()).await?;
-    assert_lightwalletd_send_transaction_classifies_invalid(&store, &backfill_config).await?;
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
+    assert_native_wallet_read_responses(
+        &store,
+        env.network(),
+        1,
+        to_height.value(),
+        Arc::clone(&activations),
+    )
+    .await?;
+    assert_lightwalletd_send_transaction_classifies_invalid(
+        &store,
+        &backfill_config,
+        Arc::clone(&activations),
+    )
+    .await?;
     Ok(())
 }
 
@@ -78,7 +94,9 @@ async fn backfills_initial_range() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn backfills_from_checkpoint() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
 
     let tip_height = fetch_live_tip_height(&env).await?;
     if tip_height.value() < 60 {
@@ -146,6 +164,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
         env.network(),
         from_height.value(),
         tip_height.value(),
+        Arc::new(sample_regtest_upgrade_activations()),
     )
     .await?;
     Ok(())
@@ -160,7 +179,9 @@ async fn backfills_from_checkpoint() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashMainnet])?;
+    let Some(env) = require_live_for(&[Network::ZcashMainnet])? else {
+        return Ok(());
+    };
 
     let tip_height = fetch_live_tip_height(&env).await?;
     if tip_height.value() < 1100 {

@@ -1,9 +1,19 @@
 //! Typed readiness state shared by every Zinder service.
+//!
+//! The hand-written [`ReadinessCause`] enum below mirrors the proto-defined
+//! `zinder.v1.ops.ReadinessCause` enum 1:1. The proto enum is the documented
+//! source of truth for the cause vocabulary
+//! ([ADR-0020](../../../docs/adrs/0020-machine-readable-readiness-causes.md)).
+//! The Rust enum carries the struct-variant payloads so the existing
+//! `/readyz` JSON wire shape stays byte-identical; the [`ReadinessReport`]
+//! type below converts to the proto message via [`Into`] for any gRPC
+//! consumer.
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::Serialize;
+use zinder_proto::v1::ops as ops_proto;
 
 /// Stable readiness cause matching `docs/architecture/service-operations.md`.
 ///
@@ -385,6 +395,121 @@ impl ReadinessState {
     }
 }
 
+impl From<&ReadinessCause> for ops_proto::ReadinessCause {
+    fn from(cause: &ReadinessCause) -> Self {
+        match cause {
+            ReadinessCause::Starting => Self::Starting,
+            ReadinessCause::Syncing { .. } => Self::Syncing,
+            ReadinessCause::Ready => Self::Ready,
+            ReadinessCause::NodeUnavailable => Self::NodeUnavailable,
+            ReadinessCause::NodeCapabilityMissing { .. } => Self::NodeCapabilityMissing,
+            ReadinessCause::StorageUnavailable => Self::StorageUnavailable,
+            ReadinessCause::SchemaMismatch => Self::SchemaMismatch,
+            ReadinessCause::ReorgWindowExceeded { .. } => Self::ReorgWindowExceeded,
+            ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
+            ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
+            ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
+            ReadinessCause::MempoolCursorAtRisk { .. } => Self::MempoolCursorAtRisk,
+            ReadinessCause::MempoolSourceUnavailable => Self::MempoolSourceUnavailable,
+            ReadinessCause::MempoolHydrationLagging { .. } => Self::MempoolHydrationLagging,
+            ReadinessCause::ShuttingDown => Self::ShuttingDown,
+        }
+    }
+}
+
+impl From<ReadinessCause> for ops_proto::ReadinessCause {
+    fn from(cause: ReadinessCause) -> Self {
+        Self::from(&cause)
+    }
+}
+
+impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
+    fn from(cause: &ReadinessCause) -> Self {
+        let payload = match cause {
+            ReadinessCause::Syncing { lag_blocks } => {
+                ops_proto::readiness_cause_detail::Payload::Syncing(ops_proto::SyncingDetail {
+                    lag_blocks: *lag_blocks,
+                })
+            }
+            ReadinessCause::NodeCapabilityMissing { capability } => {
+                ops_proto::readiness_cause_detail::Payload::NodeCapabilityMissing(
+                    ops_proto::NodeCapabilityMissingDetail {
+                        capability: (*capability).to_owned(),
+                    },
+                )
+            }
+            ReadinessCause::ReorgWindowExceeded { depth, configured } => {
+                ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(
+                    ops_proto::ReorgWindowExceededDetail {
+                        depth: *depth,
+                        configured: *configured,
+                    },
+                )
+            }
+            ReadinessCause::ReplicaLagging { lag_chain_epochs } => {
+                ops_proto::readiness_cause_detail::Payload::ReplicaLagging(
+                    ops_proto::ReplicaLaggingDetail {
+                        lag_chain_epochs: *lag_chain_epochs,
+                    },
+                )
+            }
+            ReadinessCause::CursorAtRisk {
+                oldest_retained_age_hours,
+                retention_hours,
+            } => ops_proto::readiness_cause_detail::Payload::CursorAtRisk(
+                ops_proto::CursorAtRiskDetail {
+                    oldest_retained_age_hours: *oldest_retained_age_hours,
+                    retention_hours: *retention_hours,
+                },
+            ),
+            ReadinessCause::MempoolCursorAtRisk {
+                oldest_retained_age_minutes,
+                retention_minutes,
+            } => ops_proto::readiness_cause_detail::Payload::MempoolCursorAtRisk(
+                ops_proto::MempoolCursorAtRiskDetail {
+                    oldest_retained_age_minutes: *oldest_retained_age_minutes,
+                    retention_minutes: *retention_minutes,
+                },
+            ),
+            ReadinessCause::MempoolHydrationLagging {
+                recent_hydration_failures,
+            } => ops_proto::readiness_cause_detail::Payload::MempoolHydrationLagging(
+                ops_proto::MempoolHydrationLaggingDetail {
+                    recent_hydration_failures: *recent_hydration_failures,
+                },
+            ),
+            ReadinessCause::Starting
+            | ReadinessCause::Ready
+            | ReadinessCause::NodeUnavailable
+            | ReadinessCause::StorageUnavailable
+            | ReadinessCause::SchemaMismatch
+            | ReadinessCause::WriterStatusUnavailable
+            | ReadinessCause::MempoolSourceUnavailable
+            | ReadinessCause::ShuttingDown => return None,
+        };
+        Some(ops_proto::ReadinessCauseDetail {
+            payload: Some(payload),
+        })
+    }
+}
+
+impl From<&ReadinessReport> for ops_proto::ReadinessReport {
+    fn from(report: &ReadinessReport) -> Self {
+        Self {
+            cause: ops_proto::ReadinessCause::from(&report.cause) as i32,
+            current_height: report.current_height,
+            target_height: report.target_height,
+            detail: Option::<ops_proto::ReadinessCauseDetail>::from(&report.cause),
+        }
+    }
+}
+
+impl From<ReadinessReport> for ops_proto::ReadinessReport {
+    fn from(report: ReadinessReport) -> Self {
+        Self::from(&report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +659,135 @@ mod tests {
             ReadinessCause::ALL_METRIC_LABELS.len(),
             "ALL_METRIC_LABELS cardinality must equal ReadinessCause variant count",
         );
+    }
+
+    fn proto_cause_for(cause: &ReadinessCause) -> ops_proto::ReadinessCause {
+        match cause {
+            ReadinessCause::Starting => ops_proto::ReadinessCause::Starting,
+            ReadinessCause::Syncing { .. } => ops_proto::ReadinessCause::Syncing,
+            ReadinessCause::Ready => ops_proto::ReadinessCause::Ready,
+            ReadinessCause::NodeUnavailable => ops_proto::ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeCapabilityMissing { .. } => {
+                ops_proto::ReadinessCause::NodeCapabilityMissing
+            }
+            ReadinessCause::StorageUnavailable => ops_proto::ReadinessCause::StorageUnavailable,
+            ReadinessCause::SchemaMismatch => ops_proto::ReadinessCause::SchemaMismatch,
+            ReadinessCause::ReorgWindowExceeded { .. } => {
+                ops_proto::ReadinessCause::ReorgWindowExceeded
+            }
+            ReadinessCause::ReplicaLagging { .. } => ops_proto::ReadinessCause::ReplicaLagging,
+            ReadinessCause::WriterStatusUnavailable => {
+                ops_proto::ReadinessCause::WriterStatusUnavailable
+            }
+            ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
+            ReadinessCause::MempoolCursorAtRisk { .. } => {
+                ops_proto::ReadinessCause::MempoolCursorAtRisk
+            }
+            ReadinessCause::MempoolSourceUnavailable => {
+                ops_proto::ReadinessCause::MempoolSourceUnavailable
+            }
+            ReadinessCause::MempoolHydrationLagging { .. } => {
+                ops_proto::ReadinessCause::MempoolHydrationLagging
+            }
+            ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
+        }
+    }
+
+    #[test]
+    fn proto_cause_maps_every_variant() {
+        for cause in every_rust_cause() {
+            assert_eq!(
+                ops_proto::ReadinessCause::from(&cause),
+                proto_cause_for(&cause),
+                "Rust cause {cause:?} mapped to the wrong proto code"
+            );
+        }
+    }
+
+    fn every_rust_cause() -> Vec<ReadinessCause> {
+        vec![
+            ReadinessCause::Starting,
+            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Ready,
+            ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeCapabilityMissing {
+                capability: "tx_broadcast",
+            },
+            ReadinessCause::StorageUnavailable,
+            ReadinessCause::SchemaMismatch,
+            ReadinessCause::ReorgWindowExceeded {
+                depth: 0,
+                configured: 0,
+            },
+            ReadinessCause::ReplicaLagging {
+                lag_chain_epochs: 0,
+            },
+            ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::CursorAtRisk {
+                oldest_retained_age_hours: 0,
+                retention_hours: 0,
+            },
+            ReadinessCause::MempoolCursorAtRisk {
+                oldest_retained_age_minutes: 0,
+                retention_minutes: 0,
+            },
+            ReadinessCause::MempoolSourceUnavailable,
+            ReadinessCause::MempoolHydrationLagging {
+                recent_hydration_failures: 0,
+            },
+            ReadinessCause::ShuttingDown,
+        ]
+    }
+
+    #[test]
+    fn proto_report_preserves_payload_for_parametric_causes() {
+        let report = ReadinessReport {
+            is_ready: false,
+            cause: ReadinessCause::ReorgWindowExceeded {
+                depth: 12,
+                configured: 10,
+            },
+            current_height: Some(100),
+            target_height: None,
+        };
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(
+            proto.cause,
+            ops_proto::ReadinessCause::ReorgWindowExceeded as i32
+        );
+        assert_eq!(proto.current_height, Some(100));
+        assert_eq!(proto.target_height, None);
+
+        let Some(detail) = proto.detail else {
+            unreachable!("parametric cause must carry detail")
+        };
+        let Some(payload) = detail.payload else {
+            unreachable!("detail must carry a payload")
+        };
+        let ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(payload) = payload
+        else {
+            unreachable!("expected ReorgWindowExceeded payload variant")
+        };
+        assert_eq!(payload.depth, 12);
+        assert_eq!(payload.configured, 10);
+    }
+
+    #[test]
+    fn proto_report_carries_no_detail_for_scalar_causes() {
+        let report = ReadinessReport {
+            is_ready: false,
+            cause: ReadinessCause::NodeUnavailable,
+            current_height: None,
+            target_height: None,
+        };
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(
+            proto.cause,
+            ops_proto::ReadinessCause::NodeUnavailable as i32
+        );
+        assert!(proto.detail.is_none());
     }
 
     #[test]

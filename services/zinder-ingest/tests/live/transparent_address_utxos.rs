@@ -38,7 +38,9 @@ const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn transparent_address_utxos_surface_through_typed_wallet_query() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let test_key = TransparentTestKey::from_seed(&BROADCAST_TEST_SEED)
         .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();

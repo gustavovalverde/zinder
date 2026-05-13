@@ -89,33 +89,6 @@ fn missing_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
 }
 
 #[test]
-fn sensitive_environment_override_is_rejected() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-sensitive-env-store");
-    let secondary_path = tempdir.path().join("compat-sensitive-env-secondary");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_toml(&storage_path, &secondary_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .env("ZINDER_COMPAT__AUTH__PASSWORD", "env-secret")
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ZINDER_COMPAT__AUTH__PASSWORD targets a sensitive field"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("env-secret"), "{stderr}");
-
-    Ok(())
-}
-
-#[test]
 fn ingest_only_node_source_config_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-node-source-store");

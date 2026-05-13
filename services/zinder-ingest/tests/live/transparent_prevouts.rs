@@ -54,11 +54,14 @@ const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn sampled_coinbase_outpoint_resolves_through_transparent_prevouts() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[
+    let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
     let network = env.network();
     let (storage_path_owner, store, sample) = backfill_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;

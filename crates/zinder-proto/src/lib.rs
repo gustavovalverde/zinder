@@ -4,7 +4,7 @@
 //! do not hand-write protocol-shaped payload structs.
 
 pub mod capabilities;
-pub use capabilities::{CapabilityDescriptor, ZINDER_CAPABILITIES};
+pub use capabilities::{CapabilityDescriptor, INGEST_CONTROL_CAPABILITIES, ZINDER_CAPABILITIES};
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///
@@ -41,6 +41,27 @@ pub mod v1 {
         )]
 
         include!(concat!(env!("OUT_DIR"), "/zinder.v1.ingest.rs"));
+    }
+
+    /// Operations-plane protocol messages (readiness, error vocabulary,
+    /// shared ServerInfo) consumed by the ops endpoint and any future
+    /// orchestrator-facing gRPC surface.
+    pub mod ops {
+        #![allow(
+            clippy::allow_attributes_without_reason,
+            clippy::default_trait_access,
+            clippy::derive_partial_eq_without_eq,
+            clippy::disallowed_names,
+            clippy::doc_markdown,
+            clippy::missing_fields_in_debug,
+            clippy::must_use_candidate,
+            clippy::too_long_first_doc_paragraph,
+            clippy::too_many_lines,
+            missing_docs,
+            reason = "Generated protobuf code mirrors owned schemas."
+        )]
+
+        include!(concat!(env!("OUT_DIR"), "/zinder.v1.ops.rs"));
     }
 
     /// Explorer-shaped read protocol messages served by zinder-derive.

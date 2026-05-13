@@ -1,26 +1,34 @@
 //! Native gRPC adapter and protobuf encoders for the wallet query plane.
 
 mod adapter;
+mod chain_events;
 mod native;
+
+use std::collections::HashMap;
 
 use tonic::{Code, Status};
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation, StatusExt};
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
+use zinder_proto::v1::ops::ErrorReason;
 use zinder_store::status_from_store_error;
 
 use crate::QueryError;
 
+/// Domain attached to every `google.rpc.ErrorInfo` returned by a Zinder
+/// service. The Rust client matches on this domain to know an [`ErrorInfo`]
+/// originated from Zinder before trusting its `reason` field.
+pub(crate) const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
+
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings,
+    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings, UpstreamNodeCapabilities,
     address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
-    build_server_capabilities_message, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_utxos_stream_chunk, chain_events_response, compact_block_response,
-    latest_block_response, latest_tree_state_response, subtree_roots_response,
-    transaction_response, transparent_address_confirmed_balance_response,
-    transparent_address_tx_ids_response, transparent_address_utxos_response,
-    transparent_prevouts_response, tree_state_response,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
+    build_wallet_server_info, chain_events_response, compact_block_response, latest_block_response,
+    latest_tree_state_response, subtree_roots_response, transaction_response,
+    transparent_address_confirmed_balance_response, transparent_address_tx_ids_response,
+    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -35,7 +43,7 @@ pub use native::{
 pub fn status_from_query_error(error: &QueryError) -> Status {
     let message = error.to_string();
 
-    match error {
+    let (code, mut details) = match error {
         QueryError::InvalidBlockRange { .. }
         | QueryError::CompactBlockRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
@@ -43,20 +51,18 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
         | QueryError::UnsupportedShieldedProtocol { .. } => {
-            Status::with_error_details(Code::InvalidArgument, message, bad_request_details(error))
+            (Code::InvalidArgument, bad_request_details(error))
         }
         QueryError::TransactionBroadcastDisabled
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnsupported
         | QueryError::ChainEpochPinUnavailable { .. }
-        | QueryError::ChainEpochPinMismatch { .. } => Status::with_error_details(
+        | QueryError::ChainEpochPinMismatch { .. } => (
             Code::FailedPrecondition,
-            message,
             precondition_failure_details(error),
         ),
-        QueryError::ArtifactUnavailable { family, key } => Status::with_error_details(
+        QueryError::ArtifactUnavailable { family, key } => (
             Code::NotFound,
-            message,
             ErrorDetails::with_resource_info(
                 format!("{family:?}"),
                 key.to_string(),
@@ -65,15 +71,60 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
             ),
         ),
         QueryError::CompactBlockPayloadMalformed { .. } | QueryError::ArtifactCorrupt { .. } => {
-            Status::data_loss(message)
+            (Code::DataLoss, ErrorDetails::new())
         }
-        QueryError::BlockNotInBestChain => Status::not_found(message),
+        QueryError::BlockNotInBestChain => (Code::NotFound, ErrorDetails::new()),
         QueryError::UnsupportedChainEvent { .. }
         | QueryError::UnsupportedBlockSelector { .. }
         | QueryError::UnsupportedTransactionStatus { .. }
         | QueryError::BlockingTaskFailed { .. }
-        | QueryError::Node(_) => Status::unavailable(message),
-        QueryError::Store(error) => status_from_store_error(error),
+        | QueryError::Node(_) => (Code::Unavailable, ErrorDetails::new()),
+        QueryError::Store(error) => return status_from_store_error(error),
+    };
+
+    let reason = error_reason_for_query_error(error);
+    details.set_error_info(reason.as_str_name(), ZINDER_ERROR_DOMAIN, HashMap::new());
+    Status::with_error_details(code, message, details)
+}
+
+/// Maps each [`QueryError`] variant to its stable [`ErrorReason`].
+///
+/// The reason code is the typed key clients pin to. Pair with the gRPC
+/// `Status::code()` for the retry semantics and with the existing structured
+/// detail types (`BadRequest`, `PreconditionFailure`, `ResourceInfo`) for the
+/// failure-shape detail.
+fn error_reason_for_query_error(error: &QueryError) -> ErrorReason {
+    match error {
+        QueryError::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
+        QueryError::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
+        QueryError::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
+        QueryError::TransparentUtxoCursorInvalid { .. } => {
+            ErrorReason::TransparentUtxoCursorInvalid
+        }
+        QueryError::TransparentHistoryCursorInvalid { .. } => {
+            ErrorReason::TransparentHistoryCursorInvalid
+        }
+        QueryError::InvalidAddress { .. } => ErrorReason::InvalidAddress,
+        QueryError::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
+        QueryError::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
+        QueryError::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
+        QueryError::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
+        QueryError::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
+        QueryError::ChainEpochPinMismatch { .. } => ErrorReason::ChainEpochPinMismatch,
+        QueryError::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
+        QueryError::CompactBlockPayloadMalformed { .. } => {
+            ErrorReason::CompactBlockPayloadMalformed
+        }
+        QueryError::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
+        QueryError::BlockNotInBestChain => ErrorReason::BlockNotInBestChain,
+        QueryError::UnsupportedChainEvent { .. } => ErrorReason::UnsupportedChainEvent,
+        QueryError::UnsupportedBlockSelector { .. } => ErrorReason::UnsupportedBlockSelector,
+        QueryError::UnsupportedTransactionStatus { .. } => {
+            ErrorReason::UnsupportedTransactionStatus
+        }
+        QueryError::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
+        QueryError::Node(_) => ErrorReason::NodeUnavailable,
+        QueryError::Store(_) => ErrorReason::Unspecified,
     }
 }
 

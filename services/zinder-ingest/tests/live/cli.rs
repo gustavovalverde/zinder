@@ -18,8 +18,9 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     BackfillConfigToml, WalletServingBackfillConfigToml, assert_native_wallet_read_responses,
-    backfill_config_toml, basic_auth_credentials, live_backfill_config,
-    wallet_serving_backfill_config_toml, zebra_source_from_backfill, zinder_ingest_command,
+    backfill_config_toml, basic_auth_credentials, fetch_live_network_upgrade_activations,
+    live_backfill_config, wallet_serving_backfill_config_toml, zebra_source_from_backfill,
+    zinder_ingest_command,
 };
 
 const WALLET_SERVING_BOUNDED_DEPTH_BLOCKS: u32 = 150;
@@ -28,7 +29,9 @@ const WALLET_SERVING_BOUNDED_DEPTH_BLOCKS: u32 = 150;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn cli_backfills_initial_range_from_config() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let (username, password) = basic_auth_credentials(&env)?;
 
     let tempdir = tempdir()?;
@@ -81,7 +84,9 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip compact block artifact"))?;
 
     assert_eq!(compact_block.height, to_height);
-    assert_native_wallet_read_responses(&store, env.network(), 1, to_height.value()).await?;
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
+    assert_native_wallet_read_responses(&store, env.network(), 1, to_height.value(), activations)
+        .await?;
     Ok(())
 }
 
@@ -93,7 +98,9 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
 )]
 async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])?;
+    let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
+        return Ok(());
+    };
     let (username, password) = basic_auth_credentials(&env)?;
 
     let tempdir = tempdir()?;

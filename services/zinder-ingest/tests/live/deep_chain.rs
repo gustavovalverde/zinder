@@ -31,7 +31,9 @@ async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
     // Backfilling [1, tip] only fits in CI budgets on regtest. Hosted networks
     // need the checkpoint-bounded backfill (BackfillConfig::checkpoint) before
     // this test can run there.
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");

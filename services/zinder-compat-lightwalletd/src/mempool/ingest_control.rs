@@ -259,6 +259,7 @@ async fn run_ingest_control_tip_change_session(
         .chain_events(Request::new(wallet::ChainEventsRequest {
             from_cursor: Vec::new(),
             family: wallet::ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         }))
         .await;
     let response = match response_outcome {

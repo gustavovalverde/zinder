@@ -20,7 +20,9 @@ use crate::common::{live_tip_follow_config, zebra_source_from_tip_follow};
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn tip_follow_advances_to_node_tip() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");

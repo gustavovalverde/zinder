@@ -1,0 +1,16 @@
+#!/command/with-contenv sh
+#
+# s6 invokes this script when the supervised service exits. We propagate
+# the underlying exit code so the container exits if zinder-ingest dies
+# (rather than silently restarting forever, which would mask a real
+# regression).
+
+set -eu
+
+# Arg 1: the service exit code (or 256 if it was signal-killed).
+exit_code="${1:-0}"
+
+# Tell s6-overlay to shut the container down and inherit the exit code.
+# 125 is a documented s6 convention meaning "do not restart this service;
+# stop the supervisor instead".
+exec s6-svscanctl -t /run/service

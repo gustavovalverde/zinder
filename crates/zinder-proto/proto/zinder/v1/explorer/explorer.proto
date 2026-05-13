@@ -2,31 +2,28 @@ syntax = "proto3";
 
 package zinder.v1.explorer;
 
+import "zinder/v1/ops/server_info.proto";
 import "zinder/v1/wallet/wallet.proto";
 
-// Capability descriptor advertised by `ExplorerQuery.ServerInfo`.
-message ExplorerServerCapabilities {
-  // Capability strings advertised by the running zinder-derive instance.
-  // Format: `derive.{consumer}.{capability}_v{N}` per
-  // docs/architecture/derive-plane.md.
-  repeated string capabilities = 1;
+// Explorer-plane server descriptor returned by `ExplorerQuery.ServerInfo`.
+//
+// `common` carries the cross-service identity, capability set, and
+// deprecation metadata defined in [`zinder.v1.ops.ServerInfo`]. The
+// `vendor` field is the only explorer-specific addition today.
+message ExplorerServerInfo {
+  // Cross-service identity and capability descriptor.
+  zinder.v1.ops.ServerInfo common = 1;
 
   // Service vendor, always "Zinder".
   string vendor = 2;
-
-  // Service semantic version reported by `CARGO_PKG_VERSION`.
-  string version = 3;
-
-  // Network this consumer mirrors, for example `zcash-mainnet`.
-  string network = 4;
 }
 
-// Server capability descriptor request.
+// Server descriptor request.
 message ServerInfoRequest {}
 
-// Server capability descriptor response.
+// Server descriptor response.
 message ServerInfoResponse {
-  ExplorerServerCapabilities capabilities = 1;
+  ExplorerServerInfo info = 1;
 }
 
 // Explorer-shaped read surface served by zinder-derive.

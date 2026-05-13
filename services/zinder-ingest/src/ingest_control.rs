@@ -11,12 +11,13 @@ use zinder_core::{
     ChainEpoch, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
+use zinder_proto::INGEST_CONTROL_CAPABILITIES;
 use zinder_proto::v1::{
     ingest::{
-        WriterStatusRequest, WriterStatusResponse,
+        ServerInfoRequest, ServerInfoResponse, WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
-    wallet,
+    ops, wallet,
 };
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
@@ -117,6 +118,24 @@ impl IngestControlGrpcAdapter {
 impl IngestControl for IngestControlGrpcAdapter {
     type ChainEventsStream = ChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
+
+    async fn server_info(
+        &self,
+        _request: Request<ServerInfoRequest>,
+    ) -> Result<Response<ServerInfoResponse>, Status> {
+        let server_info = ops::ServerInfo {
+            network: encode_zinder_native_chain_name(self.network).to_owned(),
+            service_name: env!("CARGO_PKG_NAME").to_owned(),
+            service_version: env!("CARGO_PKG_VERSION").to_owned(),
+            capabilities: INGEST_CONTROL_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+        };
+        Ok(Response::new(ServerInfoResponse {
+            server_info: Some(server_info),
+        }))
+    }
 
     async fn writer_status(
         &self,

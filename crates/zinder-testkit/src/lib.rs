@@ -38,7 +38,9 @@
 //! [`PrimaryChainStore`]: zinder_store::PrimaryChainStore
 
 pub mod chain_fixture;
+pub mod deploy;
 pub mod live;
+pub mod log_capture;
 pub mod mock_mempool_source;
 pub mod mock_node_source;
 pub mod mock_transaction_broadcaster;
@@ -47,6 +49,7 @@ pub mod store_fixture;
 pub mod transparent_signer;
 
 pub use chain_fixture::{ChainFixture, FixtureBlock};
+pub use log_capture::{CapturedEvent, LogCapture};
 pub use mock_mempool_source::{
     MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,
 };

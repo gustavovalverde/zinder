@@ -21,7 +21,7 @@ use zinder_core::{
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
-use zinder_proto::v1::wallet;
+use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
@@ -36,7 +36,7 @@ use zinder_store::{
     chain_event_envelope_message, outpoint_message, transparent_prevout_entry_message,
 };
 
-/// Operator-configured snapshot used to build the `ServerCapabilities` descriptor.
+/// Operator-configured snapshot used to build the `WalletServerInfo` descriptor.
 ///
 /// Populated once at startup; the adapter does not call config-rs on each
 /// `ServerInfo` request.
@@ -61,6 +61,28 @@ pub struct ServerInfoSettings {
     pub mempool_mined_retention_seconds: u64,
     /// Mempool invalidated-event retention window in seconds.
     pub mempool_invalidated_retention_seconds: u64,
+    /// Upstream-node capability snapshot captured by the source probe.
+    ///
+    /// `None` for storage-only deployments that have no source handle
+    /// (e.g. a query service running purely off a `RocksDB` secondary).
+    /// When `Some`, the contents are surfaced through the `node` field of
+    /// the `WalletServerInfo` response and used to compute the
+    /// cross-service `ops.ServerInfo.upstream_node_fingerprint`.
+    pub upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
+}
+
+/// Snapshot of the upstream-node capability probe used by `ServerInfo`.
+///
+/// Kept in this crate to avoid pulling the `zinder-source` crate's
+/// `NodeCapability` enum across every consumer of `ServerInfoSettings`.
+/// Operators set this from the live probe at startup (see
+/// `services/zinder-query/src/bin/zinder-query/main.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct UpstreamNodeCapabilities {
+    /// Node-reported semantic version when available.
+    pub version: Option<String>,
+    /// Stable capability names observed on the upstream node.
+    pub capabilities: Vec<String>,
 }
 
 impl Default for ServerInfoSettings {
@@ -79,37 +101,63 @@ impl Default for ServerInfoSettings {
             chain_event_retention_seconds: 0,
             mempool_mined_retention_seconds: 0,
             mempool_invalidated_retention_seconds: 0,
+            upstream_node_capabilities: None,
         }
     }
 }
 
-/// Builds the `ServerCapabilities` descriptor from operator settings and the
-/// statically advertised capability list in [`ZINDER_CAPABILITIES`].
+/// Builds the `WalletServerInfo` descriptor from operator settings.
+///
+/// Embeds the cross-service [`ops::ServerInfo`] shape every Zinder gRPC
+/// surface returns, with capabilities sourced from [`ZINDER_CAPABILITIES`]
+/// filtered against the operator settings.
 #[must_use]
-pub fn build_server_capabilities_message(
-    settings: &ServerInfoSettings,
-) -> wallet::ServerCapabilities {
-    wallet::ServerCapabilities {
-        network: settings.network.clone(),
-        service_version: settings.service_version.clone(),
+pub fn build_wallet_server_info(settings: &ServerInfoSettings) -> wallet::WalletServerInfo {
+    wallet::WalletServerInfo {
+        common: Some(build_ops_server_info(settings)),
         lightwalletd_protocol_commit: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
         schema_version: settings.schema_version,
         reorg_window_blocks: settings.reorg_window_blocks,
         chain_event_retention_seconds: settings.chain_event_retention_seconds,
         mempool_mined_retention_seconds: settings.mempool_mined_retention_seconds,
         mempool_invalidated_retention_seconds: settings.mempool_invalidated_retention_seconds,
+        node: Some(build_node_capabilities_descriptor(
+            settings.upstream_node_capabilities.as_ref(),
+        )),
+    }
+}
+
+/// Builds the cross-service [`ops::ServerInfo`] descriptor for `zinder-query`.
+///
+/// Capability strings are filtered against the operator settings (e.g.
+/// broadcast is only advertised when a broadcaster is configured).
+#[must_use]
+fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
+    ops::ServerInfo {
+        network: settings.network.clone(),
+        service_name: env!("CARGO_PKG_NAME").to_owned(),
+        service_version: settings.service_version.clone(),
         capabilities: ZINDER_CAPABILITIES
             .iter()
             .filter(|capability| capability_enabled(capability, settings))
-            .map(|cap| (*cap).to_owned())
+            .map(|capability| (*capability).to_owned())
             .collect(),
-        deprecated_capabilities: Vec::new(),
-        node: Some(wallet::NodeCapabilitiesDescriptor {
+    }
+}
+
+fn build_node_capabilities_descriptor(
+    upstream: Option<&UpstreamNodeCapabilities>,
+) -> wallet::NodeCapabilitiesDescriptor {
+    upstream.map_or_else(
+        || wallet::NodeCapabilitiesDescriptor {
             version: None,
             capabilities: Vec::new(),
-        }),
-        mcp_endpoint: None,
-    }
+        },
+        |capabilities| wallet::NodeCapabilitiesDescriptor {
+            version: capabilities.version.clone(),
+            capabilities: capabilities.capabilities.clone(),
+        },
+    )
 }
 
 fn capability_enabled(capability: &&str, settings: &ServerInfoSettings) -> bool {
@@ -765,5 +813,51 @@ fn native_shielded_protocol(
         ShieldedProtocol::Sapling => Ok(wallet::ShieldedProtocol::Sapling),
         ShieldedProtocol::Orchard => Ok(wallet::ShieldedProtocol::Orchard),
         _ => Err(QueryError::UnsupportedShieldedProtocol { protocol }),
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::{ServerInfoSettings, UpstreamNodeCapabilities, build_wallet_server_info};
+
+    #[test]
+    fn build_wallet_server_info_populates_node_when_upstream_known() {
+        let settings = ServerInfoSettings {
+            upstream_node_capabilities: Some(UpstreamNodeCapabilities {
+                version: Some("2.4.0".to_owned()),
+                capabilities: vec!["tx_broadcast".to_owned(), "subtree_roots".to_owned()],
+            }),
+            ..ServerInfoSettings::default()
+        };
+
+        let descriptor = build_wallet_server_info(&settings);
+        let Some(node) = descriptor.node else {
+            unreachable!("node field must always be set")
+        };
+        assert_eq!(node.version.as_deref(), Some("2.4.0"));
+        assert_eq!(node.capabilities.len(), 2);
+        assert!(node.capabilities.iter().any(|cap| cap == "tx_broadcast"));
+
+        let Some(common) = descriptor.common else {
+            unreachable!("common ops.ServerInfo field must always be set")
+        };
+        assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
+        assert!(!common.capabilities.is_empty());
+    }
+
+    #[test]
+    fn build_wallet_server_info_emits_empty_node_when_no_upstream() {
+        let settings = ServerInfoSettings::default();
+        let descriptor = build_wallet_server_info(&settings);
+        let Some(node) = descriptor.node else {
+            unreachable!("node field must always be set")
+        };
+        assert!(node.version.is_none());
+        assert!(node.capabilities.is_empty());
+
+        let Some(common) = descriptor.common else {
+            unreachable!("common ops.ServerInfo field must always be set")
+        };
+        assert_eq!(common.network, "zcash-regtest");
     }
 }

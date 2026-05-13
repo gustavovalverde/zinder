@@ -12,7 +12,7 @@ use zinder_core::{
     RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
     TransactionId, TreeStateArtifact, TxStatus,
 };
-use zinder_proto::v1::wallet::ServerCapabilities;
+use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_source::{
     block_header_info_from_raw_block_bytes, transparent_prevout_from_raw_transaction_bytes,
 };
@@ -159,7 +159,7 @@ impl Drop for LocalChainIndex {
 
 #[async_trait]
 impl ChainIndex for LocalChainIndex {
-    async fn server_info(&self) -> Result<ServerCapabilities, IndexerError> {
+    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
         self.remote("server_info")?.server_info().await
     }
 

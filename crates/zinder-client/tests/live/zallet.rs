@@ -31,12 +31,17 @@ const EMBEDDED_ZAINO_CONFIG_FIELDS: &[&str] = &[
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 fn zallet_binary_runs_against_zinder_native_contract() -> eyre::Result<()> {
     let _guard = init();
-    require_zallet_gate()?;
-    let live_env = require_live_for(&[
+    if !zallet_gate_enabled() {
+        return Ok(());
+    }
+    let Some(live_env) = require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
 
     let config_path = PathBuf::from(require_env(ZALLET_CONFIG_ENV)?);
     let config_source = fs::read_to_string(&config_path)
@@ -84,14 +89,8 @@ fn zallet_binary_runs_against_zinder_native_contract() -> eyre::Result<()> {
     Ok(())
 }
 
-fn require_zallet_gate() -> eyre::Result<()> {
-    if env::var(ENABLE_ZALLET_GATE).as_deref() == Ok("1") {
-        Ok(())
-    } else {
-        Err(eyre!(
-            "set {ENABLE_ZALLET_GATE}=1 to run the real Zallet T3 gate"
-        ))
-    }
+fn zallet_gate_enabled() -> bool {
+    env::var(ENABLE_ZALLET_GATE).as_deref() == Ok("1")
 }
 
 fn require_config_marker(parsed_config: &toml::Value) -> eyre::Result<()> {

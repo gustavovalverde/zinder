@@ -7,18 +7,21 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use eyre::{Result, eyre};
+use zinder_core::Network;
 use zinder_source::{
     MempoolSource, MempoolSourceBackend, MempoolSourceEventStream, SourceError,
     ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget,
     ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
-use zinder_testkit::live::{LiveTestEnv, init, require_live};
+use zinder_testkit::live::{LiveTestEnv, init, require_live, require_live_for};
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn zebra_indexer_mempool_source_opens_stream_against_running_indexer() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
         return Err(eyre!(
             "this live test requires ZINDER_NODE__INDEXER_GRPC_ADDR to point at \
@@ -92,7 +95,9 @@ fn build_indexer_mempool_source(
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn streaming_source_recovers_after_zebra_indexer_restart() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
         return Err(eyre!(
             "this destructive test needs ZINDER_NODE__INDEXER_GRPC_ADDR; skipping"

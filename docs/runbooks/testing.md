@@ -19,7 +19,7 @@ document is the step-by-step guide for actually running them.
 | T3 Zallet live | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | Release / integration certification | Real Zallet binary using Zinder's native contract |
 | External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
 
-`default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"`
+`default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/) and not test(/^deploy::/)"`
 is the structural boundary. The regular `ci-live` profile excludes
 `live::zallet::`; run `ci-zallet-live` explicitly when a Zallet build that
 targets Zinder is available. Every live test additionally carries

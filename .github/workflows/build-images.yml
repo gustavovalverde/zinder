@@ -1,0 +1,66 @@
+name: build-images
+
+# Build each service's Docker image on every PR that could affect the build.
+# Tagged releases get the parallel release-images.yml workflow (planned with
+# Tier B4) that also pushes to ghcr.io. This workflow only builds.
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".dockerignore"
+      - "crates/**"
+      - "services/**"
+      - "buf.yaml"
+      - ".github/workflows/build-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - zinder-ingest
+          - zinder-query
+          - zinder-compat-lightwalletd
+          - zinder-derive
+    env:
+      SERVICE: ${{ matrix.service }}
+      PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: ${{ matrix.service }}:${{ env.PR_TAG }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Inspect image
+        run: |
+          docker image inspect "$SERVICE:$PR_TAG" \
+            --format 'image={{.Id}} size_bytes={{.Size}}'
+
+      - name: Smoke test --help
+        run: |
+          docker run --rm --entrypoint="$SERVICE" "$SERVICE:$PR_TAG" --help

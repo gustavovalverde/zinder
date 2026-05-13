@@ -85,11 +85,14 @@ const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn federated_balance_matches_utxo_sum_for_sampled_coinbase_address() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[
+    let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
     let mut fixture = FederatedBalanceFixture::open(&env).await?;
     let response = fixture.query_federated_balance().await?;
 
@@ -345,7 +348,9 @@ const MEMPOOL_OVERLAY_MINE_COUNT: u32 = 101;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let probe_config = live_backfill_config(
         &env,
         std::path::Path::new("/tmp/zinder-mempool-overlay-schedule-probe"),

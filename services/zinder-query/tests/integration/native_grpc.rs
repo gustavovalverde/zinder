@@ -250,6 +250,7 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
         Request::new(wallet::ChainEventsRequest {
             from_cursor: Vec::new(),
             family: wallet::ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         }),
     )
     .await?
@@ -305,6 +306,7 @@ async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Resul
         Request::new(wallet::ChainEventsRequest {
             from_cursor: first_cursor,
             family: wallet::ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         }),
     )
     .await?
@@ -434,6 +436,7 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
         Request::new(wallet::ChainEventsRequest {
             from_cursor: Vec::new(),
             family: wallet::ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         }),
     )
     .await?
@@ -462,21 +465,18 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
     );
     let read_only_adapter =
         WalletQueryGrpcAdapter::new(read_only_query, ServerInfoSettings::default());
-    let read_only_capabilities = WalletQueryService::server_info(
+    let read_only_info = WalletQueryService::server_info(
         &read_only_adapter,
         Request::new(wallet::ServerInfoRequest {}),
     )
     .await?
     .into_inner()
-    .capabilities
-    .ok_or_else(|| eyre!("missing read-only capabilities"))?;
+    .info
+    .ok_or_else(|| eyre!("missing read-only info"))?;
 
-    assert!(has_capability(
-        &read_only_capabilities,
-        WALLET_EVENTS_CHAIN_V1
-    ));
+    assert!(has_capability(&read_only_info, WALLET_EVENTS_CHAIN_V1));
     assert!(!has_capability(
-        &read_only_capabilities,
+        &read_only_info,
         WALLET_BROADCAST_TRANSACTION_V1
     ));
 
@@ -493,17 +493,17 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
             ..ServerInfoSettings::default()
         },
     );
-    let broadcast_capabilities = WalletQueryService::server_info(
+    let broadcast_info = WalletQueryService::server_info(
         &broadcast_adapter,
         Request::new(wallet::ServerInfoRequest {}),
     )
     .await?
     .into_inner()
-    .capabilities
-    .ok_or_else(|| eyre!("missing broadcast capabilities"))?;
+    .info
+    .ok_or_else(|| eyre!("missing broadcast info"))?;
 
     assert!(has_capability(
-        &broadcast_capabilities,
+        &broadcast_info,
         WALLET_BROADCAST_TRANSACTION_V1
     ));
 
@@ -531,7 +531,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default())
         .with_explorer_proxy(explorer_proxy);
 
-    let initial_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    let initial_capabilities = wallet_server_info(&grpc_adapter).await?;
     assert!(
         !has_capability(
             &initial_capabilities,
@@ -541,14 +541,14 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     );
 
     readiness.mark_ready();
-    let ready_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    let ready_capabilities = wallet_server_info(&grpc_adapter).await?;
     assert!(has_capability(
         &ready_capabilities,
         DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
     ));
 
     readiness.mark_not_ready();
-    let not_ready_capabilities = wallet_server_capabilities(&grpc_adapter).await?;
+    let not_ready_capabilities = wallet_server_info(&grpc_adapter).await?;
     assert!(
         !has_capability(
             &not_ready_capabilities,
@@ -718,21 +718,23 @@ fn response_chain_epoch_id(response: &impl HasChainEpoch) -> u64 {
         .map_or(0, |chain_epoch| chain_epoch.chain_epoch_id)
 }
 
-fn has_capability(capabilities: &wallet::ServerCapabilities, capability: &str) -> bool {
-    capabilities
-        .capabilities
-        .iter()
-        .any(|advertised| advertised == capability)
+fn has_capability(wallet_info: &wallet::WalletServerInfo, capability: &str) -> bool {
+    wallet_info.common.as_ref().is_some_and(|common| {
+        common
+            .capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
+    })
 }
 
-async fn wallet_server_capabilities(
+async fn wallet_server_info(
     grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
-) -> eyre::Result<wallet::ServerCapabilities> {
+) -> eyre::Result<wallet::WalletServerInfo> {
     WalletQueryService::server_info(grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
         .await?
         .into_inner()
-        .capabilities
-        .ok_or_else(|| eyre!("missing wallet server capabilities"))
+        .info
+        .ok_or_else(|| eyre!("missing wallet server info"))
 }
 
 fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
@@ -770,6 +772,15 @@ impl IngestControl for StaticIngestControl {
     type MempoolEventsStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>,
     >;
+
+    async fn server_info(
+        &self,
+        _request: Request<zinder_proto::v1::ingest::ServerInfoRequest>,
+    ) -> Result<Response<zinder_proto::v1::ingest::ServerInfoResponse>, Status> {
+        Ok(Response::new(
+            zinder_proto::v1::ingest::ServerInfoResponse { server_info: None },
+        ))
+    }
 
     async fn writer_status(
         &self,

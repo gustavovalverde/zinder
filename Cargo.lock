@@ -5073,12 +5073,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "eyre",
+ "secrecy",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-types",
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
@@ -5272,7 +5276,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zinder-core",
+ "zinder-proto",
  "zinder-source",
+ "zinder-testkit",
 ]
 
 [[package]]
@@ -5290,6 +5296,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -5339,6 +5346,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
  "tracing-subscriber",
  "zcash_address",
  "zcash_primitives",

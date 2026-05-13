@@ -1,0 +1,42 @@
+# systemd unit wrapping the Compose deployment at deploy/docker-compose.yml.
+#
+# Install: copy this file to /etc/systemd/system/zinder.service, then run
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now zinder
+#
+# The compose file is expected at /etc/zinder/docker-compose.yml; adjust
+# WorkingDirectory below if your operator-chosen layout differs.
+
+[Unit]
+Description=Zinder Zcash indexer (Compose topology)
+Documentation=https://github.com/zcashfoundation/zinder
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/zinder
+EnvironmentFile=-/etc/zinder/env
+
+# `docker compose up` blocks while the topology runs, so Type=simple is
+# correct. ExecStop tears down the topology on stop; ExecStartPre prunes
+# any stale containers so a half-restarted state does not strand the
+# named volume on a previous container's lifecycle.
+ExecStartPre=-/usr/bin/docker compose -f docker-compose.yml down --remove-orphans
+ExecStart=/usr/bin/docker compose -f docker-compose.yml up
+ExecStop=/usr/bin/docker compose -f docker-compose.yml down
+
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+# Tighten the systemd sandbox without breaking docker's own capabilities.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

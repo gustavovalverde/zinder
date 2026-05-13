@@ -35,14 +35,18 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
     let channel = await_with_retry(server_addr).await?;
     let mut client = ExplorerQueryClient::new(channel);
     let response = client.server_info(ServerInfoRequest {}).await?.into_inner();
-    let capabilities = response
-        .capabilities
-        .ok_or_else(|| eyre!("server info response missing capabilities envelope"))?;
+    let explorer_info = response
+        .info
+        .ok_or_else(|| eyre!("server info response missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
 
-    assert_eq!(capabilities.vendor, "Zinder");
-    assert_eq!(capabilities.network, "zcash-regtest");
+    assert_eq!(explorer_info.vendor, "Zinder");
+    assert_eq!(common.network, "zcash-regtest");
     assert!(
-        capabilities
+        common
             .capabilities
             .iter()
             .any(|advertised| { advertised == DERIVE_EXPLORER_SERVER_INFO_V1 })
@@ -76,14 +80,18 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
 
     let channel = await_with_retry(server_addr).await?;
     let mut client = ExplorerQueryClient::new(channel);
-    let info = client
+    let explorer_info = client
         .server_info(ServerInfoRequest {})
         .await?
         .into_inner()
-        .capabilities
-        .ok_or_else(|| eyre!("server info missing capabilities envelope"))?;
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
     assert!(
-        !info
+        !common
             .capabilities
             .iter()
             .any(|advertised| { advertised == DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1 }),
@@ -161,10 +169,14 @@ async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result
         .server_info(ServerInfoRequest {})
         .await?
         .into_inner();
-    let correct_capabilities = correct_response
-        .capabilities
-        .ok_or_else(|| eyre!("server info missing capabilities envelope"))?;
-    assert_eq!(correct_capabilities.network, "zcash-regtest");
+    let correct_info = correct_response
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let correct_common = correct_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_eq!(correct_common.network, "zcash-regtest");
 
     server_handle.abort();
     let _ = server_handle.await;

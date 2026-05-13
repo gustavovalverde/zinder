@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use zinder_proto::capabilities::DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    BearerToken, OpsServer, Readiness, cancel_on_ctrl_c, connect_authenticated_channel,
-    install_tracing_subscriber, spawn_ops_endpoint,
+    BearerToken, OpsServer, Readiness, StartupPhase, cancel_on_ctrl_c,
+    connect_authenticated_channel, install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -122,24 +122,60 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     reason = "Runtime startup wires storage, readiness, reflection, health, and shutdown in one auditable sequence."
 )]
 async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
+    let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
     let ops_listen_addr = cli.ops_listen_addr;
-    let query_config = config::load_query_config(config_path, cli.into())?;
+    let query_config = match config::load_query_config(config_path, cli.into()) {
+        Ok(query_config) => {
+            load_config_phase.complete();
+            query_config
+        }
+        Err(error) => {
+            load_config_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let readiness = Readiness::default();
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle =
         ops_listen_addr.map(|listen_addr| spawn_ops(listen_addr, &query_config, &readiness));
-    let store = SecondaryChainStore::open(
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let store = match SecondaryChainStore::open(
         &query_config.storage_path,
         &query_config.secondary_path,
         zinder_store::ChainStoreOptions::for_network(query_config.network),
-    )
-    .map_err(QueryConfigError::Store)?;
+    ) {
+        Ok(store) => {
+            open_storage_phase.complete();
+            store
+        }
+        Err(error) => {
+            let error = QueryConfigError::Store(error);
+            open_storage_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let visible_height = store
         .current_chain_epoch()
         .map_err(QueryConfigError::Store)?
         .map(|epoch| epoch.tip_height.value());
-    let broadcaster = build_broadcaster(query_config.broadcaster.as_ref()).await?;
-    let transaction_broadcast_enabled = broadcaster.is_some();
+    let broadcaster_and_capabilities = build_broadcaster(query_config.broadcaster.as_ref()).await?;
+    let transaction_broadcast_enabled = broadcaster_and_capabilities.is_some();
+    let upstream_node_capabilities =
+        broadcaster_and_capabilities
+            .as_ref()
+            .map(
+                |(_, node_capabilities)| zinder_query::UpstreamNodeCapabilities {
+                    version: None,
+                    capabilities: node_capabilities
+                        .iter()
+                        .map(|capability| capability.name().to_owned())
+                        .collect(),
+                },
+            );
+    let broadcaster = broadcaster_and_capabilities.map(|(source, _)| source);
     let network_upgrade_activations = match broadcaster.as_ref() {
         Some(source) => source
             .discover_network_upgrade_activations("zinder-query")
@@ -163,6 +199,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         chain_event_retention_seconds: query_config.chain_event_retention_seconds,
         mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds,
         mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds,
+        upstream_node_capabilities,
         ..zinder_query::ServerInfoSettings::default()
     };
     let grpc_adapter = {
@@ -250,6 +287,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         "wallet query gRPC server started"
     );
 
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
     let server_result = tonic::transport::Server::builder()
         .add_service(grpc_adapter.into_server())
         .add_optional_service(reflection_service)
@@ -280,9 +319,11 @@ async fn probe_explorer_capability(endpoint: String, bearer_token: Option<Bearer
     };
     response
         .into_inner()
-        .capabilities
-        .is_some_and(|capabilities| {
-            capabilities
+        .info
+        .as_ref()
+        .and_then(|explorer_info| explorer_info.common.as_ref())
+        .is_some_and(|common| {
+            common
                 .capabilities
                 .iter()
                 .any(|capability| capability == DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1)
@@ -322,7 +363,7 @@ async fn update_grpc_health(
 
 async fn build_broadcaster(
     broadcaster_target: Option<&zinder_source::NodeTarget>,
-) -> Result<Option<ZebraJsonRpcSource>, QueryConfigError> {
+) -> Result<Option<(ZebraJsonRpcSource, NodeCapabilities)>, QueryConfigError> {
     let Some(target) = broadcaster_target else {
         tracing::info!(
             target: "zinder::query",
@@ -375,7 +416,7 @@ async fn build_broadcaster(
         json_rpc_addr = %target.json_rpc_addr,
         "transaction broadcast enabled via Zebra JSON-RPC"
     );
-    Ok(Some(source))
+    Ok(Some((source, capabilities)))
 }
 
 fn require_broadcaster_node_capabilities(

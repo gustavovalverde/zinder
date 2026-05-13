@@ -46,13 +46,20 @@ const NEAR_TIP_DEPTH_BLOCKS: u32 = 16;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Near-tip parity sweep keeps env resolution, backfill, multi-height assertions, and one optional regtest branch in one auditable scenario."
+)]
 async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[
+    let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
 
     let tip_before = fetch_live_tip_height(&env).await?;
     if env.network() == Network::ZcashRegtest && tip_before.value() == 0 {

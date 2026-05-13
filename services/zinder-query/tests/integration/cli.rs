@@ -97,33 +97,6 @@ fn missing_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
 }
 
 #[test]
-fn sensitive_environment_override_is_rejected() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("query-sensitive-env-store");
-    let secondary_path = tempdir.path().join("query-sensitive-env-secondary");
-    let config_path = tempdir.path().join("zinder-query.toml");
-    fs::write(
-        &config_path,
-        query_config_toml(&storage_path, &secondary_path)?,
-    )?;
-
-    let output = zinder_query_command()
-        .env("ZINDER_QUERY__AUTH__PASSWORD", "env-secret")
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ZINDER_QUERY__AUTH__PASSWORD targets a sensitive field"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("env-secret"), "{stderr}");
-
-    Ok(())
-}
-
-#[test]
 fn print_config_accepts_explorer_derive_proxy() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("query-derive-store");

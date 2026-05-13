@@ -28,6 +28,7 @@ tonic = { workspace = true, features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zinder-core.workspace = true
+zinder-proto.workspace = true
 zinder-source.workspace = true
 
 [dev-dependencies]
@@ -37,6 +38,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+zinder-testkit.workspace = true
 
 [lints]
 workspace = true

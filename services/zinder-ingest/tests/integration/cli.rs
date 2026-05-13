@@ -405,13 +405,18 @@ fn max_response_bytes_can_be_overridden_from_cli() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn sensitive_password_environment_override_is_rejected() -> Result<(), Box<dyn Error>> {
+fn print_config_redacts_password_supplied_through_environment() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("sensitive-env-store");
+    let storage_path = tempdir.path().join("env-password-redaction-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(
+        &config_path,
+        backfill_config_toml_without_auth(&storage_path, 1, 1)?,
+    )?;
 
     let output = zinder_ingest_command()
+        .env("ZINDER_NODE__AUTH__METHOD", "basic")
+        .env("ZINDER_NODE__AUTH__USERNAME", "zebra")
         .env("ZINDER_NODE__AUTH__PASSWORD", "env-secret")
         .args([
             "--print-config",
@@ -421,23 +426,30 @@ fn sensitive_password_environment_override_is_rejected() -> Result<(), Box<dyn E
         ])
         .output()?;
 
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("ZINDER_NODE__AUTH__PASSWORD targets a sensitive field"));
+    assert!(stdout.contains("method = \"basic\""));
+    assert!(stdout.contains("password = \"[REDACTED]\""));
+    assert!(!stdout.contains("env-secret"));
     assert!(!stderr.contains("env-secret"));
 
     Ok(())
 }
 
 #[test]
-fn sensitive_password_hint_environment_override_is_rejected() -> Result<(), Box<dyn Error>> {
+fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("sensitive-env-hint-store");
+    let storage_path = tempdir.path().join("env-cookie-redaction-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(
+        &config_path,
+        backfill_config_toml_without_auth(&storage_path, 1, 1)?,
+    )?;
 
     let output = zinder_ingest_command()
-        .env("ZINDER_NODE__AUTH__PASSWORD_HINT", "env-secret")
+        .env("ZINDER_NODE__AUTH__METHOD", "cookie")
+        .env("ZINDER_NODE__AUTH__COOKIE", "user:env-cookie-secret")
         .args([
             "--print-config",
             "--config",
@@ -446,10 +458,13 @@ fn sensitive_password_hint_environment_override_is_rejected() -> Result<(), Box<
         ])
         .output()?;
 
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("ZINDER_NODE__AUTH__PASSWORD_HINT targets a sensitive field"));
-    assert!(!stderr.contains("env-secret"));
+    assert!(stdout.contains("method = \"cookie\""));
+    assert!(stdout.contains("path = \"[REDACTED]\""));
+    assert!(!stdout.contains("env-cookie-secret"));
+    assert!(!stderr.contains("env-cookie-secret"));
 
     Ok(())
 }
@@ -689,6 +704,37 @@ request_timeout_secs = 30
 method = "basic"
 username = "zebra"
 password = "file-secret"
+
+[storage]
+path = "{}"
+
+[ingest]
+commit_batch_blocks = 1000
+
+[backfill]
+from_height = {}
+to_height = {}
+allow_near_tip_finalize = false
+"#,
+        path_str(storage_path)?,
+        from_height,
+        to_height
+    ))
+}
+
+fn backfill_config_toml_without_auth(
+    storage_path: &Path,
+    from_height: u32,
+    to_height: u32,
+) -> Result<String, Box<dyn Error>> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[node]
+source = "zebra-json-rpc"
+json_rpc_addr = "http://127.0.0.1:39232"
+request_timeout_secs = 30
 
 [storage]
 path = "{}"

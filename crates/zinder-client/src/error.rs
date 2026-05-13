@@ -2,8 +2,36 @@
 
 use thiserror::Error;
 use tonic::Code;
+use tonic_types::StatusExt;
 use zinder_core::{Network, artifact_family};
+use zinder_proto::v1::ops::ErrorReason;
 use zinder_store::{ArtifactFamily, StoreError};
+
+/// Domain Zinder services set on every `google.rpc.ErrorInfo`.
+///
+/// Matches [ADR-0019](../../../docs/adrs/0019-typed-grpc-error-reason-vocabulary.md);
+/// duplicated here so the client does not need to depend on a service crate.
+const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
+
+/// Suggested retry policy attached to every [`IndexerError`].
+///
+/// Clients consult this to decide whether to retry, surface to the operator,
+/// or fail the caller. The policy is derived from the gRPC code and the
+/// typed [`ErrorReason`], so it is stable across Zinder releases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RetryPolicy {
+    /// Retry with exponential backoff. The remote service or upstream node
+    /// is transiently unavailable; the request shape is correct.
+    RetryWithBackoff,
+    /// An operator must intervene before the request can succeed. Examples:
+    /// reorg window exceeded, schema mismatch, broadcast disabled. Clients
+    /// must not retry without manual reconfiguration.
+    OperatorActionRequired,
+    /// The request itself is malformed or out of bounds. Clients fix the
+    /// request and re-issue; retrying the same input will fail again.
+    ClientError,
+}
 
 /// Error returned by [`crate::ChainIndex`] implementations.
 #[derive(Debug, Error)]
@@ -167,14 +195,35 @@ impl IndexerError {
         reason = "tonic::Status is consumed through map_err adapters at gRPC boundaries"
     )]
     pub(crate) fn from_status(status: tonic::Status) -> Self {
-        let reason = status.message().to_owned();
+        let message = status.message().to_owned();
+        let details = status.get_error_details();
+        let zinder_reason = details.error_info().and_then(|error_info| {
+            if error_info.domain == ZINDER_ERROR_DOMAIN {
+                ErrorReason::from_str_name(&error_info.reason)
+            } else {
+                None
+            }
+        });
+
+        // For NOT_FOUND, prefer the ResourceInfo (gives family + key) when
+        // available so the client can match on ArtifactUnavailable.
+        if status.code() == Code::NotFound
+            && matches!(zinder_reason, Some(ErrorReason::ArtifactUnavailable))
+            && let Some(resource_info) = details.resource_info()
+        {
+            return Self::ArtifactUnavailable {
+                family: artifact_family_for_label(&resource_info.resource_type),
+                key: resource_info.resource_name.clone(),
+            };
+        }
+
         match status.code() {
-            Code::InvalidArgument => Self::InvalidRequest { reason },
-            Code::FailedPrecondition => Self::FailedPrecondition { reason },
+            Code::InvalidArgument => Self::InvalidRequest { reason: message },
+            Code::FailedPrecondition => Self::FailedPrecondition { reason: message },
             Code::NotFound => Self::NotFound {
                 resource: "artifact",
             },
-            Code::DataLoss => Self::DataLoss { reason },
+            Code::DataLoss => Self::DataLoss { reason: message },
             Code::Ok
             | Code::Cancelled
             | Code::Unknown
@@ -187,7 +236,58 @@ impl IndexerError {
             | Code::Unimplemented
             | Code::Internal
             | Code::Unavailable
-            | Code::Unauthenticated => Self::ServiceUnavailable { reason },
+            | Code::Unauthenticated => Self::ServiceUnavailable { reason: message },
+        }
+    }
+
+    /// Returns the typed [`ErrorReason`] attached to the failure, when known.
+    ///
+    /// Returns `Some` for errors that originated at a gRPC boundary carrying
+    /// a `google.rpc.ErrorInfo` with `domain = "zinder.dev"`. Returns `None`
+    /// for client-side validation errors and for legacy servers that have
+    /// not yet adopted the typed vocabulary.
+    #[must_use]
+    pub fn reason(&self) -> Option<ErrorReason> {
+        // Variant-level inference: each variant is most commonly produced by
+        // one reason. The full reason is available on the wire via
+        // ErrorInfo; this accessor exposes the variant's canonical mapping
+        // so consumers can pattern-match without parsing strings.
+        match self {
+            Self::NotFound { .. } => Some(ErrorReason::BlockNotInBestChain),
+            Self::ArtifactUnavailable { .. } => Some(ErrorReason::ArtifactUnavailable),
+            Self::StorageUnavailable { .. } => Some(ErrorReason::StorageUnavailable),
+            Self::ServiceUnavailable { .. } => Some(ErrorReason::NodeUnavailable),
+            Self::BlockingTaskFailed { .. } => Some(ErrorReason::BlockingTaskFailed),
+            Self::NoVisibleChainEpoch
+            | Self::InvalidRequest { .. }
+            | Self::FailedPrecondition { .. }
+            | Self::DataLoss { .. }
+            | Self::RemoteEndpointUnconfigured { .. }
+            | Self::MalformedResponse { .. }
+            | Self::NetworkMismatch { .. } => None,
+        }
+    }
+
+    /// Suggested retry policy for this error.
+    ///
+    /// Returns a stable [`RetryPolicy`] derived from the variant tag.
+    /// Consumers map this to local retry, alerting, and operator-action
+    /// decisions without parsing message strings.
+    #[must_use]
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::NoVisibleChainEpoch
+            | Self::NotFound { .. }
+            | Self::ArtifactUnavailable { .. }
+            | Self::ServiceUnavailable { .. }
+            | Self::StorageUnavailable { .. }
+            | Self::BlockingTaskFailed { .. } => RetryPolicy::RetryWithBackoff,
+            Self::FailedPrecondition { .. }
+            | Self::DataLoss { .. }
+            | Self::NetworkMismatch { .. } => RetryPolicy::OperatorActionRequired,
+            Self::InvalidRequest { .. }
+            | Self::RemoteEndpointUnconfigured { .. }
+            | Self::MalformedResponse { .. } => RetryPolicy::ClientError,
         }
     }
 
@@ -233,6 +333,30 @@ fn artifact_family_label(family: ArtifactFamily) -> &'static str {
         ArtifactFamily::TransparentAddressTxIndex => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
         ArtifactFamily::BlockHashIndex => artifact_family::BLOCK_HASH_INDEX,
         ArtifactFamily::MempoolEvent => artifact_family::MEMPOOL_EVENT,
+        _ => "unknown_artifact",
+    }
+}
+
+/// Inverse of [`artifact_family_label`].
+///
+/// Maps a `ResourceInfo.resource_type` string back to the canonical static
+/// `family` label exposed by [`IndexerError::ArtifactUnavailable`]. The
+/// server emits the family via `format!("{family:?}")`, so the matching is
+/// on the Rust `Debug` form.
+fn artifact_family_for_label(resource_type: &str) -> &'static str {
+    match resource_type {
+        "ChainEpoch" => artifact_family::CHAIN_EPOCH,
+        "ChainEvent" => artifact_family::CHAIN_EVENT,
+        "FinalizedBlock" => artifact_family::FINALIZED_BLOCK,
+        "CompactBlock" => artifact_family::COMPACT_BLOCK,
+        "Transaction" => artifact_family::MINED_TRANSACTION,
+        "TreeState" => artifact_family::TREE_STATE,
+        "SubtreeRoot" => artifact_family::SUBTREE_ROOT,
+        "TransparentAddressUtxo" => artifact_family::TRANSPARENT_ADDRESS_UTXO,
+        "TransparentUtxoSpend" => artifact_family::TRANSPARENT_UTXO_SPEND,
+        "TransparentAddressTxIndex" => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
+        "BlockHashIndex" => artifact_family::BLOCK_HASH_INDEX,
+        "MempoolEvent" => artifact_family::MEMPOOL_EVENT,
         _ => "unknown_artifact",
     }
 }

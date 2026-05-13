@@ -24,13 +24,24 @@
 //! ```
 //!
 //! `require_live()` rejects [`Network::ZcashMainnet`] by default. Tests that
-//! genuinely target mainnet must opt in:
+//! target a specific network allowlist (mainnet, testnet, regtest, or a
+//! subset) opt in via [`require_live_for`] and use the `let Some(env) = ...?
+//! else { return Ok(()); }` pattern so the operator can run the full live
+//! suite against any single network without those tests failing:
 //!
 //! ```ignore
-//! let env = require_live_for(&[Network::ZcashMainnet])?;
+//! let Some(env) = require_live_for(&[Network::ZcashMainnet])? else {
+//!     return Ok(());
+//! };
 //! // or:
-//! let env = require_live_mainnet()?;
+//! let Some(env) = require_live_mainnet()? else { return Ok(()); };
 //! ```
+//!
+//! Tests that depend on optional external services (a reference
+//! `lightwalletd-go` for parity, a Zallet sidecar) read their endpoints with
+//! [`optional_env`], applying the same skip-when-absent pattern so a full
+//! `cargo nextest run --profile=ci-live` always lights up exactly the subset
+//! of tests the operator's environment can serve.
 
 use std::sync::Once;
 
@@ -65,50 +76,76 @@ impl LiveTestEnv {
     }
 }
 
-/// Gate any test that touches a real upstream node. Verifies `ZINDER_TEST_LIVE=1`,
-/// resolves the source endpoint from the unified env-var schema, and
-/// rejects [`Network::ZcashMainnet`] by default.
+/// Gate any live test that targets a non-mainnet upstream node.
 ///
-/// Tests that target a subset of networks should call [`require_live_for`].
-/// Tests that genuinely target mainnet should call [`require_live_mainnet`].
-pub fn require_live() -> eyre::Result<LiveTestEnv> {
+/// Returns `Ok(Some(env))` when `ZINDER_TEST_LIVE=1` is set and the resolved
+/// network is regtest or testnet. Returns `Ok(None)` when the resolved
+/// network is mainnet (the test skips silently because it does not opt into
+/// mainnet semantics); tests that genuinely target mainnet should call
+/// [`require_live_mainnet`] or [`require_live_for`] instead. Returns `Err`
+/// only when the live gate or `ZINDER_NODE__*` env-var schema is misconfigured.
+pub fn require_live() -> eyre::Result<Option<LiveTestEnv>> {
     let env = resolve_live_env()?;
     if matches!(env.network(), Network::ZcashMainnet) {
-        return Err(eyre!(
-            "this live test does not target mainnet by default; \
-             use require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet() \
-             to opt in explicitly"
-        ));
+        Ok(None)
+    } else {
+        Ok(Some(env))
     }
-    Ok(env)
 }
 
-/// Gate a live test to a specific network allowlist. Returns an error if the
-/// resolved network is not in `allowed`.
-pub fn require_live_for(allowed: &[Network]) -> eyre::Result<LiveTestEnv> {
+/// Gate a live test to a specific network allowlist.
+///
+/// Returns `Ok(Some(env))` when the resolved network is in `allowed`. Returns
+/// `Ok(None)` when `ZINDER_TEST_LIVE=1` is set but the resolved network is
+/// not in `allowed`, so the test can early-return successfully (the operator
+/// is running the full suite against a different network). Returns `Err` only
+/// for genuine configuration problems (live gate not enabled, missing
+/// required `ZINDER_NODE__*` vars).
+pub fn require_live_for(allowed: &[Network]) -> eyre::Result<Option<LiveTestEnv>> {
     let env = resolve_live_env()?;
     if allowed.contains(&env.network()) {
-        Ok(env)
+        Ok(Some(env))
     } else {
-        Err(eyre!(
-            "live test allowed only on {allowed:?}; ZINDER_NETWORK resolved to {:?}",
-            env.network()
-        ))
+        Ok(None)
     }
 }
 
-/// Convenience for tests that genuinely target mainnet. Equivalent to
-/// `require_live_for(&[Network::ZcashMainnet])` but reads more directly at the
-/// call site.
-pub fn require_live_mainnet() -> eyre::Result<LiveTestEnv> {
+/// Convenience for tests that target mainnet only.
+///
+/// Equivalent to `require_live_for(&[Network::ZcashMainnet])` but reads more
+/// directly at the call site. Returns `Ok(None)` when the operator's
+/// environment targets a non-mainnet network so the test skips silently.
+pub fn require_live_mainnet() -> eyre::Result<Option<LiveTestEnv>> {
     require_live_for(&[Network::ZcashMainnet])
 }
 
-/// Reads a required environment variable, returning a wrapped error when it
-/// is unset. Use for live-test inputs the operator must supply explicitly
-/// (binary path, marker fragment, additional CLI args).
+/// Reads a required environment variable, returning a wrapped error when it is unset.
+///
+/// Use for live-test inputs the operator must supply explicitly when the test
+/// cannot meaningfully proceed without them and the absence indicates
+/// operator misconfiguration rather than an unprovisioned subsystem.
 pub fn require_env(name: &str) -> eyre::Result<String> {
     std::env::var(name).wrap_err_with(|| format!("missing required env var {name}"))
+}
+
+/// Reads an optional environment variable.
+///
+/// Returns `Ok(None)` when the variable is unset so the caller can skip its
+/// enclosing test silently; returns `Err` only when the value is present but
+/// unreadable (non-UTF-8).
+///
+/// Use for endpoints supplied by optional external sidecars (a reference
+/// `lightwalletd-go` for parity, a Zallet binary) so a full
+/// `cargo nextest run --profile=ci-live` always lights up exactly the subset
+/// of tests the operator's environment can serve.
+pub fn optional_env(name: &str) -> eyre::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(eyre!("environment variable {name} is not valid UTF-8"))
+        }
+    }
 }
 
 /// One-time test bootstrap.

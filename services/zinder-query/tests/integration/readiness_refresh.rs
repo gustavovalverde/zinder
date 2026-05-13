@@ -315,6 +315,15 @@ impl IngestControl for SharedWriterStatus {
     type MempoolEventsStream =
         Pin<Box<dyn Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>>;
 
+    async fn server_info(
+        &self,
+        _request: Request<zinder_proto::v1::ingest::ServerInfoRequest>,
+    ) -> Result<Response<zinder_proto::v1::ingest::ServerInfoResponse>, Status> {
+        Ok(Response::new(
+            zinder_proto::v1::ingest::ServerInfoResponse { server_info: None },
+        ))
+    }
+
     async fn writer_status(
         &self,
         _request: Request<WriterStatusRequest>,

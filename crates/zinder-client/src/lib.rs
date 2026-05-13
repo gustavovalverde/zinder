@@ -19,7 +19,7 @@ pub use chain_index::{
     TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
     TransparentHistoryCursor, TransparentUtxoCursor,
 };
-pub use error::IndexerError;
+pub use error::{IndexerError, RetryPolicy};
 pub use local::{LocalChainIndex, LocalOpenOptions};
 pub use remote::{RemoteChainIndex, RemoteOpenOptions};
 pub use zinder_core::{
@@ -46,5 +46,6 @@ pub use zinder_proto::capabilities::{
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
     WALLET_READ_TRANSPARENT_PREVOUTS_V1, WALLET_READ_TREE_STATE_AT_V1, WALLET_SNAPSHOT_MEMPOOL_V1,
 };
-pub use zinder_proto::v1::wallet::ServerCapabilities;
+pub use zinder_proto::v1::ops::ErrorReason;
+pub use zinder_proto::v1::wallet::WalletServerInfo;
 pub use zinder_store::ChainEventStreamFamily;

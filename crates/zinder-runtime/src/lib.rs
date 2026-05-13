@@ -21,9 +21,11 @@
 
 mod auth;
 mod config;
+mod env_var_docs;
 mod metrics;
 mod ops_endpoint;
 mod readiness;
+mod startup_phase;
 
 pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
@@ -33,11 +35,16 @@ pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeToml,
     duration_as_millis_u64, require_field, zinder_environment_source,
 };
+pub use env_var_docs::{
+    ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
+    render_environment_variable_table,
+};
 pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
 };
 pub use readiness::{Readiness, ReadinessCause, ReadinessReport, ReadinessState};
+pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

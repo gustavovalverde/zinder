@@ -17,6 +17,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true, features = ["transport"] }
+tonic-types.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
@@ -24,13 +25,24 @@ zinder-store.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+secrecy.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
 toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
 zebra-chain.workspace = true
 zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
+
+[[example]]
+name = "observe_transparent_address"
+path = "examples/observe_transparent_address.rs"
+
+[[example]]
+name = "observe_mempool_to_confirmed"
+path = "examples/observe_mempool_to_confirmed.rs"
 
 [lints]
 workspace = true

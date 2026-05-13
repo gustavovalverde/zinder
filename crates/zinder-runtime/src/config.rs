@@ -1,15 +1,22 @@
 //! Shared configuration loading helpers used by every Zinder service binary.
 //!
 //! Every binary follows the same `defaults -> file -> ZINDER_* environment ->
-//! CLI overrides` precedence and the same rules for filtering the test-only
-//! prefix (`ZINDER_TEST_`) and rejecting sensitive leaves (`password`,
-//! `secret`, `token`, `cookie`, `private_key`). This module owns that policy
-//! so the rules cannot drift between binaries.
+//! CLI overrides` precedence. This module owns that policy so the rules
+//! cannot drift between binaries.
 //!
 //! Live tests reuse the production env-var schema directly; the
 //! `ZINDER_TEST_LIVE` gate (and other `ZINDER_TEST_*` knobs like
 //! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config.
+//!
+//! Secret hygiene is handled at emit time rather than at load time
+//! ([ADR-0018](../../../docs/adrs/0018-environment-variable-secret-policy.md)).
+//! Secrets pass through this loader unchanged; redaction happens in
+//! [`NodeAuthToml::from_node_auth`] (used by `--print-config`) and in the
+//! manual `Debug` impls on [`zinder_source::NodeAuth`] and
+//! [`crate::auth::BearerToken`]. Per-surface file-only constraints (see
+//! [ADR-0009](../../../docs/adrs/0009-ingest-control-transport-security.md))
+//! remain enforced at their respective config types.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
@@ -25,8 +32,6 @@ use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
-const SENSITIVE_ENV_LEAF_MARKERS: &[&str] =
-    &["password", "secret", "token", "cookie", "private_key"];
 
 /// Error returned while resolving Zinder service configuration from defaults,
 /// file, environment, and CLI overrides.
@@ -61,18 +66,6 @@ pub enum ConfigError {
     Invalid {
         /// Validation failure reason.
         reason: String,
-    },
-
-    /// A sensitive leaf was provided through a production environment variable.
-    ///
-    /// Sensitive values must come from the TOML config file or a secret
-    /// manager so they never appear in process environment.
-    #[error(
-        "environment variable {variable} targets a sensitive field; provide it through the config file or a secret manager instead"
-    )]
-    SensitiveEnvironmentOverride {
-        /// Environment variable name.
-        variable: String,
     },
 
     /// A CLI-supplied path is not valid UTF-8 and cannot be carried through
@@ -129,8 +122,9 @@ impl From<NodeConfigError> for ConfigError {
 ///
 /// Strips the `ZINDER_TEST_` prefix (used by `ZINDER_TEST_LIVE` and crash-
 /// recovery harness vars) so test-only acknowledgements cannot leak into
-/// production config, and rejects any `ZINDER_*` variable whose leaf matches
-/// a sensitive marker.
+/// production config. Secret values pass through unchanged; redaction is
+/// applied at emit boundaries (see [`NodeAuthToml`] and the `Debug` impls on
+/// [`NodeAuth`] and [`crate::auth::BearerToken`]).
 pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
     let mut filtered_env = HashMap::new();
 
@@ -146,10 +140,6 @@ pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
             continue;
         };
 
-        if env_leaf_is_sensitive(config_key) {
-            return Err(ConfigError::SensitiveEnvironmentOverride { variable });
-        }
-
         filtered_env.insert(config_key.to_owned(), env_value);
     }
 
@@ -157,19 +147,6 @@ pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
         .separator("__")
         .try_parsing(true)
         .source(Some(filtered_env)))
-}
-
-/// Returns `true` when `config_key`'s leaf segment matches a sensitive marker.
-fn env_leaf_is_sensitive(config_key: &str) -> bool {
-    let leaf = config_key
-        .rsplit("__")
-        .next()
-        .unwrap_or(config_key)
-        .to_ascii_lowercase();
-
-    SENSITIVE_ENV_LEAF_MARKERS
-        .iter()
-        .any(|marker| leaf.contains(marker))
 }
 
 /// Returns `field_value` or a [`ConfigError::MissingField`] error pointing at
@@ -361,6 +338,12 @@ pub struct NodeAuthToml {
 
 impl NodeAuthToml {
     /// Builds a redacted [`NodeAuthToml`] from a resolved [`NodeAuth`].
+    ///
+    /// Both cookie sources (file path and inline credentials) redact to
+    /// `[REDACTED]` so an operator inspecting `--print-config` cannot tell
+    /// the credential apart from the path. Distinguishing them is not
+    /// useful for debugging and risks leaking metadata about how the secret
+    /// was injected.
     #[must_use]
     pub fn from_node_auth(auth: &NodeAuth) -> Self {
         match auth {
@@ -376,7 +359,7 @@ impl NodeAuthToml {
                 password: Some("[REDACTED]"),
                 path: None,
             },
-            NodeAuth::Cookie { .. } => Self {
+            NodeAuth::Cookie(_) => Self {
                 method: "cookie",
                 username: None,
                 password: None,
@@ -419,16 +402,6 @@ impl NodeToml {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn env_leaf_is_sensitive_detects_password_leaf() {
-        assert!(env_leaf_is_sensitive("NODE__AUTH__PASSWORD"));
-    }
-
-    #[test]
-    fn env_leaf_is_sensitive_passes_innocuous_leaf() {
-        assert!(!env_leaf_is_sensitive("NODE__JSON_RPC_ADDR"));
-    }
 
     #[test]
     fn require_field_returns_missing_field_for_none() {

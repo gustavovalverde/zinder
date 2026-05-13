@@ -22,7 +22,7 @@ use zinder_core::{
     TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
     TxStatus, UnixTimestampMillis,
 };
-use zinder_proto::v1::wallet::{self, ServerCapabilities, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
     mempool_entry_from_message,
@@ -86,7 +86,7 @@ impl RemoteChainIndex {
 
 #[async_trait]
 impl ChainIndex for RemoteChainIndex {
-    async fn server_info(&self) -> Result<ServerCapabilities, IndexerError> {
+    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
         let response = self
             .client()
             .await
@@ -94,11 +94,15 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(IndexerError::from_status)?
             .into_inner();
-        let capabilities = response
-            .capabilities
-            .ok_or_else(|| IndexerError::malformed("capabilities", "field is missing"))?;
-        ensure_network_name(self.network, &capabilities.network)?;
-        Ok(capabilities)
+        let wallet_info = response
+            .info
+            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
+        let common = wallet_info
+            .common
+            .as_ref()
+            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
+        ensure_network_name(self.network, &common.network)?;
+        Ok(wallet_info)
     }
 
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
@@ -333,12 +337,23 @@ impl ChainIndex for RemoteChainIndex {
         from_cursor: Option<ChainEventCursor>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEventStream, IndexerError> {
+        self.chain_events_with_filter(from_cursor, family, Vec::new())
+            .await
+    }
+
+    async fn chain_events_with_filter(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+        family: ChainEventStreamFamily,
+        address_filter: Vec<String>,
+    ) -> Result<ChainEventStream, IndexerError> {
         let response = self
             .client()
             .await
             .chain_events(Request::new(wallet::ChainEventsRequest {
                 from_cursor: from_cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
                 family: chain_event_stream_family_to_message(family) as i32,
+                address_filter,
             }))
             .await
             .map_err(IndexerError::from_status)?;

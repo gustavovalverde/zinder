@@ -11,7 +11,9 @@
 //! capability is a separate string from its `_v1` predecessor and may
 //! coexist during a deprecation window.
 
-use crate::v1::wallet::ServerCapabilities;
+use crate::v1::explorer::ExplorerServerInfo;
+use crate::v1::ops::ServerInfo as OpsServerInfo;
+use crate::v1::wallet::WalletServerInfo;
 
 /// Capability advertised for `WalletQuery.LatestBlock`.
 pub const WALLET_READ_LATEST_BLOCK_V1: &str = "wallet.read.latest_block_v1";
@@ -64,6 +66,42 @@ pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transpar
 pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const DERIVE_EXPLORER_SERVER_INFO_V1: &str = "derive.explorer.server_info_v1";
+
+/// Capability advertised for `IngestControl.ServerInfo`.
+pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
+/// Capability advertised for `IngestControl.WriterStatus`.
+pub const INGEST_CONTROL_WRITER_STATUS_V1: &str = "ingest.control.writer_status_v1";
+/// Capability advertised for `IngestControl.ChainEvents`.
+pub const INGEST_CONTROL_CHAIN_EVENTS_V1: &str = "ingest.control.chain_events_v1";
+/// Capability advertised for `IngestControl.MempoolSnapshot`.
+pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1: &str = "ingest.control.mempool_snapshot_v1";
+/// Capability advertised for `IngestControl.MempoolEvents`.
+pub const INGEST_CONTROL_MEMPOOL_EVENTS_V1: &str = "ingest.control.mempool_events_v1";
+/// Capability advertised for `IngestControl.TransparentMempoolOutputsByAddress`.
+pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1: &str =
+    "ingest.control.transparent_mempool_outputs_by_address_v1";
+/// Capability advertised for `IngestControl.TransparentMempoolSpendByOutpoint`.
+pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1: &str =
+    "ingest.control.transparent_mempool_spend_by_outpoint_v1";
+/// Capability advertised for `IngestControl.TransparentMempoolPrevouts`.
+pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
+    "ingest.control.transparent_mempool_prevouts_v1";
+
+/// Active capability strings advertised by `IngestControl`.
+///
+/// Returned through the cross-service `ops.ServerInfo.capabilities` field on
+/// the `IngestControl.ServerInfo` rpc so orchestration tooling can probe the
+/// control-plane surface without an out-of-band schema lookup.
+pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
+    INGEST_CONTROL_SERVER_INFO_V1,
+    INGEST_CONTROL_WRITER_STATUS_V1,
+    INGEST_CONTROL_CHAIN_EVENTS_V1,
+    INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
+    INGEST_CONTROL_MEMPOOL_EVENTS_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+];
 /// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
 ///
 /// Coexists with [`WALLET_ADDRESS_TRANSPARENT_BALANCE_V1`] when the derive
@@ -103,29 +141,37 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
 ];
 
 /// Helpers for client-side capability discovery.
+///
+/// Implemented by every per-service descriptor (`WalletServerInfo`,
+/// `ExplorerServerInfo`) plus the cross-service `ops::ServerInfo` they embed.
+/// Capability discovery always reads from the embedded `ops::ServerInfo`;
+/// per-service descriptors delegate.
 pub trait CapabilityDescriptor {
     /// Returns true if the descriptor advertises `capability` under
     /// [`ZINDER_CAPABILITIES`] semantics.
     fn has(&self, capability: &str) -> bool;
-
-    /// Returns the deprecation entry for `capability` when one is present.
-    ///
-    /// A capability listed in `deprecated_capabilities` continues to function
-    /// during the deprecation window; the entry communicates the replacement
-    /// and the earliest removal version.
-    fn deprecation(&self, capability: &str) -> Option<&crate::v1::wallet::DeprecatedCapability>;
 }
 
-impl CapabilityDescriptor for ServerCapabilities {
+impl CapabilityDescriptor for OpsServerInfo {
     fn has(&self, capability: &str) -> bool {
         self.capabilities
             .iter()
             .any(|advertised| advertised == capability)
     }
+}
 
-    fn deprecation(&self, capability: &str) -> Option<&crate::v1::wallet::DeprecatedCapability> {
-        self.deprecated_capabilities
-            .iter()
-            .find(|entry| entry.capability == capability)
+impl CapabilityDescriptor for WalletServerInfo {
+    fn has(&self, capability: &str) -> bool {
+        self.common
+            .as_ref()
+            .is_some_and(|common| common.has(capability))
+    }
+}
+
+impl CapabilityDescriptor for ExplorerServerInfo {
+    fn has(&self, capability: &str) -> bool {
+        self.common
+            .as_ref()
+            .is_some_and(|common| common.has(capability))
     }
 }

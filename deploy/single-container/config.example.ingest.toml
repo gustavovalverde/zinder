@@ -1,0 +1,40 @@
+# Reference `zinder-ingest tip-follow` configuration for the single-container
+# image (mounted at /etc/zinder/ingest.toml).
+#
+# Each binary strict-parses its own TOML schema (deny_unknown_fields), so the
+# writer and reader live in separate files. Secrets prefer PaaS-injected env
+# vars per ADR-0018:
+#
+#   ZINDER_NODE__AUTH__METHOD=cookie
+#   ZINDER_NODE__AUTH__COOKIE=<cookie-content>
+#
+# or, with a mounted cookie file:
+#
+#   ZINDER_NODE__AUTH__METHOD=cookie
+#   ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
+
+[network]
+name = "zcash-testnet"
+
+[node]
+source = "zebra-json-rpc"
+json_rpc_addr = "http://zebra:8232"
+request_timeout_secs = 30
+
+[node.auth]
+method = "basic"
+username = "zebra"
+password = "REPLACE_VIA_ENV_VAR"
+
+[storage]
+path = "/var/lib/zinder/store"
+
+[ingest]
+reorg_window_blocks = 100
+commit_batch_blocks = 1000
+
+[ingest.control]
+listen_addr = "127.0.0.1:9100"
+
+[tip_follow]
+poll_interval_ms = 2000

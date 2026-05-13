@@ -27,8 +27,8 @@ use zinder_ingest::{
     tip_follow_with_primary_store,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, cancel_on_ctrl_c,
-    install_tracing_subscriber, spawn_ops_endpoint,
+    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, StartupPhase,
+    cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{
     JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeTarget,
@@ -248,13 +248,28 @@ fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
     ExitCode::FAILURE
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Backfill bootstrap composes the load_config, start_api, connect_node, check_schema, recover_state, and ready phases plus the actual backfill in one auditable sequence; splitting the phases out would obscure the ordering."
+)]
 async fn run_backfill(
     config_path: Option<PathBuf>,
     args: BackfillArgs,
     ops_listen_addr: Option<SocketAddr>,
 ) -> Result<(), IngestConfigError> {
-    let mut command_config = config::load_backfill_config(config_path, args.into())?;
+    let load_config_phase = StartupPhase::LoadConfig.start();
+    let mut command_config = match config::load_backfill_config(config_path, args.into()) {
+        Ok(cfg) => {
+            load_config_phase.complete();
+            cfg
+        }
+        Err(error) => {
+            load_config_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let readiness = Readiness::default();
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = ops_listen_addr.map(|listen_addr| {
         spawn_ingest_ops(
             listen_addr,
@@ -262,15 +277,47 @@ async fn run_backfill(
             &readiness,
         )
     });
+
+    let connect_node_phase = StartupPhase::ConnectNode.start();
     let source =
-        zebra_json_rpc_source_for_target(command_config.node_source, &command_config.node)?;
-    ensure_node_capabilities(&source, &readiness).await?;
-    resolve_backfill_coverage(&mut command_config, &source).await?;
+        match zebra_json_rpc_source_for_target(command_config.node_source, &command_config.node) {
+            Ok(source) => {
+                connect_node_phase.complete();
+                source
+            }
+            Err(error) => {
+                connect_node_phase.fail(&error);
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
+
+    let check_schema_phase = StartupPhase::CheckSchema.start();
+    match ensure_node_capabilities(&source, &readiness).await {
+        Ok(_probed_capabilities) => check_schema_phase.complete(),
+        Err(error) => {
+            check_schema_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    }
+
+    let recover_state_phase = StartupPhase::RecoverState.start();
+    if let Err(error) = resolve_backfill_coverage(&mut command_config, &source).await {
+        recover_state_phase.fail(&error);
+        start_api_phase.fail(&error);
+        return Err(error);
+    }
     let checkpoint = if let Some(checkpoint_height) = command_config.checkpoint_height {
-        let checkpoint = source
-            .fetch_chain_checkpoint(checkpoint_height)
-            .await
-            .map_err(IngestError::from)?;
+        let checkpoint = match source.fetch_chain_checkpoint(checkpoint_height).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let wrapped: IngestConfigError = IngestError::from(error).into();
+                recover_state_phase.fail(&wrapped);
+                start_api_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
         tracing::info!(
             target: "zinder::ingest",
             event = "backfill_checkpoint_resolved",
@@ -285,7 +332,17 @@ async fn run_backfill(
     } else {
         None
     };
-    let backfill_config = command_config.resolved_backfill_config(checkpoint)?;
+    let backfill_config = match command_config.resolved_backfill_config(checkpoint) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            recover_state_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
+    recover_state_phase.complete();
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::syncing(None, None, None));
     let backfill_outcome = backfill(&backfill_config, &source).await?;
 
@@ -379,7 +436,7 @@ async fn resolve_backfill_coverage(
 async fn ensure_node_capabilities(
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
-) -> Result<(), IngestConfigError> {
+) -> Result<NodeCapabilities, IngestConfigError> {
     let probed_capabilities = match source.probe_capabilities().await {
         Ok(probed_capabilities) => probed_capabilities,
         Err(probe_error) => {
@@ -427,7 +484,7 @@ async fn ensure_node_capabilities(
         return Err(IngestError::from(error).into());
     }
 
-    Ok(())
+    Ok(probed_capabilities)
 }
 
 fn require_ingest_node_capabilities(
@@ -472,9 +529,21 @@ async fn run_tip_follow(
     args: TipFollowArgs,
     ops_listen_addr: Option<SocketAddr>,
 ) -> Result<(), IngestConfigError> {
-    let command_config = config::load_tip_follow_config(config_path, args.into())?;
+    let load_config_phase = StartupPhase::LoadConfig.start();
+    let command_config = match config::load_tip_follow_config(config_path, args.into()) {
+        Ok(command_config) => {
+            load_config_phase.complete();
+            command_config
+        }
+        Err(error) => {
+            load_config_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let tip_follow_config = command_config.tip_follow;
     let readiness = Readiness::default();
+
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = ops_listen_addr.map(|listen_addr| {
         spawn_ingest_ops(
             listen_addr,
@@ -482,9 +551,49 @@ async fn run_tip_follow(
             &readiness,
         )
     });
-    let store = open_tip_follow_store(&tip_follow_config)?;
-    let source =
-        zebra_json_rpc_source_for_target(tip_follow_config.node_source, &tip_follow_config.node)?;
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let store = match open_tip_follow_store(&tip_follow_config) {
+        Ok(store) => {
+            open_storage_phase.complete();
+            store
+        }
+        Err(error) => {
+            open_storage_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error.into());
+        }
+    };
+
+    let connect_node_phase = StartupPhase::ConnectNode.start();
+    let source = match zebra_json_rpc_source_for_target(
+        tip_follow_config.node_source,
+        &tip_follow_config.node,
+    ) {
+        Ok(source) => {
+            connect_node_phase.complete();
+            source
+        }
+        Err(error) => {
+            connect_node_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
+
+    let check_schema_phase = StartupPhase::CheckSchema.start();
+    match ensure_node_capabilities(&source, &readiness).await {
+        Ok(_probed_capabilities) => {
+            check_schema_phase.complete();
+        }
+        Err(error) => {
+            check_schema_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    }
+
+    start_api_phase.complete();
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     let mempool_index = MempoolIndex::new();
@@ -546,8 +655,8 @@ async fn run_tip_follow(
         "tip-follow started"
     );
 
-    ensure_node_capabilities(&source, &readiness).await?;
     readiness.set(ReadinessState::syncing(None, None, None));
+    StartupPhase::Ready.start().complete();
     let tip_follow_outcome = tip_follow_with_primary_store(
         &tip_follow_config,
         &source,

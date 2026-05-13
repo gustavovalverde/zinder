@@ -416,11 +416,45 @@ A bare count (`max_compact_block_range`) is acceptable when the unit is intrinsi
 
 ### Environment variable mapping
 
-`ZINDER_<SECTION>__<FIELD>` is the convention. Nested sections double-underscore: `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_INGEST__RETENTION__CHAIN_EVENT_RETENTION_HOURS`. Sensitive leaves (`password`, `secret`, `token`, `cookie`, `private_key`) are rejected from environment variables; they must come from the TOML file or a secret manager.
+`ZINDER_<SECTION>__<FIELD>` is the convention. Nested sections double-underscore: `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_INGEST__RETENTION__CHAIN_EVENT_RETENTION_HOURS`. Every TOML field is reachable through this mapping.
+
+Secrets are accepted through the environment ([ADR-0018](../adrs/0018-environment-variable-secret-policy.md)); redaction happens at every emit boundary (`--print-config`, structured logs, `Debug` impls). The supported upstream-node auth shapes are:
+
+| Env var | Resolves to |
+| ------- | ----------- |
+| `ZINDER_NODE__AUTH__METHOD=basic` + `ZINDER_NODE__AUTH__USERNAME` + `ZINDER_NODE__AUTH__PASSWORD` | HTTP Basic auth |
+| `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie` | Cookie auth from a file on disk |
+| `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__COOKIE=<credentials>` | Cookie auth from inline credentials (PaaS pattern) |
+
+`__PATH` and `__COOKIE` are mutually exclusive. Per-surface file-only constraints that remain load-bearing for security reasons (the ingest-control bearer token at `ingest.control.token_path`, per [ADR-0009](../adrs/0009-ingest-control-transport-security.md)) are enforced at their respective config types, not as a blanket env-var policy.
+
+#### Operator-facing variables
+
+The table below lists the `ZINDER_*` variables every Zinder binary advertises. The content mirrors [`zinder_runtime::ENVIRONMENT_VARIABLES`](../../crates/zinder-runtime/src/env_var_docs.rs); the doc-mirror integration test `zinder-runtime::integration::env_var_docs::public_interfaces_env_var_table_mirrors_runtime_constant` fails when this block and the source list drift apart. Regenerate the rendered table via `cargo run -p zinder-runtime --example dump_env_var_table` and paste the output between the markers below.
+
+<!-- env-var-table:public-interfaces:start -->
+| Variable | Used by | Requirement | TOML field | Description |
+| -------- | ------- | ----------- | ---------- | ----------- |
+| `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-derive | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC polling when unset. |
+| `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
+| `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
+| `ZINDER_NODE__AUTH__PASSWORD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.password` | Basic-auth password. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_NODE__AUTH__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.path` | Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`. |
+| `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Per ADR-0018 the variable accepts secrets so a PaaS environment without persistent disks can supply the credential. (sensitive; redacted) |
+| `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
+| `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
+| `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest.control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0009. |
+| `ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH` | zinder-ingest | Optional | `ingest.control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0009). File-only by policy; inline secrets are rejected at config load. |
+| `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | zinder-query, zinder-compat-lightwalletd | Required | `storage.ingest_control_addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. |
+| `ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH` | zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `storage.ingest_control_bearer_token_path` | Path to the bearer token file presented to the IngestControl writer when the writer enforces auth (ADR-0009). |
+| `ZINDER_DERIVE__BEARER_TOKEN_PATH` | zinder-derive | Optional | `derive.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service derive-plane reads (ADR-0011). |
+<!-- env-var-table:public-interfaces:end -->
 
 ### `--print-config`
 
-Every production binary exposes `--config` and `--print-config`. The print form must show explicit `[REDACTED]` markers for sensitive fields. The output should round-trip: feeding `--print-config` back as `--config` produces the same effective configuration.
+Every production binary exposes `--config` and `--print-config`. The print form shows explicit `[REDACTED]` markers for every sensitive field regardless of how the value was supplied (config file, env var, or CLI override). The output round-trips: feeding `--print-config` back as `--config` produces the same effective configuration.
 
 ### Avoid ambiguous names
 

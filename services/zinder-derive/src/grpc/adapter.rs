@@ -15,9 +15,10 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::{
     explorer::{
-        ExplorerServerCapabilities, ServerInfoRequest, ServerInfoResponse,
+        ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
+    ops,
     wallet::{
         self, TransparentAddressBalanceRequest, TransparentAddressBalanceResponse,
         wallet_query_client::WalletQueryClient,
@@ -123,11 +124,14 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
         Ok(Response::new(ServerInfoResponse {
-            capabilities: Some(ExplorerServerCapabilities {
-                capabilities: self.advertised_capabilities(),
+            info: Some(ExplorerServerInfo {
+                common: Some(ops::ServerInfo {
+                    network: self.settings.network.clone(),
+                    service_name: env!("CARGO_PKG_NAME").to_owned(),
+                    service_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    capabilities: self.advertised_capabilities(),
+                }),
                 vendor: "Zinder".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                network: self.settings.network.clone(),
             }),
         }))
     }

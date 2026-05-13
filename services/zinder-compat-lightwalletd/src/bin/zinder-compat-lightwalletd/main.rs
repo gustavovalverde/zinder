@@ -9,7 +9,8 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    OpsServer, Readiness, cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
+    OpsServer, Readiness, StartupPhase, cancel_on_ctrl_c, install_tracing_subscriber,
+    spawn_ops_endpoint,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::SecondaryChainStore;
@@ -97,35 +98,79 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     reason = "lightwalletd bootstrap composes the readiness, ops, store, broadcaster, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
 )]
 async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
+    let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
     let ops_listen_addr = cli.ops_listen_addr;
-    let lightwalletd_config = config::load_lightwalletd_config(config_path, cli.into())?;
+    let lightwalletd_config = match config::load_lightwalletd_config(config_path, cli.into()) {
+        Ok(cfg) => {
+            load_config_phase.complete();
+            cfg
+        }
+        Err(error) => {
+            load_config_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let readiness = Readiness::default();
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle =
         ops_listen_addr.map(|listen_addr| spawn_ops(listen_addr, &lightwalletd_config, &readiness));
-    let store = SecondaryChainStore::open(
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let store = match SecondaryChainStore::open(
         &lightwalletd_config.storage_path,
         &lightwalletd_config.secondary_path,
         zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network),
-    )
-    .map_err(LightwalletdConfigError::Store)?;
+    ) {
+        Ok(handle) => {
+            open_storage_phase.complete();
+            handle
+        }
+        Err(error) => {
+            let wrapped = LightwalletdConfigError::Store(error);
+            open_storage_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
     let visible_height = store
         .current_chain_epoch()
         .map_err(LightwalletdConfigError::Store)?
         .map(|epoch| epoch.tip_height.value());
-    let broadcaster = build_broadcaster(lightwalletd_config.broadcaster.as_ref())?;
-    let network_upgrade_activations = match broadcaster.as_ref() {
-        Some(source) => source
-            .discover_network_upgrade_activations("zinder-compat-lightwalletd")
-            .await
-            .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?,
-        None => {
-            return Err(LightwalletdConfigError::Source(Box::new(
-                zinder_source::SourceError::SourceProtocolMismatch {
-                    reason: "[node] section is required so GetLightdInfo can serve a \
-                             node-discovered consensus branch id",
-                },
-            )));
+
+    let connect_node_phase = StartupPhase::ConnectNode.start();
+    let broadcaster = match build_broadcaster(lightwalletd_config.broadcaster.as_ref()) {
+        Ok(broadcaster) => broadcaster,
+        Err(error) => {
+            connect_node_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
+    let Some(broadcaster_source) = broadcaster.as_ref() else {
+        let wrapped = LightwalletdConfigError::Source(Box::new(
+            zinder_source::SourceError::SourceProtocolMismatch {
+                reason: "[node] section is required so GetLightdInfo can serve a \
+                         node-discovered consensus branch id",
+            },
+        ));
+        connect_node_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    };
+    let network_upgrade_activations = match broadcaster_source
+        .discover_network_upgrade_activations("zinder-compat-lightwalletd")
+        .await
+    {
+        Ok(activations) => {
+            connect_node_phase.complete();
+            activations
+        }
+        Err(source_error) => {
+            let wrapped = LightwalletdConfigError::Source(Box::new(source_error));
+            connect_node_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
         }
     };
     let wallet_query = zinder_query::WalletQuery::new(
@@ -182,6 +227,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)
         .build_v1()?;
+
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
 
     let server_result = tonic::transport::Server::builder()
         .add_service(grpc_adapter.into_server())

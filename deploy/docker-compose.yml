@@ -1,0 +1,68 @@
+# Reference Compose topology pairing zinder-ingest (writer) and zinder-query
+# (public reader) against a single canonical volume.
+#
+# This composes the per-service images at services/<svc>/Dockerfile rather
+# than the single-container s6-overlay image. Both shapes are supported;
+# use the single-container image when you want one process tree, this
+# Compose file when you want two containers with separate restart policies.
+
+services:
+  zinder-ingest:
+    build:
+      context: ..
+      dockerfile: services/zinder-ingest/Dockerfile
+    image: zinder-ingest:latest
+    container_name: zinder-ingest
+    restart: on-failure
+    volumes:
+      - zinder-data:/var/lib/zinder
+      - ./config/ingest.toml:/etc/zinder/config.toml:ro
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      # Provide exactly one of ZINDER_NODE__AUTH__COOKIE or __PATH.
+      ZINDER_NODE__AUTH__COOKIE: ${ZINDER_NODE__AUTH__COOKIE:-}
+      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-}
+      ZINDER_NODE__AUTH__USERNAME: ${ZINDER_NODE__AUTH__USERNAME:-}
+      ZINDER_NODE__AUTH__PASSWORD: ${ZINDER_NODE__AUTH__PASSWORD:-}
+    ports:
+      # ingest-control is internal-only; do not publish externally.
+      - "127.0.0.1:9100:9100"
+      - "127.0.0.1:9105:9105"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9105/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  zinder-query:
+    build:
+      context: ..
+      dockerfile: services/zinder-query/Dockerfile
+    image: zinder-query:latest
+    container_name: zinder-query
+    restart: on-failure
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    volumes:
+      - zinder-data:/var/lib/zinder
+      - ./config/query.toml:/etc/zinder/config.toml:ro
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      ZINDER_STORAGE__INGEST_CONTROL_ADDR: http://zinder-ingest:9100
+    ports:
+      - "9101:9101"
+      - "127.0.0.1:9106:9106"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9106/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  zinder-data:
+    name: zinder-data

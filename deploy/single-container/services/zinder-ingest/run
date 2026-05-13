@@ -1,0 +1,20 @@
+#!/command/with-contenv sh
+#
+# Supervises zinder-ingest tip-follow inside the single-container image.
+# s6 invokes this script and treats stdout/stderr as the service log; the
+# tracing subscriber installed by zinder-ingest writes structured events
+# directly to stderr, so no log-shipping fan-out is required.
+
+set -eu
+
+# Run as the unprivileged zinder user. s6-overlay's s6-setuidgid is the
+# idiomatic way to drop privileges inside a longrun script.
+#
+# Each Zinder binary strict-parses its own TOML schema (writer and reader
+# do not share the same field set), so the single-container image ships
+# two configs: `/etc/zinder/ingest.toml` for the writer and
+# `/etc/zinder/query.toml` for the reader.
+exec s6-setuidgid zinder \
+    /usr/local/bin/zinder-ingest tip-follow \
+    --config /etc/zinder/ingest.toml \
+    --ops-listen-addr 127.0.0.1:9105

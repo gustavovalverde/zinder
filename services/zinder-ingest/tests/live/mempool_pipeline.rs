@@ -22,7 +22,7 @@ use zinder_source::{
 };
 use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use zinder_testkit::StoreFixture;
-use zinder_testkit::live::{LiveTestEnv, init, require_live};
+use zinder_testkit::live::{LiveTestEnv, init, require_live, require_live_for};
 
 /// Validates that the canonical hydration step (`build_mempool_entry`) decodes
 /// a real Zebra-emitted transaction into a well-formed `MempoolEntry` whose
@@ -40,7 +40,9 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live};
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn build_mempool_entry_decodes_real_zebra_coinbase_into_canonical_form() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let json_rpc = json_rpc_source(&env)?;
 
     let tip_height = NodeSource::tip_id(&json_rpc).await?.height;
@@ -165,7 +167,9 @@ fn synthetic_chain_epoch_at(network: Network, tip_height: BlockHeight) -> ChainE
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
         return Err(eyre!(
             "this test needs ZINDER_NODE__INDEXER_GRPC_ADDR; skipping"
@@ -288,7 +292,9 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
     };
 
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
 
     let json_rpc = json_rpc_source(&env)?;
     let tip_id = NodeSource::tip_id(&json_rpc).await?;
@@ -469,7 +475,9 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     };
 
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
 
     // The publisher subscribes to `ChainEvents` strictly, so the writer must
     // commit at least one chain epoch before the publisher connects. Run

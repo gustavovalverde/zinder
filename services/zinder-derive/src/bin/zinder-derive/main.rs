@@ -9,8 +9,8 @@ use zinder_derive::{
     DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
 };
 use zinder_runtime::{
-    OpsServer, Readiness, ReadinessState, cancel_on_ctrl_c, install_tracing_subscriber,
-    spawn_ops_endpoint,
+    OpsServer, Readiness, ReadinessState, StartupPhase, cancel_on_ctrl_c,
+    install_tracing_subscriber, spawn_ops_endpoint,
 };
 
 mod config;
@@ -87,17 +87,41 @@ async fn run_runtime(cli: Cli) -> ExitCode {
 }
 
 async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
+    let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
     let ops_listen_addr_override = cli.ops_listen_addr;
-    let derive_config = config::load_derive_config(config_path, cli.into())?;
+    let derive_config = match config::load_derive_config(config_path, cli.into()) {
+        Ok(cfg) => {
+            load_config_phase.complete();
+            cfg
+        }
+        Err(error) => {
+            load_config_phase.fail(&error);
+            return Err(error);
+        }
+    };
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = derive_config
         .ops_listen_addr
         .or(ops_listen_addr_override)
         .map(|listen_addr| spawn_ops(listen_addr, &derive_config, &readiness));
-    let _store = DeriveStore::open(&derive_config.storage_path, DeriveStoreOptions::default())
-        .map_err(DeriveConfigError::Store)?;
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let _store = match DeriveStore::open(&derive_config.storage_path, DeriveStoreOptions::default())
+    {
+        Ok(handle) => {
+            open_storage_phase.complete();
+            handle
+        }
+        Err(error) => {
+            let wrapped = DeriveConfigError::Store(error);
+            open_storage_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
     let server_info = ExplorerServerInfoSettings {
         network: encode_zinder_native_chain_name(derive_config.network).to_owned(),
     };
@@ -110,6 +134,8 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     }
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::ready(None));
 
     tracing::info!(

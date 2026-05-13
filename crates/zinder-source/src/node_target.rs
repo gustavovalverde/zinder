@@ -18,18 +18,25 @@
 //! | `ZINDER_NODE__AUTH__METHOD` | `none` / `basic` / `cookie` |
 //! | `ZINDER_NODE__AUTH__USERNAME` | Basic-auth username |
 //! | `ZINDER_NODE__AUTH__PASSWORD` | Basic-auth password |
-//! | `ZINDER_NODE__AUTH__PATH` | Cookie-auth path |
+//! | `ZINDER_NODE__AUTH__PATH` | Cookie-auth file path |
+//! | `ZINDER_NODE__AUTH__COOKIE` | Cookie-auth inline credentials |
 //! | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | [`NodeTarget::request_timeout`] |
 //! | `ZINDER_NODE__MAX_RESPONSE_BYTES` | [`NodeTarget::max_response_bytes`] |
+//!
+//! Cookie credentials may be supplied either by file path or inline (but not
+//! both). Inline credentials let `PaaS`-style deployments inject the secret
+//! directly through the environment without writing a shim that materializes
+//! a cookie file. See [ADR-0018](../../../docs/adrs/0018-environment-variable-secret-policy.md).
 
 use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::decode_zinder_native_chain_name;
 
-use crate::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
+use crate::{CookieSource, DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 
 /// Default per-RPC node request timeout when the configuration omits one.
 pub const DEFAULT_NODE_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -166,6 +173,7 @@ impl NodeTarget {
                 username: read_optional("ZINDER_NODE__AUTH__USERNAME"),
                 password: read_optional("ZINDER_NODE__AUTH__PASSWORD"),
                 path: read_optional("ZINDER_NODE__AUTH__PATH").map(PathBuf::from),
+                cookie: read_optional("ZINDER_NODE__AUTH__COOKIE"),
             },
         };
 
@@ -203,8 +211,12 @@ pub struct NodeAuthSection {
     pub username: Option<String>,
     /// Basic-auth password.
     pub password: Option<String>,
-    /// Cookie-auth file path.
+    /// Cookie-auth file path. Mutually exclusive with [`Self::cookie`].
     pub path: Option<PathBuf>,
+    /// Cookie-auth inline credentials. Used by `PaaS` deployments that inject
+    /// the secret as a configuration value. Mutually exclusive with
+    /// [`Self::path`].
+    pub cookie: Option<String>,
 }
 
 /// Error returned while resolving node configuration.
@@ -259,10 +271,12 @@ fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigErr
             reject_present(section.username.is_some(), "node.auth.username", "none")?;
             reject_present(section.password.is_some(), "node.auth.password", "none")?;
             reject_present(section.path.is_some(), "node.auth.path", "none")?;
+            reject_present(section.cookie.is_some(), "node.auth.cookie", "none")?;
             Ok(NodeAuth::None)
         }
         "basic" => {
             reject_present(section.path.is_some(), "node.auth.path", "basic")?;
+            reject_present(section.cookie.is_some(), "node.auth.cookie", "basic")?;
             let username = section.username.ok_or(NodeConfigError::MissingField {
                 field: "node.auth.username",
             })?;
@@ -274,10 +288,21 @@ fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigErr
         "cookie" => {
             reject_present(section.username.is_some(), "node.auth.username", "cookie")?;
             reject_present(section.password.is_some(), "node.auth.password", "cookie")?;
-            let path = section.path.ok_or(NodeConfigError::MissingField {
-                field: "node.auth.path",
-            })?;
-            Ok(NodeAuth::Cookie { path })
+            let source = match (section.path, section.cookie) {
+                (Some(_), Some(_)) => {
+                    return Err(NodeConfigError::Invalid {
+                        reason: "node.auth.path and node.auth.cookie are mutually exclusive",
+                    });
+                }
+                (Some(path), None) => CookieSource::File(path),
+                (None, Some(content)) => CookieSource::Inline(SecretString::from(content)),
+                (None, None) => {
+                    return Err(NodeConfigError::MissingField {
+                        field: "node.auth.path or node.auth.cookie",
+                    });
+                }
+            };
+            Ok(NodeAuth::Cookie(source))
         }
         other => Err(NodeConfigError::UnknownAuthMethod {
             method: other.to_owned(),
@@ -338,6 +363,7 @@ mod tests {
                 username: Some("zebra".to_owned()),
                 password: Some("zebra".to_owned()),
                 path: None,
+                cookie: None,
             },
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
@@ -365,6 +391,7 @@ mod tests {
                 username: None,
                 password: None,
                 path: None,
+                cookie: None,
             },
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
@@ -398,6 +425,7 @@ mod tests {
                 username: Some("zebra".to_owned()),
                 password: Some("zebra".to_owned()),
                 path: Some(PathBuf::from("/etc/zebra/cookie")),
+                cookie: None,
             },
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
@@ -407,6 +435,104 @@ mod tests {
             Err(NodeConfigError::AuthFieldNotApplicable {
                 field: "node.auth.path",
                 method: "basic",
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_cookie_auth_from_path() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("cookie".to_owned()),
+                username: None,
+                password: None,
+                path: Some(PathBuf::from("/var/run/auth/.cookie")),
+                cookie: None,
+            },
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+
+        assert!(matches!(
+            target.node_auth,
+            NodeAuth::Cookie(CookieSource::File(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cookie_auth_from_inline() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("cookie".to_owned()),
+                username: None,
+                password: None,
+                path: None,
+                cookie: Some("user:cookie-secret".to_owned()),
+            },
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+
+        assert!(matches!(
+            target.node_auth,
+            NodeAuth::Cookie(CookieSource::Inline(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_rejects_cookie_auth_with_both_path_and_inline() {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("cookie".to_owned()),
+                username: None,
+                password: None,
+                path: Some(PathBuf::from("/var/run/auth/.cookie")),
+                cookie: Some("user:cookie-secret".to_owned()),
+            },
+        };
+        let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
+
+        assert!(matches!(
+            outcome,
+            Err(NodeConfigError::Invalid {
+                reason: "node.auth.path and node.auth.cookie are mutually exclusive",
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_cookie_auth_without_path_or_inline() {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("cookie".to_owned()),
+                username: None,
+                password: None,
+                path: None,
+                cookie: None,
+            },
+        };
+        let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
+
+        assert!(matches!(
+            outcome,
+            Err(NodeConfigError::MissingField {
+                field: "node.auth.path or node.auth.cookie",
             })
         ));
     }
@@ -423,6 +549,7 @@ mod tests {
                 username: None,
                 password: None,
                 path: None,
+                cookie: None,
             },
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);

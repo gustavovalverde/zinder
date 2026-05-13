@@ -1,0 +1,38 @@
+# Build artifacts and scratch state never belong in the build context.
+target/
+.tmp/
+mutants.out/
+mutants.out.old/
+*.rocksdb/
+*.zinder-store/
+*.profraw
+coverage/
+lcov.info
+
+# Local IDE and shell state.
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Documentation and plans are not used by the runtime image.
+docs/
+plans/
+observability/
+
+# Existing Dockerfiles and deploy assets do not need to ship inside images,
+# with the exception of the single-container image's s6-overlay service
+# definitions and reference config: the Dockerfile at
+# `deploy/single-container/Dockerfile` COPYs those files into the runtime
+# image and the build fails when they are excluded from the build context.
+**/Dockerfile
+**/Dockerfile.*
+deploy/
+!deploy/single-container/services/
+!deploy/single-container/services/**
+!deploy/single-container/config.example.ingest.toml
+!deploy/single-container/config.example.query.toml
+
+# Test outputs.
+**/test-results/
+**/junit.xml

@@ -13,18 +13,15 @@ use zinder_source::{
     NodeCapability, NodeSource, TransactionBroadcaster, UpstreamTransactionLookup,
     ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
-use zinder_testkit::live::{init, require_live, require_live_mainnet};
+use zinder_testkit::live::{init, require_live, require_live_for, require_live_mainnet};
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetch_chain_checkpoint_at_tip_returns_zero_tree_sizes_on_regtest() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
-    if !matches!(env.network(), Network::ZcashRegtest) {
-        return Err(eyre!(
-            "this test asserts regtest semantics; set ZINDER_NETWORK=zcash-regtest"
-        ));
-    }
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let tip = NodeSource::tip_id(&source).await?.height;
     let checkpoint = source.fetch_chain_checkpoint(tip).await?;
@@ -42,7 +39,9 @@ async fn fetch_chain_checkpoint_at_tip_returns_zero_tree_sizes_on_regtest() -> R
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet() -> Result<()> {
     let _guard = init();
-    let env = require_live_mainnet()?;
+    let Some(env) = require_live_mainnet()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let tip = NodeSource::tip_id(&source).await?.height;
     let checkpoint_height = BlockHeight::new(tip.value().saturating_sub(1_000));
@@ -66,7 +65,9 @@ async fn fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet() -> Res
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn capability_probe_discovers_zebra_methods() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
 
     let probed = source.probe_capabilities().await?;
@@ -86,7 +87,9 @@ async fn capability_probe_discovers_zebra_methods() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn tip_id_advances_above_one_million() -> Result<()> {
     let _guard = init();
-    let env = require_live_mainnet()?;
+    let Some(env) = require_live_mainnet()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let tip = source.tip_id().await?;
 
@@ -101,7 +104,9 @@ async fn tip_id_advances_above_one_million() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn broadcast_classifies_invalid_transaction() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
 
     let subtree_roots = source
@@ -130,7 +135,9 @@ async fn broadcast_classifies_invalid_transaction() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetches_tip_block_and_rejects_invalid_transaction() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
 
     let tip_height = source.tip_id().await?.height;
@@ -176,7 +183,9 @@ fn zebra_source(env: &zinder_testkit::live::LiveTestEnv) -> Result<ZebraJsonRpcS
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetch_raw_mempool_transaction_ids_returns_typed_list() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     // The shape of the response (Vec<TransactionId>) is the contract;
     // the regtest mempool may be empty or carry whatever the running
@@ -193,7 +202,9 @@ async fn fetch_raw_mempool_transaction_ids_returns_typed_list() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn upstream_transaction_lookup_resolves_mined_coinbase() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let tip_height = source.tip_id().await?.height;
     let mined_transaction_id = parse_coinbase_transaction_id(&source, tip_height).await?;
@@ -222,7 +233,9 @@ async fn upstream_transaction_lookup_resolves_mined_coinbase() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn json_rpc_mempool_source_runs_one_poll_cycle_without_panic() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let json_rpc = zebra_source(&env)?;
     let mempool_source = JsonRpcMempoolSource::with_options(
         json_rpc,
@@ -283,7 +296,9 @@ async fn parse_coinbase_transaction_id(
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn upstream_transaction_lookup_returns_not_found_for_unknown_txid() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let unknown_transaction_id = TransactionId::from_bytes([0xAB; 32]);
     let lookup = source
@@ -297,7 +312,9 @@ async fn upstream_transaction_lookup_returns_not_found_for_unknown_txid() -> Res
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetch_raw_transaction_bytes_returns_none_for_unknown_txid() -> Result<()> {
     let _guard = init();
-    let env = require_live()?;
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let unknown_transaction_id = TransactionId::from_bytes([0xCD; 32]);
     let bytes = source
@@ -311,11 +328,14 @@ async fn fetch_raw_transaction_bytes_returns_none_for_unknown_txid() -> Result<(
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn fetch_network_upgrade_activations_matches_running_node_getblockchaininfo() -> Result<()> {
     let _guard = init();
-    let env = zinder_testkit::live::require_live_for(&[
+    let Some(env) = zinder_testkit::live::require_live_for(&[
         Network::ZcashRegtest,
         Network::ZcashTestnet,
         Network::ZcashMainnet,
-    ])?;
+    ])?
+    else {
+        return Ok(());
+    };
     let source = zebra_source(&env)?;
     let activations = source.fetch_network_upgrade_activations().await?;
 

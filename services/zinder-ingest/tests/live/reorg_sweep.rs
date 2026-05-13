@@ -90,7 +90,9 @@ async fn three_block_reorg_covers_full_reverted_range() -> Result<()> {
 )]
 async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     let _guard = init();
-    let env = require_live_for(&[Network::ZcashRegtest])?;
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
 
     let tempdir = tempfile::tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
@@ -184,6 +186,7 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         .chain_events(ChainEventsRequest {
             from_cursor: Vec::new(),
             family: ProtoChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
         })
         .await?
         .into_inner();

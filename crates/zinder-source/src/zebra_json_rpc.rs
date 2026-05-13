@@ -1,12 +1,8 @@
 //! Zebra JSON-RPC source adapter.
 
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{
-    fs,
-    num::{NonZeroU32, NonZeroU64},
-    path::Path,
-};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -27,9 +23,10 @@ use zinder_core::{
 };
 
 use crate::{
-    NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainCheckpoint,
-    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
-    decode_display_block_hash, source_block::wire_error_to_transaction_id_error,
+    CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
+    SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
+    TransactionBroadcaster, decode_display_block_hash,
+    source_block::wire_error_to_transaction_id_error,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -338,7 +335,7 @@ impl ZebraJsonRpcSource {
             NodeAuth::Basic { username, password } => {
                 Some(basic_authorization_header(&username, &password))
             }
-            NodeAuth::Cookie { path } => Some(cookie_authorization_header(&path)?),
+            NodeAuth::Cookie(source) => Some(cookie_authorization_header(&source)?),
         };
 
         let client = build_http_client(
@@ -844,20 +841,22 @@ fn basic_authorization_header(username: &str, password: &SecretString) -> String
     basic_authorization_header_from_credentials(&credentials)
 }
 
-/// Builds the `Authorization: Basic ...` header value from a node cookie file.
-fn cookie_authorization_header(path: &Path) -> Result<String, SourceError> {
-    let cookie = fs::read_to_string(path).map_err(|_| SourceError::NodeUnavailable {
-        is_retryable: false,
-        reason: "node cookie file could not be read".to_owned(),
-    })?;
-    let credentials = cookie.trim();
-    if credentials.is_empty() {
-        return Err(SourceError::NodeUnavailable {
+/// Builds the `Authorization: Basic ...` header value from a cookie source.
+fn cookie_authorization_header(source: &CookieSource) -> Result<String, SourceError> {
+    let credentials = source
+        .read_credentials()
+        .map_err(|error| SourceError::NodeUnavailable {
             is_retryable: false,
-            reason: "node cookie file is empty".to_owned(),
-        });
-    }
-    Ok(basic_authorization_header_from_credentials(credentials))
+            reason: match error {
+                CookieSourceError::Unreadable { .. } => {
+                    "node cookie source could not be read".to_owned()
+                }
+                CookieSourceError::Empty => "node cookie credentials are empty".to_owned(),
+            },
+        })?;
+    Ok(basic_authorization_header_from_credentials(
+        credentials.expose_secret(),
+    ))
 }
 
 /// Builds the `Authorization: Basic ...` header value from raw `username:password` credentials.
@@ -1145,25 +1144,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cookie_auth_builds_basic_authorization_from_cookie_file() -> Result<(), SourceError> {
-        let cookie_path = std::env::temp_dir().join(format!(
-            "zinder-zebra-cookie-auth-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| SourceError::NodeUnavailable {
-                    is_retryable: false,
-                    reason: "system clock is before unix epoch".to_owned(),
-                })?
-                .as_nanos()
-        ));
-        fs::write(&cookie_path, "zebra:secret\n").map_err(|_| SourceError::NodeUnavailable {
-            is_retryable: false,
-            reason: "test cookie file could not be written".to_owned(),
-        })?;
+    fn cookie_auth_builds_basic_authorization_from_file() -> Result<(), eyre::Report> {
+        use std::io::Write;
+        let mut cookie_file = tempfile::NamedTempFile::new()?;
+        writeln!(cookie_file, "zebra:secret")?;
 
-        let authorization = cookie_authorization_header(&cookie_path)?;
-        let _ = fs::remove_file(cookie_path);
+        let source = CookieSource::File(cookie_file.path().to_path_buf());
+        let authorization = cookie_authorization_header(&source)?;
+
+        assert_eq!(authorization, "Basic emVicmE6c2VjcmV0");
+        Ok(())
+    }
+
+    #[test]
+    fn cookie_auth_builds_basic_authorization_from_inline() -> Result<(), SourceError> {
+        let source = CookieSource::Inline(SecretString::from("zebra:secret"));
+        let authorization = cookie_authorization_header(&source)?;
 
         assert_eq!(authorization, "Basic emVicmE6c2VjcmV0");
         Ok(())

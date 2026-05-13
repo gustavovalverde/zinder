@@ -1,0 +1,80 @@
+// Stable error-reason vocabulary attached to every Zinder gRPC `Status`
+// via `google.rpc.ErrorInfo` (carried by `tonic_types::ErrorDetails`).
+//
+// The outer `Status` code stays the canonical gRPC retry signal; the
+// `ErrorReason` is the typed name a client maps to local handling
+// decisions (retry policy, alerting, operator action). The proto enum is
+// the documented source of truth; the Rust hand-written `QueryError` and
+// `StoreError` enums map each variant to a reason at the gRPC adapter
+// boundary.
+//
+// See:
+// - docs/architecture/public-interfaces.md (Error vocabulary)
+// - docs/adrs/0019-typed-grpc-error-reason-vocabulary.md
+
+syntax = "proto3";
+
+package zinder.v1.ops;
+
+// Stable reason attached as `google.rpc.ErrorInfo.reason` on every gRPC
+// `Status` returned by a Zinder service. The `domain` is `zinder.dev`.
+// Auxiliary detail (resource family/key, precondition subject, field
+// violations) continues to ride alongside via the existing
+// `tonic_types::ErrorDetails` shapes (`ResourceInfo`, `PreconditionFailure`,
+// `BadRequest`).
+//
+// New reasons are additive only and must reserve a new scalar code;
+// existing reasons' semantics are stable within a major version.
+enum ErrorReason {
+  // Default scalar so unset fields do not silently match a real reason.
+  ERROR_REASON_UNSPECIFIED = 0;
+
+  // INVALID_ARGUMENT family.
+  INVALID_BLOCK_RANGE = 1;
+  COMPACT_BLOCK_RANGE_TOO_LARGE = 2;
+  CHAIN_EVENT_CURSOR_INVALID = 3;
+  TRANSPARENT_UTXO_CURSOR_INVALID = 4;
+  TRANSPARENT_HISTORY_CURSOR_INVALID = 5;
+  INVALID_ADDRESS = 6;
+  UNSUPPORTED_SHIELDED_PROTOCOL = 7;
+  INVALID_CHAIN_STORE_OPTIONS = 8;
+  ARTIFACT_PAYLOAD_TOO_LARGE = 9;
+  INVALID_CHAIN_EPOCH_ARTIFACTS = 10;
+
+  // FAILED_PRECONDITION family.
+  BROADCAST_DISABLED = 11;
+  CHAIN_EVENT_CURSOR_EXPIRED = 12;
+  MEMPOOL_EVENT_CURSOR_EXPIRED = 13;
+  CHAIN_EPOCH_PIN_UNSUPPORTED = 14;
+  CHAIN_EPOCH_PIN_UNAVAILABLE = 15;
+  CHAIN_EPOCH_PIN_MISMATCH = 16;
+  SCHEMA_MISMATCH = 17;
+  SCHEMA_TOO_NEW = 18;
+  REORG_WINDOW_EXCEEDED = 19;
+  CHAIN_EPOCH_CONFLICT = 20;
+  CHAIN_EPOCH_NETWORK_MISMATCH = 21;
+
+  // NOT_FOUND family.
+  ARTIFACT_UNAVAILABLE = 22;
+  CHAIN_EPOCH_MISSING = 23;
+  BLOCK_NOT_IN_BEST_CHAIN = 24;
+
+  // DATA_LOSS family.
+  COMPACT_BLOCK_PAYLOAD_MALFORMED = 25;
+  ARTIFACT_CORRUPT = 26;
+
+  // UNAVAILABLE family.
+  UNSUPPORTED_CHAIN_EVENT = 27;
+  UNSUPPORTED_BLOCK_SELECTOR = 28;
+  UNSUPPORTED_TRANSACTION_STATUS = 29;
+  BLOCKING_TASK_FAILED = 30;
+  NODE_UNAVAILABLE = 31;
+  STORAGE_UNAVAILABLE = 32;
+
+  // INTERNAL family.
+  ENTROPY_UNAVAILABLE = 33;
+
+  // Reserved slots for additive growth. Removing a reserved range is a
+  // breaking change.
+  reserved 34 to 63;
+}

@@ -1,0 +1,33 @@
+#!/command/with-contenv sh
+#
+# Supervises zinder-query inside the single-container image.
+#
+# Depends on zinder-ingest being up: the dependency is declared in
+# dependencies.d/, but s6's "started" means "run script invoked", not
+# "ready to serve". The reader opens a `RocksDB` secondary against the
+# writer's primary, which fails until the writer has created its column
+# families. Wait here until the writer's IngestControl endpoint accepts
+# TCP connections (the writer binds it once its primary store is open),
+# then launch the binary.
+
+set -eu
+
+INGEST_CONTROL_HOST=127.0.0.1
+INGEST_CONTROL_PORT=9100
+WAIT_DEADLINE_SECONDS=60
+WAIT_INTERVAL_SECONDS=1
+
+elapsed=0
+until nc -z "$INGEST_CONTROL_HOST" "$INGEST_CONTROL_PORT"; do
+    if [ "$elapsed" -ge "$WAIT_DEADLINE_SECONDS" ]; then
+        echo "zinder-query/run: ingest-control endpoint at ${INGEST_CONTROL_HOST}:${INGEST_CONTROL_PORT} did not accept connections within ${WAIT_DEADLINE_SECONDS}s; exiting so s6 can decide whether to retry or tear down." >&2
+        exit 1
+    fi
+    sleep "$WAIT_INTERVAL_SECONDS"
+    elapsed=$((elapsed + WAIT_INTERVAL_SECONDS))
+done
+
+exec s6-setuidgid zinder \
+    /usr/local/bin/zinder-query \
+    --config /etc/zinder/query.toml \
+    --ops-listen-addr 0.0.0.0:9106

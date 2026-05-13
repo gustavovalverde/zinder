@@ -19,6 +19,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Request, transport::Server};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+use zinder_core::NetworkUpgradeActivations;
 use zinder_core::wire::encode_bip70_chain_name;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
@@ -41,7 +42,6 @@ use zinder_query::{
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
-use zinder_testkit::sample_regtest_upgrade_activations;
 
 /// Builds a `BackfillConfig` from a resolved live-test env plus per-test
 /// runtime knobs.
@@ -236,6 +236,35 @@ pub(crate) async fn rpc_reconsider_block(env: &LiveTestEnv, block_hash_hex: &str
     Ok(())
 }
 
+/// Fetches the network-upgrade activation table from the live node behind `env`.
+///
+/// Returns the discovered table wrapped in an `Arc` so live tests can thread
+/// it through wallet/compat adapter constructors. The compat shim's
+/// `GetLightdInfo` rejects requests when the activation table's `network`
+/// disagrees with the chain epoch's `network`, so regtest tests may use the
+/// hand-built `sample_regtest_upgrade_activations` fixture only when running
+/// against a regtest node; tests that opt into testnet or mainnet must
+/// discover the table at runtime.
+pub(crate) async fn fetch_live_network_upgrade_activations(
+    env: &LiveTestEnv,
+) -> Result<Arc<NetworkUpgradeActivations>> {
+    let source = zebra_json_rpc_source_for_env(env)?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    Ok(Arc::new(activations))
+}
+
+fn zebra_json_rpc_source_for_env(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
+    Ok(ZebraJsonRpcSource::with_options(
+        env.target.network,
+        &env.target.json_rpc_addr,
+        env.target.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: env.target.request_timeout,
+            max_response_bytes: env.target.max_response_bytes,
+        },
+    )?)
+}
+
 /// Calls Zebra's `getblockhash` JSON-RPC and returns the canonical block
 /// hash at `height` in Zebra's display (big-endian) encoding.
 pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> Result<String> {
@@ -248,25 +277,28 @@ pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> 
 
 /// Asserts that the backfilled store answers every wallet read RPC consistently
 /// for `[start_height..=end_height]` against the visible chain epoch.
+///
+/// Live tests pass `activations` discovered from the running node via
+/// [`fetch_live_network_upgrade_activations`] so the wallet/compat adapters see
+/// a table whose `network` matches the chain epoch's network.
 pub(crate) async fn assert_native_wallet_read_responses(
     store: &PrimaryChainStore,
     network: Network,
     start_height: u32,
     end_height: u32,
+    activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(
-        store.clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(&activations));
     assert_native_compact_block_range_chunks(&wallet_query, network, start_height, end_height)
         .await?;
     assert_native_latest_block_response(&wallet_query, network, end_height).await?;
     assert_native_tree_state_response(&wallet_query, network, end_height).await?;
     assert_native_latest_tree_state_response(&wallet_query, network, end_height).await?;
     assert_native_subtree_roots_response(&wallet_query, network).await?;
-    assert_native_wallet_grpc_responses(store, network, start_height, end_height).await?;
-    assert_lightwalletd_compat_responses(store, network, start_height, end_height).await?;
+    assert_native_wallet_grpc_responses(store, network, start_height, end_height, &activations)
+        .await?;
+    assert_lightwalletd_compat_responses(store, network, start_height, end_height, &activations)
+        .await?;
     Ok(())
 }
 
@@ -275,15 +307,11 @@ pub(crate) async fn assert_native_wallet_read_responses(
 pub(crate) async fn assert_lightwalletd_send_transaction_classifies_invalid(
     store: &PrimaryChainStore,
     backfill_config: &BackfillConfig,
+    activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
     let source = zebra_source_from_backfill(backfill_config)?;
-    let wallet_query = WalletQuery::new(
-        store.clone(),
-        source,
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let grpc_adapter =
-        LightwalletdGrpcAdapter::new(wallet_query, Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store.clone(), source, Arc::clone(&activations));
+    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, Arc::clone(&activations));
 
     let response = LightwalletdCompactTxStreamer::send_transaction(
         &grpc_adapter,
@@ -311,18 +339,20 @@ async fn assert_lightwalletd_compat_responses(
     network: Network,
     start_height: u32,
     end_height: u32,
+    activations: &Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(
-        store.clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let grpc_adapter =
-        LightwalletdGrpcAdapter::new(wallet_query, Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(activations));
+    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, Arc::clone(activations));
 
     assert_lightwalletd_trait_responses(&grpc_adapter, network, start_height, end_height).await?;
-    assert_generated_lightwalletd_client_responses(store, network, start_height, end_height)
-        .await?;
+    assert_generated_lightwalletd_client_responses(
+        store,
+        network,
+        start_height,
+        end_height,
+        activations,
+    )
+    .await?;
     Ok(())
 }
 
@@ -416,16 +446,13 @@ async fn assert_generated_lightwalletd_client_responses(
     network: Network,
     start_height: u32,
     end_height: u32,
+    activations: &Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store.clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
+        WalletQuery::new(store.clone(), (), Arc::clone(activations)),
+        Arc::clone(activations),
     )
     .into_server();
     let server_handle = tokio::spawn(async move {
@@ -496,12 +523,9 @@ async fn assert_native_wallet_grpc_responses(
     network: Network,
     start_height: u32,
     end_height: u32,
+    activations: &Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
-    let wallet_query = WalletQuery::new(
-        store.clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(activations));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let latest_block = WalletQueryService::latest_block(
@@ -982,7 +1006,7 @@ pub(crate) fn basic_auth_credentials(env: &LiveTestEnv) -> Result<(&str, &str)> 
     use zinder_source::NodeAuth;
     match &env.target.node_auth {
         NodeAuth::Basic { username, password } => Ok((username, password.expose_secret())),
-        NodeAuth::None | NodeAuth::Cookie { .. } => Err(eyre!(
+        NodeAuth::None | NodeAuth::Cookie(_) => Err(eyre!(
             "live CLI test requires basic auth; set ZINDER_NODE__AUTH__METHOD=basic"
         )),
     }
