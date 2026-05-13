@@ -22,9 +22,8 @@ json_rpc_addr = "http://zebra:8232"
 request_timeout_secs = 30
 
 [node.auth]
-method = "basic"
-username = "zebra"
-password = "REPLACE_VIA_ENV_VAR"
+method = "cookie"
+cookie = "REPLACE_VIA_ENV_VAR"
 
 [storage]
 path = "/var/lib/zinder/store"
