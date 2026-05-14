@@ -63,8 +63,8 @@ pub struct RemoteOpenOptions {
 /// connection is detected by the keepalive PING within
 /// `KEEP_ALIVE_INTERVAL + KEEP_ALIVE_TIMEOUT`, so a stalled call errors out
 /// instead of hanging forever. The channel multiplexes concurrent calls over
-/// one HTTP/2 connection; callers obtain their own cheap [`Clone`] via
-/// [`Self::client`].
+/// one HTTP/2 connection; the type is itself [`Clone`], and each clone
+/// shares the same underlying connection.
 #[derive(Clone)]
 pub struct RemoteChainIndex {
     client: WalletQueryClient<Channel>,

@@ -16,6 +16,13 @@ pub enum SourceError {
     },
 
     /// Raw block hex returned by the node could not be decoded.
+    ///
+    /// Prefer this variant when the `getblock` payload is malformed at the hex
+    /// layer (odd-length, non-hex digit). Once the bytes decode successfully
+    /// but fail a Zcash invariant (coinbase height, parse, timestamp range),
+    /// reach for the matching `RawBlock*` variant instead. Pure JSON-RPC
+    /// envelope violations (missing fields, wrong types) belong in
+    /// [`Self::SourceProtocolMismatch`].
     #[error("raw block is not valid hex")]
     InvalidRawBlockHex {
         /// Hex decoding failure.
@@ -72,6 +79,12 @@ pub enum SourceError {
     },
 
     /// Raw block bytes could not be parsed as a Zcash block.
+    ///
+    /// Prefer this variant when bytes decoded from hex successfully but the
+    /// resulting buffer is not a valid Zcash block (truncated header,
+    /// unexpected transaction encoding). For hex-layer failures use
+    /// [`Self::InvalidRawBlockHex`]; for JSON-RPC envelope violations use
+    /// [`Self::SourceProtocolMismatch`].
     #[error("raw block parse failed: {reason}")]
     RawBlockParseFailed {
         /// Parser failure reason.
@@ -90,6 +103,12 @@ pub enum SourceError {
     RawBlockCoinbaseHeightMissing,
 
     /// Parsed raw block height did not match the node-reported height.
+    ///
+    /// Prefer this variant when the bytes parsed cleanly but the coinbase
+    /// height disagrees with what the node-side height lookup returned (a
+    /// Zcash consensus-level mismatch). For JSON-RPC envelope mismatches
+    /// (header object reports a different height than requested) use
+    /// [`Self::SourceProtocolMismatch`] instead.
     #[error("raw block height {parsed_height} does not match source height {source_height:?}")]
     RawBlockHeightMismatch {
         /// Height parsed from the raw block coinbase transaction.
@@ -160,6 +179,14 @@ pub enum SourceError {
     },
 
     /// The node response did not match the expected JSON-RPC contract.
+    ///
+    /// Prefer this variant when the JSON-RPC envelope or response shape is
+    /// wrong: missing fields, wrong types, header height disagreeing with the
+    /// requested height, tree-state hash disagreeing with the anchor hash. For
+    /// hex-layer failures use [`Self::InvalidRawBlockHex`]; for byte-level
+    /// parse failures use [`Self::RawBlockParseFailed`]; for coinbase-height
+    /// disagreements after successful parse use
+    /// [`Self::RawBlockHeightMismatch`].
     #[error("source protocol mismatch: {reason}")]
     SourceProtocolMismatch {
         /// Protocol mismatch reason.
