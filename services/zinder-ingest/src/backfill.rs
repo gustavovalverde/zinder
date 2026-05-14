@@ -120,13 +120,6 @@ pub async fn backfill_with_store<Source>(
 where
     Source: NodeSource,
 {
-    if config.from_height > config.to_height {
-        return Err(IngestError::InvalidBackfillRange {
-            from_height: config.from_height,
-            to_height: config.to_height,
-        });
-    }
-
     let store_options = ChainStoreOptions::for_network(config.node.network);
     let node_tip_height = source.tip_id().await?.height;
     validate_backfill_finality_bound(config, node_tip_height, store_options.reorg_window_blocks)?;
@@ -213,8 +206,11 @@ where
         IngestSubtreeRootIndexes::from_tip_metadata(backfill_start.initial_tip_metadata);
     let mut last_commit_outcome = None;
     let mut retry_state = IngestRetryState::default();
-    let commit_batch_blocks = usize::try_from(config.commit_batch_blocks.get())
-        .map_err(|_| IngestError::InvalidCommitBatchBlocks)?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
+    )]
+    let commit_batch_blocks = config.commit_batch_blocks.get() as usize;
 
     // Pipeline the per-block fetches with bounded concurrency. The commit
     // path stays strictly ordered because `buffered` yields completed

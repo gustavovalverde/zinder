@@ -65,6 +65,15 @@ impl BackfillCommandConfig {
             .from_height
             .ok_or_else(|| ConfigError::missing_field("backfill.from_height"))?;
 
+        if from_height > self.to_height {
+            return Err(ConfigError::invalid(format!(
+                "invalid backfill range: from height {from} exceeds to height {to}",
+                from = from_height.value(),
+                to = self.to_height.value(),
+            ))
+            .into());
+        }
+
         Ok(BackfillConfig {
             node: self.node.clone(),
             node_source: self.node_source,

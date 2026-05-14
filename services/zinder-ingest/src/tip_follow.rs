@@ -27,6 +27,10 @@ use crate::mempool::MempoolReadyGate;
 pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
 
 /// Configuration for polling the upstream node tip and committing live chain changes.
+///
+/// `reorg_window_blocks` and `poll_interval` must be greater than zero;
+/// `zinder-runtime::ConfigError::Invalid` is the canonical rejection emitted by
+/// the binary's config layer before this type is constructed.
 #[derive(Clone, Debug)]
 pub struct TipFollowConfig {
     /// Resolved upstream node endpoint (network, JSON-RPC URL, auth, timeout,
@@ -36,11 +40,11 @@ pub struct TipFollowConfig {
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
-    /// Number of near-tip blocks that may be replaced by a reorg.
+    /// Number of near-tip blocks that may be replaced by a reorg. Must be greater than zero.
     pub reorg_window_blocks: u32,
     /// Maximum number of blocks committed in one chain epoch.
     pub commit_batch_blocks: NonZeroU32,
-    /// Delay between tip polls when no cancellation is requested.
+    /// Delay between tip polls when no cancellation is requested. Must be greater than zero.
     pub poll_interval: Duration,
     /// Lag threshold (in blocks) below which tip-follow reports `Ready`.
     ///
@@ -62,8 +66,6 @@ pub async fn tip_follow<Source>(
 where
     Source: NodeSource,
 {
-    validate_tip_follow_config(config)?;
-
     let store = open_tip_follow_store(config)?;
     tip_follow_with_primary_store(config, source, store, readiness, None, None, cancel).await
 }
@@ -73,8 +75,6 @@ where
 /// Binaries use this when they need to share the primary store handle with a
 /// process-local adapter, such as the private ingest-control endpoint.
 pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainStore, IngestError> {
-    validate_tip_follow_config(config)?;
-
     let mut store_options = ChainStoreOptions::for_network(config.node.network);
     store_options.reorg_window_blocks = config.reorg_window_blocks;
     PrimaryChainStore::open(&config.storage_path, store_options).map_err(IngestError::from)
@@ -107,8 +107,6 @@ pub async fn tip_follow_with_primary_store<Source>(
 where
     Source: NodeSource,
 {
-    validate_tip_follow_config(config)?;
-
     let mut retry_state = IngestRetryState::default();
     // When the upstream node exposes the gRPC `ChainTipChange` stream the
     // tip-follow loop uses it as a push-based wake-up signal: each
@@ -239,17 +237,6 @@ async fn wait_for_chain_tip_notification(
             *chain_tip_stream = None;
         }
     }
-}
-
-fn validate_tip_follow_config(config: &TipFollowConfig) -> Result<(), IngestError> {
-    if config.reorg_window_blocks == 0 {
-        return Err(IngestError::InvalidReorgWindowBlocks);
-    }
-    if config.poll_interval.is_zero() {
-        return Err(IngestError::InvalidTipFollowPollInterval);
-    }
-
-    Ok(())
 }
 
 /// Result of one tip-follow iteration: the node tip identity observed in

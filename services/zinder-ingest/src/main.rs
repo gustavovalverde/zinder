@@ -250,7 +250,7 @@ fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Backfill bootstrap composes the load_config, start_api, connect_node, check_schema, recover_state, and ready phases plus the actual backfill in one auditable sequence; splitting the phases out would obscure the ordering."
+    reason = "Backfill bootstrap composes the load_config, start_api, connect_node, check_schema, recover_state, validate_config, open_storage, and ready phases plus the actual backfill in one auditable sequence; splitting the phases out would obscure the ordering."
 )]
 async fn run_backfill(
     config_path: Option<PathBuf>,
@@ -332,25 +332,43 @@ async fn run_backfill(
     } else {
         None
     };
+    recover_state_phase.complete();
+
+    let validate_config_phase = StartupPhase::ValidateConfig.start();
     let backfill_config = match command_config.resolved_backfill_config(checkpoint) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => {
+            validate_config_phase.complete();
+            cfg
+        }
         Err(error) => {
-            recover_state_phase.fail(&error);
+            validate_config_phase.fail(&error);
             start_api_phase.fail(&error);
             return Err(error);
         }
     };
-    recover_state_phase.complete();
-    start_api_phase.complete();
-    StartupPhase::Ready.start().complete();
-    readiness.set(ReadinessState::syncing(None, None, None));
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
 
+    let open_storage_phase = StartupPhase::OpenStorage.start();
     let store_options = zinder_store::ChainStoreOptions::for_network(backfill_config.node.network);
-    let store = zinder_store::PrimaryChainStore::open(&backfill_config.storage_path, store_options)
-        .map_err(IngestError::from)?;
+    let store =
+        match zinder_store::PrimaryChainStore::open(&backfill_config.storage_path, store_options) {
+            Ok(store) => {
+                open_storage_phase.complete();
+                store
+            }
+            Err(store_error) => {
+                let wrapped: IngestConfigError = IngestError::from(store_error).into();
+                open_storage_phase.fail(&wrapped);
+                start_api_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
+
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
+    readiness.set(ReadinessState::syncing(None, None, None));
 
     let _ingest_control_handle =
         if let Some(listen_addr) = command_config.ingest_control_listen_addr {

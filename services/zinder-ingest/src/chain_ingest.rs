@@ -62,27 +62,6 @@ pub enum IngestError {
         node_source: String,
     },
 
-    /// Requested backfill range is invalid.
-    #[error("invalid backfill range: from height {from_height:?} exceeds to height {to_height:?}")]
-    InvalidBackfillRange {
-        /// First requested height.
-        from_height: BlockHeight,
-        /// Last requested height.
-        to_height: BlockHeight,
-    },
-
-    /// Commit batch size is invalid.
-    #[error("invalid commit batch size: commit batch blocks must be greater than zero")]
-    InvalidCommitBatchBlocks,
-
-    /// Reorg window size is invalid.
-    #[error("invalid reorg window: reorg window blocks must be greater than zero")]
-    InvalidReorgWindowBlocks,
-
-    /// Tip-follow poll interval is invalid.
-    #[error("invalid tip-follow poll interval: poll interval must be greater than zero")]
-    InvalidTipFollowPollInterval,
-
     /// Node returned fewer subtree roots than committed tree sizes require.
     #[error(
         "{protocol:?} subtree roots are unavailable from {start_index:?}: expected {expected_count}, got {actual_count}"
@@ -921,10 +900,6 @@ fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
     match error {
         None => "none",
         Some(IngestError::UnknownNodeSource { .. }) => "unknown_node_source",
-        Some(IngestError::InvalidBackfillRange { .. }) => "invalid_backfill_range",
-        Some(IngestError::InvalidCommitBatchBlocks) => "invalid_commit_batch_blocks",
-        Some(IngestError::InvalidReorgWindowBlocks) => "invalid_reorg_window_blocks",
-        Some(IngestError::InvalidTipFollowPollInterval) => "invalid_tip_follow_poll_interval",
         Some(IngestError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(IngestError::SubtreeRootCompletingBlockMissing { .. }) => {
             "subtree_root_completing_block_missing"

@@ -496,7 +496,7 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
     assert!(!output.status.success());
     assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("invalid commit batch size"));
+    assert!(stderr.contains("ingest.commit_batch_blocks must be greater than zero"));
 
     Ok(())
 }
@@ -556,7 +556,7 @@ fn zero_tip_follow_poll_interval_fails_before_storage_creation() -> Result<(), B
     assert!(!output.status.success());
     assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("invalid tip-follow poll interval"));
+    assert!(stderr.contains("tip_follow.poll_interval_ms must be greater than zero"));
 
     Ok(())
 }
