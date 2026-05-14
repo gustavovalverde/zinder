@@ -39,6 +39,7 @@
 
 pub mod chain_fixture;
 pub mod deploy;
+pub mod json_rpc_test_server;
 pub mod live;
 pub mod log_capture;
 pub mod mock_mempool_source;
@@ -49,6 +50,9 @@ pub mod store_fixture;
 pub mod transparent_signer;
 
 pub use chain_fixture::{ChainFixture, FixtureBlock};
+pub use json_rpc_test_server::{
+    JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,
+};
 pub use log_capture::{CapturedEvent, LogCapture};
 pub use mock_mempool_source::{
     MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,
