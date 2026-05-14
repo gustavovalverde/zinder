@@ -2,11 +2,11 @@
 
 ## Context
 
-[PRD-0002 REQ-13](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements) needs the readiness-cause vocabulary defined in [Service operations §Required readiness causes](../architecture/service-operations.md#health-and-readiness) to be machine-readable so an automated probe can act on `not_ready` causes without code changes per Zinder release. Before this ADR, the cause vocabulary lived only as a hand-written Rust enum in `zinder-runtime` and as Markdown in the architecture doc; gRPC consumers and language-agnostic SDK generators had no source they could parse.
+The readiness-cause vocabulary defined in [Service operations §Required readiness causes](../architecture/service-operations.md#health-and-readiness) needs to be machine-readable so an automated probe can act on `not_ready` causes without code changes per Zinder release. The Rust enum in `zinder-runtime` is the authoring surface; gRPC consumers and language-agnostic SDK generators need a parseable contract that matches it.
 
-The existing `/readyz` HTTP JSON endpoint carries the cause and its operator-actionable detail (e.g. `{"cause": {"reorg_window_exceeded": {"depth": 12, "configured": 10}}}`). Operator probes already consume that wire shape. Breaking it would force every Zinder deployment's monitoring stack to update on the same day this change lands; preserving it keeps the change purely additive.
+The `/readyz` HTTP JSON endpoint carries the cause and its operator-actionable detail (e.g. `{"cause": {"reorg_window_exceeded": {"depth": 12, "configured": 10}}}`). Operator probes consume that wire shape. Breaking it would force every Zinder deployment's monitoring stack to update in lockstep with the proto landing; keeping the JSON intact lets the proto contract land as a purely additive change.
 
-proto3 enums are scalar; they cannot carry a per-variant payload like the Rust `Syncing { lag_blocks: Option<u64> }` variant. Promoting the cause to a proto enum therefore has two routes: (1) keep the Rust enum hand-written and add the proto enum as a *categorical mirror* (proto is the documented source of truth for the cause vocabulary; the Rust struct variants stay), (2) collapse the payload into a sibling `oneof` so the proto message fully replaces the Rust types. Route 2 changes the JSON wire shape because proto-generated serialization names variants in `SCREAMING_SNAKE_CASE` with the payload as a sibling object; route 1 preserves the current JSON.
+proto3 enums are scalar; they cannot carry a per-variant payload like the Rust `Syncing { lag_blocks: Option<u64> }` variant. Two routes follow: (1) keep the Rust enum hand-written and add the proto enum as a *categorical mirror* (proto is the documented source of truth for the cause vocabulary; the Rust struct variants stay), (2) collapse the payload into a sibling `oneof` so the proto message fully replaces the Rust types. Route 2 changes the JSON wire shape because proto-generated serialization names variants in `SCREAMING_SNAKE_CASE` with the payload as a sibling object; route 1 preserves the current JSON.
 
 ## Decision
 
@@ -22,7 +22,7 @@ A roundtrip test (`proto_cause_maps_every_variant`) asserts that every Rust vari
 
 ## Consequences
 
-**Cause vocabulary is now a published proto contract.** The descriptor set artifact published per release (per [ADR-0022](0022-release-artifact-set.md), planned) carries the enum. Orchestrators, SDK generators, and MCP bridges can parse it without reading the Rust source.
+**Cause vocabulary is a published proto contract.** The descriptor set artifact published per release (per [ADR-0022](0022-release-artifact-set.md)) carries the enum. Orchestrators, SDK generators, and MCP bridges can parse it without reading the Rust source.
 
 **`/readyz` JSON shape is byte-identical.** Existing operator probes continue to work unchanged. The breaking-change budget is preserved for changes that earn it.
 
@@ -32,7 +32,7 @@ A roundtrip test (`proto_cause_maps_every_variant`) asserts that every Rust vari
 
 **The `oneof ReadinessCauseDetail.payload` is a soft contract.** The proto guarantees only that the active variant *can* match the cause; it does not enforce it structurally. Producers (Zinder) honor the correspondence in the `From` impls. Consumers should treat a mismatch as a server bug rather than a protocol expansion path.
 
-**`zinder-runtime` depends on `zinder-proto`.** Previously the runtime crate was proto-free. The new dep is small (proto-generated types only); `zinder-source` already pulls in `zinder-proto`, so the transitive graph does not grow.
+**`zinder-runtime` depends on `zinder-proto`** for proto-generated types only. `zinder-source` already pulls in `zinder-proto`, so the transitive graph stays unchanged.
 
 ## Alternatives Considered
 
@@ -40,11 +40,10 @@ A roundtrip test (`proto_cause_maps_every_variant`) asserts that every Rust vari
 
 **`tonic_types::ErrorDetails` shape.** Considered for cases where the readiness cause bubbles up as a request error (e.g. via the future `ServerInfo` rpc). Deferred: error vocabulary is [ADR-0019](0019-typed-grpc-error-reason-vocabulary.md)'s job; the readiness cause is a state, not a transient error.
 
-**Hand-written JSON Schema for `/readyz`.** Rejected. JSON Schema is a separate documentation artifact that would drift from the Rust source; the proto contract is the canonical machine-readable form and OpenAPI generation (via `protoc-gen-openapiv2`, planned in [ADR-0022](0022-release-artifact-set.md)) produces a JSON Schema for free.
+**Hand-written JSON Schema for `/readyz`.** Rejected. JSON Schema is a separate documentation artifact that would drift from the Rust source; the proto contract is the canonical machine-readable form and OpenAPI generation via `protoc-gen-openapiv2` (per [ADR-0022](0022-release-artifact-set.md)) produces a JSON Schema for free.
 
 ## References
 
-- [PRD-0002 §Capability Requirements REQ-13](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements)
 - [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness)
 - [`crates/zinder-proto/proto/zinder/v1/ops/readiness.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/readiness.proto)
 - [`crates/zinder-runtime/src/readiness.rs`](../../crates/zinder-runtime/src/readiness.rs)

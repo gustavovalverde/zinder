@@ -5,10 +5,9 @@
 
 //! Wallet-SDK scan acceptance test for the lightwalletd compat shim.
 //!
-//! Realizes the named PRD-0001 acceptance criterion that "a
-//! lightwalletd-compatible client can scan a regtest range from Zinder
-//! without sending viewing keys or spending keys to Zinder." The test
-//! exercises the wire contract that wallets actually consume:
+//! Proves a lightwalletd-compatible client can scan a regtest range from
+//! Zinder without sending viewing keys or spending keys to Zinder. The
+//! test exercises the wire contract that wallets actually consume:
 //!
 //! 1. Stand up the `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
 //! 2. Connect through the generated `CompactTxStreamerClient`, the same

@@ -76,10 +76,6 @@ To stop the local services and compose stack:
 scripts/observability-smoke.sh stop
 ```
 
-The legacy `scripts/observability-regtest-smoke.sh` filename remains as a
-compatibility wrapper. New docs and automation should use the network-neutral
-`scripts/observability-smoke.sh` name.
-
 ## Public-Network Smokes
 
 Use public-network smokes when a synced local node is available. Set
@@ -177,9 +173,9 @@ runs and node-poll metrics remain visible, but the live
 `zinder_ingest_commit_duration_seconds_count` sample may stay absent until a new
 block arrives.
 
-The default smoke run now executes the one-shot `backup` command and verifies
+The default smoke run executes the one-shot `backup` command and verifies
 the restored checkpoint by serving `WalletQuery/LatestBlock` from it. Backup
-metrics may still be absent from Prometheus because the backup process exits
+metrics may be absent from Prometheus because the backup process exits
 before a long-running scrape path exists; the readiness report records the
 backup-restore outcome directly.
 

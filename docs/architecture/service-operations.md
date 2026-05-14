@@ -1,6 +1,6 @@
 # Service Operations
 
-Zinder should be easy to run without hiding failure. Operators need typed states, explicit migrations, useful metrics, and production configuration that fails closed.
+Zinder should be easy to run without hiding failure. Operators need typed states, useful metrics, and production configuration that fails closed.
 
 ## Startup Phases
 
@@ -175,7 +175,6 @@ P95, P99, and worst-case values before updating performance-budget tables.
 - Node request latency and error class. The baseline metrics are
   `zinder_node_request_duration_seconds` and
   `zinder_node_request_total`.
-- Migration state and progress.
 - Mempool source health and hydration outcome. The baseline metrics are
   `zinder_mempool_source_errors_total`,
   `zinder_mempool_hydration_failures_total`,
@@ -220,7 +219,7 @@ Required structured fields:
 - `tip_height` when available
 - `tip_hash` when available
 - `request_id` for API requests
-- `phase` for startup and migration logs
+- `phase` for startup logs
 
 Logs must not include wallet secrets, seed phrases, spending keys, viewing keys, or raw authorization material.
 
@@ -253,7 +252,6 @@ Production config should reject:
 
 - Missing persistent storage.
 - Placeholder upstream node credentials.
-- Migration-on-start without explicit migration mode.
 - Unknown network names.
 - Canonical storage already anchored to a different network.
 - Zero reorg-window or ingest commit-batch sizes.
@@ -277,11 +275,11 @@ The loader shape is:
 3. Merge `ZINDER_` environment variables with `__` nesting.
 4. Apply CLI overrides.
 5. Deserialize into the service-specific config type.
-6. Run `validate_config` before storage, source, network bind, or migration side effects.
+6. Run `validate_config` before storage, source, or network-bind side effects.
 
 Use `ZINDER_` with `__` for nesting, for example `ZINDER_NODE__JSON_RPC_ADDR` and `ZINDER_QUERY__LISTEN_ADDR`. Service code should not read production configuration directly from `std::env`; test-only gates use the explicit `ZINDER_TEST_*` namespace (`ZINDER_TEST_LIVE`, `ZINDER_STORE_CRASH_*`) which is stripped from production reads in `zinder_runtime::zinder_environment_source`. There is no parallel `ZINDER_Z3_*` namespace; live tests reuse the production `ZINDER_NETWORK` and `ZINDER_NODE__*` schema (see [§Validation Tiers](#validation-tiers)).
 
-Reject production environment overrides whose leaf keys contain sensitive terms such as `password`, `secret`, `token`, `cookie`, or `private_key`. Those values belong in the config file or an operator secret-management layer, not process environment.
+Secrets pass through the env-var loader unchanged. Secret hygiene lives at the emit boundary: `--print-config`, structured logs, and `Debug` impls redact every secret regardless of how it was supplied ([ADR-0018](../adrs/0018-environment-variable-secret-policy.md)). The ingest-control bearer token remains file-only ([ADR-0009](../adrs/0009-ingest-control-transport-security.md)).
 
 Do not expose secret-bearing CLI overrides. Command-line flags are for non-secret selectors and operational knobs; password, token, cookie, key, and secret material must come from the accepted config source or the operator secret-management layer.
 

@@ -11,12 +11,10 @@
 
 Two surfaces answer the same conceptual query, "the confirmed transparent-address balance summed across an address set":
 
-- Lightwalletd-compat `GetTaddressBalance` (`cash.z.wallet.sdk.rpc.CompactTxStreamer`). Used by every legacy lightwalletd-compatible wallet: Zashi, Zodl, librustzcash-based wallets, and any future client that scans through the vendored upstream proto.
+- Lightwalletd-compat `GetTaddressBalance` (`cash.z.wallet.sdk.rpc.CompactTxStreamer`). Used by every lightwalletd-compatible wallet: Zashi, Zodl, librustzcash-based wallets, and any future client that scans through the vendored upstream proto.
 - Native `WalletQuery.TransparentAddressBalance` (`zinder.v1.wallet`). Used by Zinder-native wallets and the in-process local client.
 
-Before this ADR, both routed to `zinder-derive`'s `ExplorerQuery.TransparentAddressBalance`. The derive method computes a richer response: it sums canonical UTXOs *and* applies a live mempool overlay (pending inflows minus pending outflows). The compat shim and the native adapter both reported `UNAVAILABLE` when no derive plane was configured. That is correct for the native surface (capability gating gives wallets a signal to negotiate), but wrong for the compat surface: legacy lightwalletd clients do not consult capabilities. Wallets that worked against `lightwalletd-go` and zaino broke on a Zinder deployment without `zinder-derive`, with no recoverable signal.
-
-The 2026-05-12 parity run made the cost concrete: regtest wallets called `GetTaddressBalance` against the miner address, got `UNAVAILABLE`, and had no way to negotiate.
+The derive plane's `ExplorerQuery.TransparentAddressBalance` computes a rich response: it sums canonical UTXOs *and* applies a live mempool overlay (pending inflows minus pending outflows). Routing both surfaces through the derive plane would couple every deployment to `zinder-derive`. That coupling is wrong on the compat surface: legacy lightwalletd clients do not consult capabilities, so `UNAVAILABLE` from `GetTaddressBalance` reads as a broken wallet, not a negotiable signal. A capability-gated `UNAVAILABLE` is correct on the native surface and wrong on the compat surface in the same deployment.
 
 [ADR-0014](0014-compute-at-read-time-canonical-reads.md) named the compute-at-read-time pattern for canonical reads: a deterministic function over a bounded number of canonical artifacts, no new column family, no aggregation of unbounded inputs. Transparent-address confirmed balance fits the pattern exactly: the input is `TransparentAddressUtxo` artifacts that ingest already writes; the per-request address cap (256, matching the federated derive cap and the prevout cap from [`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST`](../../crates/zinder-core/src/transparent_prevout.rs)) keeps the fan-out bounded; the response binds to one `ChainEpoch`.
 
@@ -41,7 +39,7 @@ Two coexisting capability strings advertise the same native RPC under different 
 
 Clients gate features accordingly:
 
-- A wallet that only needs confirmed totals checks for `wallet.address.transparent_balance_v1` (or simply calls the RPC, which now always answers).
+- A wallet that only needs confirmed totals checks for `wallet.address.transparent_balance_v1` (or simply calls the RPC, which always answers).
 - A wallet that depends on the mempool overlay checks for `derive.explorer.transparent_balance_v1` and degrades gracefully if absent: it treats the `unconfirmed_delta_zat` field on the response as authoritative only when the derive capability is advertised.
 
 The compat shim has no capability surface to layer; `LightdInfo` predates capability discovery. The shim's behavior is single-shape and always answers.
@@ -74,10 +72,10 @@ Rejected. The point of the derive plane is to stay optional ([ADR-0013](0013-der
 
 ## Consequences
 
-- A Zinder deployment without `zinder-derive` now answers `GetTaddressBalance` correctly. The parity harness in [Phase 4 of the wire-conventions refactor plan](../runbooks/testing.md) exercises this path against `electriccoinco/lightwalletd:latest`.
-- `WalletQuery.TransparentAddressBalance` is no longer derive-gated. `ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `derive.explorer.transparent_balance_v1` only when the proxy is configured and ready. Clients that already checked for the derive capability keep working unchanged; new clients can rely on the wallet capability for confirmed totals.
+- A Zinder deployment without `zinder-derive` answers `GetTaddressBalance` correctly. The parity harness exercises this path against `electriccoinco/lightwalletd:latest`.
+- `WalletQuery.TransparentAddressBalance` is not derive-gated. `ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `derive.explorer.transparent_balance_v1` only when the proxy is configured and ready. Clients that need the overlay gate on the derive capability; clients that need confirmed totals rely on the wallet capability.
 - The native helper `transparent_address_confirmed_balance_response` is a public part of `zinder-query` and reusable by future compat surfaces or alternate adapters.
-- The compat shim no longer takes a `DeriveProxy` argument. The `with_explorer_proxy` builder is gone; the derive plane is not a compat-shim dependency in any path.
+- The compat shim does not take a `DeriveProxy` argument. The derive plane is not a compat-shim dependency on any path.
 - The structural test `crates/zinder-proto/tests/integration/capability_string_uniqueness.rs` ([ADR-0016](0016-wire-conventions-and-zebra-alignment.md)) enforces that the new capability string is imported, not duplicated.
 
 ## Forward compatibility

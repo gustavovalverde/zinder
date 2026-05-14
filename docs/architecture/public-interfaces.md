@@ -483,16 +483,8 @@ message ServerCapabilities {
   uint64 mempool_mined_retention_seconds = 7;       // 0 = mined-event family not retained on this deployment
   uint64 mempool_invalidated_retention_seconds = 8; // 0 = invalidated-event family not retained on this deployment
   repeated string capabilities = 9;              // capability strings; clients match exact strings
-  repeated DeprecatedCapability deprecated_capabilities = 10;
-  NodeCapabilitiesDescriptor node = 11;
-  optional string mcp_endpoint = 12;             // unset in v1
-}
-
-message DeprecatedCapability {
-  string capability = 1;
-  optional string replaced_by = 2;
-  string earliest_removal_version = 3;
-  string deprecation_notice = 4;
+  NodeCapabilitiesDescriptor node = 10;
+  optional string mcp_endpoint = 11;             // unset in v1
 }
 
 message NodeCapabilitiesDescriptor {
@@ -503,9 +495,9 @@ message NodeCapabilitiesDescriptor {
 
 ### Capability strings
 
-Capability strings are exact-match (no version negotiation, no regex). New capabilities are additive. Removing a capability from a deployed server is a breaking change. The naming convention is `domain.subdomain.capability_name_v{N}`.
+Capability strings are exact-match (no version negotiation, no regex). New capabilities are additive. Each wire shape pairs with one capability identifier; a wire-shape change lands as a new `_vN` identifier. The naming convention is `domain.subdomain.capability_name_v{N}`; the suffix is part of the identity, never decoded as a version field.
 
-Until a Zinder consumer ships, no capability is "deployed" in this sense; pre-launch wire-shape evolution mutates the `_v1` string in place rather than bumping. Capability versioning becomes a deprecation mechanism only after the first consumer reads the string in production, at which point a wire-shape change bumps to `_v2` and retains `_v1` in `deprecated_capabilities` for the documented overlap window.
+v1 carries no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)). Capability strings can be added, renamed, or removed between releases; a deprecation policy ADR lands when a published consumer constraint exists.
 
 The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs); a CI test (`zinder-proto::integration::capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities`) fails when this list and the constant diverge, so any drift is caught at build time.
 
@@ -565,10 +557,6 @@ The current `zinder-source::NodeCapability` diagnostic names are:
 Do not advertise future source capabilities such as block-stream ingestion or
 spending-transaction lookup until the source adapter and runtime wiring both
 exist.
-
-### Deprecation policy
-
-When a capability is deprecated, `capabilities` continues to advertise it, and a parallel `deprecated_capabilities` list names the replacement and earliest removal version. Clients compatible with the deprecated capability keep working; clients reading the deprecation list can plan migration. Capabilities are not silently removed.
 
 ## Wire Conventions
 
@@ -748,7 +736,7 @@ Zinder's vocabulary is the durable spine; this table is how to read each term in
 | `CompactTxStreamer`, `CompactBlock`, `CompactTx`, `BlockID`, `ChainSpec` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) | Vendored verbatim into `proto/compat/lightwalletd/`, pinned to the upstream commit in `LIGHTWALLETD_PROTOCOL_COMMIT`. Compat layer maps Zinder's `Network` strings to lightwalletd's `chainName` (`"main"`/`"test"`). |
 | `BlockSelector`, `BlockMetadata` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `BlockID` | Intentional improvement: split request shape (oneof `height_or_hash`) from response shape (typed `BlockMetadata`); response uses `uint32` height and `block_hash` instead of `uint64` + `hash`. |
 | `ServerCapabilities.network` (`"zcash-mainnet"`, `"zcash-testnet"`, `"zcash-regtest"`) | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `ChainSpec` | Intentional improvement: `ChainSpec` is structurally empty in ZIP-307; Zinder identifies the network with a machine-readable string. |
-| Transparent address selectors (`AddressLookup`) | [ZIP-316](https://github.com/zcash/zips/blob/main/zips/zip-0316.rst) `Receiver`, `Typecode` | Out of scope on the indexer side: Zinder accepts base58 P2PKH/P2SH addresses or a SHA-256 script-hash. UA parsing and receiver extraction are wallet responsibilities (consistent with [PRD §Out of scope](../prd-0001-zinder-indexer.md#out-of-scope)). |
+| Transparent address selectors (`AddressLookup`) | [ZIP-316](https://github.com/zcash/zips/blob/main/zips/zip-0316.rst) `Receiver`, `Typecode` | Out of scope on the indexer side: Zinder accepts base58 P2PKH/P2SH addresses or a SHA-256 script-hash. UA parsing and receiver extraction are wallet responsibilities. |
 | Conventional/marginal fee surface | [ZIP-317](https://github.com/zcash/zips/blob/main/zips/zip-0317.rst) `conventional_fee`, `marginal_fee` | Not exposed. Fee estimation is a wallet concern; Zinder is an indexer. The compat `CompactTx.fee` field is inherited legacy from lightwalletd and is not re-typed. |
 | Chain value pools | [ZIP-209](https://github.com/zcash/zips/blob/main/zips/zip-0209.rst) Sprout/Sapling/Orchard chain value pool | Not exposed. Zebra enforces the invariant; Zinder does not re-account. |
 | Shielded scanning surfaces | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) §payment detection, [ZIP-302](https://github.com/zcash/zips/blob/main/zips/zip-0302.rst), [ZIP-310](https://github.com/zcash/zips/blob/main/zips/zip-0310.rst) | Out of scope (PRD: no server-side viewing-key custody, no memo decryption). |

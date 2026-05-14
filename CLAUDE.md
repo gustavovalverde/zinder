@@ -154,4 +154,4 @@ When a change alters a service boundary, public API, storage byte layout, protoc
 
 ## Workspace Patches
 
-`Cargo.toml` patches `core2` to a git source because `equihash 0.2.2` (transitive through `zebra-chain 6.0.2`) depends on a yanked crates.io version. The patch is gated by the `cargo-deny` `allow-git` list. Remove it only when Zebra publishes a resolution path.
+`Cargo.toml` patches `core2` to a git source because `equihash 0.2.2` (transitive through `zebra-chain 6.0.2`) depends on a yanked crates.io version. The patch is gated by the `cargo-deny` `allow-git` list.

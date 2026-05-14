@@ -13,9 +13,11 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 
 ## Why This Split Exists
 
-Ingestion and query serving optimize for different things. Ingestion needs correctness under reorgs, durable commits, schema migration, recoverability, and source-failure handling. Query serving needs latency, compatibility, privacy constraints, and read availability.
+Zcash indexing has two distinct jobs that often get coupled: converting upstream node state into durable, queryable chain artifacts, and serving wallets and applications with stable APIs and privacy-aware behavior. The jobs have different failure modes. Ingestion needs deterministic sync, reorg handling, atomic commits, schema migration, recoverability, and source-failure handling. Query serving needs latency, compatibility, privacy boundaries, and independent scale-out.
 
-One runtime can do both during local development. Production architecture must not let read traffic share the same ownership boundary as chain commits.
+Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Production architecture must not let read traffic share the same ownership boundary as chain commits.
+
+The same shape appears across the indexer ecosystem: Blockscout separates indexer, web, and API modes; Sui separates checkpoint processing from ingestion sources; Reth Execution Extensions model committed and reverted chains explicitly; Substreams treats indexing as deterministic transformations with replayable sinks.
 
 ## Allowed Coupling
 

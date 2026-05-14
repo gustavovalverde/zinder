@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Storage access and service boundaries |
-| Related | [Storage backend](../architecture/storage-backend.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md) |
+| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md) |
 
 ## Context
 
@@ -74,7 +74,7 @@ The boundary keeps the database engine behind Zinder-owned contracts. That prese
 
 Reorg handling is easier to reason about. A query starts from one `ChainEpoch`, receives a `ChainEpochReader`, and either finishes from that epoch or restarts. Readers do not assemble responses from a mix of old compact blocks, new tree state, and a newer tip pointer.
 
-Migrations stay protected. Only `zinder-ingest migrate --plan` and `zinder-ingest migrate --apply` change canonical storage. Query startup rejects schema mismatches with a typed readiness cause instead of attempting repair.
+Schema mismatches fail closed. The store validates schema on open and reports `StoreError::SchemaTooNew` or `SchemaMismatch`; query startup surfaces these as typed readiness causes and refuses to repair canonical storage.
 
 Wallet privacy stays auditable. Wallet-facing APIs are reviewable as a single data plane. Direct table access by multiple services would make it harder to prevent shielded wallet scanning, leaked query interests, and accidental exposure of derived wallet state.
 

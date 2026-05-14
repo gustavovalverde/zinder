@@ -125,15 +125,10 @@ mempool; a non-best-chain lookup must add its own named API surface.
 
 ## Transaction Status and Enrichment
 
-Native transaction lookup returns typed transaction status, not a mined-only
-artifact shape plus out-of-band probing. The public Rust shape is
+Native transaction lookup returns typed transaction status. The public Rust shape is
 `zinder_core::TxStatus` and the native gRPC surface mirrors it through
 `WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
-under capability `wallet.read.transaction_by_id_v1`. With no consumers shipped
-yet, wire-shape evolution mutates `_v1` in place rather than bumping; capability
-versioning becomes a deprecation mechanism only after a consumer ships. The wire
-oneof has three arms; `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because
-typed errors do not consume oneof variants:
+under capability `wallet.read.transaction_by_id_v1`. The wire oneof has three arms; `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
 
 - `Mined`: `MinedTransaction { Transaction transaction; MinedDetails details }`.
 - `InMempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
@@ -167,10 +162,7 @@ canonical chain read and never consults live mempool state. A non-epoch-pinned
 lookup may fall through to the writer-owned mempool index after the canonical
 chain returns `NotFound`.
 
-Changing the native wire response from mined-only `Transaction` to a
-status-bearing response required a new capability string. If the RPC name is
-kept for source compatibility, the capability still records the semantic change;
-silent widening is not allowed.
+Each native wire response shape pairs to one capability string. The capability records the semantic shape; a change to the response shape requires a new capability string, even when the RPC name stays the same.
 
 ## Chain-Event Subscription
 

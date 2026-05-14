@@ -61,8 +61,7 @@ async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevout
     let remote = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
-    })
-    .await?;
+    })?;
     let local = LocalChainIndex::open(LocalOpenOptions {
         storage_path: store_fixture.tempdir_path().to_path_buf(),
         secondary_path: store_fixture.tempdir_path().join("zinder-client-secondary"),

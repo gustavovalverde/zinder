@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Storage and persistence |
-| Related | [Storage backend](../architecture/storage-backend.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md) |
+| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md) |
 
 ## Context
 

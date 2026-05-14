@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Storage runtime topology |
-| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md), [Service operations](../architecture/service-operations.md), [Public interfaces](../architecture/public-interfaces.md), [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md) |
+| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md), [Service operations](../architecture/service-operations.md), [Public interfaces](../architecture/public-interfaces.md) |
 
 ## Context
 
@@ -54,8 +54,8 @@ Rolling upgrade sequence (across schema bumps):
 1. Upgrade and restart all read replicas first. They serve under the existing schema; their compiled-in max is now greater than or equal to the persisted version.
 2. Stop the primary.
 3. Upgrade the primary binary.
-4. Start the primary. If the upgrade requires a migration (`zinder-ingest migrate --apply`), it runs explicitly per [Storage backend §Migrations](../architecture/storage-backend.md#migrations).
-5. Once migration completes, the persisted schema may be greater. Readers (already upgraded) keep serving without restart.
+4. Start the primary. A schema bump that the binary cannot read on the existing store fails open with `StoreError::SchemaTooNew` / `SchemaMismatch`; recovery is operator-driven (recreate the store from a backfill or checkpoint, per [Storage backend §Schema Compatibility](../architecture/storage-backend.md#schema-compatibility)).
+5. Once the primary is serving the new schema, readers (already upgraded) keep serving without restart.
 
 Same-schema upgrades (binary changes without a schema bump) tolerate any process order.
 

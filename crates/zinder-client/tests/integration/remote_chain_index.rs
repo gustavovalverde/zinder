@@ -44,8 +44,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
-    })
-    .await?;
+    })?;
 
     let server_info = chain_index.server_info().await?;
     let current_epoch = chain_index.current_epoch().await?;

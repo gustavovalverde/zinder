@@ -25,7 +25,7 @@ Direct embedded reads outside that contract are allowed only for `zinder dev` co
 - RocksDB column-family layout.
 - `PrimaryChainStore`, `SecondaryChainStore`, `ChainEpochReader`, and domain store traits.
 - Storage-control records, including the store network anchor.
-- Migration planning and application.
+- Schema-version validation on open.
 - Checkpoint creation and fixture capture.
 
 `zinder-store` must not expose RocksDB handles as public API. Public callers use domain contracts.
@@ -131,34 +131,9 @@ Reorg semantics and event vocabulary live in [Chain events](chain-events.md). At
 - The replacement event (`ChainEvent::ChainReorged`) is persisted before the visible epoch advances; readers see consistent state.
 - Reorgs beyond the configured window fail closed with `ReorgWindowExceeded` and require operator intervention.
 
-## Migrations
+## Schema Compatibility
 
-Migrations are explicit and owned by `zinder-ingest`.
-
-Allowed commands:
-
-- `zinder-ingest migrate --plan`
-- `zinder-ingest migrate --apply`
-- `zinder-ingest start --require-schema <version>`
-
-`zinder-query` must not migrate canonical storage. On schema mismatch it reports `SchemaMismatch` and fails readiness.
-
-Major migrations may use a shadow store:
-
-```text
-plan migration
-  -> build shadow store
-  -> replay canonical artifacts
-  -> validate shadow store
-  -> promote shadow store
-  -> checkpoint old store
-```
-
-Promotion must be explicit and observable. Partial migration state must be visible through readiness and metrics.
-
-Migration planning should use a version graph, not a single linear ladder. Each artifact family records its schema fingerprint, and `StoreMigrator` computes an explicit path from the current store identity to the requested target. If multiple paths exist, the plan must name the selected path before `--apply` mutates data.
-
-This keeps small-footprint or experimental storage layouts additive. A new artifact family or storage major should not require editing one global enum that knows every historical version.
+Stores validate schema at open. A store written with an `artifact_schema_version` above `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` returns `StoreError::SchemaTooNew`; a network or layout mismatch returns the matching `SchemaMismatch` or `ChainEpochNetworkMismatch` variant. Both surface as `SchemaMismatch` at the service boundary and fail readiness with `schema_mismatch`. `zinder-query` never mutates canonical storage on schema mismatch; the operator recreates the store from a fresh backfill or an offline checkpoint.
 
 ## Checkpoints and Backups
 
@@ -208,7 +183,6 @@ Use typed errors at service boundaries:
 - `ArtifactUnavailable`
 - `ReorgWindowExceeded`
 - `InvalidChainStoreOptions`
-- `MigrationRequired`
 - `CheckpointUnavailable`
 - `NodeUnavailable`
 
@@ -243,10 +217,9 @@ Production storage code should not be treated as ready until these checks pass:
 3. Crash recovery during artifact writes, visible pointer writes, compaction, and reorg replacement.
 4. Recovery to the last complete `ChainEpoch` or a typed fail-closed error.
 5. Query refusal on schema mismatch.
-6. Migration plan/apply/resume behavior.
-7. Checkpoint creation and checkpoint reader validation.
-8. Compact block raw-byte serving or measured decode/re-encode fallback.
-9. Deletion and rebuild of query-owned caches without canonical storage changes.
+6. Checkpoint creation and checkpoint reader validation.
+7. Compact block raw-byte serving or measured decode/re-encode fallback.
+8. Deletion and rebuild of query-owned caches without canonical storage changes.
 
 ## Module Naming Guidance
 
@@ -260,7 +233,6 @@ Future implementation modules should be named by storage-owned concepts:
 - `transaction_artifact`
 - `tree_state`
 - `reorg_window`
-- `store_migration`
 - `store_error`
 - `store_key`
 - `artifact_envelope`

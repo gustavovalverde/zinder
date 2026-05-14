@@ -117,7 +117,7 @@ A self-inflicted failure that needs investigation. Retry policy: **OperatorActio
 
 ## Stability
 
-The set above is the v1 contract. Additions are allowed within a major version; the reserved range in [`error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto) leaves room for additive growth. Existing reasons' semantics are stable within a major version. Deprecated reasons advertise `deprecated_at` / `removal_at` date strings through `ServerInfo` (see [ADR-0022](../adrs/0022-release-artifact-set.md), planned).
+The set above is the v1 contract. Additions are allowed within a major version; the reserved range in [`error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto) leaves room for additive growth. Existing reasons' semantics are stable within a major version. v1 has no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)); reasons can be added, renamed, or removed between releases until a published consumer constraint exists.
 
 ## References
 

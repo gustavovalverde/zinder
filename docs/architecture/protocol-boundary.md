@@ -81,7 +81,6 @@ The current native wallet read-sync surface is:
 - `zinder_proto::v1::wallet::ServerInfoRequest`
 - `zinder_proto::v1::wallet::ServerInfoResponse`
 - `zinder_proto::v1::wallet::ServerCapabilities`
-- `zinder_proto::v1::wallet::DeprecatedCapability`
 - `zinder_proto::v1::wallet::NodeCapabilitiesDescriptor`
 - `zinder_proto::v1::wallet::wallet_query_server::WalletQuery`
 - `zinder_proto::v1::wallet::wallet_query_client::WalletQueryClient`
@@ -258,15 +257,11 @@ The category contract: `Unavailable` is reserved for transient infrastructure fa
 
 Capability strings follow `domain.subdomain.capability_name_v{N}`. The naming spine in [Public Interfaces §Capability Discovery](public-interfaces.md#capability-discovery) lists the active capabilities.
 
-## Deprecation Policy
-
-When a `WalletQuery` capability is deprecated:
-
-1. The capability appears in both `capabilities` and `deprecated_capabilities` in `ServerCapabilities`. The `DeprecatedCapability` entry names the replacement (if any), the deprecation rationale, and the earliest semver at which the capability may be removed (`earliest_removal_version`).
-2. The capability remains functional during the deprecation window. The window is at least one minor version.
-3. At removal, the capability is removed from both lists. The proto method may be marked `[deprecated = true]` to preserve the wire identifier; new methods may not reuse the wire number.
+## Proto Evolution
 
 `buf breaking` runs as a CI gate on every PR touching the owned Zinder proto tree and rejects package-level non-additive changes. `buf lint` also checks the owned Zinder proto package layout. The vendored lightwalletd protos under `proto/compat/lightwalletd/` are excluded from Buf because they are governed by the upstream commit pin and the existing `vendored proto drift` job.
+
+v1 carries no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)). Each wire shape pairs with one capability identifier; a shape change lands as a new `_vN` identifier and the old method may be removed in the same release. A deprecation policy ADR lands when a published consumer constraint exists.
 
 A second CI gate, `capability-coverage`, asserts that every `WalletQuery` RPC has a corresponding entry in `crates/zinder-proto/src/capabilities.rs::ZINDER_CAPABILITIES`. Adding an RPC without a capability string fails the job.
 
@@ -302,7 +297,7 @@ A protocol change is not ready unless:
 - The `.proto` file lives in `zinder-proto`.
 - The generated Rust type does not leak into `zinder-core` or `zinder-store` public APIs.
 - The method has a clear owner: native, internal, or compat.
-- The change is additive, or it follows the deprecation policy (capability string moved to `deprecated_capabilities` with `replaced_by` and `earliest_removal_version`; `buf breaking` CI passes either because the change is additive or because the maintainers have approved the breaking semver bump).
+- The change is additive, or `buf breaking` CI passes because maintainers have approved the breaking semver bump.
 - The new method has a corresponding capability string in `ZINDER_CAPABILITIES` (`capability-coverage` CI passes).
 - Tests cover wire compatibility and domain error mapping.
 - The docs name the service that serves the method.

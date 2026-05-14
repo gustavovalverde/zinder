@@ -110,8 +110,7 @@ async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint: endpoint.to_owned(),
         network,
-    })
-    .await?;
+    })?;
 
     let script_hash = transparent_address_script_hash(address)?;
     let watched = snapshot_mempool(&chain_index, script_hash, address).await?;

@@ -11,7 +11,7 @@ The list is not exhaustive and intentionally so. If you are integrating against 
 | **Zashi** (mobile) | Mobile wallet | `zinder-compat-lightwalletd` | Uses the vendored lightwalletd protocol; treats Zinder as a drop-in `lightwalletd` replacement. The Android SDK driving Zashi is the same one driving the gap analysis in [Findings from Android wallet integration](android-wallet-integration-findings.md). |
 | **Zodl** (mobile) | Mobile wallet | `zinder-compat-lightwalletd` | Same protocol path as Zashi; treats Zinder as a drop-in `lightwalletd` replacement. |
 | **Zallet** | Full-node wallet process | `zinder-client::LocalChainIndex` / `RemoteChainIndex` | The companion full-node wallet; pairs with Zinder for chain reads + broadcast. See [Serving Zebra and Zallet](serving-zebra-and-zallet.md) for the integration audit. |
-| **Zcash testnet faucet** | Server-side wallet | `zinder-client::RemoteChainIndex` + `chain_events` | The faucet integration that triggered [PRD-0002](../prd-0002-self-hosting-and-integration-experience.md). Uses the transparent-address surface plus the `chain_events` address-invalidation hint ([ADR-0021](../adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)) to detect incoming deposits. |
+| **Zcash testnet faucet** | Server-side wallet | `zinder-client::RemoteChainIndex` + `chain_events` | Server-side wallet consumer for the testnet faucet. Uses the transparent-address surface plus the `chain_events` address-invalidation hint ([ADR-0021](../adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)) to detect incoming deposits. |
 
 ## Reserved sections
 
@@ -47,7 +47,7 @@ If you are starting a new integration, pick the shape based on what you control:
 | ... need transparent-only reads + broadcast (no shielded) | `zinder-client::RemoteChainIndex` directly |
 | ... need explorer-shaped views | `WalletQuery` + `ExplorerQuery` (via the derive plane) |
 | ... need a wallet RPC the operator can drive externally | Zallet alongside Zinder |
-| ... need cross-language access | `WalletQuery` gRPC + the published OpenAPI / descriptor set ([ADR-0022](../adrs/0022-release-artifact-set.md), planned) |
+| ... need cross-language access | `WalletQuery` gRPC + the published OpenAPI / descriptor set ([ADR-0022](../adrs/0022-release-artifact-set.md)) |
 
 ## When NOT to be on this list
 
@@ -55,7 +55,6 @@ This page lists *known* consumers. There is no obligation to be listed; many ope
 
 ## References
 
-- [PRD-0002 §Capability Requirements REQ-17](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements)
 - [ADR-0008: Consumer-neutral wallet data plane](../adrs/0008-consumer-neutral-wallet-data-plane.md)
 - [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md)
 - [Server-side wallet pattern](server-side-wallet-pattern.md)

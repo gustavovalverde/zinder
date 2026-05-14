@@ -15,7 +15,7 @@ Concretely, the derive plane:
 - **Cannot affect** canonical state. A derive-plane crash does not stop ingest, does not block reads from `WalletQueryApi`, and does not corrupt canonical storage.
 - **Is rebuildable**. Any derived view can be discarded and rebuilt from canonical artifacts. This is the test for whether a view belongs in the derive plane: if rebuilding requires re-validating chain data, the view is in the wrong plane.
 
-[PRD-0001 Implementation Decisions](../prd-0001-zinder-indexer.md) is explicit: "`zinder-derive` is optional in v1 and must consume canonical artifacts rather than upstream node RPCs directly. ... Derived explorer or analytics indexes must be rebuilt from canonical artifacts and must not become a hidden dependency of wallet sync."
+`zinder-derive` is optional in v1 and consumes canonical artifacts rather than upstream node RPCs directly. Derived explorer or analytics indexes must be rebuildable from canonical artifacts and must not become a hidden dependency of wallet sync.
 
 ## When to use the derive plane
 
@@ -184,8 +184,7 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 
 ## Cross-references
 
-- [PRD-0001](../prd-0001-zinder-indexer.md) — defines the derive plane as optional in v1 and replayable.
-- [RFC-0001 §zinder-derive](../rfcs/0001-service-oriented-indexer-architecture.md) — names the derive plane in the workspace inventory.
+- [Service boundaries](service-boundaries.md) — names the derive plane in the workspace inventory and locks its optional, replayable shape.
 - [Wallet Data Plane](wallet-data-plane.md) — the sibling boundary; canonical wallet/application read surface.
 - [Chain Events](chain-events.md) — the event vocabulary the derive plane consumes.
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the subscription contract.

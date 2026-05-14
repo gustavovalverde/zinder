@@ -4,10 +4,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 
 ## Product and architecture
 
-- [PRD-0001: Zinder indexer product requirements](prd-0001-zinder-indexer.md)
-- [PRD-0002: v1 self-hosting and integration experience](prd-0002-self-hosting-and-integration-experience.md)
 - [What Zinder is and is not](architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
-- [RFC-0001: Service-Oriented Indexer Architecture](rfcs/0001-service-oriented-indexer-architecture.md)
 
 ## Architecture
 

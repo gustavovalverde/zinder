@@ -19,22 +19,19 @@ The same shape applies to two other dialect-sensitive identifier translations:
 - `Network` to wire-string conversion: lightwalletd's `LightdInfo.chainName` and `TreeState.network` use the BIP70 names `"main"` and `"test"` (with regtest collapsed into `"test"`); Zinder-native fields use `"zcash-mainnet"`, `"zcash-testnet"`, `"zcash-regtest"`.
 - Consensus branch id rendering: `LightdInfo.consensusBranchId` and the `MinedDetails.consensus_branch_id` projection both want a lowercase 8-character hex string.
 
-Before this ADR, those translations lived inline at every call site. A 2026-05-12 parity run against `electriccoinco/lightwalletd:latest` surfaced two production bugs traced to that scattering:
+Inline translations at every call site invite three bug classes that no amount of code review reliably catches:
 
-1. `GetLightdInfo.chainName` returned `"regtest"` because the compat shim's private `lightwalletd_chain_name` helper had drifted from the BIP70 convention. The same drift escaped CI because `services/zinder-ingest/tests/common/mod.rs:617` held a *duplicate* `lightwalletd_chain_name` that returned `"test"` correctly; tests passed while production lied.
-2. `GetTransaction(hash)` returned `NotFound` for coinbase txids round-tripped through `GetAddressUtxos`. The cause was an inverted reversal in the compat shim's `transaction_id_from_lightwalletd_hash` helper: it reversed bytes on input that were already in internal order. Inline `as_bytes()` calls at five other wire-boundary sites had each independently picked one of three contradictory docstring claims about what byte order was expected.
+- Chain-name dialect drift between BIP70 and Zinder-native (one inline helper returns `"regtest"` while another returns `"test"`; tests against one helper pass while production calls the other).
+- Byte-order reversal applied twice or skipped at one of several scattered sites (txid bytes round-trip through a hash-keyed lookup and return `NotFound` because one site reversed bytes that were already in internal order).
+- Capability literal duplicated outside the `ZINDER_CAPABILITIES` source of truth (one CI run advertises a capability the rest of the codebase no longer recognizes).
 
-The pattern question is not "what is the byte order for txid bytes." It is "where in the architecture does a Zinder process express the wire convention, and how is the same expression enforced as new wire fields and new dialects are added." Without one answer, every new method risks rediscovering one of the same three bug classes:
-
-- Chain-name dialect drift between BIP70 and Zinder-native.
-- Byte-order reversal applied twice or skipped at one of several scattered sites.
-- Capability literal duplicated outside the `ZINDER_CAPABILITIES` source of truth.
+The pattern question is where in the architecture a Zinder process expresses the wire convention, and how the same expression is enforced as new wire fields and new dialects are added.
 
 ## Decision
 
 Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by *concept*, not by *dialect*: `transaction_id.rs` holds every transaction-id conversion across every dialect; `block_hash.rs` holds every block-hash conversion; `chain_name.rs` holds every `Network` to wire-string conversion; `branch_id.rs` holds every consensus-branch-id conversion. Adding a new dialect to a shipped concept extends the existing file; adding a new concept adds a new file.
 
-Proto-enum mappings that require tonic-generated types (for example `ShieldedProtocol` between `zinder.v1.wallet` and `cash.z.wallet.sdk.rpc`) stay co-located with their adapters until a second caller appears for one mapping; the wire module's promise is *one canonical conversion per direction*, not *every conversion routed through a shared file*. A shared `zinder_proto::wire` was tried and removed: it had a single submodule with zero callers, because each adapter wanted a different error shape.
+Proto-enum mappings that require tonic-generated types (for example `ShieldedProtocol` between `zinder.v1.wallet` and `cash.z.wallet.sdk.rpc`) stay co-located with their adapters until a second caller appears for one mapping; the wire module's promise is *one canonical conversion per direction*, not *every conversion routed through a shared file*. A shared `zinder_proto::wire` pays off only when more than one adapter agrees on the error shape, so it does not exist until that constraint emerges.
 
 ### Verb vocabulary
 

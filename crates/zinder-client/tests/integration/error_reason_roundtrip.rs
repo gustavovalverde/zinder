@@ -61,14 +61,15 @@ fn invalid_block_range_carries_invalid_argument_status() {
 }
 
 #[test]
-fn unspecified_reason_is_skipped_for_unknown_domain() {
+fn missing_zinder_error_info_fails_closed() {
     let foreign_status = Status::with_error_details(
         tonic::Code::Internal,
         "foreign service failure",
         tonic_types::ErrorDetails::with_error_info("MIGRATING", "other.example.com", []),
     );
     let client_error = into_client_error(&foreign_status);
-    // Foreign-domain ErrorInfo is ignored; falls back to status-code mapping.
+    // A status without zinder.dev ErrorInfo cannot be classified; the client
+    // refuses to guess and reports ServiceUnavailable.
     assert!(matches!(
         client_error,
         IndexerError::ServiceUnavailable { .. }
@@ -144,16 +145,20 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
 
     let message = status.message().to_owned();
     let details = status.get_error_details();
-    let zinder_reason = details.error_info().and_then(|error_info| {
+    let Some(zinder_reason) = details.error_info().and_then(|error_info| {
         if error_info.domain == ZINDER_DOMAIN {
             ErrorReason::from_str_name(&error_info.reason)
         } else {
             None
         }
-    });
+    }) else {
+        return IndexerError::ServiceUnavailable {
+            reason: format!("missing zinder.dev ErrorInfo: {message}"),
+        };
+    };
 
     if status.code() == Code::NotFound
-        && matches!(zinder_reason, Some(ErrorReason::ArtifactUnavailable))
+        && matches!(zinder_reason, ErrorReason::ArtifactUnavailable)
         && let Some(resource_info) = details.resource_info()
     {
         return IndexerError::ArtifactUnavailable {

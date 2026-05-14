@@ -165,8 +165,7 @@ async fn setup_chain_indexes(utxo_count: u32) -> eyre::Result<ChainIndexFixtures
     let remote = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
-    })
-    .await?;
+    })?;
     let local = LocalChainIndex::open(LocalOpenOptions {
         storage_path: store_fixture.tempdir_path().to_path_buf(),
         secondary_path: store_fixture.tempdir_path().join("zinder-client-secondary"),

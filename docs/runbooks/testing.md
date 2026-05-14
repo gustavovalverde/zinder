@@ -708,10 +708,8 @@ cargo run --release --bin zinder-compat-lightwalletd -- \
 
 What this catches that the deterministic test does not:
 
-- `GetTransaction` NotFound mapping (the client sees plain `NOT_FOUND`, not the
-  legacy `ArtifactUnavailable`-with-resource_info detail).
-- `GetBlock { height=0, hash }` flow through the new `BlockSelector`
-  resolver.
+- `GetTransaction` NotFound mapping (the client sees plain `NOT_FOUND` for unknown transactions).
+- `GetBlock { height=0, hash }` flow through the `BlockSelector` resolver.
 - `GetTaddressTxids` / `GetTaddressTransactions` via the transparent-history
   index.
 - Real-world streaming and connection-reuse patterns the in-process test cannot
@@ -869,9 +867,7 @@ grpcurl -plaintext -import-path crates/zinder-proto/proto \
 Expect:
 
 - `mined`/`in_mempool`/`conflicting` oneof for known transactions.
-- gRPC `NOT_FOUND` (with a plain "not visible" message) for unknown
-  transactions. The legacy `ArtifactUnavailable`-with-resource_info shape is
-  gone.
+- gRPC `NOT_FOUND` (with a plain "not visible" message) for unknown transactions.
 
 ## Failure interpretation reference
 

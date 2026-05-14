@@ -5,7 +5,7 @@
 | Status   | Background research                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Audience | Zinder maintainers, operators, downstream wallet developers                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Date     | 2026-05-07                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Related  | [Wallet data plane](../architecture/wallet-data-plane.md), [Service operations](../architecture/service-operations.md), [Protocol boundary](../architecture/protocol-boundary.md), [PRD-0001](../prd-0001-zinder-indexer.md), [ADR-0007](../adrs/0007-multi-process-storage-access.md), [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](../adrs/0009-ingest-control-transport-security.md), [Findings from Android wallet integration](android-wallet-integration-findings.md) |
+| Related  | [Wallet data plane](../architecture/wallet-data-plane.md), [Service operations](../architecture/service-operations.md), [Protocol boundary](../architecture/protocol-boundary.md), [ADR-0007](../adrs/0007-multi-process-storage-access.md), [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), [ADR-0009](../adrs/0009-ingest-control-transport-security.md), [Findings from Android wallet integration](android-wallet-integration-findings.md) |
 
 ## Purpose
 
@@ -29,7 +29,7 @@ Per [Service operations](../architecture/service-operations.md):
 - `zinder-ingest backfill --wallet-serving` to seed the historical floor required by lightwalletd-compatible bootstrap, verified end-to-end on testnet against Zashi (see [Findings from Android wallet integration](android-wallet-integration-findings.md)).
 - Plaintext h2c on every gRPC port, including the public client port; the private `IngestControl` plane is governed by [ADR-0009](../adrs/0009-ingest-control-transport-security.md).
 
-What Zinder does not ship, by deliberate v1 scope cut (`README.md` and [PRD-0001](../prd-0001-zinder-indexer.md)): public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting.
+Out of v1 scope: public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting.
 
 ## Capability comparison
 

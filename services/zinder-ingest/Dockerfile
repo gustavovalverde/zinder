@@ -5,8 +5,7 @@
 #
 #     docker build -f services/zinder-ingest/Dockerfile -t zinder-ingest .
 #
-# See PRD-0002 REQ-1 and ADR-0007 for the writer/reader topology this image
-# fits into.
+# See ADR-0007 for the writer/reader topology this image fits into.
 
 ARG RUST_VERSION=1.91
 ARG DEBIAN_RELEASE=bookworm

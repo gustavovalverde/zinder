@@ -28,7 +28,7 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 - **Maintain per-consumer wallet state.** Account balances, transaction labels, address books, fiat-conversion rates, and notification settings all live in the consumer.
 - **Infer address ownership.** Two clients querying the same transparent address get the same response; Zinder has no concept of "this consumer owns this address".
 - **Compliance or identity.** No KYC, no source-of-funds tracking, no per-user audit logs of which addresses were queried.
-- **Terminate TLS, authenticate callers, or rate-limit.** Operators put a reverse proxy in front of Zinder for any of these. [PRD-0001](../prd-0001-zinder-indexer.md) §Non-Goals.
+- **Terminate TLS, authenticate callers, or rate-limit.** Operators put a reverse proxy in front of Zinder for any of these; these surfaces are out of v1 scope.
 - **Provide multi-tenant hosting.** Zinder serves one logical operator; tenant isolation lives at the layer above.
 - **Run cross-host RocksDB secondaries.** Single-host topology is the v1 recommendation. [ADR-0007](../adrs/0007-multi-process-storage-access.md).
 
@@ -97,4 +97,3 @@ If you find yourself adding a per-user table to Zinder, stop and reconsider. The
 - [Wallet data plane](wallet-data-plane.md)
 - [Server-side wallet pattern](../reference/server-side-wallet-pattern.md)
 - [Known consumers](../reference/known-consumers.md)
-- [PRD-0001: Zinder indexer product requirements](../prd-0001-zinder-indexer.md)

@@ -1,6 +1,6 @@
 # Deploying Zinder on Railway
 
-This runbook gets a fresh Zinder deployment onto Railway (or a structurally similar PaaS like Fly.io or Render) in roughly 30 minutes. Target shape: the single-container image (`deploy/single-container/Dockerfile`) running `zinder-ingest` + `zinder-query` together under s6-overlay, against a Zebra deployment hosted somewhere reachable from Railway's network. PRD-0002 REQ-4.
+This runbook gets a fresh Zinder deployment onto Railway (or a structurally similar PaaS like Fly.io or Render) in roughly 30 minutes. Target shape: the single-container image (`deploy/single-container/Dockerfile`) running `zinder-ingest` + `zinder-query` together under s6-overlay, against a Zebra deployment hosted somewhere reachable from Railway's network.
 
 The same shape applies to any PaaS that:
 
@@ -152,7 +152,6 @@ For pinned-tag deploys, change the image tag back to the prior version and redep
 
 ## References
 
-- [PRD-0002 §Capability Requirements REQ-4](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements)
 - [ADR-0018: Environment variable secret policy](../adrs/0018-environment-variable-secret-policy.md)
 - [`deploy/single-container/`](../../deploy/single-container/)
 - [`deploy/single-container/README.md`](../../deploy/single-container/README.md)

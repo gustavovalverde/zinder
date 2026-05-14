@@ -390,12 +390,11 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Resolves a block selector against the canonical best chain.
     ///
-    /// Replaces the lightwalletd `BlockId { height, hash }` request shape:
-    /// hash-only callers no longer need to pretend `height = 0` is a
-    /// sentinel, and height-only callers get a normalized [`BlockId`] with
-    /// the resolved hash. Returns [`IndexerError::NotFound`] when the
-    /// selector addresses a block that is not visible at the request's
-    /// chain epoch (reorged out or never indexed).
+    /// Hash-only callers pass the `Hash` arm; height-only callers pass the
+    /// `Height` arm and receive a normalized [`BlockId`] with the resolved
+    /// hash. Returns [`IndexerError::NotFound`] when the selector addresses
+    /// a block that is not visible at the request's chain epoch (reorged
+    /// out or never indexed).
     ///
     /// # Examples
     ///

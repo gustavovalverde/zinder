@@ -4,19 +4,15 @@ Zinder is a service-oriented Zcash indexer. It separates the chain ingestion pla
 
 ## Why Zinder
 
-The Zcash ecosystem is mid-transition. `zcashd` is deprecated; [Zebra](https://github.com/ZcashFoundation/zebra) has intentionally narrowed its scope and assigns wallet, indexer, and explorer responsibilities to projects around it. [lightwalletd](https://github.com/zcash/lightwalletd) covers shielded compact blocks but has no path to absorb the wallet RPCs that used to live inside `zcashd`. The wallet-facing API surface needs a new home that targets Zebra first, scales operationally, and treats the lightwalletd vocabulary as a migration concern rather than a permanent constraint.
-
-Zinder is that home: a service-oriented Zcash indexer built clean-slate in Rust. The v1 deployment target is a self-hosted, single-operator service backed by a configured Zebra node. It serves [Zodl](https://github.com/zodl-inc/zodl-android), formerly Zashi, and other lightwalletd-compatible clients through the compatibility adapter, while [Zallet](https://github.com/zcash/wallet) and other Rust consumers integrate through the typed client. Public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting are explicitly out of v1 scope.
+Zinder is the Zcash chain indexer for wallets, explorers, and application backends that need a stable, epoch-consistent data plane on top of [Zebra](https://github.com/ZcashFoundation/zebra). The v1 deployment target is a self-hosted, single-operator service backed by one configured Zebra node. [Zodl](https://github.com/zodl-inc/zodl-android), formerly Zashi, and other lightwalletd-compatible clients connect through the compatibility adapter; [Zallet](https://github.com/zcash/wallet) and other Rust consumers integrate through the typed client. Public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting are out of v1 scope.
 
 ### Approach
 
-**A native `WalletQuery` protocol with a separate compatibility translator.** Zinder defines its own gRPC schema for wallets and applications. The lightwalletd `CompactTxStreamer` surface is served by a discrete adapter (`zinder-compat-lightwalletd`) that translates legacy calls onto the native query API. New wallet capabilities land in `WalletQuery`; the compat layer exists so existing wallets are not stranded during migration, not as the strategic destination.
+**A native `WalletQuery` protocol with a separate compatibility translator.** Zinder defines its own gRPC schema for wallets and applications. The lightwalletd `CompactTxStreamer` surface is served by a discrete adapter (`zinder-compat-lightwalletd`) that translates calls onto the native query API. New wallet capabilities land in `WalletQuery`; the compat layer keeps existing wallets supported without becoming the strategic destination.
 
 **A service-oriented split with one writer.** `zinder-ingest` is the only process that writes to canonical storage. `zinder-query` reads through an epoch-bounded read API. The compat shim translates without touching storage or upstream nodes. Reads pin to one chain epoch, so a sync batch never mixes data across competing tips. Ingestion and query scale independently.
 
 **Upstream-node coupling isolated to one crate.** All Zebra node integration lives in `zinder-source`. Domain types, storage, and protocol crates never import Zebra or source-specific types. A new source backend is a new module in `zinder-source` rather than a workspace-wide refactor.
-
-**Separate product, shared ecosystem lessons.** Zinder reuses no Zaino code. It uses Zaino's public tracker and architecture discussions as prior art for a different product shape: an epoch-consistent data plane for multiple consumers with explicit ingestion, query, compatibility, and derived-index boundaries.
 
 ### What to expect
 
@@ -32,14 +28,14 @@ Zinder is that home: a service-oriented Zcash indexer built clean-slate in Rust.
 
 - [Zebra](https://github.com/ZcashFoundation/zebra): the ZFND Zcash node and Zinder's primary upstream node source.
 - [Zodl](https://github.com/zodl-inc/zodl-android), formerly Zashi: a mobile wallet served through Zinder's lightwalletd-compatible adapter and validated with real wallet flows.
-- [Zallet](https://github.com/zcash/wallet): the full-node wallet that should integrate through Zinder's native typed Rust client, not through lightwalletd.
-- [lightwalletd](https://github.com/zcash/lightwalletd): the existing `CompactTxStreamer` protocol Zinder implements as a compatibility surface.
-- [Zaino](https://github.com/zingolabs/zaino): ecosystem prior art and compatibility reference, not a Zinder dependency.
+- [Zallet](https://github.com/zcash/wallet): the full-node wallet that integrates through Zinder's native typed Rust client.
+- [lightwalletd](https://github.com/zcash/lightwalletd): the `CompactTxStreamer` protocol Zinder implements as a compatibility surface.
+- [Zaino](https://github.com/zingolabs/zaino): ecosystem prior-art reference; not a Zinder dependency.
 
 ### Further reading
 
-- [Product requirements](docs/prd-0001-zinder-indexer.md): user stories, scope, non-goals.
-- [RFC-0001: Service-Oriented Indexer Architecture](docs/rfcs/0001-service-oriented-indexer-architecture.md): the boundary contract Zinder is built against.
+- [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
+- [Service boundaries](docs/architecture/service-boundaries.md): the boundary contract Zinder is built against.
 - [Lessons from Zaino](docs/reference/lessons-from-zaino.md): prior-art lessons from Zaino's public tracker and how they inform Zinder's product guarantees.
 - [Serving Zebra and Zallet](docs/reference/serving-zebra-and-zallet.md): how Zinder fits between the upstream node and the full-node wallet.
 - [Architecture index](docs/README.md): full ADR and architecture doc index.
@@ -86,7 +82,7 @@ flowchart LR
 
 Two foundation crates are shared across every plane: `zinder-core` (chain vocabulary: `ChainEpoch`, `BlockArtifact`, `Network`) and `zinder-proto` (`.proto` files and generated wire modules, including the pinned vendored lightwalletd schemas). Every binary also exposes an operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) with typed readiness causes; that contract is owned by `zinder-runtime`. See [service operations](docs/architecture/service-operations.md).
 
-For the full boundary contract, read [RFC-0001](docs/rfcs/0001-service-oriented-indexer-architecture.md) and [service boundaries](docs/architecture/service-boundaries.md).
+For the full boundary contract, read [service boundaries](docs/architecture/service-boundaries.md).
 
 ## Workspace
 

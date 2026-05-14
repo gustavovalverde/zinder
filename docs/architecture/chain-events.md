@@ -64,9 +64,6 @@ The replacement range must start at the first height where the old visible branc
 
 Reject the name `ReorgTooDeep`. It describes a symptom. `ReorgWindowExceeded` names the configured boundary that was violated.
 
-`ChainReverted` was considered and removed in favor of `ChainReorged`, which
-binds the reverted and replacement ranges in one durable transition.
-
 `zinder-ingest tip-follow` is the first live producer of
 `ReorgWindowChange::Replace`; historical backfill only appends and finalizes
 already-stable ranges.

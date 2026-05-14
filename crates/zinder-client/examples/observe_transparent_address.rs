@@ -111,8 +111,7 @@ async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint: endpoint.to_owned(),
         network,
-    })
-    .await?;
+    })?;
 
     let wallet_info = chain_index.server_info().await?;
     let common = wallet_info

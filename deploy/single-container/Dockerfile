@@ -2,11 +2,10 @@
 # (public reader) supervised by s6-overlay, sharing one canonical volume.
 #
 # This is the recommended deployment shape for single-operator self-hosting
-# (PRD-0002 REQ-2 and ADR-0007 §Single-host topology). Operators on PaaS
-# targets that lack shared filesystems across services (Railway, Fly.io,
-# Render) deploy this image once; Kubernetes operators wanting sidecar
-# separation use the per-service Dockerfiles in services/<svc>/Dockerfile
-# instead.
+# (per ADR-0007 §Single-host topology). Operators on PaaS targets that lack
+# shared filesystems across services (Railway, Fly.io, Render) deploy this
+# image once; Kubernetes operators wanting sidecar separation use the
+# per-service Dockerfiles in services/<svc>/Dockerfile instead.
 
 ARG RUST_VERSION=1.91
 ARG DEBIAN_RELEASE=bookworm

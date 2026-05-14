@@ -2,9 +2,9 @@
 
 ## Context
 
-[PRD-0002 REQ-11](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements) needs every Zinder gRPC method to return a typed error vocabulary that consumers can map onto local retry, gate, and alert decisions without parsing message strings. Before this ADR, `QueryError` and `StoreError` mapped to `tonic::Status` with the appropriate code and structured detail (`BadRequest`, `PreconditionFailure`, `ResourceInfo`), but the *category name* of the failure (`reorg_window_exceeded`, `broadcast_disabled`, `artifact_unavailable`, etc.) lived only in the Rust source and in the human-readable message string. A client that wanted to act on, say, "broadcast disabled" had to parse the message — fragile across releases.
+Every Zinder gRPC method needs to return a typed error vocabulary that consumers can map onto local retry, gate, and alert decisions without parsing message strings. `QueryError` and `StoreError` map to `tonic::Status` with the appropriate code and structured detail (`BadRequest`, `PreconditionFailure`, `ResourceInfo`); the structured detail answers "what specifically failed". The category name of the failure (`reorg_window_exceeded`, `broadcast_disabled`, `artifact_unavailable`, etc.) is the orthogonal axis a client gates on.
 
-The `google.rpc.ErrorInfo` shape is the standard for this in the protobuf ecosystem. It carries three fields: a stable `reason` enum value, a `domain` namespacing the reason, and a `metadata` key-value map. `tonic-types 0.14.5` is already a workspace dependency and `Status::with_error_details` is already used at every detail layer.
+The `google.rpc.ErrorInfo` shape is the standard for this in the protobuf ecosystem. It carries three fields: a stable `reason` enum value, a `domain` namespacing the reason, and a `metadata` key-value map. `tonic-types` is already a workspace dependency and `Status::with_error_details` is already used at every detail layer.
 
 ## Decision
 
@@ -16,7 +16,7 @@ The `google.rpc.ErrorInfo` shape is the standard for this in the protobuf ecosys
 
 **Server side:** `status_from_query_error` and `status_from_store_error` each gain a `code_and_typed_detail_for` (or equivalent) split that returns the `(Code, ErrorDetails)` pair without the `ErrorInfo`, then `set_error_info` is applied uniformly before constructing the final `Status`. `error_reason_for_*` maps each Rust variant to its `ErrorReason`.
 
-**Client side:** `IndexerError::from_status` parses `ErrorInfo` from `Status::get_error_details()`, validates the domain, and uses the reason to choose the most specific `IndexerError` variant. When `ResourceInfo` accompanies an `ARTIFACT_UNAVAILABLE` reason, the family/key fields are preserved into `IndexerError::ArtifactUnavailable`. Legacy responses (no `ErrorInfo`) fall back to the previous status-code mapping.
+**Client side:** `IndexerError::from_status` parses `ErrorInfo` from `Status::get_error_details()`, validates the domain, and uses the reason to choose the most specific `IndexerError` variant. When `ResourceInfo` accompanies an `ARTIFACT_UNAVAILABLE` reason, the family/key fields are preserved into `IndexerError::ArtifactUnavailable`. Responses without a Zinder-domain `ErrorInfo` fail closed as `ServiceUnavailable`; the client refuses to guess a typed reason from the bare status code.
 
 **Add `IndexerError::reason() -> Option<ErrorReason>`** so consumers can pattern-match on the typed reason without crossing an extra deserialization step.
 
@@ -34,7 +34,7 @@ The `google.rpc.ErrorInfo` shape is the standard for this in the protobuf ecosys
 
 **Public client API additions:** `RetryPolicy`, `IndexerError::reason()`, `IndexerError::retry_policy()`, and re-export of `zinder_proto::v1::ops::ErrorReason` from `zinder-client`. Consumers building on the existing `IndexerError` see the new accessors as additive.
 
-**`tonic-types` is now a direct dep of `zinder-client`.** Previously the client crate imported only proto types from `tonic`; the `ErrorInfo` extractor requires `tonic_types::StatusExt`. The dep is small and already in the workspace tree.
+**`tonic-types` is a direct dep of `zinder-client`** because the `ErrorInfo` extractor requires `tonic_types::StatusExt`. The dep is small and already in the workspace tree.
 
 ## Alternatives Considered
 
@@ -46,7 +46,6 @@ The `google.rpc.ErrorInfo` shape is the standard for this in the protobuf ecosys
 
 ## References
 
-- [PRD-0002 §Capability Requirements REQ-11](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements)
 - [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto)
 - [`services/zinder-query/src/grpc/mod.rs`](../../services/zinder-query/src/grpc/mod.rs) (`status_from_query_error`)
 - [`crates/zinder-store/src/grpc_status.rs`](../../crates/zinder-store/src/grpc_status.rs) (`status_from_store_error`)

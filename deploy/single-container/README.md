@@ -1,6 +1,6 @@
 # Single-container Zinder deployment
 
-This is the v1 recommended deployment shape for single-operator self-hosting (PRD-0002 REQ-2, ADR-0007).
+This is the v1 recommended deployment shape for single-operator self-hosting (per ADR-0007).
 
 ## What runs inside
 
@@ -39,7 +39,7 @@ This is the v1 recommended deployment shape for single-operator self-hosting (PR
                     (wallets, faucets, SDKs)
 ```
 
-Zinder explicitly does not own TLS termination, authentication, or rate limiting (PRD-0001 §Non-Goals). The reverse-proxy layer is operator-supplied; it sits between public consumers and the container's plaintext gRPC port.
+Zinder does not own TLS termination, authentication, or rate limiting; those are out of v1 scope. The reverse-proxy layer is operator-supplied; it sits between public consumers and the container's plaintext gRPC port.
 
 ## Required volumes
 

@@ -31,7 +31,7 @@ The cost compounds at every protocol upgrade and every Zebra release.
 
 ### Zinder design response
 
-- [PRD-0001](../prd-0001-zinder-indexer.md): public API names must be domain-first (`ChainEpoch`, `BlockArtifact`, `WalletQueryApi`), and forbidden words include `Service`, `Manager`, `common`, `shared`, `utils`.
+- [Public interfaces §Naming Rules](../architecture/public-interfaces.md): public API names are domain-first (`ChainEpoch`, `BlockArtifact`, `WalletQueryApi`); forbidden words include `Service`, `Manager`, `common`, `shared`, `utils`.
 - [ADR-0002](../adrs/0002-boundary-specific-serialization.md): three serialization formats are reserved for three boundaries (fixed for ordered keys and envelopes, protobuf for protocol payloads, postcard for non-durable internal binary). The format split makes the type split self-enforcing.
 - [Public interfaces](../architecture/public-interfaces.md): `zinder-core` types are the canonical domain vocabulary; `zinder-store` owns persistence; `zinder-proto` owns wire. Cross-crate type leakage is reviewed at PR time.
 - [Service Boundaries](../architecture/service-boundaries.md): allowed coupling between services is enumerated (domain types, storage contracts, protocol definitions, test fixtures). Anything else is a boundary violation.
@@ -63,7 +63,7 @@ The `CompactTxStreamer` proto came from `librustzcash`, the JSON-RPC spec came f
 ### Zinder design response
 
 - [Public interfaces](../architecture/public-interfaces.md) names `WalletQueryApi` as the single externally visible read contract.
-- [PRD-0001](../prd-0001-zinder-indexer.md): _"Compatibility tests must compare wallet-facing behavior against lightwalletd-compatible expectations for compact blocks, block ranges, latest block metadata, and transaction submission."_
+- Compatibility tests compare wallet-facing behavior against lightwalletd-compatible expectations for compact blocks, block ranges, latest block metadata, and transaction submission.
 - [ADR-0002](../adrs/0002-boundary-specific-serialization.md): protobuf is the canonical wire serialization, which means the `.proto` files are the spec, not a derived artifact.
 
 ### Zinder decisions
@@ -106,7 +106,7 @@ Operators paid for this in three places: load balancer health checks reduced to 
   - Typed startup phases (`load_config`, `validate_config`, `open_storage`, `check_schema`, `connect_node`, `recover_state`, `start_api`, `ready`).
   - `/healthz`, `/readyz`, `/metrics` required from day one.
   - Readiness response is JSON with a machine-readable cause.
-- [RFC-0001 §Operations Model](../rfcs/0001-service-oriented-indexer-architecture.md) enumerates required readiness causes: `starting`, `syncing`, `ready`, `migrating`, `node_unavailable`, `storage_unavailable`, `schema_mismatch`, `reorg_window_exceeded`, `shutting_down`. These map directly to the gaps Zaino is still closing in #1040.
+- [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness) enumerates required readiness causes: `starting`, `syncing`, `ready`, `migrating`, `node_unavailable`, `storage_unavailable`, `schema_mismatch`, `reorg_window_exceeded`, `shutting_down`. These map directly to the gaps Zaino is still closing in #1040.
 
 ### Seams to preserve
 
@@ -137,12 +137,12 @@ A user wanting "smaller on-disk footprint" ([#858](https://github.com/zingolabs/
 - [ADR-0001](../adrs/0001-rocksdb-canonical-store.md): RocksDB is the canonical KV store. Column families replace per-major-version directories.
 - [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md): canonical storage is reached only through `ChainEpochReadApi`. `zinder-query` does not open the live RocksDB database in production.
 - [Storage Backend](../architecture/storage-backend.md): explicit fingerprint, atomic batch commits per epoch, schema version stored alongside data.
-- [PRD-0001 Testing Decisions](../prd-0001-zinder-indexer.md): atomic commits, migration refusal without an explicit migration mode, snapshot consistency, schema-version checks, and crash recovery are required test categories.
+- Required storage test categories: atomic commits, snapshot consistency, schema-version checks, and crash recovery.
 - Block and transaction parsing is delegated to maintained Zcash consensus primitives behind `zinder-source` or ingestion adapters. Zinder defines indexing artifacts on top of validated parser output, not custom byte parsers.
 
 ### Zinder decisions
 
-- Migration shape. Zaino's option-A version graph is the model Zinder adopts in [Storage backend](../architecture/storage-backend.md): each artifact family records its schema fingerprint, and `StoreMigrator` computes an explicit path before `--apply`.
+- Schema versioning. Per [Storage backend](../architecture/storage-backend.md), the store validates schema on open and fails closed on mismatch; operators recreate the store. Migration tooling lands later if and when persistent operator stores need it.
 - Newtype audit. `Height`, `BlockHash`, `TxId`, `ReorgWindowDepth`, `FinalizedHeight` should be domain newtypes with checked arithmetic. Zaino's silent-truncation bug ([#549](https://github.com/zingolabs/zaino/issues/549)) is a textbook case.
 - LMDB map-size analogue. RocksDB has fewer hard sizing constraints, but operator-facing defaults must be calculated from network, not hard-coded for mainnet.
 
@@ -174,8 +174,8 @@ Zaino's tip-vs-chainwork bug ([#786](https://github.com/zingolabs/zaino/issues/7
 
 ### Zinder design response
 
-- [RFC-0001 §Reorg Model](../rfcs/0001-service-oriented-indexer-architecture.md) defines the reorg state machine explicitly: `observe_chain_source → fetch_missing_ancestors → select_best_chain → build_chain_artifacts → commit_chain_epoch → publish_chain_event → finalize_tip_if_ready`. Each transition has tests.
-- [PRD-0001 Testing Decisions](../prd-0001-zinder-indexer.md): "ingestion tests must cover initial sync, restart from partial sync, source disconnect, reorg inside the non-finalized window, reorg beyond the supported window, mempool add/remove, and duplicate block delivery."
+- [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) defines the reorg state machine explicitly: `observe_chain_source → fetch_missing_ancestors → select_best_chain → build_chain_artifacts → commit_chain_epoch → publish_chain_event → finalize_tip_if_ready`. Each transition has tests.
+- Ingestion tests cover initial sync, restart from partial sync, source disconnect, reorg inside the non-finalized window, reorg beyond the supported window, mempool add/remove, and duplicate block delivery.
 - `ChainEpoch` carries `tip_height` and `finalized_height` separately; "finalised" is a typed boundary, not an integer threshold.
 
 ### Zinder decisions
@@ -208,7 +208,7 @@ Result: the most common wallet-sync operation is the slowest. The endpoints Zain
 ### Zinder design response
 
 - [Wallet Data Plane](../architecture/wallet-data-plane.md): block ranges are a streaming contract, not a per-block iteration.
-- [PRD-0001](../prd-0001-zinder-indexer.md) lists "compatibility tests against lightwalletd-style clients" as required, which provides the regression gate Zinder needs for this product shape.
+- Compatibility tests against lightwalletd-style clients are the standing regression gate for this product shape.
 - The `ChainEpochReader` boundary makes batch reads cheap because it pins to a snapshot for the duration of the response.
 
 ### Zinder decisions
@@ -248,7 +248,7 @@ The user-visible damage is silent invalid states: a user setting `node_cookie_au
 
 - [Service Boundaries](../architecture/service-boundaries.md): each service has its own configuration. There is no shared `IndexerConfig` god object.
 - [Service Operations](../architecture/service-operations.md): startup phases include `load_config` and `validate_config`. Validation is typed and runs before any side effect.
-- PRD-0001: "production configuration must reject unsafe defaults".
+- Production configuration rejects unsafe defaults; per-service config validation is part of startup.
 
 ### Zinder decisions
 
@@ -282,8 +282,7 @@ Upstream node coupling also narrows the feature space: supporting both Zebra 4.2
 
 ### Zinder design response
 
-- [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md) names `zinder-source` as the source-adapter crate.
-- [PRD-0001](../prd-0001-zinder-indexer.md) story 16: _"As a node implementation maintainer, I want Zinder to isolate source adapters, so that Zebra ReadState, JSON-RPC, and future streaming sources can evolve without rewriting query APIs."_
+- [Node source boundary](../architecture/node-source-boundary.md) names `zinder-source` as the source-adapter crate; Zebra ReadState, JSON-RPC, and future streaming sources evolve behind one trait so query APIs do not see source-specific types.
 - The vocabulary forbids leaking Zebra or source-specific types past `zinder-source`.
 
 ### Zinder decisions
@@ -315,8 +314,8 @@ Test infrastructure was authored as needed and later had to absorb more contribu
 
 ### Zinder design response
 
-- `zinder-testkit` is named in [RFC-0001 §Workspace Crates](../rfcs/0001-service-oriented-indexer-architecture.md): "deterministic source, chain, reorg, and wallet API fixtures."
-- [PRD-0001 Testing Decisions](../prd-0001-zinder-indexer.md): tests are categorised (ingestion, storage, query, compatibility, operations, derived) and external behaviour is the primary target.
+- `zinder-testkit` provides deterministic source, chain, reorg, and wallet API fixtures.
+- Tests are categorised (ingestion, storage, query, compatibility, operations, derived) and external behaviour is the primary target.
 
 ### Zinder decisions
 
@@ -344,7 +343,7 @@ Zaino tracks observability as follow-up work. Every operator who wanted Promethe
 ### Zinder design response
 
 - [Service Operations](../architecture/service-operations.md): `/metrics` is a launch requirement, not a milestone.
-- [PRD-0001](../prd-0001-zinder-indexer.md) story 17 lists the required dimensions: chain lag, commit latency, reorg depth, query latency, DB health, API error classes.
+- Required observability dimensions: chain lag, commit latency, reorg depth, query latency, DB health, and API error classes.
 
 ### Seams to preserve
 

@@ -47,7 +47,7 @@ Zinder's mitigation must be a durable last-processed-hash cursor, paired with an
 
 #### 3. Gate Zinder readiness on Zebra readiness
 
-Zebra's `/ready` returns 200 only when block lag is `≤ ready_max_blocks_behind` (default 2) and tip age is `≤ ready_max_tip_age` (default 5 minutes). Zinder's own readiness signal must not contradict Zebra's. If Zebra is `not_ready/syncing`, Zinder is at most `not_ready/node_unavailable` regardless of how many epochs Zinder has materialised locally. The typed readiness causes named in [RFC-0001 §Operations Model](../rfcs/0001-service-oriented-indexer-architecture.md) already enumerate this; the implementation must consume Zebra's probe, not just expose Zinder's own.
+Zebra's `/ready` returns 200 only when block lag is `≤ ready_max_blocks_behind` (default 2) and tip age is `≤ ready_max_tip_age` (default 5 minutes). Zinder's own readiness signal must not contradict Zebra's. If Zebra is `not_ready/syncing`, Zinder is at most `not_ready/node_unavailable` regardless of how many epochs Zinder has materialised locally. The typed readiness causes in [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness) already enumerate this; the implementation must consume Zebra's probe, not just expose Zinder's own.
 
 #### 4. Refuse to start if Zebra's DB does not have the indexer feature when Zinder needs it
 
@@ -129,7 +129,7 @@ The concrete call set Zallet makes today (cited from Zallet source, paths relati
 | Broadcast | `components/json_rpc/payments.rs:478` | `send_raw_transaction` |
 | Block by hash | `components/sync/steps.rs:223` | `z_get_block` (currently dead path) |
 
-Zallet's wallet keys never leave Zallet. The indexer never sees viewing keys, and `scan_cached_blocks` runs locally in `zcash_client_backend`. This is exactly the privacy boundary [Wallet Data Plane](../architecture/wallet-data-plane.md) and [PRD-0001 Out of Scope](../prd-0001-zinder-indexer.md) commit Zinder to: no server-side scanning, no viewing-key custody.
+Zallet's wallet keys never leave Zallet. The indexer never sees viewing keys, and `scan_cached_blocks` runs locally in `zcash_client_backend`. This is the privacy boundary [Wallet Data Plane](../architecture/wallet-data-plane.md) commits Zinder to: no server-side scanning, no viewing-key custody.
 
 ### Zallet Integration Constraints in the Current API
 
@@ -173,7 +173,7 @@ These are the concrete API contracts Zallet's source code and tracker imply. Non
 
 Every "chaininfo-aware" TODO in Zallet, the entire `#237` migration, and `components/json_rpc/methods/view_transaction.rs:944` depend on this single capability: take a snapshot of chain state at one height-and-hash, and issue multiple queries against it consistently.
 
-[PRD-0001 Implementation Decisions](../prd-0001-zinder-indexer.md) commits to this: _"Query responses that require chain consistency must read from one epoch. Mixing latest values from different epochs is a correctness bug."_ The `ChainEpoch` type is the canonical mechanism. The Rust API surface Zallet consumes must expose epoch-pinned readers, not method-by-method calls against an implicitly-current chain.
+Query responses that require chain consistency read from one epoch; mixing latest values from different epochs is a correctness bug. The `ChainEpoch` type is the canonical mechanism. The Rust API surface Zallet consumes exposes epoch-pinned readers, not method-by-method calls against an implicitly-current chain.
 
 #### Typed Rust API: heights, errors, transaction status
 
@@ -197,13 +197,13 @@ This is also the right granularity for Zallet's `#403` (rebroadcast detection) b
 
 #### Mempool as a queryable index
 
-The Zallet `#139`, `#403`, and `sync.rs:467` cluster all need mempool *queries*, not just *streams*. Zinder must back the mempool with an indexed view (epoch-bound or sequence-numbered, per [RFC-0001 §Mempool Model](../rfcs/0001-service-oriented-indexer-architecture.md)) that supports at minimum:
+The Zallet `#139`, `#403`, and `sync.rs:467` cluster all need mempool *queries*, not just *streams*. Zinder backs the mempool with an indexed view (epoch-bound or sequence-numbered, per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)) that supports at minimum:
 
 - `is_in_mempool(txid) -> bool`
 - `transparent_mempool_outputs_by_address(request) -> Vec<TransparentMempoolOutput>`
 - `transparent_mempool_spend_by_outpoint(outpoint) -> Option<TransparentMempoolSpend>`
 
-Insert-only mempool caches are explicitly forbidden by RFC-0001; the design rationale is now grounded in Zallet `#403` and `#139` evidence.
+Insert-only mempool caches are forbidden by [Node source boundary §Mempool source](../architecture/node-source-boundary.md) and [ADR-0010](../adrs/0010-mempool-topology-and-retention.md); the design rationale is grounded in Zallet `#403` and `#139` evidence.
 
 #### Fixed-height variants of every chain query
 
@@ -232,7 +232,7 @@ Zinder's durable direction is captured in [ADR-0008: Consumer-neutral wallet dat
 
 #### Native `WalletQuery` (`zinder_proto::v1::wallet`)
 
-Implemented end-to-end:
+The native surface covers:
 
 - `LatestBlock`, `CompactBlock`, `CompactBlockRange` (server streaming, capped by `max_compact_block_range` with default `1000`).
 - `Transaction` by transaction id.
@@ -246,13 +246,11 @@ Implemented end-to-end:
 
 Every response carries the `ChainEpoch` it was answered from, and native read requests accept an optional `at_epoch` pin. This satisfies the atomic-snapshot contract for multi-call wallet flows: a client can call `LatestBlock`, persist the returned `ChainEpoch`, and require `CompactBlockRange`, `TreeState`, `LatestTreeState`, `SubtreeRoots`, `Transaction`, `TransparentAddressUtxos`, and `TransparentAddressTxIdsInRange` to answer from that same epoch.
 
-Not yet on the native surface:
-
-- `getrawtransaction(txid, blockhash)` form (non-best-chain transaction lookup) needs a separate API if explorer or zcashd-compat parity requires it.
+Non-best-chain transaction lookup (`getrawtransaction(txid, blockhash)` form) is a separate API surface; explorer or zcashd-compat parity for that case lands as a new method, not a third arm on the existing selector.
 
 #### Lightwalletd compat (`zinder_proto::compat::lightwalletd`)
 
-Implemented end-to-end in `services/zinder-compat-lightwalletd/src/grpc.rs`:
+The compat surface in `services/zinder-compat-lightwalletd/src/grpc.rs` covers:
 
 - `GetLatestBlock`, `GetBlock`, `GetBlockRange`, `GetBlockNullifiers`, `GetBlockRangeNullifiers`.
 - `GetTransaction` by hash and by block index.
@@ -265,26 +263,8 @@ Implemented end-to-end in `services/zinder-compat-lightwalletd/src/grpc.rs`:
 - `GetLightdInfo`. Several fields (`zcashd_build`, `git_commit`, `donation_address`, `upgrade_name`, `upgrade_height`) are populated as empty strings or zero; `taddr_support` is `true` because the UTXO stream is backed by stored transparent artifacts.
 - `Ping`.
 
-Returning `Status::unimplemented` today:
-
-| Compat method | Returns |
-| ------------- | ------- |
-| (no compat methods currently return `Status::unimplemented` after the prevout, balance, and selector surfaces shipped) ||
-
 Android SDK and Zashi compatibility details are owned by
 [Findings from Android wallet integration](android-wallet-integration-findings.md)
 and the canonical claim in
 [Wallet data plane](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims).
 
-#### Status-by-contract summary
-
-| Contract from "What Zinder Owes Zallet" | Status | Notes |
-| --------------------------------------- | ------ | ----- |
-| Atomic chain snapshots | Done | `ChainEpochReadApi` snapshots in place; per-response `chain_epoch` advertised; native requests and `zinder-client::ChainIndex` support request-side epoch pins |
-| Typed Rust API | Done for read + mempool surfaces | `zinder-client` exports `ChainIndex`, `LocalChainIndex`, `RemoteChainIndex`, typed `TxStatus`, typed `TransactionBroadcastResult`, `IndexerError`, chain-event streams, mempool snapshot/event streams, transparent-mempool overlay reads, and epoch-pinned variants |
-| Chain notifications | Done | `WalletQuery.ChainEvents`, `IngestControl.ChainEvents`, and `zinder-client::ChainIndex::chain_events` expose replayable Tip/Finalized chain events with retention pruning; deployed query processes proxy public streams to the private ingest-control endpoint |
-| Mempool as queryable index | Done | `MempoolSnapshot` (bounded snapshot), `MempoolEvents` (replayable `Added`/`Invalidated`/`Mined` stream), `ChainIndex::is_in_mempool`, `transparent_mempool_outputs_by_address`, `transparent_mempool_spend_by_outpoint`, and native gRPC point lookups for transparent mempool outputs and spends |
-| Fixed-height variants of every chain query | Done | Heighted reads, transaction queries, transparent UTXO reads, and transparent tx-history reads accept request-side `ChainEpoch` pins on both native and typed Rust surfaces |
-| Compact block streaming with batch range fetch | Done | `CompactBlockRange` streams up to `max_compact_block_range` per request, bounded |
-| Transparent-address read surface | Done | `TransparentAddressUtxos[Stream]`, `TransparentAddressTxIdsInRange`, `TransparentAddressBalance`, matching `ChainIndex` methods, lightwalletd-compat `GetAddressUtxos*`, `GetTaddressTxids`, `GetTaddressTransactions`, and `GetTaddressBalance*` |
-| Transaction broadcast | Done | Native `BroadcastTransaction` with typed outcomes; compat `SendTransaction` maps onto the same path; gated on `[node]` config plus the source-advertised `transaction_broadcast` capability |

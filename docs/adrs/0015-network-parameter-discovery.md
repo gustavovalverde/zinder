@@ -17,9 +17,7 @@ Three pieces of per-network consensus data flow through Zinder's read path: acti
 
 Mainnet and testnet have stable activation schedules baked into upstream `zebra-chain`. Regtest and operator-configured custom testnets do not: their activation heights come from each operator's `zebrad.toml` (or equivalent) and are only authoritative on the running node.
 
-Before this ADR, Zinder constructed a static `OnceLock<ZebraNetwork>` per-variant using `RegtestParameters::default()` for regtest. That singleton produced the wrong active upgrade on regtest: `RegtestParameters::default()` leaves NU5/NU6/NU6\_1 unset, so `NetworkUpgrade::current` falls back to Canopy at height 1, even when the running Zebra has NU6 active at height 2. The bug surfaced through `GetLightdInfo` reporting `consensusBranchId = e9ff75a6 (Canopy)` and `upgradeName = "Canopy"` while Zaino on the same node reported `c8e71055 (NU6)` and `"NU6"`. The same wrong branch id silently propagated into `MinedDetails.consensus_branch_id` on every native wallet `Transaction` lookup. The transparent signer's `regtest_local_network()` had a parallel, independently maintained hardcoded copy of the same heights, equally susceptible to drift.
-
-The pattern question is not "what numbers should the regtest singleton hold." It is "where in the architecture does a Zinder process learn the per-network consensus activations, and how is that knowledge shared with every component that needs it." Without a single answer, every new read-path consumer would rediscover the same trap and risk a different copy of the same constants.
+Hardcoded per-network singletons cannot cover the regtest and custom-testnet case. Library defaults disagree silently with operator-configured activation heights, and every consumer that wants the active branch id at a height has to know which table to consult. The pattern question is where in the architecture a Zinder process learns the per-network consensus activations, and how that knowledge is shared with every component that needs it. Without one answer, every new read-path consumer risks a different copy of the same constants.
 
 ## Decision
 
@@ -45,7 +43,7 @@ The type exposes pure-data queries:
 2. `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` wraps the fetch, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The four service binaries call this one helper so the discovery event shape stays consistent across the workspace.
 3. Consumers receive `Arc<NetworkUpgradeActivations>` at construction and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
 
-The free-standing helpers `zinder_source::zebra_network()` and `zinder_source::consensus_branch_id_at()` are removed. The `RegtestParameters::default()` codepath is removed from production code. The testkit retains `regtest_local_network()` (derived from `sample_regtest_upgrade_activations()` so they cannot drift) for in-process unit-test fixtures that do not broadcast; both helpers carry doc comments steering live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
+Production code does not consult `RegtestParameters::default()` or library-default activation singletons; consumers receive `Arc<NetworkUpgradeActivations>` and call methods on the owned type. The testkit's `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the in-process unit-test fixtures cannot drift from the discovery path; doc comments steer live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
 
 ### Wiring contract per service
 

@@ -14,7 +14,7 @@ This document covers three related but distinct extension shapes. Pick the right
 | A new artifact family (new storage) | [Extending artifacts](extending-artifacts.md) | The data is chain-derived but not yet persisted |
 | A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) + [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) | The data is materialized in `zinder-derive` and surfaced through `WalletQuery` |
 
-Pre-launch the wire shape mutates in place (`_v1`); post-launch wire shape changes bump to `_v2` and retain `_v1` in `deprecated_capabilities` per [Public interfaces §Capability discovery](public-interfaces.md#capability-discovery).
+Each wire shape pairs with one capability string. Changing the shape of an `_v1` response requires landing a new `_v2` capability; the `_vN` suffix is part of the identity, not a version field decoded by clients (per [Public interfaces §Capability discovery](public-interfaces.md#capability-discovery)).
 
 ## The 14-step canonical file list
 
@@ -288,7 +288,7 @@ A non-federated typed read with a new core type.
 
 ### Example 2 — `TransactionStatusResponse` (Primitive B)
 
-Wire envelope evolution + response enrichment. The path adds the `chain_epoch`-bound `MinedDetails::from_response_epoch` constructor (the entropy gate) plus a `oneof status` discriminated wire shape (mined / in_mempool / conflicting). Capability `wallet.read.transaction_by_id_v1` mutates in place because no consumers had shipped yet.
+Wire envelope plus response enrichment. The path adds the `chain_epoch`-bound `MinedDetails::from_response_epoch` constructor (the entropy gate) and a `oneof status` discriminated wire shape (mined / in_mempool / conflicting). Capability `wallet.read.transaction_by_id_v1` advertises this shape.
 
 ### Example 3 — `TransparentAddressBalance` (Primitive D)
 

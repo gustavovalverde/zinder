@@ -197,18 +197,20 @@ impl IndexerError {
     pub(crate) fn from_status(status: tonic::Status) -> Self {
         let message = status.message().to_owned();
         let details = status.get_error_details();
-        let zinder_reason = details.error_info().and_then(|error_info| {
+        let Some(zinder_reason) = details.error_info().and_then(|error_info| {
             if error_info.domain == ZINDER_ERROR_DOMAIN {
                 ErrorReason::from_str_name(&error_info.reason)
             } else {
                 None
             }
-        });
+        }) else {
+            return Self::ServiceUnavailable {
+                reason: format!("missing zinder.dev ErrorInfo: {message}"),
+            };
+        };
 
-        // For NOT_FOUND, prefer the ResourceInfo (gives family + key) when
-        // available so the client can match on ArtifactUnavailable.
         if status.code() == Code::NotFound
-            && matches!(zinder_reason, Some(ErrorReason::ArtifactUnavailable))
+            && matches!(zinder_reason, ErrorReason::ArtifactUnavailable)
             && let Some(resource_info) = details.resource_info()
         {
             return Self::ArtifactUnavailable {
@@ -244,8 +246,8 @@ impl IndexerError {
     ///
     /// Returns `Some` for errors that originated at a gRPC boundary carrying
     /// a `google.rpc.ErrorInfo` with `domain = "zinder.dev"`. Returns `None`
-    /// for client-side validation errors and for legacy servers that have
-    /// not yet adopted the typed vocabulary.
+    /// for client-side validation errors that never crossed a Zinder gRPC
+    /// boundary.
     #[must_use]
     pub fn reason(&self) -> Option<ErrorReason> {
         // Variant-level inference: each variant is most commonly produced by
@@ -288,16 +290,6 @@ impl IndexerError {
             Self::InvalidRequest { .. }
             | Self::RemoteEndpointUnconfigured { .. }
             | Self::MalformedResponse { .. } => RetryPolicy::ClientError,
-        }
-    }
-
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "tonic transport errors are consumed when connection setup fails"
-    )]
-    pub(crate) fn from_transport_error(error: tonic::transport::Error) -> Self {
-        Self::ServiceUnavailable {
-            reason: error.to_string(),
         }
     }
 

@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Upstream node adapters, Rust API shape, and wire protocols |
-| Related | [RFC-0001](../rfcs/0001-service-oriented-indexer-architecture.md), [Node source boundary](../architecture/node-source-boundary.md), [Protocol boundary](../architecture/protocol-boundary.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md), [Lessons from Zaino](../reference/lessons-from-zaino.md) |
+| Related | [Service boundaries](../architecture/service-boundaries.md), [Node source boundary](../architecture/node-source-boundary.md), [Protocol boundary](../architecture/protocol-boundary.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md), [Lessons from Zaino](../reference/lessons-from-zaino.md) |
 
 ## Context
 
@@ -136,7 +136,7 @@ Forbidden:
 
 ## Capability Model
 
-Adapters expose capabilities instead of requiring exact upstream-node versions. The original intent was to mirror `NodeCapabilities` into the public `ServerCapabilities.node` field. Current storage-only `zinder-query` deployments do not call upstream nodes, so the public node descriptor remains empty unless a runtime source snapshot is explicitly handed to query.
+Adapters expose capabilities instead of requiring exact upstream-node versions. Storage-only `zinder-query` deployments do not call upstream nodes, so `ServerCapabilities.node` stays empty unless a runtime source snapshot is explicitly handed to query.
 
 Current `NodeCapability` names:
 

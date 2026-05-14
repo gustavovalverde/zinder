@@ -2,10 +2,10 @@
 //! integrated `zinder-ingest` + `zinder-query` stack serves the public
 //! surface end-to-end against the operator's regtest Zebra sidecar.
 //!
-//! The test sequence captures the operator self-hosting promise from
-//! PRD-0002 §REQ-2: `docker run` the recommended image, point it at a real
-//! Zebra, and have a typed Rust client read the wallet-query surface
-//! through it without any out-of-band glue.
+//! The test sequence captures the operator self-hosting contract:
+//! `docker run` the recommended image, point it at a real Zebra, and have
+//! a typed Rust client read the wallet-query surface through it without
+//! any out-of-band glue.
 //!
 //! The test is intentionally tolerant of slow builds (the Rust workspace
 //! compiles in release mode inside the builder stage) and is skipped
@@ -197,8 +197,7 @@ async fn exercise_running_stack(query_port: u16, ops_port: u16) -> Result<()> {
         endpoint: endpoint.clone(),
         network: Network::ZcashRegtest,
     })
-    .await
-    .map_err(|error| eyre!("connecting WalletQuery client to {endpoint}: {error}"))?;
+    .map_err(|error| eyre!("configuring WalletQuery client for {endpoint}: {error}"))?;
     let wallet_info = chain_index
         .server_info()
         .await

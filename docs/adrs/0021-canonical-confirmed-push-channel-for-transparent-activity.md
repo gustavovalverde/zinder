@@ -2,7 +2,7 @@
 
 ## Context
 
-[PRD-0002 REQ-14](../prd-0002-self-hosting-and-integration-experience.md#real-time-consumer-needs-end-user-experience) needs `chain_events` to be the canonical low-latency push channel for confirmed transparent activity, so per-address consumers (faucets, payment receivers) do not pay the bandwidth cost of unrelated events. The PRD asks for an optional `address_filter` parameter on `ChainEventsRequest`.
+`chain_events` is the canonical low-latency push channel for confirmed transparent activity. Per-address consumers (faucets, payment receivers) need an optional `address_filter` on `ChainEventsRequest` so they do not pay the bandwidth cost of unrelated events.
 
 The canonical chain-event stream defined by [Chain events §Canonical Event Boundary](../architecture/chain-events.md#canonical-event-boundary) emits only two variants: `ChainCommitted` (per epoch advance) and `ChainReorged` (per non-finalized replacement). There are no per-address event variants today; an address watcher subscribing to `chain_events` receives one envelope per chain transition, not one per address activity.
 
@@ -59,7 +59,6 @@ Three routes considered:
 
 ## References
 
-- [PRD-0002 §Real-time consumer needs REQ-14](../prd-0002-self-hosting-and-integration-experience.md#real-time-consumer-needs-end-user-experience)
 - [Chain events §Canonical Event Boundary](../architecture/chain-events.md#canonical-event-boundary)
 - [ADR-0005: Chain event cursor sequence](0005-chain-event-cursor-sequence.md)
 - [`crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto`](../../crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto) (`ChainEventsRequest.address_filter`)

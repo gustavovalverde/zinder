@@ -1,6 +1,6 @@
 # Deploying Zinder on a VM
 
-This runbook gets a fresh Zinder deployment onto a single Linux VM in roughly 30 minutes. Target shape: Docker Compose orchestrating `zinder-ingest` + `zinder-query`, behind systemd, against a Zebra deployment running on the same VM or a peer VM. PRD-0002 REQ-4.
+This runbook gets a fresh Zinder deployment onto a single Linux VM in roughly 30 minutes. Target shape: Docker Compose orchestrating `zinder-ingest` + `zinder-query`, behind systemd, against a Zebra deployment running on the same VM or a peer VM.
 
 Steps below assume a Debian-family VM with Docker Engine 24+ installed. Adapt package commands for your distribution.
 
@@ -41,7 +41,7 @@ Steps below assume a Debian-family VM with Docker Engine 24+ installed. Adapt pa
    wallets / faucets / SDKs                    Zebra deployment
 ```
 
-Zinder does not own TLS termination, authentication, or rate limiting (PRD-0001 §Non-Goals). The reverse-proxy layer is operator-supplied; it sits between the public consumers and the container's plaintext gRPC port.
+Zinder does not own TLS termination, authentication, or rate limiting; those are out of scope for v1. The reverse-proxy layer is operator-supplied; it sits between the public consumers and the container's plaintext gRPC port.
 
 ## Steps
 
@@ -174,7 +174,6 @@ The canonical store at `/var/lib/docker/volumes/zinder-data` survives rollback. 
 
 ## References
 
-- [PRD-0002 §Capability Requirements REQ-4](../prd-0002-self-hosting-and-integration-experience.md#capability-requirements)
 - [ADR-0007: Multi-process storage access](../adrs/0007-multi-process-storage-access.md)
 - [ADR-0018: Environment variable secret policy](../adrs/0018-environment-variable-secret-policy.md)
 - [`deploy/docker-compose.yml`](../../deploy/docker-compose.yml)

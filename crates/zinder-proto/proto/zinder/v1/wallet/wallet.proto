@@ -66,10 +66,10 @@ message LatestBlockRequest {
 
 // Typed selector for a block in the canonical best chain.
 //
-// Replaces the lightwalletd `BlockId { height, hash }` request shape: hash-only
-// callers no longer need a `height = 0` sentinel, and height-only callers get a
-// normalized response. Non-best-chain `(txid, block_hash)` lookup is a separate
-// future operation, not a third oneof arm.
+// Hash-only callers pass the `hash` arm; height-only callers pass the
+// `height` arm and receive a normalized response that includes the resolved
+// hash. Non-best-chain `(txid, block_hash)` lookup is a separate operation,
+// not a third oneof arm.
 message BlockSelector {
   oneof selector {
     // Address the block at this height in the canonical best chain.
@@ -98,8 +98,8 @@ message BlockIdResponse {
   BlockMetadata block_id = 2;
 }
 
-// Typed block-header read-model response. The shape is Zinder-native: it does
-// not re-export upstream-node JSON-RPC fields or zaino-internal response types.
+// Typed block-header read-model response. The shape is Zinder-native and
+// does not re-export upstream-node JSON-RPC fields.
 message BlockHeaderInfo {
   // Resolved block identity.
   BlockMetadata block_id = 1;
@@ -252,9 +252,8 @@ message ConflictingChainTransaction {
 
 // Single transaction-status response bound to one chain epoch.
 //
-// Replaces the legacy mined-only `TransactionResponse`. `NotFound` is
-// conveyed as gRPC `NOT_FOUND`, not as an oneof arm, because typed
-// errors do not consume oneof slots.
+// `NotFound` is conveyed as gRPC `NOT_FOUND`, not as an oneof arm,
+// because typed errors do not consume oneof slots.
 message TransactionStatusResponse {
   // Chain epoch used to answer this response.
   ChainEpoch chain_epoch = 1;
@@ -521,12 +520,12 @@ message ChainEventEnvelope {
 
 // Wallet-plane server descriptor returned by `WalletQuery.ServerInfo`.
 //
-// `common` carries the cross-service identity, capability set, and
-// deprecation metadata defined in [`zinder.v1.ops.ServerInfo`]. The
-// wallet-specific fields below describe operator configuration that
-// constrains a wallet consumer's behavior (retention windows, reorg
-// depth, upstream-node capability snapshot, vendored lightwalletd
-// protocol commit, canonical artifact schema version).
+// `common` carries the cross-service identity and capability set defined
+// in [`zinder.v1.ops.ServerInfo`]. The wallet-specific fields below
+// describe operator configuration that constrains a wallet consumer's
+// behavior (retention windows, reorg depth, upstream-node capability
+// snapshot, vendored lightwalletd protocol commit, canonical artifact
+// schema version).
 message WalletServerInfo {
   // Cross-service identity and capability descriptor.
   zinder.v1.ops.ServerInfo common = 1;

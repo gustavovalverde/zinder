@@ -209,13 +209,13 @@ batch that advances the visible epoch pointer. The state-machine name above is
 therefore descriptive: publication is a property of the commit, not a separate
 post-commit write.
 
-## Migrations
+## Schema Compatibility
 
-Migrations are explicit, owned by `zinder-ingest`, and described in [Storage backend §Migrations](storage-backend.md#migrations). The ingest invariants this document enforces:
+Schema validation lives in `zinder-store` per [Storage backend §Schema Compatibility](storage-backend.md#schema-compatibility). The ingest invariants this document enforces:
 
 - The query service must not silently upgrade canonical storage or open it as its production read path.
-- The ingest service must not delete old state without a migration record.
-- Partial migration state must remain visible through readiness and metrics.
+- The ingest service must not delete old state silently.
+- Schema mismatches surface as typed readiness causes.
 
 ## First Invariants
 

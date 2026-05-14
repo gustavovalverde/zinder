@@ -88,7 +88,7 @@ impl LocalChainIndex {
 
         let remote_index = match options.subscription_endpoint {
             Some(endpoint) => {
-                Some(RemoteChainIndex::connect(RemoteOpenOptions { endpoint, network }).await?)
+                Some(RemoteChainIndex::connect(RemoteOpenOptions { endpoint, network })?)
             }
             None => None,
         };

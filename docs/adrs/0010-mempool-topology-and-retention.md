@@ -20,7 +20,7 @@ The decisions to record here are:
 1. The split between in-memory `MempoolIndex` (live state) and persistent `MempoolEventLog` (history + cursor resume) and why the canonical store carries the latter but not the former.
 2. The `IngestControlMempoolSurface` topology: secondary readers and the lightwalletd compat shim consume the writer's mempool through the same `IngestControl` endpoint that already serves chain events, instead of opening a second source connection.
 3. The two-tier retention windows, their defaults, and the readiness causes they emit when retention is approaching exhaustion.
-4. The `TxStatus::InMempool(MempoolEntry)` shape change that retires the prior string-matching workaround.
+4. The `TxStatus::InMempool(MempoolEntry)` typed shape that carries the hydrated mempool entry, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes; clients receive the typed status directly rather than parsing error strings.
 
 ## Decision
 
@@ -82,9 +82,7 @@ The wire variant, the canonical `MempoolEvent::Suppressed` variant, the persiste
 
 Suppression shares the `invalidated_retention` window. The lifecycle signal is the same ("this txid is not coming through this node"), and exposing a separate `suppressed_retention` knob would add an operator surface for an event that never fires today. The retention report carries a `pruned_suppressed_count` so the per-variant counts stay honest when emission begins.
 
-### `TxStatus::InMempool` carries the hydrated entry, not a string
-
-Earlier consumers (notably Zallet) detected "this transaction is in the mempool" by string-matching the human-readable error returned for `transaction_by_id` when the canonical chain had no record. The current shape retires that workaround:
+### `TxStatus::InMempool` carries the hydrated entry
 
 ```rust
 pub enum TxStatus {
@@ -94,9 +92,7 @@ pub enum TxStatus {
 }
 ```
 
-The `MempoolEntry` carries the hydrated transaction, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes. Consumers no longer parse error strings; the type tells them everything `transaction_by_id` saw.
-
-String-matching against `transaction_by_id` error text is not a stable contract. Zinder treats the typed `TransactionStatus` as required for product correctness, not deferrable to a major version.
+The `MempoolEntry` carries the hydrated transaction, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes. The typed enum is the contract; `transaction_by_id` reports mempool presence by returning `InMempool`, not by an error string consumers parse. Typed transaction status is a product-correctness requirement.
 
 ## Consequences
 
