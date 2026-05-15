@@ -61,6 +61,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `NodeCapabilities` | Capability descriptor detected from the selected source |
 | `NodeAuth` | Typed source authentication configuration |
 | `MempoolSourceEvent` | Source-level mempool observation normalized from source streams or polling diffs |
+| `ChainTipNotification` | Source-level chain-tip wake-up payload normalized from Zebra indexer streams |
+| `ChainTipNotificationSource` | Source boundary that opens chain-tip notification streams. Consumers treat it as a wake-up source and keep JSON-RPC polling as the canonical catch-up path |
 | `TransactionBroadcaster` | Source-backed transaction broadcast boundary implemented by source adapters |
 | `TransactionBroadcastResult` | Typed accepted, duplicate, invalid-encoding, rejected, or unknown broadcast outcome |
 | `RawTransactionBytes` | Raw serialized transaction bytes submitted by a wallet |
@@ -437,7 +439,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | -------- | ------- | ----------- | ---------- | ----------- |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-derive | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
 | `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC polling when unset. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source and chain-tip wakeups. Falls back to JSON-RPC polling when unset. |
 | `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
 | `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
 | `ZINDER_NODE__AUTH__PASSWORD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.password` | Basic-auth password. Redacted in `--print-config` and structured logs. (sensitive; redacted) |

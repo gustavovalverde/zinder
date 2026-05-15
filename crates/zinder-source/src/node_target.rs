@@ -190,8 +190,8 @@ pub struct NodeSection {
     pub json_rpc_addr: Option<String>,
     /// Zebra indexer gRPC endpoint URL.
     ///
-    /// When set, enables the streaming mempool source backend. Omit to fall
-    /// back to JSON-RPC polling.
+    /// When set, enables the streaming mempool source backend and chain-tip
+    /// wakeups. Omit to fall back to JSON-RPC polling.
     pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
     pub request_timeout_secs: Option<u64>,

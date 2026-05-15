@@ -294,6 +294,19 @@ impl ReadinessState {
         }
     }
 
+    /// Returns an upstream-node-unavailable state.
+    ///
+    /// `current_height` carries the last visible tip when the writer can still
+    /// read local storage while waiting for the upstream node to recover.
+    #[must_use]
+    pub const fn node_unavailable(current_height: Option<u32>) -> Self {
+        Self {
+            cause: ReadinessCause::NodeUnavailable,
+            current_height,
+            target_height: None,
+        }
+    }
+
     /// Returns a reorg-window-exceeded state.
     ///
     /// `current_height` carries the visible tip at the time of failure so the

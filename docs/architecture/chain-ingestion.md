@@ -142,7 +142,9 @@ Tip-follow stays serial: it commits one block per poll because by definition it 
 
 ### Tip-follow wakeups
 
-Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure or a missed reconnect cannot stall ingest beyond `poll_interval_ms`. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
+Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `poll_interval_ms`. The subscription lifecycle runs beside polling and keeps re-subscribing after stream errors. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
+
+Retryable upstream-node failures are readiness events, not process lifecycle events. If Zebra is restarting, temporarily warming up, or unavailable during a tip-follow iteration, `zinder-ingest` reports `node_unavailable`, keeps `/healthz` alive, returns not-ready on `/readyz`, and continues retrying. Non-retryable source protocol mismatches, missing capabilities, storage errors, and reorg-window violations still fail closed or drain readiness for operator action.
 
 Historical backfill also fetches newly completed shielded subtree roots through
 the source boundary. The source adapter returns `z_getsubtreesbyindex`

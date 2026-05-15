@@ -42,8 +42,8 @@ pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::transparent_prevout_from_raw_transaction_bytes;
 pub use transparent_address::transparent_address_matches_network;
 pub use zebra_indexer_chain_tip::{
-    ChainTipNotification, ChainTipNotificationStream, ZebraIndexerChainTipSource,
-    ZebraIndexerChainTipSourceOptions,
+    ChainTipNotification, ChainTipNotificationSource, ChainTipNotificationStream,
+    ZebraIndexerChainTipSource, ZebraIndexerChainTipSourceOptions,
 };
 pub use zebra_indexer_mempool::{
     ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget,

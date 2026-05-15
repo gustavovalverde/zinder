@@ -1,7 +1,11 @@
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::stream::StreamExt;
 use prost::Message;
+use tokio::{
+    sync::mpsc::{self, error::TrySendError},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
@@ -9,7 +13,7 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
-use zinder_source::{ChainTipNotificationStream, NodeSource, NodeTarget, SourceBlock};
+use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceBlock};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
     ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -25,6 +29,15 @@ use crate::mempool::MempoolReadyGate;
 
 /// Default lag threshold (in blocks) below which tip-follow reports `Ready`.
 pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
+const CHAIN_TIP_WAKEUP_CHANNEL_CAPACITY: usize = 1;
+#[cfg(not(test))]
+const CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Configuration for polling the upstream node tip and committing live chain changes.
 ///
@@ -101,36 +114,140 @@ pub async fn tip_follow_with_primary_store<Source>(
     store: PrimaryChainStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
-    chain_tip_stream: Option<ChainTipNotificationStream>,
+    chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
     cancel: CancellationToken,
 ) -> Result<(), IngestError>
 where
     Source: NodeSource,
 {
-    let mut retry_state = IngestRetryState::default();
-    // When the upstream node exposes the gRPC `ChainTipChange` stream the
-    // tip-follow loop uses it as a push-based wake-up signal: each
-    // notification triggers an immediate `tip_follow_once`. The poll
-    // interval stays in the `select!` arm as a safety net so that a
-    // transient stream failure (broadcast lag, transport reset) cannot
-    // stall ingest beyond `config.poll_interval`. The first iteration
-    // still runs through the polling arm so cold-start catch-up against
-    // the current tip happens without waiting for a notification.
-    let mut chain_tip_stream = chain_tip_stream;
+    run_tip_follow_loop(
+        config,
+        source,
+        store,
+        readiness,
+        mempool_ready_gate,
+        chain_tip_source,
+        cancel,
+        IngestArtifactBuilder::with_initial_tip_metadata,
+    )
+    .await
+}
 
-    loop {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tip-follow loop tests inject the artifact builder while production callers keep the public dependency list explicit."
+)]
+async fn run_tip_follow_loop<Source, Builder, MakeBuilder>(
+    config: &TipFollowConfig,
+    source: &Source,
+    store: PrimaryChainStore,
+    readiness: &Readiness,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
+    chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
+    cancel: CancellationToken,
+    make_artifact_builder: MakeBuilder,
+) -> Result<(), IngestError>
+where
+    Source: NodeSource,
+    Builder: ArtifactBuilder,
+    MakeBuilder: Fn(ChainTipMetadata) -> Builder + Copy,
+{
+    let mut retry_state = IngestRetryState::default();
+    let chain_tip_task_cancel = cancel.child_token();
+    let (chain_tip_wakeup_handle, mut chain_tip_wakeup_receiver) =
+        start_chain_tip_notification_wakeup(chain_tip_source, chain_tip_task_cancel.clone());
+    let mut source_was_unavailable = false;
+
+    let tip_follow_outcome = loop {
         tokio::select! {
-            () = cancel.cancelled() => return Ok(()),
-            () = wait_for_chain_tip_notification(&mut chain_tip_stream) => {}
+            () = cancel.cancelled() => break Ok(()),
+            () = wait_for_chain_tip_wakeup(&mut chain_tip_wakeup_receiver) => {}
             () = tokio::time::sleep(config.poll_interval) => {}
         }
 
-        let iteration = tip_follow_once(config, source, &store, &mut retry_state).await?;
+        let mut iteration = match tip_follow_once_with_artifact_builder(
+            config,
+            source,
+            &store,
+            &mut retry_state,
+            make_artifact_builder,
+        )
+        .await
+        {
+            Ok(iteration) => iteration,
+            Err(error) if tip_follow_error_is_recoverable(&error) => {
+                retry_state = IngestRetryState::default();
+                if !source_was_unavailable {
+                    tracing::warn!(
+                        target: "zinder::ingest",
+                        event = "tip_follow_source_unavailable",
+                        error = %error,
+                        "tip-follow source is unavailable; keeping the writer alive and retrying"
+                    );
+                }
+                source_was_unavailable = true;
+                set_tip_follow_source_unavailable(readiness, &store);
+                tokio::select! {
+                    () = cancel.cancelled() => break Ok(()),
+                    () = tokio::time::sleep(TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF) => {}
+                }
+                continue;
+            }
+            Err(error) => break Err(error),
+        };
 
-        let lag_state =
-            compute_tip_follow_readiness_state(&store, iteration.observed_tip_id.height, config)?;
+        if let Some(commit_outcome) = iteration.commit_outcome.as_ref() {
+            match finalize_tip_if_ready(config, &store, commit_outcome.chain_epoch) {
+                Ok(Some(finalized_outcome)) => {
+                    iteration.commit_outcome = Some(finalized_outcome);
+                }
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+        }
+
+        if source_was_unavailable {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "tip_follow_source_recovered",
+                "tip-follow source recovered"
+            );
+            source_was_unavailable = false;
+        }
+
+        let lag_state = match compute_tip_follow_readiness_state(
+            &store,
+            iteration.observed_tip_id.height,
+            config,
+        ) {
+            Ok(lag_state) => lag_state,
+            Err(error) => break Err(error),
+        };
         set_tip_follow_readiness(readiness, lag_state, mempool_ready_gate);
+    };
+
+    chain_tip_task_cancel.cancel();
+    if let Some(handle) = chain_tip_wakeup_handle {
+        handle.abort();
     }
+
+    tip_follow_outcome
+}
+
+fn start_chain_tip_notification_wakeup(
+    source: Option<Arc<dyn ChainTipNotificationSource>>,
+    cancel: CancellationToken,
+) -> (Option<JoinHandle<()>>, Option<mpsc::Receiver<()>>) {
+    let (sender, receiver) = mpsc::channel(CHAIN_TIP_WAKEUP_CHANNEL_CAPACITY);
+    source.map_or_else(
+        || (None, None),
+        |source| {
+            (
+                Some(spawn_chain_tip_notification_wakeup(source, sender, cancel)),
+                Some(receiver),
+            )
+        },
+    )
 }
 
 fn set_tip_follow_readiness(
@@ -163,6 +280,20 @@ fn set_tip_follow_readiness(
     }
 
     readiness.set(gated_state);
+}
+
+fn set_tip_follow_source_unavailable(readiness: &Readiness, store: &PrimaryChainStore) {
+    readiness.set(ReadinessState::node_unavailable(current_chain_height(
+        store,
+    )));
+}
+
+fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
+    store
+        .current_chain_epoch()
+        .ok()
+        .flatten()
+        .map(|chain_epoch| chain_epoch.tip_height.value())
 }
 
 fn compute_tip_follow_readiness_state(
@@ -200,42 +331,132 @@ fn compute_tip_follow_readiness_state(
     }
 }
 
-async fn wait_for_chain_tip_notification(
-    chain_tip_stream: &mut Option<ChainTipNotificationStream>,
-) {
-    let Some(stream) = chain_tip_stream.as_mut() else {
-        // No streaming source configured. Park forever; the sibling
-        // `sleep(poll_interval)` arm of the surrounding `select!` is the
-        // sole wake-up signal in that mode.
+fn tip_follow_error_is_recoverable(error: &IngestError) -> bool {
+    match error {
+        IngestError::Source(source) => source.is_retryable(),
+        IngestError::SourceRetryBudgetExceeded { .. }
+        | IngestError::SourceRetryDeadlineExceeded { .. } => true,
+        IngestError::UnknownNodeSource { .. }
+        | IngestError::SubtreeRootsUnavailable { .. }
+        | IngestError::SubtreeRootCompletingBlockMissing { .. }
+        | IngestError::TransparentPrevoutOutputMissing { .. }
+        | IngestError::UnsupportedShieldedProtocol { .. }
+        | IngestError::EmptyIngestBatch
+        | IngestError::BackfillProducedNoCommit
+        | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
+        | IngestError::BackfillRequiresContiguousTipMetadata { .. }
+        | IngestError::BackfillCheckpointMisaligned { .. }
+        | IngestError::TipFollowObservedTipBehindStore { .. }
+        | IngestError::TipFollowCommonAncestorMissing { .. }
+        | IngestError::TipFollowParentMetadataUnavailable { .. }
+        | IngestError::ReorgWindowExceeded { .. }
+        | IngestError::SystemTimeBeforeUnixEpoch { .. }
+        | IngestError::TimestampTooLarge
+        | IngestError::ArtifactDerive(_)
+        | IngestError::Store(_) => false,
+    }
+}
+
+async fn wait_for_chain_tip_wakeup(receiver: &mut Option<mpsc::Receiver<()>>) {
+    let Some(active_receiver) = receiver.as_mut() else {
         std::future::pending::<()>().await;
         return;
     };
-    match stream.next().await {
-        Some(Ok(notification)) => {
-            tracing::debug!(
-                target: "zinder::ingest",
-                event = "chain_tip_notification_received",
-                height = notification.tip_id.height.value(),
-                "wakeup on Zebra chain_tip_change notification",
-            );
+    if active_receiver.recv().await.is_none() {
+        *receiver = None;
+    }
+}
+
+fn spawn_chain_tip_notification_wakeup(
+    source: Arc<dyn ChainTipNotificationSource>,
+    sender: mpsc::Sender<()>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        run_chain_tip_notification_wakeup(source, sender, cancel).await;
+    })
+}
+
+async fn run_chain_tip_notification_wakeup(
+    source: Arc<dyn ChainTipNotificationSource>,
+    sender: mpsc::Sender<()>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let mut stream = match source.subscribe().await {
+            Ok(stream) => {
+                tracing::info!(
+                    target: "zinder::ingest",
+                    event = "chain_tip_notification_source_selected",
+                    backend = "zebra-indexer-grpc",
+                    "subscribed to Zebra chain_tip_change stream; tip-follow wakeups are push-based"
+                );
+                stream
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "chain_tip_notification_source_unavailable",
+                    %error,
+                    "Zebra chain_tip_change subscription failed; polling tip-follow remains active"
+                );
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF) => {}
+                }
+                continue;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                notification = stream.next() => {
+                    match notification {
+                        Some(Ok(notification)) => {
+                            tracing::debug!(
+                                target: "zinder::ingest",
+                                event = "chain_tip_notification_received",
+                                height = notification.tip_id.height.value(),
+                                "wakeup on Zebra chain_tip_change notification"
+                            );
+                            if !send_chain_tip_wakeup(&sender) {
+                                return;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                target: "zinder::ingest",
+                                event = "chain_tip_notification_stream_error",
+                                %error,
+                                "chain_tip_change stream emitted an error; re-subscribing while polling remains active"
+                            );
+                            break;
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "zinder::ingest",
+                                event = "chain_tip_notification_stream_ended",
+                                "chain_tip_change stream ended; re-subscribing while polling remains active"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        Some(Err(error)) => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "chain_tip_notification_stream_error",
-                %error,
-                "chain_tip_change stream emitted an error; falling back to polling",
-            );
-            *chain_tip_stream = None;
+
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF) => {}
         }
-        None => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "chain_tip_notification_stream_ended",
-                "chain_tip_change stream ended; falling back to polling",
-            );
-            *chain_tip_stream = None;
-        }
+    }
+}
+
+fn send_chain_tip_wakeup(sender: &mpsc::Sender<()>) -> bool {
+    match sender.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => true,
+        Err(TrySendError::Closed(())) => false,
     }
 }
 
@@ -246,34 +467,6 @@ pub(crate) struct TipFollowIteration {
     pub(crate) observed_tip_id: BlockId,
     /// Commit outcome when the iteration produced one, otherwise `None`.
     pub(crate) commit_outcome: Option<ChainEpochCommitOutcome>,
-}
-
-async fn tip_follow_once<Source>(
-    config: &TipFollowConfig,
-    source: &Source,
-    store: &PrimaryChainStore,
-    retry_state: &mut IngestRetryState,
-) -> Result<TipFollowIteration, IngestError>
-where
-    Source: NodeSource,
-{
-    let mut iteration = tip_follow_once_with_artifact_builder(
-        config,
-        source,
-        store,
-        retry_state,
-        IngestArtifactBuilder::with_initial_tip_metadata,
-    )
-    .await?;
-
-    if let Some(commit_outcome) = iteration.commit_outcome.as_ref()
-        && let Some(finalized_outcome) =
-            finalize_tip_if_ready(config, store, commit_outcome.chain_epoch)?
-    {
-        iteration.commit_outcome = Some(finalized_outcome);
-    }
-
-    Ok(iteration)
 }
 
 async fn tip_follow_once_with_artifact_builder<Source, Builder, MakeBuilder>(
@@ -713,12 +906,17 @@ fn finalized_height_for_tip(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         error::Error,
         path::Path,
-        sync::atomic::{AtomicU32, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
     };
 
     use async_trait::async_trait;
+    use futures_util::stream;
     use parking_lot::Mutex;
     use prost::Message;
     use tempfile::tempdir;
@@ -731,8 +929,8 @@ mod tests {
     };
     use zinder_runtime::ReadinessCause;
     use zinder_source::{
-        NodeCapabilities, SourceBlockHeader, SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
-        ZebraJsonRpcSource,
+        ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
+        SourceError, SourceSubtreeRoot, SourceSubtreeRoots, ZebraJsonRpcSource,
     };
 
     use super::*;
@@ -907,6 +1105,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tip_follow_keeps_running_when_tip_id_is_temporarily_unavailable()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("tip-follow-tip-id-recovery-store");
+        let config = test_tip_follow_config(&storage_path, 10)?;
+        let source = TestNodeSource::linear(1).with_retryable_tip_failures(10);
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        let task = {
+            let readiness = readiness.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_tip_follow_loop(
+                    &config,
+                    &source,
+                    store,
+                    &readiness,
+                    None,
+                    None,
+                    cancel,
+                    |_| TestArtifactBuilder,
+                )
+                .await
+            })
+        };
+
+        wait_for_readiness_cause(&readiness, |cause| {
+            matches!(cause, ReadinessCause::NodeUnavailable)
+        })
+        .await?;
+        wait_for_readiness_cause(&readiness, |cause| matches!(cause, ReadinessCause::Ready))
+            .await?;
+        cancel.cancel();
+        task.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tip_follow_keeps_running_when_block_fetch_retry_deadline_is_exceeded()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("tip-follow-block-fetch-recovery-store");
+        let config = test_tip_follow_config(&storage_path, 10)?;
+        let source = TestNodeSource::linear(1).with_retryable_block_failures(10);
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        let task = {
+            let readiness = readiness.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_tip_follow_loop(
+                    &config,
+                    &source,
+                    store,
+                    &readiness,
+                    None,
+                    None,
+                    cancel,
+                    |_| TestArtifactBuilder,
+                )
+                .await
+            })
+        };
+
+        wait_for_readiness_cause(&readiness, |cause| {
+            matches!(cause, ReadinessCause::NodeUnavailable)
+        })
+        .await?;
+        wait_for_readiness_cause(&readiness, |cause| matches!(cause, ReadinessCause::Ready))
+            .await?;
+        cancel.cancel();
+        task.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_tip_wakeup_resubscribes_after_stream_error() -> Result<(), Box<dyn Error>> {
+        let source = Arc::new(TestChainTipNotificationSource::new(vec![
+            Box::pin(stream::iter(vec![Err(
+                SourceError::ChainTipStreamUnavailable {
+                    reason: "test stream failed".to_owned(),
+                    is_retryable: true,
+                },
+            )])),
+            Box::pin(stream::iter(vec![Ok(ChainTipNotification {
+                tip_id: BlockId::new(BlockHeight::new(1), block_hash(1)),
+            })])),
+        ]));
+        let (sender, mut receiver) = mpsc::channel(CHAIN_TIP_WAKEUP_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let task = spawn_chain_tip_notification_wakeup(source.clone(), sender, cancel.clone());
+
+        let wakeup = tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await?;
+
+        cancel.cancel();
+        task.abort();
+        assert!(wakeup.is_some(), "expected a wake-up after re-subscribe");
+        assert!(
+            source.subscribe_count.load(Ordering::SeqCst) >= 2,
+            "expected the chain-tip wake-up task to re-subscribe"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn readiness_state_reports_ready_when_lag_within_threshold() -> Result<(), Box<dyn Error>>
     {
         let tempdir = tempdir()?;
@@ -1027,6 +1341,8 @@ mod tests {
 
     struct TestNodeSource {
         tip_height: AtomicU32,
+        tip_failures_remaining: AtomicU32,
+        block_failures_remaining: AtomicU32,
         blocks: Mutex<Vec<TestSourceBlock>>,
     }
 
@@ -1049,8 +1365,22 @@ mod tests {
 
             Self {
                 tip_height: AtomicU32::new(tip_height),
+                tip_failures_remaining: AtomicU32::new(0),
+                block_failures_remaining: AtomicU32::new(0),
                 blocks: Mutex::new(blocks),
             }
+        }
+
+        fn with_retryable_tip_failures(self, failure_count: u32) -> Self {
+            self.tip_failures_remaining
+                .store(failure_count, Ordering::SeqCst);
+            self
+        }
+
+        fn with_retryable_block_failures(self, failure_count: u32) -> Self {
+            self.block_failures_remaining
+                .store(failure_count, Ordering::SeqCst);
+            self
         }
 
         fn set_tip_height(&self, tip_height: u32) {
@@ -1081,6 +1411,14 @@ mod tests {
             &self,
             height: BlockHeight,
         ) -> Result<SourceBlock, SourceError> {
+            if consume_retryable_failure(&self.block_failures_remaining) {
+                return Err(SourceError::BlockUnavailable {
+                    height,
+                    reason: "test block temporarily unavailable".to_owned(),
+                    is_retryable: true,
+                });
+            }
+
             let block = self
                 .blocks
                 .lock()
@@ -1107,6 +1445,13 @@ mod tests {
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            if consume_retryable_failure(&self.tip_failures_remaining) {
+                return Err(SourceError::NodeUnavailable {
+                    reason: "test tip temporarily unavailable".to_owned(),
+                    is_retryable: true,
+                });
+            }
+
             let height = BlockHeight::new(self.tip_height.load(Ordering::SeqCst));
             let hash = self
                 .blocks
@@ -1140,6 +1485,68 @@ mod tests {
                 subtree_roots,
             ))
         }
+    }
+
+    struct TestChainTipNotificationSource {
+        subscribe_count: AtomicU32,
+        streams: Mutex<VecDeque<ChainTipNotificationStream>>,
+    }
+
+    impl TestChainTipNotificationSource {
+        fn new(streams: Vec<ChainTipNotificationStream>) -> Self {
+            Self {
+                subscribe_count: AtomicU32::new(0),
+                streams: Mutex::new(VecDeque::from(streams)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChainTipNotificationSource for TestChainTipNotificationSource {
+        async fn subscribe(&self) -> Result<ChainTipNotificationStream, SourceError> {
+            self.subscribe_count.fetch_add(1, Ordering::SeqCst);
+            self.streams
+                .lock()
+                .pop_front()
+                .ok_or_else(|| SourceError::ChainTipStreamUnavailable {
+                    reason: "test subscription unavailable".to_owned(),
+                    is_retryable: true,
+                })
+        }
+    }
+
+    async fn wait_for_readiness_cause(
+        readiness: &Readiness,
+        mut accepts: impl FnMut(ReadinessCause) -> bool,
+    ) -> Result<(), Box<dyn Error>> {
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if accepts(readiness.report().cause) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                return Err(format!(
+                    "timed out waiting for readiness cause; last report: {:?}; {error}",
+                    readiness.report()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_retryable_failure(counter: &AtomicU32) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failure_count| {
+                failure_count.checked_sub(1)
+            })
+            .is_ok()
     }
 
     fn test_tree_state_payload() -> Vec<u8> {

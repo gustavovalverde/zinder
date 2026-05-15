@@ -116,6 +116,8 @@ Startup validates required capabilities before ingestion mutates state. Missing 
 - `BlockUnavailable`
 - `TransactionBroadcastDisabled` for the no-op broadcaster path.
 
+Retryable upstream-node failures in long-running tip-follow mode are not process-fatal. `zinder-ingest` reports `node_unavailable`, keeps polling, and recovers readiness when the source answers again. Non-retryable source errors remain fatal or operator-action states.
+
 Streaming-source-cursor errors will appear here when the streaming follower lands.
 
 Version strings may be logged and included in diagnostics, but they are not the primary compatibility contract.

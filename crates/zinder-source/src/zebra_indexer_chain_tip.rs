@@ -16,13 +16,14 @@
 //! # Reconnect contract
 //!
 //! Zebra terminates the stream with `UNAVAILABLE` when the broadcast
-//! channel lags or the node restarts. The consumer must reconnect and
-//! re-issue `subscribe`. The adapter does not buffer notifications across
-//! reconnects; the tip-follow loop's poll-interval safety net ensures any
-//! missed tips are caught up via JSON-RPC on the next iteration.
+//! channel lags or the node restarts. The consumer re-subscribes and keeps
+//! JSON-RPC polling active while the stream is down. The adapter does not
+//! buffer notifications across reconnects; the tip-follow loop's
+//! poll-interval safety net ensures any missed tips are caught up via JSON-RPC.
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -49,6 +50,17 @@ pub struct ChainTipNotification {
 /// polling path on the next iteration; the tip-follow loop's existing
 /// poll-interval safety net covers that case.
 pub type ChainTipNotificationStream = BoxStream<'static, Result<ChainTipNotification, SourceError>>;
+
+/// Source that opens Zebra chain-tip notification streams.
+///
+/// Consumers use this as a wake-up source, not as canonical chain data. A
+/// subscription can end at any time; callers keep JSON-RPC polling as the
+/// authoritative catch-up path and re-subscribe when the stream ends.
+#[async_trait]
+pub trait ChainTipNotificationSource: Send + Sync + 'static {
+    /// Opens a fresh chain-tip notification stream.
+    async fn subscribe(&self) -> Result<ChainTipNotificationStream, SourceError>;
+}
 
 /// Runtime options for [`ZebraIndexerChainTipSource`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +170,13 @@ impl ZebraIndexerChainTipSource {
                     is_retryable: true,
                 })?;
         Ok(IndexerClient::new(channel))
+    }
+}
+
+#[async_trait]
+impl ChainTipNotificationSource for ZebraIndexerChainTipSource {
+    async fn subscribe(&self) -> Result<ChainTipNotificationStream, SourceError> {
+        Self::subscribe(self).await
     }
 }
 
