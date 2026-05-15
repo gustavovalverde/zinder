@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core` for shared types, `zinder-store` for RocksDB-backed canonical storage, `zinder-source` for upstream node adapters and the shared `NodeTarget` config type, `zinder-proto` for generated protocol modules, `zinder-runtime` for the operational HTTP surface and config loader, and `zinder-testkit` for fixtures and the `live::` test-helper module. Service crates live under `services/`: `zinder-ingest` owns backfill and canonical writes, `zinder-query` owns wallet-facing read APIs, `zinder-compat-lightwalletd` translates the lightwalletd protocol. Integration tests sit beside each crate in `tests/{integration,live,perf}/` per [ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md). Architecture, ADRs, references, and runbooks live under `docs/`; update them when a change alters boundaries, protocol bytes, storage semantics, or public vocabulary.
+This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core` for shared types, `zinder-store` for RocksDB-backed canonical storage, `zinder-source` for upstream node adapters and the shared `NodeTarget` config type, `zinder-proto` for generated protocol modules, `zinder-runtime` for the operational HTTP surface and config loader, and `zinder-testkit` for fixtures and the `live::` test-helper module. Service crates live under `services/`: `zinder-ingest` owns backfill and canonical writes, `zinder-query` owns wallet-facing read APIs, `zinder-compat-lightwalletd` translates the lightwalletd protocol. Integration tests sit beside each crate in `tests/{integration,live,perf}/` as documented in the [Testing Runbook](docs/runbooks/testing.md). Architecture, ADRs, references, and runbooks live under `docs/`; update them when a change alters boundaries, protocol bytes, storage semantics, or public vocabulary.
 
 ## Build, Test, and Development Commands
 
@@ -24,7 +24,7 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Testing Guidelines
 
-Tests should exercise public boundaries and contract shapes: append, reorg, finality, cursor validation, storage recovery, and parser edge cases. Tier organization is by directory ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)): T0 unit (`#[cfg(test)] mod tests` in `src/`), T1 integration (`tests/integration/`), T2 perf (`tests/perf/`), T3 live (`tests/live/`). T3 tests are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and `zinder_testkit::live::require_live()`; mainnet is rejected by default. Mutation testing is targeted at critical storage and parser functions through the CI workflow; expand that target set when changing those contracts.
+Tests should exercise public boundaries and contract shapes: append, reorg, finality, cursor validation, storage recovery, and parser edge cases. Tier organization is by directory: T0 unit (`#[cfg(test)] mod tests` in `src/`), T1 integration (`tests/integration/`), T2 perf (`tests/perf/`), T3 live (`tests/live/`). T3 tests are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and `zinder_testkit::live::require_live()`; mainnet is rejected by default. Mutation testing is targeted at critical storage and parser functions through the CI workflow; expand that target set when changing those contracts.
 
 ## Commit & Pull Request Guidelines
 

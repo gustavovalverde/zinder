@@ -13,7 +13,9 @@ This page is the canonical recipe for building a server-side Zcash wallet on top
 | Chain reads + broadcast | **Zinder** | Compact blocks, tree state, subtree roots, transparent UTXOs, mempool, broadcast |
 | Upstream node | Zebra | Block production / consensus / mempool source |
 
-Zinder's tested pin (as of 2026-05-12) is `zcash_primitives = 0.26.4`. The other librustzcash crates ship in lockstep within the same release train; pin all of them together.
+Zinder tracks the workspace's pinned `librustzcash` release train. Server-side
+wallets should pin `zcash_client_backend`, `zcash_client_sqlite`,
+`zcash_primitives`, and `zcash_proofs` together.
 
 ## Boundary contract
 
@@ -51,7 +53,7 @@ flowchart LR
 
 ## Canonical pattern
 
-The structure is "snapshot once, subscribe forever, re-derive on hint" (see [ADR-0021](../adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)).
+The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Chain events §Address Filters](../architecture/chain-events.md#address-filters)).
 
 1. **Snapshot phase**: paginate the current state for each tracked account using `WalletQuery.TransparentAddressUtxosStream` (transparent) plus `WalletQuery.CompactBlockRange` + `WalletQuery.TreeState` (shielded, fed to `zcash_client_backend::scan_cached_blocks`).
 2. **Subscribe phase**: open a `WalletQuery.ChainEvents` stream with the addresses you care about in `address_filter`. Each envelope tells you a chain epoch advanced (commit) or replaced (reorg); use the height range to re-derive the affected slice from `compact_block_at` and merge the result into `zcash_client_sqlite`.
@@ -165,10 +167,9 @@ This pattern leaves these pieces to the consumer:
 
 ## References
 
-- [ADR-0008: Consumer-neutral wallet data plane](../adrs/0008-consumer-neutral-wallet-data-plane.md)
-- [ADR-0021: `chain_events` address invalidation hint](../adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)
+- [ADR-0005: Consumer-neutral wallet data plane](../adrs/0005-consumer-neutral-wallet-data-plane.md)
+- [Chain events §Address Filters](../architecture/chain-events.md#address-filters)
 - [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md)
 - [Wallet data plane](../architecture/wallet-data-plane.md)
-- [Serving Zebra and Zallet](serving-zebra-and-zallet.md)
-- [Known consumers](known-consumers.md)
+- [Integration surfaces](integration-surfaces.md)
 - [Error vocabulary](error-vocabulary.md)

@@ -18,10 +18,9 @@
 //! The test resolves its height from the running node and backfills a
 //! three-block window around it.
 //!
-//! Reference: [ADR-0015 §Network parameter discovery].
+//! Reference: `docs/adrs/0008-network-parameter-discovery.md`.
 //!
 //! [`mined_consensus_branch_id_parity`]: ./mined_consensus_branch_id_parity.rs
-//! [ADR-0015 §Network parameter discovery]: ../../../docs/adrs/0015-network-parameter-discovery.md
 
 #![allow(
     missing_docs,

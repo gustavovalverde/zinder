@@ -20,10 +20,8 @@
 //! 5. Look up that txid via `WalletQueryApi::transaction(...)`.
 //! 6. Assert `MinedDetails.consensus_branch_id == activations.consensus_branch_id_at(mined_height)`.
 //!
-//! Pins the regtest active-upgrade fix from [ADR-0015] in CI and proves
-//! parity on testnet and mainnet by opting in via `require_live_for`.
-//!
-//! [ADR-0015]: ../../../docs/adrs/0015-network-parameter-discovery.md
+//! Pins the regtest active-upgrade behavior in CI and proves parity on
+//! testnet and mainnet by opting in via `require_live_for`.
 
 use std::num::NonZeroU32;
 

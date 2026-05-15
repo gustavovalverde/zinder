@@ -1,126 +1,164 @@
-# ADR-0003: Use an Epoch Read API for Canonical Storage Access
+# ADR-0003: Use Epoch-Bound Storage Access With RocksDB Secondaries
 
 | Field | Value |
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
-| Domain | Storage access and service boundaries |
-| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md) |
+| Domain | Storage access, service topology, reader freshness |
+| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md), [Service operations](../architecture/service-operations.md) |
 
 ## Context
 
-`zinder-ingest` owns canonical RocksDB writes per [ADR-0001](0001-rocksdb-canonical-store.md), and storage byte contracts live behind the boundaries in [ADR-0002](0002-boundary-specific-serialization.md). That still leaves how production readers access canonical chain state.
+`zinder-ingest` owns canonical RocksDB writes per [ADR-0001](0001-rocksdb-canonical-store.md), and storage byte contracts live behind [ADR-0002](0002-boundary-specific-serialization.md). Production readers still need a concrete way to read current canonical state without becoming writers, hiding schema upgrades, or assembling responses from mixed epochs.
 
-The wrong default would let `zinder-query` open the live RocksDB database directly because it seems simpler. That would push schema knowledge, migration timing, reorg safety, compaction behavior, and snapshot semantics into the read-serving plane and would make the phrase "read-only canonical storage" sound like a service boundary when it is only a storage-engine capability.
+The tempting default is to let `zinder-query` open the live database directly as a normal read-only store. That pushes RocksDB layout, schema timing, reorg retention, compaction behavior, and snapshot semantics into the read-serving plane. The service boundary would then be a storage-engine side effect instead of a Zinder-owned contract.
 
-The Zcash ecosystem and adjacent indexing systems point the same way: lightwalletd proves wallets should talk to a dedicated light-client service rather than open upstream-node or indexer storage directly. Reth models committed, reorged, and reverted chains explicitly. Substreams models undo signals for reversible chain segments. Sui separates source transport from deterministic checkpoint processing.
+Production Zinder runs as one writer plus colocated readers: `zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, and optionally `zinder-client::LocalChainIndex` consumers. The architecture needs one answer for visibility, freshness, subscriptions, schema compatibility, and backup.
 
 ## Decision
 
-Production Zinder uses a storage-owner access boundary:
+Zinder uses **epoch-bound storage access** backed by **RocksDB secondary instances**.
 
-1. `zinder-ingest` is the only production process that opens the live canonical RocksDB database as primary and owns every canonical write.
-2. `zinder-query` reads canonical chain state through `ChainEpochReadApi`, backed by `SecondaryChainStore` per [ADR-0007](0007-multi-process-storage-access.md).
-3. `zinder-query` must not open the live canonical database as primary or bypass `ChainEpochReadApi`.
-4. Direct embedded reads are allowed only for local development composition, tests, offline repair tools, and immutable checkpoint readers.
-5. `zinder-derive` consumes `ChainEventEnvelope` values or immutable snapshots and must not read live canonical storage.
+1. `zinder-ingest` is the only production process that opens the canonical RocksDB database as primary.
+2. `zinder-query`, `zinder-compat-lightwalletd`, and colocated `LocalChainIndex` consumers open the same primary store path as RocksDB secondaries through `SecondaryChainStore`.
+3. Every chain-dependent query starts by resolving one `ChainEpoch` and reads every artifact through a `ChainEpochReadApi` view bound to that epoch.
+4. Subscriptions do not rely on RocksDB secondary tailing. Chain and mempool subscriptions travel over the private `IngestControl` gRPC plane and are proxied by reader services where needed.
+5. Direct embedded primary reads are allowed only for local development composition, tests, offline repair tools, and immutable checkpoint readers.
 
-The minimum production topology is:
+## Runtime Topology
 
 ```text
 zinder-ingest
+  -> PrimaryChainStore
   -> canonical RocksDB primary
-  -> ChainEpochReadApi
-  -> ChainEventEnvelope
+  -> IngestControl.WriterStatus / ChainEvents / MempoolSnapshot / MempoolEvents
 
 zinder-query
-  -> canonical RocksDB secondary
+  -> SecondaryChainStore
   -> ChainEpochReadApi
-  -> query-owned caches
+  -> WalletQuery
+  -> IngestControl proxy for writer-owned live streams
 
-zinder-derive
-  -> ChainEventEnvelope or immutable snapshots
-  -> derived storage
+zinder-compat-lightwalletd
+  -> SecondaryChainStore
+  -> WalletQueryApi
+  -> CompactTxStreamer translation
+
+LocalChainIndex
+  -> SecondaryChainStore for colocated reads
+  -> explicit subscription endpoint for chain and mempool events
 ```
 
-The local developer profile may run these in one process:
+Each secondary uses a distinct `secondary_path`; sharing one secondary directory across processes is invalid. Secondary readers replay the writer's WAL and manifest by calling `try_catch_up_with_primary` on a configurable interval. The default catchup interval is 250 ms.
 
-```text
-zinder dev
-  -> zinder-ingest
-  -> zinder-query
-  -> shared in-process ChainEpochReader
-```
+## Visibility Contract
 
-That local profile is composition over the same contracts. It does not introduce a second commit path, hidden migrations, query-time upstream-node fallback, or a local-only storage layout.
+`ChainEpoch` is the visibility boundary. A reader either sees the old epoch or the new epoch; it never sees a half-committed batch.
 
-## Boundary Names
+Primary readers may use RocksDB snapshots. Secondary readers are snapshotless because RocksDB secondary mode does not support snapshots. That constraint is acceptable because Zinder pins every request to a `ChainEpoch` and retains visibility rows needed by pinned epochs until retention can safely remove them.
 
 The storage-access boundary uses these names:
 
-- `ChainEpochReadApi`: the internal service-to-service API exposing epoch-bound reads.
-- `ChainEpochReader`: the in-process reader bound to one `ChainEpoch`. Primary reads may use a RocksDB snapshot; secondary reads are snapshotless and rely on epoch-bound visibility retention.
-- `ChainEpochCommitted`: the event emitted after a new epoch becomes visible.
-- `ChainRangeReverted`: the event emitted when a previously visible non-finalized range is invalidated.
-- `commit_chain_epoch`: the write operation that atomically publishes a new visible epoch.
+- `PrimaryChainStore`: the only handle that may write canonical state.
+- `SecondaryChainStore`: a read replica handle backed by RocksDB secondary mode.
+- `ChainEpochReadApi`: the internal API exposing epoch-bound canonical reads.
+- `ChainEpochReader`: an in-process reader bound to one `ChainEpoch`.
+- `commit_chain_epoch`: the atomic publish operation that makes a new epoch visible.
 
-Post-commit values wrap into `ChainEvent` and `ChainEventEnvelope` per [Chain events](../architecture/chain-events.md).
+Forbidden names: `StorageService`, `StoreManager`, `DbHelper`, `ReadOnlyStore`, or "canonical storage, read-only" as a deployment boundary.
 
-Forbidden names: `StorageService`, `StoreManager`, `DbHelper`, `ReadOnlyStore`, "internal API" without naming `ChainEpochReadApi`, "canonical storage, read-only" in deployment diagrams.
+## Freshness And Readiness
 
-## Rationale
+Readers compute lag from writer status, not from local inference. `zinder-ingest` exposes `IngestControl.WriterStatus` on a private endpoint. Each reader compares the writer's latest chain epoch with its current secondary-visible epoch after catchup.
 
-The boundary keeps the database engine behind Zinder-owned contracts. That preserves the option to change the RocksDB layout, add derived read stores, add checkpoint exports, or introduce a fallback store without changing the wallet and explorer API surface.
+Readiness behavior:
 
-Reorg handling is easier to reason about. A query starts from one `ChainEpoch`, receives a `ChainEpochReader`, and either finishes from that epoch or restarts. Readers do not assemble responses from a mix of old compact blocks, new tree state, and a newer tip pointer.
+- Lag at or below `secondary_replica_lag_threshold_chain_epochs` is acceptable.
+- Lag above the threshold reports `replica_lagging`.
+- Writer status unavailable before any cached writer observation reports `writer_status_unavailable`.
+- If the primary is offline, readers continue serving their last replayed epoch until lag exceeds the configured threshold.
 
-Schema mismatches fail closed. The store validates schema on open and reports `StoreError::SchemaTooNew` or `SchemaMismatch`; query startup surfaces these as typed readiness causes and refuses to repair canonical storage.
+The catchup loop is lazy on idle: when no WAL state changed and a fresh writer-status snapshot proves the reader is already current, the reader skips readiness recomputation until the heartbeat interval.
 
-Wallet privacy stays auditable. Wallet-facing APIs are reviewable as a single data plane. Direct table access by multiple services would make it harder to prevent shielded wallet scanning, leaked query interests, and accidental exposure of derived wallet state.
+## Schema Compatibility
+
+The store records `artifact_schema_version` in `storage_control`. Reader binaries compile in the highest artifact schema they can read.
+
+- Reader max schema >= persisted schema: open succeeds.
+- Reader max schema < persisted schema: open fails with `SchemaTooNew`, and the service reports `schema_mismatch`.
+
+Rolling upgrade order across schema bumps:
+
+1. Upgrade read replicas first.
+2. Stop the primary.
+3. Upgrade and restart the primary.
+4. Readers catch up to the new schema after the primary publishes it.
+
+Same-schema upgrades tolerate any process order.
+
+## Subscription Transport
+
+RocksDB secondaries do not deliver live subscription semantics. The private ingest-control gRPC plane owns stream delivery:
+
+- `IngestControl.ChainEvents` carries canonical chain-event envelopes.
+- `IngestControl.MempoolSnapshot` and `IngestControl.MempoolEvents` carry writer-owned mempool state.
+- `zinder-query` proxies native subscription RPCs to wallet clients.
+- `zinder-compat-lightwalletd` only exposes subscription-like behavior that exists in the vendored lightwalletd protocol.
+
+Read-only RPCs are served directly from the local secondary store. Live writer-owned state crosses `IngestControl`.
+
+## Backup
+
+`zinder-ingest backup --to <path>` uses the RocksDB Checkpoint API to create a hardlinked point-in-time checkpoint of the canonical store while the writer is live. Restore is operator-driven in v1: stop all processes, replace the storage path with a checkpoint, start the primary, then let readers reopen and catch up.
+
+Checkpoint readers are separate from production readers. They open frozen snapshots and must validate store identity, network, schema version, and visible epoch before serving data.
 
 ## Consequences
 
 Positive:
 
-- RocksDB details stay inside `zinder-store` and the storage owner.
-- `zinder-query` scales by adding caches, query-owned read stores, or immutable checkpoint readers without becoming a second canonical writer.
-- Migration ownership is unambiguous.
-- Reorg events become explicit inputs to query and derived stores.
-- Downstream developers integrate with domain APIs, not column families.
+- Canonical RocksDB has exactly one writer.
+- Readers replay the writer's byte-level state instead of rebuilding projections.
+- Query services can scale locally without owning schema migrations or upstream-node fallbacks.
+- The default reader staleness budget is small and observable.
+- Read paths and subscription paths are separated explicitly.
+- Backup uses a mature RocksDB primitive.
 
-Negative:
+Tradeoffs:
 
-- Production readers are coupled to the canonical RocksDB layout through `SecondaryChainStore`.
-- Secondary readers require manual catchup, unique secondary paths, and snapshotless read invariants.
-- Internal API and storage schema versioning are part of the operational surface.
-- Tests cover service-to-service freshness, backpressure, and epoch consistency.
+- Readers remain coupled to the RocksDB layout. Schema-version checks and rolling-upgrade order bound that coupling.
+- Read replicas are colocated by default. Cross-host replicas need a future design.
+- Secondary readers cannot depend on RocksDB snapshots. Epoch-bound visibility is the contract instead.
+- The writer's private control plane is an operational surface and must be secured for non-loopback deployments.
 
-Neutral:
+## Out of Scope
 
-- RocksDB secondary instances are the production read transport (see [ADR-0007](0007-multi-process-storage-access.md)). They do not change ownership: only `zinder-ingest` opens primary.
-- RocksDB checkpoints remain the preferred primitive for immutable fixtures, backup, and offline read replicas.
-- A future high-scale deployment can replace `ChainEpochReadApi` with a query-owned read store without changing wallet APIs.
+- Cross-host read replicas.
+- gRPC-fronted `ChainEpochReadApi`.
+- Query-owned projection stores fed by chain events.
+- Standalone storage service.
+- Online restore.
+- Cross-network secondary access.
 
 ## Alternatives Considered
 
-### Direct Read-Only RocksDB in `zinder-query`
+### Direct Read-Only RocksDB in Query
 
-Tempting because it avoids an internal read API, but it makes RocksDB layout, migration timing, and snapshot caveats part of the query service boundary. The accepted secondary path keeps the public boundary as `ChainEpochReadApi`, uses role-specific `SecondaryChainStore`, and accepts the RocksDB coupling explicitly.
+Rejected. It makes RocksDB schema details part of the query boundary and hides migration ownership.
+
+### `ChainEpochReadApi` Over gRPC
+
+Reserved. It is the scale escape valve for reader fleets that outgrow colocated RocksDB secondaries, but v1 does not pre-pay the extra process and network hop.
+
+### Query-Owned Store Fed By Events
+
+Reserved. It is useful for specialized read models, but it duplicates canonical state and makes reorg replay a reader concern.
 
 ### Standalone Storage Service
 
-A dedicated storage service makes ownership explicit but adds another production process before the simpler `zinder-ingest` ownership model has been stressed. Reserved for the case where `ChainEpochReadApi` becomes a scaling or operational bottleneck.
-
-### Checkpoint-Only Query Replicas
-
-Checkpoints are excellent for fixtures, backups, and offline read replicas. They are not enough for the lowest-latency wallet path unless paired with a freshness model and near-tip event delivery.
+Rejected for v1. It makes ownership explicit but adds a new production process before the simpler writer-owned store model has been stressed.
 
 ## References
 
 - RocksDB read-only and secondary instances: <https://github.com/facebook/rocksdb/wiki/Read-only-and-Secondary-instances>
 - RocksDB checkpoints: <https://rocksdb.org/blog/2015/11/10/use-checkpoints-for-efficient-snapshots.html>
-- Reth `ExExNotification`: <https://reth.rs/docs/reth_exex/enum.ExExNotification.html>
-- Substreams reorg handling: <https://docs.substreams.dev/reference-material/sql/sql/reorg-handling>
-- Sui gRPC streaming indexers: <https://blog.sui.io/grpc-real-time-streaming-indexing-sui/>
-- Zcash lightwalletd: <https://github.com/zcash/lightwalletd>
-- Zcash wallet threat model: <https://zcash.readthedocs.io/en/latest/rtd_pages/wallet_threat_model.html>

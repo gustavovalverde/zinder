@@ -136,7 +136,7 @@ pub struct P2pkhSpendArgs<'a> {
 
 impl TransparentTestKey {
     /// Derives a deterministic test key from the supplied seed using the
-    /// default regtest activation heights (Zaino-style).
+    /// local regtest activation heights.
     ///
     /// The seed must be at least 32 bytes (BIP32 minimum). Shorter seeds are
     /// rejected by the underlying derivation.

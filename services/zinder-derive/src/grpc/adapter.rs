@@ -3,7 +3,7 @@
 //! Serves [`ExplorerQuery::ServerInfo`] (advertising
 //! [`DERIVE_EXPLORER_SERVER_INFO_V1`]) and
 //! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
-//! request time per ADR-0014: confirmed totals are summed from canonical
+//! request time: confirmed totals are summed from canonical
 //! transparent UTXO artifacts (via `WalletQuery`) and the mempool overlay is
 //! composed from the live mempool point lookups (also via `WalletQuery`).
 //! The derive plane owns no balance column family; the wire shape is the

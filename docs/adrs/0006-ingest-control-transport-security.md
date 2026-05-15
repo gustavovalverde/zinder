@@ -1,15 +1,15 @@
-# ADR-0009: IngestControl Transport Security
+# ADR-0006: IngestControl Transport Security
 
 | Field | Value |
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Service-to-service transport security |
-| Related | [ADR-0007](0007-multi-process-storage-access.md), [Service operations](../architecture/service-operations.md), [Service boundaries](../architecture/service-boundaries.md) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [Service operations](../architecture/service-operations.md), [Service boundaries](../architecture/service-boundaries.md) |
 
 ## Context
 
-[ADR-0007](0007-multi-process-storage-access.md) settles that `zinder-ingest`
+[ADR-0003](0003-canonical-storage-access-boundary.md) settles that `zinder-ingest`
 exposes a private `IngestControl` gRPC endpoint and that
 `zinder-query`, `zinder-compat-lightwalletd`, and embedded
 `zinder-client::LocalChainIndex` consumers reach the writer's live state
@@ -22,7 +22,7 @@ The default deployment is single-host: the writer and one or more readers
 share a host and bind the IngestControl port to `127.0.0.1`. Operators
 running readers on a different host (a separate VM, a different node in a
 private VLAN, a Wireguard peer) need a transport security story that does
-not assume the network is trusted. ADR-0007 deferred that story; this ADR
+not assume the network is trusted. ADR-0003 defines the topology; this ADR
 fills the gap.
 
 The constraints on the answer are:
@@ -100,7 +100,7 @@ neither `[ingest.control] token_path` nor any equivalent reader-side
 config is set. Operators who run all processes on one host and bind the
 port to `127.0.0.1` (or who put the port on a private network they
 trust) configure nothing. This is the **localhost-default** story
-referenced throughout ADR-0007 and the service-operations doc.
+referenced throughout ADR-0003 and the service-operations doc.
 
 This default exists because the threat model collapses for single-host
 deployments: an attacker with local code execution on the writer's host
@@ -172,9 +172,8 @@ token, both sides have to agree on it."
 - Hot-reload of the token file.
 - A compile-time feature flag for the auth code path.
 
-These can be added later if a deployment shape demands them. The
-present design is small enough that adding any of them is an additive
-change, not a rewrite.
+These are out of scope for the accepted design. Adding one requires a
+separate decision that names the deployment shape it serves.
 
 ## Consequences
 
@@ -219,17 +218,6 @@ change, not a rewrite.
   `WalletQueryGrpcAdapter::with_ingest_control_bearer_token`,
   `IngestControlMempoolSurface::with_bearer_token`,
   `spawn_ingest_control_tip_change_publisher(_, bearer_token, _)`.
-
-### Future work
-
-- If a deployment requires native TLS without a reverse proxy, the path
-  is to add `[ingest.control] tls.cert_path` / `tls.key_path` and a
-  matching reader-side `tls.ca_certificate_path`, gated behind a
-  `tls` cargo feature on `zinder-runtime`. This ADR does not preclude
-  that work; it defers it until a deployment shape demands it.
-- mTLS is reachable through the same path. Whether to support it
-  natively or push it to the reverse-proxy edge is a deployment
-  decision, not a Zinder one.
 
 ## Out of Scope
 

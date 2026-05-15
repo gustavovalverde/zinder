@@ -26,7 +26,7 @@
 //! Cookie credentials may be supplied either by file path or inline (but not
 //! both). Inline credentials let `PaaS`-style deployments inject the secret
 //! directly through the environment without writing a shim that materializes
-//! a cookie file. See [ADR-0018](../../../docs/adrs/0018-environment-variable-secret-policy.md).
+//! a cookie file.
 
 use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 

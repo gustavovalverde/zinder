@@ -1,6 +1,7 @@
 //! `WalletQuery.ChainEvents` server-side filter logic.
 //!
-//! Owns the `address_filter` semantics defined in [ADR-0021]: clients pass a
+//! Owns the `address_filter` semantics defined in the chain-events
+//! architecture: clients pass a
 //! list of transparent addresses they care about; the server narrows
 //! delivered envelopes to those whose committed block range touches at
 //! least one of the supplied addresses. Reorged envelopes always pass
@@ -11,8 +12,6 @@
 //! the server would have emitted without a filter. A resuming client with
 //! a different filter receives an envelope set consistent with the new
 //! filter applied from the cursor forward.
-//!
-//! [ADR-0021]: ../../../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md
 
 use std::num::NonZeroU32;
 
@@ -66,7 +65,8 @@ pub(super) fn decode_address_filter(
 }
 
 /// Spawns the server task that drives one client's chain-events stream and
-/// applies the address-filter semantics from [ADR-0021] when the filter is
+/// applies the address-filter semantics from `docs/architecture/chain-events.md`
+/// when the filter is
 /// non-empty.
 ///
 /// The cursor and family follow the same shape as the unfiltered stream;

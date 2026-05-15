@@ -5,7 +5,7 @@
 //! compile-time assertions ensure the `ChainIndex` methods Zashi's typed
 //! gRPC paths depend on are present on the trait surface.
 //!
-//! Cross-references: [Android wallet integration findings](../../../../docs/reference/android-wallet-integration-findings.md).
+//! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;

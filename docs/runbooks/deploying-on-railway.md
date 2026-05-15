@@ -72,7 +72,7 @@ Railway provides a UI for environment variables. Set:
 | `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | `127.0.0.1:9100` | Internal-only |
 | `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | `http://127.0.0.1:9100` | Reader points at colocated writer |
 
-[ADR-0018](../adrs/0018-environment-variable-secret-policy.md) is what makes this possible. The single-container image accepts the cookie content inline through `ZINDER_NODE__AUTH__COOKIE`; you do not need an entrypoint shim that materializes a cookie file.
+The single-container image accepts the cookie content inline through `ZINDER_NODE__AUTH__COOKIE`; you do not need an entrypoint shim that materializes a cookie file.
 
 Railway's secret-handling UI marks every variable with a leaf name in `{password, secret, cookie, token, private_key}` as sensitive in its console. Treat the variables above accordingly.
 
@@ -152,7 +152,7 @@ For pinned-tag deploys, change the image tag back to the prior version and redep
 
 ## References
 
-- [ADR-0018: Environment variable secret policy](../adrs/0018-environment-variable-secret-policy.md)
+- [Public interfaces §Environment variable mapping](../architecture/public-interfaces.md#environment-variable-mapping)
 - [`deploy/single-container/`](../../deploy/single-container/)
 - [`deploy/single-container/README.md`](../../deploy/single-container/README.md)
 - [Service operations](../architecture/service-operations.md)

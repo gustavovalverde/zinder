@@ -188,9 +188,8 @@ async fn fetch_raw_mempool_transaction_ids_returns_typed_list() -> Result<()> {
     };
     let source = zebra_source(&env)?;
     // The shape of the response (Vec<TransactionId>) is the contract;
-    // the regtest mempool may be empty or carry whatever the running
-    // Zaino/Zallet sidecar is currently broadcasting. Either way, the
-    // call must succeed and return a typed list.
+    // the regtest mempool may be empty or carry transactions from another
+    // local process. Either way, the call must succeed and return a typed list.
     let mempool_ids = source.fetch_raw_mempool_transaction_ids().await?;
     for transaction_id in &mempool_ids {
         assert_eq!(transaction_id.as_bytes().len(), 32);

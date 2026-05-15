@@ -2,8 +2,7 @@
 //!
 //! Each per-consumer module asserts the typed shape that consumer's contract
 //! depends on. Parity here means "Zinder serves the consumer-expected shape",
-//! not byte-equivalence with Zaino (which Zinder deliberately refuses for
-//! the documented anti-patterns).
+//! not byte-equivalence with every implementation detail of another indexer.
 
 use std::{sync::Arc, time::Duration};
 

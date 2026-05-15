@@ -446,15 +446,13 @@ message ChainEventsRequest {
   // cursor's encoded family is authoritative.
   ChainEventStreamFamily family = 2;
 
-  // Address-invalidation filter ([ADR-0021]). Empty disables filtering.
+  // Address-invalidation filter. Empty disables filtering.
   // When non-empty, the server narrows envelopes to commits whose block
   // range touches at least one of these transparent addresses, plus every
   // reorg (which always passes through regardless of filter). Cursor
   // semantics are unchanged; clients still re-derive per-address state
   // from the committed compact block. Addresses are encoded as the same
   // dotted-canonical strings accepted by transparent-address queries.
-  //
-  // [ADR-0021]: ../../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md
   repeated string address_filter = 3;
 }
 
@@ -835,7 +833,7 @@ message MempoolMinedEvent {
 // Source-side emission is reserved. The wire surface and store-side event
 // log accept this variant today so external integrators can subscribe; the
 // upstream node must expose pre-admission rejects before Zinder populates
-// the event. See ADR-0010 §Suppression.
+// the event. See docs/architecture/wallet-data-plane.md.
 message MempoolSuppressedEvent {
   // Identifier of the suppressed transaction.
   bytes transaction_id = 1;
@@ -969,8 +967,8 @@ message TransparentAddressBalanceRequest {
 //
 // Splits the canonical confirmed total from the signed mempool delta so
 // explorer-shaped clients can render `confirmed`/`unconfirmed` separately;
-// legacy lightwalletd clients project this into a single `value_zat` at the
-// compatibility boundary. Named `*Response` to match the rest of
+// lightwalletd-compatible clients project this into a single `value_zat` at
+// the compatibility boundary. Named `*Response` to match the rest of
 // `wallet.proto` and avoid a name collision with the same-named RPC.
 message TransparentAddressBalanceResponse {
   // Sum of unspent canonical outputs at the requested addresses.

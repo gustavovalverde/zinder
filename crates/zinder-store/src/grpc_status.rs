@@ -10,7 +10,7 @@ use crate::StoreError;
 
 /// Domain attached to every `google.rpc.ErrorInfo` returned by a Zinder
 /// service. Duplicated here so `zinder-store` does not need to import the
-/// query crate; the value is fixed by [ADR-0019].
+/// query crate; the value is fixed by the error vocabulary reference.
 const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 
 /// Maps a [`StoreError`] to the canonical gRPC status used by all services.

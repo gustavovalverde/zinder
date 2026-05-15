@@ -233,7 +233,7 @@ pub enum MempoolConsumerEventVariant<'a> {
     },
     /// Upstream node refused admission of the transaction. Reserved for
     /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
-    /// visibility per ADR-0010 §Suppression.
+    /// visibility as documented by the mempool topology.
     Suppressed {
         /// Transaction id of the suppressed transaction.
         transaction_id: &'a [u8],

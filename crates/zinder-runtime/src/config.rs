@@ -9,13 +9,12 @@
 //! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config.
 //!
-//! Secret hygiene is handled at emit time rather than at load time
-//! ([ADR-0018](../../../docs/adrs/0018-environment-variable-secret-policy.md)).
-//! Secrets pass through this loader unchanged; redaction happens in
+//! Secret hygiene is handled at emit time rather than at load time. Secrets
+//! pass through this loader unchanged; redaction happens in
 //! [`NodeAuthToml::from_node_auth`] (used by `--print-config`) and in the
 //! manual `Debug` impls on [`zinder_source::NodeAuth`] and
 //! [`crate::auth::BearerToken`]. Per-surface file-only constraints (see
-//! [ADR-0009](../../../docs/adrs/0009-ingest-control-transport-security.md))
+//! [ADR-0006](../../../docs/adrs/0006-ingest-control-transport-security.md))
 //! remain enforced at their respective config types.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};

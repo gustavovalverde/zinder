@@ -246,7 +246,7 @@ where
     /// canonical transparent UTXO column family.
     ///
     /// The compat shim answers `GetTaddressBalance` directly from canonical
-    /// artifacts (ADR-0017): the legacy proto carries one signed `value_zat`
+    /// artifacts: the legacy proto carries one signed `value_zat`
     /// field that wallets interpret as confirmed balance. The richer native
     /// `WalletQuery.TransparentAddressBalance` adds a mempool overlay through
     /// the optional derive plane and is the right surface for clients that

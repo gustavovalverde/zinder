@@ -6,7 +6,7 @@ Event and reorg semantics live in [Chain events](chain-events.md).
 
 ## Ownership
 
-`zinder-ingest` owns the live canonical RocksDB database as the only primary writer. Production readers (`zinder-query`, `zinder-compat-lightwalletd`, `zinder-client::LocalChainIndex`) reach the same store through `SecondaryChainStore`, which implements `ChainEpochReadApi` over a RocksDB secondary instance. The full topology, catchup mechanism, lock semantics, and rolling-upgrade order live in [ADR-0007](../adrs/0007-multi-process-storage-access.md); this document does not restate them.
+`zinder-ingest` owns the live canonical RocksDB database as the only primary writer. Production readers (`zinder-query`, `zinder-compat-lightwalletd`, `zinder-client::LocalChainIndex`) reach the same store through `SecondaryChainStore`, which implements `ChainEpochReadApi` over a RocksDB secondary instance. The full topology, catchup mechanism, lock semantics, and rolling-upgrade order live in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
 ```text
 zinder-ingest    -> RocksDB primary -> ChainEpochReadApi -> ChainEvent
@@ -73,7 +73,7 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `block_hash_index` | Best-chain `(network, block_hash) -> (height, source_chain_epoch_id)` resolver written on every finalized-block commit. Monotonic: reorged-out hashes are filtered at read time and never deleted, so the family grows roughly one row per finalized block (~50K rows per year on mainnet). A future retention pass may prune rows older than the reorg window once an active-reader proof exists. |
 | `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable non-finalized links |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
-| `mempool_event` | Durable mempool-event log per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
+| `mempool_event` | Durable mempool-event log per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
 
 Mempool state is split between in-memory and persistent storage. The live `MempoolIndex` lives in `zinder-ingest` as in-process state, not in canonical RocksDB. The `mempool_event` column family persists the typed event log for retention-dependent queries (rebroadcast detection, audit) and cursor resume on `WalletQuery.MempoolEvents`. Reads from the mempool event log go through `MempoolEventReadApi`, parallel to but distinct from `ChainEpochReadApi`; live snapshots and live stream tailing still require the ingest-owned private control surface because secondary RocksDB readers cannot observe the live in-process index. Mempool events do not participate in `commit_ingest_batch`; they are written by `zinder-ingest` as each `MempoolSourceEvent` arrives.
 
@@ -139,11 +139,11 @@ Stores validate schema at open. A store written with an `artifact_schema_version
 
 RocksDB checkpoints are used for backups (`zinder-ingest backup --to <path>`), fixture capture, offline repair, and immutable analytics replicas. Restore is "stop, replace, start" (operator procedure, no online restore in v1).
 
-Checkpoint readers must open a documented manifest and validate store identity, network, schema versions, and visible epoch before serving data. They serve frozen snapshots; production read replicas instead open the live store as RocksDB-secondary per [ADR-0007](../adrs/0007-multi-process-storage-access.md) and replay the writer's WAL.
+Checkpoint readers must open a documented manifest and validate store identity, network, schema versions, and visible epoch before serving data. They serve frozen snapshots; production read replicas instead open the live store as RocksDB-secondary per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and replay the writer's WAL.
 
 ## Multi-Process Operations
 
-The primary/secondary contract is in [ADR-0007](../adrs/0007-multi-process-storage-access.md): one writer per store path, process-unique `secondary_path`, 250 ms catchup default, schema-version one-directional compatibility, gRPC-only subscription delivery. Storage code follows that ADR; this document does not duplicate the operational details.
+The primary/secondary contract is in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md): one writer per store path, process-unique `secondary_path`, 250 ms catchup default, schema-version one-directional compatibility, gRPC-only subscription delivery. Storage code follows that ADR; this document owns the storage-family details.
 
 ## Storage Metrics
 

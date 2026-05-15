@@ -2,7 +2,7 @@
 # (public reader) supervised by s6-overlay, sharing one canonical volume.
 #
 # This is the recommended deployment shape for single-operator self-hosting
-# (per ADR-0007 §Single-host topology). Operators on PaaS targets that lack
+# (per ADR-0003 §Runtime Topology). Operators on PaaS targets that lack
 # shared filesystems across services (Railway, Fly.io, Render) deploy this
 # image once; Kubernetes operators wanting sidecar separation use the
 # per-service Dockerfiles in services/<svc>/Dockerfile instead.
@@ -91,7 +91,7 @@ COPY deploy/single-container/config.example.query.toml          /etc/zinder/conf
 # The run scripts launch each binary with `--config /etc/zinder/{ingest,query}.toml`.
 # Seed those paths from the example configs so the image is immediately runnable
 # on PaaS targets that drive every dynamic field through `ZINDER_*` env vars
-# without requiring a mounted config file (ADR-0018). Operators that ship their
+# without requiring a mounted config file. Operators that ship their
 # own configs simply mount over these defaults.
 RUN cp /etc/zinder/config.example.ingest.toml /etc/zinder/ingest.toml \
     && cp /etc/zinder/config.example.query.toml /etc/zinder/query.toml \

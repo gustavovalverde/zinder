@@ -38,7 +38,7 @@ The services must not share:
 
 ## Storage Ownership
 
-`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0007](../adrs/0007-multi-process-storage-access.md).
+`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
@@ -61,7 +61,7 @@ the product boundaries remain `zinder-ingest`, `zinder-query`, and
 
 ## Production Profiles
 
-Minimum production deployment (per [ADR-0007](../adrs/0007-multi-process-storage-access.md)):
+Minimum production deployment (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
@@ -84,13 +84,13 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
 zinder-derive              -> ChainEventEnvelope or snapshots -> derived storage
 ```
 
-Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see ADR-0007 §Out of Scope.
+Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
 
 ## Anti-Patterns
 
 - A single production daemon where query handlers call upstream node RPC directly.
 - A query service that writes missing blocks on demand.
-- A query service that opens the live canonical RocksDB database as **primary** in production. Secondary access is the production contract per ADR-0013.
+- A query service that opens the live canonical RocksDB database as **primary** in production. Secondary access is the production contract per ADR-0003.
 - A compatibility adapter that opens storage or calls upstream nodes instead of translating `WalletQueryApi`.
 - A generic `zinder-serve` boundary that hides which service owns ingestion,
   query, or compatibility behavior.

@@ -31,7 +31,7 @@ Required artifact families:
 - `CompactBlockArtifact`: wallet-oriented compact block representation.
 - `TreeStateArtifact`: tree state data required by wallet sync APIs.
 - `TransactionArtifact`: transaction lookup material needed by APIs.
-- `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` alongside `tip-follow`. The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of `tip-follow` in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
+- `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` alongside `tip-follow`. The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of `tip-follow` in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
 
 Each artifact must include:
 
@@ -138,11 +138,11 @@ Historical backfill is bounded by JSON-RPC round-trip latency, not by upstream-n
 1. **Pipelined block fetches.** `backfill_from_source_with_store` keeps up to `BACKFILL_FETCH_CONCURRENCY` (32) `fetch_block_by_height` calls in flight via `futures_util::stream::iter(...).buffered(N)`. The stream preserves submission order, so artifact assembly and RocksDB writes stay strictly ordered; only the network-bound fetch path is concurrent.
 2. **Concurrent per-block RPCs.** `ZebraJsonRpcSource::fetch_block_by_height` resolves the anchor hash with one `getblockhash` call, then drives `getblockheader`, `getblock`, and `z_gettreestate` concurrently via `tokio::join!`. Per-block round-trip count drops from four sequential RTTs to one plus a parallel triple.
 
-[ADR-0023](../adrs/0023-pipelined-backfill-and-concurrent-block-fetch.md) records the rationale and the operational tuning advice. Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
+Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
 
 ### Tip-follow wakeups
 
-Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure or a missed reconnect cannot stall ingest beyond `poll_interval_ms`. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only. [ADR-0024](../adrs/0024-grpc-chain-tip-notifications.md) records the rationale.
+Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure or a missed reconnect cannot stall ingest beyond `poll_interval_ms`. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
 
 Historical backfill also fetches newly completed shielded subtree roots through
 the source boundary. The source adapter returns `z_getsubtreesbyindex`
@@ -155,9 +155,7 @@ Checkpoint bootstrap must initialize the running shielded tree-size observer
 from the upstream-node-supplied checkpoint tree state before validating the first
 post-checkpoint block. Assuming zero after Sapling or Orchard activation makes
 deep wallet-serving backfill fail even when the checkpoint metadata is correct.
-The observed failure and reproduction live in
-[Android wallet integration findings](../reference/android-wallet-integration-findings.md#backfill-from-a-non-zero-shielded-tree-size-checkpoint-must-seed-the-builder);
-this page owns the durable ingestion requirement.
+This page owns the durable ingestion requirement.
 
 Wallet-serving backfill is an explicit coverage mode, not an operator folklore
 recipe. `zinder-ingest backfill --wallet-serving` derives the historical floor
@@ -177,12 +175,12 @@ path included) reads it from a process-startup
 `Arc<NetworkUpgradeActivations>` populated by
 `ZebraJsonRpcSource::discover_network_upgrade_activations()`, never from
 library-default constants. See
-[ADR-0015](../adrs/0015-network-parameter-discovery.md).
+[ADR-0008](../adrs/0008-network-parameter-discovery.md).
 
 The derived floor does not relax the finality bound on the backfill end height.
 Serving-store backfills should stop at the latest height outside the configured
 reorg window, then let `tip-follow` ingest the replaceable near-tip suffix.
-Per [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md),
+Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 `--allow-near-tip-finalize` is invalid with `--wallet-serving`; use it only
 with explicit local or disposable stores.
 

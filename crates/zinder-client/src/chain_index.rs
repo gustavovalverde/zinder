@@ -216,7 +216,7 @@ pub enum MempoolEvent {
     },
     /// Upstream node refused admission of the transaction. Reserved for
     /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
-    /// visibility per ADR-0010 §Suppression. Wallet integrators may subscribe
+    /// visibility as documented by the mempool topology. Wallet integrators may subscribe
     /// today but should not block on receiving this variant.
     Suppressed {
         /// Identifier of the suppressed transaction.
@@ -599,7 +599,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<ChainEventStream, IndexerError>;
 
     /// Streams chain events with a server-side address invalidation filter
-    /// applied (per [ADR-0021]).
+    /// applied.
     ///
     /// `address_filter` is a list of transparent t-addresses (canonical
     /// Base58 form). An empty list disables filtering and delivers every
@@ -614,8 +614,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// `LocalChainIndex` that talk to storage directly continue to work;
     /// remote backends that talk to a Zinder server push the filter
     /// through to the wire.
-    ///
-    /// [ADR-0021]: ../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md
     ///
     /// # Examples
     ///

@@ -20,7 +20,7 @@ const ZALLET_CONFIG_ENV: &str = "ZINDER_TEST_ZALLET_CONFIG";
 const ZALLET_CONFIG_MARKER_ENV: &str = "ZINDER_TEST_ZALLET_CONFIG_MUST_CONTAIN";
 const ZALLET_ARGS_ENV: &str = "ZINDER_TEST_ZALLET_ARGS";
 const ZALLET_OUTPUT_MARKER_ENV: &str = "ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN";
-const EMBEDDED_ZAINO_CONFIG_FIELDS: &[&str] = &[
+const VALIDATOR_DIRECT_CONFIG_FIELDS: &[&str] = &[
     "validator_address",
     "validator_cookie_path",
     "validator_user",
@@ -52,7 +52,7 @@ fn zallet_binary_runs_against_zinder_native_contract() -> eyre::Result<()> {
             config_path.display()
         )
     })?;
-    reject_embedded_zaino_config(&parsed_config, &config_path)?;
+    reject_validator_direct_config(&parsed_config, &config_path)?;
     require_config_marker(&parsed_config)?;
 
     let zallet_binary = env::var(ZALLET_BINARY_ENV).unwrap_or_else(|_| "zallet".to_owned());
@@ -117,15 +117,15 @@ fn require_config_marker(parsed_config: &toml::Value) -> eyre::Result<()> {
     Ok(())
 }
 
-fn reject_embedded_zaino_config(
+fn reject_validator_direct_config(
     parsed_config: &toml::Value,
     config_path: &Path,
 ) -> eyre::Result<()> {
-    for field in EMBEDDED_ZAINO_CONFIG_FIELDS {
+    for field in VALIDATOR_DIRECT_CONFIG_FIELDS {
         if config_contains_key(parsed_config, field) {
             return Err(eyre!(
-                "{} contains active `{field}`; that is Zallet's embedded-Zaino \
-                 validator path, not the Zinder native contract",
+                "{} contains active `{field}`; that is Zallet's validator-direct \
+                 path, not the Zinder native contract",
                 config_path.display()
             ));
         }

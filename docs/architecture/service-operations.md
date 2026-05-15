@@ -50,10 +50,10 @@ Required readiness causes:
 - `storage_unavailable` — canonical RocksDB cannot answer or has lost the visible epoch pointer
 - `schema_mismatch` — Zinder's expected schema version differs from the persisted store's schema fingerprint
 - `reorg_window_exceeded` — the selected branch requires replacing data outside the configured reorg window; operator action required
-- `replica_lagging` — a `zinder-query` or `zinder-compat-lightwalletd` secondary RocksDB reader is behind the writer by more than `secondary_replica_lag_threshold_chain_epochs` (per [ADR-0007](../adrs/0007-multi-process-storage-access.md)); reads still serve from the last replayed state. Usually self-heals within one catchup interval; persistent lag indicates the writer is offline or under load
+- `replica_lagging` — a `zinder-query` or `zinder-compat-lightwalletd` secondary RocksDB reader is behind the writer by more than `secondary_replica_lag_threshold_chain_epochs` (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)); reads still serve from the last replayed state. Usually self-heals within one catchup interval; persistent lag indicates the writer is offline or under load
 - `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `storage.ingest_control_addr` and the ingest-control listener
 - `cursor_at_risk` — chain-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
-- `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0010 §Retention windows](../adrs/0010-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
+- `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0007 §Retention windows](../adrs/0007-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
 - `mempool_source_unavailable` — the mempool source stream cannot be opened or has emitted a non-retryable error (`MempoolStreamUnavailable { is_retryable: false }`); the live `MempoolIndex` keeps the last known state but no new `Added`/`Invalidated`/`Mined` events are arriving. Operators check upstream node health and the indexer port (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for streaming, `getrawmempool` reachability for polling)
 - `mempool_hydration_lagging` — hydration of `MempoolChange::ADDED` notifications via `getrawtransaction` is falling behind the source's emission rate; the index and event log will skip events older than the lag threshold and surface them as missing rather than out-of-order. Operators check upstream JSON-RPC latency and the `zinder_node_request_duration_seconds{operation="get_raw_transaction"}` series
 - `shutting_down` — graceful shutdown in progress; new traffic is rejected
@@ -143,7 +143,7 @@ Implemented baseline metrics:
 | `zinder_mempool_hydration_failures_total` | counter | `zinder-source` | Mempool `Added` observations the source could not hydrate by reason (transient JSON-RPC failure, payload too large, unknown txid races). |
 | `zinder_mempool_source_errors_total` | counter | `zinder-source` | Mempool source error items by kind (`stream_item`, `connect`); a non-zero rate is the input signal for `mempool_source_unavailable` readiness. |
 | `zinder_mempool_events_pruned_total` | counter | `zinder-store` | Mempool events pruned by the retention worker by kind (`added`, `invalidated`, `mined`); the cumulative health signal for two-tier retention. |
-| `zinder_mempool_event_retention_oldest_age_seconds` | gauge | `zinder-store` | Age of the oldest retained mempool event in seconds; together with the per-variant retention windows in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), drives `mempool_cursor_at_risk` readiness. |
+| `zinder_mempool_event_retention_oldest_age_seconds` | gauge | `zinder-store` | Age of the oldest retained mempool event in seconds; together with the per-variant retention windows in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md), drives `mempool_cursor_at_risk` readiness. |
 | `zinder_mempool_event_retention_oldest_sequence` | gauge | `zinder-store` | Oldest retained mempool-event sequence number; cursor consumers below this floor receive `MempoolCursorExpired`. |
 | `zinder_mempool_snapshot_age_seconds` | gauge | `zinder-ingest` | Wall-clock age of the most recent `WalletQuery.MempoolSnapshot` response; published by the ingest control adapter for clients deciding whether to fall through to `MempoolEvents`. |
 
@@ -196,7 +196,7 @@ P95, P99, and worst-case values before updating performance-budget tables.
 - Transaction broadcast result class.
 - Storage read latency and error class. The baseline metric is
   `zinder_store_read_duration_seconds`.
-- Secondary catchup lag (per [ADR-0007](../adrs/0007-multi-process-storage-access.md)): current chain-epoch lag and time since last successful catchup.
+- Secondary catchup lag (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)): current chain-epoch lag and time since last successful catchup.
 
 `zinder-derive` should expose:
 
@@ -257,8 +257,8 @@ Production config should reject:
 - Zero reorg-window or ingest commit-batch sizes.
 - Unsafe debug endpoints.
 - Incompatible service and storage schema versions.
-- A secondary reader binary whose `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` is lower than the persisted store version (per [ADR-0007](../adrs/0007-multi-process-storage-access.md)).
-- A `wallet-serving` backfill configuration that also enables `allow_near_tip_finalize` (per [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md)).
+- A secondary reader binary whose `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` is lower than the persisted store version (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)).
+- A `wallet-serving` backfill configuration that also enables `allow_near_tip_finalize` (per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md)).
 
 Configuration precedence is:
 
@@ -279,7 +279,7 @@ The loader shape is:
 
 Use `ZINDER_` with `__` for nesting, for example `ZINDER_NODE__JSON_RPC_ADDR` and `ZINDER_QUERY__LISTEN_ADDR`. Service code should not read production configuration directly from `std::env`; test-only gates use the explicit `ZINDER_TEST_*` namespace (`ZINDER_TEST_LIVE`, `ZINDER_STORE_CRASH_*`) which is stripped from production reads in `zinder_runtime::zinder_environment_source`. There is no parallel `ZINDER_Z3_*` namespace; live tests reuse the production `ZINDER_NETWORK` and `ZINDER_NODE__*` schema (see [§Validation Tiers](#validation-tiers)).
 
-Secrets pass through the env-var loader unchanged. Secret hygiene lives at the emit boundary: `--print-config`, structured logs, and `Debug` impls redact every secret regardless of how it was supplied ([ADR-0018](../adrs/0018-environment-variable-secret-policy.md)). The ingest-control bearer token remains file-only ([ADR-0009](../adrs/0009-ingest-control-transport-security.md)).
+Secrets pass through the env-var loader unchanged. Secret hygiene lives at the emit boundary: `--print-config`, structured logs, and `Debug` impls redact every secret regardless of how it was supplied. The ingest-control bearer token remains file-only ([ADR-0006](../adrs/0006-ingest-control-transport-security.md)).
 
 Do not expose secret-bearing CLI overrides. Command-line flags are for non-secret selectors and operational knobs; password, token, cookie, key, and secret material must come from the accepted config source or the operator secret-management layer.
 
@@ -392,17 +392,15 @@ Caddy, nginx, or traefik terminates HTTPS and forwards h2c to the local compat
 process. Plaintext LAN endpoints are development-only for patched SDK demo apps
 and protocol debugging.
 
-In v1.x the public wallet plane (`WalletQuery` on `zinder-query` and
+The public wallet plane (`WalletQuery` on `zinder-query` and
 `CompactTxStreamer` on `zinder-compat-lightwalletd`) has no built-in
 authentication; operators terminate TLS and apply auth, rate-limiting, and
-per-tenant quotas at the reverse proxy. [ADR-0009](../adrs/0009-ingest-control-transport-security.md)
-explicitly defers wallet-plane auth to a later v2 ADR; the open question is
-whether multi-tenant wallet hosting is in scope.
+per-tenant quotas at the reverse proxy.
 
 The private `IngestControl` gRPC plane that ties `zinder-ingest`,
 `zinder-query`, and `zinder-compat-lightwalletd` together is plaintext h2c.
 Zinder does not offer native TLS on this port. Per
-[ADR-0009](../adrs/0009-ingest-control-transport-security.md), the operator
+[ADR-0006](../adrs/0006-ingest-control-transport-security.md), the operator
 chooses one of three deployment patterns:
 
 1. **Localhost only.** All processes share a host and bind to `127.0.0.1`.
@@ -441,14 +439,14 @@ timestamps in logs after an NTP adjustment.
 
 ## Validation Tiers
 
-Tests are organized into four tiers by **runtime mechanism** ([ADR-0006](../adrs/0006-test-tiers-and-live-config.md)). Network choice (regtest, testnet, mainnet) is a parameter on T3, not a separate tier.
+Tests are organized into four tiers by **runtime mechanism**. Network choice (regtest, testnet, mainnet) is a parameter on T3, not a separate tier. The detailed commands and runner profiles live in the [Testing Runbook](../runbooks/testing.md).
 
 | Tier | Mechanism | Module path | Default cadence |
 | ---- | --------- | ----------- | --------------- |
 | T0 unit | in-process pure logic | `#[cfg(test)] mod tests` in `src/` | every PR |
 | T1 integration | fixture-driven, no external state | `tests/integration/` | every PR |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
-| T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra (CI matrix shape pending per [ADR-0006 §Open mainnet infrastructure questions](../adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions)) |
+| T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra |
 | T3 Zallet live | real Zallet binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | release / integration certification |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
@@ -457,4 +455,4 @@ T3 tests carry two gates: `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a first-lin
 
 Test functions under `tests/live/` use plain `snake_case_describing_behavior` names. Do not include `live`, `regtest`, `testnet`, `mainnet`, or `z3` in the function name; the directory and runtime parameterization handle that.
 
-`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live tests and production binaries read the same env-var schema (`ZINDER_NETWORK`, `ZINDER_NODE__*`); the full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by [ADR-0006](../adrs/0006-test-tiers-and-live-config.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
+`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live tests and production binaries read the same env-var schema (`ZINDER_NETWORK`, `ZINDER_NODE__*`); the full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).

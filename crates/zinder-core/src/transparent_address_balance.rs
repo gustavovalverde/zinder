@@ -51,8 +51,8 @@ impl TransparentAddressBalance {
 
     /// Convenience: total visible balance projected onto a non-negative
     /// integer, saturating to `0` when pending outflows exceed the
-    /// confirmed total. Useful for legacy lightwalletd consumers that
-    /// expose only the confirmed value.
+    /// confirmed total. Useful for lightwalletd-compatible consumers that
+    /// expose only one balance value.
     #[must_use]
     pub fn projected_total_zat(self) -> u64 {
         let signed_total =

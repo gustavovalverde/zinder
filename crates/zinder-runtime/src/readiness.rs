@@ -1,9 +1,9 @@
 //! Typed readiness state shared by every Zinder service.
 //!
 //! The hand-written [`ReadinessCause`] enum below mirrors the proto-defined
-//! `zinder.v1.ops.ReadinessCause` enum 1:1. The proto enum is the documented
-//! source of truth for the cause vocabulary
-//! ([ADR-0020](../../../docs/adrs/0020-machine-readable-readiness-causes.md)).
+//! `zinder.v1.ops.ReadinessCause` enum 1:1. The proto enum and
+//! `docs/architecture/service-operations.md` are the documented source of
+//! truth for the cause vocabulary.
 //! The Rust enum carries the struct-variant payloads so the existing
 //! `/readyz` JSON wire shape stays byte-identical; the [`ReadinessReport`]
 //! type below converts to the proto message via [`Into`] for any gRPC

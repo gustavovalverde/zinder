@@ -2,8 +2,7 @@
 //!
 //! Returned by [`crate::BlockSelector`]-keyed block-header read paths. The
 //! shape is Zinder-native: it does not re-export Zebra's JSON-RPC
-//! `getblockheader` object, the lightwalletd compact block header, or any
-//! zaino-internal response type.
+//! `getblockheader` object or the lightwalletd compact block header.
 
 use crate::{BlockHash, BlockId};
 

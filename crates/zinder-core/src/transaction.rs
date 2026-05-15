@@ -214,7 +214,7 @@ impl MinedTransaction {
 #[non_exhaustive]
 #[allow(
     clippy::large_enum_variant,
-    reason = "InMempool carries the full hydrated MempoolEntry by design so consumers (Zallet, Zashi/Zodl) can drop the string-matching tx-status workaround they currently use against zaino. Boxing would push allocation cost into every consumer's pattern match."
+    reason = "InMempool carries the full hydrated MempoolEntry by design so consumers can match typed transaction state directly. Boxing would push allocation cost into every consumer's pattern match."
 )]
 pub enum TxStatus {
     /// Transaction is mined in the canonical chain.

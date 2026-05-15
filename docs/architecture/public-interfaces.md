@@ -50,7 +50,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
 | `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
 | `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
-| `NetworkUpgradeActivations` | Node-discovered consensus upgrade table (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeActivations>` from process startup. Source of truth for `consensus_branch_id_at`, `active_at`, and Sapling activation height across the compat shim, native query API, and signer testkit. Required at construction by every consumer: see [ADR-0015](../adrs/0015-network-parameter-discovery.md). |
+| `NetworkUpgradeActivations` | Node-discovered consensus upgrade table (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeActivations>` from process startup. Source of truth for `consensus_branch_id_at`, `active_at`, and Sapling activation height across the compat shim, native query API, and signer testkit. Required at construction by every consumer: see [ADR-0008](../adrs/0008-network-parameter-discovery.md). |
 | `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeActivations` table: `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
 
 ### Source Boundary
@@ -177,7 +177,7 @@ Methods that return a server-streaming subscription with cursor resume:
 Methods that ask the server about itself rather than about chain data:
 
 - `server_info()` returning `ServerCapabilities`.
-- `tip_id()` returning the visible tip identity as `BlockId { height, hash }`. (Lifted from `NodeSource` for symmetry with the read API; see the lazy-catchup short-circuit in [ADR-0007](../adrs/0007-multi-process-storage-access.md).)
+- `tip_id()` returning the visible tip identity as `BlockId { height, hash }`. (Lifted from `NodeSource` for symmetry with the read API; see the lazy-catchup short-circuit in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).)
 
 ### Rule 6 — Verb forms inside `zinder-source`
 
@@ -206,11 +206,11 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 - `last_visible_block_hash`: block hash at the tip of that epoch (used to detect forks across reconnect)
 - `in_epoch_offset`: position within the epoch's emitted events
 - `event_sequence`: monotonic per-store sequence (also surfaced on the envelope for diagnostics)
-- HMAC over the body, per [ADR-0005](../adrs/0005-chain-event-cursor-sequence.md), so a tampered cursor returns `EventCursorInvalid` rather than serving wrong data.
+- HMAC over the body so a tampered cursor returns `EventCursorInvalid` rather than serving wrong data.
 
 A cursor whose `last_visible_block_hash` is no longer present at its `epoch_id`'s tip indicates the client missed a reorg. The server emits a synthetic `ChainReorged` envelope describing the divergence before resuming the stream. Clients never see "silent" branch changes.
 
-`MempoolStreamCursorV1` uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+`MempoolStreamCursorV1` uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 
 ### Field naming
 
@@ -418,7 +418,7 @@ A bare count (`max_compact_block_range`) is acceptable when the unit is intrinsi
 
 `ZINDER_<SECTION>__<FIELD>` is the convention. Nested sections double-underscore: `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_INGEST__RETENTION__CHAIN_EVENT_RETENTION_HOURS`. Every TOML field is reachable through this mapping.
 
-Secrets are accepted through the environment ([ADR-0018](../adrs/0018-environment-variable-secret-policy.md)); redaction happens at every emit boundary (`--print-config`, structured logs, `Debug` impls). The supported upstream-node auth shapes are:
+Secrets are accepted through the environment; redaction happens at every emit boundary (`--print-config`, structured logs, `Debug` impls). The supported upstream-node auth shapes are:
 
 | Env var | Resolves to |
 | ------- | ----------- |
@@ -426,7 +426,7 @@ Secrets are accepted through the environment ([ADR-0018](../adrs/0018-environmen
 | `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie` | Cookie auth from a file on disk |
 | `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__COOKIE=<credentials>` | Cookie auth from inline credentials (PaaS pattern) |
 
-`__PATH` and `__COOKIE` are mutually exclusive. Per-surface file-only constraints that remain load-bearing for security reasons (the ingest-control bearer token at `ingest.control.token_path`, per [ADR-0009](../adrs/0009-ingest-control-transport-security.md)) are enforced at their respective config types, not as a blanket env-var policy.
+`__PATH` and `__COOKIE` are mutually exclusive. Per-surface file-only constraints that remain load-bearing for security reasons (the ingest-control bearer token at `ingest.control.token_path`, per [ADR-0006](../adrs/0006-ingest-control-transport-security.md)) are enforced at their respective config types, not as a blanket env-var policy.
 
 #### Operator-facing variables
 
@@ -442,14 +442,14 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
 | `ZINDER_NODE__AUTH__PASSWORD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.password` | Basic-auth password. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 | `ZINDER_NODE__AUTH__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.path` | Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`. |
-| `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Per ADR-0018 the variable accepts secrets so a PaaS environment without persistent disks can supply the credential. (sensitive; redacted) |
+| `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
-| `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest.control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0009. |
-| `ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH` | zinder-ingest | Optional | `ingest.control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0009). File-only by policy; inline secrets are rejected at config load. |
+| `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest.control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. |
+| `ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH` | zinder-ingest | Optional | `ingest.control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). File-only by policy; inline secrets are rejected at config load. |
 | `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | zinder-query, zinder-compat-lightwalletd | Required | `storage.ingest_control_addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. |
-| `ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH` | zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `storage.ingest_control_bearer_token_path` | Path to the bearer token file presented to the IngestControl writer when the writer enforces auth (ADR-0009). |
-| `ZINDER_DERIVE__BEARER_TOKEN_PATH` | zinder-derive | Optional | `derive.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service derive-plane reads (ADR-0011). |
+| `ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH` | zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `storage.ingest_control_bearer_token_path` | Path to the bearer token file presented to the IngestControl writer when the writer enforces auth (ADR-0006). |
+| `ZINDER_DERIVE__BEARER_TOKEN_PATH` | zinder-derive | Optional | `derive.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service derive-plane reads. |
 <!-- env-var-table:public-interfaces:end -->
 
 ### `--print-config`
@@ -497,7 +497,7 @@ message NodeCapabilitiesDescriptor {
 
 Capability strings are exact-match (no version negotiation, no regex). New capabilities are additive. Each wire shape pairs with one capability identifier; a wire-shape change lands as a new `_vN` identifier. The naming convention is `domain.subdomain.capability_name_v{N}`; the suffix is part of the identity, never decoded as a version field.
 
-v1 carries no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)). Capability strings can be added, renamed, or removed between releases; a deprecation policy ADR lands when a published consumer constraint exists.
+Capability strings are the deprecation boundary. A wire-shape change lands as a new `_vN` capability; removing an older capability requires the architecture doc for that surface to name the consumer constraint and removal rule.
 
 The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs); a CI test (`zinder-proto::integration::capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities`) fails when this list and the constant diverge, so any drift is caught at build time.
 
@@ -560,7 +560,7 @@ exist.
 
 ## Wire Conventions
 
-Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by concept (`transaction_id`, `block_hash`, `chain_name`, `branch_id`), not by dialect; every dialect for one concept shares one file. The decision is locked in [ADR-0016](../adrs/0016-wire-conventions-and-zebra-alignment.md).
+Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by concept (`transaction_id`, `block_hash`, `chain_name`, `branch_id`), not by dialect; every dialect for one concept shares one file.
 
 When adding a new wire field or a new ingress dialect, locate or add a function in that module before writing any boundary code. The following inline forms are forbidden anywhere outside the wire module:
 
@@ -641,7 +641,7 @@ let chain = RemoteChainIndex::connect(RemoteOpenOptions {
 let tip = chain.latest_block().await?;
 ```
 
-[Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape) defines the `zinder-client` shape. ADR-0007 owns the multi-process model that makes both implementations necessary.
+[Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape) defines the `zinder-client` shape. [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) owns the multi-process model that makes both implementations necessary.
 
 ### Local development composition facade
 
@@ -701,7 +701,7 @@ Public shapes describe behavior that production code can actually reach.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
 - Backfill ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
-- Wallet-serving backfill coverage is selected with `backfill.coverage = "wallet-serving"` or `zinder-ingest backfill --wallet-serving`. Per [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives `from_height` and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
+- Wallet-serving backfill coverage is selected with `backfill.coverage = "wallet-serving"` or `zinder-ingest backfill --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives `from_height` and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.
 - Operator-facing errors name the real cause and carry useful fields. Prefer `NoVisibleChainEpoch`, sequence-overflow, and payload-size errors over sentinel IDs or reused malformed-input errors.
@@ -728,11 +728,11 @@ Zinder's vocabulary is the durable spine; this table is how to read each term in
 | `TransactionId` (32-byte canonical) | [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) `txid_digest` (v5+); pre-v5 SHA256d | Same bytes; derivation differs by tx version. Zinder treats the value as opaque; the doc comment in `zinder-core::transaction.rs` records the split. |
 | `AuthDigest` | [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) `auth_digest` | Aligned (v5+ only; `Option`-gated on pre-v5). |
 | `ConsensusBranchId` | [ZIP-200](https://github.com/zcash/zips/blob/main/zips/zip-0200.rst) `CONSENSUS_BRANCH_ID` | Aligned (newtype over `u32`; rendered as `{:#010x}` to match `getblockchaininfo`). |
-| `NetworkUpgradeActivation.name` | [ZIP-252](https://github.com/zcash/zips/blob/main/zips/zip-0252.rst) `NU5`, [ZIP-253](https://github.com/zcash/zips/blob/main/zips/zip-0253.md) `NU6`, NU6.1, NU7 | Carried verbatim from the node per [ADR-0015](../adrs/0015-network-parameter-discovery.md); no Zinder-side enum. |
+| `NetworkUpgradeActivation.name` | [ZIP-252](https://github.com/zcash/zips/blob/main/zips/zip-0252.rst) `NU5`, [ZIP-253](https://github.com/zcash/zips/blob/main/zips/zip-0253.md) `NU6`, NU6.1, NU7 | Carried verbatim from the node per [ADR-0008](../adrs/0008-network-parameter-discovery.md); no Zinder-side enum. |
 | `BlockHeaderInfo.commitment_bytes` | [ZIP-221](https://github.com/zcash/zips/blob/main/zips/zip-0221.rst) `hashChainHistoryRoot`, [ZIP-244](https://github.com/zcash/zips/blob/main/zips/zip-0244.rst) §3.2 `hashBlockCommitments` | Single raw 32-byte field; interpretation depends on height + upgrade. Doc comment records all three possible meanings (`hashFinalSaplingRoot`, `hashChainHistoryRoot`, `hashBlockCommitments`). |
 | `MempoolEvictionReason::Expired` | [ZIP-203](https://github.com/zcash/zips/blob/main/zips/zip-0203.rst) `nExpiryHeight` | Aligned (expiry surfaced as a removal reason, not the raw header field). |
 | `MempoolEvictionReason::LowFee` | [ZIP-401](https://github.com/zcash/zips/blob/main/zips/zip-0401.rst) `low_fee_penalty` | Aligned. |
-| `MempoolEvent::Suppressed` | [ZIP-401](https://github.com/zcash/zips/blob/main/zips/zip-0401.rst) `RecentlyEvicted` | Wire and Rust shape wired; source-side emission reserved per [ADR-0010 §Suppression](../adrs/0010-mempool-topology-and-retention.md#suppression-zip-401-recentlyevicted-is-wired-but-reserved). |
+| `MempoolEvent::Suppressed` | [ZIP-401](https://github.com/zcash/zips/blob/main/zips/zip-0401.rst) `RecentlyEvicted` | Wire and Rust shape wired; source-side emission reserved per [ADR-0007 §Suppression](../adrs/0007-mempool-topology-and-retention.md#suppression-zip-401-recentlyevicted-is-wired-but-reserved). |
 | `CompactTxStreamer`, `CompactBlock`, `CompactTx`, `BlockID`, `ChainSpec` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) | Vendored verbatim into `proto/compat/lightwalletd/`, pinned to the upstream commit in `LIGHTWALLETD_PROTOCOL_COMMIT`. Compat layer maps Zinder's `Network` strings to lightwalletd's `chainName` (`"main"`/`"test"`). |
 | `BlockSelector`, `BlockMetadata` | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `BlockID` | Intentional improvement: split request shape (oneof `height_or_hash`) from response shape (typed `BlockMetadata`); response uses `uint32` height and `block_hash` instead of `uint64` + `hash`. |
 | `ServerCapabilities.network` (`"zcash-mainnet"`, `"zcash-testnet"`, `"zcash-regtest"`) | [ZIP-307](https://github.com/zcash/zips/blob/main/zips/zip-0307.rst) `ChainSpec` | Intentional improvement: `ChainSpec` is structurally empty in ZIP-307; Zinder identifies the network with a machine-readable string. |
@@ -745,9 +745,8 @@ Zinder's vocabulary is the durable spine; this table is how to read each term in
 ## Cross-references
 
 - [Extending Artifacts cookbook](extending-artifacts.md) — the agent-extensibility checklist for adding artifact families, RPC methods, and error variants.
-- [ADR-0005: Chain event cursor sequence](../adrs/0005-chain-event-cursor-sequence.md) — the cursor body authentication contract.
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the chain-event subscription wire shape.
 - [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape) — typed Rust client surface.
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows and pruning.
-- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — mempool topology, retention windows, and protocol surface.
+- [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) — mempool topology, retention windows, and protocol surface.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — `ServerInfo` shape and deprecation rules.

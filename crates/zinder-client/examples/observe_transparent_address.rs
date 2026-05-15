@@ -1,7 +1,7 @@
 //! Worked example: observe a transparent address.
 //!
 //! Demonstrates the canonical `snapshot once, subscribe forever, re-derive
-//! on hint` pattern from [ADR-0021](../../../../docs/adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md).
+//! on hint` pattern from `docs/architecture/chain-events.md`.
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,

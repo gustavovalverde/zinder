@@ -5,13 +5,13 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Upstream node adapters, Rust API shape, and wire protocols |
-| Related | [Service boundaries](../architecture/service-boundaries.md), [Node source boundary](../architecture/node-source-boundary.md), [Protocol boundary](../architecture/protocol-boundary.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md), [Lessons from Zaino](../reference/lessons-from-zaino.md) |
+| Related | [Service boundaries](../architecture/service-boundaries.md), [Node source boundary](../architecture/node-source-boundary.md), [Protocol boundary](../architecture/protocol-boundary.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md) |
 
 ## Context
 
 Two adjacent decisions tend to collapse into one if the boundary is not explicit before code lands: the Rust trait that adapts upstream-node data, and the protocol crate that owns wire schemas. The dangerous default is letting the first working JSON-RPC client in ingest become the architecture, embedding a Zebra internal type in public configuration, or letting query handlers reach back to the upstream node when an artifact is missing.
 
-The Zaino research surfaces the failure mode repeatedly: wire, internal, and persistence types shape each other; upstream-node types leak into public configuration and service traits; consensus-critical parsing gets reimplemented outside the upstream node and Zcash primitive crates; the wallet-compatible protocol and the project's native RPC surface have no single owner; runtime lifecycle is scattered flags rather than a typed contract.
+The boundary prevents common indexer failure modes: wire, internal, and persistence types shaping each other; upstream-node types leaking into public configuration and service traits; consensus-critical parsing being reimplemented outside upstream-node and Zcash primitive crates; wallet-compatible and native RPC surfaces lacking a single owner; and runtime lifecycle collapsing into scattered flags rather than a typed contract.
 
 The Rust-specific choices follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) for predictable naming, newtypes, hidden representation, and future-proof public APIs; the [async trait guidance](https://blog.rust-lang.org/inside-rust/2023/05/03/stabilizing-async-fn-in-trait/) for keeping async traits static by default and introducing erased wrappers only at composition; and [Tokio's graceful-shutdown guidance](https://tokio.rs/tokio/topics/shutdown) for propagating cancellation tokens through long-running tasks.
 

@@ -1,11 +1,11 @@
-# ADR-0015: Per-Network Consensus Parameters Discovered From The Running Node
+# ADR-0008: Per-Network Consensus Parameters Discovered From The Running Node
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted (2026-05-12) |
+| Status | Accepted |
 | Product | Zinder |
 | Domain | Per-network consensus-rule data flow across process boundaries |
-| Related | [Chain ingestion](../architecture/chain-ingestion.md), [Public interfaces](../architecture/public-interfaces.md), [Service boundaries](../architecture/service-boundaries.md), [ADR-0006](0006-test-tiers-and-live-config.md), [ADR-0007](0007-multi-process-storage-access.md) |
+| Related | [Chain ingestion](../architecture/chain-ingestion.md), [Public interfaces](../architecture/public-interfaces.md), [Service boundaries](../architecture/service-boundaries.md), [Testing runbook](../runbooks/testing.md), [ADR-0003](0003-canonical-storage-access-boundary.md) |
 
 ## Context
 
@@ -76,7 +76,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 ### Out of scope for this ADR
 
 - Sharing the discovered table via `IngestControl` from the writer to readers. The current per-process discovery is the smallest correct fix; the unified-writer-source pattern is a future extension if cross-process drift becomes a real concern. The `NetworkUpgradeActivations` carrier type does not change shape in that future.
-- Persisting the table in the on-disk store metadata. Discovery from the live node remains the source of truth ([ADR-0006](0006-test-tiers-and-live-config.md), [ADR-0007](0007-multi-process-storage-access.md)). Operators iterating on regtest must not be punished by a store-reset cost.
+- Persisting the table in the on-disk store metadata. Discovery from the live node remains the source of truth; operators iterating on regtest must not be punished by a store-reset cost.
 
 ## Vocabulary
 

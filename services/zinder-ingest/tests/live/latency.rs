@@ -31,8 +31,8 @@ const HOSTED_BACKFILL_DEPTH_BLOCKS: u32 = 150;
 async fn read_endpoint_latency_baseline() -> Result<()> {
     let _guard = init();
     // The baseline backfills [1, tip], which only fits in CI budgets on
-    // regtest. The hosted-network calibration is pending the
-    // checkpoint-bounded backfill path (BackfillConfig::checkpoint).
+    // regtest. Hosted-network calibration uses the checkpoint-bounded test
+    // below.
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };

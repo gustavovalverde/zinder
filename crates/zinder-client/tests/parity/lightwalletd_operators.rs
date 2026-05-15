@@ -4,7 +4,7 @@
 //! third-party clients. These compile-time assertions ensure the typed
 //! `ChainIndex` methods that back compat surfaces remain on the trait.
 //!
-//! Cross-references: [Serving public lightwalletd clients](../../../../docs/reference/serving-public-lightwalletd-clients.md).
+//! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;

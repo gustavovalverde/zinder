@@ -7,7 +7,6 @@
 //
 // See:
 // - docs/architecture/service-operations.md (Health and Readiness)
-// - docs/adrs/0020-machine-readable-readiness-causes.md
 
 syntax = "proto3";
 

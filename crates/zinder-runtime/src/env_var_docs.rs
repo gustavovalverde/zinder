@@ -174,8 +174,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=cookie"),
         sensitive: true,
         description: "Inline cookie credentials (`username:password`). Mutually exclusive with \
-                      `ZINDER_NODE__AUTH__PATH`. Per ADR-0018 the variable accepts secrets so a \
-                      PaaS environment without persistent disks can supply the credential.",
+                      `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without \
+                      persistent disks.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__REQUEST_TIMEOUT_SECS",
@@ -208,7 +208,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Listen address of the private IngestControl gRPC endpoint. Localhost-only \
-                      by default; cross-host deployments must add bearer-token auth per ADR-0009.",
+                      by default; cross-host deployments must add bearer-token auth per ADR-0006.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH",
@@ -217,7 +217,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Path to the shared-secret bearer token the IngestControl endpoint enforces \
-                      on every request (ADR-0009). File-only by policy; inline secrets are \
+                      on every request (ADR-0006). File-only by policy; inline secrets are \
                       rejected at config load.",
     },
     EnvVarDoc {
@@ -237,7 +237,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
         sensitive: false,
         description: "Path to the bearer token file presented to the IngestControl writer when \
-                      the writer enforces auth (ADR-0009).",
+                      the writer enforces auth (ADR-0006).",
     },
     EnvVarDoc {
         name: "ZINDER_DERIVE__BEARER_TOKEN_PATH",
@@ -246,7 +246,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Path to the shared-secret bearer token the ExplorerQuery endpoint enforces \
-                      on cross-service derive-plane reads (ADR-0011).",
+                      on cross-service derive-plane reads.",
     },
 ];
 

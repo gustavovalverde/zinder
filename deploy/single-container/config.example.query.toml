@@ -4,7 +4,7 @@
 # The reader points at the in-process IngestControl writer over loopback;
 # operators wanting cross-host topology should set
 # `storage.ingest_control_addr` to the writer's external URL and add a
-# shared-secret bearer token (ADR-0009).
+# shared-secret bearer token (ADR-0006).
 
 [network]
 name = "zcash-testnet"

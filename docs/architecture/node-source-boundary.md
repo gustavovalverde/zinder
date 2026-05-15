@@ -122,14 +122,18 @@ Version strings may be logged and included in diagnostics, but they are not the 
 
 ## Mempool Source Adapter
 
-`zinder-source` produces `MempoolSourceEvent` values consumed by `zinder-ingest` (see [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)). Two backends are supported, selected by capability discovery:
+`zinder-source` produces `MempoolSourceEvent` values consumed by `zinder-ingest` (see [ADR-0007](../adrs/0007-mempool-topology-and-retention.md)). Two backends are supported, selected by capability discovery:
 
 - **Streaming backend** (preferred): consumes Zebra's `MempoolChange` gRPC stream when an indexer gRPC endpoint is configured. It reports `MempoolSourceCapabilities::streaming()` internally. Maps `ADDED` → `Added`, `INVALIDATED` → `Invalidated`, `MINED` → `Mined`. Sub-second latency.
 - **Polling backend** (fallback): calls `getrawmempool` on `[mempool] poll_interval_ms` (default 10000) and diffs successive responses to synthesize `Added` and `Invalidated` events. `Mined` events are inferred from chain commits, not from `getrawmempool`. Default-second latency.
 
 The backend choice is invisible to clients except through the `mempool_snapshot_age_ms` metric. Operators choose the backend by configuring whether Zebra runs with `--features indexer`; Zinder does not require the streaming backend. `wallet.snapshot.mempool_v1` and `wallet.events.mempool_v1` are advertised when the public mempool methods, storage, and retention path are reachable.
 
-Reorg interaction: Zinder's mempool reflects Zebra's `MempoolChange` directly. When a `ChainReorged` event fires in `zinder-ingest`, mempool state is **not** synthesized from the reverted block; Zinder waits for Zebra to emit corresponding `MempoolSourceEvent` values. This avoids the Zaino phantom-mempool-entry bug class.
+Reorg interaction: Zinder's mempool reflects Zebra's `MempoolChange` directly.
+When a `ChainReorged` event fires in `zinder-ingest`, mempool state is **not**
+synthesized from the reverted block; Zinder waits for Zebra to emit
+corresponding `MempoolSourceEvent` values. This keeps mempool truth tied to the
+upstream node instead of reconstructing it from reverted chain artifacts.
 
 ## Adapter Selection
 

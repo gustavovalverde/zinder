@@ -43,11 +43,9 @@ fn increment_polling_hydration_failure(reason: MempoolHydrationFailureReason) {
 
 /// Default cadence between mempool polls.
 ///
-/// Five seconds matches the trade-off between hydration cost and freshness:
-/// Zaino's 100 ms default is fine on a small mempool but consumes JSON-RPC
-/// budget that chain ingestion also needs. Operators on small deployments
-/// can shorten the interval; operators on busy nodes should keep it at the
-/// default until streaming ingestion is available.
+/// Five seconds matches the trade-off between hydration cost and freshness.
+/// Operators on small deployments can shorten the interval; operators on busy
+/// nodes should keep it at the default until streaming ingestion is available.
 pub const DEFAULT_MEMPOOL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum number of concurrent `getrawtransaction` round-trips during a single poll.

@@ -9,8 +9,8 @@
 // boundary.
 //
 // See:
+// - docs/reference/error-vocabulary.md
 // - docs/architecture/public-interfaces.md (Error vocabulary)
-// - docs/adrs/0019-typed-grpc-error-reason-vocabulary.md
 
 syntax = "proto3";
 

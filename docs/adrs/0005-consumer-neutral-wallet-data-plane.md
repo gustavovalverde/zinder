@@ -1,4 +1,4 @@
-# ADR-0008: Consumer-Neutral Wallet Data Plane
+# ADR-0005: Consumer-Neutral Wallet Data Plane
 
 | Field | Value |
 | ----- | ----- |
@@ -13,9 +13,12 @@ A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwa
 
 - `lightwalletd` exposes `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos`, and `GetAddressUtxosStream` as first-class `CompactTxStreamer` methods.
 - Zallet's `wallet` code fetches birthday tree state at `birthday - 1`, loads Sapling and Orchard subtree roots from index `0`, and polls transparent UTXOs for wallet-owned transparent receivers.
-- Zaino's direction is both compatibility RPCs and a Rust client/state-service model, with `ChainIndex` snapshot semantics for atomic non-finalized reads.
+- Zallet and in-process Rust applications need a typed `ChainIndex` model with snapshot semantics for atomic non-finalized reads.
 
-The architectural risk is treating the first failing wallet as the design center. A Zashi-shaped patch would make the current demo pass while leaving Zinder without a durable consumer contract. The opposite risk is becoming lightwalletd: compatibility is necessary, but it is not Zinder's native product identity.
+The architectural risk is treating one wallet as the design center. App-specific
+patches would leave Zinder without a durable consumer contract. The opposite
+risk is becoming lightwalletd: compatibility is necessary, but it is not
+Zinder's native product identity.
 
 ## Decision
 
@@ -50,7 +53,9 @@ Serving coverage fails closed:
 
 ### Compatibility and native surfaces
 
-`zinder-compat-lightwalletd` implements legacy `CompactTxStreamer` semantics as an adapter. It may preserve lightwalletd field names and wire behavior, but it does not own storage, query semantics, or product vocabulary.
+`zinder-compat-lightwalletd` implements `CompactTxStreamer` semantics as an
+adapter. It preserves lightwalletd field names and wire behavior, but it does
+not own storage, query semantics, or product vocabulary.
 
 `zinder-client::ChainIndex` is the native Rust integration direction for Zallet and future in-process consumers. Its method names, typed errors, and epoch-pinned variants may diverge from lightwalletd when that improves DX, UX, or AX. Compatibility and native-client readiness are validated separately.
 
@@ -90,7 +95,7 @@ Upstream-node fallback is rejected. It would blur the source of truth, make read
 
 ## Out of Scope
 
-- Zashi-only endpoint behavior.
+- App-specific endpoint behavior.
 - A separate per-wallet coverage profile.
 - Public by-address shielded queries.
 - Mempool UTXO completeness; the mempool surface owns mempool indexing.

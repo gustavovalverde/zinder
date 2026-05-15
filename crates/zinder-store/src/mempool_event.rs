@@ -4,8 +4,9 @@
 //! variant carries a hydrated [`MempoolEntry`]; `Invalidated` and `Mined`
 //! variants carry the affected transaction id with a reason or mined
 //! height. `Suppressed` carries the txid when the upstream node refuses
-//! admission (ZIP-401 `RecentlyEvicted`; source-side emission reserved per
-//! ADR-0010). The envelope binds the event to its cursor token, monotonic
+//! admission (ZIP-401 `RecentlyEvicted`; source-side emission is reserved
+//! until the node exposes pre-admission visibility). The envelope binds the
+//! event to its cursor token, monotonic
 //! sequence, and source-observation timestamp.
 
 use zinder_core::{BlockHash, BlockHeight, MempoolEntry, MempoolEvictionReason, TransactionId};
@@ -74,7 +75,7 @@ pub enum MempoolEvent {
     /// ZIP-401 `RecentlyEvicted` (the node drops re-broadcasts of a txid it
     /// recently evicted). The variant is wired through the wire and event
     /// log so external integrators can subscribe; source-side emission is
-    /// pending node-side visibility per ADR-0010 §Suppression.
+    /// pending node-side visibility as documented by the mempool topology.
     Suppressed {
         /// Identifier of the suppressed transaction.
         transaction_id: TransactionId,

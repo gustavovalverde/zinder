@@ -6,7 +6,7 @@ This document defines the boundary, input and output contracts, failure model, r
 
 ## Purpose
 
-Zaino's tracker shows what happens when explorer features and wallet sync share storage and write paths: every explorer addition either grows the canonical schema (forcing migrations) or creates a hidden dependency that breaks wallet sync ([Lessons from Zaino Pattern 4](../reference/lessons-from-zaino.md#pattern-4-storage-as-a-linear-migration-ladder)). Zinder avoids this by keeping the derive plane separate from canonical state.
+Explorer features and wallet sync have different ownership rules. If explorer additions grow the canonical schema or create hidden dependencies in wallet sync, the store stops being a wallet correctness boundary and becomes a mixed product database. Zinder avoids that by keeping the derive plane separate from canonical state.
 
 Concretely, the derive plane:
 
@@ -57,7 +57,7 @@ The shipped consumer-side helper is `zinder_derive::run_chain_events_subscriber`
 
 ### Channel B — `MempoolEvents` subscription
 
-For views that include unconfirmed activity. A `zinder-derive` consumer subscribes to `WalletQuery.MempoolEvents` (defined in [ADR-0010](../adrs/0010-mempool-topology-and-retention.md)) with a persisted `MempoolStreamCursorV1` cursor.
+For views that include unconfirmed activity. A `zinder-derive` consumer subscribes to `WalletQuery.MempoolEvents` (defined in [Wallet data plane §Mempool Snapshot and Subscription](wallet-data-plane.md#mempool-snapshot-and-subscription) and [ADR-0007](../adrs/0007-mempool-topology-and-retention.md)) with a persisted `MempoolStreamCursorV1` cursor.
 
 Combine with Channel A when the view needs both chain and mempool perspectives (e.g. explorer dashboards showing pending transactions alongside confirmed activity). The two streams have independent cursors and independent retention; consumers handle cross-stream ordering.
 
@@ -89,9 +89,9 @@ The service's capability strings use the `derive.<consumer>.<capability>_v{N}` n
 
 ### Shape 2 — Federated under `WalletQuery`
 
-For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in `services/zinder-derive` (or a dedicated derive crate) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) is owned by [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) and lives in `services/zinder-query/src/derive_proxy.rs`; every federated derive method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
+For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in `services/zinder-derive` (or a dedicated derive crate) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) lives in `services/zinder-query/src/derive_proxy.rs`; every federated derive method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
 
-The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-derive` when the derive plane is configured and ready. When the derive plane is unavailable, the native adapter falls back to the always-on canonical-confirmed compute path on the same RPC ([ADR-0017](../adrs/0017-compute-at-read-time-at-the-compat-boundary.md)); `WalletQuery.ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `derive.explorer.transparent_balance_v1` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `derive.explorer.server_info_v1` ready inside the configured window. The derive capability signals that the response additionally carries the live mempool overlay in `unconfirmed_delta_zat`; the wallet capability signals confirmed totals from canonical UTXOs.
+The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-derive` when the derive plane is configured and ready. When the derive plane is unavailable, the native adapter falls back to the always-on canonical-confirmed compute path on the same RPC; `WalletQuery.ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `derive.explorer.transparent_balance_v1` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `derive.explorer.server_info_v1` ready inside the configured window. The derive capability signals that the response additionally carries the live mempool overlay in `unconfirmed_delta_zat`; the wallet capability signals confirmed totals from canonical UTXOs.
 
 This shape is reserved for views that wallets and applications consume *as if* they were canonical. The `derive.*` capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 
@@ -189,9 +189,8 @@ Sensitive upstream node credentials never reach the derive plane. The derive pla
 - [Chain Events](chain-events.md) — the event vocabulary the derive plane consumes.
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) — the subscription contract.
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows that bound derive-consumer downtime tolerance.
-- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
-- [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) — the federation primitive (`DeriveProxy<Client>`, readiness probe loop, capability namespace rule) that every federated derive method reuses.
-- [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md) — the first shipped derive consumer (transparent address balance), the consumer SDK contract, and the operational topology the rest of this doc describes in architectural terms.
-- [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) — the Shape C compute-at-read-time pattern that the explorer balance handler implements.
+- [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
+- [Extending the wallet data plane §Federation extension](extending-the-wallet-data-plane.md#federation-extension) — the concrete extension checklist for federated derive methods.
+- [Wallet data plane §Transparent Address Balance](wallet-data-plane.md#transparent-address-balance) — the first shipped federated derive consumer and its capability contract.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — the capability protocol derive consumers must implement.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions that derive consumers inherit.

@@ -10,7 +10,7 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 - [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the four runtimes (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, `zinder-derive`).
 - [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (types, errors, config fields, capability strings).
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
-- [docs/adrs/0007-multi-process-storage-access.md](docs/adrs/0007-multi-process-storage-access.md): the writer/reader topology, secondary catchup, and writer-status RPC.
+- [docs/adrs/0003-canonical-storage-access-boundary.md](docs/adrs/0003-canonical-storage-access-boundary.md): the epoch-bound storage API, writer/reader topology, secondary catchup, and writer-status RPC.
 
 Before changing public types, storage layouts, protocol bytes, or service boundaries, read the relevant doc above and amend it in the same change.
 
@@ -30,7 +30,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner; the test tiers and live configuration are documented in the [Testing Runbook](docs/runbooks/testing.md). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage/parser changes (also run by scheduled CI):
 
@@ -47,7 +47,7 @@ Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<tes
 
 ## Live Node Tests (T3)
 
-Network-touching tests live under `tests/live/` ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)). They are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and a `zinder_testkit::live::require_live()` runtime check, and read the same env-var schema as production binaries.
+Network-touching tests live under `tests/live/`. They are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and a `zinder_testkit::live::require_live()` runtime check, and read the same env-var schema as production binaries.
 
 Regtest:
 
@@ -91,7 +91,7 @@ ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR=http://127.0.0.1:9088 \
     -E 'test(/^live::parity_against_lightwalletd::/)'
 ```
 
-`require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. Local mainnet runs are supported against an operator-hosted Zebra; the CI matrix shape for T3 mainnet is still being finalized per [ADR-0006 §Open mainnet infrastructure questions](docs/adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions).
+`require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. Local mainnet runs are supported against an operator-hosted Zebra.
 
 Mainnet (operator-hosted Zebra):
 
@@ -136,7 +136,7 @@ Practical effects:
 - Use `#[non_exhaustive]` for public enums expected to gain variants.
 - Supported build targets must have a pointer width of at least 32 bits; `zinder-core` enforces this so infallible `u32` to `usize` conversions stay honest.
 - "Service" means a deployable runtime, not a Rust trait or struct name. Do not create types named `*Service`, `*Manager`, `*Handler`, `*Helper`, or modules named `utils`, `common`, `helpers`. Full vocabulary in [public-interfaces.md](docs/architecture/public-interfaces.md).
-- Wire-boundary identifier translations live in `crates/zinder-core/src/wire/` (pure-domain helpers) and `crates/zinder-proto/src/wire/` (proto-enum mappings). Adding a new wire field starts there: locate or add a function for the concept, then call it from the boundary. Inline `transaction_id.as_bytes()`, inline `format!("{:08x}", ...)`, hardcoded capability literals, and duplicate `Network` to wire-string tables outside those modules are forbidden patterns (see [ADR-0016](docs/adrs/0016-wire-conventions-and-zebra-alignment.md); enforced by `wire_invariants.rs` and `capability_string_uniqueness.rs` on every `cargo nextest run --profile=ci`).
+- Wire-boundary identifier translations live in `crates/zinder-core/src/wire/` (pure-domain helpers) and `crates/zinder-proto/src/wire/` (proto-enum mappings). Adding a new wire field starts there: locate or add a function for the concept, then call it from the boundary. Inline `transaction_id.as_bytes()`, inline `format!("{:08x}", ...)`, hardcoded capability literals, and duplicate `Network` to wire-string tables outside those modules are forbidden patterns (see [Public interfaces §Wire Conventions](docs/architecture/public-interfaces.md#wire-conventions); enforced by `wire_invariants.rs` and `capability_string_uniqueness.rs` on every `cargo nextest run --profile=ci`).
 
 ## Protobuf Generation
 

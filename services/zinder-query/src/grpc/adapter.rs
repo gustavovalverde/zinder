@@ -554,7 +554,7 @@ where
         // Prefer the federated derive plane when configured and ready: it adds
         // the mempool overlay that canonical-only compute cannot supply. Fall
         // back to the always-on canonical-confirmed-balance path otherwise so
-        // the RPC stays answerable without `zinder-derive`. See ADR-0017.
+        // the RPC stays answerable without `zinder-derive`.
         if let Some(proxy) = self
             .explorer_proxy
             .as_ref()

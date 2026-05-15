@@ -83,11 +83,21 @@ ChainEventEnvelope
 
 The Substreams last-irreversible-block pattern maps to Zinder's `finalized_height`. Every envelope carries the finalized height that was true for that event. Consumers may discard undo state at or below that height.
 
-`StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md) and [ADR-0005](../adrs/0005-chain-event-cursor-sequence.md). It carries the event sequence, last height, and last hash for one chain-event stream. Adding a second cursor format for chain events requires a new ADR.
+`StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). It carries the event sequence, last height, and last hash for one chain-event stream. Adding a second cursor format for chain events requires updating this contract and the boundary-specific serialization ADR.
 
 The wallet-facing exposure of this envelope is settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription): the same `ChainEventEnvelope` shape is published as a `zinder.v1.wallet` proto message and streamed by `WalletQuery.ChainEvents`. The cursor crosses the wire as opaque bytes so wallet clients persist the exact bytes they received and replay strictly after them on reconnect.
 
 The cursor body is not decorative state. `event_sequence` is the resume key, and `last_height` plus `last_hash` are position checks for the event that produced the cursor. If future stream families add cursor fields that are not immediately consumed, the field must be documented as reserved in the stream-specific contract before it is serialized.
+
+## Address Filters
+
+`WalletQuery.ChainEvents` accepts an optional `address_filter` containing transparent addresses. This filter is an invalidation hint, not a per-address event stream:
+
+- An empty filter delivers every envelope for the requested stream family.
+- A non-empty filter delivers `ChainCommitted` envelopes only when at least one filtered transparent address appears in the committed block range according to the transparent-address transaction-history index.
+- `ChainReorged` envelopes always pass through because consumers must invalidate cached derivations after a reorg regardless of which addresses they watch.
+- Cursor bytes remain opaque and independent of the filter. A client that resumes with a different filter receives the envelope set produced by applying the new filter from the cursor forward.
+- The current touch detection is backed by the transparent-address history index; clients still re-derive per-address state from canonical compact blocks or transparent-address read APIs after receiving a hint.
 
 ## Resume Semantics
 
@@ -180,4 +190,4 @@ Avoid `event_service`, `reorg_manager`, `notification_handler`, `source_processo
 ## Cross-References
 
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) defines the public wire surface (`WalletQuery.ChainEvents`, `ChainEventEnvelope`, `ChainCommitted`, `ChainReorged`).
-- [ADR-0010](../adrs/0010-mempool-topology-and-retention.md) defines the parallel mempool event stream and its `MempoolStreamCursorV1` cursor body.
+- [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) defines the parallel mempool event stream and its `MempoolStreamCursorV1` cursor body.

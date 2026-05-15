@@ -10,10 +10,10 @@ Zinder exposes three protocol families:
 
 | Surface | Rust module | Served by | Purpose |
 | ------- | ----------- | --------- | ------- |
-| Native wallet/application API | `zinder_proto::v1::wallet` | `zinder-query` | Future-facing Zinder query API |
+| Native wallet/application API | `zinder_proto::v1::wallet` | `zinder-query` | Primary Zinder query API |
 | Private ingest control API | `zinder_proto::v1::ingest` | `zinder-ingest` | Writer status and retained chain-event replay for secondary readers |
 | Internal epoch API | `zinder_proto::v1::epoch` | `zinder-ingest` or read sidecar | Epoch-bound canonical reads and chain-event history |
-| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Existing wallet migration path |
+| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Lightwalletd-compatible wallet surface |
 
 Native protocol naming must not copy lightwalletd names unless the concept is truly identical. Compat protocol naming must not be rewritten into Zinder terminology because it is a compatibility contract.
 
@@ -110,7 +110,7 @@ The current native network service exposes Zinder concepts:
 - `TreeState`, `LatestTreeState`, `SubtreeRoots`
 - `ServerInfo`
 
-The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 
 Native read requests that depend on canonical chain state carry an optional
 `at_epoch` field. When it is absent, the server answers from the visible epoch
@@ -261,7 +261,7 @@ Capability strings follow `domain.subdomain.capability_name_v{N}`. The naming sp
 
 `buf breaking` runs as a CI gate on every PR touching the owned Zinder proto tree and rejects package-level non-additive changes. `buf lint` also checks the owned Zinder proto package layout. The vendored lightwalletd protos under `proto/compat/lightwalletd/` are excluded from Buf because they are governed by the upstream commit pin and the existing `vendored proto drift` job.
 
-v1 carries no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)). Each wire shape pairs with one capability identifier; a shape change lands as a new `_vN` identifier and the old method may be removed in the same release. A deprecation policy ADR lands when a published consumer constraint exists.
+Each wire shape pairs with one capability identifier. A shape change lands as a new `_vN` identifier. Removing an older capability requires the owning architecture document to name the consumer constraint and removal rule.
 
 A second CI gate, `capability-coverage`, asserts that every `WalletQuery` RPC has a corresponding entry in `crates/zinder-proto/src/capabilities.rs::ZINDER_CAPABILITIES`. Adding an RPC without a capability string fails the job.
 

@@ -12,7 +12,7 @@ This document covers three related but distinct extension shapes. Pick the right
 |---|---|---|
 | A new typed read method on existing artifacts | This doc | The data is already in storage; you need a new way to access it |
 | A new artifact family (new storage) | [Extending artifacts](extending-artifacts.md) | The data is chain-derived but not yet persisted |
-| A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) + [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) | The data is materialized in `zinder-derive` and surfaced through `WalletQuery` |
+| A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) | The data is materialized in `zinder-derive` and surfaced through `WalletQuery` |
 
 Each wire shape pairs with one capability string. Changing the shape of an `_v1` response requires landing a new `_v2` capability; the `_vN` suffix is part of the identity, not a version field decoded by clients (per [Public interfaces §Capability discovery](public-interfaces.md#capability-discovery)).
 
@@ -150,7 +150,7 @@ File: `services/zinder-compat-lightwalletd/src/grpc.rs`
 Add the arm only if the lightwalletd `CompactTxStreamer` proto names a corresponding method.
 
 - The compat shim reads only through `self.query_api.method_name(...)` on `WalletQueryApi`; it never touches RocksDB or gRPC directly.
-- The compat shim builds lightwalletd-shaped types directly, projecting confirmed/unconfirmed splits onto legacy single-field shapes (e.g. `Balance { value_zat }` is the confirmed total; `unconfirmed_delta_zat` is silently dropped at the lightwalletd boundary).
+- The compat shim builds lightwalletd-shaped types directly, projecting confirmed/unconfirmed splits onto single-field lightwalletd shapes (e.g. `Balance { value_zat }` is the confirmed total; `unconfirmed_delta_zat` is silently dropped at the lightwalletd boundary).
 - Inventing surfaces absent from the vendored `CompactTxStreamer` proto is forbidden per [Service boundaries](service-boundaries.md).
 
 ### Step 13 — Integration tests
@@ -167,7 +167,7 @@ Required for range reads where N-block reads could regress. Not required for poi
 
 ## Federation extension
 
-When the new RPC delegates to `zinder-derive`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. See [ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md) for the design rationale.
+When the new RPC delegates to `zinder-derive`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. The design rationale and boundary rules live in [Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery).
 
 ### F1. ExplorerQuery proto
 
@@ -247,7 +247,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
 | `derive.{consumer}.*` | Federated derive-plane methods | `derive.explorer.transparent_balance_v1` |
 
-Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md).
+Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests.
 
 ## Two discipline gates
 
@@ -260,7 +260,9 @@ A close-out PR that fails any of these has not landed correctly.
 
 ## Anti-patterns to refuse
 
-The wallet data plane refuses these specific Zaino-era shapes. A PR proposing any of them must explain why the case is different from the documented refusal.
+The wallet data plane refuses these shapes because they couple the native API to
+implementation-specific transport habits. A PR proposing any of them must
+explain why the case is different from the documented refusal.
 
 | Anti-pattern | Refusal in code |
 |---|---|
@@ -268,7 +270,7 @@ The wallet data plane refuses these specific Zaino-era shapes. A PR proposing an
 | Verbose boolean | `block_header_by_selector` returns typed `BlockHeaderInfo`, no `verbose: bool` |
 | String-keyed pool | `ShieldedProtocol` enum at every layer |
 | Sentinel-overloaded `BlockId` | `BlockSelector` oneof; `BlockId` is return-only |
-| `zaino_proto::*` types on Rust API | `ChainIndex` trait takes / returns `zinder-core` types only |
+| External proto types on Rust API | `ChainIndex` trait takes / returns `zinder-core` types only |
 
 ## Worked examples
 
@@ -300,7 +302,7 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F6: capabilities `derive.explorer.server_info_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
-The compute shape is Shape C (compute at read time, federated UTXO sum + live mempool overlay) per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md); the accumulator-backed Shape A is reserved as a future read-path optimization that does not change the public wire shape ([ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)).
+The compute shape is compute at read time: canonical confirmed totals are summed from transparent UTXOs, and the derive plane adds the live mempool overlay. An accumulator-backed read optimization may land later without changing the public wire shape or capability strings.
 
 ### Example 4 — `TransparentPrevouts` and `TransparentMempoolPrevouts`
 
@@ -313,7 +315,7 @@ A pair of canonical wallet-plane reads that resolve outpoints to their reference
 - `ChainIndex` exposes three methods: `transparent_prevouts`, `transparent_prevouts_at_epoch`, `transparent_mempool_prevouts`.
 - No compat-shim counterpart: `CompactTxStreamer` has no prevout endpoint, and the cookbook forbids inventing one.
 
-[ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md) locks the **compute-at-read-time pattern**: a parse helper in `zinder-source` extracts the requested view from an existing artifact's payload at read time without committing new storage. The public wire shape and capability string never depend on the storage shape, so a future Shape A landing (a dedicated column family) would not bump the capability or change the response message.
+The **compute-at-read-time pattern** is the current read-model rule: a parse helper in `zinder-source` extracts the requested view from an existing artifact's payload at read time without committing new storage. The public wire shape and capability string never depend on the storage shape, so a future dedicated column family would not bump the capability or change the response message.
 
 ## Common mistakes
 
@@ -321,7 +323,7 @@ Each entry references the discipline gate that catches it.
 
 - **Adding a public method without a capability string.** Fails capability-coverage; capability_docs both. Add the string in the same commit.
 - **Adding a capability string without updating the docs mirrors.** Fails capability_docs. Update `public-interfaces.md` and `runbooks/testing.md`.
-- **Putting a federated method under `wallet.*` instead of `derive.{consumer}.*`.** Fails per [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md) capability-coverage assertions.
+- **Putting a federated method under `wallet.*` instead of `derive.{consumer}.*`.** Fails capability-coverage assertions.
 - **Computing `confirmations` or `block_time` from a re-read latest tip.** Violates the response enrichment rule. Use `MinedDetails::from_response_epoch` or analogous epoch-bound constructor.
 - **Returning a `tonic::Status` or `zinder_proto::*` type from `ChainIndex`.** Violates the rule that the trait takes / returns only `zinder-core` types. Add a `from_status` mapping at the adapter boundary.
 
@@ -332,4 +334,3 @@ Each entry references the discipline gate that catches it.
 - [Service boundaries](service-boundaries.md): which runtime owns what.
 - [Extending artifacts](extending-artifacts.md): companion cookbook for new artifact families.
 - [Derive plane](derive-plane.md): federation overview.
-- [ADR-0011: Derive-plane federation pattern](../adrs/0011-derive-plane-federation-pattern.md): the federation primitive.

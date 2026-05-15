@@ -9,8 +9,8 @@ use zinder_store::{ArtifactFamily, StoreError};
 
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
-/// Matches [ADR-0019](../../../docs/adrs/0019-typed-grpc-error-reason-vocabulary.md);
-/// duplicated here so the client does not need to depend on a service crate.
+/// Matches the error vocabulary reference; duplicated here so the client does
+/// not need to depend on a service crate.
 const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 
 /// Suggested retry policy attached to every [`IndexerError`].

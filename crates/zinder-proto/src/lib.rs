@@ -16,8 +16,8 @@ pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] =
 /// Encoded descriptor set for the vendored lightwalletd compatibility schemas.
 ///
 /// Mirrors [`ZINDER_V1_FILE_DESCRIPTOR_SET`] for the compat shim's
-/// `CompactTxStreamer` surface so legacy wallets can discover the served
-/// service via gRPC reflection.
+/// `CompactTxStreamer` surface so lightwalletd-compatible wallets can discover
+/// the served service via gRPC reflection.
 pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/lightwalletd_compat_descriptor.bin"

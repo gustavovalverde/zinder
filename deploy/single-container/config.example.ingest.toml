@@ -3,7 +3,7 @@
 #
 # Each binary strict-parses its own TOML schema (deny_unknown_fields), so the
 # writer and reader live in separate files. Secrets prefer PaaS-injected env
-# vars per ADR-0018:
+# vars:
 #
 #   ZINDER_NODE__AUTH__METHOD=cookie
 #   ZINDER_NODE__AUTH__COOKIE=<cookie-content>

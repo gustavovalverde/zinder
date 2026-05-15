@@ -4,7 +4,7 @@ Zinder is a service-oriented Zcash indexer. It separates the chain ingestion pla
 
 ## Why Zinder
 
-Zinder is the Zcash chain indexer for wallets, explorers, and application backends that need a stable, epoch-consistent data plane on top of [Zebra](https://github.com/ZcashFoundation/zebra). The v1 deployment target is a self-hosted, single-operator service backed by one configured Zebra node. [Zodl](https://github.com/zodl-inc/zodl-android), formerly Zashi, and other lightwalletd-compatible clients connect through the compatibility adapter; [Zallet](https://github.com/zcash/wallet) and other Rust consumers integrate through the typed client. Public multi-tenant hosting, TLS termination, authentication, rate limiting, and quota accounting are out of v1 scope.
+Zinder is the Zcash chain indexer for wallets, explorers, and application backends that need a stable, epoch-consistent data plane on top of [Zebra](https://github.com/ZcashFoundation/zebra). The deployment target is a self-hosted, single-operator service backed by one configured Zebra node. Lightwalletd-compatible clients connect through the compatibility adapter; [Zallet](https://github.com/zcash/wallet) and Rust applications integrate through the typed client. Operators place TLS termination, authentication, rate limiting, and quota accounting in front of Zinder when they need a public endpoint.
 
 ### Approach
 
@@ -16,29 +16,27 @@ Zinder is the Zcash chain indexer for wallets, explorers, and application backen
 
 ### What to expect
 
-**For wallet developers.** A stable native gRPC API designed not to churn with Zebra releases, plus drop-in `CompactTxStreamer` compatibility for existing clients. The wallet surface covers compact blocks, tree state, subtree roots, transaction lookup, typed broadcast, chain events, mempool views, and transparent-address artifacts. Each feature has an explicit capability string rather than being hidden inside the read-sync API.
+**For wallet developers.** A stable native gRPC API designed not to churn with Zebra releases, plus `CompactTxStreamer` compatibility for lightwalletd clients. The wallet surface covers compact blocks, tree state, subtree roots, transaction lookup, typed broadcast, chain events, mempool views, and transparent-address artifacts. Each feature has an explicit capability string rather than being hidden inside the read-sync API.
 
 **For operators.** Explicit `/healthz`, `/readyz`, and `/metrics` endpoints with typed readiness causes (`syncing`, `node_unavailable`, `reorg_window_exceeded`, and others), so load balancers and incident response act on machine-readable state. Network-aware defaults for mainnet, testnet, and regtest. Production configuration that refuses to start with placeholder credentials, unsafe binds, or missing storage. Capability detection at source connection time instead of hard version pins.
 
 **For explorer and application backends.** Epoch-consistent reads through a typed query API. Replayable downstream derived indexes (`zinder-derive`) that consume canonical artifacts and can be rebuilt without affecting wallet sync. Additive artifact families that land as new column families without central enum edits.
 
-**For Rust consumers.** A typed client crate (`zinder-client`) exposing `ChainIndex`, with two implementations selected by deployment topology: `LocalChainIndex` for colocated consumers (RocksDB-secondary reads, no tonic round-trip) and `RemoteChainIndex` for cross-host consumers (gRPC). Zallet and future Rust integrations consume the same trait.
+**For Rust consumers.** A typed client crate (`zinder-client`) exposing `ChainIndex`, with two implementations selected by deployment topology: `LocalChainIndex` for colocated consumers (RocksDB-secondary reads, no tonic round-trip) and `RemoteChainIndex` for cross-host consumers (gRPC). Zallet and Rust applications consume the same trait.
 
 ### Upstream context
 
 - [Zebra](https://github.com/ZcashFoundation/zebra): the ZFND Zcash node and Zinder's primary upstream node source.
-- [Zodl](https://github.com/zodl-inc/zodl-android), formerly Zashi: a mobile wallet served through Zinder's lightwalletd-compatible adapter and validated with real wallet flows.
+- [Zodl](https://github.com/zodl-inc/zodl-android): a mobile wallet served through Zinder's lightwalletd-compatible adapter.
 - [Zallet](https://github.com/zcash/wallet): the full-node wallet that integrates through Zinder's native typed Rust client.
 - [lightwalletd](https://github.com/zcash/lightwalletd): the `CompactTxStreamer` protocol Zinder implements as a compatibility surface.
-- [Zaino](https://github.com/zingolabs/zaino): ecosystem prior-art reference; not a Zinder dependency.
 
 ### Further reading
 
 - [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
 - [Service boundaries](docs/architecture/service-boundaries.md): the boundary contract Zinder is built against.
-- [Lessons from Zaino](docs/reference/lessons-from-zaino.md): prior-art lessons from Zaino's public tracker and how they inform Zinder's product guarantees.
-- [Serving Zebra and Zallet](docs/reference/serving-zebra-and-zallet.md): how Zinder fits between the upstream node and the full-node wallet.
-- [Architecture index](docs/README.md): full ADR and architecture doc index.
+- [Integration surfaces](docs/reference/integration-surfaces.md): how wallet, application, explorer, and operator clients connect to Zinder.
+- [Architecture index](docs/README.md): full documentation index.
 
 ## Architecture at a glance
 
@@ -67,7 +65,7 @@ flowchart LR
 
     Zebra --> Source
     Query --> NativeClients["Zallet, native wallets, Rust SDKs"]
-    Compat --> LegacyClients["Zodl, Android SDK, lightwalletd clients"]
+    Compat --> LightwalletdClients["Zodl, Android SDK, lightwalletd clients"]
     Derive --> Explorers["explorers, analytics"]
 ```
 
@@ -75,7 +73,7 @@ flowchart LR
 
 - **Node source boundary** (`zinder-source`). All Zebra node coupling is isolated here. Adapters normalize upstream node observations into `NodeSource` values; no other crate imports Zebra or source-specific types, so a new source backend is a new module here rather than a workspace-wide refactor. See [node source boundary](docs/architecture/node-source-boundary.md).
 - **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns backfill, tip following, reorg handling, artifact builders, and the atomic chain-epoch commit (`commit_ingest_batch`) that makes a new epoch visible. See [chain ingestion](docs/architecture/chain-ingestion.md) and [chain events](docs/architecture/chain-events.md).
-- **Canonical storage** (`zinder-store`). RocksDB-backed `PrimaryChainStore` and `SecondaryChainStore` role handles exposed to services through the domain-shaped `ChainEpochReadApi`. RocksDB types are private; the public read API is epoch-bound, so callers always resolve one `ChainEpoch` before reading any artifact. See [storage backend](docs/architecture/storage-backend.md), [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md), and [ADR-0007](docs/adrs/0007-multi-process-storage-access.md).
+- **Canonical storage** (`zinder-store`). RocksDB-backed `PrimaryChainStore` and `SecondaryChainStore` role handles exposed to services through the domain-shaped `ChainEpochReadApi`. RocksDB types are private; the public read API is epoch-bound, so callers always resolve one `ChainEpoch` before reading any artifact. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
 - **Wallet data plane** (`zinder-query`). Read-only wallet and application API over `WalletQueryApi`, served as the native `WalletQuery` gRPC service. Owns compact block ranges, tree state, subtree roots, transaction lookup, transaction broadcast, the public `ChainEvents` proxy, mempool snapshots/events, and transparent-address reads. Never calls upstream nodes, never writes storage, never custodies keys. See [wallet data plane](docs/architecture/wallet-data-plane.md).
 - **Compatibility plane** (`zinder-compat-lightwalletd`). Translates the vendored lightwalletd `CompactTxStreamer` calls onto `WalletQueryApi`. A pure translation layer: it has no source client, no canonical storage handle, and no parallel artifact construction. New compatibility adapters must use the same shape. See [protocol boundary](docs/architecture/protocol-boundary.md).
 - **Derive plane** (`zinder-derive`, optional). Replayable materialized views (explorer indexes, analytics aggregates, compliance projections) that consume canonical artifacts and the `ChainEvents` stream. Cannot affect canonical state; any derived view can be discarded and rebuilt from canonical artifacts, which is the test for whether a feature belongs here versus in canonical storage. See [derive plane](docs/architecture/derive-plane.md).
@@ -115,7 +113,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory ([ADR-0006](docs/adrs/0006-test-tiers-and-live-config.md)): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the real Zallet binary gate when a Zinder-native Zallet build is available. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the real Zallet binary gate when a Zinder-native Zallet build is available. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage or parser changes:
 
@@ -140,7 +138,7 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-For testnet, swap `ZINDER_NETWORK=zcash-testnet` and use Zebra cookie auth (the cookie file's `user:pass` split feeds `ZINDER_NODE__AUTH__USERNAME` and `ZINDER_NODE__AUTH__PASSWORD`). Mainnet runs are `workflow_dispatch`-only until [ADR-0012 §Open mainnet infrastructure questions](docs/adrs/0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions-parked) resolve.
+For testnet, swap `ZINDER_NETWORK=zcash-testnet` and use Zebra cookie auth (the cookie file's `user:pass` split feeds `ZINDER_NODE__AUTH__USERNAME` and `ZINDER_NODE__AUTH__PASSWORD`). Mainnet live tests require an explicit mainnet opt-in as documented in the [Testing Runbook](docs/runbooks/testing.md).
 
 ## Local Observability Smoke
 

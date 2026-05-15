@@ -6,7 +6,7 @@
 #
 # This image exposes the public WalletQuery gRPC surface. Pair with the
 # zinder-ingest image (which owns the canonical store) and a writer-side
-# IngestControl proxy endpoint; see ADR-0007 for the topology.
+# IngestControl proxy endpoint; see ADR-0003 for the topology.
 
 ARG RUST_VERSION=1.91
 ARG DEBIAN_RELEASE=bookworm

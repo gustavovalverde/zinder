@@ -1,15 +1,15 @@
-# ADR-0010: Mempool Topology and Retention
+# ADR-0007: Mempool Topology and Retention
 
 | Field | Value |
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Mempool surface, write-side topology, read-side proxy, retention |
-| Related | [ADR-0005](0005-chain-event-cursor-sequence.md), [ADR-0007](0007-multi-process-storage-access.md), [ADR-0009](0009-ingest-control-transport-security.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Storage backend](../architecture/storage-backend.md), [Chain ingestion](../architecture/chain-ingestion.md), [Service operations](../architecture/service-operations.md), [Public interfaces](../architecture/public-interfaces.md) |
+| Related | [Chain events](../architecture/chain-events.md), [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0006](0006-ingest-control-transport-security.md), [Wallet data plane](../architecture/wallet-data-plane.md), [Storage backend](../architecture/storage-backend.md), [Chain ingestion](../architecture/chain-ingestion.md), [Service operations](../architecture/service-operations.md), [Public interfaces](../architecture/public-interfaces.md) |
 
 ## Context
 
-[ADR-0007](0007-multi-process-storage-access.md) settles the writer / secondary-reader topology for canonical chain state. The mempool surface is structurally similar (writer-owned live state, reader-owned secondary access) but differs in three ways the chain-state design did not have to answer:
+[ADR-0003](0003-canonical-storage-access-boundary.md) settles the writer / secondary-reader topology for canonical chain state. The mempool surface is structurally similar (writer-owned live state, reader-owned secondary access) but differs in three ways the chain-state design did not have to answer:
 
 - A mempool transaction's lifetime is bounded by network behavior, not by chain commits. Retention is per-variant: a `Mined` event is interesting only until the wallet has resynced past the height; an `Invalidated` event is interesting until the wallet has decided whether to rebroadcast; an `Added` event is only interesting while the transaction is still in the mempool.
 - The live `MempoolIndex` cannot be a column-family read. It is in-process state computed from a streaming source, and a secondary RocksDB reader cannot observe it without a control-plane handoff. Chain state has the inverse property: the visible epoch is precisely what the canonical store records.
@@ -34,15 +34,15 @@ The split exists because the live index needs to answer transparent lookups in m
 
 ### Compat and query reach the writer through `IngestControl`, not a second source connection
 
-`zinder-query` and `zinder-compat-lightwalletd` are secondary RocksDB readers per ADR-0007. The mempool live state is not in RocksDB, so the secondary readers cannot observe it directly. Two options were considered:
+`zinder-query` and `zinder-compat-lightwalletd` are secondary RocksDB readers per ADR-0003. The mempool live state is not in RocksDB, so the secondary readers cannot observe it directly. Two options were considered:
 
 1. Each reader opens its own `MempoolSource` connection to the upstream node and maintains its own `MempoolIndex`.
 2. Each reader proxies `MempoolSnapshot` and `MempoolEvents` through the writer's `IngestControl` gRPC endpoint, which already terminates `WriterStatus` and `ChainEvents`.
 
 Zinder picks option 2. The decisive constraints are:
 
-- Two `MempoolIndex` instances diverge under load. A wallet that hits compat for `GetMempoolStream` and `WalletQuery` for `transaction_by_id` must see a single mempool, not a per-process one. Source-of-truth duplication would recreate the multi-cache class of bug documented in the Zaino reference.
-- Operators already wire one privileged path from secondary readers to the writer (writer status). Adding mempool to that path costs no new transport, no new auth surface, no new firewall rules. ADR-0009's bearer token already covers `MempoolSnapshot` and `MempoolEvents`.
+- Two `MempoolIndex` instances diverge under load. A wallet that hits compat for `GetMempoolStream` and `WalletQuery` for `transaction_by_id` must see a single mempool, not a per-process one. Source-of-truth duplication would make pending-transaction visibility depend on which read service handled the request.
+- Operators already wire one privileged path from secondary readers to the writer (writer status). Adding mempool to that path costs no new transport, no new auth surface, no new firewall rules. ADR-0006's bearer token already covers `MempoolSnapshot` and `MempoolEvents`.
 - One source connection upstream uses one mempool-stream slot on Zebra. A reader-per-process design multiplies that load by the number of read services.
 
 The concrete bindings are:
@@ -98,7 +98,7 @@ The `MempoolEntry` carries the hydrated transaction, the chain epoch at first ob
 
 ### Operational
 
-- One privileged path (`IngestControl`) terminates four streams: `WriterStatus`, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`. Bearer-token auth from ADR-0009 covers all four.
+- One privileged path (`IngestControl`) terminates four streams: `WriterStatus`, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`. Bearer-token auth from ADR-0006 covers all four.
 - Operators tune mempool retention separately from chain-event retention. Default `mined_window = 60 minutes` and `invalidated_window = 24 hours` are shipped values; production deployments with longer wallet reconnect SLAs raise them and accept the larger `mempool_event` column-family footprint.
 - A `mempool_*` readiness cause never fails a load balancer probe. They are drain-not-fail signals, identical posture to the existing `cursor_at_risk` cause.
 
@@ -113,7 +113,7 @@ The `MempoolEntry` carries the hydrated transaction, the chain epoch at first ob
 - Persistent pipeline tests live in `services/zinder-ingest/tests/integration/mempool_pipeline.rs`. They cover the snapshot+events delivery path, cursor resume, restart durability (`mempool_event_log_resumes_after_writer_restart`), and time-window pruning surfacing `MempoolCursorExpired` (`mempool_event_log_prunes_mined_under_short_retention`).
 - Compat surface tests in `services/zinder-compat-lightwalletd/tests/integration/mempool_compat.rs` cover `lightwalletd_get_mempool_stream_closes_on_tip_change` against a `ScriptedTipChangeWatcher`.
 - Live broadcast cycle tests in `services/zinder-ingest/tests/live/mempool_broadcast_cycle.rs` use `zinder_testkit::TransparentTestKey` to sign + broadcast a real v5 transparent transaction and observe it through the polling source. The reorg-out gate uses Zebra's `invalidateblock` JSON-RPC.
-- Mainnet streaming-source soak runs against an operator-hosted Zebra; the CI matrix shape is pending per [ADR-0006 §Open mainnet infrastructure questions](0006-test-tiers-and-live-config.md#open-mainnet-infrastructure-questions). Local invocation is supported today via `require_live_mainnet()` plus the standard `ZINDER_NETWORK=zcash-mainnet` schema.
+- Mainnet streaming-source soak runs against an operator-hosted Zebra; local invocation is supported today via `require_live_mainnet()` plus the standard `ZINDER_NETWORK=zcash-mainnet` schema. The CI matrix shape is owned by the testing runbook.
 
 ## Alternatives Considered
 
@@ -155,7 +155,7 @@ Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the
 
 ## Out of Scope
 
-- Native gRPC TLS for `IngestControl.MempoolSnapshot` / `MempoolEvents`. ADR-0009 covers transport security; this ADR does not modify it.
+- Native gRPC TLS for `IngestControl.MempoolSnapshot` / `MempoolEvents`. ADR-0006 covers transport security; this ADR does not modify it.
 - A second mempool source backend type. The two existing backends (`JsonRpcMempoolSource` polling, `ZebraIndexerMempoolSource` streaming) are the supported set; new backends would be a separate ADR.
 - Shielded-by-address mempool queries. The privacy boundary forbids them; transparent-only is intentional and already encoded in [Wallet data plane](../architecture/wallet-data-plane.md).
 - Mempool-broadcast endpoints beyond the existing `SendTransaction` path. Broadcast remains a `TransactionBroadcaster` boundary owned by `zinder-source`.

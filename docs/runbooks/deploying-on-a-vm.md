@@ -72,7 +72,7 @@ ZINDER_NODE__AUTH__COOKIE=user:cookie-secret-here
 EOF
 ```
 
-The cookie value can be supplied as inline content via `ZINDER_NODE__AUTH__COOKIE` (per [ADR-0018](../adrs/0018-environment-variable-secret-policy.md)) or as a path via `ZINDER_NODE__AUTH__PATH=/path/to/.cookie`. Pick one; never both.
+The cookie value can be supplied as inline content via `ZINDER_NODE__AUTH__COOKIE` or as a path via `ZINDER_NODE__AUTH__PATH=/path/to/.cookie`. Pick one; never both.
 
 If you prefer basic auth:
 
@@ -168,14 +168,14 @@ The canonical store at `/var/lib/docker/volumes/zinder-data` survives rollback. 
 | `/readyz` stays `not_ready` with cause `node_unavailable` | Zebra RPC not reachable from the container | Check `ZINDER_NODE__JSON_RPC_ADDR`; if Zebra is on the host, use `host.docker.internal` (Linux: `--add-host host.docker.internal:host-gateway`) |
 | `/readyz` cause is `node_capability_missing` | Zebra is too old to serve a required RPC | Upgrade Zebra to the version pinned in this Zinder release |
 | `/readyz` cause is `schema_mismatch` | Existing store was created by an incompatible Zinder version | Migrate or recreate; consult the release notes |
-| `/readyz` cause is `reorg_window_exceeded` | The non-finalized reorg crossed `reorg_window_blocks` | Operator action: re-sync from the divergence point per ADR-0007 |
+| `/readyz` cause is `reorg_window_exceeded` | The non-finalized reorg crossed `reorg_window_blocks` | Operator action: re-sync from the divergence point after preserving incident evidence |
 | Startup logs show `phase=connect_node outcome=failed reason=...` | Credential or network issue contacting Zebra | The `reason` field carries the underlying error |
 | `docker compose up` exits immediately | Container failed health check before settling | Increase `start_period` in the Compose healthcheck if your initial sync is slow |
 
 ## References
 
-- [ADR-0007: Multi-process storage access](../adrs/0007-multi-process-storage-access.md)
-- [ADR-0018: Environment variable secret policy](../adrs/0018-environment-variable-secret-policy.md)
+- [ADR-0003: Epoch-bound storage access with RocksDB secondaries](../adrs/0003-canonical-storage-access-boundary.md)
+- [Public interfaces §Environment variable mapping](../architecture/public-interfaces.md#environment-variable-mapping)
 - [`deploy/docker-compose.yml`](../../deploy/docker-compose.yml)
 - [`deploy/systemd/zinder.service`](../../deploy/systemd/zinder.service)
 - [Service operations](../architecture/service-operations.md)

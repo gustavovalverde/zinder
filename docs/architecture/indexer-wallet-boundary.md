@@ -13,24 +13,24 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 - **Subtree-root reads**: shielded subtree roots for batched scanning (`WalletQuery.SubtreeRootsInRange`).
 - **Transparent-address UTXO reads**: paginated current UTXO set per address (`WalletQuery.TransparentAddressUtxosStream`).
 - **Transparent-address tx-history reads**: paginated tx-ids per address in a height range (`WalletQuery.TransparentAddressTxIdsInRange`).
-- **Transparent-address balance**: confirmed-balance via the derive plane (`WalletQuery.TransparentAddressBalance`).
+- **Transparent-address balance**: confirmed balance from canonical UTXOs plus an optional derive-plane mempool overlay (`WalletQuery.TransparentAddressBalance`).
 - **Mempool reads**: snapshot + change-event subscription (`WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`).
 - **Transparent prevout resolution**: canonical and live-mempool spend lookups.
 - **Transaction broadcast**: forwards raw transactions to the upstream node.
-- **Chain-event subscription**: cursor-resumable committed/reorged stream with optional address-invalidation hint ([ADR-0021](../adrs/0021-canonical-confirmed-push-channel-for-transparent-activity.md)).
+- **Chain-event subscription**: cursor-resumable committed/reorged stream with optional address-invalidation hint ([Chain events §Address Filters](chain-events.md#address-filters)).
 - **Capability discovery**: `ServerInfo` advertises which RPCs and features the deployment serves.
 - **Lightwalletd compatibility**: the `zinder-compat-lightwalletd` binary speaks the vendored lightwalletd protocol so Zashi/Zodl and the Android SDK integrate without changes.
 
 ## Zinder does NOT do this
 
-- **Hold keys.** No spending keys, viewing keys, or seed phrases ever touch the indexer. [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md).
+- **Hold keys.** No spending keys, viewing keys, or seed phrases ever touch the indexer. [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md).
 - **Scan shielded outputs per account.** Trial decryption stays in the consumer where the keys live.
 - **Maintain per-consumer wallet state.** Account balances, transaction labels, address books, fiat-conversion rates, and notification settings all live in the consumer.
 - **Infer address ownership.** Two clients querying the same transparent address get the same response; Zinder has no concept of "this consumer owns this address".
 - **Compliance or identity.** No KYC, no source-of-funds tracking, no per-user audit logs of which addresses were queried.
 - **Terminate TLS, authenticate callers, or rate-limit.** Operators put a reverse proxy in front of Zinder for any of these; these surfaces are out of v1 scope.
 - **Provide multi-tenant hosting.** Zinder serves one logical operator; tenant isolation lives at the layer above.
-- **Run cross-host RocksDB secondaries.** Single-host topology is the v1 recommendation. [ADR-0007](../adrs/0007-multi-process-storage-access.md).
+- **Run cross-host RocksDB secondaries.** Single-host topology is the v1 recommendation. [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
 ## Where to go for each "Zinder does not do this" capability
 
@@ -93,7 +93,7 @@ If you find yourself adding a per-user table to Zinder, stop and reconsider. The
 
 ## References
 
-- [ADR-0008: Consumer-neutral wallet data plane](../adrs/0008-consumer-neutral-wallet-data-plane.md)
+- [ADR-0005: Consumer-neutral wallet data plane](../adrs/0005-consumer-neutral-wallet-data-plane.md)
 - [Wallet data plane](wallet-data-plane.md)
 - [Server-side wallet pattern](../reference/server-side-wallet-pattern.md)
-- [Known consumers](../reference/known-consumers.md)
+- [Integration surfaces](../reference/integration-surfaces.md)

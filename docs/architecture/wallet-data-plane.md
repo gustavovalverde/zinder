@@ -6,11 +6,11 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 
 `zinder-query` owns the wallet data plane.
 
-Per [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md),
+Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 this plane is consumer-neutral. Android SDK/Zashi, lightwalletd clients,
 Zallet, and future Rust consumers exercise different public contracts, but they
 all depend on the same canonical artifact families. Compatibility adapters may
-preserve legacy wire names; the core vocabulary stays on artifact coverage,
+preserve lightwalletd wire names; the core vocabulary stays on artifact coverage,
 tree-state anchors, chain epochs, and typed errors.
 
 It should provide:
@@ -24,7 +24,7 @@ It should provide:
   backed by the stored transparent UTXO artifact family.
 - Transaction broadcast.
 - Chain-event subscription per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription).
-- Mempool snapshot and mempool-event subscription per [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+- Mempool snapshot and mempool-event subscription per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 - `ServerInfo` capability descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery).
 - Optional compatibility endpoints for lightwalletd clients.
 
@@ -109,7 +109,7 @@ The same resolver backs the typed block-header read model:
 chain_epoch, block_header }` where `BlockHeaderInfo` is the Zinder-native
 header shape (block identity, previous hash, merkle root, commitment bytes,
 block time, bits, nonce, version). The shape does not re-export Zebra's
-JSON-RPC `getblockheader` object or any zaino-internal response type. The
+JSON-RPC `getblockheader` object or the lightwalletd compact block header. The
 header is parsed at request time from the underlying `BlockArtifact` payload
 through `zinder_source::block_header_info_from_raw_block_bytes`; storage
 remains a single `BlockArtifact` per block. If repeated parsing becomes the
@@ -149,7 +149,7 @@ process-startup `Arc<NetworkUpgradeActivations>` discovered via
 `PRE_OVERWINTER_BRANCH_ID` for heights below the earliest activation. The
 service binary refuses to start when `[node]` is not configured, so the
 field always reflects a real node-discovered table at request time; see
-[ADR-0015](../adrs/0015-network-parameter-discovery.md). `block_time` is
+[ADR-0008](../adrs/0008-network-parameter-discovery.md). `block_time` is
 parsed from the stored `BlockArtifact` through
 `zinder_source::block_header_info_from_raw_block_bytes` and falls back to `0`
 when the block payload cannot be parsed.
@@ -184,7 +184,7 @@ The lightwalletd compatibility shim does not expose this subscription. The vendo
 
 ## Mempool Snapshot and Subscription
 
-Mempool surfaces are owned by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes.
+Mempool surfaces are owned by [ADR-0007](../adrs/0007-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes.
 
 The unconfirmed-transaction contract serves several Zcash ecosystem products,
 but each product consumes a different boundary. This table is the canonical
@@ -193,12 +193,11 @@ observed wallet-run details.
 
 | Ecosystem product | Zinder relationship | What the mempool surface enables | Required boundary |
 | ----------------- | ------------------- | ---------- | ----------------- |
-| Zallet (`zcash/wallet`) | Primary native Rust consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and removal of the "mempool stream closed means tip changed" workaround | `zinder-client::ChainIndex` plus native `WalletQuery`; no dependency on the lightwalletd compatibility adapter |
+| Zallet (`zcash/wallet`) | Primary native Rust consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and chain-tip notifications separate from mempool stream lifecycle | `zinder-client::ChainIndex` plus native `WalletQuery`; no dependency on the lightwalletd compatibility adapter |
 | Zashi/Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
-| Existing lightwalletd clients and operators | Migration consumers | Backend option for clients that already speak `CompactTxStreamer`, including current mempool methods and transaction submission behavior | Compatibility adapter only; no upstream node calls, no independent storage, and no Zinder-only method extensions in the lightwalletd proto |
+| Lightwalletd clients and operators | Compatibility consumers | Backend option for clients that speak `CompactTxStreamer`, including mempool methods and transaction submission behavior | Compatibility adapter only; no upstream node calls, no independent storage, and no Zinder-only method extensions in the lightwalletd proto |
 | Block explorers and analytics | Application or `zinder-derive` consumers | Live mempool pages, pending transaction lifecycle, pending transparent address/outpoint overlays, and "mempool in sync" status | Native `WalletQuery` or replayable `zinder-derive` views; full explorer parity also needs transparent history and balance |
 | Zebra | Upstream node source, not a Zinder client | Keeps wallet and explorer indexing outside the node while reusing Zebra's verified mempool observations | `zinder-source` consumes Zebra `MempoolChange` when available, or falls back to `getrawmempool` polling |
-| Zaino | Ecosystem prior art and compatibility reference | Reference behavior for wallet, full-client, and block-explorer use cases while Zinder keeps its own wire, domain, and storage boundaries | Compatibility tests and reference analysis only; Zinder public APIs must not expose Zaino types |
 
 Three architectural consequences follow from that map:
 
@@ -216,8 +215,8 @@ The native protocol exposes two complementary mempool methods:
 `Invalidated` is not optional. If the polling backend observes a txid disappear
 from `getrawmempool` without a corresponding block commit, it emits
 `Invalidated { reason: Unknown }` or a more specific reason when the source can
-prove one. Silently dropping a txid would recreate the stale insert-only
-mempool cache class documented in the Zaino comparison.
+prove one. Silently dropping a txid would make the mempool cache insert-only and
+break rebroadcast and pending-transaction views.
 
 Mempool retention is two-tier (60 minutes mined / 24 hours invalidated by default, both configurable). Expired cursors return `MempoolCursorExpired` with `oldest_retained_sequence` in `PreconditionFailure` detail.
 
@@ -245,7 +244,7 @@ server constant, and values larger than the server's hard cap are silently
 clamped.
 
 These methods read the writer-owned `MempoolIndex` through the `IngestControl`
-proxy path settled by [ADR-0010](../adrs/0010-mempool-topology-and-retention.md).
+proxy path settled by [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 They do not open a second mempool source and do not reconstruct a local live
 index inside `zinder-query`. The native adapter parses the public
 `AddressLookup` (string or script-hash form) at the public boundary and
@@ -289,7 +288,7 @@ it. Missing indexed state is a readiness or artifact-availability failure; it
 is not a reason to bypass the wallet data plane.
 
 `GetLightdInfo.taddr_support` is `true` only when the adapter reads from stored
-transparent UTXO artifacts. It is a product contract for legacy lightwalletd
+transparent UTXO artifacts. It is a product contract for lightwalletd
 clients, not a way to silence Android SDK logs.
 
 The native `WalletQuery` proto exposes the same artifact-backed reads through
@@ -357,7 +356,7 @@ adapter wiring) is the canonical worked example in
 
 Transparent prevout resolution turns an `OutPoint` (a `(transaction_id, output_index)` pair) into the `TxOut` that funds the referenced input. Two paired RPCs cover both chain views:
 
-- `WalletQuery.TransparentPrevouts(TransparentPrevoutsRequest) returns (TransparentPrevoutsResponse)` resolves outpoints against the canonical chain. Capability `wallet.read.transparent_prevouts_v1`. The handler reads `TransactionArtifact.payload_bytes` for each unique `transaction_id` once, deserializes via `zinder_source::transparent_prevout_from_raw_transaction_bytes`, and indexes into the transaction's `vout` list (Shape C compute-at-read-time per [ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md)). No new column family in `zinder-store`.
+- `WalletQuery.TransparentPrevouts(TransparentPrevoutsRequest) returns (TransparentPrevoutsResponse)` resolves outpoints against the canonical chain. Capability `wallet.read.transparent_prevouts_v1`. The handler reads `TransactionArtifact.payload_bytes` for each unique `transaction_id` once, deserializes via `zinder_source::transparent_prevout_from_raw_transaction_bytes`, and indexes into the transaction's `vout` list at read time. No new column family in `zinder-store`.
 - `WalletQuery.TransparentMempoolPrevouts(TransparentMempoolPrevoutsRequest) returns (TransparentPrevoutsResponse)` resolves outpoints against the writer's live mempool index, sharing the canonical surface's response shape so consumers decode both surfaces through one path. Capability `wallet.mempool.transparent_prevouts_v1`. The handler reads `MempoolEntry.transparent_outputs` directly through `MempoolIndex::transparent_prevouts_by_outpoints`; no parsing at read time because the mempool ingest path pre-extracts transparent outputs at admission time. The wallet adapter proxies the call through the `IngestControl` private endpoint since secondary readers cannot observe live writer state.
 
 Every response binds to a `ChainEpoch` (canonical: the read's epoch; mempool: the writer's epoch visible at lookup time), then carries `repeated TransparentPrevoutEntry entries` in input order. Each entry has the request's `OutPoint` and an `optional TransparentPrevout prevout`; absence means the canonical chain at the bound epoch (canonical) or the live mempool index (mempool) does not have the referenced output. The inner `TransparentPrevout` carries `value_zat: uint64` and `script_pub_key: bytes`; identifying fields stay on the entry's `outpoint` so the inner payload carries no redundant fields. Duplicate request outpoints emit duplicate entries.
@@ -374,14 +373,14 @@ The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevou
 
 The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, `address_count: uint32`, and the binding `chain_epoch`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.
 
-Two coexisting capabilities advertise the same RPC under different semantics per [ADR-0017](../adrs/0017-compute-at-read-time-at-the-compat-boundary.md):
+Two coexisting capabilities advertise the same RPC under different semantics:
 
-- `wallet.address.transparent_balance_v1`: always present. The native adapter answers from canonical UTXOs alone (confirmed totals, `unconfirmed_delta_zat = 0`). The compute path is Shape C ([ADR-0014](../adrs/0014-compute-at-read-time-canonical-reads.md)); the helper is `zinder_query::transparent_address_confirmed_balance_response`. The address list is hard-capped at `MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST = 256` to bound the compute fanout.
-- `derive.explorer.transparent_balance_v1`: present when the derive plane is configured and the proxy's readiness probe reports `derive.explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery), [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)) which additionally applies the live mempool overlay: for each address in the request, the handler calls `WalletQuery.TransparentAddressUtxos` for confirmed UTXOs, `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, and `WalletQuery.TransparentMempoolSpendByOutpoint` per UTXO for unconfirmed spends. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends. The federation primitive is owned by [ADR-0011](../adrs/0011-derive-plane-federation-pattern.md).
+- `wallet.address.transparent_balance_v1`: always present. The native adapter answers from canonical UTXOs alone (confirmed totals, `unconfirmed_delta_zat = 0`). The helper is `zinder_query::transparent_address_confirmed_balance_response`. The address list is hard-capped at `MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST = 256` to bound the compute fanout.
+- `derive.explorer.transparent_balance_v1`: present when the derive plane is configured and the proxy's readiness probe reports `derive.explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery)) which additionally applies the live mempool overlay: for each address in the request, the handler calls `WalletQuery.TransparentAddressUtxos` for confirmed UTXOs, `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, and `WalletQuery.TransparentMempoolSpendByOutpoint` per UTXO for unconfirmed spends. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends.
 
-Clients that only need confirmed totals can rely on the RPC always answering. Clients that depend on the mempool overlay must check for `derive.explorer.transparent_balance_v1` and treat `unconfirmed_delta_zat` as authoritative only when the derive capability is advertised. The `at_epoch` field pins the read to a specific chain epoch (per the standard chain-epoch pin contract); historical balance at an arbitrary height is out of scope ([ADR-0013 §Out of scope](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md#out-of-scope-reserved)). A future read-path optimization (the accumulator-backed Shape A reserved in [ADR-0013](../adrs/0013-derive-plane-instantiation-and-transparent-address-balance.md)) does not change the public wire shape or the capability strings.
+Clients that only need confirmed totals can rely on the RPC always answering. Clients that depend on the mempool overlay must check for `derive.explorer.transparent_balance_v1` and treat `unconfirmed_delta_zat` as authoritative only when the derive capability is advertised. The `at_epoch` field pins the read to a specific chain epoch (per the standard chain-epoch pin contract). Historical balance at an arbitrary height is out of scope. A future read-path optimization does not change the public wire shape or the capability strings.
 
-The lightwalletd compat shim wires `GetTaddressBalance` and `GetTaddressBalanceStream` directly to the canonical-confirmed-balance helper. The legacy `Balance { value_zat: int64 }` proto carries no overlay slot; the shim never depends on `zinder-derive` for these methods. `GetTaddressBalanceStream` is a per-address loop over the unary form for legacy clients; it has zero call sites across the surveyed wallet ecosystem and exists only for the lightwalletd contract.
+The lightwalletd compat shim wires `GetTaddressBalance` and `GetTaddressBalanceStream` directly to the canonical-confirmed-balance helper. The lightwalletd `Balance { value_zat: int64 }` proto carries no overlay slot; the shim never depends on `zinder-derive` for these methods. `GetTaddressBalanceStream` is a per-address loop over the unary form for compatibility clients and exists only for the lightwalletd contract.
 
 The `ChainIndex` Rust API exposes `transparent_address_balance(addresses, at_epoch)` returning `TransparentAddressBalance`. `LocalChainIndex` and `RemoteChainIndex` both implement it; the capability-coverage test asserts the method exists for any consumer that advertises either `wallet.address.transparent_balance_v1` or `derive.explorer.transparent_balance_v1`.
 
@@ -427,12 +426,9 @@ v1 wallet APIs target self-hosted, single-operator deployments backed by a confi
 ### External Wallet Compatibility Claims
 
 This section is the canonical Zinder contract for external wallet serving
-claims. Per [ADR-0008](../adrs/0008-consumer-neutral-wallet-data-plane.md),
-the contract is consumer-neutral; Android SDK and Zashi are evidence-bearing
-clients, not the architecture center. The observed method sequence, logs,
-heights, and reproduction steps live in
-[Android wallet integration findings](../reference/android-wallet-integration-findings.md);
-do not copy those test-run details into architecture docs.
+claims. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
+the contract is consumer-neutral: client-specific validation belongs in test
+evidence, while this document owns the durable serving criteria.
 
 A deployment may claim Android SDK or Zashi compatibility only when:
 
@@ -458,7 +454,7 @@ pending-transaction UX.
 
 ## Query Consistency
 
-Wallet sync APIs must read from one `ChainEpoch`. Primary in-process reads may also be backed by one RocksDB snapshot; secondary reads are snapshotless and rely on epoch-bound visibility retention per [ADR-0007](../adrs/0007-multi-process-storage-access.md).
+Wallet sync APIs must read from one `ChainEpoch`. Primary in-process reads may also be backed by one RocksDB snapshot; secondary reads are snapshotless and rely on epoch-bound visibility retention per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
 For example, a compact block range response should bind:
 

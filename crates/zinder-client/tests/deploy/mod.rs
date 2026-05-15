@@ -5,7 +5,7 @@
 //! supervised by `s6-overlay`) serves the public surface end-to-end against
 //! the operator's regtest Zebra sidecar. See [Service operations §Validation
 //! Tiers](../../../../docs/architecture/service-operations.md#validation-tiers)
-//! and ADR-0007 for the topology this exercises.
+//! and ADR-0003 for the topology this exercises.
 //!
 //! Tests are gated by [`DEPLOY_TEST_IGNORE_REASON`] plus a runtime Docker
 //! probe so machines without Docker silently skip; the `ci-deploy` nextest

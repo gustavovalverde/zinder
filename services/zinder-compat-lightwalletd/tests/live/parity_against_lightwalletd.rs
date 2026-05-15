@@ -2,8 +2,8 @@
 //! upstream `electriccoinco/lightwalletd` Go reference implementation, both
 //! pointed at the same Zebra node.
 //!
-//! Double-gated per ADR-0006: `#[ignore]` keeps the test off the default
-//! filter, and `require_live()` reads `ZINDER_TEST_LIVE=1`. Two additional
+//! Double-gated by the Testing Runbook: `#[ignore]` keeps the test off the
+//! default filter, and `require_live()` reads `ZINDER_TEST_LIVE=1`. Two additional
 //! env vars name the gRPC endpoints; the test skips when either is absent so
 //! the harness is invocable without infrastructure-level coordination:
 //!

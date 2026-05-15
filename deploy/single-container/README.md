@@ -1,6 +1,6 @@
 # Single-container Zinder deployment
 
-This is the v1 recommended deployment shape for single-operator self-hosting (per ADR-0007).
+This is the v1 recommended deployment shape for single-operator self-hosting (per [ADR-0003](../../docs/adrs/0003-canonical-storage-access-boundary.md)).
 
 ## What runs inside
 
@@ -57,7 +57,7 @@ Set at least the following in each per-service config file (or override via `ZIN
 - `node.json_rpc_addr` (e.g. `http://zebra:8232`)
 - One of:
   - `node.auth.method = "basic"` + `node.auth.username` + `node.auth.password`
-  - `node.auth.method = "cookie"` + `node.auth.cookie` (inline credentials per [ADR-0018](../../docs/adrs/0018-environment-variable-secret-policy.md))
+  - `node.auth.method = "cookie"` + `node.auth.cookie` (inline credentials for PaaS environments without persistent disks)
   - `node.auth.method = "cookie"` + `node.auth.path` (file path)
 
 The reader additionally needs `storage.ingest_control_addr = "http://127.0.0.1:9100"` so it can reach the colocated writer.

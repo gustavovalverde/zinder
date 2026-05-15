@@ -23,7 +23,7 @@ If any of these are false, you may not be adding an artifact family. Common alte
 | Adding fee-rate ordering to mempool transactions | `zinder-derive` view over `MempoolEvents` | Canonical mempool artifact |
 | Adding a new field to per-block metadata | Extend `BlockArtifact`'s payload with the new field, bump artifact schema version | New artifact family |
 | Adding transparent address transaction history | New canonical artifact family with `ArtifactKey::TransparentAddress` | Compat-shim-only feature, derive view, ad-hoc index |
-| Adding transparent address UTXO lookup for Zashi compatibility | New canonical transparent UTXO artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
+| Adding transparent address UTXO lookup for lightwalletd compatibility | New canonical transparent UTXO artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
 
 When in doubt, the [Wallet data plane](wallet-data-plane.md) and [derive plane](derive-plane.md) docs distinguish the two boundaries.
 
@@ -263,7 +263,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
 
 The CI `capability-coverage` job will reject the proto change if the capability constant is not updated.
 
-For the Android/Zashi compatibility slice, the transparent UTXO family uses the
+For the lightwalletd compatibility slice, the transparent UTXO family uses the
 reserved `wallet.address.transparent_utxos_v1` capability for the native proto
 surface. The lightwalletd `GetAddressUtxos[Stream]` adapter already reads from
 stored transparent UTXO artifacts and can therefore set
@@ -289,7 +289,7 @@ For both adapters, the error mapping function is **shared, not duplicated**. If 
 
 **Integration tests** in `services/zinder-query/tests/`. Cover the full path: ingest commits → store reads → WalletQueryApi → gRPC adapter → response. The pattern in `services/zinder-query/tests/single_artifact_lookup.rs` is the template.
 
-**Live tests** under `services/zinder-ingest/tests/live/`, gated per [ADR-0006](../adrs/0006-test-tiers-and-live-config.md): `#[ignore = LIVE_TEST_IGNORE_REASON]` plus `require_live()`, with the unified `ZINDER_NETWORK` and `ZINDER_NODE__*` env-var schema. Add a test that exercises the artifact against a live regtest stack.
+**Live tests** under `services/zinder-ingest/tests/live/`, gated per the [Testing Runbook](../runbooks/testing.md): `#[ignore = LIVE_TEST_IGNORE_REASON]` plus `require_live()`, with the unified `ZINDER_NETWORK` and `ZINDER_NODE__*` env-var schema. Add a test that exercises the artifact against a live regtest stack.
 
 **Capability advertisement**. Add the capability string to `crates/zinder-proto/src/capabilities.rs::ZINDER_CAPABILITIES`. The `capability-coverage` CI job verifies this.
 
@@ -306,9 +306,9 @@ If the artifact changes the on-disk shape of an existing artifact, [ADR-0002](..
 
 ## A worked example: transparent address tx index
 
-To make the cookbook concrete, here is the path for `TransparentAddressTxIndex` (the artifact family that backs paginated `GetTaddressTxids`, addressing [Zaino `#789`](https://github.com/zingolabs/zaino/issues/789)).
+To make the cookbook concrete, here is the path for `TransparentAddressTxIndex`, the artifact family that backs paginated `GetTaddressTxids`.
 
-The Android/Zashi transparent UTXO artifact follows the same seven-step path,
+The transparent UTXO artifact follows the same seven-step path,
 but its priority and capability are different: it is release-gated by
 `wallet.address.transparent_utxos_v1`, while this transaction-history example
 uses `wallet.address.transparent_history_v1`.
@@ -370,7 +370,7 @@ The DX/AX audit and code review have surfaced a recurring set of errors. Each is
 | Duplicating `status_from_query_error` in the new adapter | The function is named in two services and looks copy-friendly | Import from `services/zinder-query/src/grpc/mod.rs`; never copy |
 | Inventing a new cursor type for a one-off paginated read | The cursor section is long; skipping seems efficient | Use `StreamCursorTokenV1` or `MempoolStreamCursorV1` with the appropriate family tag |
 | Naming the method `get_*` or `fetch_*` | These verbs are common in other codebases | Use the bare-noun convention: `transparent_address_tx_ids_in_range`, not `get_transparent_address_tx_ids` or `fetch_*` |
-| Mixing `_secs` and `_ms` for the new feature's config knobs | The legacy code has both | Use `_ms` for durations; see [Public Interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions) |
+| Mixing `_secs` and `_ms` for the new feature's config knobs | Duration units become inconsistent across services | Use `_ms` for durations; see [Public Interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions) |
 | Skipping the capability string update | The CI job will catch it, so why be careful upfront | Add `ZINDER_CAPABILITIES` in the same commit as the proto method; treat it as part of the proto change |
 | Adding the artifact to the compat shim because "wallets need it" | The compat shim is a translation layer, not a feature surface | If the lightwalletd protocol does not name the method, the compat shim does not implement it; native-only is fine |
 

@@ -2,7 +2,7 @@
 
 This page lists every `zinder.v1.ops.ErrorReason` value, the gRPC `Status` code it pairs with, the recommended retry policy, and the auxiliary detail clients should expect alongside it. Use it as the reference when you map Zinder errors to your local retry, alert, and operator-action decisions.
 
-The proto enum is defined in [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto); the wire shape is described in [ADR-0019](../adrs/0019-typed-grpc-error-reason-vocabulary.md).
+The proto enum is defined in [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto); this page owns the wire semantics clients should rely on.
 
 ## How to read the wire
 
@@ -113,15 +113,14 @@ A self-inflicted failure that needs investigation. Retry policy: **OperatorActio
 
 ### Sentinel
 
-`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat as a Zinder bug and report it. Clients with `IndexerError::reason() == None` for an error carried over the wire have hit a server that either does not advertise `ErrorInfo` (legacy) or emitted `Unspecified`.
+`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat as a Zinder bug and report it. Clients with `IndexerError::reason() == None` for an error carried over the wire have hit a server that omitted `ErrorInfo` or emitted `Unspecified`.
 
 ## Stability
 
-The set above is the v1 contract. Additions are allowed within a major version; the reserved range in [`error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto) leaves room for additive growth. Existing reasons' semantics are stable within a major version. v1 has no deprecation surface ([ADR-0022](../adrs/0022-release-artifact-set.md)); reasons can be added, renamed, or removed between releases until a published consumer constraint exists.
+The set above is the v1 contract. Additions are allowed within a major version; the reserved range in [`error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto) leaves room for additive growth. Existing reasons' semantics are stable within a major version. Removing or repurposing a reason requires a major-version boundary because clients make retry and alerting decisions from this vocabulary.
 
 ## References
 
-- [ADR-0019: Typed gRPC error reason vocabulary](../adrs/0019-typed-grpc-error-reason-vocabulary.md)
 - [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto)
 - [`crates/zinder-client/src/error.rs`](../../crates/zinder-client/src/error.rs)
 - [Server-side wallet pattern](server-side-wallet-pattern.md)

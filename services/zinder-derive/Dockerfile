@@ -5,7 +5,7 @@
 #     docker build -f services/zinder-derive/Dockerfile -t zinder-derive .
 #
 # This image serves the ExplorerQuery gRPC surface and is intended to be
-# colocated with zinder-query (per ADR-0011 federation pattern) rather
+# colocated with zinder-query (per the derive-plane federation pattern) rather
 # than exposed publicly.
 
 ARG RUST_VERSION=1.91

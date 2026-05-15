@@ -1,10 +1,9 @@
-# buf generation config for the two release artifacts described in
-# docs/adrs/0022-release-artifact-set.md.
+# buf generation config for Zinder's public proto exports.
 #
-# Both artifacts are produced from the same proto module declared in
-# buf.yaml. The vendored lightwalletd schemas under proto/compat are
-# excluded; downstream consumers consuming `lightwalletd` already have
-# its public protocol.
+# OpenAPI output and descriptor sets are produced from the same proto module
+# declared in buf.yaml. The vendored lightwalletd schemas under proto/compat
+# are excluded; downstream consumers consuming `lightwalletd` already have its
+# public protocol.
 #
 # Build invocation (per-release; the CI workflow at
 # .github/workflows/release-api-docs.yml runs the same commands):

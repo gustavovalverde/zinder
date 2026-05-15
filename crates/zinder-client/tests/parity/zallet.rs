@@ -3,8 +3,7 @@
 //! Zallet (the desktop wallet) is the primary `zinder-client::ChainIndex` Rust
 //! consumer. These compile-time assertions ensure the `ChainIndex` methods
 //! Zallet depends on stay present on the trait surface.
-//! Renaming or removing any referenced method makes this module fail to
-//! compile, gating Zallet's migration confidence at build time.
+//! Renaming or removing any referenced method makes this module fail to compile.
 
 use eyre::eyre;
 use zinder_client::{
@@ -15,7 +14,7 @@ use zinder_client::{
 use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
 
 #[test]
-fn parity_chain_index_surface_compiles_for_zallet_migration() {
+fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
     fn assert_compiles<T: ChainIndex>() {
         // typed BlockId from latest_block
         let _ = T::latest_block;
