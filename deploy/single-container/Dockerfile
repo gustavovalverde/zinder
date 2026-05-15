@@ -7,7 +7,7 @@
 # image once; Kubernetes operators wanting sidecar separation use the
 # per-service Dockerfiles in services/<svc>/Dockerfile instead.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder

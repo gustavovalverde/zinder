@@ -24,11 +24,13 @@ use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use zinder_testkit::StoreFixture;
 use zinder_testkit::live::{LiveTestEnv, init, require_live, require_live_for};
 
-/// Validates that the canonical hydration step (`build_mempool_entry`) decodes
-/// a real Zebra-emitted transaction into a well-formed `MempoolEntry` whose
-/// raw bytes round-trip, compact-tx parses as `lightwalletd::CompactTx`,
-/// transparent overlays match the parsed transaction, and identifiers agree
-/// with `zebra-chain`'s view.
+/// Validates canonical hydration from a real Zebra-emitted transaction.
+///
+/// The decoded `MempoolEntry` must have raw bytes that round-trip,
+/// compact-tx bytes that parse as `lightwalletd::CompactTx`, and transparent
+/// overlays that match the parsed transaction.
+///
+/// The parsed identifiers must agree with `zebra-chain`'s view.
 ///
 /// The test exercises the same parsing pipeline that the streaming
 /// orchestrator runs on every observed `Added` notification, but against the
@@ -154,10 +156,13 @@ fn synthetic_chain_epoch_at(network: Network, tip_height: BlockHeight) -> ChainE
     }
 }
 
-/// Validates the orchestrator wiring against a live Zebra indexer:
+/// Validates the orchestrator wiring against a live Zebra indexer.
+///
 /// `ZebraIndexerMempoolSource` → `run_mempool_orchestrator` →
-/// `MempoolIndex` + canonical mempool-event store runs cleanly for a few
-/// seconds without panicking, hangs, or fatal errors.
+/// `MempoolIndex` + canonical mempool-event store must run cleanly for a few
+/// seconds.
+///
+/// The task must not panic, hang, or surface fatal errors.
 ///
 /// This is a smoke test for the streaming integration: no transactions are
 /// expected on an idle regtest mempool, so the test verifies the loop stays
@@ -243,11 +248,14 @@ fn build_indexer_mempool_source(
     ))
 }
 
-/// End-to-end persistence: a `MempoolEntry` built from a real Zebra-emitted
-/// coinbase transaction is appended to the canonical mempool event store,
-/// served through the `IngestControl.MempoolEvents` gRPC, then rediscovered
-/// via cursor resume after the writer process is dropped and the same
-/// `RocksDB` store path is reopened.
+/// Proves end-to-end mempool persistence with real Zebra-emitted bytes.
+///
+/// A `MempoolEntry` built from a coinbase transaction is appended to the
+/// canonical mempool event store, served through `IngestControl.MempoolEvents`,
+/// then rediscovered via cursor resume.
+///
+/// Cursor resume must survive dropping the writer process and reopening the
+/// same `RocksDB` store path.
 ///
 /// The real-data ingredients:
 /// - A live regtest Zebra mines coinbase transactions; the test fetches one

@@ -59,9 +59,10 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
 
 /// Without a configured `wallet_query_endpoint`, the explorer-balance
 /// capability is omitted from `ServerInfo` and the federated method returns
-/// `UNAVAILABLE`. This pins the operational contract that capability
-/// advertisement gates on a wired federation, not on the binary's mere
-/// presence.
+/// `UNAVAILABLE`.
+///
+/// This pins the operational contract that capability advertisement gates on
+/// a wired federation, not on the binary's mere presence.
 #[tokio::test]
 async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> Result<()> {
     use zinder_proto::v1::wallet::TransparentAddressBalanceRequest;

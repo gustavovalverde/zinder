@@ -18,7 +18,7 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/gustavovalverde/zinder"
-rust-version = "1.91"
+rust-version = "1.95"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -118,3 +118,4 @@ unimplemented = "deny"
 undocumented_unsafe_blocks = "deny"
 unwrap_used = "deny"
 wildcard_enum_match_arm = "deny"
+disallowed_types = "deny"

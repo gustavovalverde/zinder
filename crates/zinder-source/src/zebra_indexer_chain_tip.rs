@@ -65,7 +65,7 @@ impl Default for ZebraIndexerChainTipSourceOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60 * 60),
+            request_timeout: Duration::from_hours(1),
             notification_channel_capacity: 64,
         }
     }

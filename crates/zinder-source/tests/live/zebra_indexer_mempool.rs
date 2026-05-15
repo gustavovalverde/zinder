@@ -84,8 +84,9 @@ fn build_indexer_mempool_source(
 
 /// Validates the streaming source's reconnect contract: when Zebra restarts
 /// mid-stream, the source must surface a retryable [`SourceError`] (or a
-/// clean stream end) rather than panicking, and a fresh `events()` call
-/// after Zebra recovers must succeed.
+/// clean stream end) rather than panicking.
+///
+/// A fresh `events()` call after Zebra recovers must succeed.
 ///
 /// **Destructive**: this test restarts the Zebra container named by
 /// `ZINDER_TEST_INDEXER_CONTAINER_NAME` (default `z3_regtest_sidecar_zebra`).
@@ -113,7 +114,7 @@ async fn streaming_source_recovers_after_zebra_indexer_restart() -> Result<()> {
     restart_container(&container_name)?;
     observe_terminal_disconnect(&mut event_stream, Duration::from_secs(30)).await?;
 
-    wait_for_container_healthy(&container_name, Duration::from_secs(60))?;
+    wait_for_container_healthy(&container_name, Duration::from_mins(1))?;
     let mut reopened_stream = open_with_retry(&mempool_source, Duration::from_secs(30)).await?;
     assert_stream_alive_for(&mut reopened_stream, Duration::from_secs(2)).await?;
     Ok(())

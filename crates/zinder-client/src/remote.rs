@@ -87,7 +87,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// OS-level TCP keepalive idle interval. Belt-and-braces alongside the
 /// application-level HTTP/2 PING: detects connections dropped silently by
 /// intermediaries that don't surface the failure to userspace.
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.

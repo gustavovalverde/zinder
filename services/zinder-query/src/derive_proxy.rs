@@ -206,7 +206,7 @@ where
 }
 
 fn derive_unavailable_status(capability: &str) -> Status {
-    Status::unavailable(format!("derive consumer for {capability} is not ready",))
+    Status::unavailable(format!("derive consumer for {capability} is not ready"))
 }
 
 /// Configuration for [`spawn_derive_readiness_probe`].

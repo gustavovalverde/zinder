@@ -404,9 +404,10 @@ impl ScriptedMempoolEventControl {
 }
 
 /// Lightwalletd contract: `GetMempoolStream` closes cleanly when the writer
-/// observes a best-chain tip change. Native `MempoolEvents` must NOT close on
-/// tip change; this is a compat-only behavior preserved for the Go
-/// lightwalletd contract Zallet relies on.
+/// observes a best-chain tip change.
+///
+/// Native `MempoolEvents` must NOT close on tip change; this is a compat-only
+/// behavior preserved for the Go lightwalletd contract Zallet relies on.
 #[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_stream_closes_on_tip_change() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;

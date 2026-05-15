@@ -35,7 +35,7 @@ use zinder_testkit::deploy::require_docker;
 use zinder_testkit::live::{init, require_live_for};
 
 const IMAGE_TAG: &str = "zinder-test:single-container-smoke";
-const READYZ_DEADLINE: Duration = Duration::from_secs(120);
+const READYZ_DEADLINE: Duration = Duration::from_mins(2);
 const READYZ_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[tokio::test(flavor = "multi_thread")]

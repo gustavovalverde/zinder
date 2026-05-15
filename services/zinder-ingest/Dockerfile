@@ -7,7 +7,7 @@
 #
 # See ADR-0003 for the writer/reader topology this image fits into.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder

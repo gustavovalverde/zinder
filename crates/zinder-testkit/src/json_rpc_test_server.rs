@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -39,6 +39,7 @@ use std::{
 };
 
 use eyre::{Result, eyre};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -253,11 +254,7 @@ impl JsonRpcTestServer {
     /// Returns a snapshot of every request the server has recorded so far,
     /// in arrival order.
     pub fn requests(&self) -> Result<Vec<JsonRpcRequest>> {
-        self.state
-            .requests
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| eyre!("requests mutex was poisoned"))
+        Ok(self.state.requests.lock().clone())
     }
 
     /// Returns the requests recorded for `method`, in arrival order.
@@ -308,16 +305,13 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) {
         return;
     };
 
-    let reply = match state.stubs.lock() {
-        Ok(mut stubs) => stubs
-            .get_mut(request.method.as_str())
-            .and_then(VecDeque::pop_front),
-        Err(_) => return,
-    };
+    let reply = state
+        .stubs
+        .lock()
+        .get_mut(request.method.as_str())
+        .and_then(VecDeque::pop_front);
 
-    if let Ok(mut requests) = state.requests.lock() {
-        requests.push(request.clone());
-    }
+    state.requests.lock().push(request.clone());
 
     let response = match reply {
         Some(reply) => reply.into_http_response(&request.id),
@@ -411,7 +405,9 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Resul
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    bytes
+        .array_windows::<4>()
+        .position(|window| window == b"\r\n\r\n")
 }
 
 fn content_length(headers: &str) -> Result<usize> {

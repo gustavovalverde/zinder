@@ -202,7 +202,9 @@ async fn ingest_control_pages_mempool_snapshot_from_live_index() -> Result<()> {
 
 /// Bearer-token auth: a server configured with a token rejects requests
 /// that lack the header, rejects requests with the wrong token, and accepts
-/// requests carrying the matching token through the client interceptor.
+/// requests carrying the matching token.
+///
+/// Matching-token requests pass through the client interceptor.
 ///
 /// This test pins the contract that `with_bearer_token` actually wires the
 /// server-side interceptor; the unit tests in `zinder-runtime` cover the
@@ -265,8 +267,10 @@ async fn ingest_control_bearer_token_rejects_unauthenticated_clients() -> Result
 }
 
 /// Open-server default: when no token is configured, an unauthenticated
-/// client succeeds. This pins the localhost-default deployment story so a
-/// future refactor cannot accidentally make auth required by default.
+/// client succeeds.
+///
+/// This pins the localhost-default deployment story so a future refactor
+/// cannot accidentally make auth required by default.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_without_bearer_token_accepts_unauthenticated_clients() -> Result<()> {
     use zinder_proto::v1::ingest::WriterStatusRequest;
@@ -381,7 +385,10 @@ async fn mempool_event_log_resumes_after_writer_restart() -> Result<()> {
 
 /// Aggressive retention: with a tiny mined window, mined envelopes are
 /// pruned by the next retention pass and a cursor pointing at the pruned
-/// sequence surfaces `MempoolCursorExpired` with the structured floor.
+/// sequence expires.
+///
+/// The expired cursor surfaces `MempoolCursorExpired` with the structured
+/// floor.
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_event_log_prunes_mined_under_short_retention() -> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
@@ -443,14 +450,14 @@ async fn mempool_event_log_prunes_mined_under_short_retention() -> Result<()> {
 
 /// End-to-end retention worker: drives synthetic mempool events into a real
 /// RocksDB-backed log over time, runs `spawn_mempool_event_retention_task`
-/// with aggressive time-window settings, and asserts that the worker
-/// (a) prunes Mined envelopes that age past their window,
-/// (b) keeps Invalidated envelopes that age within their longer window,
-/// (c) updates the retention floor in `storage_control`,
-/// (d) flips the readiness signal to `MempoolCursorAtRisk` when the oldest
-///     retained event crosses the warning threshold, and
-/// (e) flips back to `Ready` once pruning brings the floor back inside the
-///     window.
+/// with aggressive time-window settings.
+///
+/// The test asserts that the worker (a) prunes Mined envelopes that age past
+/// their window, (b) keeps Invalidated envelopes that age within their longer
+/// window, (c) updates the retention floor in `storage_control`, (d) flips the
+/// readiness signal to `MempoolCursorAtRisk` when the oldest retained event
+/// crosses the warning threshold, and (e) flips back to `Ready` once pruning
+/// brings the floor back inside the window.
 #[allow(
     clippy::too_many_lines,
     reason = "End-to-end retention test exercises append → time-pass → prune → readiness flip in one linear sequence so timing assumptions stay auditable in a single function."
@@ -600,9 +607,10 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
 }
 
 /// Reorg semantics gate: the orchestrator + index must faithfully relay the
-/// Added → Mined → Added sequence the source emits when a tx is mined into
-/// block N and then block N is reorged out, returning the tx to the
-/// upstream node's mempool.
+/// Added → Mined → Added sequence the source emits.
+///
+/// The sequence models a tx mined into block N and then returned to the
+/// upstream node's mempool when block N is reorged out.
 ///
 /// The structural invariant is that nothing in the chain ingest path emits
 /// mempool events; Zinder must follow upstream node mempool observations
@@ -884,9 +892,10 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
 }
 
 /// `IngestControl.TransparentMempoolPrevouts` resolves the outputs of
-/// mempool transactions into per-entry prevouts in input order, returning
-/// `None` for outpoints that reference unknown transactions or
-/// out-of-bounds output indices.
+/// mempool transactions into per-entry prevouts in input order.
+///
+/// Outpoints that reference unknown transactions or out-of-bounds output
+/// indices return `None`.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
     use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolPrevoutsRequest};
@@ -949,6 +958,7 @@ async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
 }
 
 /// `MempoolMinedEvent.block_hash` rides the wire alongside `mined_height`.
+///
 /// Source-driven enrichment: the canonical event log persists the
 /// source-observed block hash and the gRPC stream replays it verbatim.
 #[tokio::test(flavor = "multi_thread")]

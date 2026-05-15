@@ -33,8 +33,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tracing::field::{Field, Visit};
 use tracing::subscriber::DefaultGuard;
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -110,10 +111,7 @@ impl LogCapture {
     /// Returns a clone of every captured event in arrival order.
     #[must_use]
     pub fn events(&self) -> Vec<CapturedEvent> {
-        match self.events.lock() {
-            Ok(events) => events.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.events.lock().clone()
     }
 
     /// Returns `true` when at least one captured event matches `predicate`.
@@ -152,10 +150,7 @@ where
             level: *metadata.level(),
             fields: visitor.fields,
         };
-        let mut events_guard = match self.events.lock() {
-            Ok(events) => events,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut events_guard = self.events.lock();
         events_guard.push(captured);
     }
 }

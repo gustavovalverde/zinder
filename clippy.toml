@@ -1,4 +1,4 @@
-msrv = "1.91"
+msrv = "1.95"
 
 cognitive-complexity-threshold = 25
 type-complexity-threshold = 250
@@ -14,7 +14,24 @@ allow-unwrap-in-tests = false
 allow-print-in-tests = false
 
 avoid-breaking-exported-api = true
+check-incompatible-msrv-in-tests = true
 check-private-items = true
+
+doc-valid-idents = [
+  "Zcash",
+  "Zebra",
+  "Zaino",
+  "Zallet",
+  "Zashi",
+  "Zinder",
+  "Zodl",
+  "..",
+]
+
+disallowed-types = [
+  { path = "std::sync::Mutex", reason = "Zinder uses parking_lot for synchronous shared state; use tokio::sync only when the guard must cross an await point." },
+  { path = "std::sync::RwLock", reason = "Zinder uses parking_lot for synchronous shared state; use tokio::sync only when the guard must cross an await point." },
+]
 
 disallowed-names = [
   "data",

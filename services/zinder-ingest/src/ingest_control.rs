@@ -507,8 +507,8 @@ fn decode_mempool_snapshot_cursor(
         ));
     }
 
-    let mut sequence_bytes = [0u8; 8];
-    sequence_bytes.copy_from_slice(&cursor_bytes[..8]);
+    let sequence_bytes = <[u8; 8]>::try_from(&cursor_bytes[..8])
+        .map_err(|_| Status::invalid_argument("mempool snapshot cursor sequence is invalid"))?;
     let snapshot_sequence = u64::from_be_bytes(sequence_bytes);
     if snapshot_sequence > current_snapshot_sequence {
         return Err(Status::invalid_argument(
@@ -516,8 +516,9 @@ fn decode_mempool_snapshot_cursor(
         ));
     }
 
-    let mut transaction_id_bytes = [0u8; 32];
-    transaction_id_bytes.copy_from_slice(&cursor_bytes[8..]);
+    let transaction_id_bytes = <[u8; 32]>::try_from(&cursor_bytes[8..]).map_err(|_| {
+        Status::invalid_argument("mempool snapshot cursor transaction id is invalid")
+    })?;
     Ok(Some(MempoolSnapshotCursor {
         after_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
     }))

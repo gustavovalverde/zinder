@@ -114,17 +114,22 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Coding Constraints
 
+The workspace MSRV is Rust 1.95. Keep `Cargo.toml`,
+`rust-toolchain.toml`, `clippy.toml`, CI toolchain actions, and Docker
+`RUST_VERSION` args in sync whenever the toolchain moves.
+
 The workspace `Cargo.toml` denies (not warns):
 
 - `unsafe_code`, `warnings`, `missing_docs`, `unreachable_pub`, `unnameable_types`
 - Clippy: `all`, `cargo`, `pedantic` (nursery is warn)
-- `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `print_stderr`, `print_stdout`, `wildcard_enum_match_arm`, `allow_attributes_without_reason`
+- `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `print_stderr`, `print_stdout`, `wildcard_enum_match_arm`, `allow_attributes_without_reason`, `disallowed_types`
 - Rustdoc: `broken_intra_doc_links`, `bare_urls`
 
 `clippy.toml` extends this:
 
 - `unwrap`, `expect`, `dbg`, `print` are also banned in tests.
 - `too-many-lines-threshold = 80`, `too-many-arguments-threshold = 5`.
+- `std::sync::{Mutex,RwLock}` are banned. Use `parking_lot` for synchronous shared state and `tokio::sync` only when a guard must cross an async boundary.
 - Disallowed names: `data`, `info`, `item`, `result`, `stuff`, `thing`, `tmp`, `value`.
 
 Practical effects:

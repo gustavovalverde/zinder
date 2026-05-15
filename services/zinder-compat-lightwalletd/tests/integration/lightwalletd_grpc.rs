@@ -221,12 +221,13 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
 }
 
 /// Regression: txid bytes emitted by `GetAddressUtxos` must be accepted verbatim
-/// by `GetTransaction(TxFilter { hash, ... })`. The 2026-05-12 parity run
-/// surfaced a `NotFound` when wallets rebound the bytes round-trip; the cause
-/// was an unnecessary byte reversal at the input handler. Lightwalletd-go
-/// documents the wire contract at `frontend/service.go:792`: txid `bytes`
-/// fields are Zcash internal little-endian, the same byte order
-/// [`TransactionId::as_bytes`] returns.
+/// by `GetTransaction(TxFilter { hash, ... })`.
+///
+/// The 2026-05-12 parity run surfaced a `NotFound` when wallets rebound the
+/// bytes round-trip; the cause was an unnecessary byte reversal at the input
+/// handler. Lightwalletd-go documents the wire contract at
+/// `frontend/service.go:792`: txid `bytes` fields are Zcash internal
+/// little-endian, the same byte order [`TransactionId::as_bytes`] returns.
 #[tokio::test]
 async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() -> eyre::Result<()> {
     let transparent_address =

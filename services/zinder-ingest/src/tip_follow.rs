@@ -715,13 +715,11 @@ mod tests {
     use std::{
         error::Error,
         path::Path,
-        sync::{
-            Mutex,
-            atomic::{AtomicU32, Ordering},
-        },
+        sync::atomic::{AtomicU32, Ordering},
     };
 
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use prost::Message;
     use tempfile::tempdir;
     use zinder_core::{
@@ -835,7 +833,7 @@ mod tests {
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
         let _second = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
 
-        source.replace_block(2, block_hash(20), block_hash(1))?;
+        source.replace_block(2, block_hash(20), block_hash(1));
         let reorged = test_tip_follow_once(&config, &source, &store, &mut retry_state)
             .await?
             .ok_or("expected replacement commit")?;
@@ -881,7 +879,7 @@ mod tests {
             BlockHeight::new(2)
         );
 
-        source.replace_block(2, block_hash(20), block_hash(1))?;
+        source.replace_block(2, block_hash(20), block_hash(1));
         source.set_tip_height(2);
         let reorged = test_tip_follow_once(&config, &source, &store, &mut retry_state)
             .await?
@@ -1059,17 +1057,9 @@ mod tests {
             self.tip_height.store(tip_height, Ordering::SeqCst);
         }
 
-        fn replace_block(
-            &self,
-            height: u32,
-            hash: BlockHash,
-            parent_hash: BlockHash,
-        ) -> Result<(), Box<dyn Error>> {
+        fn replace_block(&self, height: u32, hash: BlockHash, parent_hash: BlockHash) {
             {
-                let mut blocks = self
-                    .blocks
-                    .lock()
-                    .map_err(|_| "test block mutex poisoned")?;
+                let mut blocks = self.blocks.lock();
                 if let Some(block) = blocks
                     .iter_mut()
                     .find(|block| block.height == BlockHeight::new(height))
@@ -1078,8 +1068,6 @@ mod tests {
                     block.parent_hash = parent_hash;
                 }
             }
-
-            Ok(())
         }
     }
 
@@ -1096,10 +1084,6 @@ mod tests {
             let block = self
                 .blocks
                 .lock()
-                .map_err(|_| SourceError::NodeUnavailable {
-                    reason: "test block mutex poisoned".to_owned(),
-                    is_retryable: false,
-                })?
                 .iter()
                 .copied()
                 .find(|block| block.height == height)
@@ -1127,10 +1111,6 @@ mod tests {
             let hash = self
                 .blocks
                 .lock()
-                .map_err(|_| SourceError::NodeUnavailable {
-                    reason: "test block mutex poisoned".to_owned(),
-                    is_retryable: false,
-                })?
                 .iter()
                 .copied()
                 .find(|block| block.height == height)

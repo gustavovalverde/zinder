@@ -3,14 +3,11 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{
-    num::NonZeroU32,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
+use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
 use zinder_core::{
@@ -79,13 +76,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         outcome.chain_epoch.tip_metadata,
         ChainTipMetadata::new(1, 0)
     );
-    assert_eq!(
-        fetched_heights
-            .lock()
-            .map_err(|_| eyre!("mutex poisoned"))?
-            .as_slice(),
-        [source_block.height]
-    );
+    assert_eq!(fetched_heights.lock().as_slice(), [source_block.height]);
 
     let store = PrimaryChainStore::open(
         &storage_path,
@@ -191,12 +182,7 @@ impl NodeSource for FixtureCheckpointSource {
     }
 
     async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        self.fetched_heights
-            .lock()
-            .map_err(|_| SourceError::SourceProtocolMismatch {
-                reason: "fixture source fetch history lock is poisoned",
-            })?
-            .push(height);
+        self.fetched_heights.lock().push(height);
 
         if height != self.block.height {
             return Err(SourceError::BlockUnavailable {

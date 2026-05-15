@@ -700,25 +700,19 @@ fn resolve_tip_follow_config(
         ingest_control_bearer_token,
         chain_event_retention: ChainEventRetentionConfig {
             retention_window: (chain_event_retention_hours > 0)
-                .then(|| Duration::from_secs(chain_event_retention_hours.saturating_mul(3_600))),
+                .then(|| Duration::from_hours(chain_event_retention_hours)),
             check_interval: Duration::from_millis(chain_event_retention_check_interval_ms),
-            cursor_at_risk_warning: Duration::from_secs(
-                cursor_at_risk_warning_hours.saturating_mul(3_600),
-            ),
+            cursor_at_risk_warning: Duration::from_hours(cursor_at_risk_warning_hours),
         },
         mempool_event_retention: MempoolEventRetentionWorkerConfig {
             retention: MempoolEventRetentionConfig::new(
-                (mempool_mined_retention_minutes > 0).then(|| {
-                    Duration::from_secs(mempool_mined_retention_minutes.saturating_mul(60))
-                }),
-                (mempool_invalidated_retention_hours > 0).then(|| {
-                    Duration::from_secs(mempool_invalidated_retention_hours.saturating_mul(3_600))
-                }),
+                (mempool_mined_retention_minutes > 0)
+                    .then(|| Duration::from_mins(mempool_mined_retention_minutes)),
+                (mempool_invalidated_retention_hours > 0)
+                    .then(|| Duration::from_hours(mempool_invalidated_retention_hours)),
             ),
             check_interval: Duration::from_millis(mempool_event_retention_check_interval_ms),
-            cursor_at_risk_warning: Duration::from_secs(
-                mempool_cursor_at_risk_warning_minutes.saturating_mul(60),
-            ),
+            cursor_at_risk_warning: Duration::from_mins(mempool_cursor_at_risk_warning_minutes),
         },
     })
 }

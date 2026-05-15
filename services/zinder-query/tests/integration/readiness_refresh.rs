@@ -99,7 +99,7 @@ async fn secondary_catchup_refreshes_before_first_interval() -> eyre::Result<()>
         secondary,
         readiness.clone(),
         zinder_query::SecondaryCatchupOptions {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             lag_threshold_chain_epochs: 1,
             writer_status: None,
         },

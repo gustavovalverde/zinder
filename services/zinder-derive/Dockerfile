@@ -8,7 +8,7 @@
 # colocated with zinder-query (per the derive-plane federation pattern) rather
 # than exposed publicly.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder

@@ -64,8 +64,14 @@ pub(crate) fn decode_visible_source_epoch(
         });
     }
 
-    let mut source_epoch = [0; 8];
-    source_epoch.copy_from_slice(source_epoch_bytes);
+    let source_epoch: [u8; 8] =
+        source_epoch_bytes
+            .try_into()
+            .map_err(|_| StoreError::ArtifactCorrupt {
+                family,
+                key: key.clone().into(),
+                reason: "visible artifact epoch pointer must be 8 bytes",
+            })?;
     Ok(ChainEpochId::new(u64::from_be_bytes(source_epoch)))
 }
 

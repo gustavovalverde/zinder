@@ -1,9 +1,10 @@
 //! Prometheus metrics recorder used by Zinder operational endpoints.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use metrics::{Unit, describe_gauge};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::OpsServer;
@@ -60,10 +61,7 @@ pub fn install_metrics_recorder(server: &OpsServer) -> Result<MetricsHandle, Met
     let handle = if let Some(handle) = PROMETHEUS_HANDLE.get() {
         handle.clone()
     } else {
-        let _install_guard = match PROMETHEUS_INSTALL_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _install_guard = PROMETHEUS_INSTALL_LOCK.lock();
         if let Some(handle) = PROMETHEUS_HANDLE.get() {
             return Ok(record_build_info(handle.clone(), server));
         }

@@ -75,7 +75,7 @@ impl Default for ZebraIndexerMempoolSourceOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_mins(1),
             event_channel_capacity: 256,
         }
     }

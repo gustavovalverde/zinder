@@ -253,8 +253,8 @@ impl StoreKey {
         {
             return None;
         }
-        let mut sequence_bytes = [0_u8; size_of::<u64>()];
-        sequence_bytes.copy_from_slice(&key_bytes[STORE_KEY_HEADER_LEN..]);
+        let sequence_bytes: [u8; size_of::<u64>()] =
+            key_bytes[STORE_KEY_HEADER_LEN..].try_into().ok()?;
         Some(u64::from_be_bytes(sequence_bytes))
     }
 

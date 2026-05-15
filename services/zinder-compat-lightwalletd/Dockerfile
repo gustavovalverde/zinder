@@ -7,7 +7,7 @@
 # This image serves the vendored lightwalletd protocol so Zashi/Zodl and
 # the Android SDK can integrate without changes.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
