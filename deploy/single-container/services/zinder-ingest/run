@@ -24,43 +24,47 @@ BOOTSTRAP_REORG_HEADROOM_BLOCKS=200
 # Tip-follow commits one block per poll iteration, so syncing a fresh
 # store from genesis on a mature network takes weeks. The `backfill`
 # subcommand batches up to `commit_batch_blocks` blocks per epoch and
-# closes that gap in minutes-to-hours. Detect an uninitialized store
-# (no RocksDB CURRENT marker) and bootstrap it via wallet-serving
-# backfill before handing off to tip-follow. Operators that prefer
-# full historical coverage can set `ZINDER_BOOTSTRAP_DISABLED=1`.
-if [ ! -f "${STORE_PATH}/CURRENT" ] \
-        && [ -z "${ZINDER_BOOTSTRAP_DISABLED:-}" ] \
+# closes that gap in minutes-to-hours. Run the wallet-serving backfill
+# before every tip-follow handoff: it is idempotent when complete and
+# resumes partial stores left by restarts or upstream-node outages.
+# Operators that prefer full historical coverage can set
+# `ZINDER_BOOTSTRAP_DISABLED=1`.
+if [ -z "${ZINDER_BOOTSTRAP_DISABLED:-}" ] \
         && [ -n "${ZINDER_NODE__JSON_RPC_ADDR:-}" ] \
         && [ -n "${ZINDER_NODE__AUTH__COOKIE:-}" ]; then
-    node_tip=$(curl -sS --connect-timeout 10 --max-time 15 \
-        -u "${ZINDER_NODE__AUTH__COOKIE}" \
-        -H 'content-type: application/json' \
-        -d '{"jsonrpc":"1.0","id":"bootstrap","method":"getblockcount","params":[]}' \
-        "${ZINDER_NODE__JSON_RPC_ADDR}" \
-        | sed -n 's/.*"result":\([0-9][0-9]*\).*/\1/p')
+    while :; do
+        node_tip=$(curl -sS --connect-timeout 10 --max-time 15 \
+            -u "${ZINDER_NODE__AUTH__COOKIE}" \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"1.0","id":"bootstrap","method":"getblockcount","params":[]}' \
+            "${ZINDER_NODE__JSON_RPC_ADDR}" \
+            | sed -n 's/.*"result":\([0-9][0-9]*\).*/\1/p')
 
-    if echo "${node_tip}" | grep -Eq '^[0-9]+$' \
-            && [ "${node_tip}" -gt "${BOOTSTRAP_REORG_HEADROOM_BLOCKS}" ]; then
-        bootstrap_to_height=$((node_tip - BOOTSTRAP_REORG_HEADROOM_BLOCKS))
-        printf 'zinder-ingest/run: bootstrapping empty store via wallet-serving backfill (node_tip=%s to_height=%s)\n' \
-            "${node_tip}" "${bootstrap_to_height}" >&2
-        # Bind the writer's loopback ops endpoint during backfill so
-        # operators can scrape `/metrics` and `/readyz` while the
-        # historical sync runs. Without this, the entire bootstrap
-        # window is observability-dark: the JSON-RPC fetch-latency and
-        # RocksDB commit-duration histograms are recorded internally
-        # but never exposed because no HTTP listener is bound.
-        s6-setuidgid zinder \
-            /usr/local/bin/zinder-ingest backfill \
-            --config "${INGEST_CONFIG}" \
-            --ops-listen-addr 127.0.0.1:9105 \
-            --wallet-serving \
-            --to-height "${bootstrap_to_height}" \
-            || printf 'zinder-ingest/run: backfill exited non-zero; continuing to tip-follow so the supervisor can surface the error\n' >&2
-    else
-        printf 'zinder-ingest/run: skipping bootstrap (node_tip=%s); tip-follow will sync from genesis\n' \
+        if echo "${node_tip}" | grep -Eq '^[0-9]+$' \
+                && [ "${node_tip}" -gt "${BOOTSTRAP_REORG_HEADROOM_BLOCKS}" ]; then
+            break
+        fi
+
+        printf 'zinder-ingest/run: waiting for upstream node tip before wallet-serving backfill (node_tip=%s)\n' \
             "${node_tip:-<empty>}" >&2
-    fi
+        sleep 2
+    done
+
+    bootstrap_to_height=$((node_tip - BOOTSTRAP_REORG_HEADROOM_BLOCKS))
+    printf 'zinder-ingest/run: ensuring wallet-serving backfill coverage (node_tip=%s to_height=%s)\n' \
+        "${node_tip}" "${bootstrap_to_height}" >&2
+    # Bind the writer's loopback ops endpoint during backfill so
+    # operators can scrape `/metrics` and `/readyz` while the
+    # historical sync runs. Without this, the entire bootstrap
+    # window is observability-dark: the JSON-RPC fetch-latency and
+    # RocksDB commit-duration histograms are recorded internally
+    # but never exposed because no HTTP listener is bound.
+    s6-setuidgid zinder \
+        /usr/local/bin/zinder-ingest backfill \
+        --config "${INGEST_CONFIG}" \
+        --ops-listen-addr 127.0.0.1:9105 \
+        --wallet-serving \
+        --to-height "${bootstrap_to_height}"
 fi
 
 # Run as the unprivileged zinder user. s6-overlay's s6-setuidgid is the

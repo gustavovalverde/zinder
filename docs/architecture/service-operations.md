@@ -62,7 +62,7 @@ Required readiness causes:
 
 `zinder-ingest` readiness is capped by upstream node readiness. If the selected upstream node cannot answer, reports not ready, lacks a required capability, or has unreadable cookie-auth material, Zinder reports a typed not-ready cause instead of accepting traffic.
 
-In long-running tip-follow mode, retryable upstream-node failures do not terminate the writer. Zebra restarts, temporary transport failures, and warming-up responses move readiness to `node_unavailable` while `/healthz` stays live and `/readyz` returns not-ready. The writer keeps polling and returns to `syncing` or `ready` once the configured node answers again. Fatal configuration, capability, protocol, storage, and reorg-window failures still fail closed or hold a dedicated operator-action readiness state.
+In long-running ingest modes, retryable upstream-node failures do not terminate the writer. Zebra restarts, temporary transport failures, and warming-up responses move readiness to `node_unavailable` while `/healthz` stays live and `/readyz` returns not-ready. Tip-follow keeps polling and returns to `syncing` or `ready` once the configured node answers again. The backfill command retries from the current visible chain epoch and returns to `ready` after the requested range is covered. Fatal configuration, capability, protocol, storage, and reorg-window failures still fail closed or hold a dedicated operator-action readiness state.
 
 ## Shutdown
 
@@ -243,6 +243,8 @@ Configuration output must make redaction observable. If `--print-config` include
 | `tip_follow_source_unavailable` | WARN | Tip-follow observed a retryable upstream-node failure and moved readiness to `node_unavailable` |
 | `tip_follow_source_recovered` | INFO   | Tip-follow recovered from `node_unavailable` and resumed normal readiness calculation |
 | `tip_follow_stopped`          | INFO   | Tip-follow exits because the cancellation token fired or a fatal error escaped the long-running loop |
+| `backfill_source_unavailable` | WARN   | Backfill observed a retryable upstream-node failure and moved readiness to `node_unavailable` |
+| `backfill_source_recovered`   | INFO   | Backfill recovered from `node_unavailable` and completed the requested range |
 | `backfill_already_complete`   | INFO   | Requested backfill range is already covered by the current chain epoch |
 | `ingest_run_failed`           | ERROR  | A subcommand returned an error before successful exit |
 

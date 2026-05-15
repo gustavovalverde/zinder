@@ -21,7 +21,7 @@ use zinder_core::BlockHeight;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_ingest::{
     BackfillOutcome, IngestControlGrpcAdapter, IngestError, MempoolIndex,
-    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill_with_store,
+    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill_until_complete,
     mempool_ready_channel, open_tip_follow_store, run_mempool_orchestrator,
     spawn_chain_event_retention_task, spawn_mempool_event_retention_task,
     tip_follow_with_primary_store,
@@ -387,7 +387,8 @@ async fn run_backfill(
             None
         };
 
-    let backfill_outcome = backfill_with_store(&backfill_config, &source, &store).await?;
+    let backfill_outcome =
+        backfill_until_complete(&backfill_config, &source, &store, &readiness).await?;
 
     let chain_epoch = backfill_outcome.chain_epoch();
     readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));

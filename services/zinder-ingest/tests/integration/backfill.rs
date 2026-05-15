@@ -13,8 +13,11 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, Network, ShieldedProtocol, SubtreeRootIndex,
 };
-use zinder_ingest::{BackfillConfig, BackfillOutcome, NodeSourceKind, backfill};
+use zinder_ingest::{
+    BackfillConfig, BackfillOutcome, NodeSourceKind, backfill, backfill_until_complete,
+};
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
+use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
     DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeSource, NodeTarget,
     SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots, decode_display_block_hash,
@@ -43,6 +46,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         block: source_block.clone(),
         tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
         fetched_heights: fetched_heights.clone(),
+        pending_retryable_fetch_failures: Arc::new(Mutex::new(0)),
     };
 
     let tempdir = tempdir()?;
@@ -134,6 +138,7 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         block: source_block.clone(),
         tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
         fetched_heights: Arc::new(Mutex::new(Vec::new())),
+        pending_retryable_fetch_failures: Arc::new(Mutex::new(0)),
     };
     let tempdir = tempdir()?;
     let backfill_config = BackfillConfig {
@@ -162,10 +167,72 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
+    let source_block = fixture_source_block()?;
+    let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
+    let checkpoint = SourceChainCheckpoint::new(
+        checkpoint_height,
+        source_block.parent_hash,
+        ChainTipMetadata::empty(),
+    );
+    let pending_retryable_fetch_failures = Arc::new(Mutex::new(6));
+    let fetched_heights = Arc::new(Mutex::new(Vec::new()));
+    let source = FixtureCheckpointSource {
+        block: source_block.clone(),
+        tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
+        fetched_heights: fetched_heights.clone(),
+        pending_retryable_fetch_failures: pending_retryable_fetch_failures.clone(),
+    };
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("recovering-backfill-store");
+    let backfill_config = BackfillConfig {
+        node: NodeTarget::new(
+            Network::ZcashTestnet,
+            "http://127.0.0.1:39232".to_owned(),
+            NodeAuth::None,
+            Duration::from_millis(1),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        ),
+        node_source: NodeSourceKind::ZebraJsonRpc,
+        storage_path: storage_path.clone(),
+        from_height: source_block.height,
+        to_height: source_block.height,
+        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        allow_near_tip_finalize: false,
+        checkpoint: Some(checkpoint),
+    };
+    let store = PrimaryChainStore::open(
+        &storage_path,
+        ChainStoreOptions::for_network(Network::ZcashTestnet),
+    )?;
+    let readiness = Readiness::default();
+
+    let BackfillOutcome::Committed(outcome) =
+        backfill_until_complete(&backfill_config, &source, &store, &readiness).await?
+    else {
+        return Err(eyre!("expected recovered backfill to commit"));
+    };
+
+    assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
+    assert_eq!(*pending_retryable_fetch_failures.lock(), 0);
+    assert_eq!(fetched_heights.lock().len(), 7);
+    let readiness_report = readiness.report();
+    assert!(readiness_report.is_ready);
+    assert_eq!(readiness_report.cause, ReadinessCause::Ready);
+    assert_eq!(
+        readiness_report.current_height,
+        Some(source_block.height.value())
+    );
+
+    Ok(())
+}
+
 struct FixtureCheckpointSource {
     block: SourceBlock,
     tip_height: BlockHeight,
     fetched_heights: Arc<Mutex<Vec<BlockHeight>>>,
+    pending_retryable_fetch_failures: Arc<Mutex<u32>>,
 }
 
 fn assert_current_artifact_schema(chain_epoch: zinder_core::ChainEpoch) {
@@ -183,6 +250,16 @@ impl NodeSource for FixtureCheckpointSource {
 
     async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetched_heights.lock().push(height);
+
+        let mut pending_retryable_fetch_failures = self.pending_retryable_fetch_failures.lock();
+        if *pending_retryable_fetch_failures > 0 {
+            *pending_retryable_fetch_failures = pending_retryable_fetch_failures.saturating_sub(1);
+            return Err(SourceError::NodeUnavailable {
+                reason: "fixture upstream outage".to_owned(),
+                is_retryable: true,
+            });
+        }
+        drop(pending_retryable_fetch_failures);
 
         if height != self.block.height {
             return Err(SourceError::BlockUnavailable {

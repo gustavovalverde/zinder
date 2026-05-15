@@ -22,8 +22,9 @@ use zinder_store::{
 use crate::chain_ingest::{
     ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
     IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, next_chain_epoch_id_after, next_chain_epoch_id_from,
-    populate_subtree_root_artifacts, record_commit_outcome, select_best_chain,
+    fetch_block_with_retry, ingest_error_is_recoverable, next_chain_epoch_id_after,
+    next_chain_epoch_id_from, populate_subtree_root_artifacts, record_commit_outcome,
+    select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
 
@@ -175,7 +176,7 @@ where
         .await
         {
             Ok(iteration) => iteration,
-            Err(error) if tip_follow_error_is_recoverable(&error) => {
+            Err(error) if ingest_error_is_recoverable(&error) => {
                 retry_state = IngestRetryState::default();
                 if !source_was_unavailable {
                     tracing::warn!(
@@ -328,32 +329,6 @@ fn compute_tip_follow_readiness_state(
             current_height,
             target_height,
         ))
-    }
-}
-
-fn tip_follow_error_is_recoverable(error: &IngestError) -> bool {
-    match error {
-        IngestError::Source(source) => source.is_retryable(),
-        IngestError::SourceRetryBudgetExceeded { .. }
-        | IngestError::SourceRetryDeadlineExceeded { .. } => true,
-        IngestError::UnknownNodeSource { .. }
-        | IngestError::SubtreeRootsUnavailable { .. }
-        | IngestError::SubtreeRootCompletingBlockMissing { .. }
-        | IngestError::TransparentPrevoutOutputMissing { .. }
-        | IngestError::UnsupportedShieldedProtocol { .. }
-        | IngestError::EmptyIngestBatch
-        | IngestError::BackfillProducedNoCommit
-        | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
-        | IngestError::BackfillRequiresContiguousTipMetadata { .. }
-        | IngestError::BackfillCheckpointMisaligned { .. }
-        | IngestError::TipFollowObservedTipBehindStore { .. }
-        | IngestError::TipFollowCommonAncestorMissing { .. }
-        | IngestError::TipFollowParentMetadataUnavailable { .. }
-        | IngestError::ReorgWindowExceeded { .. }
-        | IngestError::SystemTimeBeforeUnixEpoch { .. }
-        | IngestError::TimestampTooLarge
-        | IngestError::ArtifactDerive(_)
-        | IngestError::Store(_) => false,
     }
 }
 

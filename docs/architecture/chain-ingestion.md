@@ -140,6 +140,8 @@ Historical backfill is bounded by JSON-RPC round-trip latency, not by upstream-n
 
 Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
 
+Long-running backfill treats retryable upstream-node failures as readiness transitions rather than process lifecycle events. If the source is unavailable long enough for a per-block retry deadline to expire, `backfill_until_complete` reports `node_unavailable`, sleeps briefly, and starts another backfill attempt from the current visible chain epoch. Committed batches are durable, so the retry does not replay from the wallet-serving floor after every transient outage. The single-container deployment runs this idempotent wallet-serving backfill before each tip-follow handoff, which covers empty stores and partial stores left by restarts.
+
 ### Tip-follow wakeups
 
 Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `poll_interval_ms`. The subscription lifecycle runs beside polling and keeps re-subscribing after stream errors. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.

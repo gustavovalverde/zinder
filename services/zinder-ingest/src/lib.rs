@@ -16,7 +16,9 @@ pub use artifact_builder::{
     ArtifactDeriveError, BlockMismatchField, derive_block_artifact, derive_compact_block_artifact,
     derive_transaction_artifacts,
 };
-pub use backfill::{BackfillConfig, BackfillOutcome, backfill, backfill_with_store};
+pub use backfill::{
+    BackfillConfig, BackfillOutcome, backfill, backfill_until_complete, backfill_with_store,
+};
 pub use chain_ingest::{IngestError, NodeSourceKind};
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use mempool::{

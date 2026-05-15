@@ -1,10 +1,11 @@
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use futures_util::stream::StreamExt;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TreeStateArtifact,
 };
+use zinder_runtime::{Readiness, ReadinessState};
 use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
@@ -14,8 +15,8 @@ use zinder_store::{
 use crate::chain_ingest::{
     ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
     IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, next_chain_epoch_id, next_chain_epoch_id_after,
-    populate_subtree_root_artifacts,
+    fetch_block_with_retry, ingest_error_is_recoverable, next_chain_epoch_id,
+    next_chain_epoch_id_after, populate_subtree_root_artifacts,
 };
 
 /// Maximum number of historical block fetches kept in flight against the
@@ -35,6 +36,10 @@ use crate::chain_ingest::{
 /// dedicated node can raise this; operators sharing the node with other readers
 /// should not.
 const BACKFILL_FETCH_CONCURRENCY: usize = 32;
+#[cfg(not(test))]
+const BACKFILL_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const BACKFILL_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -152,6 +157,66 @@ where
         .await
         .map(Box::new)
         .map(BackfillOutcome::Committed)
+}
+
+/// Runs a historical backfill until the requested range is covered.
+///
+/// Retryable upstream-node failures move readiness to `node_unavailable` and
+/// keep polling instead of ending the writer process. Fatal configuration,
+/// source protocol, storage, and artifact errors still return immediately.
+/// One-shot callers that want process-fatal retry deadlines should call
+/// [`backfill_with_store`] directly.
+pub async fn backfill_until_complete<Source>(
+    config: &BackfillConfig,
+    source: &Source,
+    store: &PrimaryChainStore,
+    readiness: &Readiness,
+) -> Result<BackfillOutcome, IngestError>
+where
+    Source: NodeSource,
+{
+    let mut source_was_unavailable = false;
+
+    loop {
+        match backfill_with_store(config, source, store).await {
+            Ok(outcome) => {
+                let chain_epoch = outcome.chain_epoch();
+                readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
+                if source_was_unavailable {
+                    tracing::info!(
+                        target: "zinder::ingest",
+                        event = "backfill_source_recovered",
+                        "backfill source recovered"
+                    );
+                }
+                return Ok(outcome);
+            }
+            Err(error) if ingest_error_is_recoverable(&error) => {
+                if !source_was_unavailable {
+                    tracing::warn!(
+                        target: "zinder::ingest",
+                        event = "backfill_source_unavailable",
+                        error = %error,
+                        "backfill source is unavailable; keeping the writer alive and retrying"
+                    );
+                }
+                source_was_unavailable = true;
+                readiness.set(ReadinessState::node_unavailable(current_chain_height(
+                    store,
+                )));
+                tokio::time::sleep(BACKFILL_SOURCE_RECOVERY_BACKOFF).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
+    store
+        .current_chain_epoch()
+        .ok()
+        .flatten()
+        .map(|chain_epoch| chain_epoch.tip_height.value())
 }
 
 #[cfg(test)]

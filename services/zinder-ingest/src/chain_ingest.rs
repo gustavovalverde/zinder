@@ -522,6 +522,32 @@ pub(crate) fn source_error_is_retryable(error: &SourceError) -> bool {
     error.is_retryable()
 }
 
+pub(crate) fn ingest_error_is_recoverable(error: &IngestError) -> bool {
+    match error {
+        IngestError::Source(source) => source.is_retryable(),
+        IngestError::SourceRetryBudgetExceeded { .. }
+        | IngestError::SourceRetryDeadlineExceeded { .. } => true,
+        IngestError::UnknownNodeSource { .. }
+        | IngestError::SubtreeRootsUnavailable { .. }
+        | IngestError::SubtreeRootCompletingBlockMissing { .. }
+        | IngestError::TransparentPrevoutOutputMissing { .. }
+        | IngestError::UnsupportedShieldedProtocol { .. }
+        | IngestError::EmptyIngestBatch
+        | IngestError::BackfillProducedNoCommit
+        | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
+        | IngestError::BackfillRequiresContiguousTipMetadata { .. }
+        | IngestError::BackfillCheckpointMisaligned { .. }
+        | IngestError::TipFollowObservedTipBehindStore { .. }
+        | IngestError::TipFollowCommonAncestorMissing { .. }
+        | IngestError::TipFollowParentMetadataUnavailable { .. }
+        | IngestError::ReorgWindowExceeded { .. }
+        | IngestError::SystemTimeBeforeUnixEpoch { .. }
+        | IngestError::TimestampTooLarge
+        | IngestError::ArtifactDerive(_)
+        | IngestError::Store(_) => false,
+    }
+}
+
 /// Classifies an already-built candidate chain segment.
 ///
 /// Parent-hash continuity is the reachable rule for the current polling source:
