@@ -49,7 +49,7 @@ Railway terminates TLS at its routing layer; the container serves plaintext gRPC
 
 In the Railway UI, create a new service from a Docker image:
 
-- **Source**: `ghcr.io/zcashfoundation/zinder:latest` (replace with a pinned tag for production: `ghcr.io/zcashfoundation/zinder:v0.1.0`).
+- **Source**: `ghcr.io/gustavovalverde/zinder:latest` (replace with a pinned tag for production: `ghcr.io/gustavovalverde/zinder:v0.1.0`).
 - **Port**: `9101` (TCP). Enable HTTP/2 / gRPC routing in Railway's networking tab.
 
 ### 2. Attach a persistent volume

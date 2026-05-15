@@ -4,7 +4,7 @@ name: parity-compat
 # upstream `electriccoinco/lightwalletd` Go reference, both pointed at the
 # same regtest Zebra node. Lands as a recurring schedule plus manual
 # dispatch; per-PR gating is advisory until the harness has a stable
-# regression baseline (per ADR-0012 §Open mainnet infrastructure questions).
+# regression baseline.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 
@@ -127,5 +127,8 @@ jobs:
         run: |
           if [ -f .tmp/parity.pids ]; then
             cat .tmp/parity.pids
-            kill $(grep -oE '[0-9]+' .tmp/parity.pids | tr '\n' ' ') 2>/dev/null || true
+            mapfile -t pids < <(grep -oE '[0-9]+' .tmp/parity.pids)
+            if [ "${#pids[@]}" -gt 0 ]; then
+              kill "${pids[@]}" 2>/dev/null || true
+            fi
           fi

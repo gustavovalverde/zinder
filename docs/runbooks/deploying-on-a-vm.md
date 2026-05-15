@@ -50,11 +50,11 @@ Zinder does not own TLS termination, authentication, or rate limiting; those are
 ```bash
 sudo install -d -o root -g root -m 0755 /etc/zinder /etc/zinder/config
 sudo curl -fsSLo /etc/zinder/docker-compose.yml \
-    https://raw.githubusercontent.com/zcashfoundation/zinder/main/deploy/docker-compose.yml
+    https://raw.githubusercontent.com/gustavovalverde/zinder/main/deploy/docker-compose.yml
 sudo curl -fsSLo /etc/zinder/config/ingest.toml \
-    https://raw.githubusercontent.com/zcashfoundation/zinder/main/deploy/single-container/config.example.ingest.toml
+    https://raw.githubusercontent.com/gustavovalverde/zinder/main/deploy/single-container/config.example.ingest.toml
 sudo curl -fsSLo /etc/zinder/config/query.toml \
-    https://raw.githubusercontent.com/zcashfoundation/zinder/main/deploy/single-container/config.example.query.toml
+    https://raw.githubusercontent.com/gustavovalverde/zinder/main/deploy/single-container/config.example.query.toml
 ```
 
 Each Zinder binary strict-parses its own TOML schema (writer and reader fields do not share a section set), so the single-container image mounts two configs. Adjust the `[node]`, `[storage]`, and per-service blocks (`[ingest]` / `[tip_follow]` for `ingest.toml`, `[query]` for `query.toml`) to match your VM. Each example config documents every field.
@@ -88,7 +88,7 @@ ZINDER_NODE__AUTH__PASSWORD=...
 
 ```bash
 sudo curl -fsSLo /etc/systemd/system/zinder.service \
-    https://raw.githubusercontent.com/zcashfoundation/zinder/main/deploy/systemd/zinder.service
+    https://raw.githubusercontent.com/gustavovalverde/zinder/main/deploy/systemd/zinder.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zinder
 ```

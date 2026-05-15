@@ -1,6 +1,5 @@
-# Workspace nextest profiles. See ADR-0012 §Test runner: nextest and the
-# matching architecture doc at docs/architecture/service-operations.md
-# §Validation Tiers.
+# Workspace nextest profiles. The Testing Runbook owns the tier definitions;
+# service operations records the operator-facing validation shape.
 #
 # Tiers:
 #   T0 unit         -> #[cfg(test)] mod tests in src/   (default-filter)
@@ -61,7 +60,7 @@ default-filter = "test(/^deploy::/)"
 slow-timeout = { period = "15m", terminate-after = 1 }
 junit = { path = "target/nextest/deploy.xml" }
 
-# Consumer-release certification tier per ADR-0012. Per-consumer parity
+# Consumer-release certification tier. Per-consumer parity
 # assertions live under `tests/parity/` in each crate that surfaces a public
 # consumer contract. The release-tag pipeline runs this profile as a release
 # gate; per-PR runs are advisory.

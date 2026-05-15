@@ -1,8 +1,8 @@
 name: build-images
 
-# Build each service's Docker image on every PR that could affect the build.
-# Tagged releases get the parallel release-images.yml workflow (planned with
-# Tier B4) that also pushes to ghcr.io. This workflow only builds.
+# Build every runtime image on PRs that could affect Rust binaries, Docker
+# contexts, or the image workflow. Tagged releases push through
+# release-images.yml.
 
 on:
   pull_request:
@@ -13,6 +13,7 @@ on:
       - ".dockerignore"
       - "crates/**"
       - "services/**"
+      - "deploy/single-container/**"
       - "buf.yaml"
       - ".github/workflows/build-images.yml"
   workflow_dispatch:
@@ -26,18 +27,30 @@ concurrency:
 
 jobs:
   build:
-    name: build ${{ matrix.service }}
+    name: build ${{ matrix.image.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service:
-          - zinder-ingest
-          - zinder-query
-          - zinder-compat-lightwalletd
-          - zinder-derive
+        image:
+          - name: zinder-ingest
+            dockerfile: services/zinder-ingest/Dockerfile
+            help_entrypoint: zinder-ingest
+          - name: zinder-query
+            dockerfile: services/zinder-query/Dockerfile
+            help_entrypoint: zinder-query
+          - name: zinder-compat-lightwalletd
+            dockerfile: services/zinder-compat-lightwalletd/Dockerfile
+            help_entrypoint: zinder-compat-lightwalletd
+          - name: zinder-derive
+            dockerfile: services/zinder-derive/Dockerfile
+            help_entrypoint: zinder-derive
+          - name: zinder
+            dockerfile: deploy/single-container/Dockerfile
+            help_entrypoint: zinder-query
     env:
-      SERVICE: ${{ matrix.service }}
+      IMAGE_NAME: ${{ matrix.image.name }}
+      HELP_ENTRYPOINT: ${{ matrix.image.help_entrypoint }}
       PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}
     steps:
       - uses: actions/checkout@v4
@@ -49,18 +62,18 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: services/${{ matrix.service }}/Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           push: false
           load: true
-          tags: ${{ matrix.service }}:${{ env.PR_TAG }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          tags: ${{ matrix.image.name }}:${{ env.PR_TAG }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
 
       - name: Inspect image
         run: |
-          docker image inspect "$SERVICE:$PR_TAG" \
+          docker image inspect "$IMAGE_NAME:$PR_TAG" \
             --format 'image={{.Id}} size_bytes={{.Size}}'
 
-      - name: Smoke test --help
+      - name: Smoke test CLI help
         run: |
-          docker run --rm --entrypoint="$SERVICE" "$SERVICE:$PR_TAG" --help
+          docker run --rm --entrypoint="$HELP_ENTRYPOINT" "$IMAGE_NAME:$PR_TAG" --help

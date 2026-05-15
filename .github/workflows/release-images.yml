@@ -7,12 +7,11 @@ name: release-images
 #   - tag is `v<semver>` (e.g. `v0.2.0`)
 #   - images published as ghcr.io/<owner>/<service>:v<semver> and :latest
 #
-# Build topology mirrors Zebra's `zfnd-build-docker-image.yml`: each
-# (image, platform) pair builds on its native runner (amd64 on
+# Each (image, platform) pair builds on its native runner (amd64 on
 # `ubuntu-latest`, arm64 on `ubuntu-24.04-arm`) and pushes by digest. A
-# per-image merge job then assembles the multi-arch manifest with all
-# tags. This avoids QEMU emulation, which makes the arm64 leg 5-10x
-# slower on the standard amd64 runner.
+# per-image merge job then assembles the multi-arch manifest with all tags.
+# Native runners avoid QEMU emulation, which makes the arm64 leg 5-10x slower
+# on the standard amd64 runner.
 
 on:
   push:
@@ -156,10 +155,15 @@ jobs:
           IMAGE: ${{ steps.tags.outputs.image }}
           VERSION: ${{ steps.tags.outputs.version }}
         run: |
+          refs=()
+          for digest in *; do
+            refs+=("${IMAGE}@sha256:${digest}")
+          done
+
           docker buildx imagetools create \
             -t "${IMAGE}:${VERSION}" \
             -t "${IMAGE}:latest" \
-            $(printf "${IMAGE}@sha256:%s " *)
+            "${refs[@]}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
   build-single-container:
@@ -269,8 +273,13 @@ jobs:
           IMAGE: ${{ steps.tags.outputs.image }}
           VERSION: ${{ steps.tags.outputs.version }}
         run: |
+          refs=()
+          for digest in *; do
+            refs+=("${IMAGE}@sha256:${digest}")
+          done
+
           docker buildx imagetools create \
             -t "${IMAGE}:${VERSION}" \
             -t "${IMAGE}:latest" \
-            $(printf "${IMAGE}@sha256:%s " *)
+            "${refs[@]}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"

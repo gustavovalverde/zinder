@@ -1,11 +1,11 @@
 name: live-tests
 
 # T3 (live) tests under tests/live/, double-gated by #[ignore] and
-# require_live(). Per ADR-0012:
+# require_live():
 #   - regtest runs nightly against a Dockerized Zebra service container
 #   - testnet runs weekly against a hosted testnet node
-#   - mainnet is workflow_dispatch-only until the open infrastructure
-#     questions in ADR-0012 §Open mainnet infrastructure questions resolve.
+#   - mainnet is workflow_dispatch-only until runner topology and trigger
+#     ownership are settled.
 # CI secrets mirror the env-var schema: NODE_<NETWORK>_JSON_RPC_ADDR etc.
 
 on:
@@ -83,9 +83,9 @@ jobs:
           ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
         # Run every live test except mainnet-only ones. Regtest is the only
         # network where deep_chain and latency fit in CI budgets without
-        # checkpoint backfill (docs/plans/backfill-from-checkpoint.md).
-        # Mainnet-only tests are excluded by explicit behavior name because
-        # ADR-0012 keeps network labels out of new live test names.
+        # checkpoint backfill. Mainnet-only tests are excluded by explicit
+        # behavior name because live test names avoid network labels unless
+        # the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint)'
@@ -127,17 +127,16 @@ jobs:
         # Filter out tests scoped to other networks. Tests under deep_chain
         # and latency need checkpoint backfill before they fit in hosted-
         # network CI budgets. Network-constrained tests are excluded by
-        # explicit behavior name because ADR-0012 keeps network labels out of
-        # new live test names.
+        # explicit behavior name because live test names avoid network labels
+        # unless the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(_on_regtest) and not test(mainnet) and not test(backfills_from_checkpoint) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(deep_chain) and not test(latency)'
 
   mainnet:
     name: live mainnet
-    # Per ADR-0012 §Open mainnet infrastructure questions, T3 mainnet is
-    # workflow_dispatch-only until the runner topology, on-call, and trigger
-    # model are answered. Tests that target mainnet must opt in via
+    # T3 mainnet is workflow_dispatch-only until the runner topology, on-call,
+    # and trigger model are answered. Tests that target mainnet must opt in via
     # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
     if: github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-mainnet'
     runs-on: ubuntu-latest
@@ -172,8 +171,8 @@ jobs:
           ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
         # Mainnet runs only tests that explicitly opt in via
         # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
-        # Keep this allowlist explicit because live test names intentionally
-        # avoid network names unless they predate ADR-0012's naming rule.
+        # Keep this allowlist explicit because live test names avoid network
+        # names unless the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint)'
