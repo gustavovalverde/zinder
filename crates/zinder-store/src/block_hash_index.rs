@@ -90,14 +90,15 @@ fn decode_block_hash_index_value(
         });
     }
 
-    let height_bytes: [u8; size_of::<u32>()] =
-        value_bytes
+    let (height_bytes, _epoch_bytes) = value_bytes.split_at(size_of::<u32>());
+    let height_array: [u8; size_of::<u32>()] =
+        height_bytes
             .try_into()
             .map_err(|_| StoreError::ArtifactCorrupt {
                 family: ArtifactFamily::BlockHashIndex,
                 key: key.clone().into(),
-                reason: "block-hash-index value has unexpected length",
+                reason: "block-hash-index value height prefix has unexpected length",
             })?;
 
-    Ok(BlockHeight::new(u32::from_be_bytes(height_bytes)))
+    Ok(BlockHeight::new(u32::from_be_bytes(height_array)))
 }
