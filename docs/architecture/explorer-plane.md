@@ -62,7 +62,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | Capability | Owner method | Always-on? |
 | ---------- | ------------ | ---------- |
 | `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v1` | `ExplorerQuery.TransactionDetail` | Yes once shipped |
+| `explorer.transaction.detail_v1` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint is configured |
 | `explorer.transparent_address.balance_v1` | `ExplorerQuery.TransparentAddressBalance` (and federated `WalletQuery.TransparentAddressBalance`) | When the wallet endpoint is configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
@@ -160,8 +160,8 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 
 | Slice | Scope | Capabilities lit |
 | ----- | ----- | ---------------- |
-| **0 (rename)** | Rebrand `zinder-derive` to `zinder-explorer`. Two existing capabilities become `explorer.server_info_v1` and `explorer.transparent_address.balance_v1`. | (renames) |
-| **1 (tracer bullet)** | `TransactionPublicFacts` parser per [ADR-0010](../adrs/0010-transaction-public-facts.md). `ExplorerQuery.TransactionDetail` for mined and mempool transactions. Parser fixture suite. | `explorer.transaction.detail_v1` |
+| ~~**0 (rename)**~~ | _Shipped._ Rebrand `zinder-derive` to `zinder-explorer`. Two existing capabilities become `explorer.server_info_v1` and `explorer.transparent_address.balance_v1`. | (renames) |
+| ~~**1 (tracer bullet)**~~ | _Shipped._ `TransactionPublicFacts` parser per [ADR-0010](../adrs/0010-transaction-public-facts.md) is the single source of truth in `zinder_source::parse_transaction_public_facts`. `ExplorerQuery.TransactionDetail` returns the typed shape plus the cross-cutting `ExplorerFreshness` envelope per [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). Both mined and mempool transactions are covered; conflicting-chain returns `FAILED_PRECONDITION`. | `explorer.transaction.detail_v1` |
 | **2** | `BlockSummary` and `BlockDetail` via the first real `BlockSummaryConsumer` derive view. Reorg-rewind test. | `explorer.block.summary_v1`, `explorer.block.detail_v1` |
 | **3** | Typed `Search` with `SearchIndexConsumer` derive view. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). | `explorer.search.v1` |
 | **4** | `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. Page-oriented aggregations of existing primitives. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |

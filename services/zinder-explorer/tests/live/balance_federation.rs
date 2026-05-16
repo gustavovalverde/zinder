@@ -173,10 +173,9 @@ impl FederatedBalanceFixture {
             serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
-        let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-            network: encode_zinder_native_chain_name(network).to_owned(),
-        })
-        .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
+        let explorer_adapter =
+            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
+                .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
         Ok(Self {
             network,
             address_script_hash: sample.address_script_hash,
@@ -433,7 +432,7 @@ impl MempoolOverlayFixture {
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
         let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-            network: encode_zinder_native_chain_name(env.network()).to_owned(),
+            network: env.network(),
         })
         .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
         Ok(Self {

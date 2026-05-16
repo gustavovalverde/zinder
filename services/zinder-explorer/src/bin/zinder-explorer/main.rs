@@ -123,7 +123,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             }
         };
     let server_info = ExplorerServerInfoSettings {
-        network: encode_zinder_native_chain_name(explorer_config.network).to_owned(),
+        network: explorer_config.network,
     };
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info);
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {

@@ -124,6 +124,21 @@ impl fmt::Display for NetworkUpgradeActivationsError {
 impl std::error::Error for NetworkUpgradeActivationsError {}
 
 impl NetworkUpgradeActivations {
+    /// Builds an activation table that advertises no upgrades.
+    ///
+    /// Convenience for callers that need a table-typed value but cannot
+    /// resolve consensus branch ids themselves: the explorer plane uses
+    /// this when parsing transactions whose branch id is supplied by the
+    /// upstream wallet response. `consensus_branch_id_at` always returns
+    /// [`ConsensusBranchId::PRE_OVERWINTER`] for an empty table.
+    #[must_use]
+    pub const fn empty(network: Network) -> Self {
+        Self {
+            network,
+            activations: Vec::new(),
+        }
+    }
+
     /// Builds the activation table from an unsorted list.
     ///
     /// Sorts activations by `activation_height` ascending. Returns

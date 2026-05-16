@@ -10,12 +10,15 @@
 //! durable contract.
 
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::{
-        ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse,
+        ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest,
+        TransactionDetailResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -29,17 +32,19 @@ use zinder_runtime::{
     connect_authenticated_channel,
 };
 
+use super::transaction_detail::handle_transaction_detail;
+
 /// Settings the binary populates before constructing the adapter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ExplorerServerInfoSettings {
-    /// Network the consumer mirrors, e.g. `zcash-mainnet`.
-    pub network: String,
+    /// Network the consumer mirrors.
+    pub network: Network,
 }
 
 impl Default for ExplorerServerInfoSettings {
     fn default() -> Self {
         Self {
-            network: "zcash-regtest".to_owned(),
+            network: Network::ZcashRegtest,
         }
     }
 }
@@ -112,6 +117,7 @@ impl ExplorerQueryGrpcAdapter {
         let mut capabilities = vec![EXPLORER_SERVER_INFO_V1.to_owned()];
         if self.wallet_query_endpoint.is_some() {
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1.to_owned());
+            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1.to_owned());
         }
         capabilities
     }
@@ -126,7 +132,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         Ok(Response::new(ServerInfoResponse {
             info: Some(ExplorerServerInfo {
                 common: Some(ops::ServerInfo {
-                    network: self.settings.network.clone(),
+                    network: encode_zinder_native_chain_name(self.settings.network).to_owned(),
                     service_name: env!("CARGO_PKG_NAME").to_owned(),
                     service_version: env!("CARGO_PKG_VERSION").to_owned(),
                     capabilities: self.advertised_capabilities(),
@@ -156,6 +162,21 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         compute_transparent_address_balance(&mut client, request_inner)
             .await
             .map(Response::new)
+    }
+
+    async fn transaction_detail(
+        &self,
+        request: Request<TransactionDetailRequest>,
+    ) -> Result<Response<TransactionDetailResponse>, Status> {
+        let endpoint = self.wallet_query_endpoint.as_deref().ok_or_else(|| {
+            Status::unavailable(
+                "TransactionDetail requires a wallet_query_endpoint; \
+                 configure --wallet-query-endpoint",
+            )
+        })?;
+        let mut client =
+            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
+        handle_transaction_detail(&mut client, self.settings.network, request).await
     }
 }
 

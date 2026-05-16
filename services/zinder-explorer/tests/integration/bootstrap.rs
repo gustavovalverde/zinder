@@ -12,18 +12,22 @@ use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint};
+use zinder_core::Network;
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
-use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
+use zinder_proto::v1::explorer::{
+    ServerInfoRequest, TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
+};
 
 #[tokio::test]
 async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: "zcash-regtest".to_owned(),
+        network: Network::ZcashRegtest,
     });
     let server_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -70,7 +74,7 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: "zcash-regtest".to_owned(),
+        network: Network::ZcashRegtest,
     });
     let server_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -110,6 +114,24 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
     assert_eq!(status.code(), tonic::Code::Unavailable);
 
+    assert!(
+        !common
+            .capabilities
+            .iter()
+            .any(|advertised| { advertised == EXPLORER_TRANSACTION_DETAIL_V1 }),
+        "transaction_detail capability must not advertise without a wallet_query_endpoint",
+    );
+    let detail_outcome = client
+        .transaction_detail(TransactionDetailRequest {
+            transaction_id: vec![0_u8; 32],
+            at_epoch: None,
+        })
+        .await;
+    let detail_status = detail_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
+    assert_eq!(detail_status.code(), tonic::Code::Unavailable);
+
     server_handle.abort();
     let _ = server_handle.await;
     Ok(())
@@ -125,7 +147,7 @@ async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result
     let server_token =
         BearerToken::from_str("expected").map_err(|error| eyre!("token parse: {error}"))?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: "zcash-regtest".to_owned(),
+        network: Network::ZcashRegtest,
     })
     .with_bearer_token(server_token.clone());
     let server_handle = tokio::spawn(async move {

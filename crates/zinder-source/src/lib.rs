@@ -39,7 +39,9 @@ pub use source_block::{
 };
 pub use source_error::SourceError;
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
-pub use source_transaction::transparent_prevout_from_raw_transaction_bytes;
+pub use source_transaction::{
+    parse_transaction_public_facts, transparent_prevout_from_raw_transaction_bytes,
+};
 pub use transparent_address::transparent_address_matches_network;
 pub use zebra_indexer_chain_tip::{
     ChainTipNotification, ChainTipNotificationSource, ChainTipNotificationStream,

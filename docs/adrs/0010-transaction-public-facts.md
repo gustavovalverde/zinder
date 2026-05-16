@@ -34,7 +34,6 @@ The decisions to record here are:
 `crates/zinder-core/src/transaction_public_facts.rs` owns the type:
 
 ```rust
-#[non_exhaustive]
 pub struct TransactionPublicFacts {
     // Identity
     pub transaction_id: TransactionId,
@@ -43,16 +42,11 @@ pub struct TransactionPublicFacts {
     // Header
     pub version: TransactionVersion,
     pub consensus_branch_id: Option<ConsensusBranchId>,
-    pub lock_time: Option<LockTime>,
+    pub lock_time: LockTime,
     pub expiry_height: Option<BlockHeight>,
     pub size_bytes: u32,
     // Component counts (privacy-shape inputs)
-    pub transparent_input_count: u32,
-    pub transparent_output_count: u32,
-    pub sapling_spend_count: u32,
-    pub sapling_output_count: u32,
-    pub orchard_action_count: u32,
-    pub sprout_joinsplit_count: u32,
+    pub counts: TransactionComponentCounts,
     // Classification
     pub privacy_shape: PrivacyShape,
     pub is_coinbase: bool,
@@ -60,13 +54,11 @@ pub struct TransactionPublicFacts {
     pub unsupported_sections: Vec<UnsupportedSection>,
 }
 
-#[non_exhaustive]
 pub enum TransactionVersion {
     V1, V2, V3, V4, V5,
     Unsupported { effective_version: u32, version_group_id: Option<u32> },
 }
 
-#[non_exhaustive]
 pub enum PrivacyShape {
     TransparentOnly,
     Shielding,        // transparent in, shielded out
@@ -79,7 +71,7 @@ pub enum PrivacyShape {
 }
 ```
 
-The struct is `#[non_exhaustive]`. The version and privacy-shape enums are `#[non_exhaustive]`. New fields and variants land additively; existing fields keep stable wire positions in the proto mirror.
+The struct and its enums are plain (not `#[non_exhaustive]`). The `Unsupported`/`Unclassified` variants are the extension points for future Zcash protocol additions: a hypothetical v6 lands as `TransactionVersion::Unsupported { effective_version: 6, .. }` and degrades to `PrivacyShape::Unclassified`; no cross-crate matcher needs to add a wildcard arm. Adding a new struct field is a breaking change for external constructors by design, which keeps the construction surface honest. `UnsupportedSection` stays `#[non_exhaustive]` because new section kinds may add variants without forcing constructor changes.
 
 ### The parser is a single helper in `zinder-source`
 
@@ -87,20 +79,23 @@ The struct is `#[non_exhaustive]`. The version and privacy-shape enums are `#[no
 
 ```rust
 pub fn parse_transaction_public_facts(
-    raw_bytes: &[u8],
+    raw_transaction_bytes: &[u8],
+    mined_height: Option<BlockHeight>,
     activations: &NetworkUpgradeActivations,
 ) -> Result<TransactionPublicFacts, SourceError>
 ```
 
-The parser is pure: input bytes + activations → struct. It uses `zebra-chain`'s accessors directly (`tx.version()`, `tx.network_upgrade()`, `tx.lock_time()`, `tx.expiry_height()`, `tx.auth_digest()`, `tx.is_coinbase()`, etc.). The accessors live in `zebra_chain::transaction::Transaction` at version 6.0.2; no upstream gap.
+The parser is pure: input bytes + optional mined height + activations → struct. It uses `zebra-chain`'s accessors directly (`tx.network_upgrade()`, `tx.lock_time()`, `tx.expiry_height()`, `tx.auth_digest()`, `tx.is_coinbase()`, `WtxId::from(tx)`, etc.). The accessors live in `zebra_chain::transaction::Transaction` at version 6.0.2; no upstream gap.
 
-The activations argument carries [ADR-0008](0008-network-parameter-discovery.md)'s node-discovered consensus branch ID table. The parser uses it only to fill `consensus_branch_id` when the transaction header omits it (v1–v2); v3+ transactions carry the branch ID natively and the parser reads it from `tx.network_upgrade()?.branch_id()`.
+The activations argument carries [ADR-0008](0008-network-parameter-discovery.md)'s node-discovered consensus branch ID table. The parser uses it to fill `consensus_branch_id` for v3/v4 transactions whose header omits the upgrade tag: `consensus_branch_id_at(mined_height)` resolves the branch ID from the activations table when the transaction is mined. Mempool v3/v4 transactions surface `consensus_branch_id: None` because no mined height is available to anchor the resolution. v5+ transactions carry the upgrade tag in the header and the parser reads it from `tx.network_upgrade()?.branch_id()` regardless of mined height. v1/v2 transactions are pre-Overwinter and have no branch ID.
+
+The explorer plane lacks a node-side view of the activations table today and constructs `NetworkUpgradeActivations::empty(network)` for the call. For mined transactions the explorer overrides the parser's result with `MinedDetails.consensus_branch_id` from the wallet response (which is authoritative because it came from the canonical commit). Mempool v3/v4 transactions therefore show `consensus_branch_id: None` until the explorer plane federates the activations table.
 
 ### Three call sites consume the parser
 
-- **Ingest block path** (`services/zinder-ingest/src/artifact_builder.rs`): replaces the ad-hoc `transaction.outputs()`/`transaction.inputs()` calls. The parser runs once per transaction during block processing; the existing compact-tx builder consumes the same parsed `ZebraTransaction` to avoid a second parse.
-- **Mempool hydration** (`services/zinder-ingest/src/mempool/entry.rs`): replaces the second `zcash_deserialize_into` call. `MempoolEntry` gains a `public_facts: TransactionPublicFacts` field.
-- **Explorer read path** (`services/zinder-explorer/src/grpc/transaction_detail.rs`): parses on demand from the canonical `TransactionArtifact.payload_bytes`. Within one request batch, parses are deduplicated by `transaction_id` so a request for multiple outputs against the same transaction parses once.
+- **Explorer read path** (`services/zinder-explorer/src/grpc/transaction_detail.rs`): _shipped._ Parses on demand from the canonical `TransactionArtifact.payload_bytes` returned by `WalletQuery.Transaction`. Each request parses once.
+- **Ingest block path** (`services/zinder-ingest/src/artifact_builder.rs`): _follow-up._ Will replace the ad-hoc `transaction.outputs()`/`transaction.inputs()` calls. The parser runs once per transaction during block processing; the existing compact-tx builder will consume the same parsed `ZebraTransaction` to avoid a second parse.
+- **Mempool hydration** (`services/zinder-ingest/src/mempool/entry.rs`): _follow-up._ Will replace the second `zcash_deserialize_into` call. `MempoolEntry` will gain a `public_facts: TransactionPublicFacts` field.
 
 ### Privacy-shape classification is pure
 

@@ -26,10 +26,240 @@ message ServerInfoResponse {
   ExplorerServerInfo info = 1;
 }
 
+// Per-field unavailability with structured reason and canonical text.
+//
+// Carried in `ExplorerFreshness.unavailable` so consumers can branch on
+// the structured `reason` or render `human_reason` verbatim. The reason
+// string comes from the canonical registry in
+// `crates/zinder-core/src/explorer_reasons.rs`; the contract is defined in
+// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md).
+message UnavailableField {
+  // Dotted path matching the response field hierarchy, e.g.
+  // `fee.computed.zip317_conventional_zat`.
+  string field_path = 1;
+
+  // Structured reason the field is absent.
+  UnavailableReason reason = 2;
+
+  // Canonical human-readable reason a UI can render verbatim.
+  string human_reason = 3;
+}
+
+// Coarse classification of why an explorer field is absent.
+enum UnavailableReason {
+  UNAVAILABLE_REASON_UNSPECIFIED = 0;
+
+  // Shielded by design; the value is private, not missing.
+  UNAVAILABLE_PRIVATE_BY_DESIGN = 1;
+
+  // Computation depends on prevouts that could not be resolved.
+  UNAVAILABLE_PREVOUTS_MISSING = 2;
+
+  // The upstream node does not expose the fact this field needs.
+  UNAVAILABLE_UPSTREAM_NOT_SUPPORTED = 3;
+
+  // The derived index does not yet contain this entity.
+  UNAVAILABLE_NOT_INDEXED = 4;
+
+  // Derived index is too far behind canonical to answer this view.
+  UNAVAILABLE_STALE = 5;
+
+  // The transaction includes sections the parser cannot decode.
+  UNAVAILABLE_PARSER_VERSION_UNSUPPORTED = 6;
+}
+
+// Cross-cutting freshness envelope embedded on every explorer response
+// (`field tag 1` by convention).
+//
+// Defined in [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
+// every `ExplorerQuery` RPC's response carries this field tag 1 first so
+// consumers can read `response.freshness` unconditionally.
+message ExplorerFreshness {
+  // Chain epoch the response was produced from.
+  zinder.v1.wallet.ChainEpoch chain_epoch = 1;
+
+  // Age of the mempool snapshot in milliseconds; zero for responses that
+  // do not touch mempool state.
+  uint64 snapshot_age_millis = 2;
+
+  // How far behind canonical the explorer derive view is, in blocks.
+  uint64 derive_cursor_lag_blocks = 3;
+
+  // Wall-clock equivalent of `derive_cursor_lag_blocks` in milliseconds.
+  uint64 derive_cursor_lag_millis = 4;
+
+  // The capability string that produced this response. Lets clients branch
+  // on which `_vN` was used to construct the response shape.
+  string capability_version = 5;
+
+  // Field-path-keyed unavailability entries.
+  repeated UnavailableField unavailable = 6;
+}
+
+// Coarse transaction-format identifier.
+//
+// `effective_version` carries the integer version from
+// [ZIP-225](https://zips.z.cash/zip-0225). `version_group_id` carries the
+// raw `nVersionGroupId` for v3/v4/v5+ transactions. The discrete `kind`
+// arm lets clients switch on a closed enum without parsing the integer.
+enum TransactionVersionKind {
+  TRANSACTION_VERSION_KIND_UNSPECIFIED = 0;
+  TRANSACTION_VERSION_KIND_V1 = 1;
+  TRANSACTION_VERSION_KIND_V2 = 2;
+  TRANSACTION_VERSION_KIND_V3 = 3;
+  TRANSACTION_VERSION_KIND_V4 = 4;
+  TRANSACTION_VERSION_KIND_V5 = 5;
+  TRANSACTION_VERSION_KIND_UNSUPPORTED = 6;
+}
+
+// Transaction-format identifier carried on the explorer wire.
+message TransactionVersion {
+  TransactionVersionKind kind = 1;
+  uint32 effective_version = 2;
+  optional uint32 version_group_id = 3;
+}
+
+// Coarse privacy classification computed by
+// `zinder_core::classify_privacy_shape`.
+enum PrivacyShape {
+  PRIVACY_SHAPE_UNSPECIFIED = 0;
+  PRIVACY_SHAPE_TRANSPARENT_ONLY = 1;
+  PRIVACY_SHAPE_SHIELDING = 2;
+  PRIVACY_SHAPE_DESHIELDING = 3;
+  PRIVACY_SHAPE_SHIELDED_ONLY = 4;
+  PRIVACY_SHAPE_MIXED = 5;
+  PRIVACY_SHAPE_COINBASE = 6;
+  PRIVACY_SHAPE_SHIELDED_COINBASE = 7;
+  PRIVACY_SHAPE_UNCLASSIFIED = 8;
+}
+
+// Transaction lock-time classification.
+//
+// Mirrors `zinder_core::LockTime`: explicit `unlocked` marker, height-based
+// lock time, or Unix-seconds lock time. The oneof is closed; clients
+// switch on the present arm.
+message LockTime {
+  oneof kind {
+    LockTimeUnlocked unlocked = 1;
+    uint32 height = 2;
+    uint64 unix_seconds = 3;
+  }
+}
+
+// Discrete marker for the "no lock-time constraint" case.
+message LockTimeUnlocked {}
+
+// Component counts feeding the privacy classifier and the wire surface.
+message TransactionComponentCounts {
+  uint32 transparent_input_count = 1;
+  uint32 transparent_output_count = 2;
+  uint32 sapling_spend_count = 3;
+  uint32 sapling_output_count = 4;
+  uint32 orchard_action_count = 5;
+  uint32 sprout_joinsplit_count = 6;
+}
+
+// Single typed value carrying every public fact the explorer renders for a
+// transaction.
+//
+// Parsed once by `zinder_source::parse_transaction_public_facts` from raw
+// transaction bytes plus the node-discovered network upgrade table per
+// [ADR-0010](../../../../../docs/adrs/0010-transaction-public-facts.md).
+message TransactionPublicFacts {
+  // Canonical transaction identifier (32 bytes, internal byte order).
+  bytes transaction_id = 1;
+
+  // ZIP-244 authorization digest (32 bytes). Empty/unset for v1-v4.
+  bytes auth_digest = 2;
+
+  // ZIP-239 witness identifier (64 bytes, `txid || auth_digest`). Empty/unset
+  // for v1-v4 where the wtxid equals the txid by definition.
+  bytes wtxid = 3;
+
+  // Coarse transaction-format identifier.
+  TransactionVersion version = 4;
+
+  // Consensus branch ID in the canonical 8-character lowercase hex form
+  // (per the BIP70 / Zebra convention). Empty when not applicable (v1/v2).
+  string consensus_branch_id_hex = 5;
+
+  // Lock-time classification.
+  LockTime lock_time = 6;
+
+  // [ZIP-203](https://zips.z.cash/zip-0203) `nExpiryHeight` when present and
+  // non-sentinel. Zero/unset means the transaction has no expiry.
+  uint32 expiry_height = 7;
+
+  // Raw transaction byte length.
+  uint32 size_bytes = 8;
+
+  // Component counts (transparent / Sapling / Orchard / Sprout).
+  TransactionComponentCounts counts = 9;
+
+  // Coarse privacy classification.
+  PrivacyShape privacy_shape = 10;
+
+  // `true` when the transaction is a coinbase row.
+  bool is_coinbase = 11;
+}
+
+// Discriminated transaction location.
+//
+// A `TransactionDetail` response carries exactly one of `mined` or
+// `in_mempool`. Transactions the indexer cannot locate at all surface as
+// `Status::NOT_FOUND`, not as an empty `TransactionLocation`.
+message TransactionLocation {
+  oneof kind {
+    MinedLocation mined = 1;
+    MempoolLocation in_mempool = 2;
+  }
+}
+
+// Mined-transaction location carrying block context the explorer page
+// renders alongside the parsed facts.
+message MinedLocation {
+  uint32 block_height = 1;
+  bytes block_hash = 2;
+  int64 block_time_unix_seconds = 3;
+  uint32 confirmations = 4;
+}
+
+// Mempool-transaction location carrying first-observation metadata.
+message MempoolLocation {
+  uint64 first_seen_unix_millis = 1;
+  zinder.v1.wallet.ChainEpoch first_seen_chain_epoch = 2;
+}
+
+// `ExplorerQuery.TransactionDetail` request.
+//
+// `at_epoch` optionally pins the read to a specific chain epoch so the
+// response stays consistent with a concurrent caller's other reads.
+message TransactionDetailRequest {
+  bytes transaction_id = 1;
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 2;
+}
+
+// `ExplorerQuery.TransactionDetail` response.
+//
+// Carries the cross-cutting freshness envelope plus the parsed public
+// facts, location discriminator, and raw transaction bytes so consumers
+// can keep parsed and raw forms together (per the PRD's user story 16).
+message TransactionDetailResponse {
+  ExplorerFreshness freshness = 1;
+  TransactionPublicFacts facts = 2;
+  TransactionLocation location = 3;
+  bytes raw_transaction_bytes = 4;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+
+  // Returns a typed read model for one transaction. Capability:
+  // `explorer.transaction.detail_v1`.
+  rpc TransactionDetail(TransactionDetailRequest)
+      returns (TransactionDetailResponse);
 
   // Returns the transparent-address balance summed across the requested
   // addresses. Capability: `explorer.transparent_address.balance_v1`.

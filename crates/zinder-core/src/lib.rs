@@ -16,6 +16,7 @@ mod mempool;
 mod network_upgrade_activations;
 mod subtree_root;
 mod transaction;
+mod transaction_public_facts;
 mod transparent_address_balance;
 mod transparent_address_tx_index;
 mod transparent_prevout;
@@ -46,6 +47,10 @@ pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
     BroadcastUnknown, MinedDetails, MinedTransaction, RawTransactionBytes, TransactionArtifact,
     TransactionBroadcastResult, TransactionId, TxStatus,
+};
+pub use transaction_public_facts::{
+    LockTime, PrivacyShape, TransactionComponentCounts, TransactionPublicFacts, TransactionVersion,
+    UnsupportedSection, Wtxid, classify_privacy_shape,
 };
 pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;

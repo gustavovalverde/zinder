@@ -66,6 +66,13 @@ pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transpar
 pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
+/// Capability advertised for `ExplorerQuery.TransactionDetail`.
+///
+/// Signals that the response carries the full `TransactionPublicFacts` shape
+/// per [ADR-0010](../../../docs/adrs/0010-transaction-public-facts.md). The
+/// always-on wallet capability for raw transaction lookup remains
+/// [`WALLET_READ_TRANSACTION_BY_ID_V1`].
+pub const EXPLORER_TRANSACTION_DETAIL_V1: &str = "explorer.transaction.detail_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -140,6 +147,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
     EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_TRANSACTION_DETAIL_V1,
 ];
 
 /// Helpers for client-side capability discovery.
