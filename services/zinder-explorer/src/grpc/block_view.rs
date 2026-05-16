@@ -1,0 +1,198 @@
+//! `ExplorerQuery.BlockSummariesInRange` and `ExplorerQuery.BlockDetail`
+//! handlers.
+//!
+//! Both reads project the materialized `BlockSummaryRecord` payloads written
+//! by [`crate::consumer::block_summary::BlockSummaryConsumer`] into the
+//! public wire shapes. The handlers wrap reads in the cross-cutting
+//! [`ExplorerFreshness`] envelope per
+//! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md) and
+//! compute `derive_cursor_lag_blocks` against the wallet plane's visible
+//! tip.
+
+use prost::Message as _;
+use tonic::{Request, Response, Status};
+use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
+use zinder_proto::v1::explorer::{
+    BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
+    BlockSummariesInRangeResponse, BlockSummaryRecord, ExplorerFreshness, block_detail_request,
+};
+use zinder_proto::v1::wallet::{
+    self, BlockSelector, LatestBlockRequest, block_selector, wallet_query_client::WalletQueryClient,
+};
+use zinder_runtime::AuthenticatedChannel;
+
+use crate::consumer::block_summary::BLOCK_SUMMARY_COLUMN_FAMILY;
+use crate::store::DeriveStore;
+
+/// Hard cap on the number of block summaries one range request returns.
+///
+/// The wire response is a single repeated field; a multi-million-row request
+/// would blow up the gRPC buffer. The cap mirrors the bounded-page rule used
+/// across other explorer reads.
+const MAX_BLOCK_SUMMARIES_PER_REQUEST: u32 = 1024;
+
+pub(crate) async fn handle_block_summaries_in_range(
+    derive_store: &DeriveStore,
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    request: Request<BlockSummariesInRangeRequest>,
+) -> Result<Response<BlockSummariesInRangeResponse>, Status> {
+    let inner = request.into_inner();
+    let start_height = inner.start_height;
+    let end_height = inner.end_height;
+    if end_height < start_height {
+        return Err(Status::invalid_argument(
+            "end_height must be >= start_height",
+        ));
+    }
+    let span = u64::from(end_height) - u64::from(start_height) + 1;
+    if span > u64::from(MAX_BLOCK_SUMMARIES_PER_REQUEST) {
+        return Err(Status::invalid_argument(format!(
+            "requested span {span} blocks exceeds the per-request cap of \
+             {MAX_BLOCK_SUMMARIES_PER_REQUEST}",
+        )));
+    }
+
+    let start_key = start_height.to_be_bytes();
+    let end_key = end_height.to_be_bytes();
+    let entries = derive_store
+        .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key)
+        .map_err(|error| Status::internal(error.to_string()))?;
+
+    let mut summaries = Vec::with_capacity(entries.len());
+    for (_, payload) in entries {
+        let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+            Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
+        })?;
+        let summary = record
+            .summary
+            .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+        summaries.push(summary);
+    }
+
+    let freshness = build_freshness(
+        derive_store,
+        wallet_client,
+        EXPLORER_BLOCK_SUMMARY_V1,
+        summaries.last().map(|summary| summary.block_height),
+    )
+    .await?;
+
+    Ok(Response::new(BlockSummariesInRangeResponse {
+        freshness: Some(freshness),
+        summaries,
+    }))
+}
+
+pub(crate) async fn handle_block_detail(
+    derive_store: &DeriveStore,
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    request: Request<BlockDetailRequest>,
+) -> Result<Response<BlockDetailResponse>, Status> {
+    let inner = request.into_inner();
+    let height = resolve_block_height(wallet_client, &inner).await?;
+    let key = height.to_be_bytes();
+    let payload = derive_store
+        .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &key)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "BlockSummary is not materialized for height {height}"
+            ))
+        })?;
+    let record = BlockSummaryRecord::decode(payload.as_slice())
+        .map_err(|error| Status::internal(format!("BlockSummaryRecord decode failed: {error}")))?;
+    let summary = record
+        .summary
+        .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+    let transaction_ids = record.transaction_ids;
+
+    let freshness = build_freshness(
+        derive_store,
+        wallet_client,
+        EXPLORER_BLOCK_DETAIL_V1,
+        Some(summary.block_height),
+    )
+    .await?;
+
+    Ok(Response::new(BlockDetailResponse {
+        freshness: Some(freshness),
+        summary: Some(summary),
+        transaction_ids,
+    }))
+}
+
+async fn resolve_block_height(
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    request: &BlockDetailRequest,
+) -> Result<u32, Status> {
+    match request
+        .selector
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("BlockDetailRequest.selector is required"))?
+    {
+        block_detail_request::Selector::BlockHeight(height) => Ok(*height),
+        block_detail_request::Selector::BlockHash(hash) => {
+            let selector = BlockSelector {
+                selector: Some(block_selector::Selector::Hash(hash.clone())),
+            };
+            let response = wallet_client
+                .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+                    selector: Some(selector),
+                    at_epoch: request.at_epoch.clone(),
+                }))
+                .await?
+                .into_inner();
+            let block_id = response
+                .block_id
+                .ok_or_else(|| Status::internal("BlockIdResponse.block_id missing"))?;
+            Ok(block_id.height)
+        }
+    }
+}
+
+async fn build_freshness(
+    derive_store: &DeriveStore,
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    capability_version: &str,
+    highest_returned_height: Option<u32>,
+) -> Result<ExplorerFreshness, Status> {
+    let latest = wallet_client
+        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .await?
+        .into_inner();
+    let chain_epoch = latest
+        .chain_epoch
+        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+    let canonical_tip = latest
+        .latest_block
+        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
+        .height;
+    let derive_tip = highest_materialized_height(derive_store)?;
+    let derive_cursor_lag_blocks = derive_tip.map_or_else(
+        || u64::from(canonical_tip),
+        |materialized| u64::from(canonical_tip.saturating_sub(materialized)),
+    );
+    let _ = highest_returned_height;
+    Ok(ExplorerFreshness {
+        chain_epoch: Some(chain_epoch),
+        snapshot_age_millis: 0,
+        derive_cursor_lag_blocks,
+        derive_cursor_lag_millis: 0,
+        capability_version: capability_version.to_owned(),
+        unavailable: Vec::new(),
+    })
+}
+
+fn highest_materialized_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
+    let start_key = [0_u8; 4];
+    let end_key = [0xFF_u8; 4];
+    let entries = derive_store
+        .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let highest = entries
+        .last()
+        .map(|(key, _)| key.as_slice())
+        .and_then(|key| <[u8; 4]>::try_from(key).ok())
+        .map(u32::from_be_bytes);
+    Ok(highest)
+}

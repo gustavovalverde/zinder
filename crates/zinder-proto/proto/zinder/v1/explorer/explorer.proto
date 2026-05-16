@@ -251,6 +251,96 @@ message TransactionDetailResponse {
   bytes raw_transaction_bytes = 4;
 }
 
+// Compact summary of one canonical block.
+//
+// Materialized once at derive time and read back by both
+// `ExplorerQuery.BlockSummariesInRange` (projection) and
+// `ExplorerQuery.BlockDetail` (full record). See
+// [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
+message BlockSummary {
+  // Canonical block height.
+  uint32 block_height = 1;
+
+  // Canonical block hash in internal byte order (32 bytes).
+  bytes block_hash = 2;
+
+  // `nTime` from the block header.
+  int64 block_time_unix_seconds = 3;
+
+  // Number of transactions in the block, including the coinbase.
+  uint32 transaction_count = 4;
+
+  // Previous block hash in internal byte order (32 bytes).
+  bytes previous_block_hash = 5;
+}
+
+// Materialized storage record for the `BlockSummary` derive view.
+//
+// Not exposed by any RPC. Encoded once at derive time and read back by
+// both `ExplorerQuery.BlockSummariesInRange` (projecting `summary`) and
+// `ExplorerQuery.BlockDetail` (emitting `summary` plus `transaction_ids`).
+// One record per canonical block, keyed by big-endian block height inside
+// the consumer's `block_summary` column family.
+message BlockSummaryRecord {
+  BlockSummary summary = 1;
+  // Transaction ids in canonical block order (32 bytes each, internal byte
+  // order). The leading entry is the coinbase.
+  repeated bytes transaction_ids = 2;
+}
+
+// `ExplorerQuery.BlockSummariesInRange` request.
+//
+// Returns one `BlockSummary` per canonical block in
+// `[start_height, end_height]` inclusive, ordered by ascending height.
+message BlockSummariesInRangeRequest {
+  // First block height to return (inclusive).
+  uint32 start_height = 1;
+
+  // Last block height to return (inclusive).
+  uint32 end_height = 2;
+
+  // Optional chain-epoch pin for snapshot consistency with concurrent reads.
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
+}
+
+// `ExplorerQuery.BlockSummariesInRange` response.
+message BlockSummariesInRangeResponse {
+  ExplorerFreshness freshness = 1;
+  repeated BlockSummary summaries = 2;
+}
+
+// `ExplorerQuery.BlockDetail` request.
+//
+// Either `block_height` or `block_hash` resolves the target block. Hash
+// lookups consult the upstream wallet plane's
+// `WalletQuery.BlockIdBySelector` indirection so the derive store keeps a
+// single height-keyed schema.
+message BlockDetailRequest {
+  oneof selector {
+    uint32 block_height = 1;
+    bytes block_hash = 2;
+  }
+
+  // Optional chain-epoch pin for snapshot consistency with concurrent reads.
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
+}
+
+// `ExplorerQuery.BlockDetail` response.
+//
+// Carries the `BlockSummary` plus the canonical-ordered transaction ids the
+// block committed. Clients render per-transaction rows by calling
+// `ExplorerQuery.TransactionDetail` with each id; the v1 surface keeps
+// per-transaction data out of the block-detail wire shape to avoid the
+// fan-out cost of parsing every transaction at request time.
+message BlockDetailResponse {
+  ExplorerFreshness freshness = 1;
+  BlockSummary summary = 2;
+
+  // Transaction ids in canonical block order (32 bytes each, internal byte
+  // order). The leading entry is the coinbase.
+  repeated bytes transaction_ids = 3;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
@@ -260,6 +350,16 @@ service ExplorerQuery {
   // `explorer.transaction.detail_v1`.
   rpc TransactionDetail(TransactionDetailRequest)
       returns (TransactionDetailResponse);
+
+  // Returns one `BlockSummary` per canonical block in the requested
+  // height range, ordered by ascending height. Capability:
+  // `explorer.block.summary_v1`.
+  rpc BlockSummariesInRange(BlockSummariesInRangeRequest)
+      returns (BlockSummariesInRangeResponse);
+
+  // Returns one `BlockSummary` plus the canonical-ordered transaction ids
+  // for the requested block. Capability: `explorer.block.detail_v1`.
+  rpc BlockDetail(BlockDetailRequest) returns (BlockDetailResponse);
 
   // Returns the transparent-address balance summed across the requested
   // addresses. Capability: `explorer.transparent_address.balance_v1`.

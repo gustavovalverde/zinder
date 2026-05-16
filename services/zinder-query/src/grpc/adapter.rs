@@ -39,7 +39,7 @@ use super::native::{
     block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
     build_compact_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_utxos_stream_chunk, build_wallet_server_info, compact_block_response,
-    latest_block_response, latest_tree_state_response, subtree_roots_response,
+    full_block_response, latest_block_response, latest_tree_state_response, subtree_roots_response,
     transaction_response, transparent_address_confirmed_balance_response,
     transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
 };
@@ -179,6 +179,21 @@ where
         compact_block_response(
             &self.query_api,
             BlockHeight::new(request.height),
+            chain_epoch_from_request(request.at_epoch)?,
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn full_block(
+        &self,
+        request: Request<wallet::FullBlockRequest>,
+    ) -> Result<Response<wallet::FullBlockResponse>, Status> {
+        let request = request.into_inner();
+        full_block_response(
+            &self.query_api,
+            BlockHeight::new(request.block_height),
             chain_epoch_from_request(request.at_epoch)?,
         )
         .await

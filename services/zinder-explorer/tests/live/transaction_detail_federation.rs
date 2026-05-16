@@ -70,58 +70,58 @@ async fn transaction_detail_returns_typed_facts_for_sampled_coinbase() -> Result
     };
     let mut fixture = TransactionDetailFixture::open(&env).await?;
     let response = fixture.query_transaction_detail().await?;
+    assert_response_invariants(&fixture, &response)?;
+    fixture.shutdown().await;
+    Ok(())
+}
 
+fn assert_response_invariants(
+    fixture: &TransactionDetailFixture,
+    response: &zinder_proto::v1::explorer::TransactionDetailResponse,
+) -> Result<()> {
     let freshness = response
         .freshness
+        .as_ref()
         .ok_or_else(|| eyre!("response missing freshness envelope"))?;
     freshness
         .chain_epoch
+        .as_ref()
         .ok_or_else(|| eyre!("freshness envelope missing chain_epoch"))?;
-
     let facts = response
         .facts
+        .as_ref()
         .ok_or_else(|| eyre!("response missing public facts"))?;
     assert_eq!(
         facts.transaction_id,
         encode_internal_transaction_id(fixture.coinbase_transaction_id).to_vec(),
         "transaction_id must match the txid the explorer was asked for",
     );
-    assert!(
-        facts.is_coinbase,
-        "tip-block first transaction must classify as coinbase",
-    );
+    assert!(facts.is_coinbase);
     let privacy_shape = WirePrivacyShape::try_from(facts.privacy_shape)
         .map_err(|error| eyre!("privacy_shape proto-decode failed: {error}"))?;
-    assert!(
-        matches!(
-            privacy_shape,
-            WirePrivacyShape::Coinbase | WirePrivacyShape::ShieldedCoinbase,
-        ),
-        "coinbase privacy_shape must be Coinbase or ShieldedCoinbase, got {privacy_shape:?}",
-    );
-
+    assert!(matches!(
+        privacy_shape,
+        WirePrivacyShape::Coinbase | WirePrivacyShape::ShieldedCoinbase,
+    ));
     let version = facts
         .version
-        .ok_or_else(|| eyre!("facts missing version"))?;
+        .as_ref()
+        .ok_or_else(|| eyre!("missing version"))?;
     let version_kind = TransactionVersionKind::try_from(version.kind)
         .map_err(|error| eyre!("version.kind proto-decode failed: {error}"))?;
-    assert!(
-        !matches!(
-            version_kind,
-            TransactionVersionKind::Unspecified | TransactionVersionKind::Unsupported,
-        ),
-        "tip-block coinbase must classify into a supported transaction version, got {version_kind:?}",
-    );
+    assert!(!matches!(
+        version_kind,
+        TransactionVersionKind::Unspecified | TransactionVersionKind::Unsupported,
+    ));
     assert_eq!(
         version.effective_version,
-        version_to_effective_integer(version_kind),
-        "effective_version must mirror the closed enum variant",
+        version_to_effective_integer(version_kind)
     );
-
     let location = response
         .location
-        .ok_or_else(|| eyre!("response missing location"))?;
-    let mined_location = match location.kind {
+        .as_ref()
+        .ok_or_else(|| eyre!("missing location"))?;
+    let mined_location = match &location.kind {
         Some(transaction_location::Kind::Mined(mined)) => mined,
         Some(transaction_location::Kind::InMempool(_)) | None => {
             return Err(eyre!("expected mined location for tip-block coinbase"));
@@ -130,14 +130,11 @@ async fn transaction_detail_returns_typed_facts_for_sampled_coinbase() -> Result
     assert_eq!(
         BlockHeight::new(mined_location.block_height),
         fixture.sample_block_height,
-        "mined block_height must match the sampled tip height",
     );
     assert_eq!(
-        response.raw_transaction_bytes.len() as u32,
+        u32::try_from(response.raw_transaction_bytes.len()).unwrap_or(u32::MAX),
         facts.size_bytes,
-        "size_bytes must mirror the raw transaction byte length",
     );
-
     tracing::info!(
         target: "zinder::live",
         event = "transaction_detail_validated",
@@ -148,20 +145,17 @@ async fn transaction_detail_returns_typed_facts_for_sampled_coinbase() -> Result
         size_bytes = facts.size_bytes,
         "explorer transaction detail validated against live node",
     );
-
-    fixture.shutdown().await;
     Ok(())
 }
 
 const fn version_to_effective_integer(kind: TransactionVersionKind) -> u32 {
     match kind {
-        TransactionVersionKind::Unspecified => 0,
         TransactionVersionKind::V1 => 1,
         TransactionVersionKind::V2 => 2,
         TransactionVersionKind::V3 => 3,
         TransactionVersionKind::V4 => 4,
         TransactionVersionKind::V5 => 5,
-        TransactionVersionKind::Unsupported => 0,
+        TransactionVersionKind::Unspecified | TransactionVersionKind::Unsupported => 0,
     }
 }
 

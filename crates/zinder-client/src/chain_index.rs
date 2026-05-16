@@ -5,13 +5,13 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    CompactBlockArtifact, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
-    TxStatus,
+    BlockArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
+    BlockSelector, ChainEpoch, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
+    RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
+    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -446,6 +446,30 @@ pub trait ChainIndex: Send + Sync + 'static {
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockArtifact, IndexerError>;
+
+    /// Reads one full canonical block artifact.
+    ///
+    /// Returns the consensus wire-serialized block bytes alongside the
+    /// canonical block hash and parent hash. Use when the compact-block
+    /// format omits transactions a caller needs (notably transparent-only
+    /// and coinbase transactions).
+    ///
+    /// `at_epoch = None` resolves to the live tip; `Some(epoch)` pins the
+    /// read to that chain epoch.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let block = client.full_block_at(BlockHeight::new(0), None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockArtifact, IndexerError>;
 
     /// Streams compact block artifacts for an inclusive range.
     ///

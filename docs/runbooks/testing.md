@@ -813,6 +813,9 @@ wallet.address.transparent_balance_v1
 explorer.server_info_v1
 explorer.transparent_address.balance_v1
 explorer.transaction.detail_v1
+explorer.block.summary_v1
+explorer.block.detail_v1
+wallet.read.full_block_at_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

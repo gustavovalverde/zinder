@@ -16,6 +16,7 @@
 //!   unconfirmed activity. Public entry point:
 //!   [`crate::run_mempool_events_subscriber`].
 
+pub(crate) mod block_summary;
 pub(crate) mod chain_events;
 pub(crate) mod mempool_events;
 

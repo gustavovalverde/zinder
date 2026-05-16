@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
-    BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
+    BlockArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
@@ -25,8 +25,8 @@ use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, LatestBlock,
-    QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
+    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, FullBlock,
+    LatestBlock, QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos, TransparentAddressUtxosRequest,
     TreeState, WalletQueryApi,
 };
@@ -189,6 +189,19 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
         .compact_block_at(height, at_epoch)
         .await
         .map(build_compact_block_response)
+}
+
+/// Reads the full canonical block at `height` and encodes the native wallet
+/// response.
+pub(super) async fn full_block_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    height: BlockHeight,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::FullBlockResponse, QueryError> {
+    query_api
+        .full_block_at(height, at_epoch)
+        .await
+        .map(build_full_block_response)
 }
 
 /// Resolves a typed block selector and encodes the native wallet response.
@@ -599,6 +612,22 @@ fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactB
     wallet::CompactBlockResponse {
         chain_epoch: Some(build_chain_epoch_message(compact_block.chain_epoch)),
         compact_block: Some(build_compact_block_message(compact_block.compact_block)),
+    }
+}
+
+fn build_full_block_response(full_block: FullBlock) -> wallet::FullBlockResponse {
+    wallet::FullBlockResponse {
+        chain_epoch: Some(build_chain_epoch_message(full_block.chain_epoch)),
+        block: Some(build_full_block_message(full_block.block)),
+    }
+}
+
+fn build_full_block_message(block: BlockArtifact) -> wallet::FullBlock {
+    wallet::FullBlock {
+        block_height: block.height.value(),
+        block_hash: encode_internal_block_hash(block.block_hash).into(),
+        parent_block_hash: encode_internal_block_hash(block.parent_hash).into(),
+        raw_block_bytes: block.payload_bytes,
     }
 }
 

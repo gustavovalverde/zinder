@@ -92,6 +92,28 @@ pub enum DeriveStoreError {
         /// Column family that could not be resolved.
         column_family: DeriveStoreColumnFamily,
     },
+    /// Consumer-owned column family handle was unexpectedly absent.
+    ///
+    /// Returned by [`crate::store::DeriveStore::consumer_column_family`] when
+    /// the requested name was not registered through
+    /// [`crate::store::DeriveStoreOptions::consumer_column_families`] before
+    /// the store opened.
+    #[error("derive store consumer column family {name} missing after open")]
+    ConsumerColumnFamilyMissing {
+        /// Column family name the consumer asked for.
+        name: &'static str,
+    },
+    /// Operation on a consumer-owned column family failed.
+    #[error("derive store {operation} failed for consumer column family {name}: {source}")]
+    ConsumerOperation {
+        /// Logical operation that failed (e.g. `get`, `range_iterate`).
+        operation: &'static str,
+        /// Consumer-owned column family the operation targeted.
+        name: &'static str,
+        /// Underlying `RocksDB` error.
+        #[source]
+        source: rust_rocksdb::Error,
+    },
 }
 
 /// Column-family identifier surfaced in `DeriveStoreError` variants.

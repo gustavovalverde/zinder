@@ -5147,6 +5147,7 @@ dependencies = [
  "eyre",
  "hex",
  "parking_lot",
+ "prost",
  "rust-rocksdb",
  "serde",
  "serde_json",

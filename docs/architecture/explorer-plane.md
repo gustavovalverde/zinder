@@ -55,6 +55,30 @@ Additional methods land incrementally per [the slicing plan](#slicing-plan-defer
 - Paginated requests accept `from_cursor: bytes` plus `max_entries: uint32`.
 - Fields use unit suffixes per [Public interfaces §Method Naming Conventions](public-interfaces.md#method-naming-conventions): `_zat`, `_zec`, `_height`, `_count`, `_bytes`, `_millis`, `_seconds`.
 
+## Block view shape
+
+The block listing and block-detail surfaces share one materialized view: a `BlockSummaryRecord` per canonical block, keyed by big-endian block height. The wire shape splits read concerns across two RPCs without duplicating storage.
+
+`BlockSummary` carries the per-block facts a listing page renders:
+
+```proto
+message BlockSummary {
+  uint32 block_height = 1;
+  bytes block_hash = 2;                  // internal byte order, 32 bytes
+  int64 block_time_unix_seconds = 3;
+  uint32 transaction_count = 4;          // includes coinbase
+  bytes previous_block_hash = 5;         // internal byte order, 32 bytes
+}
+```
+
+`ExplorerQuery.BlockSummariesInRange` returns a range of `BlockSummary` rows ordered by ascending height. The handler reads the materialized record from the consumer store, projects the summary fields, and skips the transaction-id payload so the wire response stays cheap on long ranges.
+
+`ExplorerQuery.BlockDetail` resolves either a height or a hash to one `BlockSummary` plus the canonical-ordered list of transaction ids. Clients drill into per-transaction facts by calling `ExplorerQuery.TransactionDetail` with each id from the list. The first slice keeps the per-tx surface as ids only; richer block-detail rows (per-tx component counts, fees, privacy shape) require new derive-time aggregation and ship in a later `_v2` increment.
+
+The materialized record covers both reads so a `BlockDetail` request is one RocksDB get, and a `BlockSummariesInRange` request is one range scan. Storage cost is dominated by the transaction-id list: `~32 bytes × tx_count` per block, plus ~80 bytes for the summary fields.
+
+Reorg rewind deletes every record in the reverted height range and re-fetches the replacement range before committing the cursor advance, so the view never advertises a stale BlockSummary for a height that no longer maps to the canonical chain.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:

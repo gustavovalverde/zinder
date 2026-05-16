@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    BlockArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
     CompactBlockArtifact, MinedDetails, MinedTransaction, Network, NetworkUpgradeActivations,
     RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
     TransactionId, TreeStateArtifact, TxStatus,
@@ -221,6 +221,20 @@ impl ChainIndex for LocalChainIndex {
                 .ok_or(IndexerError::NotFound {
                     resource: "compact block",
                 })
+        })
+        .await
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockArtifact, IndexerError> {
+        self.read_at_epoch(at_epoch, move |reader| {
+            reader
+                .block_at(height)
+                .map_err(IndexerError::from_store_error)?
+                .ok_or(IndexerError::NotFound { resource: "block" })
         })
         .await
     }

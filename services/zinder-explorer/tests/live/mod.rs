@@ -6,4 +6,5 @@
 //! parallel test-only namespace.
 
 mod balance_federation;
+mod block_view_federation;
 mod transaction_detail_federation;

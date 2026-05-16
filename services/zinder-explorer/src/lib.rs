@@ -19,6 +19,10 @@ mod error;
 mod grpc;
 mod store;
 
+pub use consumer::block_summary::{
+    BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
+    BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
+};
 pub use consumer::chain_events::{ChainEventsRunOutcome, run as run_chain_events_subscriber};
 pub use consumer::mempool_events::{MempoolEventsRunOutcome, run as run_mempool_events_subscriber};
 pub use consumer::{
@@ -29,5 +33,6 @@ pub use consumer::{
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 pub use store::{
-    DERIVE_SCHEMA_VERSION, DeriveCursorEntry, DeriveStore, DeriveStoreOptions, DeriveStoreTable,
+    ConsumerEntry, DERIVE_SCHEMA_VERSION, DeriveCursorEntry, DeriveStore, DeriveStoreOptions,
+    DeriveStoreTable,
 };

@@ -539,6 +539,9 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `explorer.server_info_v1`
 - `explorer.transparent_address.balance_v1`
 - `explorer.transaction.detail_v1`
+- `explorer.block.summary_v1`
+- `explorer.block.detail_v1`
+- `wallet.read.full_block_at_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.

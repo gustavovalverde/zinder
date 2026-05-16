@@ -12,13 +12,14 @@
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_SERVER_INFO_V1,
+    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::{
-        ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest,
-        TransactionDetailResponse,
+        BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
+        BlockSummariesInRangeResponse, ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse,
+        TransactionDetailRequest, TransactionDetailResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -32,7 +33,9 @@ use zinder_runtime::{
     connect_authenticated_channel,
 };
 
+use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::transaction_detail::handle_transaction_detail;
+use crate::store::DeriveStore;
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +64,7 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_query_endpoint: Option<String>,
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
+    derive_store: Option<DeriveStore>,
 }
 
 impl ExplorerQueryGrpcAdapter {
@@ -72,7 +76,16 @@ impl ExplorerQueryGrpcAdapter {
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
             bearer_token: None,
+            derive_store: None,
         }
+    }
+
+    /// Wires the consumer-side derive store so block-view RPCs can read the
+    /// materialized `BlockSummary` records.
+    #[must_use]
+    pub fn with_derive_store(mut self, store: DeriveStore) -> Self {
+        self.derive_store = Some(store);
+        self
     }
 
     /// Configures the `WalletQuery` endpoint the balance handler reads from.
@@ -118,6 +131,10 @@ impl ExplorerQueryGrpcAdapter {
         if self.wallet_query_endpoint.is_some() {
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1.to_owned());
             capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1.to_owned());
+        }
+        if self.derive_store.is_some() && self.wallet_query_endpoint.is_some() {
+            capabilities.push(EXPLORER_BLOCK_SUMMARY_V1.to_owned());
+            capabilities.push(EXPLORER_BLOCK_DETAIL_V1.to_owned());
         }
         capabilities
     }
@@ -177,6 +194,48 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let mut client =
             connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
         handle_transaction_detail(&mut client, self.settings.network, request).await
+    }
+
+    async fn block_summaries_in_range(
+        &self,
+        request: Request<BlockSummariesInRangeRequest>,
+    ) -> Result<Response<BlockSummariesInRangeResponse>, Status> {
+        let derive_store = self.require_derive_store("BlockSummariesInRange")?;
+        let endpoint = self.require_wallet_endpoint("BlockSummariesInRange")?;
+        let mut client =
+            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
+        handle_block_summaries_in_range(derive_store, &mut client, request).await
+    }
+
+    async fn block_detail(
+        &self,
+        request: Request<BlockDetailRequest>,
+    ) -> Result<Response<BlockDetailResponse>, Status> {
+        let derive_store = self.require_derive_store("BlockDetail")?;
+        let endpoint = self.require_wallet_endpoint("BlockDetail")?;
+        let mut client =
+            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
+        handle_block_detail(derive_store, &mut client, request).await
+    }
+}
+
+impl ExplorerQueryGrpcAdapter {
+    fn require_derive_store(&self, method: &'static str) -> Result<&DeriveStore, Status> {
+        self.derive_store.as_ref().ok_or_else(|| {
+            Status::unavailable(format!(
+                "{method} requires the BlockSummary derive view; configure \
+                 --storage-path and start the explorer with the consumer wired"
+            ))
+        })
+    }
+
+    fn require_wallet_endpoint(&self, method: &'static str) -> Result<&str, Status> {
+        self.wallet_query_endpoint.as_deref().ok_or_else(|| {
+            Status::unavailable(format!(
+                "{method} requires a wallet_query_endpoint; configure \
+                 --wallet-query-endpoint"
+            ))
+        })
     }
 }
 

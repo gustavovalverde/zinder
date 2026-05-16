@@ -180,6 +180,45 @@ message CompactBlockResponse {
   CompactBlock compact_block = 2;
 }
 
+// Full canonical block in consensus wire-serialized form.
+//
+// Use when the lightwalletd-compatible `CompactBlock` payload omits the
+// transactions a consumer needs (e.g. transparent-only and coinbase
+// transactions). Consumers decode `raw_block_bytes` with `zebra-chain`'s
+// `Block::zcash_deserialize` to recover the full transaction list.
+message FullBlock {
+  // Height of the source block.
+  uint32 block_height = 1;
+
+  // Canonical block hash in internal byte order (32 bytes).
+  bytes block_hash = 2;
+
+  // Parent block hash in internal byte order (32 bytes).
+  bytes parent_block_hash = 3;
+
+  // Serialized consensus block payload bytes.
+  bytes raw_block_bytes = 4;
+}
+
+// Single full block request.
+message FullBlockRequest {
+  // Requested block height.
+  uint32 block_height = 1;
+
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 2;
+}
+
+// Single full block response bound to one chain epoch.
+message FullBlockResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Full block at the requested height.
+  FullBlock block = 2;
+}
+
 // Single transaction request.
 message TransactionRequest {
   // Transaction identifier in canonical 32-byte order.
@@ -1053,6 +1092,11 @@ service WalletQuery {
 
   // Stream compact blocks for an inclusive height range.
   rpc CompactBlockRange(CompactBlockRangeRequest) returns (stream CompactBlockRangeChunk);
+
+  // Return one full canonical block at a given height. Capability:
+  // `wallet.read.full_block_at_v1`. Returns NOT_FOUND when the height is
+  // beyond the visible tip or the canonical artifact is missing.
+  rpc FullBlock(FullBlockRequest) returns (FullBlockResponse);
 
   // Return the typed status of one transaction by transaction id. NotFound
   // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states

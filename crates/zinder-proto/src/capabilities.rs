@@ -25,6 +25,12 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
 /// Capability advertised for `WalletQuery.CompactBlockRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
+/// Capability advertised for `WalletQuery.FullBlock`.
+///
+/// Returns the full canonical block bytes for consumers that need the
+/// transaction list including transparent-only and coinbase transactions
+/// the compact-block format omits.
+pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
 /// Capability advertised for `WalletQuery.TreeState`.
 pub const WALLET_READ_TREE_STATE_AT_V1: &str = "wallet.read.tree_state_at_v1";
 /// Capability advertised for `WalletQuery.LatestTreeState`.
@@ -73,6 +79,21 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// always-on wallet capability for raw transaction lookup remains
 /// [`WALLET_READ_TRANSACTION_BY_ID_V1`].
 pub const EXPLORER_TRANSACTION_DETAIL_V1: &str = "explorer.transaction.detail_v1";
+/// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
+///
+/// Signals that the explorer plane is materializing the `BlockSummary`
+/// derive view and the consumer has caught up far enough to serve the
+/// summary shape (`block_height`, `block_hash`, `block_time_unix_seconds`,
+/// `transaction_count`, `previous_block_hash`). The companion
+/// [`EXPLORER_BLOCK_DETAIL_V1`] covers the per-block transaction-id list.
+pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
+/// Capability advertised for `ExplorerQuery.BlockDetail`.
+///
+/// Signals that the explorer plane materialized the per-block transaction
+/// id list alongside the summary fields. Coexists with
+/// [`EXPLORER_BLOCK_SUMMARY_V1`]; both are advertised together by the same
+/// `BlockSummaryConsumer` derive view.
+pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -129,6 +150,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
     WALLET_READ_COMPACT_BLOCK_AT_V1,
     WALLET_READ_COMPACT_BLOCK_RANGE_V1,
+    WALLET_READ_FULL_BLOCK_AT_V1,
     WALLET_READ_TREE_STATE_AT_V1,
     WALLET_READ_LATEST_TREE_STATE_V1,
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
@@ -148,6 +170,8 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
     EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_DETAIL_V1,
 ];
 
 /// Helpers for client-side capability discovery.

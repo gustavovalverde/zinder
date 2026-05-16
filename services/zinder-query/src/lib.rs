@@ -13,12 +13,13 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevoutEntry, TransparentPrevoutsResponse, TxStatus,
+    BlockArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionBroadcastResult,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutEntry,
+    TransparentPrevoutsResponse, TxStatus,
 };
 use zinder_source::{
     SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes,
@@ -94,6 +95,18 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         block_range: BlockHeightRange,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads one full canonical block artifact at a given height.
+    ///
+    /// Returns the consensus wire-serialized block bytes alongside the
+    /// canonical block hash and parent hash. Use when the lightwalletd
+    /// compact-block format omits the transactions a caller needs (notably
+    /// transparent-only and coinbase transactions).
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<FullBlock, QueryError>;
 
     /// Reads typed transaction status by transaction id.
     ///
@@ -362,6 +375,38 @@ where
         }))
         .await;
         record_wallet_query_outcome("compact_block_at", started_at, &query_outcome, None);
+        query_outcome
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<FullBlock, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let chain_epoch = reader.chain_epoch();
+            let block = match reader.block_at(height) {
+                Ok(Some(block)) => block,
+                Ok(None)
+                | Err(StoreError::ArtifactMissing {
+                    family: ArtifactFamily::FinalizedBlock,
+                    ..
+                }) => {
+                    return Err(block_height_artifact_unavailable(
+                        ArtifactFamily::FinalizedBlock,
+                        height,
+                    ));
+                }
+                Err(error) => return Err(QueryError::Store(error)),
+            };
+
+            Ok(FullBlock { chain_epoch, block })
+        }))
+        .await;
+        record_wallet_query_outcome("full_block_at", started_at, &query_outcome, None);
         query_outcome
     }
 
@@ -1026,6 +1071,15 @@ pub struct CompactBlock {
     pub chain_epoch: ChainEpoch,
     /// Compact block artifact at the requested height.
     pub compact_block: CompactBlockArtifact,
+}
+
+/// Full canonical block response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullBlock {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Full canonical block artifact at the requested height.
+    pub block: BlockArtifact,
 }
 
 /// Compact block range response bound to one chain epoch.
