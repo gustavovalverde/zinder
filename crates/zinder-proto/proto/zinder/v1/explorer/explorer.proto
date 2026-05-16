@@ -722,6 +722,48 @@ message TransparentAddressActivityResponse {
   bytes next_cursor = 3;
 }
 
+// `ExplorerQuery.FeeSummary` request.
+//
+// Aggregates per-transaction ZIP-317 conventional fee floors over the
+// inclusive block range `[start_height, end_height]`. The handler parses
+// every block via `WalletQuery.FullBlock` and computes
+// `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat`
+// for each non-coinbase transaction.
+message FeeSummaryRequest {
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
+}
+
+// `ExplorerQuery.FeeSummary` response.
+//
+// The fee fields are ZIP-317 conventional fee floors, not miner-collected
+// fees. Computing actual fees requires prevout resolution and is
+// intentionally out of scope for `v1`; the conventional-fee floor is the
+// minimum a wallet should attach to a transaction with the given shape.
+message FeeSummaryResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Number of canonical blocks the response aggregated.
+  uint32 block_count = 2;
+
+  // Number of non-coinbase transactions across the aggregated range.
+  // Coinbase transactions are excluded because they have no fee.
+  uint32 transaction_count = 3;
+
+  // Sum of `zip317_conventional_fee_zat` across every non-coinbase
+  // transaction.
+  uint64 total_zip317_conventional_fee_zat = 4;
+
+  // Smallest `zip317_conventional_fee_zat` observed across the range,
+  // zero when the range carries no non-coinbase transactions.
+  uint64 min_zip317_conventional_fee_zat = 5;
+
+  // Largest `zip317_conventional_fee_zat` observed across the range,
+  // zero when the range carries no non-coinbase transactions.
+  uint64 max_zip317_conventional_fee_zat = 6;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
@@ -775,4 +817,9 @@ service ExplorerQuery {
   // Capability: `explorer.transparent_address.activity_v1`.
   rpc TransparentAddressActivity(TransparentAddressActivityRequest)
       returns (TransparentAddressActivityResponse);
+
+  // Aggregates ZIP-317 conventional fee floors over the inclusive block
+  // range `[start_height, end_height]`. Capability:
+  // `explorer.fee.summary_v1`.
+  rpc FeeSummary(FeeSummaryRequest) returns (FeeSummaryResponse);
 }

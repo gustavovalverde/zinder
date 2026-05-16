@@ -7,6 +7,7 @@
 
 mod balance_federation;
 mod block_view_federation;
+mod fee_summary_federation;
 mod mempool_federation;
 mod search_federation;
 mod transaction_detail_federation;

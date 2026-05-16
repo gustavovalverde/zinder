@@ -2,6 +2,7 @@
 
 mod adapter;
 mod block_view;
+mod fee_summary;
 mod mempool;
 mod search;
 mod transaction_detail;

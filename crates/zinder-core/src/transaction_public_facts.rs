@@ -199,6 +199,47 @@ impl TransactionComponentCounts {
             || self.sprout_joinsplit_count > 0
     }
 
+    /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) conventional
+    /// fee floor in zatoshi computed from the component counts alone.
+    ///
+    /// The conventional fee is `MARGINAL_FEE * max(logical_actions,
+    /// GRACE_ACTIONS)`, where `MARGINAL_FEE = 5_000`, `GRACE_ACTIONS =
+    /// 2`, and `logical_actions = max(transparent_input_count,
+    /// transparent_output_count, max(sapling_spend_count,
+    /// sapling_output_count), orchard_action_count)`. The result is the
+    /// minimum fee a wallet should attach to a transaction with this
+    /// shape; the actual fee a miner collected may differ and requires
+    /// prevout resolution to compute.
+    ///
+    /// Used by `ExplorerQuery.FeeSummary` to aggregate fee floors across
+    /// a block range without resolving every transparent input.
+    #[must_use]
+    pub const fn zip317_conventional_fee_zat(self) -> u64 {
+        const MARGINAL_FEE_ZAT: u64 = 5_000;
+        const GRACE_ACTIONS: u32 = 2;
+        let sapling_logical = if self.sapling_spend_count > self.sapling_output_count {
+            self.sapling_spend_count
+        } else {
+            self.sapling_output_count
+        };
+        let mut max_logical = self.transparent_input_count;
+        if self.transparent_output_count > max_logical {
+            max_logical = self.transparent_output_count;
+        }
+        if sapling_logical > max_logical {
+            max_logical = sapling_logical;
+        }
+        if self.orchard_action_count > max_logical {
+            max_logical = self.orchard_action_count;
+        }
+        let logical_actions = if max_logical < GRACE_ACTIONS {
+            GRACE_ACTIONS
+        } else {
+            max_logical
+        };
+        MARGINAL_FEE_ZAT * logical_actions as u64
+    }
+
     /// Returns `true` when the transaction has any shielded outputs
     /// (Sapling output, Orchard action acting as output, or Sprout `JoinSplit`).
     #[must_use]
@@ -379,6 +420,41 @@ mod tests {
         };
         let shape = classify_privacy_shape(counts([1, 1, 0, 0, 0, 0]), false, unsupported);
         assert_eq!(shape, PrivacyShape::Unclassified);
+    }
+
+    #[test]
+    fn zip317_conventional_fee_matches_grace_floor() {
+        // Empty counts: logical_actions = 0, clamped up to GRACE_ACTIONS = 2;
+        // conventional fee = 5_000 * 2 = 10_000 zatoshi.
+        assert_eq!(
+            TransactionComponentCounts::EMPTY.zip317_conventional_fee_zat(),
+            10_000,
+        );
+    }
+
+    #[test]
+    fn zip317_conventional_fee_uses_max_across_axes() {
+        // 1 transparent_in, 2 transparent_out, 1 sapling_spend, 0 sapling_out,
+        // 3 orchard_action -> logical_actions = max(1, 2, max(1, 0), 3) = 3.
+        // Conventional fee = 5_000 * 3 = 15_000 zatoshi.
+        let payload = counts([1, 2, 1, 0, 3, 0]);
+        assert_eq!(payload.zip317_conventional_fee_zat(), 15_000);
+    }
+
+    #[test]
+    fn zip317_conventional_fee_uses_max_of_sapling_spends_and_outputs() {
+        // 4 sapling_spend, 7 sapling_out -> sapling_logical = 7, dominates.
+        // Conventional fee = 5_000 * 7 = 35_000 zatoshi.
+        let payload = counts([0, 0, 4, 7, 0, 0]);
+        assert_eq!(payload.zip317_conventional_fee_zat(), 35_000);
+    }
+
+    #[test]
+    fn zip317_conventional_fee_floored_to_grace_actions() {
+        // 1 transparent_in, 1 transparent_out -> logical_actions = 1, floored
+        // up to GRACE_ACTIONS = 2; conventional fee = 5_000 * 2 = 10_000.
+        let payload = counts([1, 1, 0, 0, 0, 0]);
+        assert_eq!(payload.zip317_conventional_fee_zat(), 10_000);
     }
 
     #[test]

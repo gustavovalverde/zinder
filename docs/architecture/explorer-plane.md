@@ -48,7 +48,7 @@ service ExplorerQuery {
 }
 ```
 
-Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Slices 1-4 are shipped; `FeeSummary` and `ValuePoolSummary` remain. Every method follows the same shape rules:
+Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Slices 1-4 and `FeeSummary` are shipped; only `ValuePoolSummary` remains (deferred behind the source-boundary extension for chain value pools). Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -127,6 +127,12 @@ The mempool overlay is emitted only on the first page (`from_cursor` empty and `
 
 The handler dedupes against the mempool overlay's transaction ids when streaming the confirmed slice so a transaction that mines between the two reads never appears twice in one response.
 
+## Fee summary
+
+`ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires resolving every transparent input via `WalletQuery.TransparentPrevouts`, and that fan-out is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
+
+`logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count)`. The handler reads each block via `WalletQuery.FullBlock`, parses with `zebra-chain`, re-serializes each non-coinbase transaction, and calls `zinder_source::parse_transaction_public_facts` to extract the component counts. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -141,7 +147,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
-| `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | Yes once shipped |
+| `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the source boundary supports chain value pools |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
@@ -237,7 +243,8 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 | **2** | `BlockSummary` and `BlockDetail` via the first real `BlockSummaryConsumer` derive view. Reorg-rewind test. | `explorer.block.summary_v1`, `explorer.block.detail_v1` |
 | ~~**3**~~ | _Shipped._ Typed `Search` with the local classifier in `crates/zinder-core/src/explorer_search.rs`. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). `SearchIndexConsumer` derive view for autocomplete is deferred. | `explorer.search_v1` |
 | ~~**4**~~ | _Shipped._ `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. All three compose existing `WalletQuery` primitives at request time; no derive consumer required. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
-| **5** | `FeeSummary` (Shape C, no consumer). `ValuePoolSummary` requires the source-boundary extension. ZIP-317 conventional-fee vocabulary. | `explorer.fee.summary_v1`, `explorer.value_pool.summary_v1` |
+| **5a** | _Shipped._ `FeeSummary` (Shape C, no consumer). Aggregates ZIP-317 conventional fee floors over a block range. Actual miner-collected fees are out of scope for v1 (would require per-input prevout resolution). | `explorer.fee.summary_v1` |
+| **5b** | `ValuePoolSummary` requires the source-boundary extension for `getblockchaininfo.valuePools` plus a new `WalletQuery` primitive before the explorer handler can compose it. | `explorer.value_pool.summary_v1` |
 
 Slices 2-5 can land in any order or in parallel once Slice 1 establishes the parser, freshness envelope, and federation patterns.
 

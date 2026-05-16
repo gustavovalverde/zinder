@@ -127,6 +127,15 @@ pub const EXPLORER_MEMPOOL_ACTIVITY_V1: &str = "explorer.mempool.activity_v1";
 /// deterministic.
 pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
     "explorer.transparent_address.activity_v1";
+/// Capability advertised for `ExplorerQuery.FeeSummary`.
+///
+/// Signals that the explorer plane aggregates per-transaction
+/// ZIP-317 conventional fee floors over a block range at request time.
+/// The fee fields are ZIP-317 conventional fees, not miner-collected
+/// fees: computing actual fees requires prevout resolution and is out
+/// of scope for `v1`. Composed from `WalletQuery.FullBlock` per height;
+/// no derive consumer required.
+pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -209,6 +218,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_MEMPOOL_SUMMARY_V1,
     EXPLORER_MEMPOOL_ACTIVITY_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
+    EXPLORER_FEE_SUMMARY_V1,
 ];
 
 /// Helpers for client-side capability discovery.

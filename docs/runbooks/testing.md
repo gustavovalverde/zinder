@@ -820,6 +820,7 @@ explorer.search_v1
 explorer.mempool.summary_v1
 explorer.mempool.activity_v1
 explorer.transparent_address.activity_v1
+explorer.fee.summary_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 
