@@ -104,6 +104,29 @@ pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
 /// read; gated on `wallet_query_endpoint.is_some()` because hash
 /// disambiguation routes through `WalletQuery`.
 pub const EXPLORER_SEARCH_V1: &str = "explorer.search_v1";
+/// Capability advertised for `ExplorerQuery.MempoolSummary`.
+///
+/// Signals that the explorer plane aggregates the live mempool snapshot
+/// into the explorer-shaped page (total counts, privacy-shape and
+/// version distributions, freshness extremes) at request time. Composed
+/// from `WalletQuery.MempoolSnapshot`; no derive consumer required.
+pub const EXPLORER_MEMPOOL_SUMMARY_V1: &str = "explorer.mempool.summary_v1";
+/// Capability advertised for `ExplorerQuery.MempoolActivity`.
+///
+/// Signals that the explorer plane projects the live mempool entries
+/// into the typed `MempoolActivityEntry` rows ordered by newest-first
+/// observation time. Composed from `WalletQuery.MempoolSnapshot`.
+pub const EXPLORER_MEMPOOL_ACTIVITY_V1: &str = "explorer.mempool.activity_v1";
+/// Capability advertised for `ExplorerQuery.TransparentAddressActivity`.
+///
+/// Signals that the explorer plane composes
+/// `WalletQuery.TransparentAddressTxIdsInRange` and
+/// `WalletQuery.TransparentMempoolOutputsByAddress` into a unified
+/// confirmed-plus-pending activity feed. Pageable; the mempool overlay
+/// is emitted only on the first page so subsequent pages stay
+/// deterministic.
+pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
+    "explorer.transparent_address.activity_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -183,6 +206,9 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_BLOCK_SUMMARY_V1,
     EXPLORER_BLOCK_DETAIL_V1,
     EXPLORER_SEARCH_V1,
+    EXPLORER_MEMPOOL_SUMMARY_V1,
+    EXPLORER_MEMPOOL_ACTIVITY_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
 ];
 
 /// Helpers for client-side capability discovery.

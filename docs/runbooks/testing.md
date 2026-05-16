@@ -817,6 +817,9 @@ explorer.block.summary_v1
 explorer.block.detail_v1
 wallet.read.full_block_at_v1
 explorer.search_v1
+explorer.mempool.summary_v1
+explorer.mempool.activity_v1
+explorer.transparent_address.activity_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

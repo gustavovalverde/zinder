@@ -48,7 +48,7 @@ service ExplorerQuery {
 }
 ```
 
-Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Every method follows the same shape rules:
+Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Slices 1-4 are shipped; `FeeSummary` and `ValuePoolSummary` remain. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -94,6 +94,39 @@ The classifier short-circuits shielded forms before the handler issues any `Wall
 
 A `SearchIndexConsumer` derive view that pre-builds sublinear address-prefix lookups for autocomplete is deferred to a later slice; the classifier alone gates the `explorer.search_v1` capability.
 
+## Mempool views
+
+The mempool surface is two RPCs that aggregate `WalletQuery.MempoolSnapshot` at request time. Neither requires a derive consumer: snapshot reads are bounded by the per-request cap (`max_entries` on the request, hard cap 4 096 on the explorer handler), and every entry is parsed once via `zinder_source::parse_transaction_public_facts` so the privacy-shape and version classifiers stay in lockstep with `TransactionDetail`.
+
+`ExplorerQuery.MempoolSummary` returns one aggregated page:
+
+```proto
+message MempoolSummaryResponse {
+  ExplorerFreshness freshness = 1;
+  uint32 transaction_count = 2;
+  uint64 total_size_bytes = 3;
+  repeated PrivacyShapeCount privacy_shape_distribution = 4;
+  repeated TransactionVersionCount version_distribution = 5;
+  uint64 oldest_entry_age_millis = 6;
+  uint64 newest_entry_age_millis = 7;
+}
+```
+
+The age fields are wall-clock deltas computed at response time against the entry's `first_seen_unix_millis`; they are zero when the snapshot is empty.
+
+`ExplorerQuery.MempoolActivity` paginates the same snapshot into typed entry rows sorted by newest-first observation time. The cursor is opaque: 12 bytes packing `(first_seen_unix_millis, transaction_id_tail_4_bytes)` big-endian. Mempool state is transient, so subsequent pages may interleave with new arrivals; clients that need a consistent paged read should treat any single response as a snapshot and re-pin if needed.
+
+## Transparent-address activity
+
+`ExplorerQuery.TransparentAddressActivity` is the single RPC explorer pages call to render the per-address activity feed. It composes two existing wallet primitives at request time:
+
+1. `WalletQuery.TransparentAddressTxIdsInRange` for the confirmed slice (server-streamed; the explorer handler consumes up to `max_entries` rows and forwards the wallet cursor as the page's `next_cursor`).
+2. `WalletQuery.TransparentMempoolOutputsByAddress` plus `WalletQuery.MempoolSnapshot` for the mempool overlay (the snapshot join hydrates `first_seen_unix_millis` per mempool entry).
+
+The mempool overlay is emitted only on the first page (`from_cursor` empty and `include_mempool=true`) so subsequent pages stay deterministic. Mempool entries lead when `descending=true`; the confirmed slice leads when `descending=false`. Each row carries either the confirmed fields (`block_height`, `block_hash`, `tx_index_in_block`) or the mempool fields (`in_mempool=true`, `first_seen_unix_millis`); the two arms never coexist on one entry.
+
+The handler dedupes against the mempool overlay's transaction ids when streaming the confirmed slice so a transaction that mines between the two reads never appears twice in one response.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -105,9 +138,9 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.transparent_address.balance_v1` | `ExplorerQuery.TransparentAddressBalance` (and federated `WalletQuery.TransparentAddressBalance`) | When the wallet endpoint is configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
-| `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | Yes once shipped |
-| `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the mempool-summary consumer is built |
-| `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | Yes once shipped |
+| `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
+| `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
+| `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | Yes once shipped |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the source boundary supports chain value pools |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
@@ -203,7 +236,7 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 | ~~**1 (tracer bullet)**~~ | _Shipped._ `TransactionPublicFacts` parser per [ADR-0010](../adrs/0010-transaction-public-facts.md) is the single source of truth in `zinder_source::parse_transaction_public_facts`. `ExplorerQuery.TransactionDetail` returns the typed shape plus the cross-cutting `ExplorerFreshness` envelope per [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). Both mined and mempool transactions are covered; conflicting-chain returns `FAILED_PRECONDITION`. | `explorer.transaction.detail_v1` |
 | **2** | `BlockSummary` and `BlockDetail` via the first real `BlockSummaryConsumer` derive view. Reorg-rewind test. | `explorer.block.summary_v1`, `explorer.block.detail_v1` |
 | ~~**3**~~ | _Shipped._ Typed `Search` with the local classifier in `crates/zinder-core/src/explorer_search.rs`. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). `SearchIndexConsumer` derive view for autocomplete is deferred. | `explorer.search_v1` |
-| **4** | `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. Page-oriented aggregations of existing primitives. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
+| ~~**4**~~ | _Shipped._ `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. All three compose existing `WalletQuery` primitives at request time; no derive consumer required. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
 | **5** | `FeeSummary` (Shape C, no consumer). `ValuePoolSummary` requires the source-boundary extension. ZIP-317 conventional-fee vocabulary. | `explorer.fee.summary_v1`, `explorer.value_pool.summary_v1` |
 
 Slices 2-5 can land in any order or in parallel once Slice 1 establishes the parser, freshness envelope, and federation patterns.

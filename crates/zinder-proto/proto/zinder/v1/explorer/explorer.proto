@@ -558,6 +558,170 @@ message SearchResponse {
   repeated SearchCandidate candidates = 2;
 }
 
+// Per-shape count carried by [`MempoolSummaryResponse`].
+message PrivacyShapeCount {
+  PrivacyShape shape = 1;
+  uint32 count = 2;
+}
+
+// Per-version count carried by [`MempoolSummaryResponse`].
+message TransactionVersionCount {
+  TransactionVersionKind kind = 1;
+  uint32 count = 2;
+}
+
+// `ExplorerQuery.MempoolSummary` request.
+//
+// Optionally pins the read to a specific chain epoch so the response
+// stays consistent with concurrent reads.
+message MempoolSummaryRequest {
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 1;
+}
+
+// `ExplorerQuery.MempoolSummary` response.
+//
+// Aggregates the current mempool snapshot into a single page-friendly
+// shape: total counts, byte size, privacy-shape distribution, version
+// distribution, and freshness extremes. The handler parses every entry
+// via `zinder_source::parse_transaction_public_facts` so the shape and
+// version classifiers stay in lockstep with `TransactionDetail`.
+message MempoolSummaryResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Number of transactions in the snapshot.
+  uint32 transaction_count = 2;
+
+  // Sum of `size_bytes` across every entry.
+  uint64 total_size_bytes = 3;
+
+  // One entry per privacy shape present in the snapshot; shapes with
+  // zero entries are omitted.
+  repeated PrivacyShapeCount privacy_shape_distribution = 4;
+
+  // One entry per transaction version kind present in the snapshot;
+  // versions with zero entries are omitted.
+  repeated TransactionVersionCount version_distribution = 5;
+
+  // Age of the oldest mempool entry (largest `first_seen_unix_millis`
+  // delta vs. now). Zero when the snapshot is empty.
+  uint64 oldest_entry_age_millis = 6;
+
+  // Age of the newest mempool entry (smallest `first_seen_unix_millis`
+  // delta vs. now). Zero when the snapshot is empty.
+  uint64 newest_entry_age_millis = 7;
+}
+
+// `ExplorerQuery.MempoolActivity` request.
+//
+// Returns the current mempool entries sorted by newest-first observation
+// time. The cursor is opaque and encodes the prior page's last entry so
+// subsequent calls resume past it. Mempool state is transient; restarted
+// pages may return new entries that arrived since the prior call.
+message MempoolActivityRequest {
+  uint32 max_entries = 1;
+  bytes from_cursor = 2;
+}
+
+// One mempool entry projected into the explorer wire shape.
+message MempoolActivityEntry {
+  // Canonical transaction identifier (32 bytes, internal byte order).
+  bytes transaction_id = 1;
+
+  // Wall-clock time when the indexer first observed this entry.
+  uint64 first_seen_unix_millis = 2;
+
+  // Raw transaction byte length.
+  uint32 size_bytes = 3;
+
+  // Coarse privacy classification computed from the parsed facts.
+  PrivacyShape privacy_shape = 4;
+
+  // Coarse transaction version classification.
+  TransactionVersion version = 5;
+}
+
+// `ExplorerQuery.MempoolActivity` response.
+message MempoolActivityResponse {
+  ExplorerFreshness freshness = 1;
+  repeated MempoolActivityEntry entries = 2;
+  bytes next_cursor = 3;
+}
+
+// `ExplorerQuery.TransparentAddressActivity` request.
+//
+// Composes the canonical transparent-address history surface with the
+// live mempool overlay so a single call returns confirmed history and
+// pending entries together. Mempool entries appear before confirmed
+// entries when `descending=true`; the mempool overlay is included only
+// on the first page (`from_cursor` empty) so subsequent pages do not
+// re-emit transient state.
+message TransparentAddressActivityRequest {
+  // Selector for the transparent address being queried.
+  zinder.v1.wallet.AddressLookup address = 1;
+
+  // Inclusive minimum block height for the confirmed slice. Zero means
+  // start from genesis.
+  uint32 start_height = 2;
+
+  // Inclusive maximum block height for the confirmed slice.
+  uint32 end_height = 3;
+
+  // Server-bounded maximum entries per page (confirmed + mempool).
+  // Zero means use the server default; values larger than the
+  // server's configured cap are silently clamped.
+  uint32 max_entries = 4;
+
+  // Empty resumes from the head of the requested direction. Non-empty
+  // resumes strictly after the prior page's last confirmed entry; the
+  // cursor's encoded direction is authoritative.
+  bytes from_cursor = 5;
+
+  // Iterate newest-first when true.
+  bool descending = 6;
+
+  // Include unmined mempool entries on the first page. Has no effect on
+  // subsequent pages so the wire shape does not re-emit transient state.
+  bool include_mempool = 7;
+
+  // Optional chain epoch pin for the confirmed slice.
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 8;
+}
+
+// One transparent-address activity row.
+//
+// Unifies confirmed history rows (carrying `block_height`, `block_hash`,
+// `tx_index_in_block`) with mempool rows (`in_mempool=true`, carrying
+// `first_seen_unix_millis`). The two arms never coexist on one entry.
+message TransparentAddressActivityEntry {
+  // Canonical transaction identifier.
+  bytes transaction_id = 1;
+
+  // Zero when `in_mempool=true`; otherwise the canonical block height
+  // of the confirming block.
+  uint32 block_height = 2;
+
+  // Empty when `in_mempool=true`; otherwise the canonical block hash.
+  bytes block_hash = 3;
+
+  // Zero when `in_mempool=true`; otherwise the canonical position of
+  // the transaction inside its block.
+  uint32 tx_index_in_block = 4;
+
+  // True for mempool entries; the confirmed-slice fields are zero.
+  bool in_mempool = 5;
+
+  // Zero unless `in_mempool=true`; wall-clock time when the indexer
+  // first observed the mempool entry funding this address.
+  uint64 first_seen_unix_millis = 6;
+}
+
+// `ExplorerQuery.TransparentAddressActivity` response.
+message TransparentAddressActivityResponse {
+  ExplorerFreshness freshness = 1;
+  repeated TransparentAddressActivityEntry entries = 2;
+  bytes next_cursor = 3;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
@@ -591,4 +755,24 @@ service ExplorerQuery {
   // unified addresses route to the typed `NotPubliclyIndexable` arm and
   // never reach a storage read. Capability: `explorer.search_v1`.
   rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Aggregates the current mempool snapshot into a single explorer-shaped
+  // response: total counts, byte size, privacy-shape distribution,
+  // version distribution, and freshness extremes. Capability:
+  // `explorer.mempool.summary_v1`.
+  rpc MempoolSummary(MempoolSummaryRequest) returns (MempoolSummaryResponse);
+
+  // Returns the current mempool entries sorted by newest-first
+  // observation time, paged with an opaque cursor. Mempool state is
+  // transient; subsequent pages may interleave with new arrivals.
+  // Capability: `explorer.mempool.activity_v1`.
+  rpc MempoolActivity(MempoolActivityRequest) returns (MempoolActivityResponse);
+
+  // Returns confirmed transparent-address history paged with the live
+  // mempool overlay. Confirmed rows page via the same cursor semantics
+  // as `WalletQuery.TransparentAddressTxIdsInRange`; mempool entries are
+  // emitted only on the first page when `include_mempool=true`.
+  // Capability: `explorer.transparent_address.activity_v1`.
+  rpc TransparentAddressActivity(TransparentAddressActivityRequest)
+      returns (TransparentAddressActivityResponse);
 }
