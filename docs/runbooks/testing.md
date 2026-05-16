@@ -816,6 +816,7 @@ explorer.transaction.detail_v1
 explorer.block.summary_v1
 explorer.block.detail_v1
 wallet.read.full_block_at_v1
+explorer.search_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

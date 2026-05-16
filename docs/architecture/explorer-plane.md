@@ -48,7 +48,7 @@ service ExplorerQuery {
 }
 ```
 
-Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`, `Search`. Every method follows the same shape rules:
+Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -79,6 +79,21 @@ The materialized record covers both reads so a `BlockDetail` request is one Rock
 
 Reorg rewind deletes every record in the reverted height range and re-fetches the replacement range before committing the cursor advance, so the view never advertises a stale BlockSummary for a height that no longer maps to the canonical chain.
 
+## Search shape
+
+`ExplorerQuery.Search` accepts a raw user input string and returns a typed `SearchResponse` carrying zero or more `SearchCandidate` arms in confidence order. The classifier lives in `crates/zinder-core/src/explorer_search.rs` and is a pure function of `(query, network)`; it never touches the canonical store, the wallet plane, or the network. The handler in `services/zinder-explorer/src/grpc/search.rs` composes the classifier output with optional `WalletQuery` confirmations:
+
+- Numeric input routes through `WalletQuery.BlockIdBySelector(height)` to confirm the block exists at that height before emitting `BlockMatch`.
+- 64-character hex input routes through both `BlockIdBySelector(hash)` and `Transaction(hash)`; whichever resolves emits a candidate. If both resolve, each candidate carries `confidence = 0.5`; otherwise the single winner carries `confidence = 1.0`.
+- Transparent (`t*/tm*`, `t3*/t2*`), ZIP-320 TEX (`tex*/textest*`), and ZIP-316 unified (`u*/utest*/uregtest*`) addresses decode locally via `zcash_address`; transparent and unified-with-transparent-receivers candidates emit at full confidence without storage probes.
+- Sapling and Sprout shielded inputs (`zs*/ztestsapling*/zc*`) route to the typed `NotPubliclyIndexable` arm with `reason = NOT_PUBLICLY_INDEXABLE_REASON_SHIELDED_ADDRESS`; viewing keys (`uivk*/uview*/zxviews*/zviews*`) route to the typed `NotPubliclyIndexable` arm with `reason = NOT_PUBLICLY_INDEXABLE_REASON_VIEWING_KEY` and the `canonical_form` field omitted.
+- Unknown ZIP-316 receiver typecodes inside a unified address surface as `UnifiedAddressReceiverKind::UNKNOWN` with a typed `NotPubliclyIndexable` body; the enclosing unified-address arm still routes any recognized transparent receivers normally.
+- Empty, oversized, and unparseable inputs route to `UnclassifiedMatch` with an operator-readable hint.
+
+The classifier short-circuits shielded forms before the handler issues any `WalletQuery` call, which is the structural invariant required by [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). The handler's only universal wallet call is `WalletQuery.LatestBlock`, issued once at the end to build the `ExplorerFreshness` envelope (a property of every explorer response, not the search candidate).
+
+A `SearchIndexConsumer` derive view that pre-builds sublinear address-prefix lookups for autocomplete is deferred to a later slice; the classifier alone gates the `explorer.search_v1` capability.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -95,7 +110,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | Yes once shipped |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | Yes once shipped |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the source boundary supports chain value pools |
-| `explorer.search.v1` | `ExplorerQuery.Search` | Yes once shipped |
+| `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
 
@@ -187,7 +202,7 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 | ~~**0 (rename)**~~ | _Shipped._ Rebrand `zinder-derive` to `zinder-explorer`. Two existing capabilities become `explorer.server_info_v1` and `explorer.transparent_address.balance_v1`. | (renames) |
 | ~~**1 (tracer bullet)**~~ | _Shipped._ `TransactionPublicFacts` parser per [ADR-0010](../adrs/0010-transaction-public-facts.md) is the single source of truth in `zinder_source::parse_transaction_public_facts`. `ExplorerQuery.TransactionDetail` returns the typed shape plus the cross-cutting `ExplorerFreshness` envelope per [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). Both mined and mempool transactions are covered; conflicting-chain returns `FAILED_PRECONDITION`. | `explorer.transaction.detail_v1` |
 | **2** | `BlockSummary` and `BlockDetail` via the first real `BlockSummaryConsumer` derive view. Reorg-rewind test. | `explorer.block.summary_v1`, `explorer.block.detail_v1` |
-| **3** | Typed `Search` with `SearchIndexConsumer` derive view. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). | `explorer.search.v1` |
+| ~~**3**~~ | _Shipped._ Typed `Search` with the local classifier in `crates/zinder-core/src/explorer_search.rs`. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). `SearchIndexConsumer` derive view for autocomplete is deferred. | `explorer.search_v1` |
 | **4** | `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. Page-oriented aggregations of existing primitives. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
 | **5** | `FeeSummary` (Shape C, no consumer). `ValuePoolSummary` requires the source-boundary extension. ZIP-317 conventional-fee vocabulary. | `explorer.fee.summary_v1`, `explorer.value_pool.summary_v1` |
 

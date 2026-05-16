@@ -94,6 +94,16 @@ pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
 /// [`EXPLORER_BLOCK_SUMMARY_V1`]; both are advertised together by the same
 /// `BlockSummaryConsumer` derive view.
 pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
+/// Capability advertised for `ExplorerQuery.Search`.
+///
+/// Signals that the explorer plane classifies a raw user input string
+/// into typed search candidates per
+/// [ADR-0012](../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+/// The classifier short-circuits shielded receivers and viewing keys
+/// into the typed `NotPubliclyIndexable` refusal arm before any storage
+/// read; gated on `wallet_query_endpoint.is_some()` because hash
+/// disambiguation routes through `WalletQuery`.
+pub const EXPLORER_SEARCH_V1: &str = "explorer.search_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -172,6 +182,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_TRANSACTION_DETAIL_V1,
     EXPLORER_BLOCK_SUMMARY_V1,
     EXPLORER_BLOCK_DETAIL_V1,
+    EXPLORER_SEARCH_V1,
 ];
 
 /// Helpers for client-side capability discovery.

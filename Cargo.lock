@@ -5135,6 +5135,8 @@ dependencies = [
  "hex",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "zcash_address",
+ "zcash_protocol",
 ]
 
 [[package]]

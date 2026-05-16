@@ -12,6 +12,8 @@ mod block_artifact;
 mod block_header;
 mod block_id;
 mod chain_epoch;
+pub mod explorer_reasons;
+pub mod explorer_search;
 mod mempool;
 mod network_upgrade_activations;
 mod subtree_root;

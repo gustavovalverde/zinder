@@ -12,14 +12,15 @@
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_SEARCH_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::{
         BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-        BlockSummariesInRangeResponse, ExplorerServerInfo, ServerInfoRequest, ServerInfoResponse,
-        TransactionDetailRequest, TransactionDetailResponse,
+        BlockSummariesInRangeResponse, ExplorerServerInfo, SearchRequest, SearchResponse,
+        ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -34,6 +35,7 @@ use zinder_runtime::{
 };
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
+use super::search::handle_search;
 use super::transaction_detail::handle_transaction_detail;
 use crate::store::DeriveStore;
 
@@ -131,6 +133,7 @@ impl ExplorerQueryGrpcAdapter {
         if self.wallet_query_endpoint.is_some() {
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1.to_owned());
             capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1.to_owned());
+            capabilities.push(EXPLORER_SEARCH_V1.to_owned());
         }
         if self.derive_store.is_some() && self.wallet_query_endpoint.is_some() {
             capabilities.push(EXPLORER_BLOCK_SUMMARY_V1.to_owned());
@@ -216,6 +219,22 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let mut client =
             connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
         handle_block_detail(derive_store, &mut client, request).await
+    }
+
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let endpoint = self.require_wallet_endpoint("Search")?;
+        let mut client =
+            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
+        handle_search(
+            self.derive_store.as_ref(),
+            &mut client,
+            self.settings.network,
+            request,
+        )
+        .await
     }
 }
 
