@@ -790,6 +790,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
                 {"name": "z_gettreestate"},
                 {"name": "z_getsubtreesbyindex"},
                 {"name": "sendrawtransaction"},
+                {"name": "getblockchaininfo"},
                 {"name": "rpc.discover"},
                 {"name": "ping"},
             ],
@@ -810,6 +811,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
     assert!(probed.supports(NodeCapability::TreeState));
     assert!(probed.supports(NodeCapability::SubtreeRoots));
     assert!(probed.supports(NodeCapability::TransactionBroadcast));
+    assert!(probed.supports(NodeCapability::ChainValuePools));
     assert_eq!(source.capabilities(), probed);
 
     Ok(())
@@ -835,6 +837,7 @@ async fn probe_capabilities_falls_back_when_method_not_found() -> eyre::Result<(
     assert!(probed.supports(NodeCapability::TipId));
     assert!(probed.supports(NodeCapability::TreeState));
     assert!(probed.supports(NodeCapability::SubtreeRoots));
+    assert!(probed.supports(NodeCapability::ChainValuePools));
 
     Ok(())
 }
@@ -864,6 +867,7 @@ async fn probe_capabilities_requires_tip_id_method_set() -> eyre::Result<()> {
     assert!(!probed.supports(NodeCapability::TreeState));
     assert!(!probed.supports(NodeCapability::SubtreeRoots));
     assert!(!probed.supports(NodeCapability::TransactionBroadcast));
+    assert!(!probed.supports(NodeCapability::ChainValuePools));
 
     Ok(())
 }
@@ -894,6 +898,7 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
     assert!(!probed.supports(NodeCapability::TreeState));
     assert!(!probed.supports(NodeCapability::SubtreeRoots));
     assert!(!probed.supports(NodeCapability::TransactionBroadcast));
+    assert!(!probed.supports(NodeCapability::ChainValuePools));
 
     Ok(())
 }
@@ -1031,6 +1036,75 @@ async fn fetch_network_upgrade_activations_parses_getblockchaininfo_upgrades() -
         earliest.activation_height,
         zinder_core::BlockHeight::new(280_000)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_value_pools_at_tip_preserves_upstream_pool_entries() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 1_234_567,
+            "valuePools": [
+                {
+                    "id": "transparent",
+                    "monitored": true,
+                    "chainValueZat": 1_000_000
+                },
+                {
+                    "id": "sapling",
+                    "monitored": true,
+                    "chainValueZat": 2_000_000
+                },
+                {
+                    "id": "lockbox",
+                    "monitored": false
+                }
+            ]
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let value_pools = source.fetch_chain_value_pools_at_tip().await?;
+
+    assert_eq!(value_pools.tip_height, BlockHeight::new(1_234_567));
+    assert_eq!(value_pools.pools.len(), 3);
+    assert_eq!(value_pools.pools[0].id, "transparent");
+    assert!(value_pools.pools[0].monitored);
+    assert_eq!(value_pools.pools[0].chain_value_zat, Some(1_000_000));
+    assert_eq!(value_pools.pools[1].id, "sapling");
+    assert!(value_pools.pools[1].monitored);
+    assert_eq!(value_pools.pools[1].chain_value_zat, Some(2_000_000));
+    assert_eq!(value_pools.pools[2].id, "lockbox");
+    assert!(!value_pools.pools[2].monitored);
+    assert_eq!(value_pools.pools[2].chain_value_zat, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_value_pools_at_tip_requires_value_pools_field() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 1_234_567
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let outcome = source.fetch_chain_value_pools_at_tip().await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::ChainValuePools
+        })
+    ));
     Ok(())
 }
 

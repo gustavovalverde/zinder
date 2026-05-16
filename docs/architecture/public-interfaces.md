@@ -533,6 +533,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.mempool.transparent_spend_by_outpoint_v1`
 - `wallet.mempool.transparent_prevouts_v1`
 - `wallet.read.transparent_prevouts_v1`
+- `wallet.read.chain_value_pools_at_tip_v1`
 - `wallet.address.transparent_utxos_v1`
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
@@ -547,6 +548,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `explorer.mempool.activity_v1`
 - `explorer.transparent_address.activity_v1`
 - `explorer.fee.summary_v1`
+- `explorer.value_pool.summary_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
@@ -575,10 +577,13 @@ The current `zinder-source::NodeCapability` diagnostic names are:
 - `transaction_broadcast`
 - `json_rpc`
 - `openrpc_discovery`
+- `chain_value_pools`
 
 Do not advertise future source capabilities such as block-stream ingestion or
 spending-transaction lookup until the source adapter and runtime wiring both
-exist.
+exist. `chain_value_pools` is source-backed by
+`getblockchaininfo.valuePools`; the wallet and explorer read planes proxy it
+through the ingest writer instead of opening independent upstream-node handles.
 
 ## Wire Conventions
 

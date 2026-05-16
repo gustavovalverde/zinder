@@ -48,7 +48,7 @@ service ExplorerQuery {
 }
 ```
 
-Additional methods land incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Slices 1-4 and `FeeSummary` are shipped; only `ValuePoolSummary` remains (deferred behind the source-boundary extension for chain value pools). Every method follows the same shape rules:
+Additional methods landed incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -133,6 +133,10 @@ The handler dedupes against the mempool overlay's transaction ids when streaming
 
 `logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count)`. The handler reads each block via `WalletQuery.FullBlock`, parses with `zebra-chain`, re-serializes each non-coinbase transaction, and calls `zinder_source::parse_transaction_public_facts` to extract the component counts. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
 
+## Value pool summary
+
+`ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `repeated ChainValuePool pools` so existing UI can render known ids while future consensus pools remain visible without a new explorer wire shape.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -148,7 +152,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
-| `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the source boundary supports chain value pools |
+| `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
@@ -227,10 +231,10 @@ The explorer plane never calls upstream Zcash node RPCs. When a view needs a fac
 
 1. New `NodeSource` method on `zinder-source` (e.g. `fetch_chain_value_pools`).
 2. New `NodeCapability` variant identifying the surface.
-3. The fact lands in `SourceBlock`, a typed `Source*` value, or a new canonical artifact family per [Extending artifacts](extending-artifacts.md).
-4. The explorer consumer subscribes to the new event or artifact and materializes its view.
+3. The fact lands in `SourceBlock`, a typed `Source*` value, a source-backed control primitive, or a new canonical artifact family per [Extending artifacts](extending-artifacts.md).
+4. The explorer consumer subscribes to the new event or artifact, or composes through the new `WalletQuery` primitive when the fact is intentionally live-source-backed.
 
-Chain value pools (the `ValuePoolSummary` view) is the first scheduled source-boundary extension. The upstream `getblockchaininfo.valuePools` field is already in scope (Zinder calls `getblockchaininfo` for network upgrade activations); extending the existing deserializer is mostly mechanical.
+Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
 
 ## Slicing plan (deferred)
 
@@ -244,9 +248,9 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 | ~~**3**~~ | _Shipped._ Typed `Search` with the local classifier in `crates/zinder-core/src/explorer_search.rs`. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). `SearchIndexConsumer` derive view for autocomplete is deferred. | `explorer.search_v1` |
 | ~~**4**~~ | _Shipped._ `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. All three compose existing `WalletQuery` primitives at request time; no derive consumer required. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
 | **5a** | _Shipped._ `FeeSummary` (Shape C, no consumer). Aggregates ZIP-317 conventional fee floors over a block range. Actual miner-collected fees are out of scope for v1 (would require per-input prevout resolution). | `explorer.fee.summary_v1` |
-| **5b** | `ValuePoolSummary` requires the source-boundary extension for `getblockchaininfo.valuePools` plus a new `WalletQuery` primitive before the explorer handler can compose it. | `explorer.value_pool.summary_v1` |
+| ~~**5b**~~ | _Shipped._ `ValuePoolSummary` composes `WalletQuery.ChainValuePoolsAtTip`, which proxies through `IngestControl` to the writer-owned source handle. The response preserves upstream pool ids as repeated entries. | `explorer.value_pool.summary_v1` |
 
-Slices 2-5 can land in any order or in parallel once Slice 1 establishes the parser, freshness envelope, and federation patterns.
+Slices 2-5 landed after Slice 1 established the parser, freshness envelope, and federation patterns.
 
 ## Cross-references
 

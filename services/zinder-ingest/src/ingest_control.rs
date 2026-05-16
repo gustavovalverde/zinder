@@ -1,17 +1,19 @@
 //! Private ingest control-plane adapter for writer status, chain events,
 //! and mempool surfaces.
 
-use std::{pin::Pin, time::Instant};
+use std::{pin::Pin, sync::Arc, time::Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    ChainEpoch, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
+    ChainEpoch, ChainValuePools, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
-use zinder_proto::INGEST_CONTROL_CAPABILITIES;
+use zinder_proto::capabilities::{
+    INGEST_CONTROL_ALWAYS_ON_CAPABILITIES, INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
+};
 use zinder_proto::v1::{
     ingest::{
         ServerInfoRequest, ServerInfoResponse, WriterStatusRequest, WriterStatusResponse,
@@ -20,6 +22,7 @@ use zinder_proto::v1::{
     ops, wallet,
 };
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
+use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
@@ -59,6 +62,7 @@ pub struct IngestControlGrpcAdapter {
     network: Network,
     store: PrimaryChainStore,
     mempool_index: Option<MempoolIndex>,
+    node_source: Option<Arc<dyn NodeSource>>,
     bearer_token: Option<BearerToken>,
 }
 
@@ -75,6 +79,7 @@ impl IngestControlGrpcAdapter {
             network,
             store,
             mempool_index: None,
+            node_source: None,
             bearer_token: None,
         }
     }
@@ -86,6 +91,17 @@ impl IngestControlGrpcAdapter {
     #[must_use]
     pub fn with_mempool(mut self, mempool_index: MempoolIndex) -> Self {
         self.mempool_index = Some(mempool_index);
+        self
+    }
+
+    /// Wires source-backed control RPCs into the ingest-control adapter.
+    ///
+    /// The source handle is owned by the writer process; secondary query
+    /// processes proxy through this adapter rather than opening their own
+    /// upstream-node connections.
+    #[must_use]
+    pub fn with_node_source(mut self, node_source: Arc<dyn NodeSource>) -> Self {
+        self.node_source = Some(node_source);
         self
     }
 
@@ -112,6 +128,21 @@ impl IngestControlGrpcAdapter {
         let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
         IngestControlServer::with_interceptor(self, interceptor)
     }
+
+    fn advertised_capabilities(&self) -> Vec<String> {
+        let mut capabilities: Vec<String> = INGEST_CONTROL_ALWAYS_ON_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect();
+        if self.node_source.as_ref().is_some_and(|source| {
+            source
+                .capabilities()
+                .supports(NodeCapability::ChainValuePools)
+        }) {
+            capabilities.push(INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1.to_owned());
+        }
+        capabilities
+    }
 }
 
 #[tonic::async_trait]
@@ -127,10 +158,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             network: encode_zinder_native_chain_name(self.network).to_owned(),
             service_name: env!("CARGO_PKG_NAME").to_owned(),
             service_version: env!("CARGO_PKG_VERSION").to_owned(),
-            capabilities: INGEST_CONTROL_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
+            capabilities: self.advertised_capabilities(),
         };
         Ok(Response::new(ServerInfoResponse {
             server_info: Some(server_info),
@@ -336,6 +364,37 @@ impl IngestControl for IngestControlGrpcAdapter {
             entries,
         }))
     }
+
+    async fn chain_value_pools_at_tip(
+        &self,
+        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+    ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
+        let node_source = self
+            .node_source
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("node source is not configured"))?;
+        if !node_source
+            .capabilities()
+            .supports(NodeCapability::ChainValuePools)
+        {
+            return Err(Status::failed_precondition(
+                "upstream node does not advertise chain_value_pools",
+            ));
+        }
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+        let value_pools = node_source
+            .fetch_chain_value_pools_at_tip()
+            .await
+            .map_err(|error| status_from_source_error(&error))?;
+        Ok(Response::new(chain_value_pools_response(
+            chain_epoch,
+            value_pools,
+        )))
+    }
 }
 
 /// Default cap for transparent-mempool point lookups when the request omits one.
@@ -343,6 +402,43 @@ const DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 256;
 
 /// Hard cap enforced by the writer regardless of caller-requested page size.
 const MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 1024;
+
+fn chain_value_pools_response(
+    chain_epoch: ChainEpoch,
+    value_pools: ChainValuePools,
+) -> wallet::ChainValuePoolsAtTipResponse {
+    wallet::ChainValuePoolsAtTipResponse {
+        chain_epoch: Some(chain_epoch_message(chain_epoch)),
+        pools: value_pools
+            .pools
+            .into_iter()
+            .map(|pool| wallet::ChainValuePool {
+                id: pool.id,
+                monitored: pool.monitored,
+                chain_value_zat: pool.chain_value_zat,
+            })
+            .collect(),
+        tip_height: value_pools.tip_height.value(),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only source errors with public gRPC semantics need distinct codes here."
+)]
+fn status_from_source_error(error: &SourceError) -> Status {
+    match error {
+        SourceError::NodeUnavailable {
+            reason,
+            is_retryable: _,
+        } => Status::unavailable(reason.clone()),
+        SourceError::NodeCapabilityMissing { capability } => {
+            Status::failed_precondition(format!("upstream node is missing {capability}"))
+        }
+        SourceError::SourceProtocolMismatch { reason } => Status::data_loss(*reason),
+        _ => Status::internal(error.to_string()),
+    }
+}
 
 const fn bounded_point_lookup_max_entries(requested: Option<u32>) -> u32 {
     let Some(requested) = requested else {

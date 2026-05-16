@@ -81,4 +81,10 @@ service IngestControl {
   // round trip.
   rpc TransparentMempoolPrevouts(zinder.v1.wallet.TransparentMempoolPrevoutsRequest)
       returns (zinder.v1.wallet.TransparentPrevoutsResponse);
+
+  // Returns chain-wide value pool totals at the upstream node's tip by
+  // calling `getblockchaininfo.valuePools`. The wallet data plane proxies
+  // through this RPC because the wallet has no source handle.
+  rpc ChainValuePoolsAtTip(zinder.v1.wallet.ChainValuePoolsAtTipRequest)
+      returns (zinder.v1.wallet.ChainValuePoolsAtTipResponse);
 }

@@ -19,7 +19,10 @@ use zinder_core::{
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
-use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
+use zinder_proto::capabilities::{
+    WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
+    WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+};
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
@@ -69,6 +72,9 @@ pub struct ServerInfoSettings {
     /// the `WalletServerInfo` response and used to compute the
     /// cross-service `ops.ServerInfo.upstream_node_fingerprint`.
     pub upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
+    /// Whether this deployment can proxy chain value-pool reads through the
+    /// ingest writer's source handle.
+    pub chain_value_pools_enabled: bool,
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -102,6 +108,7 @@ impl Default for ServerInfoSettings {
             mempool_mined_retention_seconds: 0,
             mempool_invalidated_retention_seconds: 0,
             upstream_node_capabilities: None,
+            chain_value_pools_enabled: false,
         }
     }
 }
@@ -164,6 +171,7 @@ fn capability_enabled(capability: &&str, settings: &ServerInfoSettings) -> bool 
     match *capability {
         WALLET_BROADCAST_TRANSACTION_V1 => settings.transaction_broadcast_enabled,
         WALLET_EVENTS_CHAIN_V1 => settings.chain_events_enabled,
+        WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1 => settings.chain_value_pools_enabled,
         _ => true,
     }
 }

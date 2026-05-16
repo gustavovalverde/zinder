@@ -8,9 +8,9 @@ use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, NetworkUpgradeActivations,
-    RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
-    TransactionId, TreeStateArtifact, TxStatus,
+    ChainValuePoolsAtTip, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
+    NetworkUpgradeActivations, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_source::{
@@ -324,6 +324,12 @@ impl ChainIndex for LocalChainIndex {
             Ok(subtree_roots)
         })
         .await
+    }
+
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
+        self.remote("chain_value_pools_at_tip")?
+            .chain_value_pools_at_tip()
+            .await
     }
 
     async fn transaction_by_id(

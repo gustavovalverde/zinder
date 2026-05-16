@@ -382,6 +382,15 @@ impl IngestControl for SharedWriterStatus {
             "readiness_refresh test stub does not implement TransparentMempoolPrevouts",
         ))
     }
+
+    async fn chain_value_pools_at_tip(
+        &self,
+        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+    ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement ChainValuePoolsAtTip",
+        ))
+    }
 }
 
 async fn spawn_writer_status_server(

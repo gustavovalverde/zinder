@@ -43,6 +43,8 @@ pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_i
 pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
 /// Capability advertised for `WalletQuery.TransparentPrevouts`.
 pub const WALLET_READ_TRANSPARENT_PREVOUTS_V1: &str = "wallet.read.transparent_prevouts_v1";
+/// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
+pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
 pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
 /// Capability advertised for `WalletQuery.ChainEvents`.
@@ -136,6 +138,13 @@ pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
 /// of scope for `v1`. Composed from `WalletQuery.FullBlock` per height;
 /// no derive consumer required.
 pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolSummary`.
+///
+/// Signals that the explorer plane can surface upstream
+/// `getblockchaininfo.valuePools` through the wallet-plane
+/// `ChainValuePoolsAtTip` primitive. The response preserves upstream pool ids
+/// instead of projecting into a fixed list of known pools.
+pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -156,12 +165,31 @@ pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1: &str =
 /// Capability advertised for `IngestControl.TransparentMempoolPrevouts`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
     "ingest.control.transparent_mempool_prevouts_v1";
+/// Capability advertised for `IngestControl.ChainValuePoolsAtTip`.
+pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
+    "ingest.control.chain_value_pools_at_tip_v1";
 
-/// Active capability strings advertised by `IngestControl`.
+/// Capabilities always advertised by `IngestControl`.
+///
+/// Source-backed capabilities are appended by the runtime only when their
+/// backing source handle advertises the required node capability.
+pub const INGEST_CONTROL_ALWAYS_ON_CAPABILITIES: &[&str] = &[
+    INGEST_CONTROL_SERVER_INFO_V1,
+    INGEST_CONTROL_WRITER_STATUS_V1,
+    INGEST_CONTROL_CHAIN_EVENTS_V1,
+    INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
+    INGEST_CONTROL_MEMPOOL_EVENTS_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+];
+
+/// Known capability strings exposed by `IngestControl`.
 ///
 /// Returned through the cross-service `ops.ServerInfo.capabilities` field on
 /// the `IngestControl.ServerInfo` rpc so orchestration tooling can probe the
-/// control-plane surface without an out-of-band schema lookup.
+/// control-plane surface without an out-of-band schema lookup. Individual
+/// server instances filter optional source-backed capabilities at runtime.
 pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_SERVER_INFO_V1,
     INGEST_CONTROL_WRITER_STATUS_V1,
@@ -171,6 +199,7 @@ pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+    INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
 ];
 /// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
 ///
@@ -206,6 +235,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
     WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1,
     WALLET_READ_TRANSPARENT_PREVOUTS_V1,
+    WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_ADDRESS_TRANSPARENT_UTXOS_V1,
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
@@ -219,6 +249,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_MEMPOOL_ACTIVITY_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
     EXPLORER_FEE_SUMMARY_V1,
+    EXPLORER_VALUE_POOL_SUMMARY_V1,
 ];
 
 /// Helpers for client-side capability discovery.

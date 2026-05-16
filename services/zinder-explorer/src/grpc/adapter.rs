@@ -16,6 +16,7 @@ use zinder_proto::capabilities::{
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1, EXPLORER_SEARCH_V1,
     EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_VALUE_POOL_SUMMARY_V1,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -25,6 +26,7 @@ use zinder_proto::v1::{
         MempoolSummaryResponse, SearchRequest, SearchResponse, ServerInfoRequest,
         ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
         TransparentAddressActivityRequest, TransparentAddressActivityResponse,
+        ValuePoolSummaryRequest, ValuePoolSummaryResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -44,6 +46,7 @@ use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::search::handle_search;
 use super::transaction_detail::handle_transaction_detail;
 use super::transparent_address_activity::handle_transparent_address_activity;
+use super::value_pool_summary::handle_value_pool_summary;
 use crate::store::DeriveStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -145,6 +148,7 @@ impl ExplorerQueryGrpcAdapter {
             capabilities.push(EXPLORER_MEMPOOL_ACTIVITY_V1.to_owned());
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1.to_owned());
             capabilities.push(EXPLORER_FEE_SUMMARY_V1.to_owned());
+            capabilities.push(EXPLORER_VALUE_POOL_SUMMARY_V1.to_owned());
         }
         if self.derive_store.is_some() && self.wallet_query_endpoint.is_some() {
             capabilities.push(EXPLORER_BLOCK_SUMMARY_V1.to_owned());
@@ -286,6 +290,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let mut client =
             connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
         handle_fee_summary(&mut client, self.settings.network, request).await
+    }
+
+    async fn value_pool_summary(
+        &self,
+        request: Request<ValuePoolSummaryRequest>,
+    ) -> Result<Response<ValuePoolSummaryResponse>, Status> {
+        let endpoint = self.require_wallet_endpoint("ValuePoolSummary")?;
+        let mut client =
+            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
+        handle_value_pool_summary(&mut client, request).await
     }
 }
 

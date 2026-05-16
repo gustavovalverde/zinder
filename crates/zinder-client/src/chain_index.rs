@@ -6,12 +6,13 @@ use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
-    BlockSelector, ChainEpoch, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
-    RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
-    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentPrevoutsResponse, TreeStateArtifact, TxStatus,
+    BlockSelector, ChainEpoch, ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry,
+    MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
+    TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -546,6 +547,22 @@ pub trait ChainIndex: Send + Sync + 'static {
         subtree_root_range: SubtreeRootRange,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError>;
+
+    /// Reads chain-wide value-pool totals at the upstream node's current tip.
+    ///
+    /// The response is bound to the Zinder chain epoch visible when the writer
+    /// answered the proxied source read. The upstream value-pool list is
+    /// preserved as entries rather than projected into fixed pool names.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let pools = client.chain_value_pools_at_tip().await?;
+    /// # let _ = pools; Ok(()) }
+    /// ```
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError>;
 
     /// Looks up a transaction by id.
     ///

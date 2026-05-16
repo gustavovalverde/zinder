@@ -822,4 +822,29 @@ service ExplorerQuery {
   // range `[start_height, end_height]`. Capability:
   // `explorer.fee.summary_v1`.
   rpc FeeSummary(FeeSummaryRequest) returns (FeeSummaryResponse);
+
+  // Returns chain-wide value pool totals at the upstream node's tip.
+  // Composed from `WalletQuery.ChainValuePoolsAtTip`. Capability:
+  // `explorer.value_pool.summary_v1`.
+  rpc ValuePoolSummary(ValuePoolSummaryRequest) returns (ValuePoolSummaryResponse);
+}
+
+// `ExplorerQuery.ValuePoolSummary` request.
+message ValuePoolSummaryRequest {}
+
+// `ExplorerQuery.ValuePoolSummary` response.
+//
+// Mirrors `WalletQuery.ChainValuePoolsAtTipResponse` with the explorer's
+// cross-cutting `ExplorerFreshness` envelope at field tag 1. Values are
+// the cumulative chain totals reported by the upstream node, not
+// per-block deltas.
+message ValuePoolSummaryResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Upstream value-pool entries, preserved in upstream order so unknown
+  // future pools can flow through without a wire-shape change.
+  repeated zinder.v1.wallet.ChainValuePool pools = 2;
+
+  // Tip height the upstream node observed when computing the pools.
+  uint32 tip_height = 3;
 }

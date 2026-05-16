@@ -13,6 +13,7 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::{
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+    WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -468,6 +469,20 @@ where
         client.transparent_mempool_prevouts(request).await
     }
 
+    async fn chain_value_pools_at_tip(
+        &self,
+        request: Request<wallet::ChainValuePoolsAtTipRequest>,
+    ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
+        let endpoint = self.require_ingest_control_proxy_endpoint(
+            "ChainValuePoolsAtTip requires the ingest-control proxy; \
+             configure the writer endpoint",
+        )?;
+        let mut client =
+            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+                .await?;
+        client.chain_value_pools_at_tip(request).await
+    }
+
     async fn transparent_address_utxos(
         &self,
         request: Request<wallet::TransparentAddressUtxosRequest>,
@@ -644,6 +659,11 @@ where
             common
                 .capabilities
                 .push(WALLET_ADDRESS_TRANSPARENT_BALANCE_V1.to_owned());
+        }
+        if self.ingest_control_proxy_endpoint.is_none() {
+            common
+                .capabilities
+                .retain(|advertised| advertised != WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1);
         }
         Ok(Response::new(wallet::ServerInfoResponse {
             info: Some(wallet_info),

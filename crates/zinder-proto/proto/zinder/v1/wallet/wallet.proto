@@ -1024,6 +1024,38 @@ message TransparentAddressBalanceResponse {
   ChainEpoch chain_epoch = 4;
 }
 
+// One upstream `getblockchaininfo.valuePools` entry.
+message ChainValuePool {
+  // Stable upstream pool identifier, such as "transparent", "sapling",
+  // "orchard", or a future consensus pool id.
+  string id = 1;
+
+  // Whether the upstream node monitors this pool's value.
+  bool monitored = 2;
+
+  // Chain-wide pool total at the observed tip, in zatoshi. Absent when the
+  // upstream node reports the pool id without exposing its value.
+  optional int64 chain_value_zat = 3;
+}
+
+// Wallet-plane request for chain-wide value-pool totals at the upstream
+// node's current tip.
+message ChainValuePoolsAtTipRequest {}
+
+// Wallet-plane response for chain-wide value-pool totals.
+message ChainValuePoolsAtTipResponse {
+  // Chain epoch visible to Zinder when the upstream value-pool read was
+  // answered.
+  ChainEpoch chain_epoch = 1;
+
+  // Upstream value-pool entries, preserved in upstream order so unknown
+  // future pools can flow through without a wire-shape change.
+  repeated ChainValuePool pools = 2;
+
+  // Tip height the upstream node reported when computing the pools.
+  uint32 tip_height = 3;
+}
+
 // Transparent-address tx-history range request, server-streamed.
 message TransparentAddressTxIdsInRangeRequest {
   // Selector for the transparent address being queried.
@@ -1170,6 +1202,13 @@ service WalletQuery {
   // `explorer.transparent_address.balance_v1`.
   rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
       returns (TransparentAddressBalanceResponse);
+
+  // Return chain-wide value-pool totals at the upstream node's current tip.
+  // Capability: `wallet.read.chain_value_pools_at_tip_v1`. Storage-only query
+  // deployments reject this call unless they are configured with the writer's
+  // ingest-control endpoint.
+  rpc ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest)
+      returns (ChainValuePoolsAtTipResponse);
 
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);

@@ -12,3 +12,4 @@ mod mempool_federation;
 mod search_federation;
 mod transaction_detail_federation;
 mod transparent_address_activity_federation;
+mod value_pool_summary_federation;

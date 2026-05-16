@@ -369,6 +369,14 @@ The `ChainIndex` Rust API exposes two methods: `transparent_prevouts(outpoints, 
 
 The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevout endpoint, and inventing a parallel surface is forbidden by [Service boundaries §Anti-Patterns](service-boundaries.md#anti-patterns).
 
+## Chain Value Pools
+
+The native surface is `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest) returns (ChainValuePoolsAtTipResponse)`. Capability `wallet.read.chain_value_pools_at_tip_v1` is advertised when the query deployment can proxy to an ingest writer whose source probe reported `chain_value_pools`.
+
+The response binds to the writer-visible `ChainEpoch`, carries the upstream tip height used by `getblockchaininfo`, and preserves `repeated ChainValuePool pools` in upstream order. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
+
+`zinder-query` does not open an upstream-node connection for this method. It proxies through `IngestControl.ChainValuePoolsAtTip`, because the ingest writer owns the source handle and the source capability snapshot. Storage-only or unproxied query deployments reject the call with `UNAVAILABLE`; writers whose source lacks `chain_value_pools` reject with `FAILED_PRECONDITION`.
+
 ## Transparent Address Balance
 
 The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, `address_count: uint32`, and the binding `chain_epoch`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.

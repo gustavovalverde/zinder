@@ -13,9 +13,9 @@ use zinder_core::wire::{
 };
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector,
-    ChainEpoch, CompactBlockArtifact, ConsensusBranchId, MempoolEntry, MinedDetails,
-    MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
+    ChainEpoch, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
+    MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
     TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
@@ -335,6 +335,16 @@ impl ChainIndex for RemoteChainIndex {
             .into_iter()
             .map(|root| subtree_root_from_message(protocol, root))
             .collect()
+    }
+
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
+        let response = self
+            .client()
+            .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
+            .await
+            .map_err(IndexerError::from_status)?
+            .into_inner();
+        chain_value_pools_at_tip_from_message(self.network, response)
     }
 
     async fn transaction_by_id(
@@ -677,6 +687,28 @@ fn transparent_prevouts_response_from_message(
     Ok(TransparentPrevoutsResponse {
         chain_epoch,
         entries,
+    })
+}
+
+fn chain_value_pools_at_tip_from_message(
+    expected_network: Network,
+    message: wallet::ChainValuePoolsAtTipResponse,
+) -> Result<ChainValuePoolsAtTip, IndexerError> {
+    let chain_epoch = chain_epoch_from_message_with_network(
+        expected_network,
+        message
+            .chain_epoch
+            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
+    )?;
+    let pools = message
+        .pools
+        .into_iter()
+        .map(|pool| ChainValuePool::new(pool.id, pool.monitored, pool.chain_value_zat))
+        .collect();
+    Ok(ChainValuePoolsAtTip {
+        chain_epoch,
+        tip_height: BlockHeight::new(message.tip_height),
+        pools,
     })
 }
 

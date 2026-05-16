@@ -12,6 +12,7 @@ mod block_artifact;
 mod block_header;
 mod block_id;
 mod chain_epoch;
+mod chain_value_pools;
 pub mod explorer_reasons;
 pub mod explorer_search;
 mod mempool;
@@ -33,6 +34,7 @@ pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
     ChainEpoch, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
 };
+pub use chain_value_pools::{ChainValuePool, ChainValuePools, ChainValuePoolsAtTip};
 pub use mempool::{
     MempoolEntry, MempoolEvictionReason, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend,

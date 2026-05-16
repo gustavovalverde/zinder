@@ -848,6 +848,15 @@ impl IngestControl for StaticIngestControl {
             "test scaffold does not stub TransparentMempoolPrevouts",
         ))
     }
+
+    async fn chain_value_pools_at_tip(
+        &self,
+        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+    ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
+        Err(Status::unimplemented(
+            "test scaffold does not stub ChainValuePoolsAtTip",
+        ))
+    }
 }
 
 async fn spawn_ingest_control_server(

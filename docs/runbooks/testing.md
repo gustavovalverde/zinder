@@ -807,6 +807,7 @@ wallet.mempool.transparent_outputs_by_address_v1
 wallet.mempool.transparent_spend_by_outpoint_v1
 wallet.mempool.transparent_prevouts_v1
 wallet.read.transparent_prevouts_v1
+wallet.read.chain_value_pools_at_tip_v1
 wallet.address.transparent_utxos_v1
 wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
@@ -821,6 +822,7 @@ explorer.mempool.summary_v1
 explorer.mempool.activity_v1
 explorer.transparent_address.activity_v1
 explorer.fee.summary_v1
+explorer.value_pool.summary_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

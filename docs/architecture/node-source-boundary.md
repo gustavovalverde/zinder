@@ -99,12 +99,13 @@ Current `NodeCapability` names:
 - `transaction_broadcast`
 - `json_rpc`
 - `openrpc_discovery`
+- `chain_value_pools`
 
 New capability names are added to `NodeCapability` when a real consumer reads the capability; aspirational vocabulary is not pre-declared.
 
 Capability discovery happens at startup in the `connect_node` phase. The probe is implementation-specific per backend:
 
-- **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. Optional methods (`getrawmempool`, etc.) are advertised but not required.
+- **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. Optional methods such as `getblockchaininfo` for `chain_value_pools` are advertised when present but are not required for canonical ingestion.
 - **Zebra indexer gRPC**: the mempool adapter detects feature presence by opening the configured gRPC stream. A block-streaming source and spending-transaction lookup capability are future extensions; they must add real `NodeCapability` variants and runtime wiring in the same change.
 - **zcashd JSON-RPC**: future. Capability probe via `getnetworkinfo` and method probing.
 

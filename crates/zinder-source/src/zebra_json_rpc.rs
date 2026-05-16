@@ -17,9 +17,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ConsensusBranchId, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainValuePool, ChainValuePools,
+    ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
+    TransactionBroadcastResult, TransactionId,
 };
 
 use crate::{
@@ -67,6 +68,7 @@ fn default_zebra_capabilities() -> NodeCapabilities {
         NodeCapability::TreeState,
         NodeCapability::SubtreeRoots,
         NodeCapability::TransactionBroadcast,
+        NodeCapability::ChainValuePools,
     ])
 }
 
@@ -666,6 +668,31 @@ impl NodeSource for ZebraJsonRpcSource {
             subtree_roots,
         ))
     }
+
+    async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
+        let blockchain_info: ZebraGetBlockchainInfoValuePools = self
+            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
+                SourceError::NodeUnavailable {
+                    is_retryable: error.is_retryable(),
+                    reason: error.message,
+                }
+            })
+            .await?;
+        if blockchain_info.value_pools.is_empty() {
+            return Err(SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::ChainValuePools,
+            });
+        }
+        let pools = blockchain_info
+            .value_pools
+            .into_iter()
+            .map(|entry| ChainValuePool::new(entry.id, entry.monitored, entry.chain_value_zat))
+            .collect();
+        Ok(ChainValuePools::new(
+            BlockHeight::new(blockchain_info.blocks),
+            pools,
+        ))
+    }
 }
 
 #[async_trait]
@@ -820,6 +847,9 @@ fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
     }
     if method_names.contains(&"sendrawtransaction") {
         probed_capabilities.push(NodeCapability::TransactionBroadcast);
+    }
+    if method_names.contains(&"getblockchaininfo") {
+        probed_capabilities.push(NodeCapability::ChainValuePools);
     }
 
     NodeCapabilities::from_trusted(probed_capabilities)
@@ -1110,6 +1140,21 @@ struct ZebraGetBlockTrees {
 #[derive(Deserialize)]
 struct ZebraGetBlockchainInfoUpgrades {
     upgrades: std::collections::BTreeMap<String, ZebraNetworkUpgradeInfo>,
+}
+
+#[derive(Deserialize)]
+struct ZebraGetBlockchainInfoValuePools {
+    blocks: u32,
+    #[serde(rename = "valuePools", default)]
+    value_pools: Vec<ZebraValuePoolEntry>,
+}
+
+#[derive(Deserialize)]
+struct ZebraValuePoolEntry {
+    id: String,
+    monitored: bool,
+    #[serde(rename = "chainValueZat")]
+    chain_value_zat: Option<i64>,
 }
 
 #[derive(Deserialize)]

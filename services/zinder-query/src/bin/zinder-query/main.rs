@@ -175,6 +175,15 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
                         .collect(),
                 },
             );
+    let chain_value_pools_enabled =
+        upstream_node_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "chain_value_pools")
+            });
     let broadcaster = broadcaster_and_capabilities.map(|(source, _)| source);
     let network_upgrade_activations = match broadcaster.as_ref() {
         Some(source) => source
@@ -200,6 +209,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds,
         mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds,
         upstream_node_capabilities,
+        chain_value_pools_enabled,
         ..zinder_query::ServerInfoSettings::default()
     };
     let grpc_adapter = {

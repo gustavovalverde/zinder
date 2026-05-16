@@ -32,7 +32,7 @@ use zinder_runtime::{
 };
 use zinder_source::{
     ChainTipNotificationSource, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
-    NodeCapability, NodeTarget, ZebraIndexerChainTipSource, ZebraIndexerMempoolSource,
+    NodeCapability, NodeSource, NodeTarget, ZebraIndexerChainTipSource, ZebraIndexerMempoolSource,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
@@ -378,6 +378,7 @@ async fn run_backfill(
                     network: backfill_config.node.network,
                     store: store.clone(),
                     mempool_index: MempoolIndex::new(),
+                    node_source: Some(Arc::new(source.clone())),
                     bearer_token: command_config.ingest_control_bearer_token.clone(),
                     cancel: cancel.clone(),
                 })
@@ -646,6 +647,7 @@ async fn run_tip_follow(
         network: tip_follow_config.node.network,
         store: store.clone(),
         mempool_index: mempool_index.clone(),
+        node_source: Some(Arc::new(source.clone())),
         bearer_token: command_config.ingest_control_bearer_token.clone(),
         cancel: cancel.clone(),
     })
@@ -792,6 +794,7 @@ struct IngestControlEndpointSpec {
     network: zinder_core::Network,
     store: PrimaryChainStore,
     mempool_index: MempoolIndex,
+    node_source: Option<Arc<dyn NodeSource>>,
     bearer_token: Option<zinder_runtime::BearerToken>,
     cancel: CancellationToken,
 }
@@ -813,6 +816,9 @@ async fn spawn_ingest_control_endpoint(
     let adapter = {
         let mut adapter = IngestControlGrpcAdapter::new(spec.network, spec.store)
             .with_mempool(spec.mempool_index);
+        if let Some(node_source) = spec.node_source {
+            adapter = adapter.with_node_source(node_source);
+        }
         if let Some(bearer_token) = spec.bearer_token {
             adapter = adapter.with_bearer_token(bearer_token);
         }
