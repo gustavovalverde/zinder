@@ -321,8 +321,8 @@ pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
 
 /// Per-request address cap for [`transparent_address_confirmed_balance_response`].
 ///
-/// Mirrors the cap the federated derive plane enforces in
-/// `services/zinder-derive/src/grpc/adapter.rs`. Each address fans out into a
+/// Mirrors the cap the federated explorer plane enforces in
+/// `services/zinder-explorer/src/grpc/adapter.rs`. Each address fans out into a
 /// paginated UTXO scan; without a cap one request could fan out into thousands
 /// of column-family seeks.
 pub const MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST: u32 = 256;

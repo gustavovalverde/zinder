@@ -43,7 +43,7 @@ jobs:
           - zinder-ingest
           - zinder-query
           - zinder-compat-lightwalletd
-          - zinder-derive
+          - zinder-explorer
         platform:
           - name: amd64
             ref: linux/amd64
@@ -112,7 +112,7 @@ jobs:
           - zinder-ingest
           - zinder-query
           - zinder-compat-lightwalletd
-          - zinder-derive
+          - zinder-explorer
     steps:
       - name: Resolve image and tags
         id: tags

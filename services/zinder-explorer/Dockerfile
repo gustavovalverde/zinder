@@ -1,12 +1,12 @@
-# Multi-stage build for the zinder-derive binary.
+# Multi-stage build for the zinder-explorer binary.
 #
 # Build context: repository root. Build command from the repo root:
 #
-#     docker build -f services/zinder-derive/Dockerfile -t zinder-derive .
+#     docker build -f services/zinder-explorer/Dockerfile -t zinder-explorer .
 #
 # This image serves the ExplorerQuery gRPC surface and is intended to be
-# colocated with zinder-query (per the derive-plane federation pattern) rather
-# than exposed publicly.
+# colocated with zinder-query (per the explorer-plane federation pattern in
+# ADR-0009) rather than exposed publicly.
 
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
@@ -23,7 +23,7 @@ RUN apt-get update \
 
 WORKDIR /workspace
 COPY . .
-RUN cargo build --release --bin zinder-derive
+RUN cargo build --release --bin zinder-explorer
 
 
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
@@ -37,12 +37,12 @@ RUN groupadd --system --gid 1000 zinder \
     && mkdir -p /var/lib/zinder/store /var/lib/zinder/secondary /etc/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 
-COPY --from=builder /workspace/target/release/zinder-derive /usr/local/bin/zinder-derive
+COPY --from=builder /workspace/target/release/zinder-explorer /usr/local/bin/zinder-explorer
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENV ZINDER_DERIVE__EXPLORER__LISTEN_ADDR=0.0.0.0:9068
+ENV ZINDER_EXPLORER__LISTEN_ADDR=0.0.0.0:9068
 ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9069
 
 EXPOSE 9068 9069
@@ -50,5 +50,5 @@ EXPOSE 9068 9069
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9069/readyz || exit 1
 
-ENTRYPOINT ["zinder-derive"]
+ENTRYPOINT ["zinder-explorer"]
 CMD ["--config", "/etc/zinder/config.toml"]

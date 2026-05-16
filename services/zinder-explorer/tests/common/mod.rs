@@ -1,7 +1,7 @@
-//! Shared helpers for `zinder-derive`'s integration and live tests.
+//! Shared helpers for `zinder-explorer`'s integration and live tests.
 //!
 //! Subset of `services/zinder-ingest/tests/common/mod.rs` that the
-//! `services/zinder-derive` test crate needs to backfill against a live
+//! `services/zinder-explorer` test crate needs to backfill against a live
 //! upstream node and probe the federated balance read path. Duplicated
 //! deliberately so the live gating contract stays colocated with the
 //! consumer; a third consumer is the prompt for consolidating into

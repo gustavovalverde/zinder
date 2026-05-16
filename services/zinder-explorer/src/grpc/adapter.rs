@@ -1,17 +1,17 @@
 //! `ExplorerQuery` gRPC adapter.
 //!
 //! Serves [`ExplorerQuery::ServerInfo`] (advertising
-//! [`DERIVE_EXPLORER_SERVER_INFO_V1`]) and
+//! [`EXPLORER_SERVER_INFO_V1`]) and
 //! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
 //! request time: confirmed totals are summed from canonical
 //! transparent UTXO artifacts (via `WalletQuery`) and the mempool overlay is
 //! composed from the live mempool point lookups (also via `WalletQuery`).
-//! The derive plane owns no balance column family; the wire shape is the
+//! The explorer plane owns no balance column family; the wire shape is the
 //! durable contract.
 
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_proto::capabilities::{
-    DERIVE_EXPLORER_SERVER_INFO_V1, DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -44,7 +44,7 @@ impl Default for ExplorerServerInfoSettings {
     }
 }
 
-/// Server adapter implementing `ExplorerQuery` for `zinder-derive`.
+/// Server adapter implementing `ExplorerQuery` for `zinder-explorer`.
 ///
 /// Construct with [`ExplorerQueryGrpcAdapter::new`] and chain
 /// [`ExplorerQueryGrpcAdapter::with_wallet_query_endpoint`] to enable the
@@ -109,9 +109,9 @@ impl ExplorerQueryGrpcAdapter {
     }
 
     fn advertised_capabilities(&self) -> Vec<String> {
-        let mut capabilities = vec![DERIVE_EXPLORER_SERVER_INFO_V1.to_owned()];
+        let mut capabilities = vec![EXPLORER_SERVER_INFO_V1.to_owned()];
         if self.wallet_query_endpoint.is_some() {
-            capabilities.push(DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1.to_owned());
+            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1.to_owned());
         }
         capabilities
     }

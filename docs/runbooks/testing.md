@@ -224,7 +224,7 @@ Currently-mainnet-only tests are:
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
 `backfills_last_1000_blocks_from_checkpoint`, plus the federated balance
-read-only confirmations under `services/zinder-derive/tests/live/`.
+read-only confirmations under `services/zinder-explorer/tests/live/`.
 
 ## T3: Parity against a reference lightwalletd
 
@@ -752,9 +752,9 @@ The script verifies the standalone `WalletQuery` capability baseline, exercises
 `LatestBlock`, both `BlockIdBySelector` arms (height + hash round-trip),
 `BlockHeaderBySelector`, and asserts the `Transaction` NotFound mapping. Exit
 code zero is the contract; any drift fails CI. The
-`derive.explorer.transparent_balance_v1` capability is conditional on a fresh
-derive proxy. Set `ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE=1` when the query
-process is started with `zinder-derive` and the smoke should require that
+`explorer.transparent_address.balance_v1` capability is conditional on a fresh
+explorer proxy. Set `ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE=1` when the query
+process is started with `zinder-explorer` and the smoke should require that
 capability too.
 
 ### Bring up `zinder-query`
@@ -810,13 +810,13 @@ wallet.read.transparent_prevouts_v1
 wallet.address.transparent_utxos_v1
 wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
-derive.explorer.server_info_v1
-derive.explorer.transparent_balance_v1
+explorer.server_info_v1
+explorer.transparent_address.balance_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 
 Standalone `zinder-query` processes advertise the list above minus
-`derive.explorer.transparent_balance_v1` until the configured derive proxy is
+`explorer.transparent_address.balance_v1` until the configured explorer proxy is
 reachable and fresh.
 
 ### `BlockSelector` smoke

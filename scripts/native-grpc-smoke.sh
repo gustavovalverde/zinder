@@ -70,11 +70,11 @@ server_info=$(grpc_call "zinder.v1.wallet.WalletQuery/ServerInfo" || die "Server
 advertised=$(jq -r '.capabilities.capabilities[]?' <<<"${server_info}" | sort)
 expected=$(grep -E '^[[:space:]]*"[a-z][^"]+",' "${CAPABILITIES_RS}" \
   | sed -E 's/^[[:space:]]*"([^"]+)".*$/\1/' \
-  | grep -vx 'derive.explorer.transparent_balance_v1' \
+  | grep -vx 'explorer.transparent_address.balance_v1' \
   | sort)
 
 if [[ "${EXPECT_DERIVE_BALANCE}" == "1" ]]; then
-  expected=$(printf '%s\n%s\n' "${expected}" "derive.explorer.transparent_balance_v1" | sort)
+  expected=$(printf '%s\n%s\n' "${expected}" "explorer.transparent_address.balance_v1" | sort)
 fi
 
 if [[ -z "${expected}" ]]; then

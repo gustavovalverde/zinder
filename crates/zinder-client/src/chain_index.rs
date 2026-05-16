@@ -803,9 +803,9 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the transparent-address balance summed across `addresses`.
     ///
-    /// Federated to the derive plane: deployments without `zinder-derive`
+    /// Federated to the explorer plane: deployments without `zinder-explorer`
     /// reachable surface this as
-    /// [`IndexerError::ServiceUnavailable`]/derive-unavailable.
+    /// [`IndexerError::ServiceUnavailable`]/explorer-unavailable.
     ///
     /// # Examples
     ///

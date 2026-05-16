@@ -946,7 +946,7 @@ message TransparentAddressUtxosStreamChunk {
   bytes cursor = 3;
 }
 
-// Bounded transparent-address balance request federated to `zinder-derive`.
+// Bounded transparent-address balance request federated to `zinder-explorer`.
 //
 // The balance read is computed from canonical transparent UTXOs at the
 // requested addresses plus the live mempool overlay. Mempool live state is
@@ -963,7 +963,7 @@ message TransparentAddressBalanceRequest {
   optional ChainEpoch at_epoch = 2;
 }
 
-// Transparent-address balance response federated from `zinder-derive`.
+// Transparent-address balance response federated from `zinder-explorer`.
 //
 // Splits the canonical confirmed total from the signed mempool delta so
 // explorer-shaped clients can render `confirmed`/`unconfirmed` separately;
@@ -1119,11 +1119,11 @@ service WalletQuery {
       returns (stream TransparentAddressTxIdsChunk);
 
   // Return the transparent-address balance summed across the requested
-  // addresses. Federated by `zinder-query` to `zinder-derive`'s
+  // addresses. Federated by `zinder-query` to `zinder-explorer`'s
   // `ExplorerQuery.TransparentAddressBalance`; deployments without a
-  // configured derive plane omit the corresponding capability and reject the
+  // configured explorer plane omit the corresponding capability and reject the
   // call with `UNAVAILABLE`. Capability:
-  // `derive.explorer.transparent_balance_v1`.
+  // `explorer.transparent_address.balance_v1`.
   rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
       returns (TransparentAddressBalanceResponse);
 

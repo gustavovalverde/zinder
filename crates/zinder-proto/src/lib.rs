@@ -64,7 +64,7 @@ pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/zinder.v1.ops.rs"));
     }
 
-    /// Explorer-shaped read protocol messages served by zinder-derive.
+    /// Explorer-shaped read protocol messages served by zinder-explorer.
     pub mod explorer {
         #![allow(
             clippy::allow_attributes_without_reason,

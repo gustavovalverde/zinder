@@ -12,7 +12,7 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
 use zinder_proto::capabilities::{
-    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -103,9 +103,9 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         }
     }
 
-    /// Wires a derive-plane explorer proxy that federates
+    /// Wires the explorer-plane proxy that federates
     /// `WalletQuery.TransparentAddressBalance` to
-    /// `zinder-derive`'s `ExplorerQuery`.
+    /// `zinder-explorer`'s `ExplorerQuery`.
     ///
     /// Without an explorer proxy the federated balance method returns
     /// `UNAVAILABLE` and `ServerInfo` omits the corresponding capability
@@ -551,10 +551,10 @@ where
         &self,
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
-        // Prefer the federated derive plane when configured and ready: it adds
-        // the mempool overlay that canonical-only compute cannot supply. Fall
-        // back to the always-on canonical-confirmed-balance path otherwise so
-        // the RPC stays answerable without `zinder-derive`.
+        // Prefer the federated explorer plane when configured and ready: it
+        // adds the mempool overlay that canonical-only compute cannot supply.
+        // Fall back to the always-on canonical-confirmed-balance path otherwise
+        // so the RPC stays answerable without `zinder-explorer`.
         if let Some(proxy) = self
             .explorer_proxy
             .as_ref()
@@ -595,10 +595,10 @@ where
         // semantics:
         //   * `wallet.address.transparent_balance_v1` is always-on. It signals
         //     the canonical-confirmed-balance compute path that
-        //     `WalletQuery.TransparentAddressBalance` answers when the derive
+        //     `WalletQuery.TransparentAddressBalance` answers when the explorer
         //     plane is unavailable.
-        //   * `derive.explorer.transparent_balance_v1` coexists when the
-        //     derive plane is configured and ready. It signals that the same
+        //   * `explorer.transparent_address.balance_v1` coexists when the
+        //     explorer plane is configured and ready. It signals that the same
         //     response additionally carries the live mempool overlay in
         //     `unconfirmed_delta_zat`.
         let mut wallet_info = build_wallet_server_info(&self.server_info);
@@ -619,7 +619,7 @@ where
         } else {
             common
                 .capabilities
-                .retain(|advertised| advertised != DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1);
+                .retain(|advertised| advertised != EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
         }
         if !common
             .capabilities

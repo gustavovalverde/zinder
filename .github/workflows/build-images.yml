@@ -42,9 +42,9 @@ jobs:
           - name: zinder-compat-lightwalletd
             dockerfile: services/zinder-compat-lightwalletd/Dockerfile
             help_entrypoint: zinder-compat-lightwalletd
-          - name: zinder-derive
-            dockerfile: services/zinder-derive/Dockerfile
-            help_entrypoint: zinder-derive
+          - name: zinder-explorer
+            dockerfile: services/zinder-explorer/Dockerfile
+            help_entrypoint: zinder-explorer
           - name: zinder
             dockerfile: deploy/single-container/Dockerfile
             help_entrypoint: zinder-query

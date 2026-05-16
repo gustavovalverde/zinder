@@ -9,7 +9,7 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 | `zinder-ingest`              | Upstream node connections, backfill, tip following, reorg handling, canonical artifact commits, migrations              | Public wallet traffic, user wallet secrets, explorer analytics                  |
 | `zinder-query`               | Wallet-facing APIs, explorer read APIs, transaction broadcast facade, response consistency                              | Chain selection, canonical writes, migrations, derived-index repair             |
 | `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
-| `zinder-derive`              | Replayable materialized views, explorer-specific indexes, analytics-specific schemas, `ChainEvent` consumption          | Wallet sync, canonical chain state, source truth                                |
+| `zinder-explorer`            | Replayable materialized views, explorer-specific indexes, analytics-specific schemas, `ChainEvent` consumption          | Wallet sync, canonical chain state, source truth                                |
 
 ## Why This Split Exists
 
@@ -42,7 +42,7 @@ The services must not share:
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
-`zinder-derive` writes derived storage. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync.
+`zinder-explorer` writes derived storage. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern this service exercises and stay derive-shaped so future consumers can link the same SDK; only the product-facing binary, config namespace, capability prefix, and Prometheus prefix rebrand. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ## Development Profile
 
@@ -81,7 +81,7 @@ Extended production deployment (adds derived plane):
 zinder-ingest              -> canonical RocksDB (primary) + ChainEventEnvelope
 zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
 zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi -> CompactTxStreamer
-zinder-derive              -> ChainEventEnvelope or snapshots -> derived storage
+zinder-explorer            -> ChainEventEnvelope or snapshots -> derived storage -> ExplorerQuery
 ```
 
 Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).

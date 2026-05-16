@@ -12,9 +12,9 @@ use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint};
-use zinder_derive::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
-    DERIVE_EXPLORER_SERVER_INFO_V1, DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 
@@ -49,7 +49,7 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
         common
             .capabilities
             .iter()
-            .any(|advertised| { advertised == DERIVE_EXPLORER_SERVER_INFO_V1 })
+            .any(|advertised| { advertised == EXPLORER_SERVER_INFO_V1 })
     );
 
     server_handle.abort();
@@ -95,7 +95,7 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         !common
             .capabilities
             .iter()
-            .any(|advertised| { advertised == DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1 }),
+            .any(|advertised| { advertised == EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1 }),
         "balance capability must not advertise without a wallet_query_endpoint",
     );
 

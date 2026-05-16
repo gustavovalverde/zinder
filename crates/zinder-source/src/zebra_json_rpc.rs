@@ -249,7 +249,7 @@ impl ZebraJsonRpcSource {
     /// [`Arc`], and emits a structured `network_upgrade_activations_discovered`
     /// log event tagged with `target`. The four service binaries
     /// (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`,
-    /// `zinder-derive`) share this one entry point so the discovery event
+    /// `zinder-explorer`) share this one entry point so the discovery event
     /// shape stays consistent across the workspace.
     pub async fn discover_network_upgrade_activations(
         &self,

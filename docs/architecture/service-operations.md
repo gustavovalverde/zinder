@@ -200,7 +200,7 @@ P95, P99, and worst-case values before updating performance-budget tables.
   `zinder_store_read_duration_seconds`.
 - Secondary catchup lag (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)): current chain-epoch lag and time since last successful catchup.
 
-`zinder-derive` should expose:
+`zinder-explorer` should expose:
 
 - Last consumed epoch.
 - Derived-index lag.
@@ -322,7 +322,7 @@ connect to the upstream node.
 Expected recovery behavior:
 
 - If `zinder-query` fails, restart it without affecting ingestion.
-- If `zinder-derive` fails, mark derived indexes stale and rebuild or resume later.
+- If `zinder-explorer` fails, mark derived indexes stale and rebuild or resume later.
 - If `zinder-ingest` fails during an epoch commit, restart from the last committed epoch or fail with `storage_unavailable` or `schema_mismatch`.
 - If a reorg exceeds the configured window, fail closed and require operator action.
 
@@ -342,7 +342,7 @@ Optional derived deployment:
 1 x zinder-ingest
 N x zinder-query
 0..N x zinder-compat-lightwalletd
-M x zinder-derive
+M x zinder-explorer
 ```
 
 Only one ingest writer should own a canonical storage namespace unless leader election and write fencing are explicitly designed.

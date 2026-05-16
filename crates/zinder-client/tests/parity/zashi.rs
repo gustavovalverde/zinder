@@ -1,7 +1,7 @@
 //! Zashi / Zodl parity assertions.
 //!
 //! Zashi (mobile, via `zcash-android-wallet-sdk`) consumes the lightwalletd
-//! compat surface and the federated `derive.explorer.*` surface. These
+//! compat surface and the federated `explorer.*` surface. These
 //! compile-time assertions ensure the `ChainIndex` methods Zashi's typed
 //! gRPC paths depend on are present on the trait surface.
 //!

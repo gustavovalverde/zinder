@@ -24,7 +24,7 @@ message ServerInfo {
   string network = 1;
 
   // Service name. Stable diagnostic identifier such as `zinder-ingest`,
-  // `zinder-query`, `zinder-compat-lightwalletd`, `zinder-derive`.
+  // `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`.
   string service_name = 2;
 
   // Service semantic version sourced from `CARGO_PKG_VERSION`.

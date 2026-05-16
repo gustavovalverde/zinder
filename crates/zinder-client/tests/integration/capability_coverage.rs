@@ -18,12 +18,12 @@
 //! Renaming or removing any of those methods on the trait makes this test
 //! file fail to compile, so the table is bound to the trait at build time
 //! instead of only at string-comparison time. Capabilities under the
-//! `derive.*` namespace target `ExplorerQuery` server types and are checked
-//! by the consuming derive crate; this test treats them as opaque table
+//! `explorer.*` namespace target `ExplorerQuery` server types and are checked
+//! by the consuming explorer crate; this test treats them as opaque table
 //! entries.
 
 use zinder_client::{
-    ChainIndex, DERIVE_EXPLORER_SERVER_INFO_V1, DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+    ChainIndex, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
     WALLET_ADDRESS_TRANSPARENT_UTXOS_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
     WALLET_EVENTS_MEMPOOL_V1, WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
@@ -88,9 +88,9 @@ const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
         WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
         "transparent_address_balance",
     ),
-    (DERIVE_EXPLORER_SERVER_INFO_V1, "explorer_server_info"),
+    (EXPLORER_SERVER_INFO_V1, "explorer_server_info"),
     (
-        DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+        EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
         "transparent_address_balance",
     ),
 ];

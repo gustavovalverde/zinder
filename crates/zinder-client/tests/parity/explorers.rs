@@ -1,7 +1,7 @@
 //! Block-explorer parity assertions.
 //!
 //! Block explorers exercise typed `WalletQuery` and federated
-//! `derive.explorer.*` surfaces to display per-block, per-transaction, and
+//! `explorer.*` surfaces to display per-block, per-transaction, and
 //! per-address state. These compile-time assertions ensure the trait surface
 //! they depend on stays intact through future refactors.
 

@@ -1,5 +1,6 @@
 //! Federation primitive for proxying typed `WalletQuery` RPCs to derive-plane
-//! consumers (`zinder-derive`).
+//! consumers (`zinder-explorer` today; future derive-pattern services follow
+//! the same shape).
 //!
 //! [`DeriveProxy`] is the federation entry point for any `WalletQuery.*`
 //! method that delegates to a derive consumer. It owns the four concerns
@@ -16,18 +17,19 @@
 //!   [`crate::WalletQueryGrpcAdapter`] can suppress the federated method's
 //!   capability string when the proxy is unconfigured or unhealthy.
 //!
-//! Federated methods advertise their capability under
-//! `derive.{consumer}.{capability}_v{N}` rather than `wallet.*`: the
-//! namespace reflects data ownership, not RPC location. Capability
-//! advertisement is gated on [`DeriveProxy::is_ready`]; `ServerInfo` does
-//! not advertise the capability when the proxy is unconfigured.
+//! Federated methods advertise their capability under the consumer's product
+//! namespace (`explorer.<noun>.<capability>_v{N}` for explorer-plane methods)
+//! rather than `wallet.*`: the namespace reflects data ownership, not RPC
+//! location. Capability advertisement is gated on [`DeriveProxy::is_ready`];
+//! `ServerInfo` does not advertise the capability when the proxy is
+//! unconfigured.
 //!
-//! Each derive consumer constructs its own `DeriveProxy<Client>`
-//! parameterized over the consumer's generated tonic client. The supplied
-//! `construct_client` function pointer turns an [`AuthenticatedChannel`]
-//! into the typed client; the rest of the federation logic is shared.
-//! A binary running multiple derive consumers spawns one probe loop per
-//! proxy.
+//! The `Derive*` type names describe the reusable SDK pattern (chain-events
+//! subscription + atomic cursor + write batch) and stay even though today's
+//! only deployed consumer is `zinder-explorer`. A future second consumer
+//! constructs its own `DeriveProxy<Client>` parameterized over its generated
+//! tonic client. A binary running multiple consumers spawns one probe loop
+//! per proxy.
 
 use std::{
     future::Future,
@@ -64,7 +66,7 @@ pub struct DeriveProxyConfig {
     /// proxy reports `is_ready` only when its readiness gauge has observed
     /// this string in the consumer's most recent capability response.
     ///
-    /// For example: `"derive.explorer.transparent_balance_v1"`.
+    /// For example: `"explorer.transparent_address.balance_v1"`.
     pub capability: &'static str,
 }
 

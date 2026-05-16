@@ -61,11 +61,11 @@ pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transpar
 ///
 /// Advertised whenever the deployment exposes the RPC. Clients that need the
 /// mempool overlay must additionally check for
-/// [`DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1`]; the wallet capability alone
+/// [`EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1`]; the wallet capability alone
 /// signals confirmed totals computed from canonical UTXOs.
 pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
-pub const DERIVE_EXPLORER_SERVER_INFO_V1: &str = "derive.explorer.server_info_v1";
+pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -104,10 +104,12 @@ pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
 ];
 /// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
 ///
-/// Coexists with [`WALLET_ADDRESS_TRANSPARENT_BALANCE_V1`] when the derive
+/// Coexists with [`WALLET_ADDRESS_TRANSPARENT_BALANCE_V1`] when the explorer
 /// plane is configured and ready. Signals that the same response carries the
-/// live mempool overlay in `unconfirmed_delta_zat`.
-pub const DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1: &str = "derive.explorer.transparent_balance_v1";
+/// live mempool overlay in `unconfirmed_delta_zat`. This is the federated form
+/// advertised by `zinder-explorer` and proxied through `WalletQuery`; see
+/// [ADR-0009](../../../docs/adrs/0009-explorer-plane-as-product-surface.md).
+pub const EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1: &str = "explorer.transparent_address.balance_v1";
 
 /// Active capability strings advertised by a Zinder deployment.
 ///
@@ -136,8 +138,8 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_ADDRESS_TRANSPARENT_UTXOS_V1,
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
-    DERIVE_EXPLORER_SERVER_INFO_V1,
-    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+    EXPLORER_SERVER_INFO_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 ];
 
 /// Helpers for client-side capability discovery.

@@ -97,7 +97,7 @@ fn missing_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
 }
 
 #[test]
-fn print_config_accepts_explorer_derive_proxy() -> eyre::Result<()> {
+fn print_config_accepts_explorer_proxy() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("query-derive-store");
     let secondary_path = tempdir.path().join("query-derive-secondary");
@@ -112,16 +112,16 @@ fn print_config_accepts_explorer_derive_proxy() -> eyre::Result<()> {
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "--derive-explorer-endpoint",
+            "--explorer-endpoint",
             "http://127.0.0.1:9068",
-            "--derive-explorer-probe-interval-ms",
+            "--explorer-probe-interval-ms",
             "1000",
         ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("[derive.explorer]"), "{stdout}");
+    assert!(stdout.contains("[explorer]"), "{stdout}");
     assert!(
         stdout.contains("endpoint = \"http://127.0.0.1:9068\""),
         "{stdout}"
@@ -132,7 +132,7 @@ fn print_config_accepts_explorer_derive_proxy() -> eyre::Result<()> {
 }
 
 #[test]
-fn zero_explorer_derive_probe_interval_is_rejected() -> eyre::Result<()> {
+fn zero_explorer_probe_interval_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("query-derive-zero-store");
     let secondary_path = tempdir.path().join("query-derive-zero-secondary");
@@ -147,9 +147,9 @@ fn zero_explorer_derive_probe_interval_is_rejected() -> eyre::Result<()> {
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "--derive-explorer-endpoint",
+            "--explorer-endpoint",
             "http://127.0.0.1:9068",
-            "--derive-explorer-probe-interval-ms",
+            "--explorer-probe-interval-ms",
             "0",
         ])
         .output()?;
@@ -157,7 +157,7 @@ fn zero_explorer_derive_probe_interval_is_rejected() -> eyre::Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("derive.explorer.probe_interval_ms must be greater than zero"),
+        stderr.contains("explorer.probe_interval_ms must be greater than zero"),
         "{stderr}"
     );
 

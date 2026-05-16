@@ -86,7 +86,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-derive",
+            "zinder-explorer",
         ],
         requirement: Requirement::Required,
         sensitive: false,
@@ -240,13 +240,38 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       the writer enforces auth (ADR-0006).",
     },
     EnvVarDoc {
-        name: "ZINDER_DERIVE__BEARER_TOKEN_PATH",
-        toml_path: "derive.bearer_token_path",
-        used_by: &["zinder-derive"],
+        name: "ZINDER_EXPLORER__BEARER_TOKEN_PATH",
+        toml_path: "explorer.bearer_token_path",
+        used_by: &["zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Path to the shared-secret bearer token the ExplorerQuery endpoint enforces \
-                      on cross-service derive-plane reads.",
+                      on cross-service explorer-plane reads (ADR-0006).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_EXPLORER__LISTEN_ADDR",
+        toml_path: "explorer.listen_addr",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_EXPLORER__STORAGE_PATH",
+        toml_path: "explorer.storage_path",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Filesystem path opened by `DeriveStore` for explorer-plane derive state.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",
+        toml_path: "explorer.wallet_query_endpoint",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. \
+                      Empty/unset disables the `explorer.transparent_address.balance_v1` capability.",
     },
 ];
 

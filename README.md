@@ -20,7 +20,7 @@ Zinder is the Zcash chain indexer for wallets, explorers, and application backen
 
 **For operators.** Explicit `/healthz`, `/readyz`, and `/metrics` endpoints with typed readiness causes (`syncing`, `node_unavailable`, `reorg_window_exceeded`, and others), so load balancers and incident response act on machine-readable state. Network-aware defaults for mainnet, testnet, and regtest. Production configuration that refuses to start with placeholder credentials, unsafe binds, or missing storage. Capability detection at source connection time instead of hard version pins.
 
-**For explorer and application backends.** Epoch-consistent reads through a typed query API. Replayable downstream derived indexes (`zinder-derive`) that consume canonical artifacts and can be rebuilt without affecting wallet sync. Additive artifact families that land as new column families without central enum edits.
+**For explorer and application backends.** Epoch-consistent reads through a typed query API. A dedicated explorer plane (`zinder-explorer`) serving block summaries, transaction details, mempool views, and typed search alongside replayable materialized views that consume canonical artifacts and can be rebuilt without affecting wallet sync. Additive artifact families that land as new column families without central enum edits.
 
 **For Rust consumers.** A typed client crate (`zinder-client`) exposing `ChainIndex`, with two implementations selected by deployment topology: `LocalChainIndex` for colocated consumers (RocksDB-secondary reads, no tonic round-trip) and `RemoteChainIndex` for cross-host consumers (gRPC). Zallet and Rust applications consume the same trait.
 
@@ -53,20 +53,20 @@ flowchart LR
         Store[("zinder-store<br/>canonical RocksDB")]
         Query["zinder-query<br/>WalletQuery API"]
         Compat["zinder-compat-lightwalletd<br/>CompactTxStreamer"]
-        Derive["zinder-derive<br/>(optional)"]
+        Explorer["zinder-explorer<br/>(optional)"]
 
         Source --> Ingest
         Ingest --> Store
         Store --> Query
         Compat --> Query
         Ingest -. "ChainEvents subscription" .-> Query
-        Ingest -. "ChainEvents subscription" .-> Derive
+        Ingest -. "ChainEvents subscription" .-> Explorer
     end
 
     Zebra --> Source
     Query --> NativeClients["Zallet, native wallets, Rust SDKs"]
     Compat --> LightwalletdClients["Zodl, Android SDK, lightwalletd clients"]
-    Derive --> Explorers["explorers, analytics"]
+    Explorer --> Explorers["explorers, analytics"]
 ```
 
 ### Planes
@@ -76,7 +76,7 @@ flowchart LR
 - **Canonical storage** (`zinder-store`). RocksDB-backed `PrimaryChainStore` and `SecondaryChainStore` role handles exposed to services through the domain-shaped `ChainEpochReadApi`. RocksDB types are private; the public read API is epoch-bound, so callers always resolve one `ChainEpoch` before reading any artifact. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
 - **Wallet data plane** (`zinder-query`). Read-only wallet and application API over `WalletQueryApi`, served as the native `WalletQuery` gRPC service. Owns compact block ranges, tree state, subtree roots, transaction lookup, transaction broadcast, the public `ChainEvents` proxy, mempool snapshots/events, and transparent-address reads. Never calls upstream nodes, never writes storage, never custodies keys. See [wallet data plane](docs/architecture/wallet-data-plane.md).
 - **Compatibility plane** (`zinder-compat-lightwalletd`). Translates the vendored lightwalletd `CompactTxStreamer` calls onto `WalletQueryApi`. A pure translation layer: it has no source client, no canonical storage handle, and no parallel artifact construction. New compatibility adapters must use the same shape. See [protocol boundary](docs/architecture/protocol-boundary.md).
-- **Derive plane** (`zinder-derive`, optional). Replayable materialized views (explorer indexes, analytics aggregates, compliance projections) that consume canonical artifacts and the `ChainEvents` stream. Cannot affect canonical state; any derived view can be discarded and rebuilt from canonical artifacts, which is the test for whether a feature belongs here versus in canonical storage. See [derive plane](docs/architecture/derive-plane.md).
+- **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. Owns materialized views (consuming canonical artifacts and the `ChainEvents` stream) that cannot affect canonical state; any derived view can be discarded and rebuilt from canonical artifacts. See [explorer plane](docs/architecture/explorer-plane.md) and [derive plane](docs/architecture/derive-plane.md) (the reusable SDK pattern this service exercises).
 
 Two foundation crates are shared across every plane: `zinder-core` (chain vocabulary: `ChainEpoch`, `BlockArtifact`, `Network`) and `zinder-proto` (`.proto` files and generated wire modules, including the pinned vendored lightwalletd schemas). Every binary also exposes an operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) with typed readiness causes; that contract is owned by `zinder-runtime`. See [service operations](docs/architecture/service-operations.md).
 

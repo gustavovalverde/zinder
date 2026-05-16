@@ -18,7 +18,8 @@ use zinder_core::{
     SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_proto::capabilities::{
-    DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_BROADCAST_TRANSACTION_V1,
+    WALLET_EVENTS_CHAIN_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -523,7 +524,7 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
         DeriveProxyConfig {
             endpoint: "http://127.0.0.1:0".to_owned(),
             bearer_token: None,
-            capability: DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1,
+            capability: EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
         },
         readiness.clone(),
         ExplorerQueryClient::new,
@@ -535,16 +536,16 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     assert!(
         !has_capability(
             &initial_capabilities,
-            DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
+            EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1
         ),
-        "derive capability must be omitted before the readiness probe succeeds"
+        "explorer capability must be omitted before the readiness probe succeeds"
     );
 
     readiness.mark_ready();
     let ready_capabilities = wallet_server_info(&grpc_adapter).await?;
     assert!(has_capability(
         &ready_capabilities,
-        DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
+        EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1
     ));
 
     readiness.mark_not_ready();
@@ -552,9 +553,9 @@ async fn native_grpc_service_gates_federated_derive_capability_on_readiness() ->
     assert!(
         !has_capability(
             &not_ready_capabilities,
-            DERIVE_EXPLORER_TRANSPARENT_BALANCE_V1
+            EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1
         ),
-        "derive capability must be removed after the readiness probe fails"
+        "explorer capability must be removed after the readiness probe fails"
     );
 
     Ok(())

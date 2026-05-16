@@ -12,7 +12,7 @@ Zinder has three event boundaries with different jobs:
 | -------- | -------- | -------- | ------- |
 | Source observations | `NodeSource` adapter | `zinder-ingest` | Report upstream node observations before canonical commit |
 | `ChainEvent` | `zinder-ingest` | ingest-owned publisher and private subscription endpoint | Describe the committed canonical transition |
-| `ChainEventEnvelope` | ingest subscription plane | `zinder-query`, `zinder-client`, `zinder-derive`, and external derived consumers | Carry replayable, cursor-bound chain events over the wire |
+| `ChainEventEnvelope` | ingest subscription plane | `zinder-query`, `zinder-client`, `zinder-explorer`, and external derived consumers | Carry replayable, cursor-bound chain events over the wire |
 
 Keep these layers distinct. A source observation is not a committed chain event. A wire envelope is not the internal state-machine event.
 
@@ -104,10 +104,10 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 Derived consumers resume through
 `chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })` or
 the equivalent private ingest subscription RPC. The shipped consumer-side
-helper `zinder_derive::run_chain_events_subscriber` drains the stream into a
+helper `zinder_explorer::run_chain_events_subscriber` drains the stream into a
 `DeriveConsumer` and persists each cursor advance atomically with the
 consumer's `WriteBatch`. Fresh consumers whose persisted cursor sits below the
-retention floor cold-start through `zinder_derive::backfill_then_attach`,
+retention floor cold-start through `zinder_explorer::backfill_then_attach`,
 which drains `compact_block_range` for the gap before attaching to the live
 stream.
 
@@ -162,12 +162,12 @@ Internal storage errors still map to API errors at service boundaries: `ChainEpo
 
 ## Retention And Backpressure
 
-`zinder-ingest` must retain enough event history for expected `zinder-derive` outages and query catch-up windows. The retention policy is an operational setting, not a protocol shortcut.
+`zinder-ingest` must retain enough event history for expected `zinder-explorer` outages and query catch-up windows. The retention policy is an operational setting, not a protocol shortcut.
 
 Event streams must be bounded:
 
 - The future streaming source method applies backpressure to source adapters.
-- `ChainEventEnvelope` streams apply backpressure to `zinder-query` and `zinder-derive`.
+- `ChainEventEnvelope` streams apply backpressure to `zinder-query` and `zinder-explorer`.
 - A slow consumer must not block `commit_chain_epoch`.
 - If a consumer exceeds retention, the system returns `EventCursorExpired` and requires replay from checkpoint or canonical artifacts.
 

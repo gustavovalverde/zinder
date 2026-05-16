@@ -16,6 +16,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [Protocol boundary](architecture/protocol-boundary.md)
 - [Wallet data plane](architecture/wallet-data-plane.md)
 - [Derive plane](architecture/derive-plane.md)
+- [Explorer plane](architecture/explorer-plane.md)
 - [Service operations](architecture/service-operations.md)
 - [Public interfaces](architecture/public-interfaces.md)
 - [Extending artifacts](architecture/extending-artifacts.md)
@@ -31,6 +32,10 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0006: IngestControl transport security](adrs/0006-ingest-control-transport-security.md)
 - [ADR-0007: Mempool topology and retention](adrs/0007-mempool-topology-and-retention.md)
 - [ADR-0008: Per-network consensus parameters discovered from the running node](adrs/0008-network-parameter-discovery.md)
+- [ADR-0009: Explorer plane as first-class product surface](adrs/0009-explorer-plane-as-product-surface.md)
+- [ADR-0010: TransactionPublicFacts as the single transaction parser](adrs/0010-transaction-public-facts.md)
+- [ADR-0011: Explorer freshness envelope](adrs/0011-explorer-freshness-envelope.md)
+- [ADR-0012: Typed explorer search and privacy refusal](adrs/0012-typed-explorer-search-and-privacy-refusal.md)
 
 ## Reference
 

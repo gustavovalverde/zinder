@@ -13,14 +13,14 @@ You are adding a new artifact family when **all** of the following are true:
 - The data is chain-derived. It comes from canonical chain state (blocks, transactions, mempool source events). It is not upstream-node-supplied configuration, not operator state, not derived analytics.
 - The data has a stable identity that can be looked up by a key. The key fits into one of the variants of `ArtifactKey` (or extends it: `BlockHeight`, `TransactionId`, `SubtreeRootIndex`, `TransparentAddress`, `OutPoint`, future variants).
 - The data is shaped enough to deserve its own schema. If the data fits into an existing artifact's payload as a new field, prefer extending that payload.
-- The data is canonical, not derived in the [zinder-derive](derive-plane.md) sense. Derived materialized views go through `zinder-derive`, not through new canonical artifact families.
+- The data is canonical, not derived in the [zinder-explorer](derive-plane.md) sense. Derived materialized views go through `zinder-explorer`, not through new canonical artifact families.
 
 If any of these are false, you may not be adding an artifact family. Common alternatives:
 
 | Situation | Right shape | Wrong shape |
 |-----------|-------------|-------------|
-| Adding a precomputed totals table for explorer dashboards | `zinder-derive` materialized view consumed via `ChainEvents` | Canonical artifact family |
-| Adding fee-rate ordering to mempool transactions | `zinder-derive` view over `MempoolEvents` | Canonical mempool artifact |
+| Adding a precomputed totals table for explorer dashboards | `zinder-explorer` materialized view consumed via `ChainEvents` | Canonical artifact family |
+| Adding fee-rate ordering to mempool transactions | `zinder-explorer` view over `MempoolEvents` | Canonical mempool artifact |
 | Adding a new field to per-block metadata | Extend `BlockArtifact`'s payload with the new field, bump artifact schema version | New artifact family |
 | Adding transparent address transaction history | New canonical artifact family with `ArtifactKey::TransparentAddress` | Compat-shim-only feature, derive view, ad-hoc index |
 | Adding transparent address UTXO lookup for lightwalletd compatibility | New canonical transparent UTXO artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |

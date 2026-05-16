@@ -1,11 +1,11 @@
-//! Zinder derive-plane gRPC server entry point.
+//! Zinder explorer-plane gRPC server entry point.
 
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use zinder_derive::{
+use zinder_explorer::{
     DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
 };
 use zinder_runtime::{
@@ -15,11 +15,11 @@ use zinder_runtime::{
 
 mod config;
 
-use config::{DeriveConfig, DeriveConfigError, DeriveConfigOverrides};
+use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 
 #[derive(Parser)]
-#[command(name = "zinder-derive")]
-#[command(about = "Zinder derive-plane gRPC server")]
+#[command(name = "zinder-explorer")]
+#[command(about = "Zinder explorer-plane gRPC server")]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]
@@ -38,8 +38,8 @@ struct Cli {
     listen_addr: Option<SocketAddr>,
     /// Path to a file containing the shared-secret bearer token enforced by
     /// the `ExplorerQuery` endpoint.
-    #[arg(long = "derive-explorer-token-path")]
-    derive_explorer_token_path: Option<PathBuf>,
+    #[arg(long = "bearer-token-path")]
+    bearer_token_path: Option<PathBuf>,
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
@@ -67,8 +67,8 @@ async fn main() -> ExitCode {
 )]
 fn run_print_config(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
-    let render_result = config::load_derive_config(config_path, cli.into())
-        .and_then(|derive_config| config::derive_config_toml(&derive_config));
+    let render_result = config::load_explorer_config(config_path, cli.into())
+        .and_then(|explorer_config| config::explorer_config_toml(&explorer_config));
 
     match render_result {
         Ok(rendered_toml) => {
@@ -80,17 +80,17 @@ fn run_print_config(cli: Cli) -> ExitCode {
 }
 
 async fn run_runtime(cli: Cli) -> ExitCode {
-    match run_derive(cli).await {
+    match run_explorer(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => emit_runtime_error(&error),
     }
 }
 
-async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
+async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
     let ops_listen_addr_override = cli.ops_listen_addr;
-    let derive_config = match config::load_derive_config(config_path, cli.into()) {
+    let explorer_config = match config::load_explorer_config(config_path, cli.into()) {
         Ok(cfg) => {
             load_config_phase.complete();
             cfg
@@ -103,33 +103,33 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = derive_config
+    let ops_handle = explorer_config
         .ops_listen_addr
         .or(ops_listen_addr_override)
-        .map(|listen_addr| spawn_ops(listen_addr, &derive_config, &readiness));
+        .map(|listen_addr| spawn_ops(listen_addr, &explorer_config, &readiness));
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let _store = match DeriveStore::open(&derive_config.storage_path, DeriveStoreOptions::default())
-    {
-        Ok(handle) => {
-            open_storage_phase.complete();
-            handle
-        }
-        Err(error) => {
-            let wrapped = DeriveConfigError::Store(error);
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
+    let _store =
+        match DeriveStore::open(&explorer_config.storage_path, DeriveStoreOptions::default()) {
+            Ok(handle) => {
+                open_storage_phase.complete();
+                handle
+            }
+            Err(error) => {
+                let wrapped = ExplorerConfigError::Store(error);
+                open_storage_phase.fail(&wrapped);
+                start_api_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
     let server_info = ExplorerServerInfoSettings {
-        network: encode_zinder_native_chain_name(derive_config.network).to_owned(),
+        network: encode_zinder_native_chain_name(explorer_config.network).to_owned(),
     };
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info);
-    if let Some(endpoint) = derive_config.wallet_query_endpoint.clone() {
+    if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
-    if let Some(token) = derive_config.bearer_token.clone() {
+    if let Some(token) = explorer_config.bearer_token.clone() {
         grpc_adapter = grpc_adapter.with_bearer_token(token);
     }
     let cancel = CancellationToken::new();
@@ -139,22 +139,22 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
     readiness.set(ReadinessState::ready(None));
 
     tracing::info!(
-        target: "zinder::derive",
-        event = "derive_started",
-        network = encode_zinder_native_chain_name(derive_config.network),
-        listen_addr = %derive_config.listen_addr,
-        storage_path = %derive_config.storage_path.display(),
+        target: "zinder::explorer",
+        event = "explorer_started",
+        network = encode_zinder_native_chain_name(explorer_config.network),
+        listen_addr = %explorer_config.listen_addr,
+        storage_path = %explorer_config.storage_path.display(),
         "explorer query gRPC server started"
     );
 
     let server_result = tonic::transport::Server::builder()
         .add_service(grpc_adapter.into_server())
-        .serve_with_shutdown(derive_config.listen_addr, cancel.cancelled_owned())
+        .serve_with_shutdown(explorer_config.listen_addr, cancel.cancelled_owned())
         .await;
 
     tracing::info!(
-        target: "zinder::derive",
-        event = "derive_stopped",
+        target: "zinder::explorer",
+        event = "explorer_stopped",
         "explorer query gRPC server stopped"
     );
 
@@ -162,43 +162,43 @@ async fn run_derive(cli: Cli) -> Result<(), DeriveConfigError> {
         handle.shutdown().await;
     }
 
-    server_result.map_err(DeriveConfigError::Transport)
+    server_result.map_err(ExplorerConfigError::Transport)
 }
 
 fn spawn_ops(
     listen_addr: SocketAddr,
-    derive_config: &DeriveConfig,
+    explorer_config: &ExplorerConfig,
     readiness: &Readiness,
 ) -> zinder_runtime::OpsEndpointHandle {
     spawn_ops_endpoint(
         listen_addr,
         OpsServer {
-            service_name: "zinder-derive",
+            service_name: "zinder-explorer",
             service_version: env!("CARGO_PKG_VERSION"),
-            network_name: encode_zinder_native_chain_name(derive_config.network),
+            network_name: encode_zinder_native_chain_name(explorer_config.network),
         },
         readiness.clone(),
     )
 }
 
-fn emit_runtime_error(error: &DeriveConfigError) -> ExitCode {
+fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {
     tracing::error!(
-        target: "zinder::derive",
-        event = "derive_run_failed",
+        target: "zinder::explorer",
+        event = "explorer_run_failed",
         error = %error,
-        "derive run failed"
+        "explorer run failed"
     );
     ExitCode::FAILURE
 }
 
-impl From<Cli> for DeriveConfigOverrides {
+impl From<Cli> for ExplorerConfigOverrides {
     fn from(cli: Cli) -> Self {
         Self {
             network: cli.network,
             storage_path: cli.storage_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
-            token_path: cli.derive_explorer_token_path,
+            bearer_token_path: cli.bearer_token_path,
             wallet_query_endpoint: cli.wallet_query_endpoint,
         }
     }

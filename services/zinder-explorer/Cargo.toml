@@ -1,10 +1,10 @@
 [package]
-name = "zinder-derive"
+name = "zinder-explorer"
 version = "0.1.0"
-description = "Zinder derive-plane runtime that hosts explorer and analytics consumers"
+description = "Zinder explorer-plane runtime serving block-explorer, dashboard, and analytics reads"
 edition.workspace = true
 readme = "../../README.md"
-keywords = ["zcash", "indexer", "derive"]
+keywords = ["zcash", "indexer", "explorer"]
 categories = ["api-bindings"]
 license.workspace = true
 repository.workspace = true
@@ -30,8 +30,8 @@ zinder-runtime.workspace = true
 zinder-store.workspace = true
 
 [[bin]]
-name = "zinder-derive"
-path = "src/bin/zinder-derive/main.rs"
+name = "zinder-explorer"
+path = "src/bin/zinder-explorer/main.rs"
 
 [lints]
 workspace = true

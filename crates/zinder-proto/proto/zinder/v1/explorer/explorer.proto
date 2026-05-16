@@ -26,13 +26,13 @@ message ServerInfoResponse {
   ExplorerServerInfo info = 1;
 }
 
-// Explorer-shaped read surface served by zinder-derive.
+// Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
 
   // Returns the transparent-address balance summed across the requested
-  // addresses. Capability: `derive.explorer.transparent_balance_v1`.
+  // addresses. Capability: `explorer.transparent_address.balance_v1`.
   // Federated to consumers under `WalletQuery.TransparentAddressBalance`;
   // the wire shape and compute path are identical between the two surfaces.
   rpc TransparentAddressBalance(zinder.v1.wallet.TransparentAddressBalanceRequest)

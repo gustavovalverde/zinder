@@ -12,7 +12,7 @@ This document covers three related but distinct extension shapes. Pick the right
 |---|---|---|
 | A new typed read method on existing artifacts | This doc | The data is already in storage; you need a new way to access it |
 | A new artifact family (new storage) | [Extending artifacts](extending-artifacts.md) | The data is chain-derived but not yet persisted |
-| A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) | The data is materialized in `zinder-derive` and surfaced through `WalletQuery` |
+| A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) | The data is materialized in `zinder-explorer` and surfaced through `WalletQuery` |
 
 Each wire shape pairs with one capability string. Changing the shape of an `_v1` response requires landing a new `_v2` capability; the `_vN` suffix is part of the identity, not a version field decoded by clients (per [Public interfaces §Capability discovery](public-interfaces.md#capability-discovery)).
 
@@ -167,7 +167,7 @@ Required for range reads where N-block reads could regress. Not required for poi
 
 ## Federation extension
 
-When the new RPC delegates to `zinder-derive`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. The design rationale and boundary rules live in [Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery).
+When the new RPC delegates to `zinder-explorer`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. The design rationale and boundary rules live in [Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery).
 
 ### F1. ExplorerQuery proto
 
@@ -245,7 +245,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 | `wallet.events.*` | Streaming event families | `wallet.events.chain_v1` |
 | `wallet.snapshot.*` | Bounded snapshot reads | `wallet.snapshot.mempool_v1` |
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
-| `derive.{consumer}.*` | Federated derive-plane methods | `derive.explorer.transparent_balance_v1` |
+| `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transparent_address.balance_v1` |
 
 Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests.
 
@@ -299,7 +299,7 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F1: `ExplorerQuery.TransparentAddressBalance` proto.
 - F2-F4: `DeriveProxy<ExplorerQueryClient<...>>` field on `WalletQueryGrpcAdapter`, builder, ServerInfo capability gating.
 - F5: `spawn_derive_readiness_probe` in `zinder-query` startup.
-- F6: capabilities `derive.explorer.server_info_v1` (probe target) and `derive.explorer.transparent_balance_v1` (federated method).
+- F6: capabilities `explorer.server_info_v1` (probe target) and `explorer.transparent_address.balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
 The compute shape is compute at read time: canonical confirmed totals are summed from transparent UTXOs, and the derive plane adds the live mempool overlay. An accumulator-backed read optimization may land later without changing the public wire shape or capability strings.

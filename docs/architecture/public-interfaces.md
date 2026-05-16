@@ -23,7 +23,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `zinder-ingest` | Production service that owns chain ingestion and canonical writes |
 | `zinder-query` | Production service that serves wallet and application APIs from epoch-bound indexed state |
 | `zinder-compat-lightwalletd` | Compatibility adapter that serves vendored lightwalletd gRPC over `WalletQueryApi` |
-| `zinder-derive` | Optional service for replayable derived indexes |
+| `zinder-explorer` | Optional service for explorer-shaped reads and replayable derived indexes ([ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)) |
 | `zinder-client` | Library crate exporting the typed Rust client surface for in-process consumers (Zallet) and Rust integrations |
 | `PrimaryChainStore` | `zinder-store` handle that opens canonical RocksDB as the only writer |
 | `SecondaryChainStore` | `zinder-store` handle that opens canonical RocksDB as a RocksDB secondary reader |
@@ -88,13 +88,21 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `ServerInfoResponse` | Native wallet protocol capability-descriptor response |
 | `ServerCapabilities` | Capability descriptor advertised by `zinder-query` to clients |
 
-### Derive plane
+### Explorer plane
 
 | Term | Meaning |
 |------|---------|
-| `ExplorerQuery` | Native protobuf service for explorer-shaped reads served by `zinder-derive` |
+| `ExplorerQuery` | Native protobuf service for explorer-shaped reads served by `zinder-explorer`. See [Explorer plane](explorer-plane.md) and [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md). |
 | `ExplorerQueryGrpcAdapter` | Tonic adapter for `ExplorerQuery`; carries the optional `WalletQuery` endpoint that backs the Shape C federated balance compute path |
-| `DeriveStore` | Per-consumer `RocksDB` wrapper colocated with the derive binary; never colocated with canonical storage. Owns the `cursor` and `consumer_metadata` column families |
+| `TransactionPublicFacts` | Single typed transaction-fact value parsed once at ingest/mempool/explorer-read time. See [ADR-0010](../adrs/0010-transaction-public-facts.md). |
+| `ExplorerFreshness` | Cross-cutting freshness envelope embedded on every explorer response. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
+| `SearchCandidate` | Typed search-result oneof distinguishing every classifiable input class, including the `NotPubliclyIndexable` arm for shielded receivers. See [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). |
+
+### Derive-plane SDK
+
+| Term | Meaning |
+|------|---------|
+| `DeriveStore` | Per-consumer `RocksDB` wrapper colocated with the consumer binary; never colocated with canonical storage. Owns the `cursor` and `consumer_metadata` column families. Today's only consumer is `zinder-explorer`. |
 | `DeriveStoreTable` | Logical column-family identifier referenced by reads and `WriteBatch` puts |
 | `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
 | `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
@@ -437,7 +445,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
-| `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-derive | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
+| `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
 | `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source and chain-tip wakeups. Falls back to JSON-RPC polling when unset. |
 | `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
@@ -451,7 +459,10 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH` | zinder-ingest | Optional | `ingest.control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). File-only by policy; inline secrets are rejected at config load. |
 | `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | zinder-query, zinder-compat-lightwalletd | Required | `storage.ingest_control_addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. |
 | `ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH` | zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `storage.ingest_control_bearer_token_path` | Path to the bearer token file presented to the IngestControl writer when the writer enforces auth (ADR-0006). |
-| `ZINDER_DERIVE__BEARER_TOKEN_PATH` | zinder-derive | Optional | `derive.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service derive-plane reads. |
+| `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
+| `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
+| `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Filesystem path opened by `DeriveStore` for explorer-plane derive state. |
+| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. Empty/unset disables the `explorer.transparent_address.balance_v1` capability. |
 <!-- env-var-table:public-interfaces:end -->
 
 ### `--print-config`
@@ -525,13 +536,13 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.address.transparent_utxos_v1`
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
-- `derive.explorer.server_info_v1`
-- `derive.explorer.transparent_balance_v1`
+- `explorer.server_info_v1`
+- `explorer.transparent_address.balance_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent UTXO column family, no mempool overlay). `derive.explorer.transparent_balance_v1` coexists with it when `zinder-derive` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the derive capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed.
+`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent UTXO column family, no mempool overlay). `explorer.transparent_address.balance_v1` coexists with it when `zinder-explorer` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the explorer capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed. The dual-capability federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are
@@ -684,12 +695,13 @@ crates/
   zinder-source/
   zinder-proto/
   zinder-client/
+  zinder-runtime/
   zinder-testkit/
 services/
   zinder-ingest/
   zinder-query/
   zinder-compat-lightwalletd/
-  zinder-derive/
+  zinder-explorer/
 ```
 
 Add a crate only when it has a stable domain boundary and enough behavior to justify its interface. The current set is the target list, not a command to create every crate immediately.

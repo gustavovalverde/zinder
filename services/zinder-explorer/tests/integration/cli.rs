@@ -14,7 +14,7 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
     let token_path = tempdir.path().join("derive-explorer.token");
     fs::write(&token_path, "expected-token\n")?;
 
-    let output = zinder_derive_command()
+    let output = zinder_explorer_command()
         .args([
             "--print-config",
             "--network",
@@ -23,7 +23,7 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
             path_str(&storage_path)?,
             "--listen-addr",
             "127.0.0.1:9068",
-            "--derive-explorer-token-path",
+            "--bearer-token-path",
             path_str(&token_path)?,
         ])
         .output()?;
@@ -31,9 +31,12 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stdout.contains("[derive.explorer]"), "{stdout}");
+    assert!(stdout.contains("[explorer]"), "{stdout}");
     assert!(
-        stdout.contains(&format!("token_path = \"{}\"", path_str(&token_path)?)),
+        stdout.contains(&format!(
+            "bearer_token_path = \"{}\"",
+            path_str(&token_path)?
+        )),
         "{stdout}"
     );
     assert!(!stdout.contains("expected-token"), "{stdout}");
@@ -49,7 +52,7 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     let token_path = tempdir.path().join("derive-empty.token");
     fs::write(&token_path, "\n")?;
 
-    let output = zinder_derive_command()
+    let output = zinder_explorer_command()
         .args([
             "--print-config",
             "--network",
@@ -58,7 +61,7 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
             path_str(&storage_path)?,
             "--listen-addr",
             "127.0.0.1:9068",
-            "--derive-explorer-token-path",
+            "--bearer-token-path",
             path_str(&token_path)?,
         ])
         .output()?;
@@ -66,15 +69,15 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("invalid derive explorer bearer token: bearer token must not be empty"),
+        stderr.contains("invalid explorer bearer token: bearer token must not be empty"),
         "{stderr}"
     );
 
     Ok(())
 }
 
-fn zinder_derive_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-derive"));
+fn zinder_explorer_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-explorer"));
     command.env_clear();
     command
 }

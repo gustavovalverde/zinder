@@ -47,7 +47,7 @@ use zinder_core::{
     BlockHeight, BroadcastAccepted, ChainEpoch, ChainEpochId, Network, RawTransactionBytes,
     TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash, UnixTimestampMillis,
 };
-use zinder_derive::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{
     BackfillOutcome, IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, backfill,
     build_mempool_entry,

@@ -11,7 +11,7 @@ Event and reorg semantics live in [Chain events](chain-events.md).
 ```text
 zinder-ingest    -> RocksDB primary -> ChainEpochReadApi -> ChainEvent
 zinder-query     -> RocksDB secondary -> ChainEpochReadApi -> WalletQueryApi
-zinder-derive    -> ChainEventEnvelope -> derived storage
+zinder-explorer    -> ChainEventEnvelope -> derived storage
 ```
 
 Direct embedded reads outside that contract are allowed only for `zinder dev` composition, unit and integration tests, offline repair tools, and immutable RocksDB checkpoint readers.

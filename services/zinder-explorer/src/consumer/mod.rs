@@ -1,7 +1,7 @@
 //! Derive-consumer trait, typed event wrappers, and subscription helpers.
 //!
 //! Every derive consumer implements [`DeriveConsumer`]. The trait is the seam
-//! between the consumer-agnostic infrastructure in `zinder-derive` (store,
+//! between the consumer-agnostic infrastructure in this crate (store,
 //! `ChainEvents` subscriber, mempool subscriber) and the consumer-specific
 //! aggregation logic that lives in each consumer module.
 //!
