@@ -30,12 +30,14 @@ use eyre::{Result, eyre};
 use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::transport::Channel;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
+use zinder_core::ChainEpoch;
 use zinder_core::wire::{encode_internal_transaction_id, encode_zinder_native_chain_name};
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 use zinder_explorer::{
@@ -50,12 +52,18 @@ use zinder_proto::v1::explorer::{
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
 use zinder_proto::v1::wallet::{
+    ChainEpochCommitted as WireChainEpochCommitted, ChainEventEnvelope,
+    ChainRangeReverted as WireChainRangeReverted, ChainReorged as WireChainReorged,
+    chain_event_envelope::Event as WireChainEvent,
+};
+use zinder_proto::v1::wallet::{
     ChainEventStreamFamily as WireChainEventStreamFamily, ChainEventsRequest,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_runtime::connect_authenticated_channel;
 use zinder_source::{NodeSource as _, SourceBlock};
+use zinder_store::chain_epoch_message;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
@@ -63,6 +71,153 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn block_summary_consumer_reorg_rewind_deletes_orphaned_heights() -> Result<()> {
+    let _guard = init();
+    let Some(env) = require_live_for(&[
+        Network::ZcashRegtest,
+        Network::ZcashTestnet,
+        Network::ZcashMainnet,
+    ])?
+    else {
+        return Ok(());
+    };
+    let mut fixture = BlockViewFixture::open(&env).await?;
+    fixture.wait_until_consumer_caught_up().await?;
+    // Quiesce the background consumer so the test owns every store write
+    // before exercising the reorg path.
+    fixture.consumer_cancel.cancel();
+    if let Some(handle) = fixture.consumer_handle.take() {
+        let _ = handle.await;
+    }
+
+    let tip = fixture.sample_block_height.value();
+    let reverted_start = tip.saturating_sub(4);
+    let reverted_end = tip;
+    let replacement_end = tip.saturating_sub(2);
+
+    // Pre-check: all heights in the reverted range have a materialized
+    // BlockSummaryRecord (the background consumer caught up to the tip).
+    for height in reverted_start..=reverted_end {
+        assert!(
+            fixture
+                .derive_store
+                .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &height.to_be_bytes())?
+                .is_some(),
+            "expected materialized record at height {height} before reorg",
+        );
+    }
+
+    let synthetic_chain_epoch =
+        make_synthetic_chain_epoch(fixture.network, fixture.sample_block_height);
+    let envelope = reorged_envelope(
+        synthetic_chain_epoch,
+        reverted_start,
+        reverted_end,
+        reverted_start,
+        replacement_end,
+    );
+    let stream = one_envelope_stream(envelope);
+    let mut consumer = build_block_summary_consumer(&fixture.wallet_endpoint).await?;
+    run_chain_events_subscriber(&mut consumer, &fixture.derive_store, stream)
+        .await
+        .map_err(|error| eyre!("subscriber returned: {error}"))?;
+
+    for height in reverted_start..=replacement_end {
+        assert!(
+            fixture
+                .derive_store
+                .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &height.to_be_bytes())?
+                .is_some(),
+            "replacement range must keep height {height} materialized",
+        );
+    }
+    for orphaned in (replacement_end + 1)..=reverted_end {
+        assert!(
+            fixture
+                .derive_store
+                .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &orphaned.to_be_bytes())?
+                .is_none(),
+            "reorg rewind must delete orphaned height {orphaned}",
+        );
+    }
+    tracing::info!(
+        target: "zinder::live",
+        event = "block_view_reorg_rewind_validated",
+        network = %encode_zinder_native_chain_name(fixture.network),
+        reverted_start,
+        reverted_end,
+        replacement_end,
+        "explorer block view reorg rewind validated against live node",
+    );
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+async fn build_block_summary_consumer(wallet_endpoint: &str) -> Result<BlockSummaryConsumer> {
+    let channel = connect_authenticated_channel(wallet_endpoint, None)
+        .await
+        .map_err(|error| eyre!("consumer connect: {error}"))?;
+    Ok(BlockSummaryConsumer::new(WalletQueryClient::new(channel)))
+}
+
+fn make_synthetic_chain_epoch(network: Network, tip_height: BlockHeight) -> ChainEpoch {
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash as CoreBlockHash, ChainEpochId, ChainTipMetadata,
+        UnixTimestampMillis,
+    };
+    ChainEpoch {
+        id: ChainEpochId::new(u64::MAX),
+        network,
+        tip_height,
+        tip_hash: CoreBlockHash::from_bytes([0; 32]),
+        finalized_height: tip_height,
+        finalized_hash: CoreBlockHash::from_bytes([0; 32]),
+        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        tip_metadata: ChainTipMetadata::new(0, 0),
+        created_at: UnixTimestampMillis::new(0),
+    }
+}
+
+fn reorged_envelope(
+    chain_epoch: ChainEpoch,
+    reverted_start: u32,
+    reverted_end: u32,
+    replacement_start: u32,
+    replacement_end: u32,
+) -> ChainEventEnvelope {
+    let chain_epoch_message_value = chain_epoch_message(chain_epoch);
+    ChainEventEnvelope {
+        cursor: vec![0x7F_u8; 8],
+        event_sequence: u64::MAX,
+        chain_epoch: Some(chain_epoch_message_value.clone()),
+        finalized_height: replacement_end,
+        event: Some(WireChainEvent::ChainReorged(WireChainReorged {
+            reverted: Some(WireChainRangeReverted {
+                chain_epoch: Some(chain_epoch_message_value.clone()),
+                start_height: reverted_start,
+                end_height: reverted_end,
+            }),
+            committed: Some(WireChainEpochCommitted {
+                chain_epoch: Some(chain_epoch_message_value),
+                start_height: replacement_start,
+                end_height: replacement_end,
+            }),
+        })),
+    }
+}
+
+fn one_envelope_stream(
+    envelope: ChainEventEnvelope,
+) -> ReceiverStream<Result<ChainEventEnvelope, tonic::Status>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let _ = sender.try_send(Ok(envelope));
+    drop(sender);
+    ReceiverStream::new(receiver)
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
@@ -87,7 +242,10 @@ async fn block_view_returns_summary_and_detail_after_consumer_catches_up() -> Re
 
     let detail_by_hash = fixture.query_block_detail_by_hash().await?;
     assert_eq!(
-        detail_by_hash.summary.as_ref().map(|summary| summary.block_height),
+        detail_by_hash
+            .summary
+            .as_ref()
+            .map(|summary| summary.block_height),
         Some(fixture.sample_block_height.value()),
     );
 
@@ -129,7 +287,10 @@ fn assert_range_invariants(
         prev = Some(summary.block_height);
         assert_eq!(summary.block_hash.len(), 32);
         assert_eq!(summary.previous_block_hash.len(), 32);
-        assert!(summary.transaction_count >= 1, "block must have >= 1 tx (coinbase)");
+        assert!(
+            summary.transaction_count >= 1,
+            "block must have >= 1 tx (coinbase)"
+        );
     }
     Ok(())
 }
@@ -182,9 +343,10 @@ struct BlockViewFixture {
     sample_coinbase_id: TransactionId,
     derive_store: DeriveStore,
     explorer_adapter: ExplorerQueryGrpcAdapter,
+    wallet_endpoint: String,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    consumer_handle: JoinHandle<()>,
+    consumer_handle: Option<JoinHandle<()>>,
     consumer_cancel: CancellationToken,
     _tempdir: TempDir,
     _store_tempdir: TempDir,
@@ -225,7 +387,7 @@ impl BlockViewFixture {
         let explorer_adapter =
             ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
                 .with_derive_store(derive_store.clone())
-                .with_wallet_query_endpoint(wallet_endpoint);
+                .with_wallet_query_endpoint(wallet_endpoint.clone());
 
         Ok(Self {
             network,
@@ -234,9 +396,10 @@ impl BlockViewFixture {
             sample_coinbase_id: sample.coinbase_transaction_id,
             derive_store,
             explorer_adapter,
+            wallet_endpoint,
             wallet_server_handle,
             ingest_control_handle,
-            consumer_handle,
+            consumer_handle: Some(consumer_handle),
             consumer_cancel,
             _tempdir: derive_tempdir,
             _store_tempdir: store_tempdir,
@@ -284,12 +447,10 @@ impl BlockViewFixture {
             )),
             at_epoch: None,
         };
-        let response = ExplorerQueryService::block_detail(
-            &self.explorer_adapter,
-            Request::new(request),
-        )
-        .await?
-        .into_inner();
+        let response =
+            ExplorerQueryService::block_detail(&self.explorer_adapter, Request::new(request))
+                .await?
+                .into_inner();
         Ok(response)
     }
 
@@ -300,18 +461,18 @@ impl BlockViewFixture {
             )),
             at_epoch: None,
         };
-        let response = ExplorerQueryService::block_detail(
-            &self.explorer_adapter,
-            Request::new(request),
-        )
-        .await?
-        .into_inner();
+        let response =
+            ExplorerQueryService::block_detail(&self.explorer_adapter, Request::new(request))
+                .await?
+                .into_inner();
         Ok(response)
     }
 
     async fn shutdown(&mut self) {
         self.consumer_cancel.cancel();
-        let _ = (&mut self.consumer_handle).await;
+        if let Some(handle) = self.consumer_handle.take() {
+            let _ = handle.await;
+        }
         self.wallet_server_handle.abort();
         self.ingest_control_handle.abort();
         let _ = (&mut self.wallet_server_handle).await;

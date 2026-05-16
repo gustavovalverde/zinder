@@ -126,8 +126,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
 
-    let consumer_handle =
-        spawn_block_summary_consumer(&explorer_config, store, cancel.clone());
+    let consumer_handle = spawn_block_summary_consumer(&explorer_config, store, cancel.clone());
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::ready(None));
@@ -191,8 +190,7 @@ fn build_grpc_adapter(
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
-    let mut grpc_adapter =
-        ExplorerQueryGrpcAdapter::new(server_info).with_derive_store(store);
+    let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info).with_derive_store(store);
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
