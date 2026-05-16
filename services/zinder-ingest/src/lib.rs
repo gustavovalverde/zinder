@@ -10,6 +10,7 @@ mod chain_ingest;
 mod ingest_control;
 mod mempool;
 mod retention;
+mod source_recovery;
 mod tip_follow;
 
 pub use artifact_builder::{

@@ -1,4 +1,13 @@
 //! Source boundary error vocabulary.
+//!
+//! Variants describe *what the upstream node did* (or failed to do). They do
+//! not encode loop-lifecycle decisions: the long-running writer loops in
+//! `zinder-ingest` own that decision via
+//! [`source_recovery::decide_recovery`](../../../services/zinder-ingest/src/source_recovery.rs).
+//!
+//! Each variant maps onto exactly one [`SourceFailureClass`]; the class is the
+//! operator-facing label that flows into readiness payloads, metrics, and
+//! recovery backoff selection.
 
 use thiserror::Error;
 use zinder_core::BlockHeight;
@@ -122,12 +131,17 @@ pub enum SourceError {
     RawBlockTimeOutOfRange,
 
     /// Configured upstream node could not answer a request.
+    ///
+    /// Construct this variant when the upstream node is unreachable, the
+    /// transport timed out, or the JSON-RPC error code indicates the node
+    /// itself is not in a state to respond (e.g. warming up). Use
+    /// [`Self::BlockUnavailable`] instead when the node responded but the
+    /// requested height is no longer addressable (best-chain race during a
+    /// reorg).
     #[error("upstream node is unavailable: {reason}")]
     NodeUnavailable {
         /// Node or transport failure reason.
         reason: String,
-        /// Whether retrying the same request can reasonably succeed later.
-        is_retryable: bool,
     },
 
     /// The configured upstream node does not support a required capability.
@@ -154,15 +168,19 @@ pub enum SourceError {
         auth_scheme: &'static str,
     },
 
-    /// The node returned an error for a required block.
+    /// The node responded but the requested block could not be returned.
+    ///
+    /// Most commonly produced by a best-chain race: the requested height was
+    /// in the upstream's best chain when Zinder resolved it, but the chain
+    /// changed before the follow-up block fetch. Long-running writer loops
+    /// must treat this as a re-observation signal (refresh tip, re-fetch),
+    /// not a fatal exit.
     #[error("block at height {height:?} is unavailable: {reason}")]
     BlockUnavailable {
         /// Requested block height.
         height: BlockHeight,
         /// Node error message.
         reason: String,
-        /// Whether retrying the same request can reasonably succeed later.
-        is_retryable: bool,
     },
 
     /// The node returned an error for required subtree roots.
@@ -174,8 +192,6 @@ pub enum SourceError {
         start_index: zinder_core::SubtreeRootIndex,
         /// Node error message.
         reason: String,
-        /// Whether retrying the same request can reasonably succeed later.
-        is_retryable: bool,
     },
 
     /// The node response did not match the expected JSON-RPC contract.
@@ -211,8 +227,6 @@ pub enum SourceError {
     MempoolStreamUnavailable {
         /// Stream or transport failure reason.
         reason: String,
-        /// Whether reconnecting can reasonably succeed later.
-        is_retryable: bool,
     },
 
     /// Hydrating an `Added` mempool observation failed.
@@ -228,9 +242,6 @@ pub enum SourceError {
         transaction_id: zinder_core::TransactionId,
         /// Hydration failure reason.
         reason: String,
-        /// Whether retrying the same hydration request can reasonably
-        /// succeed later.
-        is_retryable: bool,
     },
 
     /// Upstream chain-tip notification stream is unavailable.
@@ -243,22 +254,105 @@ pub enum SourceError {
     ChainTipStreamUnavailable {
         /// Stream or transport failure reason.
         reason: String,
-        /// Whether reconnecting can reasonably succeed later.
-        is_retryable: bool,
     },
 }
 
-impl SourceError {
-    /// Returns whether retrying the same source request can reasonably succeed later.
+/// Operator-facing classification of an upstream failure.
+///
+/// The classification describes *what the source observed*, not what the
+/// caller should do. Writer-loop lifecycle decisions live in
+/// `services/zinder-ingest/src/source_recovery.rs`; readiness payloads,
+/// metrics labels, and recovery backoff selection consume this enum to
+/// surface a stable signal to operators and dashboards.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum SourceFailureClass {
+    /// Transport, authentication, or upstream-node warming-up failure.
+    /// The node itself cannot answer; retry the same call after a brief
+    /// backoff.
+    NodeUnreachable,
+    /// The upstream answered, but the request targeted a view that is no
+    /// longer current (best-chain race, height not in best chain, txid
+    /// dropped between observation and lookup). Re-observe the upstream's
+    /// fresh state before retrying dependent requests.
+    UpstreamViewChanged,
+    /// A long-lived subscription (chain-tip or mempool notification stream)
+    /// disconnected or failed to open. Reconnect with backoff; the writer
+    /// loop continues to poll while the stream is down.
+    StreamDisconnected,
+    /// The upstream is missing a capability ingest needs (e.g. a probed RPC
+    /// method is absent). Operator action: upgrade the node or change the
+    /// configured source.
+    CapabilityMissing,
+    /// The upstream's response did not match the expected JSON-RPC or wire
+    /// contract (missing fields, hash mismatch, height disagreement after
+    /// parse). Operator action: investigate the upstream version.
+    ProtocolMismatch,
+    /// Bytes returned by the upstream could not be decoded or parsed as
+    /// valid Zcash data. Operator action: investigate the upstream version.
+    Malformed,
+    /// Adapter configuration is invalid (unsupported auth scheme,
+    /// broadcast disabled by deliberate read-only configuration).
+    Configuration,
+}
+
+impl SourceFailureClass {
+    /// Every label this enum may render through [`Self::label`].
+    ///
+    /// Iterated by the readiness ops endpoint to zero out
+    /// `zinder_readiness_node_failure_class` gauge cells for inactive
+    /// classes on every scrape. The unit test
+    /// `label_appears_in_all_labels` enforces parity with [`Self::label`],
+    /// so adding a new variant without extending this slice fails CI.
+    pub const ALL_LABELS: &'static [&'static str] = &[
+        "node_unreachable",
+        "upstream_view_changed",
+        "stream_disconnected",
+        "capability_missing",
+        "protocol_mismatch",
+        "malformed",
+        "configuration",
+    ];
+
+    /// Stable kebab-case label suitable for metrics, logs, and readiness
+    /// payloads. The label is the operator-facing identifier; do not
+    /// rename without coordinating dashboards and alert rules.
     #[must_use]
-    pub const fn is_retryable(&self) -> bool {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::NodeUnavailable { is_retryable, .. }
-            | Self::BlockUnavailable { is_retryable, .. }
-            | Self::SubtreeRootsUnavailable { is_retryable, .. }
-            | Self::MempoolStreamUnavailable { is_retryable, .. }
-            | Self::MempoolHydrationFailed { is_retryable, .. }
-            | Self::ChainTipStreamUnavailable { is_retryable, .. } => *is_retryable,
+            Self::NodeUnreachable => "node_unreachable",
+            Self::UpstreamViewChanged => "upstream_view_changed",
+            Self::StreamDisconnected => "stream_disconnected",
+            Self::CapabilityMissing => "capability_missing",
+            Self::ProtocolMismatch => "protocol_mismatch",
+            Self::Malformed => "malformed",
+            Self::Configuration => "configuration",
+        }
+    }
+}
+
+impl SourceError {
+    /// Returns the operator-facing class describing what the upstream did.
+    ///
+    /// Classification is descriptive: the class names a kind of failure, not
+    /// a recommended action. Loop lifecycle decisions belong to the writer
+    /// loop, which composes this class with its own policy.
+    #[must_use]
+    pub const fn upstream_classification(&self) -> SourceFailureClass {
+        match self {
+            Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
+            Self::BlockUnavailable { .. } | Self::SubtreeRootsUnavailable { .. } => {
+                SourceFailureClass::UpstreamViewChanged
+            }
+            Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {
+                SourceFailureClass::StreamDisconnected
+            }
+            Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
+            Self::NodeCapabilityMissing { .. } => SourceFailureClass::CapabilityMissing,
+            Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,
+            Self::TransactionBroadcastDisabled | Self::UnsupportedNodeAuth { .. } => {
+                SourceFailureClass::Configuration
+            }
             Self::InvalidBlockHashHex { .. }
             | Self::InvalidRawBlockHex { .. }
             | Self::InvalidRawTransactionHex { .. }
@@ -272,11 +366,32 @@ impl SourceError {
             | Self::RawBlockCoinbaseHeightMissing
             | Self::RawBlockHeightMismatch { .. }
             | Self::RawBlockTimeOutOfRange
-            | Self::NodeCapabilityMissing { .. }
-            | Self::TransactionBroadcastDisabled
-            | Self::UnsupportedNodeAuth { .. }
-            | Self::SourceProtocolMismatch { .. }
-            | Self::SourcePayloadEncodingFailed { .. } => false,
+            | Self::SourcePayloadEncodingFailed { .. } => SourceFailureClass::Malformed,
         }
+    }
+}
+
+#[cfg(test)]
+mod source_failure_class_tests {
+    use super::SourceFailureClass;
+
+    #[test]
+    fn label_appears_in_all_labels() {
+        for class in [
+            SourceFailureClass::NodeUnreachable,
+            SourceFailureClass::UpstreamViewChanged,
+            SourceFailureClass::StreamDisconnected,
+            SourceFailureClass::CapabilityMissing,
+            SourceFailureClass::ProtocolMismatch,
+            SourceFailureClass::Malformed,
+            SourceFailureClass::Configuration,
+        ] {
+            assert!(
+                SourceFailureClass::ALL_LABELS.contains(&class.label()),
+                "label {} for {class:?} missing from ALL_LABELS",
+                class.label(),
+            );
+        }
+        assert_eq!(SourceFailureClass::ALL_LABELS.len(), 7);
     }
 }

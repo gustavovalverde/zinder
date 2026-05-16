@@ -255,30 +255,45 @@ fn record_readiness_metrics(state: &MetricsState) {
         .set(if *cause == active_cause { 1.0 } else { 0.0 });
     }
 
+    let active_failure_class = report.cause.node_failure_class_label();
+    for class_label in zinder_source::SourceFailureClass::ALL_LABELS {
+        metrics::gauge!(
+            "zinder_readiness_node_failure_class",
+            "service" => state.service_name,
+            "network" => state.network_name,
+            "class" => *class_label
+        )
+        .set(if Some(*class_label) == active_failure_class {
+            1.0
+        } else {
+            0.0
+        });
+    }
+
     metrics::gauge!(
         "zinder_readiness_sync_lag_blocks",
         "service" => state.service_name,
         "network" => state.network_name
     )
-    .set(readiness_sync_lag_blocks(report.cause));
+    .set(readiness_sync_lag_blocks(&report.cause));
 
     metrics::gauge!(
         "zinder_readiness_replica_lag_chain_epochs",
         "service" => state.service_name,
         "network" => state.network_name
     )
-    .set(readiness_replica_lag_chain_epochs(report.cause));
+    .set(readiness_replica_lag_chain_epochs(&report.cause));
 }
 
-fn readiness_sync_lag_blocks(cause: crate::ReadinessCause) -> f64 {
+fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
     match cause {
         crate::ReadinessCause::Syncing {
             lag_blocks: Some(lag_blocks),
-        } => u64_to_f64(lag_blocks),
+        } => u64_to_f64(*lag_blocks),
         crate::ReadinessCause::Starting
         | crate::ReadinessCause::Syncing { lag_blocks: None }
         | crate::ReadinessCause::Ready
-        | crate::ReadinessCause::NodeUnavailable
+        | crate::ReadinessCause::NodeUnavailable(_)
         | crate::ReadinessCause::NodeCapabilityMissing { .. }
         | crate::ReadinessCause::StorageUnavailable
         | crate::ReadinessCause::SchemaMismatch
@@ -293,13 +308,13 @@ fn readiness_sync_lag_blocks(cause: crate::ReadinessCause) -> f64 {
     }
 }
 
-fn readiness_replica_lag_chain_epochs(cause: crate::ReadinessCause) -> f64 {
+fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
     match cause {
-        crate::ReadinessCause::ReplicaLagging { lag_chain_epochs } => u64_to_f64(lag_chain_epochs),
+        crate::ReadinessCause::ReplicaLagging { lag_chain_epochs } => u64_to_f64(*lag_chain_epochs),
         crate::ReadinessCause::Starting
         | crate::ReadinessCause::Syncing { .. }
         | crate::ReadinessCause::Ready
-        | crate::ReadinessCause::NodeUnavailable
+        | crate::ReadinessCause::NodeUnavailable(_)
         | crate::ReadinessCause::NodeCapabilityMissing { .. }
         | crate::ReadinessCause::StorageUnavailable
         | crate::ReadinessCause::SchemaMismatch

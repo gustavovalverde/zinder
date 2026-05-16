@@ -76,8 +76,6 @@ fn default_zebra_capabilities() -> NodeCapabilities {
 pub const DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES: NonZeroU64 =
     NonZeroU64::MIN.saturating_add((16 * 1024 * 1024) - 1);
 
-/// JSON-RPC warming-up error code returned by Zcash nodes while syncing.
-const JSON_RPC_WARMING_UP_CODE: i32 = -28;
 /// JSON-RPC error code returned for invalid transaction encodings.
 const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 /// JSON-RPC error code returned for transactions already in the mempool.
@@ -146,7 +144,6 @@ impl ZebraJsonRpcSource {
     ) -> Result<SourceChainCheckpoint, SourceError> {
         let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
             height,
-            is_retryable: error.is_retryable(),
             reason: error.message,
         };
 
@@ -207,7 +204,6 @@ impl ZebraJsonRpcSource {
         let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
             .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
                 SourceError::NodeUnavailable {
-                    is_retryable: error.is_retryable(),
                     reason: error.message,
                 }
             })
@@ -453,7 +449,6 @@ impl ZebraJsonRpcSource {
                     Ok(UpstreamTransactionLookup::NotFound)
                 } else {
                     Err(SourceError::NodeUnavailable {
-                        is_retryable: call_error.is_retryable(),
                         reason: call_error.message,
                     })
                 }
@@ -499,7 +494,6 @@ impl ZebraJsonRpcSource {
                 } else {
                     Err(SourceError::MempoolHydrationFailed {
                         transaction_id,
-                        is_retryable: call_error.is_retryable(),
                         reason: call_error.message,
                     })
                 }
@@ -518,7 +512,6 @@ impl NodeSource for ZebraJsonRpcSource {
     async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
             height,
-            is_retryable: error.is_retryable(),
             reason: error.message,
         };
 
@@ -624,7 +617,6 @@ impl NodeSource for ZebraJsonRpcSource {
                 |error| SourceError::SubtreeRootsUnavailable {
                     protocol,
                     start_index,
-                    is_retryable: error.is_retryable(),
                     reason: error.message,
                 },
             )
@@ -673,7 +665,6 @@ impl NodeSource for ZebraJsonRpcSource {
         let blockchain_info: ZebraGetBlockchainInfoValuePools = self
             .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
                 SourceError::NodeUnavailable {
-                    is_retryable: error.is_retryable(),
                     reason: error.message,
                 }
             })
@@ -725,7 +716,6 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
 
 fn map_node_unavailable(error: JsonRpcCallError) -> SourceError {
     SourceError::NodeUnavailable {
-        is_retryable: error.is_retryable(),
         reason: error.message,
     }
 }
@@ -882,7 +872,6 @@ fn cookie_authorization_header(source: &CookieSource) -> Result<String, SourceEr
     let credentials = source
         .read_credentials()
         .map_err(|error| SourceError::NodeUnavailable {
-            is_retryable: false,
             reason: match error {
                 CookieSourceError::Unreadable { .. } => {
                     "node cookie source could not be read".to_owned()
@@ -911,7 +900,6 @@ fn build_http_client(
     if let Some(authorization) = authorization {
         let header_value =
             HeaderValue::from_str(&authorization).map_err(|_| SourceError::NodeUnavailable {
-                is_retryable: false,
                 reason: "node authorization header is not a valid HTTP header value".to_owned(),
             })?;
         headers.insert("authorization", header_value);
@@ -925,7 +913,6 @@ fn build_http_client(
         .set_headers(headers)
         .build(json_rpc_addr)
         .map_err(|source| SourceError::NodeUnavailable {
-            is_retryable: false,
             reason: source.to_string(),
         })
 }
@@ -1074,10 +1061,6 @@ struct JsonRpcCallError {
 }
 
 impl JsonRpcCallError {
-    fn is_retryable(&self) -> bool {
-        matches!(self.code, Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_WARMING_UP_CODE))
-    }
-
     /// Returns whether the call error reports the requested resource was
     /// not found at the source.
     ///
@@ -1104,13 +1087,7 @@ impl From<ErrorObjectOwned> for JsonRpcCallError {
 }
 
 fn map_transport_error(error: &ClientError) -> SourceError {
-    let is_retryable = matches!(
-        error,
-        ClientError::RequestTimeout | ClientError::Transport(_) | ClientError::RestartNeeded(_)
-    );
-
     SourceError::NodeUnavailable {
-        is_retryable,
         reason: error.to_string(),
     }
 }

@@ -36,19 +36,15 @@ enum BroadcastOutcome {
 #[derive(Clone, Debug)]
 enum MockSourceError {
     BroadcastDisabled,
-    NodeUnavailable { reason: String, is_retryable: bool },
+    NodeUnavailable { reason: String },
 }
 
 impl MockSourceError {
     fn as_source_error(&self) -> SourceError {
         match self {
             Self::BroadcastDisabled => SourceError::TransactionBroadcastDisabled,
-            Self::NodeUnavailable {
-                reason,
-                is_retryable,
-            } => SourceError::NodeUnavailable {
+            Self::NodeUnavailable { reason } => SourceError::NodeUnavailable {
                 reason: reason.clone(),
-                is_retryable: *is_retryable,
             },
         }
     }
@@ -81,14 +77,12 @@ impl MockTransactionBroadcaster {
     }
 
     /// Returns a broadcaster that fails every call with
-    /// [`SourceError::NodeUnavailable`] using the supplied reason and
-    /// retryability.
+    /// [`SourceError::NodeUnavailable`] using the supplied reason.
     #[must_use]
-    pub fn node_unavailable(reason: impl Into<String>, is_retryable: bool) -> Self {
+    pub fn node_unavailable(reason: impl Into<String>) -> Self {
         Self::with_outcome(BroadcastOutcome::SourceError(
             MockSourceError::NodeUnavailable {
                 reason: reason.into(),
-                is_retryable,
             },
         ))
     }
@@ -187,18 +181,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn node_unavailable_propagates_reason_and_retry_flag() -> Result<(), Box<dyn Error>> {
-        let broadcaster = MockTransactionBroadcaster::node_unavailable("planned outage", false);
+    async fn node_unavailable_propagates_reason() -> Result<(), Box<dyn Error>> {
+        let broadcaster = MockTransactionBroadcaster::node_unavailable("planned outage");
         let outcome = broadcaster
             .broadcast_transaction(RawTransactionBytes::new(vec![1, 2, 3]))
             .await;
         match outcome {
-            Err(SourceError::NodeUnavailable {
-                reason,
-                is_retryable,
-            }) => {
+            Err(SourceError::NodeUnavailable { reason }) => {
                 assert_eq!(reason, "planned outage");
-                assert!(!is_retryable);
             }
             other => {
                 return Err(format!("expected NodeUnavailable, got {other:?}").into());

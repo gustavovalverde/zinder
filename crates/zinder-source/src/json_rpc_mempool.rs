@@ -164,7 +164,6 @@ impl PollFailure {
         match self {
             Self::Source(error) => error,
             Self::ReceiverGone => SourceError::NodeUnavailable {
-                is_retryable: true,
                 reason: "mempool source consumer dropped the event stream".to_owned(),
             },
         }

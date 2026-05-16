@@ -428,10 +428,7 @@ fn chain_value_pools_response(
 )]
 fn status_from_source_error(error: &SourceError) -> Status {
     match error {
-        SourceError::NodeUnavailable {
-            reason,
-            is_retryable: _,
-        } => Status::unavailable(reason.clone()),
+        SourceError::NodeUnavailable { reason } => Status::unavailable(reason.clone()),
         SourceError::NodeCapabilityMissing { capability } => {
             Status::failed_precondition(format!("upstream node is missing {capability}"))
         }

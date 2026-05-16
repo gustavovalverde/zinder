@@ -54,7 +54,7 @@ Required readiness causes:
 - `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `storage.ingest_control_addr` and the ingest-control listener
 - `cursor_at_risk` — chain-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
 - `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0007 §Retention windows](../adrs/0007-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
-- `mempool_source_unavailable` — the mempool source stream cannot be opened or has emitted a non-retryable error (`MempoolStreamUnavailable { is_retryable: false }`); the live `MempoolIndex` keeps the last known state but no new `Added`/`Invalidated`/`Mined` events are arriving. Operators check upstream node health and the indexer port (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for streaming, `getrawmempool` reachability for polling)
+- `mempool_source_unavailable` — the mempool source stream cannot be opened or has emitted `MempoolStreamUnavailable`; the live `MempoolIndex` keeps the last known state but no new `Added`/`Invalidated`/`Mined` events are arriving. Operators check upstream node health and the indexer port (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for streaming, `getrawmempool` reachability for polling)
 - `mempool_hydration_lagging` — hydration of `MempoolChange::ADDED` notifications via `getrawtransaction` is falling behind the source's emission rate; the index and event log will skip events older than the lag threshold and surface them as missing rather than out-of-order. Operators check upstream JSON-RPC latency and the `zinder_node_request_duration_seconds{operation="get_raw_transaction"}` series
 - `shutting_down` — graceful shutdown in progress; new traffic is rejected
 
@@ -62,7 +62,7 @@ Required readiness causes:
 
 `zinder-ingest` readiness is capped by upstream node readiness. If the selected upstream node cannot answer, reports not ready, lacks a required capability, or has unreadable cookie-auth material, Zinder reports a typed not-ready cause instead of accepting traffic.
 
-In long-running ingest modes, retryable upstream-node failures do not terminate the writer. Zebra restarts, temporary transport failures, and warming-up responses move readiness to `node_unavailable` while `/healthz` stays live and `/readyz` returns not-ready. Tip-follow keeps polling and returns to `syncing` or `ready` once the configured node answers again. The backfill command retries from the current visible chain epoch and returns to `ready` after the requested range is covered. Fatal configuration, capability, protocol, storage, and reorg-window failures still fail closed or hold a dedicated operator-action readiness state.
+In long-running ingest modes, every source-shaped failure is a readiness transition, not a process exit. The writer loops (`tip-follow`, `backfill-until-complete`, `mempool-orchestrator`, the chain-tip re-subscriber) consult `services/zinder-ingest/src/source_recovery.rs::decide_recovery` on every iteration; source errors recover with a backoff selected by failure class, storage and reorg-window failures exit. The `node_unavailable` readiness cause carries a structured `NodeUnavailableDetail` payload (`failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`) so operators can triage from `/readyz` without consulting logs. The full failure-class operator table lives in [Node source boundary](node-source-boundary.md#capability-model); the architectural decision is recorded in [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
 
 ## Shutdown
 
@@ -240,10 +240,10 @@ Configuration output must make redaction observable. If `--print-config` include
 | `chain_committed`             | INFO   | Pure append, finalization advance, or any other transition that does not invalidate visible blocks |
 | `chain_reorged`               | WARN   | A non-finalized range is replaced by a new committed range inside the reorg window |
 | `tip_follow_started`          | INFO   | Tip-follow begins polling the upstream node tip   |
-| `tip_follow_source_unavailable` | WARN | Tip-follow observed a retryable upstream-node failure and moved readiness to `node_unavailable` |
+| `tip_follow_source_unavailable` | WARN | Tip-follow observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `failure_class`) |
 | `tip_follow_source_recovered` | INFO   | Tip-follow recovered from `node_unavailable` and resumed normal readiness calculation |
 | `tip_follow_stopped`          | INFO   | Tip-follow exits because the cancellation token fired or a fatal error escaped the long-running loop |
-| `backfill_source_unavailable` | WARN   | Backfill observed a retryable upstream-node failure and moved readiness to `node_unavailable` |
+| `backfill_source_unavailable` | WARN   | Backfill observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `failure_class`) |
 | `backfill_source_recovered`   | INFO   | Backfill recovered from `node_unavailable` and completed the requested range |
 | `backfill_already_complete`   | INFO   | Requested backfill range is already covered by the current chain epoch |
 | `ingest_run_failed`           | ERROR  | A subcommand returned an error before successful exit |

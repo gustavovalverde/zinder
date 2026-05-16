@@ -117,7 +117,21 @@ Startup validates required capabilities before ingestion mutates state. Missing 
 - `BlockUnavailable`
 - `TransactionBroadcastDisabled` for the no-op broadcaster path.
 
-Retryable upstream-node failures in long-running tip-follow mode are not process-fatal. `zinder-ingest` reports `node_unavailable`, keeps polling, and recovers readiness when the source answers again. Non-retryable source errors remain fatal or operator-action states.
+Source errors describe what the upstream did; lifecycle decisions are owned by the writer loops, not by this boundary. `SourceError::upstream_classification()` returns a [`SourceFailureClass`](../adrs/0013-source-failure-recovery-topology.md) (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) that the recovery primitive in `zinder-ingest` consumes to select backoff and populate the `node_unavailable` readiness payload. Every source-shaped failure is loop-recoverable; storage and reorg-window failures are the only ingest-exit paths.
+
+Operators triaging a `/readyz` response with `cause.node_unavailable.failure_class = <label>` map the label to an action:
+
+| `failure_class` | Meaning | Operator action |
+| --- | --- | --- |
+| `node_unreachable` | Zebra is down or unreachable | Investigate Zebra liveness, connection limits, transport |
+| `upstream_view_changed` | Best-chain race; height was valid but the chain moved | None (normal during reorgs and node restarts) |
+| `stream_disconnected` | Chain-tip or mempool subscription dropped | Self-heals; check indexer endpoint if persistent |
+| `capability_missing` | Zebra is missing a required RPC method | Upgrade Zebra or switch source |
+| `protocol_mismatch` | Zebra response shape does not match expectations | Investigate Zebra version mismatch |
+| `malformed` | Zebra returned bytes that did not parse | Investigate Zebra version mismatch or data corruption |
+| `configuration` | Adapter configuration is invalid | Fix configuration (auth scheme, broadcast mode, etc.) |
+
+Operators also see this label through the `zinder_readiness_node_failure_class{class=...}` Prometheus gauge, so alert rules can route differently per class without parsing log payloads.
 
 Streaming-source-cursor errors will appear here when the streaming follower lands.
 

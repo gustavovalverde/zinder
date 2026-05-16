@@ -37,7 +37,7 @@ pub use source_block::{
     SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes,
     decode_display_block_hash, encode_display_block_hash,
 };
-pub use source_error::SourceError;
+pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::{
     parse_transaction_public_facts, transparent_prevout_from_raw_transaction_bytes,

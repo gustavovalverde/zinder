@@ -256,7 +256,6 @@ impl NodeSource for FixtureCheckpointSource {
             *pending_retryable_fetch_failures = pending_retryable_fetch_failures.saturating_sub(1);
             return Err(SourceError::NodeUnavailable {
                 reason: "fixture upstream outage".to_owned(),
-                is_retryable: true,
             });
         }
         drop(pending_retryable_fetch_failures);
@@ -264,7 +263,6 @@ impl NodeSource for FixtureCheckpointSource {
         if height != self.block.height {
             return Err(SourceError::BlockUnavailable {
                 height,
-                is_retryable: false,
                 reason: "fixture source only serves the configured block".to_owned(),
             });
         }

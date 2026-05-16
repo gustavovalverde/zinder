@@ -82,6 +82,7 @@ message ReadinessCauseDetail {
     CursorAtRiskDetail cursor_at_risk = 5;
     MempoolCursorAtRiskDetail mempool_cursor_at_risk = 6;
     MempoolHydrationLaggingDetail mempool_hydration_lagging = 7;
+    NodeUnavailableDetail node_unavailable = 8;
   }
 }
 
@@ -133,4 +134,28 @@ message MempoolHydrationLaggingDetail {
   // operators should compare against zinder_mempool_hydration_failures_total
   // for a rate.
   uint64 recent_hydration_failures = 1;
+}
+
+// Detail for READINESS_CAUSE_NODE_UNAVAILABLE.
+//
+// Carries the narrative the operator needs to triage from /readyz alone:
+// which kind of upstream failure is happening, the last reason string, how
+// many iterations the writer has been retrying, and how long the outage has
+// lasted. The kind label matches SourceFailureClass::label() in
+// zinder-source so dashboards can pivot on a stable identifier.
+message NodeUnavailableDetail {
+  // Stable kebab-case label naming the upstream failure class. Mirrors
+  // SourceFailureClass::label() (e.g. "node_unreachable",
+  // "upstream_view_changed", "stream_disconnected").
+  string failure_class = 1;
+  // Last failure reason observed from the upstream node, sanitized for
+  // operator display. Bounded in length by the source adapter so this
+  // payload stays metric- and log-safe.
+  string last_reason = 2;
+  // Consecutive failed iterations since the outage began. Resets to zero
+  // after a successful upstream response.
+  uint32 consecutive_failures = 3;
+  // Seconds since the first failure of the current outage window, rounded
+  // down. Zero on the first iteration of an outage.
+  uint32 outage_seconds = 4;
 }

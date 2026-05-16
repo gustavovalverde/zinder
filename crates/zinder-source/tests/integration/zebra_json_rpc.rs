@@ -86,7 +86,13 @@ async fn fetch_block_by_height_uses_expected_json_rpc_methods_and_basic_auth() -
 }
 
 #[tokio::test]
-async fn json_rpc_error_maps_to_block_unavailable() -> eyre::Result<()> {
+async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> eyre::Result<()> {
+    // The Zebra string "height out of range" is the wire-level marker for
+    // the 2026-05-15 production scenario: the upstream's best chain shifted
+    // between the height resolution and the follow-up fetch. After the
+    // architectural change the adapter classifies this as
+    // `UpstreamViewChanged`, which the long-running loop treats as a
+    // recoverable signal — the writer no longer exits when this happens.
     let server = JsonRpcTestServer::start([
         method("getblockhash").reply(RpcReply::error("height out of range"))
     ])?;
@@ -106,18 +112,24 @@ async fn json_rpc_error_maps_to_block_unavailable() -> eyre::Result<()> {
 
     assert!(matches!(
         error,
-        SourceError::BlockUnavailable {
-            height,
-            is_retryable: false,
-            ..
-        } if height == BlockHeight::new(1)
+        SourceError::BlockUnavailable { height, .. } if height == BlockHeight::new(1)
     ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn json_rpc_warming_up_error_marks_block_unavailable_retryable() -> eyre::Result<()> {
+async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> eyre::Result<()> {
+    // Warming-up was the only JSON-RPC error code we used to whitelist as
+    // retryable before the refactor. After the change, every JSON-RPC error
+    // maps onto a `SourceError` variant whose classification drives the
+    // loop's recovery posture; warming-up still surfaces as
+    // BlockUnavailable from a `getblockhash` failure and stays
+    // loop-recoverable through its UpstreamViewChanged class.
     let server = JsonRpcTestServer::start([
         method("getblockhash").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
@@ -137,12 +149,12 @@ async fn json_rpc_warming_up_error_marks_block_unavailable_retryable() -> eyre::
 
     assert!(matches!(
         error,
-        SourceError::BlockUnavailable {
-            height,
-            is_retryable: true,
-            ..
-        } if height == BlockHeight::new(1)
+        SourceError::BlockUnavailable { height, .. } if height == BlockHeight::new(1)
     ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
 
     Ok(())
 }
@@ -215,19 +227,17 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(
-        error,
-        SourceError::NodeUnavailable {
-            is_retryable: true,
-            ..
-        }
-    ));
+    assert!(matches!(error, SourceError::NodeUnavailable { .. }));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::NodeUnreachable,
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn json_rpc_warming_up_error_marks_tip_unavailable_retryable() -> eyre::Result<()> {
+async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([
         method("getbestblockhash").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
@@ -245,13 +255,11 @@ async fn json_rpc_warming_up_error_marks_tip_unavailable_retryable() -> eyre::Re
         Err(error) => error,
     };
 
-    assert!(matches!(
-        error,
-        SourceError::NodeUnavailable {
-            is_retryable: true,
-            ..
-        }
-    ));
+    assert!(matches!(error, SourceError::NodeUnavailable { .. }));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::NodeUnreachable,
+    );
 
     Ok(())
 }
@@ -627,10 +635,13 @@ async fn json_rpc_warming_up_error_marks_subtree_roots_unavailable_retryable() -
         SourceError::SubtreeRootsUnavailable {
             protocol: ShieldedProtocol::Sapling,
             start_index,
-            is_retryable: true,
             ..
         } if start_index == SubtreeRootIndex::new(0)
     ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
 
     Ok(())
 }

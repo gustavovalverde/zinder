@@ -12,7 +12,9 @@ use zinder_core::{
     Network, TreeStateArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
-use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
+use std::time::Instant;
+
+use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceBlock};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
@@ -22,11 +24,14 @@ use zinder_store::{
 use crate::chain_ingest::{
     ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
     IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, ingest_error_is_recoverable, next_chain_epoch_id_after,
-    next_chain_epoch_id_from, populate_subtree_root_artifacts, record_commit_outcome,
-    select_best_chain,
+    fetch_block_with_retry, next_chain_epoch_id_after, next_chain_epoch_id_from,
+    populate_subtree_root_artifacts, record_commit_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
+use crate::source_recovery::{
+    SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
+    detail_for_ongoing_outage,
+};
 
 /// Default lag threshold (in blocks) below which tip-follow reports `Ready`.
 pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
@@ -35,10 +40,6 @@ const CHAIN_TIP_WAKEUP_CHANNEL_CAPACITY: usize = 1;
 const CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const CHAIN_TIP_NOTIFICATION_RECONNECT_BACKOFF: Duration = Duration::from_millis(1);
-#[cfg(not(test))]
-const TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Configuration for polling the upstream node tip and committing live chain changes.
 ///
@@ -138,6 +139,10 @@ where
     clippy::too_many_arguments,
     reason = "tip-follow loop tests inject the artifact builder while production callers keep the public dependency list explicit."
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the tip-follow loop is one auditable sequence of select+recover+commit+finalize+readiness; splitting it would scatter the contract across helpers without simplifying any single decision."
+)]
 async fn run_tip_follow_loop<Source, Builder, MakeBuilder>(
     config: &TipFollowConfig,
     source: &Source,
@@ -157,7 +162,8 @@ where
     let chain_tip_task_cancel = cancel.child_token();
     let (chain_tip_wakeup_handle, mut chain_tip_wakeup_receiver) =
         start_chain_tip_notification_wakeup(chain_tip_source, chain_tip_task_cancel.clone());
-    let mut source_was_unavailable = false;
+    let mut outage_tracker: Option<SourceOutageTracker> = None;
+    let recovery_backoff = default_recovery_backoff();
 
     let tip_follow_outcome = loop {
         tokio::select! {
@@ -176,25 +182,36 @@ where
         .await
         {
             Ok(iteration) => iteration,
-            Err(error) if ingest_error_is_recoverable(&error) => {
-                retry_state = IngestRetryState::default();
-                if !source_was_unavailable {
-                    tracing::warn!(
-                        target: "zinder::ingest",
-                        event = "tip_follow_source_unavailable",
-                        error = %error,
-                        "tip-follow source is unavailable; keeping the writer alive and retrying"
+            Err(error) => match decide_recovery(&error, recovery_backoff) {
+                SourceRecoveryDecision::Recover {
+                    failure_class,
+                    last_reason,
+                    backoff,
+                } => {
+                    retry_state = IngestRetryState::default();
+                    let detail = update_outage_tracker(
+                        &mut outage_tracker,
+                        failure_class,
+                        last_reason.clone(),
                     );
+                    if detail.consecutive_failures == 1 {
+                        tracing::warn!(
+                            target: "zinder::ingest",
+                            event = "tip_follow_source_unavailable",
+                            failure_class = failure_class.label(),
+                            error = %error,
+                            "tip-follow source is unavailable; keeping the writer alive and retrying"
+                        );
+                    }
+                    set_tip_follow_node_unavailable(readiness, &store, detail);
+                    tokio::select! {
+                        () = cancel.cancelled() => break Ok(()),
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    continue;
                 }
-                source_was_unavailable = true;
-                set_tip_follow_source_unavailable(readiness, &store);
-                tokio::select! {
-                    () = cancel.cancelled() => break Ok(()),
-                    () = tokio::time::sleep(TIP_FOLLOW_SOURCE_RECOVERY_BACKOFF) => {}
-                }
-                continue;
-            }
-            Err(error) => break Err(error),
+                SourceRecoveryDecision::Exit => break Err(error),
+            },
         };
 
         if let Some(commit_outcome) = iteration.commit_outcome.as_ref() {
@@ -207,13 +224,12 @@ where
             }
         }
 
-        if source_was_unavailable {
+        if outage_tracker.take().is_some() {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "tip_follow_source_recovered",
                 "tip-follow source recovered"
             );
-            source_was_unavailable = false;
         }
 
         let lag_state = match compute_tip_follow_readiness_state(
@@ -233,6 +249,44 @@ where
     }
 
     tip_follow_outcome
+}
+
+/// Per-outage running state for the tip-follow recovery loop.
+///
+/// Records the latest readiness detail and the instant the current outage
+/// began so each subsequent failure can advance `consecutive_failures` and
+/// `outage_seconds` without surface-level state. The tracker is reset to
+/// `None` after the next successful iteration.
+#[derive(Debug)]
+struct SourceOutageTracker {
+    detail: NodeUnavailableDetail,
+    started_at: Instant,
+}
+
+fn update_outage_tracker(
+    tracker: &mut Option<SourceOutageTracker>,
+    failure_class: zinder_source::SourceFailureClass,
+    last_reason: std::borrow::Cow<'static, str>,
+) -> NodeUnavailableDetail {
+    if let Some(existing) = tracker {
+        let outage_seconds =
+            u32::try_from(existing.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
+        let detail = detail_for_ongoing_outage(
+            &existing.detail,
+            failure_class,
+            last_reason,
+            outage_seconds,
+        );
+        existing.detail = detail.clone();
+        detail
+    } else {
+        let detail = detail_for_new_outage(failure_class, last_reason);
+        *tracker = Some(SourceOutageTracker {
+            detail: detail.clone(),
+            started_at: Instant::now(),
+        });
+        detail
+    }
 }
 
 fn start_chain_tip_notification_wakeup(
@@ -283,10 +337,15 @@ fn set_tip_follow_readiness(
     readiness.set(gated_state);
 }
 
-fn set_tip_follow_source_unavailable(readiness: &Readiness, store: &PrimaryChainStore) {
-    readiness.set(ReadinessState::node_unavailable(current_chain_height(
-        store,
-    )));
+fn set_tip_follow_node_unavailable(
+    readiness: &Readiness,
+    store: &PrimaryChainStore,
+    detail: NodeUnavailableDetail,
+) {
+    readiness.set(ReadinessState::node_unavailable_with_detail(
+        detail,
+        current_chain_height(store),
+    ));
 }
 
 fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
@@ -1111,7 +1170,7 @@ mod tests {
         };
 
         wait_for_readiness_cause(&readiness, |cause| {
-            matches!(cause, ReadinessCause::NodeUnavailable)
+            matches!(cause, ReadinessCause::NodeUnavailable(_))
         })
         .await?;
         wait_for_readiness_cause(&readiness, |cause| matches!(cause, ReadinessCause::Ready))
@@ -1154,7 +1213,7 @@ mod tests {
         };
 
         wait_for_readiness_cause(&readiness, |cause| {
-            matches!(cause, ReadinessCause::NodeUnavailable)
+            matches!(cause, ReadinessCause::NodeUnavailable(_))
         })
         .await?;
         wait_for_readiness_cause(&readiness, |cause| matches!(cause, ReadinessCause::Ready))
@@ -1171,7 +1230,6 @@ mod tests {
             Box::pin(stream::iter(vec![Err(
                 SourceError::ChainTipStreamUnavailable {
                     reason: "test stream failed".to_owned(),
-                    is_retryable: true,
                 },
             )])),
             Box::pin(stream::iter(vec![Ok(ChainTipNotification {
@@ -1390,7 +1448,6 @@ mod tests {
                 return Err(SourceError::BlockUnavailable {
                     height,
                     reason: "test block temporarily unavailable".to_owned(),
-                    is_retryable: true,
                 });
             }
 
@@ -1403,7 +1460,6 @@ mod tests {
                 .ok_or_else(|| SourceError::BlockUnavailable {
                     height,
                     reason: "test block unavailable".to_owned(),
-                    is_retryable: false,
                 })?;
             let header = SourceBlockHeader {
                 network: Network::ZcashRegtest,
@@ -1423,7 +1479,6 @@ mod tests {
             if consume_retryable_failure(&self.tip_failures_remaining) {
                 return Err(SourceError::NodeUnavailable {
                     reason: "test tip temporarily unavailable".to_owned(),
-                    is_retryable: true,
                 });
             }
 
@@ -1485,7 +1540,6 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| SourceError::ChainTipStreamUnavailable {
                     reason: "test subscription unavailable".to_owned(),
-                    is_retryable: true,
                 })
         }
     }

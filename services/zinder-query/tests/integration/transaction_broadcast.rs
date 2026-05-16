@@ -82,7 +82,7 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
     let store_fixture = StoreFixture::open()?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
-        MockTransactionBroadcaster::node_unavailable("node is offline", true),
+        MockTransactionBroadcaster::node_unavailable("node is offline"),
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
@@ -98,10 +98,7 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
 
     assert!(matches!(
         error,
-        QueryError::Node(SourceError::NodeUnavailable {
-            ref reason,
-            is_retryable: true,
-        })
+        QueryError::Node(SourceError::NodeUnavailable { ref reason })
             if reason == "node is offline"
     ));
 

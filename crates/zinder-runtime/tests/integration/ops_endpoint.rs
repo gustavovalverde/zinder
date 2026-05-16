@@ -4,7 +4,7 @@ use eyre::Result;
 use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
-use zinder_runtime::{OpsServer, Readiness, ReadinessCause, ReadinessState, spawn_ops_endpoint};
+use zinder_runtime::{OpsServer, Readiness, ReadinessState, spawn_ops_endpoint};
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
     let client = Client::builder(TokioExecutor::new()).build_http::<String>();
@@ -53,11 +53,17 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     assert_eq!(readyz_value["cause"], "ready");
     assert_eq!(readyz_value["current_height"], 7);
 
-    readiness.set(ReadinessState::not_ready(ReadinessCause::NodeUnavailable));
+    readiness.set(ReadinessState::node_unavailable_with_detail(
+        zinder_runtime::NodeUnavailableDetail::first_iteration(
+            "node_unreachable",
+            "synthetic test outage",
+        ),
+        Some(7),
+    ));
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 503);
     assert_eq!(readyz_value["status"], "not_ready");
-    assert_eq!(readyz_value["cause"], "node_unavailable");
+    assert_eq!(readyz_value["cause"]["node_unavailable"]["failure_class"], "node_unreachable");
 
     let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
     assert_eq!(status, 200);

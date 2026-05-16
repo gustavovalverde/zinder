@@ -24,7 +24,7 @@ use zinder_core::{
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
     TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
 };
-use zinder_source::{NodeSource, SourceBlock, SourceError, SourceSubtreeRoots};
+use zinder_source::{NodeSource, SourceBlock, SourceError, SourceFailureClass, SourceSubtreeRoots};
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
     StoreError,
@@ -473,7 +473,7 @@ where
     loop {
         match request().await {
             Ok(response) => return Ok(response),
-            Err(error) if source_error_is_retryable(&error) => {
+            Err(error) if per_call_retry_permitted(&error) => {
                 retry_state.retryable_failures = retry_state.retryable_failures.saturating_add(1);
                 metrics::counter!(
                     "zinder_ingest_source_retry_total",
@@ -518,34 +518,21 @@ fn next_fetch_retry_backoff(current_backoff: Duration) -> Duration {
         .min(FETCH_RETRY_MAX_BACKOFF)
 }
 
-pub(crate) fn source_error_is_retryable(error: &SourceError) -> bool {
-    error.is_retryable()
-}
-
-pub(crate) fn ingest_error_is_recoverable(error: &IngestError) -> bool {
-    match error {
-        IngestError::Source(source) => source.is_retryable(),
-        IngestError::SourceRetryBudgetExceeded { .. }
-        | IngestError::SourceRetryDeadlineExceeded { .. } => true,
-        IngestError::UnknownNodeSource { .. }
-        | IngestError::SubtreeRootsUnavailable { .. }
-        | IngestError::SubtreeRootCompletingBlockMissing { .. }
-        | IngestError::TransparentPrevoutOutputMissing { .. }
-        | IngestError::UnsupportedShieldedProtocol { .. }
-        | IngestError::EmptyIngestBatch
-        | IngestError::BackfillProducedNoCommit
-        | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
-        | IngestError::BackfillRequiresContiguousTipMetadata { .. }
-        | IngestError::BackfillCheckpointMisaligned { .. }
-        | IngestError::TipFollowObservedTipBehindStore { .. }
-        | IngestError::TipFollowCommonAncestorMissing { .. }
-        | IngestError::TipFollowParentMetadataUnavailable { .. }
-        | IngestError::ReorgWindowExceeded { .. }
-        | IngestError::SystemTimeBeforeUnixEpoch { .. }
-        | IngestError::TimestampTooLarge
-        | IngestError::ArtifactDerive(_)
-        | IngestError::Store(_) => false,
-    }
+/// Returns whether `retry_source_request` should sleep and re-issue the
+/// same call.
+///
+/// Per-call retry handles the failure classes where retrying the *same
+/// request* can plausibly succeed: transient transport
+/// ([`SourceFailureClass::NodeUnreachable`]) and short-lived subscription
+/// failures ([`SourceFailureClass::StreamDisconnected`]). View-stale
+/// failures ([`SourceFailureClass::UpstreamViewChanged`]) and structural
+/// failures are bubbled up to the loop, which re-observes the upstream
+/// before issuing dependent requests.
+pub(crate) fn per_call_retry_permitted(error: &SourceError) -> bool {
+    matches!(
+        error.upstream_classification(),
+        SourceFailureClass::NodeUnreachable | SourceFailureClass::StreamDisconnected,
+    )
 }
 
 /// Classifies an already-built candidate chain segment.

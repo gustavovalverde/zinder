@@ -36,6 +36,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0010: TransactionPublicFacts as the single transaction parser](adrs/0010-transaction-public-facts.md)
 - [ADR-0011: Explorer freshness envelope](adrs/0011-explorer-freshness-envelope.md)
 - [ADR-0012: Typed explorer search and privacy refusal](adrs/0012-typed-explorer-search-and-privacy-refusal.md)
+- [ADR-0013: Source failure recovery topology](adrs/0013-source-failure-recovery-topology.md)
 
 ## Reference
 

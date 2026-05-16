@@ -55,8 +55,8 @@ pub struct NodeFailureScript {
 
 #[derive(Clone, Debug)]
 enum FetchFailureTemplate {
-    NodeUnavailable { reason: String, is_retryable: bool },
-    BlockUnavailable { reason: String, is_retryable: bool },
+    NodeUnavailable { reason: String },
+    BlockUnavailable { reason: String },
 }
 
 impl NodeFailureScript {
@@ -70,33 +70,39 @@ impl NodeFailureScript {
     }
 
     /// Fail the next `count` block fetches with [`SourceError::NodeUnavailable`].
+    ///
+    /// Models a transient or warming-up upstream where the node itself
+    /// cannot answer. Maps to
+    /// [`SourceFailureClass::NodeUnreachable`](zinder_source::SourceFailureClass).
     #[must_use]
     pub fn fail_next_fetches_with_node_unavailable(
         count: u32,
         reason: impl Into<String>,
-        is_retryable: bool,
     ) -> Self {
         Self {
             pending_fetch_failures: count,
             pending_fetch_failure_template: Some(FetchFailureTemplate::NodeUnavailable {
                 reason: reason.into(),
-                is_retryable,
             }),
         }
     }
 
     /// Fail the next `count` block fetches with [`SourceError::BlockUnavailable`].
+    ///
+    /// Models a best-chain race where the requested height was valid when
+    /// resolved but is no longer addressable. Maps to
+    /// [`SourceFailureClass::UpstreamViewChanged`](zinder_source::SourceFailureClass).
+    /// This is the shape of the 2026-05-15 production incident
+    /// (`"block height not in best chain"`).
     #[must_use]
     pub fn fail_next_fetches_with_block_unavailable(
         count: u32,
         reason: impl Into<String>,
-        is_retryable: bool,
     ) -> Self {
         Self {
             pending_fetch_failures: count,
             pending_fetch_failure_template: Some(FetchFailureTemplate::BlockUnavailable {
                 reason: reason.into(),
-                is_retryable,
             }),
         }
     }
@@ -108,20 +114,12 @@ impl NodeFailureScript {
         self.pending_fetch_failures = self.pending_fetch_failures.saturating_sub(1);
         let template = self.pending_fetch_failure_template.as_ref()?;
         Some(match template {
-            FetchFailureTemplate::NodeUnavailable {
-                reason,
-                is_retryable,
-            } => SourceError::NodeUnavailable {
+            FetchFailureTemplate::NodeUnavailable { reason } => SourceError::NodeUnavailable {
                 reason: reason.clone(),
-                is_retryable: *is_retryable,
             },
-            FetchFailureTemplate::BlockUnavailable {
-                reason,
-                is_retryable,
-            } => SourceError::BlockUnavailable {
+            FetchFailureTemplate::BlockUnavailable { reason } => SourceError::BlockUnavailable {
                 height,
                 reason: reason.clone(),
-                is_retryable: *is_retryable,
             },
         })
     }
@@ -201,7 +199,6 @@ impl NodeSource for MockNodeSource {
             .ok_or_else(|| SourceError::BlockUnavailable {
                 height,
                 reason: "mock chain fixture does not contain this height".to_owned(),
-                is_retryable: false,
             })
     }
 
@@ -293,7 +290,7 @@ mod tests {
     async fn failure_script_replays_pending_failures_then_succeeds() -> Result<(), Box<dyn Error>> {
         let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
         let node_source = MockNodeSource::from_chain(chain_fixture).with_failure_script(
-            NodeFailureScript::fail_next_fetches_with_node_unavailable(2, "planned outage", true),
+            NodeFailureScript::fail_next_fetches_with_node_unavailable(2, "planned outage"),
         );
 
         let outcomes = [

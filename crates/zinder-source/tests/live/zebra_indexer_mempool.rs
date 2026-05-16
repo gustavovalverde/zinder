@@ -151,13 +151,18 @@ async fn observe_terminal_disconnect(
                 // Best-effort residual events from before the disconnect are
                 // benign; keep waiting for the disconnect signal itself.
             }
-            Ok(Some(Err(SourceError::MempoolStreamUnavailable { is_retryable, .. }))) => {
-                if is_retryable {
-                    return Ok(());
-                }
-                return Err(eyre!(
-                    "indexer stream emitted MempoolStreamUnavailable but is_retryable was false"
-                ));
+            Ok(Some(Err(error @ SourceError::MempoolStreamUnavailable { .. }))) => {
+                // The indexer mempool stream is inherently
+                // StreamDisconnected — every variant of this error
+                // routes the writer loop through reconnect. We assert
+                // the classification rather than a now-deleted boolean
+                // so the test pins the loop-recovery contract instead
+                // of the wire shape.
+                assert_eq!(
+                    error.upstream_classification(),
+                    zinder_source::SourceFailureClass::StreamDisconnected,
+                );
+                return Ok(());
             }
             #[allow(
                 clippy::wildcard_enum_match_arm,

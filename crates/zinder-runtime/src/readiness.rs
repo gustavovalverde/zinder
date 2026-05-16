@@ -9,7 +9,7 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -19,7 +19,7 @@ use zinder_proto::v1::ops as ops_proto;
 ///
 /// Causes that carry operator-actionable detail use struct variants so the
 /// data is reachable by `serde_json` consumers without an out-of-band lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessCause {
@@ -34,7 +34,13 @@ pub enum ReadinessCause {
     /// Service is healthy and accepting production traffic.
     Ready,
     /// Upstream node source is unavailable.
-    NodeUnavailable,
+    ///
+    /// Long-running writer loops (tip-follow, backfill, mempool
+    /// orchestrator) drain readiness here when an upstream source error
+    /// classifies as recoverable. The payload carries the operator
+    /// narrative the runbook expects: which class of upstream failure,
+    /// the last reason, and how the outage is progressing.
+    NodeUnavailable(NodeUnavailableDetail),
     /// A required node capability is missing.
     NodeCapabilityMissing {
         /// Stable name of the missing capability (matches
@@ -92,6 +98,76 @@ pub enum ReadinessCause {
     ShuttingDown,
 }
 
+/// Operator-actionable narrative for [`ReadinessCause::NodeUnavailable`].
+///
+/// Surfaces in `/readyz` JSON, the proto report, and the
+/// `zinder_readiness_state{cause="node_unavailable",class="..."}` Prometheus
+/// label set. Dashboards and alert rules pivot on
+/// [`Self::failure_class`]; humans reading the JSON payload also get
+/// [`Self::last_reason`], a running count of [`Self::consecutive_failures`],
+/// and an [`Self::outage_seconds`] elapsed counter.
+///
+/// The fields are populated by `zinder-ingest`'s recovery primitive
+/// (`services/zinder-ingest/src/source_recovery.rs`); other services that
+/// drain readiness for upstream errors should construct this through
+/// [`ReadinessState::node_unavailable_with_detail`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NodeUnavailableDetail {
+    /// Stable kebab-case label naming the upstream failure class. Matches
+    /// `SourceFailureClass::label()` in `zinder-source`.
+    pub failure_class: &'static str,
+    /// Sanitized one-line reason from the most recent failure. Bounded
+    /// in length by the producing recovery primitive so the payload
+    /// stays metric- and log-safe.
+    pub last_reason: Cow<'static, str>,
+    /// Consecutive failed iterations since the outage began. Resets to
+    /// zero after a successful upstream response.
+    pub consecutive_failures: u32,
+    /// Seconds since the first failure of the current outage window.
+    pub outage_seconds: u32,
+}
+
+impl NodeUnavailableDetail {
+    /// Returns a detail snapshot for the first iteration of a new outage.
+    ///
+    /// Use this when a writer loop transitions out of `Ready`/`Syncing`
+    /// because of an upstream failure. Subsequent iterations during the
+    /// same outage should bump `consecutive_failures` and
+    /// `outage_seconds` via [`Self::extend_with`].
+    #[must_use]
+    pub fn first_iteration(
+        failure_class: &'static str,
+        last_reason: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            failure_class,
+            last_reason: last_reason.into(),
+            consecutive_failures: 1,
+            outage_seconds: 0,
+        }
+    }
+
+    /// Returns a detail snapshot extending an ongoing outage.
+    ///
+    /// `consecutive_failures` advances by one (saturating) and
+    /// `outage_seconds` is updated from the supplied elapsed duration.
+    #[must_use]
+    pub fn extend_with(
+        previous: &Self,
+        failure_class: &'static str,
+        last_reason: impl Into<Cow<'static, str>>,
+        outage_seconds: u32,
+    ) -> Self {
+        Self {
+            failure_class,
+            last_reason: last_reason.into(),
+            consecutive_failures: previous.consecutive_failures.saturating_add(1),
+            outage_seconds,
+        }
+    }
+}
+
 impl ReadinessCause {
     /// Every Prometheus label `metric_label` may return, in declaration order.
     ///
@@ -126,7 +202,7 @@ impl ReadinessCause {
             Self::Starting => "starting",
             Self::Syncing { .. } => "syncing",
             Self::Ready => "ready",
-            Self::NodeUnavailable => "node_unavailable",
+            Self::NodeUnavailable(_) => "node_unavailable",
             Self::NodeCapabilityMissing { .. } => "node_capability_missing",
             Self::StorageUnavailable => "storage_unavailable",
             Self::SchemaMismatch => "schema_mismatch",
@@ -138,6 +214,34 @@ impl ReadinessCause {
             Self::MempoolSourceUnavailable => "mempool_source_unavailable",
             Self::MempoolHydrationLagging { .. } => "mempool_hydration_lagging",
             Self::ShuttingDown => "shutting_down",
+        }
+    }
+
+    /// Returns the source failure class label when the cause is
+    /// [`Self::NodeUnavailable`].
+    ///
+    /// `None` for every other cause. Operators read this through the
+    /// `class` Prometheus label on `zinder_readiness_state`; the empty
+    /// string is rendered for inactive causes so the label set stays
+    /// stable across scrapes.
+    #[must_use]
+    pub const fn node_failure_class_label(&self) -> Option<&'static str> {
+        match self {
+            Self::NodeUnavailable(detail) => Some(detail.failure_class),
+            Self::Starting
+            | Self::Syncing { .. }
+            | Self::Ready
+            | Self::NodeCapabilityMissing { .. }
+            | Self::StorageUnavailable
+            | Self::SchemaMismatch
+            | Self::ReorgWindowExceeded { .. }
+            | Self::ReplicaLagging { .. }
+            | Self::WriterStatusUnavailable
+            | Self::CursorAtRisk { .. }
+            | Self::MempoolCursorAtRisk { .. }
+            | Self::MempoolSourceUnavailable
+            | Self::MempoolHydrationLagging { .. }
+            | Self::ShuttingDown => None,
         }
     }
 
@@ -160,7 +264,7 @@ impl ReadinessCause {
 }
 
 /// Snapshot of the current readiness state surfaced to operators.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReadinessReport {
     /// `true` when the service is healthy enough to receive production traffic.
     pub is_ready: bool,
@@ -215,7 +319,7 @@ impl Readiness {
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
-        let state = *self.inner.lock();
+        let state = self.inner.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
             cause: state.cause,
@@ -226,7 +330,7 @@ impl Readiness {
 }
 
 /// Mutable readiness state owned by the service's runtime task.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadinessState {
     /// Stable readiness cause.
     pub cause: ReadinessCause,
@@ -284,9 +388,10 @@ impl ReadinessState {
     ///
     /// For parametric causes ([`ReadinessCause::Syncing`],
     /// [`ReadinessCause::ReorgWindowExceeded`],
-    /// [`ReadinessCause::ReplicaLagging`]) use the dedicated constructors.
+    /// [`ReadinessCause::ReplicaLagging`],
+    /// [`ReadinessCause::NodeUnavailable`]) use the dedicated constructors.
     #[must_use]
-    pub const fn not_ready(cause: ReadinessCause) -> Self {
+    pub fn not_ready(cause: ReadinessCause) -> Self {
         Self {
             cause,
             current_height: None,
@@ -294,14 +399,20 @@ impl ReadinessState {
         }
     }
 
-    /// Returns an upstream-node-unavailable state.
+    /// Returns an upstream-node-unavailable state with an operator-actionable
+    /// narrative.
     ///
-    /// `current_height` carries the last visible tip when the writer can still
-    /// read local storage while waiting for the upstream node to recover.
+    /// `current_height` carries the last visible tip when the writer can
+    /// still read local storage while waiting for the upstream node to
+    /// recover. `detail` carries the failure narrative the runbook expects
+    /// in `/readyz`.
     #[must_use]
-    pub const fn node_unavailable(current_height: Option<u32>) -> Self {
+    pub fn node_unavailable_with_detail(
+        detail: NodeUnavailableDetail,
+        current_height: Option<u32>,
+    ) -> Self {
         Self {
-            cause: ReadinessCause::NodeUnavailable,
+            cause: ReadinessCause::NodeUnavailable(detail),
             current_height,
             target_height: None,
         }
@@ -414,7 +525,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::Starting => Self::Starting,
             ReadinessCause::Syncing { .. } => Self::Syncing,
             ReadinessCause::Ready => Self::Ready,
-            ReadinessCause::NodeUnavailable => Self::NodeUnavailable,
+            ReadinessCause::NodeUnavailable(_) => Self::NodeUnavailable,
             ReadinessCause::NodeCapabilityMissing { .. } => Self::NodeCapabilityMissing,
             ReadinessCause::StorageUnavailable => Self::StorageUnavailable,
             ReadinessCause::SchemaMismatch => Self::SchemaMismatch,
@@ -491,9 +602,18 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     recent_hydration_failures: *recent_hydration_failures,
                 },
             ),
+            ReadinessCause::NodeUnavailable(detail) => {
+                ops_proto::readiness_cause_detail::Payload::NodeUnavailable(
+                    ops_proto::NodeUnavailableDetail {
+                        failure_class: detail.failure_class.to_owned(),
+                        last_reason: detail.last_reason.clone().into_owned(),
+                        consecutive_failures: detail.consecutive_failures,
+                        outage_seconds: detail.outage_seconds,
+                    },
+                )
+            }
             ReadinessCause::Starting
             | ReadinessCause::Ready
-            | ReadinessCause::NodeUnavailable
             | ReadinessCause::StorageUnavailable
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
@@ -634,7 +754,10 @@ mod tests {
             ReadinessCause::Starting,
             ReadinessCause::Syncing { lag_blocks: None },
             ReadinessCause::Ready,
-            ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+                "node_unreachable",
+                "test reason",
+            )),
             ReadinessCause::NodeCapabilityMissing { capability: "test" },
             ReadinessCause::StorageUnavailable,
             ReadinessCause::SchemaMismatch,
@@ -679,7 +802,7 @@ mod tests {
             ReadinessCause::Starting => ops_proto::ReadinessCause::Starting,
             ReadinessCause::Syncing { .. } => ops_proto::ReadinessCause::Syncing,
             ReadinessCause::Ready => ops_proto::ReadinessCause::Ready,
-            ReadinessCause::NodeUnavailable => ops_proto::ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeUnavailable(_) => ops_proto::ReadinessCause::NodeUnavailable,
             ReadinessCause::NodeCapabilityMissing { .. } => {
                 ops_proto::ReadinessCause::NodeCapabilityMissing
             }
@@ -722,7 +845,10 @@ mod tests {
             ReadinessCause::Starting,
             ReadinessCause::Syncing { lag_blocks: None },
             ReadinessCause::Ready,
-            ReadinessCause::NodeUnavailable,
+            ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+                "node_unreachable",
+                "test reason",
+            )),
             ReadinessCause::NodeCapabilityMissing {
                 capability: "tx_broadcast",
             },
@@ -790,8 +916,30 @@ mod tests {
     fn proto_report_carries_no_detail_for_scalar_causes() {
         let report = ReadinessReport {
             is_ready: false,
-            cause: ReadinessCause::NodeUnavailable,
+            cause: ReadinessCause::StorageUnavailable,
             current_height: None,
+            target_height: None,
+        };
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(
+            proto.cause,
+            ops_proto::ReadinessCause::StorageUnavailable as i32
+        );
+        assert!(proto.detail.is_none());
+    }
+
+    #[test]
+    fn proto_report_preserves_node_unavailable_payload() {
+        let report = ReadinessReport {
+            is_ready: false,
+            cause: ReadinessCause::NodeUnavailable(NodeUnavailableDetail {
+                failure_class: "upstream_view_changed",
+                last_reason: Cow::Borrowed("block height not in best chain"),
+                consecutive_failures: 3,
+                outage_seconds: 12,
+            }),
+            current_height: Some(4_013_801),
             target_height: None,
         };
 
@@ -800,7 +948,29 @@ mod tests {
             proto.cause,
             ops_proto::ReadinessCause::NodeUnavailable as i32
         );
-        assert!(proto.detail.is_none());
+        let Some(detail) = proto.detail else {
+            unreachable!("NodeUnavailable must carry detail")
+        };
+        let Some(payload) = detail.payload else {
+            unreachable!("detail must carry a payload")
+        };
+        let ops_proto::readiness_cause_detail::Payload::NodeUnavailable(payload) = payload else {
+            unreachable!("expected NodeUnavailable payload variant")
+        };
+        assert_eq!(payload.failure_class, "upstream_view_changed");
+        assert_eq!(payload.last_reason, "block height not in best chain");
+        assert_eq!(payload.consecutive_failures, 3);
+        assert_eq!(payload.outage_seconds, 12);
+    }
+
+    #[test]
+    fn node_failure_class_label_exposes_active_class() {
+        let cause = ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+            "node_unreachable",
+            "connection refused",
+        ));
+        assert_eq!(cause.node_failure_class_label(), Some("node_unreachable"));
+        assert_eq!(ReadinessCause::Ready.node_failure_class_label(), None);
     }
 
     #[test]

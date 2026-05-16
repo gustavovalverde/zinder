@@ -135,14 +135,12 @@ impl NodeSource for StaticValuePoolSource {
         Err(SourceError::BlockUnavailable {
             height,
             reason: "static source does not serve blocks".to_owned(),
-            is_retryable: false,
         })
     }
 
     async fn tip_id(&self) -> std::result::Result<BlockId, SourceError> {
         Err(SourceError::NodeUnavailable {
             reason: "static source does not serve tip ids".to_owned(),
-            is_retryable: false,
         })
     }
 

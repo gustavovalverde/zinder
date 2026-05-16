@@ -1,12 +1,12 @@
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Instant};
 
 use futures_util::stream::StreamExt;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TreeStateArtifact,
 };
-use zinder_runtime::{Readiness, ReadinessState};
-use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint};
+use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
+use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint, SourceFailureClass};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
     ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -15,8 +15,12 @@ use zinder_store::{
 use crate::chain_ingest::{
     ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
     IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, ingest_error_is_recoverable, next_chain_epoch_id,
-    next_chain_epoch_id_after, populate_subtree_root_artifacts,
+    fetch_block_with_retry, next_chain_epoch_id, next_chain_epoch_id_after,
+    populate_subtree_root_artifacts,
+};
+use crate::source_recovery::{
+    SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
+    detail_for_ongoing_outage,
 };
 
 /// Maximum number of historical block fetches kept in flight against the
@@ -36,10 +40,6 @@ use crate::chain_ingest::{
 /// dedicated node can raise this; operators sharing the node with other readers
 /// should not.
 const BACKFILL_FETCH_CONCURRENCY: usize = 32;
-#[cfg(not(test))]
-const BACKFILL_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const BACKFILL_SOURCE_RECOVERY_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -175,14 +175,15 @@ pub async fn backfill_until_complete<Source>(
 where
     Source: NodeSource,
 {
-    let mut source_was_unavailable = false;
+    let recovery_backoff = default_recovery_backoff();
+    let mut outage: Option<(NodeUnavailableDetail, Instant)> = None;
 
     loop {
         match backfill_with_store(config, source, store).await {
             Ok(outcome) => {
                 let chain_epoch = outcome.chain_epoch();
                 readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
-                if source_was_unavailable {
+                if outage.take().is_some() {
                     tracing::info!(
                         target: "zinder::ingest",
                         event = "backfill_source_recovered",
@@ -191,23 +192,53 @@ where
                 }
                 return Ok(outcome);
             }
-            Err(error) if ingest_error_is_recoverable(&error) => {
-                if !source_was_unavailable {
-                    tracing::warn!(
-                        target: "zinder::ingest",
-                        event = "backfill_source_unavailable",
-                        error = %error,
-                        "backfill source is unavailable; keeping the writer alive and retrying"
+            Err(error) => match decide_recovery(&error, recovery_backoff) {
+                SourceRecoveryDecision::Recover {
+                    failure_class,
+                    last_reason,
+                    backoff,
+                } => {
+                    let detail = advance_backfill_outage(
+                        &mut outage,
+                        failure_class,
+                        last_reason.clone(),
                     );
+                    if detail.consecutive_failures == 1 {
+                        tracing::warn!(
+                            target: "zinder::ingest",
+                            event = "backfill_source_unavailable",
+                            failure_class = failure_class.label(),
+                            error = %error,
+                            "backfill source is unavailable; keeping the writer alive and retrying"
+                        );
+                    }
+                    readiness.set(ReadinessState::node_unavailable_with_detail(
+                        detail,
+                        current_chain_height(store),
+                    ));
+                    tokio::time::sleep(backoff).await;
                 }
-                source_was_unavailable = true;
-                readiness.set(ReadinessState::node_unavailable(current_chain_height(
-                    store,
-                )));
-                tokio::time::sleep(BACKFILL_SOURCE_RECOVERY_BACKOFF).await;
-            }
-            Err(error) => return Err(error),
+                SourceRecoveryDecision::Exit => return Err(error),
+            },
         }
+    }
+}
+
+fn advance_backfill_outage(
+    outage: &mut Option<(NodeUnavailableDetail, Instant)>,
+    failure_class: SourceFailureClass,
+    last_reason: std::borrow::Cow<'static, str>,
+) -> NodeUnavailableDetail {
+    if let Some((existing, started_at)) = outage {
+        let outage_seconds = u32::try_from(started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
+        let detail =
+            detail_for_ongoing_outage(existing, failure_class, last_reason, outage_seconds);
+        *existing = detail.clone();
+        detail
+    } else {
+        let detail = detail_for_new_outage(failure_class, last_reason);
+        *outage = Some((detail.clone(), Instant::now()));
+        detail
     }
 }
 
@@ -580,10 +611,7 @@ mod tests {
     };
     use zinder_store::ChainEventHistoryRequest;
 
-    use crate::{
-        ArtifactDeriveError,
-        chain_ingest::{BuiltArtifacts, source_error_is_retryable},
-    };
+    use crate::{ArtifactDeriveError, chain_ingest::BuiltArtifacts};
 
     use super::*;
 
@@ -695,7 +723,7 @@ mod tests {
                 tip_height: BlockHeight::new(200),
                 network: Network::ZcashRegtest,
             },
-            failure: FlakySourceFailure::BlockUnavailable { is_retryable: true },
+            failure: FlakySourceFailure::BlockUnavailable,
             retryable_failures_before_success: AtomicU32::new(2),
             fetch_attempts: AtomicU32::new(0),
         };
@@ -713,18 +741,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_does_not_retry_fatal_block_unavailable_failures() -> Result<(), Box<dyn Error>>
-    {
+    async fn backfill_does_not_retry_protocol_mismatch_failures() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("fatal-block-unavailable-store");
+        let storage_path = tempdir.path().join("protocol-mismatch-store");
         let source = FlakyNodeSource {
             delegate: TestNodeSource {
                 tip_height: BlockHeight::new(200),
                 network: Network::ZcashRegtest,
             },
-            failure: FlakySourceFailure::BlockUnavailable {
-                is_retryable: false,
-            },
+            failure: FlakySourceFailure::ProtocolMismatch,
             retryable_failures_before_success: AtomicU32::new(2),
             fetch_attempts: AtomicU32::new(0),
         };
@@ -746,10 +771,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            IngestError::Source(SourceError::BlockUnavailable {
-                is_retryable: false,
-                ..
-            })
+            IngestError::Source(SourceError::SourceProtocolMismatch { .. })
         ));
         assert_eq!(source.fetch_attempts.load(Ordering::SeqCst), 1);
 
@@ -757,21 +779,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_retry_classification_keeps_protocol_errors_fatal() {
-        assert!(source_error_is_retryable(&SourceError::NodeUnavailable {
-            reason: "connection reset".to_owned(),
-            is_retryable: true,
-        }));
-        assert!(!source_error_is_retryable(&SourceError::BlockUnavailable {
-            height: BlockHeight::new(1),
-            reason: "invalid height parameter".to_owned(),
-            is_retryable: false,
-        }));
-        assert!(!source_error_is_retryable(
-            &SourceError::SourceProtocolMismatch {
+    async fn source_retry_classification_uses_upstream_classification() {
+        use zinder_source::SourceFailureClass;
+        assert_eq!(
+            SourceError::NodeUnavailable {
+                reason: "connection reset".to_owned(),
+            }
+            .upstream_classification(),
+            SourceFailureClass::NodeUnreachable,
+        );
+        assert_eq!(
+            SourceError::BlockUnavailable {
+                height: BlockHeight::new(1),
+                reason: "block height not in best chain".to_owned(),
+            }
+            .upstream_classification(),
+            SourceFailureClass::UpstreamViewChanged,
+        );
+        assert_eq!(
+            SourceError::SourceProtocolMismatch {
                 reason: "missing block hash",
             }
-        ));
+            .upstream_classification(),
+            SourceFailureClass::ProtocolMismatch,
+        );
     }
 
     #[tokio::test]
@@ -1144,7 +1175,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FlakySourceFailure {
         NodeUnavailable,
-        BlockUnavailable { is_retryable: bool },
+        BlockUnavailable,
+        ProtocolMismatch,
     }
 
     impl FlakySourceFailure {
@@ -1152,12 +1184,13 @@ mod tests {
             match self {
                 Self::NodeUnavailable => SourceError::NodeUnavailable {
                     reason: "temporary node outage".to_owned(),
-                    is_retryable: true,
                 },
-                Self::BlockUnavailable { is_retryable } => SourceError::BlockUnavailable {
+                Self::BlockUnavailable => SourceError::BlockUnavailable {
                     height,
                     reason: "node returned block error".to_owned(),
-                    is_retryable,
+                },
+                Self::ProtocolMismatch => SourceError::SourceProtocolMismatch {
+                    reason: "node payload missing required field",
                 },
             }
         }

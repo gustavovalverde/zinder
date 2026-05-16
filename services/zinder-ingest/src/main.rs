@@ -485,7 +485,11 @@ async fn ensure_node_capabilities(
     let probed_capabilities = match source.probe_capabilities().await {
         Ok(probed_capabilities) => probed_capabilities,
         Err(probe_error) => {
-            readiness.set(ReadinessState::not_ready(ReadinessCause::NodeUnavailable));
+            let detail = zinder_runtime::NodeUnavailableDetail::first_iteration(
+                probe_error.upstream_classification().label(),
+                probe_error.to_string(),
+            );
+            readiness.set(ReadinessState::node_unavailable_with_detail(detail, None));
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "node_capability_probe_failed",

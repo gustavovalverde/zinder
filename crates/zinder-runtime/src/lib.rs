@@ -43,7 +43,9 @@ pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
 };
-pub use readiness::{Readiness, ReadinessCause, ReadinessReport, ReadinessState};
+pub use readiness::{
+    NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
+};
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 
 use tokio::task::JoinHandle;

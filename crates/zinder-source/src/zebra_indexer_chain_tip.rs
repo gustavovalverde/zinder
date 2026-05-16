@@ -118,7 +118,6 @@ impl ZebraIndexerChainTipSource {
             .await
             .map_err(|status| SourceError::ChainTipStreamUnavailable {
                 reason: format!("indexer chain_tip_change call failed: {status}"),
-                is_retryable: true,
             })?;
         let mut wire_stream = response.into_inner();
 
@@ -138,7 +137,6 @@ impl ZebraIndexerChainTipSource {
                         let _ = sender
                             .send(Err(SourceError::ChainTipStreamUnavailable {
                                 reason: format!("indexer chain_tip_change stream ended: {status}"),
-                                is_retryable: true,
                             }))
                             .await;
                         return;
@@ -155,7 +153,6 @@ impl ZebraIndexerChainTipSource {
             Endpoint::from_shared(self.target.endpoint_url.clone()).map_err(|error| {
                 SourceError::ChainTipStreamUnavailable {
                     reason: format!("invalid indexer endpoint: {error}"),
-                    is_retryable: false,
                 }
             })?;
         let endpoint = endpoint
@@ -167,7 +164,6 @@ impl ZebraIndexerChainTipSource {
                 .await
                 .map_err(|error| SourceError::ChainTipStreamUnavailable {
                     reason: format!("indexer endpoint connect failed: {error}"),
-                    is_retryable: true,
                 })?;
         Ok(IndexerClient::new(channel))
     }

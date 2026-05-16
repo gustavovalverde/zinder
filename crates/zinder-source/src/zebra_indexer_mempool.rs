@@ -125,7 +125,6 @@ impl ZebraIndexerMempoolSource {
             Endpoint::from_shared(self.target.endpoint_url.clone()).map_err(|error| {
                 SourceError::MempoolStreamUnavailable {
                     reason: format!("invalid indexer endpoint: {error}"),
-                    is_retryable: false,
                 }
             })?;
         let endpoint = endpoint
@@ -137,7 +136,6 @@ impl ZebraIndexerMempoolSource {
                 .await
                 .map_err(|error| SourceError::MempoolStreamUnavailable {
                     reason: format!("indexer endpoint connect failed: {error}"),
-                    is_retryable: true,
                 })?;
         Ok(IndexerClient::new(channel))
     }
@@ -156,7 +154,6 @@ impl MempoolSource for ZebraIndexerMempoolSource {
             .await
             .map_err(|status| SourceError::MempoolStreamUnavailable {
                 reason: format!("indexer mempool_change call failed: {status}"),
-                is_retryable: true,
             })?;
         let mut wire_stream = response.into_inner();
 
@@ -182,7 +179,6 @@ impl MempoolSource for ZebraIndexerMempoolSource {
                                 reason: format!(
                                     "indexer mempool_change stream ended: {stream_status}"
                                 ),
-                                is_retryable: true,
                             }))
                             .await;
                         return;
@@ -306,7 +302,6 @@ async fn build_added_event(
                 transaction_id,
                 reason: "transaction disappeared from upstream node before hydration completed"
                     .to_owned(),
-                is_retryable: false,
             })
         }
         Err(hydration_error) => {
