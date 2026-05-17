@@ -71,9 +71,15 @@ The eight shared sections at the time of writing are:
 - `[node]` and `[node.auth]` ([`NodeSection`](../../crates/zinder-source/src/node_target.rs),
   pre-existing in `zinder-source`)
 
-Per-service sections (`[ingest]`, `[backfill]`, `[tip_follow]`,
-`[backup]`, `[query]`, `[compat]`, `[explorer]`) stay private to their
-owning binary.
+Per-service sections (`[ingest]`, `[backup]`, `[query]`, `[compat]`,
+`[explorer]`) stay private to their owning binary.
+[ADR-0015](0015-unified-phase-driven-ingest.md) collapses the earlier
+`[backfill]` and `[tip_follow]` writer-side splits into the
+sub-sectioned `[ingest.phases]`, `[ingest.bulk_catchup]`,
+`[ingest.tip_follow]`, and `[ingest.modifiers]` schema, and adds a
+new shared `[node.health]` sub-section on the existing `[node]`
+schema so the upstream-health knobs are operator-readable from every
+binary that wants them.
 
 ### Defaults
 

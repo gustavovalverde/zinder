@@ -65,4 +65,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9105/readyz || exit 1
 
 ENTRYPOINT ["zinder-ingest"]
-CMD ["tip-follow", "--config", "/etc/zinder/config.toml"]
+CMD ["--config", "/etc/zinder/config.toml"]

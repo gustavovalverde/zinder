@@ -12,13 +12,16 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
-    NodeAuth, NodeCapability, NodeSource, SourceError, TransactionBroadcaster, ZebraJsonRpcSource,
+    NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceError, TransactionBroadcaster,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
+    UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
     decode_display_block_hash,
 };
 use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
 #[tokio::test]
-async fn fetch_block_by_height_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
+async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
         method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
@@ -44,7 +47,7 @@ async fn fetch_block_by_height_uses_expected_json_rpc_methods_and_basic_auth() -
         Duration::from_secs(5),
     )?;
 
-    let source_block = source.fetch_block_by_height(BlockHeight::new(1)).await?;
+    let source_block = source.fetch_block_at(BlockHeight::new(1)).await?;
     let requests = server.requests()?;
 
     assert_eq!(source_block.height, BlockHeight::new(1));
@@ -103,7 +106,7 @@ async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> e
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -140,7 +143,7 @@ async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> e
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -169,7 +172,7 @@ async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()>
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -336,7 +339,7 @@ async fn header_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> 
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -376,7 +379,7 @@ async fn header_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -415,7 +418,7 @@ async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -452,7 +455,7 @@ async fn tree_state_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -489,7 +492,7 @@ async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<
         Duration::from_secs(5),
     )?;
 
-    let error = match source.fetch_block_by_height(BlockHeight::new(1)).await {
+    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
             return Err(eyre!("expected fetch error, got {source_block:?}"));
         }
@@ -1134,4 +1137,195 @@ fn string_field<'fixture>(
         .get(field_name)
         .and_then(Value::as_str)
         .ok_or_else(|| eyre!("fixture field {field_name} must be a string"))
+}
+
+#[tokio::test]
+async fn poll_upstream_health_falls_back_to_verification_progress() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 50,
+            "estimatedheight": 1_000,
+            "verificationprogress": 0.5,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let snapshot = source.poll_upstream_health().await?;
+    assert!(!snapshot.ready_for_queries);
+    assert_eq!(
+        snapshot.source,
+        UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK
+    );
+    assert_eq!(
+        snapshot.reason.as_ref(),
+        UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR
+    );
+    assert_eq!(snapshot.upstream_committed_height, Some(50));
+    assert_eq!(snapshot.upstream_estimated_height, Some(1_000));
+    assert_eq!(snapshot.upstream_verification_progress, Some(0.5));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_upstream_health_flags_estimated_gap_when_progress_is_above_floor() -> eyre::Result<()>
+{
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 100,
+            "estimatedheight": 200,
+            "verificationprogress": 0.9995,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let snapshot = source.poll_upstream_health().await?;
+    assert!(!snapshot.ready_for_queries);
+    assert_eq!(
+        snapshot.reason.as_ref(),
+        UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR
+    );
+    assert_eq!(snapshot.upstream_committed_height, Some(100));
+    assert_eq!(snapshot.upstream_estimated_height, Some(200));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_upstream_health_reports_ready_when_progress_and_gap_within_floors() -> eyre::Result<()>
+{
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 2_500_000,
+            "estimatedheight": 2_500_005,
+            "verificationprogress": 0.9999,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let snapshot = source.poll_upstream_health().await?;
+    assert!(snapshot.ready_for_queries);
+    assert_eq!(
+        snapshot.source,
+        UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK
+    );
+    assert_eq!(snapshot.upstream_committed_height, Some(2_500_000));
+    assert_eq!(snapshot.upstream_estimated_height, Some(2_500_005));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 50,
+            "estimatedheight": 1_000,
+            "verificationprogress": 0.4,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    // Point the health probe at a port that nothing listens on so the
+    // first call errors out and the source falls back to the JSON-RPC
+    // path within the same `poll_upstream_health` invocation.
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?
+    .with_health_config(Some(NodeHealthConfig::new(
+        "http://127.0.0.1:1/ready".to_owned(),
+        Duration::from_millis(500),
+        0.999,
+        10,
+    )));
+
+    let snapshot = source.poll_upstream_health().await?;
+    assert!(!snapshot.ready_for_queries);
+    assert_eq!(
+        snapshot.source,
+        UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK
+    );
+    assert_eq!(snapshot.upstream_committed_height, Some(50));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_upstream_health_uses_ready_endpoint_when_configured() -> eyre::Result<()> {
+    use std::net::SocketAddr;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let bound: SocketAddr = listener.local_addr()?;
+    let accept_handle = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| eyre!("accept failed: {error}"))?;
+        let mut request_buffer = [0_u8; 1024];
+        let _bytes_read = stream
+            .read(&mut request_buffer)
+            .await
+            .map_err(|error| eyre!("request read failed: {error}"))?;
+        stream
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Content-Length: 18\r\n\
+                  Content-Type: text/plain\r\n\
+                  Connection: close\r\n\
+                  \r\n\
+                  insufficient peers",
+            )
+            .await
+            .map_err(|error| eyre!("response write failed: {error}"))?;
+        stream
+            .shutdown()
+            .await
+            .map_err(|error| eyre!("stream shutdown failed: {error}"))?;
+        Ok::<(), eyre::Report>(())
+    });
+
+    let json_rpc_server = JsonRpcTestServer::start(Vec::<zinder_testkit::JsonRpcStub>::new())?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        json_rpc_server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?
+    .with_health_config(Some(NodeHealthConfig::new(
+        format!("http://{bound}/ready"),
+        Duration::from_secs(5),
+        0.999,
+        10,
+    )));
+
+    let snapshot = source.poll_upstream_health().await?;
+    accept_handle
+        .await
+        .map_err(|error| eyre!("ready endpoint task panicked: {error}"))??;
+
+    assert!(!snapshot.ready_for_queries);
+    assert_eq!(snapshot.source, "zebra_ready_endpoint");
+    assert_eq!(snapshot.reason.as_ref(), "insufficient peers");
+    Ok(())
 }

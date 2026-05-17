@@ -24,10 +24,13 @@ use zinder_core::{
 };
 
 use crate::{
-    CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
-    SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
-    TransactionBroadcaster, decode_display_block_hash,
-    source_block::wire_error_to_transaction_id_error,
+    CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
+    NodeSource, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoot,
+    SourceSubtreeRoots, TransactionBroadcaster, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
+    UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
+    decode_display_block_hash, source_block::wire_error_to_transaction_id_error,
+    zebra_ready_endpoint::ZebraReadyClient,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -72,6 +75,26 @@ fn default_zebra_capabilities() -> NodeCapabilities {
     ])
 }
 
+/// Returns `capabilities` with [`NodeCapability::ReadinessProbe`] added when
+/// `enabled` is true, or with it cleared otherwise.
+///
+/// Operators opt in to the probe by setting `[node.health].addr`; sources
+/// without that configuration must not advertise the capability because
+/// the background probe is the only mechanism that exercises it.
+fn with_readiness_probe_capability(
+    capabilities: NodeCapabilities,
+    enabled: bool,
+) -> NodeCapabilities {
+    let mut entries: Vec<NodeCapability> = capabilities
+        .iter()
+        .filter(|capability| *capability != NodeCapability::ReadinessProbe)
+        .collect();
+    if enabled {
+        entries.push(NodeCapability::ReadinessProbe);
+    }
+    NodeCapabilities::from_trusted(entries)
+}
+
 /// Default maximum JSON-RPC response body size.
 pub const DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES: NonZeroU64 =
     NonZeroU64::MIN.saturating_add((16 * 1024 * 1024) - 1);
@@ -89,6 +112,8 @@ pub struct ZebraJsonRpcSource {
     network: Network,
     client: HttpClient,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
+    health_config: Option<NodeHealthConfig>,
+    ready_http_client: Option<ZebraReadyClient>,
 }
 
 /// Runtime options for [`ZebraJsonRpcSource`].
@@ -286,7 +311,7 @@ impl ZebraJsonRpcSource {
             .await;
         record_json_rpc_client_result("rpc.discover", started_at, &response_body);
 
-        let probed_capabilities = match response_body {
+        let json_rpc_capabilities = match response_body {
             Ok(openrpc_response) => parse_openrpc_capabilities(&openrpc_response),
             Err(probe_error) => {
                 tracing::warn!(
@@ -299,6 +324,8 @@ impl ZebraJsonRpcSource {
             }
         };
 
+        let probed_capabilities =
+            with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
         *self.cached_capabilities.lock() = probed_capabilities;
         Ok(probed_capabilities)
     }
@@ -347,7 +374,32 @@ impl ZebraJsonRpcSource {
             network,
             client,
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
+            health_config: None,
+            ready_http_client: None,
         })
+    }
+
+    /// Installs the upstream-health probe configuration.
+    ///
+    /// Pass the resolved [`NodeHealthConfig`] from
+    /// [`NodeTarget::health`](crate::NodeTarget::health). With it set, the
+    /// trait method [`NodeSource::poll_upstream_health`] hits Zebra's
+    /// `/ready` endpoint; without it, the same method falls back to
+    /// `getblockchaininfo.verificationprogress` per
+    /// [ADR-0015 §Upstream sync detection].
+    ///
+    /// [ADR-0015 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    #[must_use]
+    pub fn with_health_config(mut self, health_config: Option<NodeHealthConfig>) -> Self {
+        self.ready_http_client = health_config
+            .as_ref()
+            .map(|config| ZebraReadyClient::new(config.poll_interval));
+        self.health_config = health_config;
+        let mut cache = self.cached_capabilities.lock();
+        *cache = with_readiness_probe_capability(*cache, self.health_config.is_some());
+        drop(cache);
+        self
     }
 
     async fn call_typed<Response>(
@@ -509,7 +561,7 @@ impl NodeSource for ZebraJsonRpcSource {
         *self.cached_capabilities.lock()
     }
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
             height,
             reason: error.message,
@@ -682,6 +734,84 @@ impl NodeSource for ZebraJsonRpcSource {
         Ok(ChainValuePools::new(
             BlockHeight::new(blockchain_info.blocks),
             pools,
+        ))
+    }
+
+    async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
+        if let (Some(config), Some(client)) =
+            (self.health_config.as_ref(), self.ready_http_client.as_ref())
+        {
+            match client.probe(&config.addr).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "zinder::source",
+                        event = "upstream_health_endpoint_unreachable",
+                        addr = config.addr.as_str(),
+                        reason = %error,
+                        "ready endpoint probe failed; falling back to verificationprogress"
+                    );
+                }
+            }
+        }
+
+        self.poll_upstream_health_from_blockchain_info().await
+    }
+}
+
+impl ZebraJsonRpcSource {
+    async fn poll_upstream_health_from_blockchain_info(
+        &self,
+    ) -> Result<UpstreamHealthSnapshot, SourceError> {
+        let snapshot_fields: ZebraGetBlockchainInfoHealth = self
+            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
+                SourceError::NodeUnavailable {
+                    reason: error.message,
+                }
+            })
+            .await?;
+
+        let (progress_floor, gap_floor) =
+            self.health_config
+                .as_ref()
+                .map_or(NodeHealthConfig::default_floors(), |config| {
+                    (
+                        config.verification_progress_floor,
+                        config.estimated_gap_floor_blocks,
+                    )
+                });
+
+        let progress = snapshot_fields.verification_progress;
+        let committed = snapshot_fields.blocks;
+        let estimated = snapshot_fields.estimated_height.unwrap_or(committed);
+        let gap = estimated.saturating_sub(committed);
+
+        if let Some(progress_value) = progress
+            && progress_value < progress_floor
+        {
+            return Ok(UpstreamHealthSnapshot::not_ready(
+                UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
+                UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
+                Some(committed),
+                Some(estimated),
+                progress,
+            ));
+        }
+        if gap > gap_floor {
+            return Ok(UpstreamHealthSnapshot::not_ready(
+                UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
+                UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+                Some(committed),
+                Some(estimated),
+                progress,
+            ));
+        }
+
+        Ok(UpstreamHealthSnapshot::ready(
+            UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
+            Some(committed),
+            Some(estimated),
+            progress,
         ))
     }
 }
@@ -1127,6 +1257,15 @@ struct ZebraGetBlockchainInfoValuePools {
 }
 
 #[derive(Deserialize)]
+struct ZebraGetBlockchainInfoHealth {
+    blocks: u32,
+    #[serde(rename = "estimatedheight", default)]
+    estimated_height: Option<u32>,
+    #[serde(rename = "verificationprogress", default)]
+    verification_progress: Option<f64>,
+}
+
+#[derive(Deserialize)]
 struct ZebraValuePoolEntry {
     id: String,
     monitored: bool,
@@ -1208,6 +1347,58 @@ mod tests {
             Duration::from_secs(1),
         )?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_capabilities_omit_readiness_probe() {
+        assert!(
+            !ZebraJsonRpcSource::baseline_capabilities().supports(NodeCapability::ReadinessProbe)
+        );
+    }
+
+    #[test]
+    fn with_health_config_grants_readiness_probe_capability() -> Result<(), SourceError> {
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?
+        .with_health_config(Some(NodeHealthConfig::new(
+            "http://127.0.0.1:18233/ready".to_owned(),
+            Duration::from_secs(30),
+            0.999,
+            10,
+        )));
+        assert!(
+            source
+                .capabilities()
+                .supports(NodeCapability::ReadinessProbe)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_health_config_clears_readiness_probe_when_unset() -> Result<(), SourceError> {
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?
+        .with_health_config(Some(NodeHealthConfig::new(
+            "http://127.0.0.1:18233/ready".to_owned(),
+            Duration::from_secs(30),
+            0.999,
+            10,
+        )))
+        .with_health_config(None);
+        assert!(
+            !source
+                .capabilities()
+                .supports(NodeCapability::ReadinessProbe)
+        );
         Ok(())
     }
 }

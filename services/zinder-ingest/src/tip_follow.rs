@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::stream::StreamExt;
 use prost::Message;
@@ -23,11 +23,12 @@ use zinder_store::{
 
 use crate::chain_ingest::{
     ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
-    IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, next_chain_epoch_id_after, next_chain_epoch_id_from,
-    populate_subtree_root_artifacts, record_commit_outcome, select_best_chain,
+    IngestSubtreeRootIndexes, commit_ingest_batch, current_unix_millis, fetch_block_with_retry,
+    next_chain_epoch_id_after, next_chain_epoch_id_from, populate_subtree_root_artifacts,
+    record_commit_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
+use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
@@ -51,14 +52,10 @@ pub struct TipFollowConfig {
     /// Resolved upstream node endpoint (network, JSON-RPC URL, auth, timeout,
     /// response-size cap). See [`NodeTarget`].
     pub node: NodeTarget,
-    /// Upstream node source implementation.
-    pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
     /// Number of near-tip blocks that may be replaced by a reorg. Must be greater than zero.
     pub reorg_window_blocks: u32,
-    /// Maximum number of blocks committed in one chain epoch.
-    pub commit_batch_blocks: NonZeroU32,
     /// Delay between tip polls when no cancellation is requested. Must be greater than zero.
     pub poll_interval: Duration,
     /// Lag threshold (in blocks) below which tip-follow reports `Ready`.
@@ -342,14 +339,6 @@ fn set_tip_follow_node_unavailable(
         detail,
         current_chain_height(store),
     ));
-}
-
-fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
-    store
-        .current_chain_epoch()
-        .ok()
-        .flatten()
-        .map(|chain_epoch| chain_epoch.tip_height.value())
 }
 
 fn compute_tip_follow_readiness_state(
@@ -938,6 +927,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         error::Error,
+        num::NonZeroU32,
         path::Path,
         sync::{
             Arc,
@@ -970,7 +960,7 @@ mod tests {
     async fn tip_follow_commits_first_available_height() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-empty-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(3);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -999,7 +989,7 @@ mod tests {
     async fn tip_follow_skips_when_tip_hash_is_unchanged() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-unchanged-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1020,7 +1010,7 @@ mod tests {
     async fn tip_follow_extends_by_one_block() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-extend-store");
-        let mut config = test_tip_follow_config(&storage_path, 10)?;
+        let mut config = test_tip_follow_config(&storage_path, 10);
         config.poll_interval = Duration::from_millis(1);
         let source = TestNodeSource::linear(2);
         let store = PrimaryChainStore::open(
@@ -1051,7 +1041,7 @@ mod tests {
     async fn tip_follow_replaces_in_window_branch() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-reorg-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(2);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1085,7 +1075,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-rewind-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(2);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1123,7 +1113,7 @@ mod tests {
     async fn tip_follow_exits_after_cancellation() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-cancel-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1);
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
@@ -1139,7 +1129,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-tip-id-recovery-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1).with_retryable_tip_failures(10);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1182,7 +1172,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-block-fetch-recovery-store");
-        let config = test_tip_follow_config(&storage_path, 10)?;
+        let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1).with_retryable_block_failures(10);
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1254,7 +1244,7 @@ mod tests {
     {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-readiness-ready-store");
-        let mut config = test_tip_follow_config(&storage_path, 10)?;
+        let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(2);
         let store = PrimaryChainStore::open(
@@ -1279,7 +1269,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-readiness-syncing-store");
-        let mut config = test_tip_follow_config(&storage_path, 10)?;
+        let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(10);
         let store = PrimaryChainStore::open(
@@ -1308,7 +1298,7 @@ mod tests {
     async fn readiness_state_reports_syncing_when_node_tip_rewinds() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("tip-follow-readiness-rewind-store");
-        let mut config = test_tip_follow_config(&storage_path, 10)?;
+        let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(2);
         let store = PrimaryChainStore::open(
@@ -1333,11 +1323,8 @@ mod tests {
         Ok(())
     }
 
-    fn test_tip_follow_config(
-        storage_path: &Path,
-        reorg_window_blocks: u32,
-    ) -> Result<TipFollowConfig, Box<dyn Error>> {
-        Ok(TipFollowConfig {
+    fn test_tip_follow_config(storage_path: &Path, reorg_window_blocks: u32) -> TipFollowConfig {
+        TipFollowConfig {
             node: NodeTarget::new(
                 Network::ZcashRegtest,
                 "http://127.0.0.1:39232".to_owned(),
@@ -1345,13 +1332,11 @@ mod tests {
                 Duration::from_secs(30),
                 zinder_source::DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
             ),
-            node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
             reorg_window_blocks,
-            commit_batch_blocks: NonZeroU32::new(1).ok_or("invalid batch size")?,
             poll_interval: Duration::from_millis(1),
             lag_threshold_blocks: super::DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-        })
+        }
     }
 
     async fn test_tip_follow_once(
@@ -1436,10 +1421,7 @@ mod tests {
             ZebraJsonRpcSource::baseline_capabilities()
         }
 
-        async fn fetch_block_by_height(
-            &self,
-            height: BlockHeight,
-        ) -> Result<SourceBlock, SourceError> {
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             if consume_retryable_failure(&self.block_failures_remaining) {
                 return Err(SourceError::BlockUnavailable {
                     height,

@@ -34,14 +34,20 @@ Transaction broadcast is the explicit exception to the read-path rule: wallets m
 
 The canonical trait name is `NodeSource`. It is the upstream dependency boundary: every adapter for Zebra, zcashd, or a future streaming source implements it, and ingest depends only on the trait, not on adapter internals.
 
-The trait is async, sized for backfill and polling tip-following:
+The trait is async, sized for the unified ingest loop's pipelined bulk-catchup and serial tip-follow phases:
 
 ```rust
 #[async_trait::async_trait]
 pub trait NodeSource: Send + Sync + 'static {
     fn capabilities(&self) -> NodeCapabilities;
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+
+    async fn stream_block_range(
+        &self,
+        range: BlockHeightRange,
+        options: BlockStreamOptions,
+    ) -> Result<BoxStream<'_, Result<SourceBlock, SourceError>>, SourceError>;
 
     async fn tip_id(&self) -> Result<BlockId, SourceError>;
 
@@ -54,9 +60,9 @@ pub trait NodeSource: Send + Sync + 'static {
 }
 ```
 
-`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
+`fetch_block_at` and `stream_block_range` pair as point-vs-range. The bulk-catchup phase of the unified ingest loop ([ADR-0015](../adrs/0015-unified-phase-driven-ingest.md)) always calls `stream_block_range`; backends that lack native streaming use the default impl that fans `fetch_block_at` through `.buffered(N)`. Backends that stream natively implement `stream_block_range` directly and let the default `fetch_block_at` reduce to a one-element stream. Tip-follow and reorg-ancestor traversal always use `fetch_block_at` because random access at the live edge is the natural shape. The capability dispatch, throughput analysis, and backend roll-out are decided in [ADR-0016](../adrs/0016-source-streaming-pipeline.md).
 
-A streaming follower with explicit source observations, resume cursors, and interruption reasons is an open extension: when a streaming backend lands, the trait gains a backpressure-aware streaming method and the corresponding event and cursor types appear in `zinder-source`. Until then, ingest drives the source through async polling calls.
+`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
 
 Transaction broadcast uses a separate boundary because it is a command, not a chain observation stream:
 
@@ -82,7 +88,7 @@ config -> SourceFactory -> DynNodeSource -> ingest runner
 
 The ingest state machine does not depend on dynamic dispatch just because runtime configuration needs it at the edge. Static dispatch keeps tests simple, avoids unnecessary allocation on hot paths, and gives Rust better type information.
 
-`zinder-ingest` follows this boundary by making the library backfill and tip-follow runners take an injected `NodeSource`. The CLI binary owns the Zebra JSON-RPC factory because it is the runtime composition edge. Production-shaped tests use the same injection point instead of reaching into private `#[cfg(test)]` helpers.
+`zinder-ingest` follows this boundary by making the unified ingest loop take an injected `NodeSource`. The CLI binary owns the Zebra JSON-RPC factory because it is the runtime composition edge. Production-shaped tests use the same injection point instead of reaching into private `#[cfg(test)]` helpers.
 
 ## Capability Model
 
@@ -224,6 +230,117 @@ Readiness carries operator-useful detail:
 }
 ```
 
+## Upstream Platform Bindings
+
+`NodeSource` is the Rust shape. In production every `NodeSource`
+implementation lives inside an *upstream platform binding*: a bundle
+of node binary, authentication mechanism, networking contract, and
+operational packaging that wraps the node. The binding is the unit
+operators install, not the trait.
+
+The binding model is what survives when Z3 evolves, when alternative
+platforms appear, and when in-process integration lands
+(see [ADR-0016 §Phase 3](../adrs/0016-source-streaming-pipeline.md#phase-3-in-process-backend)).
+
+### The binding contract
+
+Every upstream-platform binding fulfils three required sub-contracts
+and one optional one.
+
+**Chain-source contract (required).** The binding must surface a
+`NodeSource` implementation reachable from Zinder. The binding
+declares:
+
+- Node endpoint(s) per protocol (JSON-RPC, indexer gRPC, future
+  streaming RPCs from [ADR-0016 §Phase 2](../adrs/0016-source-streaming-pipeline.md#phase-2-native-streaming-backend)).
+- Authentication mechanism: cookie file path, basic-auth credentials,
+  or no auth for regtest/dev.
+- Per-network identity (`zcash-mainnet`, `zcash-testnet`,
+  `zcash-regtest`).
+
+Delivery mechanism is binding-specific: shared volumes, environment
+variables, container DNS, host networking, in-process function calls.
+
+**Identity contract (required).** The binding must establish
+operator-controllable identity for the node connection. Two
+production patterns:
+
+- *Cookie file in a shared volume.* The binding writes `.cookie` into
+  a volume Zinder mounts read-only. Rotation is implicit (cookie
+  regenerated on node restart). This is Z3's pattern.
+- *Operator-managed credentials.* The operator provisions a
+  username/password (or token) and feeds it to Zinder via env vars or
+  a secret file. Suitable for PaaS shapes where no shared volume
+  exists.
+
+The contract is the binding's promise that the credential at the
+named path works against the named endpoint across the node's
+lifecycle.
+
+**Discovery contract (required).** The binding declares the names
+operators and Zinder must agree on:
+
+- Network name (Docker network, Kubernetes namespace, host loopback):
+  where Zinder's containers must live to reach the node.
+- Container/service DNS: how to dial each platform service.
+- Per-network port matrix: testnet vs mainnet differences.
+
+The discovery contract is a published interface Zinder reads, not a
+configuration mechanism Zinder owns. Z3 publishes its contract at
+[`docs/contract.md`](https://github.com/ZcashFoundation/z3/blob/main/docs/contract.md);
+Zinder's compose substitutes against it.
+
+**Observability contract (optional).** The binding may provide
+shared Prometheus, Grafana, Jaeger, and Alertmanager pods for the
+node services it owns. Zinder does not require this contract to
+function; federation patterns are operator-driven and live in
+[Service operations §Observability Federation](service-operations.md#observability-federation).
+
+### Bindings shipped today
+
+| Binding | Status | Source | Deployment shape | Observability |
+|---|---|---|---|---|
+| `z3` | Production | [ZcashFoundation/z3](https://github.com/ZcashFoundation/z3) Zebra + Zaino + Zallet | Sibling Docker networks; shared cookie volume | Optional per-network profile |
+| `bare-zebra` | Supported | Operator-managed Zebra | Operator-defined; host networking common | Operator-managed |
+| `in-process` | [Future](../adrs/0016-source-streaming-pipeline.md#phase-3-in-process-backend) | Zebra-as-a-library | Single binary | N/A (single process owns both metric paths) |
+
+**Z3 binding.** Zinder's `deploy/docker-compose.yml` and
+`deploy/.env.{testnet,mainnet}` are calibrated for this binding:
+
+- The compose file declares `z3-${Z3_NETWORK_LOWER}` and
+  `z3-${Z3_NETWORK_LOWER}-cookie` as external Docker resources. Z3
+  owns their lifecycle; Zinder attaches.
+- Zinder dials the upstream node by container DNS
+  (`http://zebra:18232` testnet JSON-RPC, `http://zebra:8232` mainnet
+  JSON-RPC, etc.).
+- Cookie auth is the default and is read from
+  `/var/run/auth/.cookie` inside the Zinder containers, which mount
+  the Z3-published `z3-${network}-cookie` volume read-only.
+
+**Bare-Zebra binding.** For operators who run Zebra themselves
+(systemd unit, hand-managed container, build from source). Same
+contract, no platform packaging. The operator publishes the node
+endpoint, points Zinder at a cookie file or basic-auth creds, chooses
+the network topology, and runs whatever observability they already
+have. The [VM runbook](../runbooks/deploying-on-a-vm.md) and
+[Railway runbook](../runbooks/deploying-on-railway.md) cover this
+binding.
+
+**In-process binding (future).** Zinder runs as a library inside the
+Zebra binary, calling `zebra_state::ReadStateService` directly. No
+network, no authentication, no discovery. The binding is "you compile
+them together."
+
+### Binding-naming conventions
+
+| Name | Role | Rationale |
+|---|---|---|
+| `upstream platform binding` | Concept noun | "Upstream" is Zinder's perspective (the node feeds Zinder); "platform" names what wraps the node; "binding" names the operator-side attachment. The phrase reads end-to-end and avoids overloaded words like "stack" or "deployment". |
+| `chain-source contract` | Sub-contract | Names what the platform provides (a node) and what Zinder uses (a `NodeSource`). |
+| `identity contract` | Sub-contract | "Identity" is broader than "auth": it covers cookie, basic creds, future token shapes, and the no-auth dev case. |
+| `discovery contract` | Sub-contract | The platform publishes the names; operators do not invent them. |
+| `observability contract` | Optional sub-contract | Explicit about its optional status. |
+
 ## Review Checklist
 
 A change touching upstream-node access is not ready unless:
@@ -235,3 +352,6 @@ A change touching upstream-node access is not ready unless:
 - Tests include a deterministic fake source from `zinder-testkit`.
 - No query path calls an upstream node directly.
 - No ingest artifact builder hand-parses consensus-critical bytes.
+- A new platform binding declares all three required sub-contracts
+  (chain-source, identity, discovery) and is listed in
+  §Bindings shipped today.

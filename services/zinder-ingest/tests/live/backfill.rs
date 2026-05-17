@@ -11,7 +11,7 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange,
 };
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
@@ -47,10 +47,9 @@ async fn backfills_initial_range() -> Result<()> {
         true,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
-    let BackfillOutcome::Committed(commit_outcome) = backfill(&backfill_config, &source).await?
-    else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    let commit_outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
     assert_eq!(commit_outcome.chain_epoch.network, env.network());
     assert_eq!(commit_outcome.chain_epoch.tip_height, to_height);
@@ -123,8 +122,10 @@ async fn backfills_from_checkpoint() -> Result<()> {
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
 
-    let outcome = backfill(&backfill_config, &source).await?;
-    let chain_epoch = outcome.chain_epoch();
+    let commit_outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed checkpoint backfill outcome"))?;
+    let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
     assert_eq!(chain_epoch.finalized_height, tip_height);
@@ -211,9 +212,11 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     backfill_config.checkpoint = Some(checkpoint);
 
     let backfill_started_at = std::time::Instant::now();
-    let outcome = backfill(&backfill_config, &source).await?;
+    let commit_outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed mainnet calibration outcome"))?;
     let backfill_seconds = backfill_started_at.elapsed().as_secs();
-    let chain_epoch = outcome.chain_epoch();
+    let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
 

@@ -28,9 +28,7 @@ use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_core::{BlockHeight, Network};
-use zinder_ingest::{
-    BackfillOutcome, IngestControlGrpcAdapter, backfill, tip_follow_with_primary_store,
-};
+use zinder_ingest::{IngestControlGrpcAdapter, backfill, tip_follow_with_primary_store};
 use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
     wallet::{
@@ -112,10 +110,9 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         true,
     );
     let backfill_source = zebra_source_from_backfill(&backfill_config)?;
-    let BackfillOutcome::Committed(_outcome) = backfill(&backfill_config, &backfill_source).await?
-    else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &backfill_source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
     // Phase 2: open the store and the tip-follow loop on top of the
     // populated state. Tip-follow now only has to absorb the
@@ -126,7 +123,6 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         &env,
         &storage_path,
         TIP_FOLLOW_REORG_WINDOW_BLOCKS,
-        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid tip-follow batch size"))?,
         TIP_FOLLOW_POLL_INTERVAL,
     );
     let tip_follow_source = zebra_source_from_tip_follow(&tip_follow_config)?;

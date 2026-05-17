@@ -120,7 +120,7 @@ async fn fetch_tip_coinbase(
     json_rpc: &ZebraJsonRpcSource,
     tip_height: BlockHeight,
 ) -> Result<ZebraCoinbase> {
-    let source_block = json_rpc.fetch_block_by_height(tip_height).await?;
+    let source_block = json_rpc.fetch_block_at(tip_height).await?;
     let parsed_block: ZebraBlock = source_block
         .raw_block_bytes
         .as_slice()
@@ -306,7 +306,7 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
 
     let json_rpc = json_rpc_source(&env)?;
     let tip_id = NodeSource::tip_id(&json_rpc).await?;
-    let coinbase_block = json_rpc.fetch_block_by_height(tip_id.height).await?;
+    let coinbase_block = json_rpc.fetch_block_at(tip_id.height).await?;
     let parsed_block: zebra_chain::block::Block = coinbase_block
         .raw_block_bytes
         .as_slice()
@@ -492,13 +492,8 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     // tip-follow once with a short cancellation to seed the store.
     let tempdir = tempfile::tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
-    let tip_follow_config = live_tip_follow_config(
-        &env,
-        &storage_path,
-        100,
-        std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid test batch size"))?,
-        Duration::from_millis(200),
-    );
+    let tip_follow_config =
+        live_tip_follow_config(&env, &storage_path, 100, Duration::from_millis(200));
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

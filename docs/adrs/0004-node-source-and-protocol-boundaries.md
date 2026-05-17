@@ -43,14 +43,20 @@ OpenRPC is not part of v1. If Zinder later exposes a JSON-RPC server, OpenRPC is
 
 ## Rust API Shape
 
-The `NodeSource` trait is async, sized for backfill and tip-following:
+The `NodeSource` trait is async, sized for the unified ingest loop's bulk-catchup and tip-follow phases (see [ADR-0015](0015-unified-phase-driven-ingest.md)). The streaming method and capability dispatch are decided in [ADR-0016](0016-source-streaming-pipeline.md).
 
 ```rust
 #[async_trait::async_trait]
 pub trait NodeSource: Send + Sync + 'static {
     fn capabilities(&self) -> NodeCapabilities;
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+
+    async fn stream_block_range(
+        &self,
+        range: BlockHeightRange,
+        options: BlockStreamOptions,
+    ) -> Result<BoxStream<'_, Result<SourceBlock, SourceError>>, SourceError>;
 
     async fn tip_id(&self) -> Result<BlockId, SourceError>;
 

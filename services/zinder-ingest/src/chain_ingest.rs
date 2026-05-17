@@ -415,7 +415,7 @@ where
         format!("fetch block at height {}", height.value()),
         request_timeout,
         retry_state,
-        || async { source.fetch_block_by_height(height).await },
+        || async { source.fetch_block_at(height).await },
     )
     .await;
     record_ingest_source_outcome("fetch_block", started_at, &source_outcome);

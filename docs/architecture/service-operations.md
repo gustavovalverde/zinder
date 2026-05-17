@@ -47,6 +47,7 @@ Required readiness causes:
 - `ready` — every required capability is wired and the visible epoch is current within tolerance
 - `node_unavailable` — the configured upstream node cannot answer or reports its own not-ready state
 - `node_capability_missing` — the upstream node is reachable but lacks a required capability (see [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) and [Node source boundary §Capability Model](node-source-boundary.md#capability-model))
+- `upstream_not_ready` — the configured upstream node is reachable but reports itself as not at the network tip; sourced from Zebra's `/ready` endpoint when `[node.health].addr` is configured, or from `getblockchaininfo.verificationprogress` + `estimatedheight` as the fallback. Carries the structured payload `{ upstream_committed_height, upstream_estimated_height, upstream_verification_progress, upstream_health.source, upstream_health.reason }`. See [ADR-0015 §Upstream sync detection](../adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection)
 - `storage_unavailable` — canonical RocksDB cannot answer or has lost the visible epoch pointer
 - `schema_mismatch` — Zinder's expected schema version differs from the persisted store's schema fingerprint
 - `reorg_window_exceeded` — the selected branch requires replacing data outside the configured reorg window; operator action required
@@ -62,7 +63,7 @@ Required readiness causes:
 
 `zinder-ingest` readiness is capped by upstream node readiness. If the selected upstream node cannot answer, reports not ready, lacks a required capability, or has unreadable cookie-auth material, Zinder reports a typed not-ready cause instead of accepting traffic.
 
-In long-running ingest modes, every source-shaped failure is a readiness transition, not a process exit. The writer loops (`tip-follow`, `backfill-until-complete`, `mempool-orchestrator`, the chain-tip re-subscriber) consult `services/zinder-ingest/src/source_recovery.rs::decide_recovery` on every iteration; source errors recover with a backoff selected by failure class, storage and reorg-window failures exit. The `node_unavailable` readiness cause carries a structured `NodeUnavailableDetail` payload (`failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`) so operators can triage from `/readyz` without consulting logs. The full failure-class operator table lives in [Node source boundary](node-source-boundary.md#capability-model); the architectural decision is recorded in [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
+Every source-shaped failure inside the long-running writer is a readiness transition, not a process exit. The writer loop and its siblings (the unified ingest loop, the mempool orchestrator, the chain-tip re-subscriber) consult `services/zinder-ingest/src/source_recovery.rs::decide_recovery` on every iteration; source errors recover with a backoff selected by failure class, storage and reorg-window failures exit. The `node_unavailable` readiness cause carries a structured `NodeUnavailableDetail` payload (`failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`) so operators can triage from `/readyz` without consulting logs. The full failure-class operator table lives in [Node source boundary](node-source-boundary.md#capability-model); the architectural decision is recorded in [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
 
 ## Shutdown
 
@@ -157,9 +158,10 @@ generates native and compatibility gRPC traffic, and writes readiness reports
 under `.tmp/observability/reports`.
 
 The readiness report is the durable baseline artifact. It records the selected
-network, upstream node tip, checkpoint height, backfill range and duration, wallet
-query p95, source RPC p95, store read p95, secondary catchup p95, RocksDB
-compaction gauges, readiness lag, replica lag, and backup-restore outcome. Use
+network, upstream node tip, checkpoint height, bulk-catchup range and duration,
+wallet query p95, source RPC p95, store read p95, secondary catchup p95,
+RocksDB compaction gauges, readiness lag, replica lag, and backup-restore
+outcome. Use
 `scripts/observability-smoke.sh calibrate` for repeated runs that aggregate P50,
 P95, P99, and worst-case values before updating performance-budget tables.
 
@@ -208,6 +210,77 @@ P95, P99, and worst-case values before updating performance-budget tables.
 - Sink write latency.
 - Failed artifact count by cause.
 
+## Observability Federation
+
+Zinder ships its own observability stack and never assumes the
+upstream platform's observability is present. Federation across the
+two stacks is operator-driven, not contract-driven.
+
+### Ownership boundary
+
+The boundary mirrors the code boundary. Zinder owns Zinder's
+metrics; the upstream platform (see [Node source boundary §Upstream Platform Bindings](node-source-boundary.md#upstream-platform-bindings))
+owns the platform's metrics. Both ship standalone-functional
+observability.
+
+### What Zinder ships
+
+`deploy/docker-compose.yml` includes a `zinder-prometheus` service
+that scrapes `zinder-ingest:9105` and `zinder-query:9106` over a
+Zinder-owned Docker network (`zinder-observability`). The service
+is always on: it comes up with every `docker compose up -d`. It
+does not depend on whether the platform's observability is
+enabled, on whether the platform exists at all, or on which
+binding the operator chose. Metrics collection is continuous for
+the life of the deployment.
+
+A `zinder-grafana` service ships behind `--profile observability`.
+It is opt-in because many operators feed Zinder's metrics into a
+sibling Grafana (the platform's, the company-wide one, Grafana
+Cloud) and do not want a second one. The minimum guarantee is
+"metrics are always collected"; the bonus is "and visualised if
+you want."
+
+The Grafana provisioning under `observability/grafana/` is shared
+between the deploy-mode observability and the smoke-mode
+observability documented in
+[`observability/README.md`](../../observability/README.md). The
+dashboards are agnostic to whether the metrics come from
+local-binary smoke or compose-attached deploy.
+
+### Federation patterns
+
+When operators want a single Grafana for everything, they have
+three choices, none of which require code changes in Zinder:
+
+1. **Cross-data-source Grafana.** Add Zinder's `zinder-prometheus`
+   as an additional data source in the platform's Grafana. Both
+   data sources live side by side; dashboards pick whichever one
+   carries the series. Lowest-friction; operator action is a
+   single Grafana datasource config.
+2. **Prometheus federation.** Configure the platform's Prometheus
+   to scrape Zinder's Prometheus via `/federate`. All Zinder
+   metrics land in the platform's TSDB. Suitable for operators who
+   want a single Prometheus to query against.
+3. **Remote-write to an external sink.** Configure either
+   Prometheus instance to remote-write to Grafana Cloud, Cortex,
+   Mimir, or Thanos. Suitable for multi-environment fleets.
+
+The architectural commitment is that Zinder's observability stays
+standalone-functional regardless of which (if any) federation
+pattern the operator picks.
+
+### What the upstream platform must not assume
+
+A platform binding must not assume Zinder's metrics will appear
+in the platform's observability stack. A platform dashboard that
+depends on Zinder metric series will break for operators who do
+not federate. Zinder reserves the right to evolve its metric
+label vocabulary (subject to
+[Public interfaces](public-interfaces.md) review), and federation
+makes that evolution visible to the platform stack. Cross-stack
+coupling is operator-owned, not contract-owned.
+
 ## Logs
 
 Logs should be structured. Production binaries use the `tracing` ecosystem with a `tracing-subscriber` layer that writes to stderr. The default level is `info`, overridable through `RUST_LOG` (the standard `EnvFilter` directive grammar).
@@ -233,22 +306,22 @@ Configuration output must make redaction observable. If `--print-config` include
 
 ### Ingest event vocabulary
 
-`zinder-ingest` emits one structured tracing event for every successful chain-epoch commit, keyed on the `event` field. Operators can filter the stream by `event` without parsing the human-readable message:
+`zinder-ingest` emits one structured tracing event for every successful chain-epoch commit and every phase transition, keyed on the `event` field. Operators can filter the stream by `event` without parsing the human-readable message:
 
 | `event`                       | Level  | Triggered by                                     |
 | ----------------------------- | ------ | ------------------------------------------------ |
 | `chain_committed`             | INFO   | Pure append, finalization advance, or any other transition that does not invalidate visible blocks |
 | `chain_reorged`               | WARN   | A non-finalized range is replaced by a new committed range inside the reorg window |
-| `tip_follow_started`          | INFO   | Tip-follow begins polling the upstream node tip   |
-| `tip_follow_source_unavailable` | WARN | Tip-follow observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `failure_class`) |
-| `tip_follow_source_recovered` | INFO   | Tip-follow recovered from `node_unavailable` and resumed normal readiness calculation |
-| `tip_follow_stopped`          | INFO   | Tip-follow exits because the cancellation token fired or a fatal error escaped the long-running loop |
-| `backfill_source_unavailable` | WARN   | Backfill observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `failure_class`) |
-| `backfill_source_recovered`   | INFO   | Backfill recovered from `node_unavailable` and completed the requested range |
-| `backfill_already_complete`   | INFO   | Requested backfill range is already covered by the current chain epoch |
-| `ingest_run_failed`           | ERROR  | A subcommand returned an error before successful exit |
+| `ingest_started`              | INFO   | The unified ingest loop begins (after store open and upstream probe) |
+| `ingest_phase_changed`        | INFO   | The loop's classifier moves between `awaiting_upstream`, `bulk_catchup`, and `following_tip`; carries `from`, `to`, `gap_blocks` |
+| `ingest_source_unavailable`   | WARN   | The loop observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `phase`, `failure_class`) |
+| `ingest_source_recovered`     | INFO   | The loop recovered from `node_unavailable` and resumed normal readiness calculation |
+| `ingest_upstream_not_ready`   | WARN   | Zebra's `/ready` probe (or the `verificationprogress` fallback) reports the upstream is itself syncing or stale; tagged with `source` (`zebra_ready_endpoint` or `verification_progress_fallback`) and `reason` |
+| `ingest_upstream_ready`       | INFO   | Upstream recovers from `upstream_not_ready` |
+| `ingest_stopped`              | INFO   | The loop exits because the cancellation token fired or a fatal error escaped |
+| `ingest_run_failed`           | ERROR  | The process returned an error before clean shutdown |
 
-`chain_committed` carries `chain_epoch_id`, `network`, `tip_height`, `tip_hash`, `finalized_height`, `block_range_start`, `block_range_end`, and `event_sequence`. `chain_reorged` extends that schema with `committed_block_range_start`, `committed_block_range_end`, `reverted_block_range_start`, and `reverted_block_range_end`. `event_sequence` matches the monotonic chain-event sequence persisted by the store, so operators can correlate logs with `chain_event_history` cursor positions.
+`chain_committed` carries `chain_epoch_id`, `network`, `tip_height`, `tip_hash`, `finalized_height`, `block_range_start`, `block_range_end`, `event_sequence`, and `phase` (`bulk_catchup` or `following_tip`). `chain_reorged` extends that schema with `committed_block_range_start`, `committed_block_range_end`, `reverted_block_range_start`, and `reverted_block_range_end`. `event_sequence` matches the monotonic chain-event sequence persisted by the store, so operators can correlate logs with `chain_event_history` cursor positions.
 
 The two chain-transition event names (`chain_committed`, `chain_reorged`) match the `ChainEvent` variants defined in [chain events](chain-events.md). Future variants must extend this table before code emits them.
 
@@ -264,7 +337,7 @@ Production config should reject:
 - Unsafe debug endpoints.
 - Incompatible service and storage schema versions.
 - A secondary reader binary whose `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` is lower than the persisted store version (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)).
-- A `wallet-serving` backfill configuration that also enables `allow_near_tip_finalize` (per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md)).
+- A `wallet-serving` coverage configuration that also enables `allow_near_tip_finalize` (per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md)).
 
 Configuration precedence is:
 
@@ -293,29 +366,53 @@ Each production binary exposes `--config`, `--print-config`, and command-specifi
 
 Use typed configuration for valid combinations. For example, source authentication is an enum (`None`, `Cookie`, `Basic`) rather than a bool paired with optional credentials.
 
-`zinder-ingest tip-follow` uses the same source, storage, and ingest sections
-as backfill, plus a mode-specific `[tip_follow]` section:
+`zinder-ingest` reads `[network]`, `[node]` (with the optional
+`[node.health]` sub-section), `[storage]`, `[ingest_control]`,
+`[retention]`, and the `[ingest]` section with its four concern-named
+sub-sections. Per [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md)
+the binary picks its phase from the gap between Zinder's store and
+Zebra's tip, so there is no per-subcommand split:
 
 ```toml
 [ingest]
-reorg_window_blocks = 100
-commit_batch_blocks = 1
+reorg_window_blocks = 100        # chain-truth invariant
+
+[ingest.phases]
+catchup_threshold_blocks = 100   # defaults to ingest.reorg_window_blocks
+
+[ingest.bulk_catchup]
+commit_batch_blocks = 1000
+fetch_concurrency = 32
+
+[ingest.tip_follow]
+poll_interval_ms = 1000
+lag_threshold_blocks = 1
+
+[ingest.modifiers]
+# target_height = ...
+# checkpoint_height = ...
+# allow_near_tip_finalize = false
+# coverage = "explicit"
+
+[node.health]
+# addr = "http://zebra:8080"
+# poll_interval_ms = 30000
+# verification_progress_floor = 0.999
+# estimated_gap_floor_blocks = 10
 
 [ingest_control]
 listen_addr = "127.0.0.1:9100"
-
-[tip_follow]
-poll_interval_ms = 1000
 ```
 
-`poll_interval_ms` must be non-zero. Shutdown is driven by a
-`CancellationToken`; the CLI root token is cancelled on `ctrl-c`, and the loop
-checks the token through `tokio::select!` instead of polling a boolean flag.
+`ingest.tip_follow.poll_interval_ms` and `node.health.poll_interval_ms`
+must be non-zero. Shutdown is driven by a `CancellationToken`; the
+CLI root token is cancelled on `ctrl-c`, and the loop checks the
+token through `tokio::select!` instead of polling a boolean flag.
 
 `zinder-ingest backup --to <path>` uses `[network]` and `[storage]` plus a
-mode-specific `[backup] to_path` field when invoked through config. It opens the
-store as `PrimaryChainStore` and creates a RocksDB checkpoint; it does not
-connect to the upstream node.
+subcommand-specific `[backup] to_path` field when invoked through config. It
+opens the store as `PrimaryChainStore` and creates a RocksDB checkpoint; it
+does not connect to the upstream node.
 
 ## Recovery
 
@@ -353,7 +450,7 @@ The default Zallet deployment uses `zinder-client::RemoteChainIndex` over a
 separately run `zinder-query` process:
 
 ```text
-1 x zinder-ingest tip-follow
+1 x zinder-ingest
 1 x zinder-query
 1 x Zallet using RemoteChainIndex -> zinder-query
 ```

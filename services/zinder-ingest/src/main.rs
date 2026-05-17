@@ -4,27 +4,22 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::config::{
-    BackfillConfigOverrides, BackfillCoverage, BackupConfigOverrides, IngestConfigError,
-    TipFollowConfigOverrides,
-};
 use clap::{Parser, Subcommand};
-use std::sync::Arc;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
-
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_ingest::{
-    BackfillOutcome, IngestControlGrpcAdapter, IngestError, MempoolIndex,
-    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, backfill_until_complete,
-    mempool_ready_channel, open_tip_follow_store, run_mempool_orchestrator,
-    spawn_chain_event_retention_task, spawn_mempool_event_retention_task,
-    tip_follow_with_primary_store,
+    IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
+    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, TipFollowSubsystems,
+    TipFollowSubsystemsLauncher, classify_phase, current_chain_height, mempool_ready_channel,
+    run_ingest_loop, run_mempool_orchestrator, spawn_chain_event_retention_task,
+    spawn_mempool_event_retention_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
@@ -36,6 +31,11 @@ use zinder_source::{
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+
+use crate::config::{
+    BackupConfigOverrides, IngestCommandConfig, IngestConfigError, IngestConfigOverrides,
+    IngestCoverage,
+};
 
 mod cli;
 mod config;
@@ -62,121 +62,85 @@ struct Cli {
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr", global = true)]
     ops_listen_addr: Option<SocketAddr>,
+    /// Network name, such as zcash-regtest.
+    #[arg(long, global = true)]
+    network: Option<String>,
+    /// Upstream node source, currently zebra-json-rpc.
+    #[arg(long = "node-source", global = true)]
+    node_source: Option<String>,
+    /// Zebra JSON-RPC address.
+    #[arg(long = "json-rpc-addr", global = true)]
+    json_rpc_addr: Option<String>,
+    /// Node auth method, such as none, basic, or cookie.
+    #[arg(long = "node-auth-method", global = true)]
+    node_auth_method: Option<String>,
+    /// Node auth username when the method is basic.
+    #[arg(long = "node-auth-username", global = true)]
+    node_auth_username: Option<String>,
+    /// Node auth cookie path when the method is cookie.
+    #[arg(long = "node-auth-path", global = true)]
+    node_auth_path: Option<PathBuf>,
+    /// Canonical Zinder store path.
+    #[arg(long = "storage-path", global = true)]
+    storage_path: Option<PathBuf>,
+    /// Node request timeout in seconds.
+    #[arg(long = "request-timeout-secs", global = true)]
+    request_timeout_secs: Option<u64>,
+    /// Maximum JSON-RPC response body size in bytes.
+    #[arg(long = "max-response-bytes", global = true)]
+    max_response_bytes: Option<u64>,
+    /// Number of near-tip blocks that may be replaced by a reorg.
+    #[arg(long = "reorg-window-blocks", global = true)]
+    reorg_window_blocks: Option<u32>,
+    /// Phase-classifier boundary; gaps above this trigger `BulkCatchup`.
+    #[arg(long = "catchup-threshold-blocks", global = true)]
+    catchup_threshold_blocks: Option<u32>,
+    /// Maximum number of blocks committed in one bulk-catchup batch.
+    #[arg(long = "commit-batch-blocks", global = true)]
+    commit_batch_blocks: Option<u32>,
+    /// Number of concurrent block fetches in the pipelined bulk-catchup fetcher.
+    #[arg(long = "fetch-concurrency", global = true)]
+    fetch_concurrency: Option<u32>,
+    /// Delay between upstream node tip polls, in milliseconds.
+    #[arg(long = "poll-interval-ms", global = true)]
+    poll_interval_ms: Option<u64>,
+    /// Lag threshold (in blocks) below which tip-follow reports `Ready`.
+    #[arg(long = "lag-threshold-blocks", global = true)]
+    lag_threshold_blocks: Option<u64>,
+    /// Stop committing after reaching this height.
+    #[arg(long = "target-height", global = true)]
+    target_height: Option<u32>,
+    /// Bootstrap an empty store from the upstream node's chain state at
+    /// this height (the unified loop begins at `checkpoint_height + 1`).
+    #[arg(long = "checkpoint-height", global = true)]
+    checkpoint_height: Option<u32>,
+    /// Allow bulk-catchup batches to finalize blocks inside the upstream
+    /// node's reorg window. Disposable-store recovery only.
+    #[arg(long = "allow-near-tip-finalize", action = clap::ArgAction::SetTrue, global = true)]
+    allow_near_tip_finalize: bool,
+    /// Derive the bulk-catchup floor needed by lightwalletd-compatible
+    /// wallets from node-advertised activation heights.
+    #[arg(long = "wallet-serving", action = clap::ArgAction::SetTrue, global = true)]
+    wallet_serving: bool,
+    /// Private ingest-control gRPC listen address.
+    #[arg(long = "ingest-control-listen-addr", global = true)]
+    ingest_control_listen_addr: Option<SocketAddr>,
+    /// Path to a file containing the shared-secret bearer token enforced
+    /// by the ingest-control endpoint.
+    #[arg(long = "ingest-control-token-path", global = true)]
+    ingest_control_token_path: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Backfill a historical block height range that is already outside the reorg window.
-    Backfill(BackfillArgs),
-    /// Follow the upstream node tip and commit live chain changes.
-    TipFollow(TipFollowArgs),
+    /// Print store + upstream state, the phase the loop would run, and the
+    /// upstream-health snapshot, then exit. Diagnostic only; does not
+    /// open the store for writing.
+    Probe,
     /// Create a point-in-time `RocksDB` checkpoint of the canonical store.
     Backup(BackupArgs),
-}
-
-#[derive(Parser)]
-struct BackfillArgs {
-    /// Network name, such as zcash-regtest.
-    #[arg(long)]
-    network: Option<String>,
-    /// Upstream node source, currently zebra-json-rpc.
-    #[arg(long = "node-source")]
-    node_source: Option<String>,
-    /// Zebra JSON-RPC address.
-    #[arg(long = "json-rpc-addr")]
-    json_rpc_addr: Option<String>,
-    /// Node auth method, such as none, basic, or cookie.
-    #[arg(long = "node-auth-method")]
-    node_auth_method: Option<String>,
-    /// Node auth username when the method is basic.
-    #[arg(long = "node-auth-username")]
-    node_auth_username: Option<String>,
-    /// Node auth cookie path when the method is cookie.
-    #[arg(long = "node-auth-path")]
-    node_auth_path: Option<PathBuf>,
-    /// Canonical Zinder store path.
-    #[arg(long = "storage-path")]
-    storage_path: Option<PathBuf>,
-    /// First block height to backfill.
-    #[arg(long = "from-height")]
-    from_height: Option<u32>,
-    /// Last block height to backfill.
-    #[arg(long = "to-height")]
-    to_height: Option<u32>,
-    /// Node request timeout in seconds.
-    #[arg(long = "request-timeout-secs")]
-    request_timeout_secs: Option<u64>,
-    /// Maximum JSON-RPC response body size in bytes.
-    #[arg(long = "max-response-bytes")]
-    max_response_bytes: Option<u64>,
-    /// Maximum number of blocks committed in one chain epoch.
-    #[arg(long = "commit-batch-blocks")]
-    commit_batch_blocks: Option<u32>,
-    /// Allow finalizing blocks inside the upstream node's current reorg window.
-    #[arg(long = "allow-near-tip-finalize", action = clap::ArgAction::SetTrue)]
-    allow_near_tip_finalize: bool,
-    /// Bootstrap an empty store from the upstream node's chain state at this
-    /// height (`from_height` must equal `checkpoint_height + 1`). Reads at
-    /// heights below the checkpoint return `ArtifactUnavailable`.
-    #[arg(long = "checkpoint-height")]
-    checkpoint_height: Option<u32>,
-    /// Derive the backfill floor needed by lightwalletd-compatible wallets
-    /// from node-advertised activation heights.
-    #[arg(long = "wallet-serving", action = clap::ArgAction::SetTrue)]
-    wallet_serving: bool,
-}
-
-#[derive(Parser)]
-struct TipFollowArgs {
-    /// Network name, such as zcash-regtest.
-    #[arg(long)]
-    network: Option<String>,
-    /// Upstream node source, currently zebra-json-rpc.
-    #[arg(long = "node-source")]
-    node_source: Option<String>,
-    /// Zebra JSON-RPC address.
-    #[arg(long = "json-rpc-addr")]
-    json_rpc_addr: Option<String>,
-    /// Node auth method, such as none, basic, or cookie.
-    #[arg(long = "node-auth-method")]
-    node_auth_method: Option<String>,
-    /// Node auth username when the method is basic.
-    #[arg(long = "node-auth-username")]
-    node_auth_username: Option<String>,
-    /// Node auth cookie path when the method is cookie.
-    #[arg(long = "node-auth-path")]
-    node_auth_path: Option<PathBuf>,
-    /// Canonical Zinder store path.
-    #[arg(long = "storage-path")]
-    storage_path: Option<PathBuf>,
-    /// Node request timeout in seconds.
-    #[arg(long = "request-timeout-secs")]
-    request_timeout_secs: Option<u64>,
-    /// Maximum JSON-RPC response body size in bytes.
-    #[arg(long = "max-response-bytes")]
-    max_response_bytes: Option<u64>,
-    /// Number of near-tip blocks that may be replaced by a reorg.
-    #[arg(long = "reorg-window-blocks")]
-    reorg_window_blocks: Option<u32>,
-    /// Maximum number of blocks committed in one chain epoch.
-    #[arg(long = "commit-batch-blocks")]
-    commit_batch_blocks: Option<u32>,
-    /// Delay between upstream node tip polls, in milliseconds.
-    #[arg(long = "poll-interval-ms")]
-    poll_interval_ms: Option<u64>,
-    /// Lag threshold (in blocks) below which tip-follow reports `Ready`.
-    #[arg(long = "lag-threshold-blocks")]
-    lag_threshold_blocks: Option<u64>,
-    /// Private ingest-control gRPC listen address used by secondary readers and subscribers.
-    #[arg(long = "ingest-control-listen-addr")]
-    ingest_control_listen_addr: Option<SocketAddr>,
-    /// Path to a file containing the shared-secret bearer token enforced by
-    /// the ingest-control endpoint. When unset, the endpoint accepts every
-    /// caller (the localhost-only default).
-    #[arg(long = "ingest-control-token-path")]
-    ingest_control_token_path: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -209,10 +173,11 @@ async fn main() -> ExitCode {
     reason = "--print-config is a structured TOML data dump, not a log event"
 )]
 fn run_print_config(cli: Cli) -> ExitCode {
+    let overrides = ingest_overrides(&cli);
+    let config_path = cli.config_path.clone();
     let render_result = match cli.command {
-        Command::Backfill(args) => print_backfill_config(cli.config_path, args),
-        Command::TipFollow(args) => print_tip_follow_config(cli.config_path, args),
-        Command::Backup(args) => print_backup_config(cli.config_path, args),
+        None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
+        Some(Command::Backup(args)) => print_backup_config(config_path, args),
     };
 
     match render_result {
@@ -226,14 +191,12 @@ fn run_print_config(cli: Cli) -> ExitCode {
 
 async fn run_runtime(cli: Cli) -> ExitCode {
     let ops_listen_addr_override = cli.ops_listen_addr;
+    let overrides = ingest_overrides_with_ops(&cli, ops_listen_addr_override);
+    let config_path = cli.config_path.clone();
     let runtime_result = match cli.command {
-        Command::Backfill(args) => {
-            run_backfill(cli.config_path, args, ops_listen_addr_override).await
-        }
-        Command::TipFollow(args) => {
-            run_tip_follow(cli.config_path, args, ops_listen_addr_override).await
-        }
-        Command::Backup(args) => run_backup(cli.config_path, args),
+        Some(Command::Backup(args)) => run_backup(config_path, args),
+        Some(Command::Probe) => run_probe(config_path, overrides).await,
+        None => run_ingest(config_path, overrides).await,
     };
 
     match runtime_result {
@@ -252,19 +215,93 @@ fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn ingest_overrides(cli: &Cli) -> IngestConfigOverrides {
+    ingest_overrides_with_ops(cli, None)
+}
+
+fn ingest_overrides_with_ops(
+    cli: &Cli,
+    ops_listen_addr_override: Option<SocketAddr>,
+) -> IngestConfigOverrides {
+    IngestConfigOverrides {
+        network: cli.network.clone(),
+        node_source: cli.node_source.clone(),
+        json_rpc_addr: cli.json_rpc_addr.clone(),
+        node_auth_method: cli.node_auth_method.clone(),
+        node_auth_username: cli.node_auth_username.clone(),
+        node_auth_path: cli.node_auth_path.clone(),
+        storage_path: cli.storage_path.clone(),
+        request_timeout_secs: cli.request_timeout_secs,
+        max_response_bytes: cli.max_response_bytes,
+        reorg_window_blocks: cli.reorg_window_blocks,
+        catchup_threshold_blocks: cli.catchup_threshold_blocks,
+        commit_batch_blocks: cli.commit_batch_blocks,
+        fetch_concurrency: cli.fetch_concurrency,
+        poll_interval_ms: cli.poll_interval_ms,
+        lag_threshold_blocks: cli.lag_threshold_blocks,
+        target_height: cli.target_height,
+        checkpoint_height: cli.checkpoint_height,
+        allow_near_tip_finalize: cli.allow_near_tip_finalize.then_some(true),
+        wallet_serving: cli.wallet_serving.then_some(true),
+        ingest_control_listen_addr: cli.ingest_control_listen_addr,
+        ingest_control_bearer_token_path: cli.ingest_control_token_path.clone(),
+        ops_listen_addr: ops_listen_addr_override,
+    }
+}
+
+#[allow(
+    clippy::print_stdout,
+    reason = "probe is a CLI diagnostic; the structured snapshot is what operators read."
+)]
+async fn run_probe(
+    config_path: Option<PathBuf>,
+    overrides: IngestConfigOverrides,
+) -> Result<(), IngestConfigError> {
+    let command_config = config::load_ingest_config(config_path, overrides)?;
+    let loop_config = command_config.loop_config;
+    let source = zebra_json_rpc_source_for_target(loop_config.node_source, &loop_config.node)?;
+    let upstream_tip = source
+        .tip_id()
+        .await
+        .map_err(IngestError::from)?
+        .height
+        .value();
+    let store = PrimaryChainStore::open(
+        &loop_config.storage_path,
+        ChainStoreOptions::for_network(loop_config.node.network),
+    )
+    .map_err(IngestError::from)?;
+    let store_tip = current_chain_height(&store);
+    let phase = classify_phase(
+        store_tip,
+        upstream_tip,
+        loop_config.phases.catchup_threshold_blocks,
+    );
+    let gap_blocks = i64::from(upstream_tip).saturating_sub(i64::from(store_tip.unwrap_or(0)));
+    let upstream_health = match source.poll_upstream_health().await {
+        Ok(snapshot) => format!("{}/{}", snapshot.source, snapshot.reason),
+        Err(error) => format!("unavailable ({error})"),
+    };
+
+    println!(
+        "{{\"store_tip\": {store_tip:?}, \"upstream_tip\": {upstream_tip}, \
+         \"gap_blocks\": {gap_blocks}, \"phase_that_would_run\": \"{phase}\", \
+         \"upstream_health\": \"{upstream_health}\"}}",
+        phase = phase.wire_label(),
+    );
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "Backfill bootstrap composes the load_config, start_api, connect_node, check_schema, recover_state, validate_config, open_storage, and ready phases plus the actual backfill in one auditable sequence; splitting the phases out would obscure the ordering."
+    reason = "the unified-ingest startup composes the load_config, start_api, connect_node, check_schema, recover_state, open_storage, ingest_control, and ready phases in one auditable sequence; splitting them would obscure the failure ordering."
 )]
-async fn run_backfill(
+async fn run_ingest(
     config_path: Option<PathBuf>,
-    args: BackfillArgs,
-    ops_listen_addr_override: Option<SocketAddr>,
+    overrides: IngestConfigOverrides,
 ) -> Result<(), IngestConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
-    let mut overrides: BackfillConfigOverrides = args.into();
-    overrides.ops_listen_addr = ops_listen_addr_override;
-    let mut command_config = match config::load_backfill_config(config_path, overrides) {
+    let mut command_config = match config::load_ingest_config(config_path, overrides) {
         Ok(cfg) => {
             load_config_phase.complete();
             cfg
@@ -274,33 +311,36 @@ async fn run_backfill(
             return Err(error);
         }
     };
+
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
         ServiceIdentifier::Ingest,
         command_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(command_config.node.network),
+        encode_zinder_native_chain_name(command_config.loop_config.node.network),
         readiness.clone(),
     );
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
-    let source =
-        match zebra_json_rpc_source_for_target(command_config.node_source, &command_config.node) {
-            Ok(source) => {
-                connect_node_phase.complete();
-                source
-            }
-            Err(error) => {
-                connect_node_phase.fail(&error);
-                start_api_phase.fail(&error);
-                return Err(error);
-            }
-        };
+    let source = match zebra_json_rpc_source_for_target(
+        command_config.loop_config.node_source,
+        &command_config.loop_config.node,
+    ) {
+        Ok(source) => {
+            connect_node_phase.complete();
+            source
+        }
+        Err(error) => {
+            connect_node_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
 
     let check_schema_phase = StartupPhase::CheckSchema.start();
     match ensure_node_capabilities(&source, &readiness).await {
-        Ok(_probed_capabilities) => check_schema_phase.complete(),
+        Ok(_capabilities) => check_schema_phase.complete(),
         Err(error) => {
             check_schema_phase.fail(&error);
             start_api_phase.fail(&error);
@@ -309,12 +349,12 @@ async fn run_backfill(
     }
 
     let recover_state_phase = StartupPhase::RecoverState.start();
-    if let Err(error) = resolve_backfill_coverage(&mut command_config, &source).await {
+    if let Err(error) = resolve_wallet_serving_modifiers(&mut command_config, &source).await {
         recover_state_phase.fail(&error);
         start_api_phase.fail(&error);
         return Err(error);
     }
-    let checkpoint = if let Some(checkpoint_height) = command_config.checkpoint_height {
+    if let Some(checkpoint_height) = command_config.loop_config.modifiers.checkpoint_height {
         let checkpoint = match source.fetch_chain_checkpoint(checkpoint_height).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -326,118 +366,196 @@ async fn run_backfill(
         };
         tracing::info!(
             target: "zinder::ingest",
-            event = "backfill_checkpoint_resolved",
+            event = "ingest_checkpoint_resolved",
             checkpoint_height = checkpoint.height.value(),
-            sapling_commitment_tree_size =
-                checkpoint.tip_metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size =
-                checkpoint.tip_metadata.orchard_commitment_tree_size,
+            sapling_commitment_tree_size = checkpoint.tip_metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size = checkpoint.tip_metadata.orchard_commitment_tree_size,
             "fetched bootstrap checkpoint from upstream node"
         );
-        Some(checkpoint)
-    } else {
-        None
-    };
+        command_config.loop_config.modifiers.checkpoint = Some(checkpoint);
+    }
     recover_state_phase.complete();
-
-    let validate_config_phase = StartupPhase::ValidateConfig.start();
-    let backfill_config = match command_config.resolved_backfill_config(checkpoint) {
-        Ok(cfg) => {
-            validate_config_phase.complete();
-            cfg
-        }
-        Err(error) => {
-            validate_config_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    };
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let store_options = zinder_store::ChainStoreOptions::for_network(backfill_config.node.network);
+    let store_options = ChainStoreOptions::for_network(command_config.loop_config.node.network);
     let store =
-        match zinder_store::PrimaryChainStore::open(&backfill_config.storage_path, store_options) {
+        match PrimaryChainStore::open(&command_config.loop_config.storage_path, store_options) {
             Ok(store) => {
                 open_storage_phase.complete();
                 store
             }
-            Err(store_error) => {
-                let wrapped: IngestConfigError = IngestError::from(store_error).into();
+            Err(error) => {
+                let wrapped: IngestConfigError = IngestError::from(error).into();
                 open_storage_phase.fail(&wrapped);
                 start_api_phase.fail(&wrapped);
                 return Err(wrapped);
             }
         };
 
+    let mempool_index = MempoolIndex::new();
+    let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
+        listen_addr: command_config.ingest_control_listen_addr,
+        network: command_config.loop_config.node.network,
+        store: store.clone(),
+        mempool_index: mempool_index.clone(),
+        node_source: Some(Arc::new(source.clone())),
+        bearer_token: command_config.ingest_control_bearer_token.clone(),
+        cancel: cancel.clone(),
+    })
+    .await?;
+    let _upstream_health_probe_handle = spawn_upstream_health_probe_for(
+        &command_config.loop_config.node,
+        &source,
+        readiness.clone(),
+        cancel.clone(),
+    );
+
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::syncing(None, None, None));
 
-    let _ingest_control_handle =
-        if let Some(listen_addr) = command_config.ingest_control_listen_addr {
-            Some(
-                spawn_ingest_control_endpoint(IngestControlEndpointSpec {
-                    listen_addr,
-                    network: backfill_config.node.network,
-                    store: store.clone(),
-                    mempool_index: MempoolIndex::new(),
-                    node_source: Some(Arc::new(source.clone())),
-                    bearer_token: command_config.ingest_control_bearer_token.clone(),
-                    cancel: cancel.clone(),
-                })
-                .await?,
-            )
-        } else {
-            None
-        };
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "ingest_loop_started",
+        network = encode_zinder_native_chain_name(command_config.loop_config.node.network),
+        json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
+        reorg_window_blocks = command_config.loop_config.reorg_window_blocks,
+        catchup_threshold_blocks = command_config.loop_config.phases.catchup_threshold_blocks,
+        commit_batch_blocks = command_config.loop_config.bulk_catchup.commit_batch_blocks.get(),
+        fetch_concurrency = command_config.loop_config.bulk_catchup.fetch_concurrency.get(),
+        poll_interval_ms = u64::try_from(
+            command_config.loop_config.tip_follow.poll_interval.as_millis()
+        )
+        .unwrap_or(u64::MAX),
+        lag_threshold_blocks = command_config.loop_config.tip_follow.lag_threshold_blocks,
+        ingest_control_listen_addr = %command_config.ingest_control_listen_addr,
+        "unified ingest loop started"
+    );
 
-    let backfill_outcome =
-        backfill_until_complete(&backfill_config, &source, &store, &readiness).await?;
+    let launcher = build_tip_follow_subsystems_launcher(
+        command_config.loop_config.node.clone(),
+        source.clone(),
+        store.clone(),
+        mempool_index,
+        readiness.clone(),
+        command_config.chain_event_retention(),
+        command_config.mempool_event_retention(),
+        cancel.clone(),
+    );
 
-    let chain_epoch = backfill_outcome.chain_epoch();
-    readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
+    let loop_outcome = run_ingest_loop(
+        &command_config.loop_config,
+        Arc::new(source),
+        store.clone(),
+        &readiness,
+        cancel.clone(),
+        Some(launcher),
+    )
+    .await;
 
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "non-exhaustive library backfill outcomes must surface conservatively"
-    )]
-    match backfill_outcome {
-        BackfillOutcome::Committed(_) => {
-            // record_commit_outcome already emitted chain_committed for the final batch.
-        }
-        BackfillOutcome::AlreadyComplete { chain_epoch } => {
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "backfill_already_complete",
-                chain_epoch_id = chain_epoch.id.value(),
-                tip_height = chain_epoch.tip_height.value(),
-                "backfill range already covered by the visible chain epoch"
-            );
-        }
-        _ => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "backfill_outcome_unrecognized",
-                "backfill outcome variant is not handled by this binary"
-            );
-        }
-    }
+    let final_result = handle_loop_outcome(loop_outcome, &readiness, &cancel).await;
+
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "ingest_loop_stopped",
+        "unified ingest loop stopped"
+    );
 
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
+    ingest_control_handle.shutdown().await;
 
-    Ok(())
+    final_result
 }
 
-async fn resolve_backfill_coverage(
-    command_config: &mut config::BackfillCommandConfig,
+async fn handle_loop_outcome(
+    outcome: Result<(), IngestError>,
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+) -> Result<(), IngestConfigError> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(IngestError::ReorgWindowExceeded {
+            from_height,
+            replacement_depth,
+            configured_window_blocks,
+        }) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "ingest_loop_reorg_window_exceeded",
+                from_height = from_height.value(),
+                replacement_depth,
+                configured_window_blocks,
+                "ingest reorg replacement crossed the configured non-finalized window; readiness drained for operator review"
+            );
+            readiness.set(ReadinessState::reorg_window_exceeded(
+                u64::from(replacement_depth),
+                u64::from(configured_window_blocks),
+                Some(from_height.value().saturating_sub(1)),
+            ));
+            cancel.cancelled().await;
+            Ok(())
+        }
+        Err(error) => Err(IngestConfigError::from(error)),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tip-follow subsystems capture the source, store, mempool index, readiness handle, two retention configs, and the cancel token; bundling them into a struct adds indirection without changing the binding count the binary must make."
+)]
+fn build_tip_follow_subsystems_launcher(
+    node_target: NodeTarget,
+    source: ZebraJsonRpcSource,
+    store: PrimaryChainStore,
+    mempool_index: MempoolIndex,
+    readiness: Readiness,
+    chain_event_retention: zinder_ingest::ChainEventRetentionConfig,
+    mempool_event_retention: zinder_ingest::MempoolEventRetentionWorkerConfig,
+    cancel: CancellationToken,
+) -> TipFollowSubsystemsLauncher {
+    Box::new(move || {
+        let retention_handle = spawn_chain_event_retention_task(
+            store.clone(),
+            readiness.clone(),
+            chain_event_retention,
+            cancel.clone(),
+        );
+        let mempool_retention_handle = spawn_mempool_event_retention_task(
+            store.clone(),
+            readiness.clone(),
+            mempool_event_retention,
+            cancel.clone(),
+        );
+        let mempool_source = build_mempool_source(&node_target, &source);
+        let chain_tip_source = build_chain_tip_notification_source(&node_target);
+        let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
+        let mempool_handle = spawn_mempool_orchestrator(
+            mempool_source,
+            store.clone(),
+            mempool_index,
+            readiness.clone(),
+            mempool_ready_signal,
+            cancel.clone(),
+        );
+
+        TipFollowSubsystems {
+            mempool_ready_gate: Some(mempool_ready_gate),
+            chain_tip_source,
+            spawned_tasks: vec![retention_handle, mempool_retention_handle, mempool_handle],
+        }
+    })
+}
+
+async fn resolve_wallet_serving_modifiers(
+    command_config: &mut IngestCommandConfig,
     source: &ZebraJsonRpcSource,
 ) -> Result<(), IngestConfigError> {
-    if !matches!(command_config.coverage, BackfillCoverage::WalletServing) {
+    if !matches!(command_config.coverage, IngestCoverage::WalletServing) {
         return Ok(());
     }
 
@@ -464,32 +582,30 @@ async fn resolve_backfill_coverage(
     }
 
     let checkpoint_height = BlockHeight::new(wallet_serving_floor.value().saturating_sub(1));
-    command_config.from_height = Some(wallet_serving_floor);
-    command_config.checkpoint_height = Some(checkpoint_height);
+    command_config.loop_config.modifiers = IngestModifiers {
+        target_height: command_config.loop_config.modifiers.target_height,
+        checkpoint_height: Some(checkpoint_height),
+        allow_near_tip_finalize: command_config.loop_config.modifiers.allow_near_tip_finalize,
+        checkpoint: command_config.loop_config.modifiers.checkpoint,
+    };
     tracing::info!(
         target: "zinder::ingest",
-        event = "wallet_serving_backfill_floor_resolved",
+        event = "wallet_serving_modifiers_resolved",
         from_height = wallet_serving_floor.value(),
         checkpoint_height = checkpoint_height.value(),
         earliest_upgrade = %earliest.name,
-        "resolved wallet-serving backfill floor from node activation heights"
+        "resolved wallet-serving floor from node activation heights"
     );
 
     Ok(())
 }
 
-/// Probes upstream node capabilities and verifies the ingest-required set.
-///
-/// On `Err`, transitions `readiness` into the failure cause
-/// (`NodeUnavailable` for transport-level failures,
-/// `node_capability_missing` for a missing required capability) so the ops
-/// endpoint surfaces the same diagnosis the caller will exit with.
 async fn ensure_node_capabilities(
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
 ) -> Result<NodeCapabilities, IngestConfigError> {
     let probed_capabilities = match source.probe_capabilities().await {
-        Ok(probed_capabilities) => probed_capabilities,
+        Ok(capabilities) => capabilities,
         Err(probe_error) => {
             let detail = zinder_runtime::NodeUnavailableDetail::first_iteration(
                 probe_error.upstream_classification().label(),
@@ -570,204 +686,9 @@ fn zebra_json_rpc_source_for_target(
                 max_response_bytes: target.max_response_bytes,
             },
         )
+        .map(|source| source.with_health_config(target.health.clone()))
         .map_err(IngestError::from)
         .map_err(IngestConfigError::from),
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "tip-follow startup composes the readiness, ops, ingest-control, retention, mempool source, and orchestrator subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
-)]
-async fn run_tip_follow(
-    config_path: Option<PathBuf>,
-    args: TipFollowArgs,
-    ops_listen_addr_override: Option<SocketAddr>,
-) -> Result<(), IngestConfigError> {
-    let load_config_phase = StartupPhase::LoadConfig.start();
-    let mut overrides: TipFollowConfigOverrides = args.into();
-    overrides.ops_listen_addr = ops_listen_addr_override;
-    let command_config = match config::load_tip_follow_config(config_path, overrides) {
-        Ok(command_config) => {
-            load_config_phase.complete();
-            command_config
-        }
-        Err(error) => {
-            load_config_phase.fail(&error);
-            return Err(error);
-        }
-    };
-    let ops_listen_addr = command_config.ops_listen_addr;
-    let ingest_control_listen_addr = command_config.ingest_control_listen_addr;
-    let ingest_control_bearer_token = command_config.ingest_control_bearer_token.clone();
-    let chain_event_retention = command_config.chain_event_retention();
-    let mempool_event_retention = command_config.mempool_event_retention();
-    let retention = command_config.retention;
-    let tip_follow_config = command_config.tip_follow;
-    let readiness = Readiness::default();
-
-    let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Ingest,
-        ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(tip_follow_config.node.network),
-        readiness.clone(),
-    );
-
-    let open_storage_phase = StartupPhase::OpenStorage.start();
-    let store = match open_tip_follow_store(&tip_follow_config) {
-        Ok(store) => {
-            open_storage_phase.complete();
-            store
-        }
-        Err(error) => {
-            open_storage_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error.into());
-        }
-    };
-
-    let connect_node_phase = StartupPhase::ConnectNode.start();
-    let source = match zebra_json_rpc_source_for_target(
-        tip_follow_config.node_source,
-        &tip_follow_config.node,
-    ) {
-        Ok(source) => {
-            connect_node_phase.complete();
-            source
-        }
-        Err(error) => {
-            connect_node_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    };
-
-    let check_schema_phase = StartupPhase::CheckSchema.start();
-    match ensure_node_capabilities(&source, &readiness).await {
-        Ok(_probed_capabilities) => {
-            check_schema_phase.complete();
-        }
-        Err(error) => {
-            check_schema_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    }
-
-    start_api_phase.complete();
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
-    let mempool_index = MempoolIndex::new();
-    let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
-        listen_addr: ingest_control_listen_addr,
-        network: tip_follow_config.node.network,
-        store: store.clone(),
-        mempool_index: mempool_index.clone(),
-        node_source: Some(Arc::new(source.clone())),
-        bearer_token: ingest_control_bearer_token,
-        cancel: cancel.clone(),
-    })
-    .await?;
-    let _retention_handle = spawn_chain_event_retention_task(
-        store.clone(),
-        readiness.clone(),
-        chain_event_retention,
-        cancel.clone(),
-    );
-    let _mempool_retention_handle = spawn_mempool_event_retention_task(
-        store.clone(),
-        readiness.clone(),
-        mempool_event_retention,
-        cancel.clone(),
-    );
-    let mempool_source = build_mempool_source(&tip_follow_config.node, &source);
-    let chain_tip_source = build_chain_tip_notification_source(&tip_follow_config.node);
-    let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
-    let _mempool_orchestrator_handle = spawn_mempool_orchestrator(
-        mempool_source,
-        store.clone(),
-        mempool_index,
-        readiness.clone(),
-        mempool_ready_signal,
-        cancel.clone(),
-    );
-
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "tip_follow_started",
-        network = encode_zinder_native_chain_name(tip_follow_config.node.network),
-        json_rpc_addr = tip_follow_config.node.json_rpc_addr.as_str(),
-        reorg_window_blocks = tip_follow_config.reorg_window_blocks,
-        lag_threshold_blocks = tip_follow_config.lag_threshold_blocks,
-        poll_interval_ms = u64::try_from(tip_follow_config.poll_interval.as_millis())
-            .unwrap_or(u64::MAX),
-        ingest_control_listen_addr = %ingest_control_listen_addr,
-        chain_event_retention_hours = retention.chain_event_retention_hours,
-        chain_event_retention_check_interval_ms = retention.chain_event_retention_check_interval_ms,
-        cursor_at_risk_warning_hours = retention.cursor_at_risk_warning_hours,
-        "tip-follow started"
-    );
-
-    readiness.set(ReadinessState::syncing(None, None, None));
-    StartupPhase::Ready.start().complete();
-    let tip_follow_outcome = tip_follow_with_primary_store(
-        &tip_follow_config,
-        &source,
-        store,
-        &readiness,
-        Some(&mempool_ready_gate),
-        chain_tip_source,
-        cancel.clone(),
-    )
-    .await;
-    let tip_follow_result =
-        handle_tip_follow_outcome(tip_follow_outcome, &readiness, &cancel).await;
-
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "tip_follow_stopped",
-        "tip-follow stopped"
-    );
-
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
-    }
-    ingest_control_handle.shutdown().await;
-
-    tip_follow_result
-}
-
-async fn handle_tip_follow_outcome(
-    outcome: Result<(), IngestError>,
-    readiness: &Readiness,
-    cancel: &CancellationToken,
-) -> Result<(), IngestConfigError> {
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(IngestError::ReorgWindowExceeded {
-            from_height,
-            replacement_depth,
-            configured_window_blocks,
-        }) => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "tip_follow_reorg_window_exceeded",
-                from_height = from_height.value(),
-                replacement_depth,
-                configured_window_blocks,
-                "tip-follow reorg replacement crossed the configured non-finalized window; readiness drained for operator review"
-            );
-            readiness.set(ReadinessState::reorg_window_exceeded(
-                u64::from(replacement_depth),
-                u64::from(configured_window_blocks),
-                Some(from_height.value().saturating_sub(1)),
-            ));
-            cancel.cancelled().await;
-            Ok(())
-        }
-        Err(error) => Err(IngestConfigError::from(error)),
     }
 }
 
@@ -870,6 +791,29 @@ fn build_chain_tip_notification_source(
     Some(Arc::new(ZebraIndexerChainTipSource::new(target)))
 }
 
+fn spawn_upstream_health_probe_for(
+    node_target: &NodeTarget,
+    json_rpc_source: &ZebraJsonRpcSource,
+    readiness: Readiness,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let health_config = node_target.health.as_ref()?;
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "upstream_health_probe_started",
+        addr = health_config.addr.as_str(),
+        poll_interval_ms = u64::try_from(health_config.poll_interval.as_millis())
+            .unwrap_or(u64::MAX),
+        "upstream health probe started"
+    );
+    Some(spawn_upstream_health_probe_task(
+        Arc::new(json_rpc_source.clone()),
+        readiness,
+        health_config.poll_interval,
+        cancel,
+    ))
+}
+
 fn build_mempool_source(
     node_target: &NodeTarget,
     json_rpc: &ZebraJsonRpcSource,
@@ -901,13 +845,6 @@ fn build_mempool_source(
     )
 }
 
-/// Threshold above which `MempoolHydrationLagging` is reported.
-///
-/// Hydration failures are typically a single-tx race (the mempool source
-/// observed an `Added` for a transaction the upstream node has already
-/// dropped). Surfacing one or two of those as a readiness regression would
-/// be noisy. Five within a single source session is a sustained pattern
-/// worth alerting on.
 const MEMPOOL_HYDRATION_LAGGING_THRESHOLD: u64 = 5;
 
 #[allow(
@@ -985,14 +922,6 @@ fn spawn_mempool_orchestrator(
             }
         }
     })
-}
-
-fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
-    store
-        .current_chain_epoch()
-        .ok()
-        .flatten()
-        .map(|chain_epoch| chain_epoch.tip_height.value())
 }
 
 fn clear_mempool_orchestrator_readiness(readiness: &Readiness, store: &PrimaryChainStore) {
@@ -1107,20 +1036,12 @@ fn current_unix_seconds_f64() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-fn print_backfill_config(
+fn print_ingest_config(
     config_path: Option<PathBuf>,
-    args: BackfillArgs,
+    overrides: IngestConfigOverrides,
 ) -> Result<String, IngestConfigError> {
-    let backfill_config = config::load_backfill_config(config_path, args.into())?;
-    config::redacted_backfill_config_toml(&backfill_config)
-}
-
-fn print_tip_follow_config(
-    config_path: Option<PathBuf>,
-    args: TipFollowArgs,
-) -> Result<String, IngestConfigError> {
-    let tip_follow_config = config::load_tip_follow_config(config_path, args.into())?;
-    config::redacted_tip_follow_config_toml(&tip_follow_config)
+    let command_config = config::load_ingest_config(config_path, overrides)?;
+    config::redacted_ingest_config_toml(&command_config)
 }
 
 fn print_backup_config(
@@ -1129,52 +1050,6 @@ fn print_backup_config(
 ) -> Result<String, IngestConfigError> {
     let backup_config = config::load_backup_config(config_path, args.into())?;
     config::redacted_backup_config_toml(&backup_config)
-}
-
-impl From<BackfillArgs> for BackfillConfigOverrides {
-    fn from(args: BackfillArgs) -> Self {
-        Self {
-            network: args.network,
-            node_source: args.node_source,
-            json_rpc_addr: args.json_rpc_addr,
-            node_auth_method: args.node_auth_method,
-            node_auth_username: args.node_auth_username,
-            node_auth_path: args.node_auth_path,
-            storage_path: args.storage_path,
-            from_height: args.from_height,
-            to_height: args.to_height,
-            request_timeout_secs: args.request_timeout_secs,
-            max_response_bytes: args.max_response_bytes,
-            commit_batch_blocks: args.commit_batch_blocks,
-            allow_near_tip_finalize: args.allow_near_tip_finalize.then_some(true),
-            checkpoint_height: args.checkpoint_height,
-            wallet_serving: args.wallet_serving.then_some(true),
-            ops_listen_addr: None,
-        }
-    }
-}
-
-impl From<TipFollowArgs> for TipFollowConfigOverrides {
-    fn from(args: TipFollowArgs) -> Self {
-        Self {
-            network: args.network,
-            node_source: args.node_source,
-            json_rpc_addr: args.json_rpc_addr,
-            node_auth_method: args.node_auth_method,
-            node_auth_username: args.node_auth_username,
-            node_auth_path: args.node_auth_path,
-            storage_path: args.storage_path,
-            request_timeout_secs: args.request_timeout_secs,
-            max_response_bytes: args.max_response_bytes,
-            reorg_window_blocks: args.reorg_window_blocks,
-            commit_batch_blocks: args.commit_batch_blocks,
-            poll_interval_ms: args.poll_interval_ms,
-            lag_threshold_blocks: args.lag_threshold_blocks,
-            ingest_control_listen_addr: args.ingest_control_listen_addr,
-            ingest_control_bearer_token_path: args.ingest_control_token_path,
-            ops_listen_addr: None,
-        }
-    }
 }
 
 impl From<BackupArgs> for BackupConfigOverrides {

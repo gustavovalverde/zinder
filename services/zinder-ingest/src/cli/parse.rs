@@ -24,8 +24,9 @@ pub(crate) fn parse_node_source(node_source: &str) -> Result<NodeSourceKind, Ing
 pub(crate) fn parse_commit_batch_blocks(
     commit_batch_blocks: u32,
 ) -> Result<NonZeroU32, ConfigError> {
-    NonZeroU32::new(commit_batch_blocks)
-        .ok_or_else(|| ConfigError::invalid("ingest.commit_batch_blocks must be greater than zero"))
+    NonZeroU32::new(commit_batch_blocks).ok_or_else(|| {
+        ConfigError::invalid("ingest.bulk_catchup.commit_batch_blocks must be greater than zero")
+    })
 }
 
 /// Parses the maximum replaceable reorg-window size.
@@ -45,7 +46,7 @@ pub(crate) fn parse_poll_interval_ms(
 ) -> Result<std::time::Duration, ConfigError> {
     if poll_interval_ms == 0 {
         return Err(ConfigError::invalid(
-            "tip_follow.poll_interval_ms must be greater than zero",
+            "ingest.tip_follow.poll_interval_ms must be greater than zero",
         ));
     }
 

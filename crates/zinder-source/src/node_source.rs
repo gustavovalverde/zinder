@@ -8,7 +8,9 @@ use zinder_core::{
     TransactionBroadcastResult,
 };
 
-use crate::{NodeCapabilities, SourceBlock, SourceError, SourceSubtreeRoots};
+use crate::{
+    NodeCapabilities, SourceBlock, SourceError, SourceSubtreeRoots, UpstreamHealthSnapshot,
+};
 
 /// Configured upstream node source for ingestion.
 #[async_trait]
@@ -17,7 +19,7 @@ pub trait NodeSource: Send + Sync + 'static {
     fn capabilities(&self) -> NodeCapabilities;
 
     /// Fetches one block by height from the configured node.
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
 
     /// Returns the node's current best tip identity (height and hash).
     ///
@@ -46,6 +48,24 @@ pub trait NodeSource: Send + Sync + 'static {
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::ChainValuePools,
+        })
+    }
+
+    /// Polls the upstream sync-health signal.
+    ///
+    /// Returns an [`UpstreamHealthSnapshot`] each call so the background
+    /// probe task can drive the `cause=upstream_not_ready` readiness
+    /// payload per
+    /// [ADR-0015 §Upstream sync detection]. The default implementation
+    /// returns [`SourceError::NodeCapabilityMissing`] so sources that
+    /// have not opted in surface a typed failure rather than silently
+    /// degrading.
+    ///
+    /// [ADR-0015 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::ReadinessProbe,
         })
     }
 }

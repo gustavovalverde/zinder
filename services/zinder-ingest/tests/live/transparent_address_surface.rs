@@ -35,7 +35,7 @@ use zinder_core::{
     BlockHash, BlockHeight, Network, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
 };
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxosRequest, WalletQuery,
     WalletQueryApi,
@@ -127,11 +127,11 @@ async fn backfill_and_sample_tip_coinbase(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
-    let block_at_tip = source.fetch_block_by_height(tip_height).await?;
+    let block_at_tip = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_coinbase_output(&block_at_tip, from_height, tip_height)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

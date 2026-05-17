@@ -16,7 +16,8 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::{
     ingest::{
-        ServerInfoRequest, ServerInfoResponse, WriterStatusRequest, WriterStatusResponse,
+        ActiveTransport, ServerInfoRequest, ServerInfoResponse, WriterPhase, WriterStatusRequest,
+        WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     ops, wallet,
@@ -183,6 +184,15 @@ impl IngestControl for IngestControlGrpcAdapter {
                     latest_writer_tip_height: chain_epoch.map(|epoch| epoch.tip_height.value()),
                     latest_writer_finalized_height: chain_epoch
                         .map(|epoch| epoch.finalized_height.value()),
+                    // ADR-0015 Phase 3 wires the unified loop; until then the
+                    // legacy backfill/tip-follow path emits Unspecified for
+                    // the phase + transport so clients that already handle
+                    // every WriterPhase / ActiveTransport variant fall
+                    // through to their "writer has not advertised yet" arm.
+                    phase: WriterPhase::Unspecified.into(),
+                    active_transport: ActiveTransport::Unspecified.into(),
+                    gap_blocks: None,
+                    upstream_not_ready: None,
                 }))
             }
             Err(error) => Err(status_from_store_error(&error)),

@@ -31,7 +31,7 @@ Required artifact families:
 - `CompactBlockArtifact`: wallet-oriented compact block representation.
 - `TreeStateArtifact`: tree state data required by wallet sync APIs.
 - `TransactionArtifact`: transaction lookup material needed by APIs.
-- `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` alongside `tip-follow`. The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of `tip-follow` in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
+- `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` and spawn the first time the unified ingest loop enters the `TipFollow` phase (see §Phase transitions below). The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of the ingest loop in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
 
 Each artifact must include:
 
@@ -118,37 +118,53 @@ Reorgs are normal control flow, not exception paths. The pipeline is the same as
 - Derived indexes receive `ChainEvent` values with explicit reverted and committed ranges (see [Chain events](chain-events.md)).
 - Query readers never observe partially reverted state.
 
-## Backfill and Tip Following
+## Bulk Catch-up and Tip Following
 
-Backfill and tip following should share the same artifact builders and commit path.
+The unified ingest loop classifies its work into one of three phases at every iteration: `AwaitingUpstream`, `BulkCatchup`, or `TipFollow`. Phase selection is internal to `zinder-ingest`; operators run one binary and the loop dispatches based on the gap between the visible chain epoch and the upstream tip. The architectural decision lives in [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).
 
-The source adapter may differ:
+All phases share the same artifact builders and commit path. The source adapter is identical across phases. What differs is fetch shape (pipelined vs serial) and commit shape (`FinalizeThrough` vs `Extend`/`Replace` plus a separate finalization step).
 
-- Historical backfill can use polling or batch reads.
-- Tip following can use polling, source notifications, or future streaming sources.
+Source capability detection happens before processing starts. If the selected source cannot provide required data such as finalized height, chainwork, non-finalized blocks, or transaction broadcast support, ingestion fails closed with a typed startup or readiness cause.
 
-The processing model must stay the same. This follows the same principle as modern checkpoint-driven indexers: source transport can change, but checkpoint or block processing remains deterministic.
+### Phase transitions
 
-Source capability detection happens before processing starts. If the selected source cannot provide required data such as finalized height, chainwork, non-finalized blocks, or transaction broadcast support for the configured mode, ingestion fails closed with a typed startup or readiness cause.
+The classifier reads two inputs each iteration: the store's `current_chain_epoch.tip_height` (cached, cheap) and the upstream tip (one `NodeSource::tip_id` call). The decision rule:
 
-### Backfill throughput shape
+- `gap_blocks > ingest.phases.catchup_threshold_blocks` (defaults to `reorg_window_blocks`): `BulkCatchup`. Pipelined fetches at `ingest.bulk_catchup.fetch_concurrency` width, batches of `ingest.bulk_catchup.commit_batch_blocks` blocks per chain epoch, commit transition `FinalizeThrough { tip_height: target }` against `min(upstream_tip - reorg_window, store_tip + commit_batch_blocks)`.
+- `gap_blocks <= ingest.phases.catchup_threshold_blocks` and upstream tip above the catch-up floor: `TipFollow`. Serial fetches, one block per commit, transition `Extend` or `Replace`. `finalize_tip_if_ready` advances the finalized boundary once a tip is older than `reorg_window_blocks`.
+- Upstream tip below catch-up floor (regtest near genesis, freshly initialized node): `AwaitingUpstream`. The loop polls on the upstream-health interval and emits `cause=upstream_not_ready` until enough chain exists to commit.
 
-Historical backfill is bounded by JSON-RPC round-trip latency, not by upstream-node CPU. Two structural choices keep the throughput high enough for a multi-million-block sync to complete in single-digit hours rather than weeks:
+Transitions are bidirectional. A long downtime or upstream burst that re-opens the gap beyond the threshold returns the loop to `BulkCatchup` until it closes. The mempool orchestrator, retention worker, and chain-tip notification stream spawn once on first entry into `TipFollow` and stay running across subsequent bounces. The `IngestControl` gRPC server starts at process start and runs throughout.
 
-1. **Pipelined block fetches.** `backfill_from_source_with_store` keeps up to `BACKFILL_FETCH_CONCURRENCY` (32) `fetch_block_by_height` calls in flight via `futures_util::stream::iter(...).buffered(N)`. The stream preserves submission order, so artifact assembly and RocksDB writes stay strictly ordered; only the network-bound fetch path is concurrent.
-2. **Concurrent per-block RPCs.** `ZebraJsonRpcSource::fetch_block_by_height` resolves the anchor hash with one `getblockhash` call, then drives `getblockheader`, `getblock`, and `z_gettreestate` concurrently via `tokio::join!`. Per-block round-trip count drops from four sequential RTTs to one plus a parallel triple.
+### Bulk-catch-up throughput shape
+
+Bulk catch-up is bounded by JSON-RPC round-trip latency, not by upstream-node CPU. Two structural choices keep the throughput high enough for a multi-million-block sync to complete in single-digit hours rather than weeks:
+
+1. **Pipelined block fetches.** The bulk-catch-up phase keeps up to `ingest.bulk_catchup.fetch_concurrency` (default 32) block fetches in flight via `futures_util::stream::iter(...).buffered(N)`. The stream preserves submission order, so artifact assembly and RocksDB writes stay strictly ordered; only the network-bound fetch path is concurrent.
+2. **Concurrent per-block RPCs.** `ZebraJsonRpcSource::fetch_block_at` resolves the anchor hash with one `getblockhash` call, then drives `getblockheader`, `getblock`, and `z_gettreestate` concurrently via `tokio::join!`. Per-block round-trip count drops from four sequential RTTs to one plus a parallel triple. The redesign of this fetch path to remove the per-block RPC tax permanently is decided in [ADR-0016](../adrs/0016-source-streaming-pipeline.md).
 
 Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom.
 
-Long-running backfill treats every upstream-source failure as a readiness transition rather than a process lifecycle event. `backfill_until_complete` consults `decide_recovery` per [ADR-0013](../adrs/0013-source-failure-recovery-topology.md), reports `node_unavailable` with a structured `NodeUnavailableDetail` payload, backs off according to the failure class, and starts another backfill attempt from the current visible chain epoch. Committed batches are durable, so the retry does not replay from the wallet-serving floor after every transient outage. The single-container deployment runs this idempotent wallet-serving backfill before each tip-follow handoff, which covers empty stores and partial stores left by restarts.
+The loop treats every upstream-source failure as a readiness transition rather than a process lifecycle event. It consults `decide_recovery` per [ADR-0013](../adrs/0013-source-failure-recovery-topology.md), reports `node_unavailable` with a structured `NodeUnavailableDetail` payload, backs off according to the failure class, and resumes from the current visible chain epoch. Committed batches are durable, so the retry does not replay from the wallet-serving floor after every transient outage.
 
 ### Tip-follow wakeups
 
-Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate `tip_follow_once` against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `poll_interval_ms`. The subscription lifecycle runs beside polling and keeps re-subscribing after stream errors. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
+Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate iteration against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `ingest.tip_follow.poll_interval_ms`. The subscription lifecycle runs beside polling and keeps re-subscribing after stream errors. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
 
 Every upstream-source failure is a readiness event, not a process lifecycle event. If Zebra is restarting, warming up, reorging near the tip, or unreachable mid-iteration, `zinder-ingest` reports `node_unavailable` with a `failure_class` payload, keeps `/healthz` alive, returns not-ready on `/readyz`, and continues retrying. Storage errors and reorg-window violations still fail closed; protocol mismatches and missing capabilities stay alive in a typed operator-action readiness state for inspection. See [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
 
-Historical backfill also fetches newly completed shielded subtree roots through
+### Upstream sync detection
+
+`zinder-ingest` distinguishes "we're up-to-date with Zebra" from "Zebra is itself at the real network tip" through a dual-path probe:
+
+- **Primary**: when `[node.health].addr` is set, the loop polls Zebra's HTTP `/ready` endpoint every `node.health.poll_interval_ms` (default 30000). Zebra returns `200 OK` when it is near tip with sufficient peers and a fresh tip; otherwise `503` with a sentinel body (`syncing`, `no tip`, `tip_age=<N>s`, `lag=<N> blocks`, `insufficient peers`).
+- **Fallback**: when `[node.health].addr` is unset or all probes fail, the loop derives the same signal from `getblockchaininfo.verificationprogress < node.health.verification_progress_floor` (default 0.999) or `estimated_height - blocks > node.health.estimated_gap_floor_blocks` (default 10). Less authoritative because both fields come from wall-clock extrapolation of the local tip's timestamp rather than peer-reported headers; operators running Zebras with the health endpoint enabled should configure `[node.health].addr` for the precise signal.
+
+When upstream-not-ready, the loop still commits whatever blocks Zebra has made available. The readiness surface gates traffic: `cause=upstream_not_ready` with structured details (`upstream_committed_height`, `upstream_estimated_height`, `upstream_verification_progress`, `upstream_health.source`, `upstream_health.reason`) is emitted on `/readyz` until the upstream catches up. See [ADR-0015 §Upstream sync detection](../adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection).
+
+### Subtree roots and checkpoint bootstrap
+
+The bulk-catch-up phase also fetches newly completed shielded subtree roots through
 the source boundary. The source adapter returns `z_getsubtreesbyindex`
 data without a completing block hash, so `zinder-ingest` binds each returned
 root to the block artifact that completed it before committing
@@ -158,11 +174,13 @@ missing subtree roots by calling the upstream node.
 Checkpoint bootstrap must initialize the running shielded tree-size observer
 from the upstream-node-supplied checkpoint tree state before validating the first
 post-checkpoint block. Assuming zero after Sapling or Orchard activation makes
-deep wallet-serving backfill fail even when the checkpoint metadata is correct.
+deep wallet-serving catch-up fail even when the checkpoint metadata is correct.
 This page owns the durable ingestion requirement.
 
-Wallet-serving backfill is an explicit coverage mode, not an operator folklore
-recipe. `zinder-ingest backfill --wallet-serving` derives the historical floor
+### Wallet-serving coverage
+
+Wallet-serving coverage is an explicit coverage mode, not an operator folklore
+recipe. `zinder-ingest --wallet-serving` derives the historical floor
 from upstream-node-advertised activation heights in `getblockchaininfo`, resolves a
 checkpoint at `floor - 1`, and starts canonical artifact ingestion at the floor.
 The current floor is the earliest shielded-pool activation the upstream node
@@ -181,25 +199,23 @@ path included) reads it from a process-startup
 library-default constants. See
 [ADR-0008](../adrs/0008-network-parameter-discovery.md).
 
-The derived floor does not relax the finality bound on the backfill end height.
-Serving-store backfills should stop at the latest height outside the configured
-reorg window, then let `tip-follow` ingest the replaceable near-tip suffix.
-Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
+The derived floor does not relax the finality bound on bulk catch-up. Wallet-serving
+stores reach `upstream_tip - reorg_window_blocks` in the bulk phase, then
+transition to tip-follow for the replaceable near-tip suffix. Per
+[ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 `--allow-near-tip-finalize` is invalid with `--wallet-serving`; use it only
 with explicit local or disposable stores.
 
-Backfill retries retryable source failures with exponential backoff,
+The loop retries retryable source failures with exponential backoff,
 a per-block source deadline, and a per-run retryable failure budget. Retryable
 failures are transport/readiness shaped, such as source unavailable,
 connection reset, timeout, HTTP 503, or Zebra's loading-state JSON-RPC error.
 Protocol mismatches, invalid block bytes, parse failures, and schema errors are
 fatal because retrying would hide a contract violation.
 
-Historical backfill may finalize each committed batch through its tip only when the configured range is known to be outside the live reorg window. That commit must use the same finality transition the live store understands, for example `FinalizeThrough { height: tip_height }`. It must not encode a finalized-height change as `Unchanged`.
+### Commit shape per phase
 
-`zinder-ingest backfill` therefore checks the upstream node tip before opening storage and rejects ranges whose `to_height` is inside the configured reorg window. The only bypass is the explicit `backfill.allow_near_tip_finalize` / `--allow-near-tip-finalize` override, intended for local regtest or disposable stores where the operator accepts that future reorgs may require recreating the store.
-
-Near-tip ingestion needs a separate finalized-boundary policy. Reusing historical backfill for near-tip ranges without that policy would mark replaceable blocks as finalized and hide the actual reorg risk from readers and event consumers.
+The bulk-catch-up phase finalizes each committed batch through its tip because it only operates outside the live reorg window. The commit uses the same finality transition the live store understands, for example `FinalizeThrough { height: tip_height }`. It must not encode a finalized-height change as `Unchanged`. The loop enforces this by clamping every bulk-phase target to `min(upstream_tip - reorg_window, store_tip + commit_batch_blocks)`. The explicit `ingest.modifiers.allow_near_tip_finalize` override is intended for local regtest or disposable stores where the operator accepts that future reorgs may require recreating the store.
 
 Tip following performs parent-hash continuity checks before commit. If the
 observed tip does not extend the visible tip, ingestion walks back to the

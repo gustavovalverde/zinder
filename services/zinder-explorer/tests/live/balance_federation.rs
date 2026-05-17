@@ -49,8 +49,7 @@ use zinder_core::{
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{
-    BackfillOutcome, IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, backfill,
-    build_mempool_entry,
+    IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, backfill, build_mempool_entry,
 };
 use zinder_proto::v1::explorer::explorer_query_server::ExplorerQuery as ExplorerQueryService;
 use zinder_proto::v1::wallet::{
@@ -290,14 +289,14 @@ async fn backfill_and_sample_tip_coinbase(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!(
+    backfill(&backfill_config, &source).await?.ok_or_else(|| {
+        eyre!(
             "expected committed backfill outcome against live {network}",
             network = encode_zinder_native_chain_name(env.network()),
-        ));
-    };
+        )
+    })?;
 
-    let tip_source_block = source.fetch_block_by_height(tip_height).await?;
+    let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_transparent_coinbase_output(&tip_source_block, from_height)?;
 
     let store =
@@ -707,9 +706,9 @@ async fn backfill_from_coinbase(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome on regtest"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome on regtest"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     Ok((tempdir, store))

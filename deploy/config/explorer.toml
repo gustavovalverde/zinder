@@ -1,0 +1,22 @@
+# zinder-explorer config. Tracked example; safe to edit. Docker Compose
+# mounts this file at /etc/zinder/config.toml.
+#
+# zinder-explorer is the third long-lived service in the zinder stack
+# (alongside zinder-ingest and zinder-query). It reads canonical state
+# through a secondary RocksDB handle on the same `zinder-data` volume
+# and serves the ExplorerQuery gRPC surface that block-explorer clients
+# (like zexplorer) consume.
+
+[network]
+name = "zcash-testnet"
+
+[explorer]
+listen_addr = "0.0.0.0:9068"
+storage_path = "/var/lib/zinder/secondary-explorer"
+# The explorer plane delegates some reads to the wallet plane through
+# the in-network DNS name the query service publishes. ADR-0009 records
+# this co-located topology.
+wallet_query_endpoint = "http://zinder-query:9101"
+
+[ops]
+listen_addr = "0.0.0.0:9069"

@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package zinder.v1.ingest;
 
+import "zinder/v1/ops/readiness.proto";
 import "zinder/v1/ops/server_info.proto";
 import "zinder/v1/wallet/wallet.proto";
 
@@ -23,6 +24,51 @@ message ServerInfoResponse {
 // chain epoch.
 message WriterStatusRequest {}
 
+// Current phase of the unified ingest loop. Orthogonal to readiness
+// `cause`: a writer in `WRITER_PHASE_BULK_CATCHUP` may report `syncing`
+// (normal) or `upstream_not_ready` (Zebra itself is behind). See ADR-0015.
+enum WriterPhase {
+  // Default scalar so unset fields do not silently match a real phase.
+  WRITER_PHASE_UNSPECIFIED = 0;
+  // Upstream tip is below the catch-up floor (regtest near genesis or
+  // freshly initialized nodes). The loop polls on the upstream-health
+  // interval and emits `cause=upstream_not_ready` until enough chain
+  // exists to commit.
+  WRITER_PHASE_AWAITING_UPSTREAM = 1;
+  // Gap to the upstream tip is above `ingest.phases.catchup_threshold_blocks`.
+  // The bulk-catchup driver runs pipelined block fetches and commits
+  // batches with `FinalizeThrough`.
+  WRITER_PHASE_BULK_CATCHUP = 2;
+  // Gap is within the catch-up threshold. The serial tip-follow driver
+  // commits one block per poll cycle.
+  WRITER_PHASE_FOLLOWING_TIP = 3;
+
+  // Reserved slots for additive growth. Removing a reserved range is a
+  // breaking change.
+  reserved 4 to 15;
+}
+
+// Transport the bulk-catchup phase is using to move block bytes off the
+// upstream node. Orthogonal to `WriterPhase`: phase answers "what is the
+// loop doing"; `active_transport` answers "how is the bulk phase moving
+// bytes". See ADR-0016.
+enum ActiveTransport {
+  // Default scalar so unset fields do not silently match a real transport.
+  ACTIVE_TRANSPORT_UNSPECIFIED = 0;
+  // Per-block fetches fanned through `.buffered(N)` over
+  // `NodeSource::fetch_block_at`. Default for the JSON-RPC backend.
+  ACTIVE_TRANSPORT_PER_BLOCK_FETCH = 1;
+  // Native streaming via `NodeSource::stream_block_range`. Set when the
+  // backend advertises `NodeCapability::BlockRangeStreaming`.
+  ACTIVE_TRANSPORT_BLOCK_RANGE_STREAM = 2;
+  // In-process backend reading through `ReadStateService`. Set when an
+  // in-process source is configured. ADR-0016 §Phase 3.
+  ACTIVE_TRANSPORT_IN_PROCESS = 3;
+
+  // Reserved slots for additive growth.
+  reserved 4 to 15;
+}
+
 // Private ingest control-plane response used by colocated secondary readers
 // to compute RocksDB-secondary replica lag.
 message WriterStatusResponse {
@@ -37,6 +83,25 @@ message WriterStatusResponse {
 
   // Writer's finalized height for latest_writer_chain_epoch_id.
   optional uint32 latest_writer_finalized_height = 4;
+
+  // Current phase of the unified ingest loop. ADR-0015.
+  WriterPhase phase = 5;
+
+  // Bulk-catchup transport in use. ADR-0016. Always
+  // `ACTIVE_TRANSPORT_PER_BLOCK_FETCH` until ADR-0016 Phase 2 ships.
+  ActiveTransport active_transport = 6;
+
+  // Distance from the writer's visible tip to the observed upstream tip
+  // when known. Drives phase classification; populated whenever the writer
+  // has both a store tip and an upstream tip observation.
+  optional uint32 gap_blocks = 7;
+
+  // Last upstream-health observation. Unset when no probe has produced a
+  // sample yet (writer still in the `STARTING` window) or when the
+  // upstream is healthy. Carries the same payload `ReadinessReport`
+  // surfaces under `cause=upstream_not_ready`; readers parse one struct
+  // for both surfaces. ADR-0015 §Upstream sync detection.
+  optional zinder.v1.ops.UpstreamNotReadyDetail upstream_not_ready = 8;
 }
 
 // Private ingest control-plane RPCs for colocated read replicas.

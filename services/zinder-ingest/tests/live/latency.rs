@@ -11,7 +11,7 @@ use tempfile::tempdir;
 use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange};
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
@@ -173,12 +173,9 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     backfill_config.checkpoint = Some(checkpoint);
 
     let backfill_started_at = std::time::Instant::now();
-    let BackfillOutcome::Committed(commit_outcome) = backfill(&backfill_config, &source).await?
-    else {
-        return Err(eyre!(
-            "expected committed checkpoint-bounded backfill outcome"
-        ));
-    };
+    let commit_outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed checkpoint-bounded backfill outcome"))?;
     let backfill_micros = backfill_started_at.elapsed().as_micros();
     assert_eq!(commit_outcome.chain_epoch.network, env.network());
     assert_eq!(commit_outcome.chain_epoch.tip_height, tip_height);

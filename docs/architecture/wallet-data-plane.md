@@ -317,9 +317,11 @@ non-terminal envelope; bounded UTXO/history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the store was produced with the wallet-serving
-backfill profile. A recent-checkpoint or tip-bootstrapped store may have the
-UTXO artifact family enabled but still lack the historical rows needed by wallet
-birthdays and resync anchors; that deployment posture is not wallet-serving.
+coverage profile (`ingest.coverage = "wallet-serving"` or
+`zinder-ingest --wallet-serving`). A recent-checkpoint or tip-bootstrapped
+store may have the UTXO artifact family enabled but still lack the historical
+rows needed by wallet birthdays and resync anchors; that deployment posture is
+not wallet-serving.
 
 `GetAddressUtxos.maxEntries` is an aggregate response budget across the
 requested address set. The compatibility adapter may make several internal
@@ -443,8 +445,9 @@ A deployment may claim Android SDK or Zashi compatibility only when:
 - The serving store contains the subtree-root history required by fresh wallet
   bootstrap and tree-state history for every anchor height a supported wallet
   flow can request, including create, resync, and restore/import flows. Use
-  `zinder-ingest backfill --wallet-serving` for this serving profile; recent
-  checkpoints are validation fixtures, not wallet-serving stores.
+  `zinder-ingest --wallet-serving` (or `ingest.coverage = "wallet-serving"`)
+  for this serving profile; recent checkpoints are validation fixtures, not
+  wallet-serving stores.
 - The transparent UTXO surface in [§Transparent Address UTXOs](#transparent-address-utxos)
   is implemented end-to-end.
 - The transport requirement in [Service operations](service-operations.md#deployment-guidance)

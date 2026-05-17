@@ -166,14 +166,14 @@ fn zero_explorer_probe_interval_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn ingest_only_node_source_config_is_rejected() -> eyre::Result<()> {
+fn ingest_only_section_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("query-node-source-store");
     let secondary_path = tempdir.path().join("query-node-source-secondary");
     let config_path = tempdir.path().join("zinder-query.toml");
     fs::write(
         &config_path,
-        query_config_with_node_source_toml(&storage_path, &secondary_path)?,
+        query_config_with_ingest_section_toml(&storage_path, &secondary_path)?,
     )?;
 
     let output = zinder_query_command()
@@ -182,10 +182,7 @@ fn ingest_only_node_source_config_is_rejected() -> eyre::Result<()> {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("unknown field `source`") && stderr.contains("json_rpc_addr"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unknown field `ingest`"), "{stderr}");
 
     Ok(())
 }
@@ -207,7 +204,7 @@ listen_addr = "127.0.0.1:9101"
     ))
 }
 
-fn query_config_with_node_source_toml(
+fn query_config_with_ingest_section_toml(
     storage_path: &Path,
     secondary_path: &Path,
 ) -> eyre::Result<String> {
@@ -223,8 +220,10 @@ secondary_path = "{}"
 listen_addr = "127.0.0.1:9101"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "http://127.0.0.1:18232"
+
+[ingest]
+source = "zebra-json-rpc"
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,

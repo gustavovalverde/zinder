@@ -55,8 +55,10 @@ async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
         true,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
-    let outcome = backfill(&backfill_config, &source).await?;
-    let chain_epoch = outcome.chain_epoch();
+    let commit_outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed deep-chain backfill outcome"))?;
+    let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
 

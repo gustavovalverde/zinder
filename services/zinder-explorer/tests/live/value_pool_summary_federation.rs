@@ -22,7 +22,7 @@ use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{BackfillOutcome, IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
     ValuePoolSummaryRequest, ValuePoolSummaryResponse,
@@ -182,9 +182,9 @@ async fn backfill_store(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     Ok((tempdir, store, source))

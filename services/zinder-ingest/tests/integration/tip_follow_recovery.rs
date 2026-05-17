@@ -12,7 +12,14 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -20,14 +27,14 @@ use parking_lot::Mutex;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex};
-use zinder_ingest::{NodeSourceKind, TipFollowConfig, tip_follow_with_primary_store};
+use zinder_ingest::{TipFollowConfig, tip_follow_with_primary_store};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
     DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeSource, NodeTarget,
     SourceBlock, SourceError, SourceFailureClass, SourceSubtreeRoots,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
-use zinder_testkit::{ChainFixture, MockNodeSource};
+use zinder_testkit::ChainFixture;
 
 /// Exact production scenario: `BlockUnavailable` with the production reason
 /// string surfaces, the writer stays alive, and readiness payload reports
@@ -41,7 +48,7 @@ async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> R
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let config = sample_tip_follow_config(&storage_path)?;
+    let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
 
@@ -86,7 +93,7 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let config = sample_tip_follow_config(&storage_path)?;
+    let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
 
@@ -112,59 +119,57 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
     Ok(())
 }
 
-/// Outage tracker advances `consecutive_failures` and `outage_seconds`
-/// across multiple failed iterations, then resets after a successful
-/// observation.
+/// Outage tracker advances `consecutive_failures` across multiple failed
+/// iterations, then resets when the upstream view recovers.
+///
+/// Models the production scenario where the writer cannot make progress
+/// (every `fetch_block_at` returns the view-stale `BlockUnavailable` shape
+/// from the 2026-05-15 incident), then the upstream node settles back to
+/// genesis so `tip_follow_plan` returns `Ok(None)` without needing a new
+/// fetch. That path clears the outage tracker and transitions readiness
+/// out of `NodeUnavailable`, which is the contract the test pins.
 #[tokio::test]
 async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
-    // Fail the first 4 fetches with the production view-stale shape, then
-    // serve the chain normally.
-    let failure_script =
-        zinder_testkit::NodeFailureScript::fail_next_fetches_with_block_unavailable(
-            4,
-            "block height not in best chain",
-        );
-    let node = MockNodeSource::from_chain(chain).with_failure_script(failure_script);
+    let node = ControllableTipSource::new(chain);
     node.set_tip_height(BlockHeight::new(1));
     let storage_path = tempdir()?.path().join("tip-follow-outage-counter");
     let store = PrimaryChainStore::open(
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let config = sample_tip_follow_config(&storage_path)?;
+    let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
 
     let loop_handle = {
         let readiness = readiness.clone();
         let cancel = cancel.clone();
-        let node = node.clone();
+        let source = node.clone();
         tokio::spawn(async move {
-            tip_follow_with_primary_store(&config, &node, store, &readiness, None, None, cancel)
+            tip_follow_with_primary_store(&config, &source, store, &readiness, None, None, cancel)
                 .await
         })
     };
 
     wait_until_node_unavailable(&readiness).await?;
-    let cause = readiness.report().cause;
-    let ReadinessCause::NodeUnavailable(ref detail) = cause else {
-        return Err(eyre!("expected NodeUnavailable, got {cause:?}"));
-    };
-    let consecutive_after_first = detail.consecutive_failures;
-    assert!(consecutive_after_first >= 1);
+    wait_until_consecutive_failures_reaches(&readiness, 2).await?;
 
-    // Wait until either the counter grows or the node recovers, then assert
-    // the writer eventually transitions back to a non-NodeUnavailable cause.
+    // Simulate the upstream view collapsing back to genesis: with an empty
+    // store and `observed_tip_id.height == 0`, the planner returns
+    // `Ok(None)` and the loop resets the outage tracker.
+    node.set_tip_height(BlockHeight::new(0));
+
     wait_until_recovered(&readiness).await?;
+    assert!(node.fetch_attempts() >= 1);
 
     cancel.cancel();
     loop_handle.await??;
     Ok(())
 }
 
-fn sample_tip_follow_config(storage_path: &std::path::Path) -> Result<TipFollowConfig> {
-    Ok(TipFollowConfig {
+fn sample_tip_follow_config(storage_path: &std::path::Path) -> TipFollowConfig {
+    TipFollowConfig {
         node: NodeTarget::new(
             Network::ZcashRegtest,
             "http://127.0.0.1:0".to_owned(),
@@ -172,13 +177,11 @@ fn sample_tip_follow_config(storage_path: &std::path::Path) -> Result<TipFollowC
             Duration::from_secs(5),
             DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
         ),
-        node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_path_buf(),
         reorg_window_blocks: 100,
-        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("non-zero batch"))?,
         poll_interval: Duration::from_millis(10),
         lag_threshold_blocks: 1,
-    })
+    }
 }
 
 async fn wait_until_node_unavailable(readiness: &Readiness) -> Result<()> {
@@ -196,6 +199,28 @@ async fn wait_until_node_unavailable(readiness: &Readiness) -> Result<()> {
     Ok(())
 }
 
+async fn wait_until_consecutive_failures_reaches(readiness: &Readiness, target: u32) -> Result<()> {
+    let deadline = Duration::from_secs(5);
+    let outcome = tokio::time::timeout(deadline, async {
+        loop {
+            if let ReadinessCause::NodeUnavailable(detail) = readiness.report().cause
+                && detail.consecutive_failures >= target
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    outcome.map_err(|_| {
+        eyre!(
+            "consecutive_failures never reached {target}; last cause: {:?}",
+            readiness.report().cause
+        )
+    })?;
+    Ok(())
+}
+
 async fn wait_until_recovered(readiness: &Readiness) -> Result<()> {
     let deadline = Duration::from_secs(5);
     let outcome = tokio::time::timeout(deadline, async {
@@ -207,7 +232,12 @@ async fn wait_until_recovered(readiness: &Readiness) -> Result<()> {
         }
     })
     .await;
-    outcome.map_err(|_| eyre!("readiness never recovered from NodeUnavailable"))?;
+    outcome.map_err(|_| {
+        eyre!(
+            "readiness never recovered from NodeUnavailable; last cause: {:?}",
+            readiness.report().cause
+        )
+    })?;
     Ok(())
 }
 
@@ -242,7 +272,7 @@ impl NodeSource for ViewChangingSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         *self.fetch_attempts.lock() += 1;
         Err(SourceError::BlockUnavailable {
             height,
@@ -257,6 +287,74 @@ impl NodeSource for ViewChangingSource {
             .block_at(tip_height)
             .map_or_else(|| BlockHash::from_bytes([0; 32]), |block| block.hash);
         Ok(BlockId::new(tip_height, hash))
+    }
+
+    async fn fetch_subtree_roots(
+        &self,
+        _protocol: ShieldedProtocol,
+        _start_index: SubtreeRootIndex,
+        _max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: zinder_source::NodeCapability::SubtreeRoots,
+        })
+    }
+}
+
+/// A `NodeSource` whose `fetch_block_at` always returns the production
+/// view-stale failure and whose `tip_id` height is controllable.
+///
+/// Tests use this to drive the outage tracker through several failed
+/// iterations (`tip_height > 0`, fetch keeps failing) and then trigger
+/// recovery by lowering the tip to zero (`tip_follow_plan` returns
+/// `Ok(None)` without touching `fetch_block_at`, so the loop clears the
+/// outage tracker without needing parseable block bytes).
+#[derive(Clone)]
+struct ControllableTipSource {
+    chain: ChainFixture,
+    tip_height: Arc<AtomicU32>,
+    fetch_attempts: Arc<AtomicU32>,
+}
+
+impl ControllableTipSource {
+    fn new(chain: ChainFixture) -> Self {
+        Self {
+            chain,
+            tip_height: Arc::new(AtomicU32::new(0)),
+            fetch_attempts: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn set_tip_height(&self, height: BlockHeight) {
+        self.tip_height.store(height.value(), Ordering::SeqCst);
+    }
+
+    fn fetch_attempts(&self) -> u32 {
+        self.fetch_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl NodeSource for ControllableTipSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        zinder_source::ZebraJsonRpcSource::baseline_capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.fetch_attempts.fetch_add(1, Ordering::SeqCst);
+        Err(SourceError::BlockUnavailable {
+            height,
+            reason: "block height not in best chain".to_owned(),
+        })
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        let height = BlockHeight::new(self.tip_height.load(Ordering::SeqCst));
+        let hash = self
+            .chain
+            .block_at(height)
+            .map_or_else(|| BlockHash::from_bytes([0; 32]), |block| block.hash);
+        Ok(BlockId::new(height, hash))
     }
 
     async fn fetch_subtree_roots(
@@ -294,7 +392,7 @@ impl NodeSource for ProtocolMismatchSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.chain
             .source_block_at(height)
             .ok_or(SourceError::SourceProtocolMismatch {

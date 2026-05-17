@@ -5291,9 +5291,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "eyre",
  "futures-util",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonrpsee",
  "metrics",
  "parking_lot",

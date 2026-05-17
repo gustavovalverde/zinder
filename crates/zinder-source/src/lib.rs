@@ -15,9 +15,11 @@ mod source_error;
 mod source_subtree_root;
 mod source_transaction;
 mod transparent_address;
+mod upstream_health;
 mod zebra_indexer_chain_tip;
 mod zebra_indexer_mempool;
 mod zebra_json_rpc;
+mod zebra_ready_endpoint;
 
 pub use chain_checkpoint::SourceChainCheckpoint;
 pub use json_rpc_mempool::{
@@ -31,7 +33,9 @@ pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};
 pub use node_source::{NodeSource, TransactionBroadcaster};
 pub use node_target::{
-    DEFAULT_NODE_REQUEST_TIMEOUT_SECS, NodeAuthSection, NodeConfigError, NodeSection, NodeTarget,
+    DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
+    DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,
+    NodeAuthSection, NodeConfigError, NodeHealthConfig, NodeHealthSection, NodeSection, NodeTarget,
 };
 pub use source_block::{
     SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes,
@@ -43,6 +47,13 @@ pub use source_transaction::{
     parse_transaction_public_facts, transparent_prevout_from_raw_transaction_bytes,
 };
 pub use transparent_address::transparent_address_matches_network;
+pub use upstream_health::{
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR, UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS,
+    UPSTREAM_HEALTH_REASON_NO_TIP, UPSTREAM_HEALTH_REASON_OK, UPSTREAM_HEALTH_REASON_SYNCING,
+    UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
+    UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
+    UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
+};
 pub use zebra_indexer_chain_tip::{
     ChainTipNotification, ChainTipNotificationSource, ChainTipNotificationStream,
     ZebraIndexerChainTipSource, ZebraIndexerChainTipSourceOptions,

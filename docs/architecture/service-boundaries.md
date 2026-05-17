@@ -6,7 +6,7 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 
 | Boundary                     | Owns                                                                                                                    | Must Not Own                                                                    |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `zinder-ingest`              | Upstream node connections, backfill, tip following, reorg handling, canonical artifact commits, migrations              | Public wallet traffic, user wallet secrets, explorer analytics                  |
+| `zinder-ingest`              | Upstream node connections, unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, canonical artifact commits, migrations | Public wallet traffic, user wallet secrets, explorer analytics                  |
 | `zinder-query`               | Wallet-facing APIs, explorer read APIs, transaction broadcast facade, response consistency                              | Chain selection, canonical writes, migrations, derived-index repair             |
 | `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
 | `zinder-explorer`            | Replayable materialized views, explorer-specific indexes, analytics-specific schemas, `ChainEvent` consumption          | Wallet sync, canonical chain state, source truth                                |

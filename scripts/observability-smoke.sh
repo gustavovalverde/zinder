@@ -278,21 +278,23 @@ password = "${node_password}"
 path = "${storage_path}"
 
 [ingest]
+source = "zebra-json-rpc"
 reorg_window_blocks = 100
+
+[ingest.bulk_catchup]
 commit_batch_blocks = ${COMMIT_BATCH_BLOCKS}
+fetch_concurrency = 32
+
+[ingest.tip_follow]
+poll_interval_ms = ${TIP_FOLLOW_POLL_INTERVAL_MS}
+lag_threshold_blocks = 2
+
+[ingest.modifiers]
+checkpoint_height = ${CHECKPOINT_HEIGHT}
+allow_near_tip_finalize = true
 
 [ingest_control]
 listen_addr = "${INGEST_CONTROL_ADDR}"
-
-[backfill]
-from_height = ${BACKFILL_FROM_HEIGHT}
-to_height = ${BACKFILL_TO_HEIGHT}
-allow_near_tip_finalize = true
-checkpoint_height = ${CHECKPOINT_HEIGHT}
-
-[tip_follow]
-poll_interval_ms = ${TIP_FOLLOW_POLL_INTERVAL_MS}
-lag_threshold_blocks = 2
 EOF
 
   cat >"$QUERY_CONFIG" <<EOF
@@ -518,15 +520,20 @@ build_binaries() {
 run_backfill() {
   local log_file="${LOG_DIR}/backfill.log"
   local started_at ended_at
-  log "backfilling ${BACKFILL_FROM_HEIGHT}..${BACKFILL_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
+  log "running unified ingest until target_height ${BACKFILL_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
   started_at="$(python3 - <<'PY'
 import time
 print(time.time())
 PY
 )"
+  # The unified loop honours --target-height and exits cleanly when
+  # reached. The same binary handles bulk-catchup and tip-follow in one
+  # process per ADR-0015; the long-running invocation below omits the
+  # flag so it continues into FollowingTip after the seed completes.
   if ! (
     cd "$ROOT_DIR"
-    zinder_process_env "${ROOT_DIR}/target/debug/zinder-ingest" --config "$INGEST_CONFIG" backfill
+    zinder_process_env "${ROOT_DIR}/target/debug/zinder-ingest" \
+      --config "$INGEST_CONFIG" --target-height "$BACKFILL_TO_HEIGHT"
   ) >"$log_file" 2>&1; then
     tail -n 160 "$log_file" >&2 || true
     die "checkpoint backfill failed"
@@ -1198,11 +1205,13 @@ run_stack() {
   run_backfill
   run_backup_restore_check
 
+  # Long-running unified ingest. No --target-height here, so the loop
+  # runs indefinitely (transitioning to FollowingTip once the store
+  # catches up to the upstream tip).
   start_process zinder-ingest \
     "${ROOT_DIR}/target/debug/zinder-ingest" \
       --config "$INGEST_CONFIG" \
-      --ops-listen-addr "$INGEST_OPS_ADDR" \
-      tip-follow
+      --ops-listen-addr "$INGEST_OPS_ADDR"
   start_process zinder-query \
     "${ROOT_DIR}/target/debug/zinder-query" \
       --config "$QUERY_CONFIG" \

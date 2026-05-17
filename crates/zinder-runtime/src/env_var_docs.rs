@@ -202,6 +202,45 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Maximum JSON-RPC response body size (bytes) accepted from the node.",
     },
     EnvVarDoc {
+        name: "ZINDER_NODE__HEALTH__ADDR",
+        toml_path: "node.health.addr",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls \
+                      it as the primary upstream-sync signal; when unset, the writer falls back \
+                      to `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
+                      [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
+        toml_path: "node.health.poll_interval_ms",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
+                      Must be greater than zero.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
+        toml_path: "node.health.verification_progress_floor",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Lower bound on `getblockchaininfo.verificationprogress` below which the \
+                      fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in \
+                      `(0.0, 1.0)`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
+        toml_path: "node.health.estimated_gap_floor_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Block gap between `estimatedheight` and the local tip above which the \
+                      fallback path reports `upstream_not_ready`. Defaults to 10.",
+    },
+    EnvVarDoc {
         name: "ZINDER_OPS__LISTEN_ADDR",
         toml_path: "ops.listen_addr",
         used_by: &[
@@ -226,7 +265,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Listen address of the private IngestControl gRPC endpoint. Localhost-only \
                       by default; cross-host deployments must add bearer-token auth per ADR-0006. \
-                      Set to an empty string to disable the endpoint (used by backfill).",
+                      Set to an empty string to disable the endpoint for diagnostic one-shot runs \
+                      (such as `--target-height` pre-seed).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__ADDR",
@@ -252,6 +292,106 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       on every request (ADR-0006). The writer reads it to verify; the readers \
                       read the same file to present. File-only by policy; inline secrets are \
                       rejected at config load.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__SOURCE",
+        toml_path: "ingest.source",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the \
+                      choice is a writer-private implementation decision: `[node]` describes the \
+                      upstream node itself, `[ingest].source` describes which adapter ingest \
+                      uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",
+        toml_path: "ingest.reorg_window_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Chain-truth invariant: how deep the live reorg window extends. Bounds \
+                      finalization, classifier default, and replacement traversal. Must be \
+                      greater than zero. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS",
+        toml_path: "ingest.phases.catchup_threshold_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Gap (in blocks) at which the unified loop transitions between \
+                      `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. \
+                      See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_BATCH_BLOCKS",
+        toml_path: "ingest.bulk_catchup.commit_batch_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Block count per bulk-catchup commit batch. Defaults to 1000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY",
+        toml_path: "ingest.bulk_catchup.fetch_concurrency",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS",
+        toml_path: "ingest.tip_follow.poll_interval_ms",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Tip-follow poll cadence in milliseconds. Must be greater than zero. \
+                      Defaults to 1000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS",
+        toml_path: "ingest.tip_follow.lag_threshold_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Block lag at which tip-follow reports `cause=syncing`. Defaults to 1.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT",
+        toml_path: "ingest.modifiers.target_height",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "One-shot stop-at modifier; the loop exits 0 after committing this \
+                      height. Renamed from `to_height`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MODIFIERS__CHECKPOINT_HEIGHT",
+        toml_path: "ingest.modifiers.checkpoint_height",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Pre-seed an empty store from an upstream-supplied checkpoint at this \
+                      height.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MODIFIERS__ALLOW_NEAR_TIP_FINALIZE",
+        toml_path: "ingest.modifiers.allow_near_tip_finalize",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Disposable-store override: lets bulk-catchup finalize inside the reorg \
+                      window. Invalid combined with `coverage = \"wallet-serving\"`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MODIFIERS__COVERAGE",
+        toml_path: "ingest.modifiers.coverage",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Ingest coverage mode: `\"explicit\"` or `\"wallet-serving\"`. Defaults to \
+                      `\"explicit\"`.",
     },
     EnvVarDoc {
         name: "ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS",

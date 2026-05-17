@@ -35,6 +35,7 @@ pub mod v1 {
             clippy::doc_markdown,
             clippy::missing_fields_in_debug,
             clippy::must_use_candidate,
+            clippy::too_long_first_doc_paragraph,
             clippy::too_many_lines,
             missing_docs,
             reason = "Generated protobuf code mirrors owned schemas."

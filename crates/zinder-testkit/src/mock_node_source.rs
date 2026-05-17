@@ -44,7 +44,7 @@ pub struct MockNodeSource {
 
 /// Pre-programmed failure responses for a [`MockNodeSource`].
 ///
-/// A script is consumed call-by-call: each `fetch_block_by_height` returns a
+/// A script is consumed call-by-call: each `fetch_block_at` returns a
 /// failure until `pending_fetch_failures` reaches zero, after which the mock
 /// returns the corresponding fixture block.
 #[derive(Clone, Debug, Default)]
@@ -161,7 +161,7 @@ impl MockNodeSource {
         self.tip_height.store(height.value(), Ordering::SeqCst);
     }
 
-    /// Returns the count of `fetch_block_by_height` calls observed so far.
+    /// Returns the count of `fetch_block_at` calls observed so far.
     #[must_use]
     pub fn fetch_attempts(&self) -> u32 {
         self.fetch_attempts.load(Ordering::SeqCst)
@@ -180,7 +180,7 @@ impl NodeSource for MockNodeSource {
         self.capabilities
     }
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetch_attempts.fetch_add(1, Ordering::SeqCst);
 
         let scheduled_failure = self.failure_script.lock().consume_one_fetch_failure(height);
@@ -272,9 +272,7 @@ mod tests {
     async fn fetch_block_returns_fixture_block() -> Result<(), Box<dyn Error>> {
         let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
         let node_source = MockNodeSource::from_chain(chain_fixture);
-        let block = node_source
-            .fetch_block_by_height(BlockHeight::new(2))
-            .await?;
+        let block = node_source.fetch_block_at(BlockHeight::new(2)).await?;
         assert_eq!(block.height, BlockHeight::new(2));
         assert_eq!(node_source.fetch_attempts(), 1);
         Ok(())
@@ -288,9 +286,9 @@ mod tests {
         );
 
         let outcomes = [
-            node_source.fetch_block_by_height(BlockHeight::new(1)).await,
-            node_source.fetch_block_by_height(BlockHeight::new(1)).await,
-            node_source.fetch_block_by_height(BlockHeight::new(1)).await,
+            node_source.fetch_block_at(BlockHeight::new(1)).await,
+            node_source.fetch_block_at(BlockHeight::new(1)).await,
+            node_source.fetch_block_at(BlockHeight::new(1)).await,
         ];
         assert!(matches!(
             outcomes[0],
@@ -310,9 +308,7 @@ mod tests {
     async fn unknown_height_returns_block_unavailable() -> Result<(), Box<dyn Error>> {
         let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
         let node_source = MockNodeSource::from_chain(chain_fixture);
-        let outcome = node_source
-            .fetch_block_by_height(BlockHeight::new(99))
-            .await;
+        let outcome = node_source.fetch_block_at(BlockHeight::new(99)).await;
         assert!(matches!(
             outcome,
             Err(SourceError::BlockUnavailable {

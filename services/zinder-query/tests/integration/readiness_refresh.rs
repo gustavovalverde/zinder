@@ -132,6 +132,7 @@ async fn secondary_catchup_marks_replica_lagging_from_writer_status() -> eyre::R
         latest_writer_chain_epoch_id: Some(7),
         latest_writer_tip_height: Some(7),
         latest_writer_finalized_height: Some(7),
+        ..Default::default()
     });
     let (writer_status_addr, writer_status_cancel, writer_status_handle) =
         spawn_writer_status_server(writer_status.clone()).await?;
@@ -158,6 +159,7 @@ async fn secondary_catchup_marks_replica_lagging_from_writer_status() -> eyre::R
         latest_writer_chain_epoch_id: Some(1),
         latest_writer_tip_height: Some(1),
         latest_writer_finalized_height: Some(1),
+        ..Default::default()
     });
     wait_for_ready_height(&readiness, Some(1)).await?;
 

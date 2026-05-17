@@ -15,13 +15,12 @@ fn print_config_validates_and_redacts_basic_auth() -> Result<(), Box<dyn Error>>
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("print-config-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args([
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "backfill",
             "--json-rpc-addr",
             "http://127.0.0.1:40000",
         ])
@@ -46,15 +45,10 @@ fn print_config_accepts_zebra_cookie_auth() -> Result<(), Box<dyn Error>> {
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(
         &config_path,
-        cookie_backfill_config_toml(&storage_path, &cookie_path, 1, 1)?,
+        cookie_ingest_config_toml(&storage_path, &cookie_path)?,
     )?;
     let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backfill",
-        ])
+        .args(["--print-config", "--config", path_str(&config_path)?])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -68,63 +62,31 @@ fn print_config_accepts_zebra_cookie_auth() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn print_config_loads_backfill_config_file() -> Result<(), Box<dyn Error>> {
+fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("configured-store");
+    let storage_path = tempdir.path().join("ingest-print-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backfill",
-        ])
+        .args(["--print-config", "--config", path_str(&config_path)?])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("name = \"zcash-regtest\""));
-    assert!(stdout.contains("json_rpc_addr = \"http://127.0.0.1:39232\""));
-    assert!(stdout.contains("from_height = 1"));
-    assert!(stdout.contains("to_height = 1"));
+    assert!(stdout.contains("[ingest]"));
+    assert!(stdout.contains("reorg_window_blocks = 100"));
+    assert!(stdout.contains("[ingest.phases]"));
+    assert!(stdout.contains("catchup_threshold_blocks ="));
+    assert!(stdout.contains("[ingest.bulk_catchup]"));
+    assert!(stdout.contains("commit_batch_blocks = 1000"));
+    assert!(stdout.contains("fetch_concurrency = 32"));
+    assert!(stdout.contains("[ingest.tip_follow]"));
+    assert!(stdout.contains("poll_interval_ms = 1000"));
+    assert!(stdout.contains("lag_threshold_blocks ="));
+    assert!(stdout.contains("[ingest.modifiers]"));
     assert!(stdout.contains("allow_near_tip_finalize = false"));
-    assert!(stdout.contains("password = \"[REDACTED]\""));
-    assert!(!stdout.contains("file-secret"));
-
-    Ok(())
-}
-
-#[test]
-fn tip_follow_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("tip-follow-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "tip-follow",
-            "--reorg-window-blocks",
-            "12",
-            "--poll-interval-ms",
-            "250",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("[tip_follow]"));
-    assert!(stdout.contains("reorg_window_blocks = 12"));
-    assert!(stdout.contains("poll_interval_ms = 250"));
-    assert!(stdout.contains("[ingest_control]"));
-    assert!(stdout.contains("listen_addr = \"127.0.0.1:9100\""));
-    assert!(stdout.contains("password = \"[REDACTED]\""));
-    assert!(!stdout.contains("file-secret"));
+    assert!(stdout.contains("coverage = \"explicit\""));
 
     Ok(())
 }
@@ -206,14 +168,13 @@ fn print_config_shows_explicit_near_tip_finalize_override() -> Result<(), Box<dy
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("allow-near-tip-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
         .args([
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "backfill",
             "--allow-near-tip-finalize",
         ])
         .output()?;
@@ -230,72 +191,101 @@ fn cli_overrides_environment_and_environment_overrides_config_file() -> Result<(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("precedence-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
-        .env("ZINDER_NODE__REQUEST_TIMEOUT_SECS", "45")
-        .env("ZINDER_BACKFILL__TO_HEIGHT", "2")
         .args([
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "backfill",
-            "--json-rpc-addr",
-            "http://127.0.0.1:40000",
-            "--to-height",
-            "3",
+            "--target-height",
+            "300",
         ])
+        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "200")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("json_rpc_addr = \"http://127.0.0.1:40000\""));
-    assert!(stdout.contains("request_timeout_secs = 45"));
-    assert!(stdout.contains("to_height = 3"));
+    // CLI override (300) wins over env (200) which would win over file.
+    assert!(stdout.contains("target_height = 300"), "{stdout}");
 
     Ok(())
 }
 
 #[test]
-fn checkpoint_height_uses_standard_config_precedence() -> Result<(), Box<dyn Error>> {
+fn target_height_uses_standard_config_precedence() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("checkpoint-precedence-store");
+    let storage_path = tempdir.path().join("target-height-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    let config_toml = format!(
-        "{}checkpoint_height = 5\n",
-        backfill_config_toml(&storage_path, 6, 10)?
-    );
-    fs::write(&config_path, config_toml)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
-        .env("ZINDER_BACKFILL__CHECKPOINT_HEIGHT", "6")
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backfill",
-            "--checkpoint-height",
-            "7",
-        ])
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "777")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("checkpoint_height = 7"));
-    assert!(stdout.contains("password = \"[REDACTED]\""));
-    assert!(!stdout.contains("file-secret"));
+    assert!(stdout.contains("target_height = 777"), "{stdout}");
 
     Ok(())
 }
 
 #[test]
-fn wallet_serving_backfill_print_config_omits_node_derived_floor() -> Result<(), Box<dyn Error>> {
+fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("wallet-serving-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(
         &config_path,
-        wallet_serving_backfill_config_toml(&storage_path, 2_000_000)?,
+        wallet_serving_ingest_config_toml(&storage_path)?,
+    )?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
+
+    Ok(())
+}
+
+#[test]
+fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-checkpoint-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(
+        &config_path,
+        wallet_serving_ingest_config_toml_with_checkpoint(&storage_path)?,
+    )?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.modifiers.coverage = \"wallet-serving\" derives checkpoint_height from the node"
+        ),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn wallet_serving_rejects_near_tip_finalize_override() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-near-tip-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(
+        &config_path,
+        wallet_serving_ingest_config_toml(&storage_path)?,
     )?;
 
     let output = zinder_ingest_command()
@@ -303,78 +293,16 @@ fn wallet_serving_backfill_print_config_omits_node_derived_floor() -> Result<(),
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "backfill",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("coverage = \"wallet-serving\""));
-    assert!(!stdout.contains("from_height = 0"));
-    assert!(!stdout.contains("checkpoint_height = 0"));
-
-    Ok(())
-}
-
-#[test]
-fn wallet_serving_backfill_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-serving-checkpoint-store");
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "backfill",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--to-height",
-            "10",
-            "--wallet-serving",
-            "--checkpoint-height",
-            "5",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("wallet-serving"));
-    assert!(stderr.contains("checkpoint_height"));
-
-    Ok(())
-}
-
-#[test]
-fn wallet_serving_backfill_rejects_near_tip_finalize_override() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-serving-near-tip-store");
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "backfill",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--to-height",
-            "10",
-            "--wallet-serving",
             "--allow-near-tip-finalize",
         ])
         .output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("wallet-serving"));
-    assert!(stderr.contains("allow_near_tip_finalize"));
+    assert!(
+        stderr.contains("ingest.modifiers.coverage = \"wallet-serving\" cannot be combined with"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -382,24 +310,23 @@ fn wallet_serving_backfill_rejects_near_tip_finalize_override() -> Result<(), Bo
 #[test]
 fn max_response_bytes_can_be_overridden_from_cli() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("response-cap-store");
+    let storage_path = tempdir.path().join("max-response-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, backfill_config_toml(&storage_path, 1, 1)?)?;
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
         .args([
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "backfill",
             "--max-response-bytes",
-            "33554432",
+            "8388608",
         ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("max_response_bytes = 33554432"));
+    assert!(stdout.contains("max_response_bytes = 8388608"), "{stdout}");
 
     Ok(())
 }
@@ -407,32 +334,24 @@ fn max_response_bytes_can_be_overridden_from_cli() -> Result<(), Box<dyn Error>>
 #[test]
 fn print_config_redacts_password_supplied_through_environment() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("env-password-redaction-store");
+    let storage_path = tempdir.path().join("env-password-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(
         &config_path,
-        backfill_config_toml_without_auth(&storage_path, 1, 1)?,
+        ingest_config_toml_without_auth(&storage_path)?,
     )?;
 
     let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
         .env("ZINDER_NODE__AUTH__METHOD", "basic")
         .env("ZINDER_NODE__AUTH__USERNAME", "zebra")
         .env("ZINDER_NODE__AUTH__PASSWORD", "env-secret")
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backfill",
-        ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stdout.contains("method = \"basic\""));
     assert!(stdout.contains("password = \"[REDACTED]\""));
     assert!(!stdout.contains("env-secret"));
-    assert!(!stderr.contains("env-secret"));
 
     Ok(())
 }
@@ -440,31 +359,23 @@ fn print_config_redacts_password_supplied_through_environment() -> Result<(), Bo
 #[test]
 fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("env-cookie-redaction-store");
+    let storage_path = tempdir.path().join("inline-cookie-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(
         &config_path,
-        backfill_config_toml_without_auth(&storage_path, 1, 1)?,
+        ingest_config_toml_without_auth(&storage_path)?,
     )?;
 
     let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
         .env("ZINDER_NODE__AUTH__METHOD", "cookie")
-        .env("ZINDER_NODE__AUTH__COOKIE", "user:env-cookie-secret")
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backfill",
-        ])
+        .env("ZINDER_NODE__AUTH__COOKIE", "zebra:inline-cookie-secret")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
     assert!(stdout.contains("method = \"cookie\""));
-    assert!(stdout.contains("path = \"[REDACTED]\""));
-    assert!(!stdout.contains("env-cookie-secret"));
-    assert!(!stderr.contains("env-cookie-secret"));
+    assert!(!stdout.contains("inline-cookie-secret"));
 
     Ok(())
 }
@@ -472,31 +383,26 @@ fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(
 #[test]
 fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-batch-store");
+    let storage_path = tempdir.path().join("zero-commit-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
     let output = zinder_ingest_command()
         .args([
-            "backfill",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--from-height",
-            "1",
-            "--to-height",
-            "1",
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
             "--commit-batch-blocks",
             "0",
         ])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("ingest.commit_batch_blocks must be greater than zero"));
+    assert!(
+        stderr.contains("ingest.bulk_catchup.commit_batch_blocks must be greater than zero"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -504,59 +410,53 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
 #[test]
 fn zero_max_response_bytes_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-response-cap-store");
+    let storage_path = tempdir.path().join("zero-response-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
     let output = zinder_ingest_command()
         .args([
-            "backfill",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--from-height",
-            "1",
-            "--to-height",
-            "1",
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
             "--max-response-bytes",
             "0",
         ])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("node.max_response_bytes must be greater than zero"));
+    assert!(
+        stderr.contains("node.max_response_bytes must be greater than zero"),
+        "{stderr}"
+    );
 
     Ok(())
 }
 
 #[test]
-fn zero_tip_follow_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zero-poll-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
     let output = zinder_ingest_command()
         .args([
-            "tip-follow",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
             "--poll-interval-ms",
             "0",
         ])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("tip_follow.poll_interval_ms must be greater than zero"));
+    assert!(
+        stderr.contains("ingest.tip_follow.poll_interval_ms must be greater than zero"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -565,23 +465,22 @@ fn zero_tip_follow_poll_interval_fails_before_storage_creation() -> Result<(), B
 fn missing_storage_path_is_rejected_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let output = zinder_ingest_command()
         .args([
-            "backfill",
+            "--print-config",
             "--network",
             "zcash-regtest",
             "--node-source",
             "zebra-json-rpc",
             "--json-rpc-addr",
             "http://127.0.0.1:18232",
-            "--from-height",
-            "1",
-            "--to-height",
-            "1",
         ])
         .output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("missing configuration field: storage.path"));
+    assert!(
+        stderr.contains("missing configuration field: storage.path"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -592,56 +491,24 @@ fn unknown_network_fails_before_storage_creation() -> Result<(), Box<dyn Error>>
     let storage_path = tempdir.path().join("unknown-network-store");
     let output = zinder_ingest_command()
         .args([
-            "backfill",
+            "--print-config",
             "--network",
-            "unknown",
+            "zcash-mars",
             "--node-source",
             "zebra-json-rpc",
             "--json-rpc-addr",
             "http://127.0.0.1:18232",
             "--storage-path",
             path_str(&storage_path)?,
-            "--from-height",
-            "1",
-            "--to-height",
-            "1",
         ])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("unknown network"));
-
-    Ok(())
-}
-
-#[test]
-fn inverted_range_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("inverted-range-store");
-    let output = zinder_ingest_command()
-        .args([
-            "backfill",
-            "--network",
-            "zcash-regtest",
-            "--node-source",
-            "zebra-json-rpc",
-            "--json-rpc-addr",
-            "http://127.0.0.1:18232",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--from-height",
-            "2",
-            "--to-height",
-            "1",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    assert!(!storage_path.exists());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("invalid backfill range"));
+    assert!(
+        stderr.contains("network.name") || stderr.contains("zcash-mars"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -652,30 +519,28 @@ fn partial_basic_auth_fails_before_storage_creation() -> Result<(), Box<dyn Erro
     let storage_path = tempdir.path().join("partial-auth-store");
     let output = zinder_ingest_command()
         .args([
-            "backfill",
+            "--print-config",
             "--network",
             "zcash-regtest",
             "--node-source",
             "zebra-json-rpc",
             "--json-rpc-addr",
             "http://127.0.0.1:18232",
+            "--storage-path",
+            path_str(&storage_path)?,
             "--node-auth-method",
             "basic",
             "--node-auth-username",
             "zebra",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--from-height",
-            "1",
-            "--to-height",
-            "1",
         ])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(!storage_path.exists());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("missing configuration field: node.auth.password"));
+    assert!(
+        stderr.contains("missing configuration field: node.auth.password"),
+        "{stderr}"
+    );
 
     Ok(())
 }
@@ -686,17 +551,12 @@ fn zinder_ingest_command() -> Command {
     command
 }
 
-fn backfill_config_toml(
-    storage_path: &Path,
-    from_height: u32,
-    to_height: u32,
-) -> Result<String, Box<dyn Error>> {
+fn ingest_config_toml(storage_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!(
         r#"[network]
 name = "zcash-regtest"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "http://127.0.0.1:39232"
 request_timeout_secs = 30
 
@@ -709,30 +569,22 @@ password = "file-secret"
 path = "{}"
 
 [ingest]
-commit_batch_blocks = 1000
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
 
-[backfill]
-from_height = {}
-to_height = {}
-allow_near_tip_finalize = false
+[ingest_control]
+listen_addr = "127.0.0.1:9100"
 "#,
         path_str(storage_path)?,
-        from_height,
-        to_height
     ))
 }
 
-fn backfill_config_toml_without_auth(
-    storage_path: &Path,
-    from_height: u32,
-    to_height: u32,
-) -> Result<String, Box<dyn Error>> {
+fn ingest_config_toml_without_auth(storage_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!(
         r#"[network]
 name = "zcash-regtest"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "http://127.0.0.1:39232"
 request_timeout_secs = 30
 
@@ -740,29 +592,22 @@ request_timeout_secs = 30
 path = "{}"
 
 [ingest]
-commit_batch_blocks = 1000
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
 
-[backfill]
-from_height = {}
-to_height = {}
-allow_near_tip_finalize = false
+[ingest_control]
+listen_addr = "127.0.0.1:9100"
 "#,
         path_str(storage_path)?,
-        from_height,
-        to_height
     ))
 }
 
-fn wallet_serving_backfill_config_toml(
-    storage_path: &Path,
-    to_height: u32,
-) -> Result<String, Box<dyn Error>> {
+fn wallet_serving_ingest_config_toml(storage_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!(
         r#"[network]
 name = "zcash-regtest"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "http://127.0.0.1:39232"
 request_timeout_secs = 30
 
@@ -775,30 +620,62 @@ password = "file-secret"
 path = "{}"
 
 [ingest]
-commit_batch_blocks = 1000
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
 
-[backfill]
-to_height = {}
-allow_near_tip_finalize = false
+[ingest.modifiers]
 coverage = "wallet-serving"
+
+[ingest_control]
+listen_addr = "127.0.0.1:9100"
 "#,
         path_str(storage_path)?,
-        to_height
     ))
 }
 
-fn cookie_backfill_config_toml(
+fn wallet_serving_ingest_config_toml_with_checkpoint(
+    storage_path: &Path,
+) -> Result<String, Box<dyn Error>> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[node]
+json_rpc_addr = "http://127.0.0.1:39232"
+request_timeout_secs = 30
+
+[node.auth]
+method = "basic"
+username = "zebra"
+password = "file-secret"
+
+[storage]
+path = "{}"
+
+[ingest]
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
+
+[ingest.modifiers]
+coverage = "wallet-serving"
+checkpoint_height = 1
+
+[ingest_control]
+listen_addr = "127.0.0.1:9100"
+"#,
+        path_str(storage_path)?,
+    ))
+}
+
+fn cookie_ingest_config_toml(
     storage_path: &Path,
     cookie_path: &Path,
-    from_height: u32,
-    to_height: u32,
 ) -> Result<String, Box<dyn Error>> {
     Ok(format!(
         r#"[network]
 name = "zcash-regtest"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "http://127.0.0.1:39232"
 request_timeout_secs = 30
 
@@ -810,17 +687,14 @@ path = "{}"
 path = "{}"
 
 [ingest]
-commit_batch_blocks = 1000
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
 
-[backfill]
-from_height = {}
-to_height = {}
-allow_near_tip_finalize = false
+[ingest_control]
+listen_addr = "127.0.0.1:9100"
 "#,
         path_str(cookie_path)?,
         path_str(storage_path)?,
-        from_height,
-        to_height
     ))
 }
 

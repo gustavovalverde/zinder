@@ -169,6 +169,19 @@ pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
 pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
     "ingest.control.chain_value_pools_at_tip_v1";
 
+/// Capability for `IngestControl.WriterStatus.phase`.
+///
+/// Advertises the classifier-driven `zinder.v1.ingest.WriterPhase`
+/// vocabulary wired in
+/// [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md).
+pub const INGEST_WRITER_PHASE_V1: &str = "ingest.writer.phase_v1";
+
+/// Capability for `IngestControl.WriterStatus.active_transport`.
+///
+/// Advertises the source-transport vocabulary from
+/// [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md).
+pub const INGEST_WRITER_ACTIVE_TRANSPORT_V1: &str = "ingest.writer.active_transport_v1";
+
 /// Capabilities always advertised by `IngestControl`.
 ///
 /// Source-backed capabilities are appended by the runtime only when their
@@ -182,6 +195,8 @@ pub const INGEST_CONTROL_ALWAYS_ON_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+    INGEST_WRITER_PHASE_V1,
+    INGEST_WRITER_ACTIVE_TRANSPORT_V1,
 ];
 
 /// Known capability strings exposed by `IngestControl`.
@@ -200,6 +215,8 @@ pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
     INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
+    INGEST_WRITER_PHASE_V1,
+    INGEST_WRITER_ACTIVE_TRANSPORT_V1,
 ];
 /// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
 ///

@@ -69,7 +69,7 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("invalid explorer bearer token: bearer token must not be empty"),
+        stderr.contains("bearer token must not be empty"),
         "{stderr}"
     );
 

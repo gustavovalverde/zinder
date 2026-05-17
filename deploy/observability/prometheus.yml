@@ -29,6 +29,16 @@ scrape_configs:
           stack: "zinder"
           service: "zinder-query"
 
+  - job_name: "zinder-explorer"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["zinder-explorer:9069"]
+        labels:
+          stack: "zinder"
+          service: "zinder-explorer"
+
   - job_name: "prometheus"
     scrape_interval: 60s
     static_configs:

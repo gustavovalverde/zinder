@@ -48,7 +48,8 @@ pub use ops_endpoint::{
     spawn_ops_endpoint_for,
 };
 pub use readiness::{
-    NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
+    IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
+    UpstreamHealth, UpstreamNotReadyDetail,
 };
 pub use sections::{
     IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,

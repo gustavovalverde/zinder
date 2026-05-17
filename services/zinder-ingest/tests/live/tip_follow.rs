@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, time::Duration};
+use std::time::Duration;
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -26,13 +26,8 @@ async fn tip_follow_advances_to_node_tip() -> Result<()> {
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
-    let tip_follow_config = live_tip_follow_config(
-        &env,
-        &storage_path,
-        100,
-        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid test batch size"))?,
-        Duration::from_millis(100),
-    );
+    let tip_follow_config =
+        live_tip_follow_config(&env, &storage_path, 100, Duration::from_millis(100));
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();

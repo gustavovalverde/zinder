@@ -37,7 +37,7 @@ use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::{encode_internal_transaction_id, encode_zinder_native_chain_name};
 use zinder_core::{BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{BackfillOutcome, IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
 use zinder_proto::v1::explorer::{
     PrivacyShape as WirePrivacyShape, TransactionDetailRequest, TransactionVersionKind,
     explorer_query_server::ExplorerQuery as ExplorerQueryService, transaction_location,
@@ -308,14 +308,14 @@ async fn backfill_and_sample_tip_coinbase(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!(
+    backfill(&backfill_config, &source).await?.ok_or_else(|| {
+        eyre!(
             "expected committed backfill outcome against live {network}",
             network = encode_zinder_native_chain_name(env.network()),
-        ));
-    };
+        )
+    })?;
 
-    let tip_source_block = source.fetch_block_by_height(tip_height).await?;
+    let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_tip_coinbase(&tip_source_block)?;
 
     let store =

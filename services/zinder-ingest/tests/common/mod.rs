@@ -57,6 +57,7 @@ pub(crate) fn live_backfill_config(
     commit_batch_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
 ) -> BackfillConfig {
+    const FETCH_CONCURRENCY: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
     BackfillConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
@@ -64,6 +65,8 @@ pub(crate) fn live_backfill_config(
         from_height,
         to_height,
         commit_batch_blocks,
+        fetch_concurrency: FETCH_CONCURRENCY,
+        upstream_tip_hint: None,
         allow_near_tip_finalize,
         checkpoint: None,
     }
@@ -74,15 +77,12 @@ pub(crate) fn live_tip_follow_config(
     env: &LiveTestEnv,
     storage_path: &Path,
     reorg_window_blocks: u32,
-    commit_batch_blocks: NonZeroU32,
     poll_interval: Duration,
 ) -> TipFollowConfig {
     TipFollowConfig {
         node: env.target.clone(),
-        node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
         reorg_window_blocks,
-        commit_batch_blocks,
         poll_interval,
         lag_threshold_blocks: DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
     }
@@ -109,17 +109,15 @@ pub(crate) fn zebra_source_from_backfill(
 pub(crate) fn zebra_source_from_tip_follow(
     tip_follow_config: &TipFollowConfig,
 ) -> Result<ZebraJsonRpcSource> {
-    match tip_follow_config.node_source {
-        NodeSourceKind::ZebraJsonRpc => Ok(ZebraJsonRpcSource::with_options(
-            tip_follow_config.node.network,
-            &tip_follow_config.node.json_rpc_addr,
-            tip_follow_config.node.node_auth.clone(),
-            ZebraJsonRpcSourceOptions {
-                request_timeout: tip_follow_config.node.request_timeout,
-                max_response_bytes: tip_follow_config.node.max_response_bytes,
-            },
-        )?),
-    }
+    Ok(ZebraJsonRpcSource::with_options(
+        tip_follow_config.node.network,
+        &tip_follow_config.node.json_rpc_addr,
+        tip_follow_config.node.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: tip_follow_config.node.request_timeout,
+            max_response_bytes: tip_follow_config.node.max_response_bytes,
+        },
+    )?)
 }
 
 /// Probes the upstream node tip via a fresh source.
@@ -897,80 +895,42 @@ pub(crate) fn zinder_ingest_command() -> Command {
     command
 }
 
-/// Builder for a TOML config file used by the CLI live tests.
-pub(crate) struct BackfillConfigToml<'fields> {
+/// Builder for a bounded unified-ingest TOML config used by the CLI live tests.
+pub(crate) struct BoundedIngestConfigToml<'fields> {
     pub(crate) network_name: &'fields str,
     pub(crate) json_rpc_addr: &'fields str,
     pub(crate) node_auth_username: &'fields str,
     pub(crate) node_auth_password: &'fields str,
     pub(crate) storage_path: &'fields Path,
-    pub(crate) from_height: u32,
-    pub(crate) to_height: u32,
+    pub(crate) target_height: u32,
     pub(crate) request_timeout_secs: u64,
     pub(crate) allow_near_tip_finalize: bool,
 }
 
-/// Builder for a wallet-serving TOML config file used by the CLI live tests.
-pub(crate) struct WalletServingBackfillConfigToml<'fields> {
+/// Builder for a wallet-serving bounded unified-ingest TOML config used by the
+/// CLI live tests.
+pub(crate) struct WalletServingIngestConfigToml<'fields> {
     pub(crate) network_name: &'fields str,
     pub(crate) json_rpc_addr: &'fields str,
     pub(crate) node_auth_username: &'fields str,
     pub(crate) node_auth_password: &'fields str,
     pub(crate) storage_path: &'fields Path,
-    pub(crate) to_height: u32,
+    pub(crate) target_height: u32,
     pub(crate) request_timeout_secs: u64,
 }
 
-/// Renders a `BackfillConfigToml` into the TOML shape `zinder-ingest` accepts.
-pub(crate) fn backfill_config_toml(config_toml: &BackfillConfigToml<'_>) -> Result<String> {
-    Ok(format!(
-        r#"[network]
-name = "{}"
-
-[node]
-source = "zebra-json-rpc"
-json_rpc_addr = "{}"
-request_timeout_secs = {}
-
-[node.auth]
-method = "basic"
-username = "{}"
-password = "{}"
-
-[storage]
-path = "{}"
-
-[ingest]
-commit_batch_blocks = 1000
-
-[backfill]
-from_height = {}
-to_height = {}
-allow_near_tip_finalize = {}
-"#,
-        config_toml.network_name,
-        config_toml.json_rpc_addr,
-        config_toml.request_timeout_secs,
-        config_toml.node_auth_username,
-        config_toml.node_auth_password,
-        path_str(config_toml.storage_path)?,
-        config_toml.from_height,
-        config_toml.to_height,
-        config_toml.allow_near_tip_finalize
-    ))
-}
-
-/// Renders a wallet-serving `BackfillConfigToml` into the TOML shape
-/// `zinder-ingest` accepts.
-pub(crate) fn wallet_serving_backfill_config_toml(
-    config_toml: &WalletServingBackfillConfigToml<'_>,
+/// Renders a `BoundedIngestConfigToml` into the TOML shape `zinder-ingest` accepts.
+///
+/// The `[ingest.modifiers].target_height` field makes the unified loop exit
+/// with status 0 once the canonical store reaches that height.
+pub(crate) fn bounded_ingest_config_toml(
+    config_toml: &BoundedIngestConfigToml<'_>,
 ) -> Result<String> {
     Ok(format!(
         r#"[network]
 name = "{}"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "{}"
 request_timeout_secs = {}
 
@@ -983,11 +943,18 @@ password = "{}"
 path = "{}"
 
 [ingest]
-commit_batch_blocks = 50
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
 
-[backfill]
-coverage = "wallet-serving"
-to_height = {}
+[ingest.bulk_catchup]
+commit_batch_blocks = 1000
+
+[ingest.modifiers]
+target_height = {}
+allow_near_tip_finalize = {}
+
+[ingest_control]
+listen_addr = "127.0.0.1:0"
 "#,
         config_toml.network_name,
         config_toml.json_rpc_addr,
@@ -995,7 +962,55 @@ to_height = {}
         config_toml.node_auth_username,
         config_toml.node_auth_password,
         path_str(config_toml.storage_path)?,
-        config_toml.to_height,
+        config_toml.target_height,
+        config_toml.allow_near_tip_finalize
+    ))
+}
+
+/// Renders a wallet-serving bounded unified-ingest TOML config.
+///
+/// The `coverage = "wallet-serving"` modifier instructs the loop to derive
+/// the historical floor from upstream activation heights before committing.
+pub(crate) fn wallet_serving_ingest_config_toml(
+    config_toml: &WalletServingIngestConfigToml<'_>,
+) -> Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "{}"
+
+[node]
+json_rpc_addr = "{}"
+request_timeout_secs = {}
+
+[node.auth]
+method = "basic"
+username = "{}"
+password = "{}"
+
+[storage]
+path = "{}"
+
+[ingest]
+source = "zebra-json-rpc"
+reorg_window_blocks = 100
+
+[ingest.bulk_catchup]
+commit_batch_blocks = 50
+
+[ingest.modifiers]
+coverage = "wallet-serving"
+target_height = {}
+
+[ingest_control]
+listen_addr = "127.0.0.1:0"
+"#,
+        config_toml.network_name,
+        config_toml.json_rpc_addr,
+        config_toml.request_timeout_secs,
+        config_toml.node_auth_username,
+        config_toml.node_auth_password,
+        path_str(config_toml.storage_path)?,
+        config_toml.target_height,
     ))
 }
 

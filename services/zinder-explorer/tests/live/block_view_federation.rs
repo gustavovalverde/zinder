@@ -44,7 +44,7 @@ use zinder_explorer::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStore, DeriveStoreOptions,
     ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, run_chain_events_subscriber,
 };
-use zinder_ingest::{BackfillOutcome, IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
 use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
     BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
@@ -616,11 +616,11 @@ async fn backfill_and_sample_tip(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
-    let tip_source_block = source.fetch_block_by_height(tip_height).await?;
+    let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_tip(&tip_source_block)?;
 
     let store =

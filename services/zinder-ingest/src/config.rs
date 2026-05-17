@@ -1,13 +1,23 @@
-//! Configuration loading for the `zinder-ingest` command.
+//! Configuration loading for the `zinder-ingest` binary.
+//!
+//! Two top-level shapes ship in Phase 3 of
+//! [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md):
+//!
+//! - [`IngestCommandConfig`] resolves the unified loop's input
+//!   (`zinder-ingest --config X` default invocation, and `zinder-ingest
+//!   probe`).
+//! - [`BackupCommandConfig`] resolves the `backup` subcommand. Backup
+//!   keeps its own command config because it does not run the loop.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
-    BackfillConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-    IngestError, MempoolEventRetentionWorkerConfig, NodeSourceKind, TipFollowConfig,
+    BulkCatchupConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
+    IngestError, IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig,
+    NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
@@ -17,95 +27,26 @@ use zinder_runtime::{
     require_field, resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
     resolve_retention,
 };
+use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::MempoolEventRetentionConfig;
 
 use crate::cli::parse::{
     parse_commit_batch_blocks, parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks,
 };
-use zinder_source::{NodeAuthSection, NodeSection, NodeTarget, SourceChainCheckpoint};
 
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
-const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1000;
-const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
+const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1_000;
+const DEFAULT_FETCH_CONCURRENCY: u32 = 32;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
+const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 
-/// Fully loaded command configuration for `zinder-ingest backfill`.
+/// Fully loaded command configuration for the unified `zinder-ingest`
+/// run (no subcommand and the `probe` subcommand both consume this).
 #[derive(Debug)]
-pub(crate) struct BackfillCommandConfig {
-    pub(crate) node: NodeTarget,
-    pub(crate) node_source: NodeSourceKind,
-    pub(crate) storage_path: PathBuf,
-    pub(crate) from_height: Option<BlockHeight>,
-    pub(crate) to_height: BlockHeight,
-    pub(crate) commit_batch_blocks: std::num::NonZeroU32,
-    pub(crate) allow_near_tip_finalize: bool,
-    pub(crate) checkpoint_height: Option<BlockHeight>,
-    pub(crate) coverage: BackfillCoverage,
-    /// Optional `IngestControl` gRPC listen address. When set, the backfill writer binds
-    /// the control endpoint at start so colocated readers can connect immediately, even
-    /// while a long cold-resume scan is in progress. Defaults to the same socket
-    /// `tip-follow` uses; set `ingest_control.listen_addr = ""` in the backfill TOML
-    /// to disable.
-    pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
-    pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
-    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
-    pub(crate) ops_listen_addr: Option<SocketAddr>,
-}
-
-impl BackfillCommandConfig {
-    pub(crate) fn resolved_backfill_config(
-        &self,
-        checkpoint: Option<SourceChainCheckpoint>,
-    ) -> Result<BackfillConfig, IngestConfigError> {
-        let from_height = self
-            .from_height
-            .ok_or_else(|| ConfigError::missing_field("backfill.from_height"))?;
-
-        if from_height > self.to_height {
-            return Err(ConfigError::invalid(format!(
-                "invalid backfill range: from height {from} exceeds to height {to}",
-                from = from_height.value(),
-                to = self.to_height.value(),
-            ))
-            .into());
-        }
-
-        Ok(BackfillConfig {
-            node: self.node.clone(),
-            node_source: self.node_source,
-            storage_path: self.storage_path.clone(),
-            from_height,
-            to_height: self.to_height,
-            commit_batch_blocks: self.commit_batch_blocks,
-            allow_near_tip_finalize: self.allow_near_tip_finalize,
-            checkpoint,
-        })
-    }
-}
-
-/// Backfill coverage policy selected by an operator.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum BackfillCoverage {
-    /// Use explicitly supplied heights.
-    Explicit,
-    /// Derive the historical floor needed by lightwalletd-compatible wallets.
-    WalletServing,
-}
-
-impl BackfillCoverage {
-    const fn as_kebab_case(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::WalletServing => "wallet-serving",
-        }
-    }
-}
-
-/// Fully loaded command configuration for `zinder-ingest tip-follow`.
-#[derive(Debug)]
-pub(crate) struct TipFollowCommandConfig {
-    pub(crate) tip_follow: TipFollowConfig,
+pub(crate) struct IngestCommandConfig {
+    pub(crate) loop_config: IngestLoopConfig,
+    pub(crate) coverage: IngestCoverage,
     pub(crate) ingest_control_listen_addr: SocketAddr,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
@@ -113,7 +54,7 @@ pub(crate) struct TipFollowCommandConfig {
     pub(crate) retention: ResolvedRetention,
 }
 
-impl TipFollowCommandConfig {
+impl IngestCommandConfig {
     pub(crate) fn chain_event_retention(&self) -> ChainEventRetentionConfig {
         ChainEventRetentionConfig {
             retention_window: self.retention.chain_event_window(),
@@ -134,6 +75,33 @@ impl TipFollowCommandConfig {
     }
 }
 
+/// Coverage policy applied to the [`IngestModifiers`] bootstrap path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum IngestCoverage {
+    /// Use explicitly supplied modifier heights as-is.
+    Explicit,
+    /// Derive the historical floor needed by lightwalletd-compatible
+    /// wallets. The unified loop looks up the checkpoint against the
+    /// upstream node before entering the first phase.
+    WalletServing,
+}
+
+impl IngestCoverage {
+    pub(crate) const fn as_kebab_case(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::WalletServing => "wallet-serving",
+        }
+    }
+}
+
+impl Default for IngestCoverage {
+    fn default() -> Self {
+        DEFAULT_INGEST_COVERAGE
+    }
+}
+
 /// Fully loaded command configuration for `zinder-ingest backup`.
 #[derive(Debug)]
 pub(crate) struct BackupCommandConfig {
@@ -142,30 +110,9 @@ pub(crate) struct BackupCommandConfig {
     pub(crate) to_path: PathBuf,
 }
 
-/// Command-line overrides for the backfill command.
+/// Command-line overrides for the unified ingest invocation.
 #[derive(Debug, Default)]
-pub(crate) struct BackfillConfigOverrides {
-    pub(crate) network: Option<String>,
-    pub(crate) node_source: Option<String>,
-    pub(crate) json_rpc_addr: Option<String>,
-    pub(crate) node_auth_method: Option<String>,
-    pub(crate) node_auth_username: Option<String>,
-    pub(crate) node_auth_path: Option<PathBuf>,
-    pub(crate) storage_path: Option<PathBuf>,
-    pub(crate) from_height: Option<u32>,
-    pub(crate) to_height: Option<u32>,
-    pub(crate) request_timeout_secs: Option<u64>,
-    pub(crate) max_response_bytes: Option<u64>,
-    pub(crate) commit_batch_blocks: Option<u32>,
-    pub(crate) allow_near_tip_finalize: Option<bool>,
-    pub(crate) checkpoint_height: Option<u32>,
-    pub(crate) wallet_serving: Option<bool>,
-    pub(crate) ops_listen_addr: Option<SocketAddr>,
-}
-
-/// Command-line overrides for the tip-follow command.
-#[derive(Debug, Default)]
-pub(crate) struct TipFollowConfigOverrides {
+pub(crate) struct IngestConfigOverrides {
     pub(crate) network: Option<String>,
     pub(crate) node_source: Option<String>,
     pub(crate) json_rpc_addr: Option<String>,
@@ -176,9 +123,15 @@ pub(crate) struct TipFollowConfigOverrides {
     pub(crate) request_timeout_secs: Option<u64>,
     pub(crate) max_response_bytes: Option<u64>,
     pub(crate) reorg_window_blocks: Option<u32>,
+    pub(crate) catchup_threshold_blocks: Option<u32>,
     pub(crate) commit_batch_blocks: Option<u32>,
+    pub(crate) fetch_concurrency: Option<u32>,
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
+    pub(crate) target_height: Option<u32>,
+    pub(crate) checkpoint_height: Option<u32>,
+    pub(crate) allow_near_tip_finalize: Option<bool>,
+    pub(crate) wallet_serving: Option<bool>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
@@ -195,104 +148,69 @@ pub(crate) struct BackupConfigOverrides {
 /// Error returned while resolving command configuration.
 #[derive(Debug, Error)]
 pub(crate) enum IngestConfigError {
-    /// Shared configuration error (load, render, missing field, invalid value,
-    /// sensitive-env override, non-UTF-8 path).
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    /// Ingestion runtime validation failed.
     #[error(transparent)]
     Ingest(#[from] IngestError),
 
-    /// Ingest-control endpoint failed to bind.
     #[error("failed to bind ingest-control endpoint at {listen_addr}: {source}")]
     IngestControlBind {
-        /// Address that failed to bind.
         listen_addr: SocketAddr,
-        /// Underlying I/O error.
         #[source]
         source: std::io::Error,
     },
 
-    /// Ingest-control endpoint transport failed.
     #[error("ingest-control endpoint failed: {source}")]
     IngestControlTransport {
-        /// Underlying tonic transport error.
         #[source]
         source: tonic::transport::Error,
     },
 
-    /// Loading the ingest-control bearer token failed.
     #[error("invalid ingest-control bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),
 }
 
-/// Loads and validates backfill configuration from defaults, file, environment, and CLI overrides.
-pub(crate) fn load_backfill_config(
+/// Loads and validates the unified ingest configuration.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the override chain is one auditable list of TOML keys; splitting it into helpers would scatter the precedence contract across multiple sites."
+)]
+pub(crate) fn load_ingest_config(
     config_path: Option<PathBuf>,
-    overrides: BackfillConfigOverrides,
-) -> Result<BackfillCommandConfig, IngestConfigError> {
-    let raw_config: IngestConfig = ConfigLoader::new()
-        .with_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)?
-        .with_default(
-            "backfill.allow_near_tip_finalize",
-            DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
-        )?
-        .with_ops_section(ServiceIdentifier::Ingest)?
-        .with_file(config_path)
-        .with_zinder_env()?
-        .with_override_if("network.name", overrides.network)?
-        .with_override_if("node.source", overrides.node_source)?
-        .with_override_if("node.json_rpc_addr", overrides.json_rpc_addr)?
-        .with_override_if("node.auth.method", overrides.node_auth_method)?
-        .with_override_if("node.auth.username", overrides.node_auth_username)?
-        .with_override_path_if("node.auth.path", overrides.node_auth_path)?
-        .with_override_path_if("storage.path", overrides.storage_path)?
-        .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
-        .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
-        .with_override_if("ingest.commit_batch_blocks", overrides.commit_batch_blocks)?
-        .with_override_if("backfill.from_height", overrides.from_height)?
-        .with_override_if("backfill.to_height", overrides.to_height)?
-        .with_override_if(
-            "backfill.allow_near_tip_finalize",
-            overrides.allow_near_tip_finalize,
-        )?
-        .with_override_if("backfill.checkpoint_height", overrides.checkpoint_height)?
-        .with_override_if(
-            "backfill.coverage",
-            (overrides.wallet_serving == Some(true))
-                .then_some(BackfillCoverage::WalletServing.as_kebab_case()),
-        )?
-        .with_override_if(
-            "ops.listen_addr",
-            overrides.ops_listen_addr.map(|addr| addr.to_string()),
-        )?
-        .load()?;
-
-    resolve_backfill_config(raw_config)
-}
-
-/// Loads and validates tip-follow configuration from defaults, file, environment, and CLI overrides.
-pub(crate) fn load_tip_follow_config(
-    config_path: Option<PathBuf>,
-    overrides: TipFollowConfigOverrides,
-) -> Result<TipFollowCommandConfig, IngestConfigError> {
+    overrides: IngestConfigOverrides,
+) -> Result<IngestCommandConfig, IngestConfigError> {
     let raw_config: IngestConfig = ConfigLoader::new()
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
-        .with_default("ingest.commit_batch_blocks", DEFAULT_COMMIT_BATCH_BLOCKS)?
         .with_default(
-            "tip_follow.poll_interval_ms",
+            "ingest.bulk_catchup.commit_batch_blocks",
+            DEFAULT_COMMIT_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.fetch_concurrency",
+            DEFAULT_FETCH_CONCURRENCY,
+        )?
+        .with_default(
+            "ingest.tip_follow.poll_interval_ms",
             DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS,
         )?
         .with_default(
-            "tip_follow.lag_threshold_blocks",
+            "ingest.tip_follow.lag_threshold_blocks",
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
+        )?
+        .with_default(
+            "ingest.modifiers.allow_near_tip_finalize",
+            DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
+        )?
+        .with_default(
+            "ingest.modifiers.coverage",
+            DEFAULT_INGEST_COVERAGE.as_kebab_case(),
         )?
         .with_ops_section(ServiceIdentifier::Ingest)?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
-        .with_override_if("node.source", overrides.node_source)?
+        .with_override_if("ingest.source", overrides.node_source)?
         .with_override_if("node.json_rpc_addr", overrides.json_rpc_addr)?
         .with_override_if("node.auth.method", overrides.node_auth_method)?
         .with_override_if("node.auth.username", overrides.node_auth_username)?
@@ -301,11 +219,39 @@ pub(crate) fn load_tip_follow_config(
         .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
         .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
         .with_override_if("ingest.reorg_window_blocks", overrides.reorg_window_blocks)?
-        .with_override_if("ingest.commit_batch_blocks", overrides.commit_batch_blocks)?
-        .with_override_if("tip_follow.poll_interval_ms", overrides.poll_interval_ms)?
         .with_override_if(
-            "tip_follow.lag_threshold_blocks",
+            "ingest.phases.catchup_threshold_blocks",
+            overrides.catchup_threshold_blocks,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.commit_batch_blocks",
+            overrides.commit_batch_blocks,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.fetch_concurrency",
+            overrides.fetch_concurrency,
+        )?
+        .with_override_if(
+            "ingest.tip_follow.poll_interval_ms",
+            overrides.poll_interval_ms,
+        )?
+        .with_override_if(
+            "ingest.tip_follow.lag_threshold_blocks",
             overrides.lag_threshold_blocks,
+        )?
+        .with_override_if("ingest.modifiers.target_height", overrides.target_height)?
+        .with_override_if(
+            "ingest.modifiers.checkpoint_height",
+            overrides.checkpoint_height,
+        )?
+        .with_override_if(
+            "ingest.modifiers.allow_near_tip_finalize",
+            overrides.allow_near_tip_finalize,
+        )?
+        .with_override_if(
+            "ingest.modifiers.coverage",
+            (overrides.wallet_serving == Some(true))
+                .then_some(IngestCoverage::WalletServing.as_kebab_case()),
         )?
         .with_override_if(
             "ingest_control.listen_addr",
@@ -323,10 +269,10 @@ pub(crate) fn load_tip_follow_config(
         )?
         .load()?;
 
-    resolve_tip_follow_config(raw_config)
+    resolve_ingest_config(raw_config)
 }
 
-/// Loads and validates backup configuration from defaults, file, environment, and CLI overrides.
+/// Loads and validates backup configuration.
 pub(crate) fn load_backup_config(
     config_path: Option<PathBuf>,
     overrides: BackupConfigOverrides,
@@ -342,25 +288,18 @@ pub(crate) fn load_backup_config(
     resolve_backup_config(raw_config)
 }
 
-/// Renders the effective backfill configuration in the accepted TOML shape.
-pub(crate) fn redacted_backfill_config_toml(
-    config: &BackfillCommandConfig,
+/// Renders the effective ingest configuration in the accepted TOML
+/// shape.
+pub(crate) fn redacted_ingest_config_toml(
+    config: &IngestCommandConfig,
 ) -> Result<String, IngestConfigError> {
-    let rendered = toml::to_string(&RedactedBackfillConfigToml::from_backfill_config(config))
+    let rendered = toml::to_string(&RedactedIngestConfigToml::from_ingest_config(config))
         .map_err(|source| ConfigError::Render { source })?;
     Ok(rendered)
 }
 
-/// Renders the effective tip-follow configuration in the accepted TOML shape.
-pub(crate) fn redacted_tip_follow_config_toml(
-    config: &TipFollowCommandConfig,
-) -> Result<String, IngestConfigError> {
-    let rendered = toml::to_string(&RedactedTipFollowConfigToml::from_tip_follow_config(config))
-        .map_err(|source| ConfigError::Render { source })?;
-    Ok(rendered)
-}
-
-/// Renders the effective backup configuration in the accepted TOML shape.
+/// Renders the effective backup configuration in the accepted TOML
+/// shape.
 pub(crate) fn redacted_backup_config_toml(
     config: &BackupCommandConfig,
 ) -> Result<String, IngestConfigError> {
@@ -374,66 +313,66 @@ pub(crate) fn redacted_backup_config_toml(
 struct IngestConfig {
     network: NetworkSection,
     ops: OpsSection,
-    node: IngestNodeConfig,
+    node: NodeSection,
     storage: PrimaryStorageSection,
-    ingest: IngestSectionConfig,
+    ingest: IngestSection,
     ingest_control: IngestControlSection,
     retention: RetentionSection,
-    backfill: BackfillSectionConfig,
-    tip_follow: TipFollowSectionConfig,
-    backup: BackupSectionConfig,
+    backup: BackupSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct IngestNodeConfig {
+struct IngestSection {
+    /// Source-adapter selector. Today only `zebra-json-rpc` is
+    /// implemented; [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
+    /// reserves `auto`, `zebra-indexer-grpc`, and `zebra-in-process`.
     source: Option<String>,
-    json_rpc_addr: Option<String>,
-    indexer_grpc_addr: Option<String>,
-    request_timeout_secs: Option<u64>,
-    max_response_bytes: Option<u64>,
-    auth: NodeAuthSection,
-}
-
-impl IngestNodeConfig {
-    fn into_node_section(self) -> NodeSection {
-        NodeSection {
-            json_rpc_addr: self.json_rpc_addr,
-            indexer_grpc_addr: self.indexer_grpc_addr,
-            request_timeout_secs: self.request_timeout_secs,
-            max_response_bytes: self.max_response_bytes,
-            auth: self.auth,
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestSectionConfig {
+    /// Chain-truth invariant: how deep into the upstream tip the
+    /// finalized cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
+    /// Phase classifier knobs.
+    phases: IngestPhasesSection,
+    /// Pipelined-fetch knobs for bulk catch-up.
+    bulk_catchup: IngestBulkCatchupSection,
+    /// Serial-loop knobs for tip-follow.
+    tip_follow: IngestTipFollowSection,
+    /// One-shot modifiers for the unified loop.
+    modifiers: IngestModifiersSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestPhasesSection {
+    catchup_threshold_blocks: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestBulkCatchupSection {
     commit_batch_blocks: Option<u32>,
+    fetch_concurrency: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct BackfillSectionConfig {
-    from_height: Option<u32>,
-    to_height: Option<u32>,
-    allow_near_tip_finalize: Option<bool>,
-    checkpoint_height: Option<u32>,
-    coverage: Option<BackfillCoverage>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct TipFollowSectionConfig {
+struct IngestTipFollowSection {
     poll_interval_ms: Option<u64>,
     lag_threshold_blocks: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct BackupSectionConfig {
+struct IngestModifiersSection {
+    target_height: Option<u32>,
+    checkpoint_height: Option<u32>,
+    allow_near_tip_finalize: Option<bool>,
+    coverage: Option<IngestCoverage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BackupSection {
     to_path: Option<PathBuf>,
 }
 
@@ -443,107 +382,74 @@ const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     }
 }
 
-fn resolve_backfill_config(
-    config: IngestConfig,
-) -> Result<BackfillCommandConfig, IngestConfigError> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the unified ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
+)]
+fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
-    let node_source_text = require_field(config.node.source.clone(), "node.source")?;
-    let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
-    let coverage = config
-        .backfill
-        .coverage
-        .unwrap_or(BackfillCoverage::Explicit);
-    let from_height = resolve_backfill_from_height(config.backfill.from_height, coverage)?;
-    let to_height =
-        require_field(config.backfill.to_height, "backfill.to_height").map(BlockHeight::new)?;
-    if matches!(coverage, BackfillCoverage::WalletServing)
-        && config.backfill.checkpoint_height.is_some()
-    {
-        return Err(ConfigError::invalid(
-            "backfill.coverage = \"wallet-serving\" derives checkpoint_height from the node; remove backfill.checkpoint_height",
-        )
-        .into());
-    }
-    let commit_batch_blocks = require_field(
-        config.ingest.commit_batch_blocks,
-        "ingest.commit_batch_blocks",
-    )?;
-    let allow_near_tip_finalize = require_field(
-        config.backfill.allow_near_tip_finalize,
-        "backfill.allow_near_tip_finalize",
-    )?;
-    if matches!(coverage, BackfillCoverage::WalletServing) && allow_near_tip_finalize {
-        return Err(ConfigError::invalid(
-            "backfill.coverage = \"wallet-serving\" cannot be combined with backfill.allow_near_tip_finalize = true; serving stores must stop outside the reorg window",
-        )
-        .into());
-    }
+    let node_source_text = require_field(config.ingest.source.clone(), "ingest.source")?;
     let node_source = parse_node_source(&node_source_text)?;
-    let ResolvedIngestControlWriter {
-        listen_addr: ingest_control_listen_addr,
-        bearer_token_path: ingest_control_bearer_token_path,
-        bearer_token: ingest_control_bearer_token,
-    } = resolve_ingest_control_writer(config.ingest_control)?;
-    let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
-    let node_target =
-        NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
-
-    Ok(BackfillCommandConfig {
-        node: node_target,
-        node_source,
-        storage_path,
-        from_height,
-        to_height,
-        commit_batch_blocks: parse_commit_batch_blocks(commit_batch_blocks)?,
-        allow_near_tip_finalize,
-        checkpoint_height: config.backfill.checkpoint_height.map(BlockHeight::new),
-        coverage,
-        ingest_control_listen_addr,
-        ingest_control_bearer_token_path,
-        ingest_control_bearer_token,
-        ops_listen_addr,
-    })
-}
-
-fn resolve_backfill_from_height(
-    from_height: Option<u32>,
-    coverage: BackfillCoverage,
-) -> Result<Option<BlockHeight>, IngestConfigError> {
-    match (from_height, coverage) {
-        (Some(from_height), BackfillCoverage::Explicit) => Ok(Some(BlockHeight::new(from_height))),
-        (None, BackfillCoverage::Explicit) => {
-            Err(ConfigError::missing_field("backfill.from_height").into())
-        }
-        (Some(_), BackfillCoverage::WalletServing) => Err(ConfigError::invalid(
-            "backfill.coverage = \"wallet-serving\" derives from_height from the node; remove backfill.from_height",
-        )
-        .into()),
-        (None, BackfillCoverage::WalletServing) => Ok(None),
-    }
-}
-
-fn resolve_tip_follow_config(
-    config: IngestConfig,
-) -> Result<TipFollowCommandConfig, IngestConfigError> {
-    let network = config.network.resolve()?;
-    let node_source_text = require_field(config.node.source.clone(), "node.source")?;
     let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
+
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
         "ingest.reorg_window_blocks",
     )?;
-    let commit_batch_blocks = require_field(
-        config.ingest.commit_batch_blocks,
-        "ingest.commit_batch_blocks",
+    let reorg_window_blocks = parse_reorg_window_blocks(reorg_window_blocks)?;
+
+    let catchup_threshold_blocks = config
+        .ingest
+        .phases
+        .catchup_threshold_blocks
+        .unwrap_or(reorg_window_blocks);
+
+    let commit_batch_blocks_raw = require_field(
+        config.ingest.bulk_catchup.commit_batch_blocks,
+        "ingest.bulk_catchup.commit_batch_blocks",
     )?;
+    let commit_batch_blocks = parse_commit_batch_blocks(commit_batch_blocks_raw)?;
+
+    let fetch_concurrency_raw = require_field(
+        config.ingest.bulk_catchup.fetch_concurrency,
+        "ingest.bulk_catchup.fetch_concurrency",
+    )?;
+    let fetch_concurrency = NonZeroU32::new(fetch_concurrency_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.bulk_catchup.fetch_concurrency must be greater than zero")
+    })?;
+
     let poll_interval_ms = require_field(
-        config.tip_follow.poll_interval_ms,
-        "tip_follow.poll_interval_ms",
+        config.ingest.tip_follow.poll_interval_ms,
+        "ingest.tip_follow.poll_interval_ms",
     )?;
+    let poll_interval = parse_poll_interval_ms(poll_interval_ms)?;
+
     let lag_threshold_blocks = require_field(
-        config.tip_follow.lag_threshold_blocks,
-        "tip_follow.lag_threshold_blocks",
+        config.ingest.tip_follow.lag_threshold_blocks,
+        "ingest.tip_follow.lag_threshold_blocks",
     )?;
+
+    let coverage = config.ingest.modifiers.coverage.unwrap_or_default();
+
+    let allow_near_tip_finalize = require_field(
+        config.ingest.modifiers.allow_near_tip_finalize,
+        "ingest.modifiers.allow_near_tip_finalize",
+    )?;
+    if matches!(coverage, IngestCoverage::WalletServing) && allow_near_tip_finalize {
+        return Err(ConfigError::invalid(
+            "ingest.modifiers.coverage = \"wallet-serving\" cannot be combined with ingest.modifiers.allow_near_tip_finalize = true; serving stores must stop outside the reorg window",
+        )
+        .into());
+    }
+    if matches!(coverage, IngestCoverage::WalletServing)
+        && config.ingest.modifiers.checkpoint_height.is_some()
+    {
+        return Err(ConfigError::invalid(
+            "ingest.modifiers.coverage = \"wallet-serving\" derives checkpoint_height from the node; remove ingest.modifiers.checkpoint_height",
+        )
+        .into());
+    }
+
     let ResolvedIngestControlWriter {
         listen_addr: ingest_control_listen_addr_opt,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -552,21 +458,42 @@ fn resolve_tip_follow_config(
     let ingest_control_listen_addr = ingest_control_listen_addr_opt
         .ok_or_else(|| ConfigError::missing_field("ingest_control.listen_addr"))?;
     let retention = resolve_retention(config.retention)?;
-    let node_source = parse_node_source(&node_source_text)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
-    let node_target =
-        NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
+    let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
 
-    Ok(TipFollowCommandConfig {
-        tip_follow: TipFollowConfig {
-            node: node_target,
-            node_source,
-            storage_path,
-            reorg_window_blocks: parse_reorg_window_blocks(reorg_window_blocks)?,
-            commit_batch_blocks: parse_commit_batch_blocks(commit_batch_blocks)?,
-            poll_interval: parse_poll_interval_ms(poll_interval_ms)?,
+    let modifiers = IngestModifiers {
+        target_height: config.ingest.modifiers.target_height.map(BlockHeight::new),
+        checkpoint_height: config
+            .ingest
+            .modifiers
+            .checkpoint_height
+            .map(BlockHeight::new),
+        allow_near_tip_finalize,
+        checkpoint: None,
+    };
+
+    let loop_config = IngestLoopConfig {
+        node: node_target,
+        node_source,
+        storage_path,
+        reorg_window_blocks,
+        phases: PhasesConfig {
+            catchup_threshold_blocks,
+        },
+        bulk_catchup: BulkCatchupConfig {
+            commit_batch_blocks,
+            fetch_concurrency,
+        },
+        tip_follow: TipFollowPhaseConfig {
+            poll_interval,
             lag_threshold_blocks,
         },
+        modifiers,
+    };
+
+    Ok(IngestCommandConfig {
+        loop_config,
+        coverage,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
@@ -594,27 +521,14 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
 }
 
 #[derive(Serialize)]
-struct RedactedBackfillConfigToml {
+struct RedactedIngestConfigToml {
     network: NetworkToml,
     ops: OpsToml,
-    node: IngestNodeToml,
-    storage: PrimaryStorageToml,
-    ingest: IngestToml,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ingest_control: Option<IngestControlWriterToml>,
-    backfill: BackfillToml,
-}
-
-#[derive(Serialize)]
-struct RedactedTipFollowConfigToml {
-    network: NetworkToml,
-    ops: OpsToml,
-    node: IngestNodeToml,
+    node: NodeToml,
     storage: PrimaryStorageToml,
     ingest: IngestToml,
     ingest_control: IngestControlWriterToml,
     retention: RetentionToml,
-    tip_follow: TipFollowToml,
 }
 
 #[derive(Serialize)]
@@ -624,82 +538,45 @@ struct RedactedBackupConfigToml {
     backup: BackupToml,
 }
 
-#[derive(Serialize)]
-struct IngestNodeToml {
-    source: &'static str,
-    #[serde(flatten)]
-    base: NodeToml,
-}
-
-impl IngestNodeToml {
-    fn from_target(node_source: NodeSourceKind, target: &NodeTarget) -> Self {
+impl RedactedIngestConfigToml {
+    fn from_ingest_config(config: &IngestCommandConfig) -> Self {
+        let loop_config = &config.loop_config;
         Self {
-            source: node_source_name(node_source),
-            base: NodeToml::from_node_target(target),
-        }
-    }
-}
-
-impl RedactedBackfillConfigToml {
-    fn from_backfill_config(config: &BackfillCommandConfig) -> Self {
-        let ingest_control = config.ingest_control_listen_addr.map(|listen_addr| {
-            IngestControlWriterToml::from_resolved(
-                Some(listen_addr),
-                config.ingest_control_bearer_token_path.as_deref(),
-            )
-        });
-        Self {
-            network: NetworkToml::from_network(config.node.network),
+            network: NetworkToml::from_network(loop_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
-            node: IngestNodeToml::from_target(config.node_source, &config.node),
+            node: NodeToml::from_node_target(&loop_config.node),
             storage: PrimaryStorageToml {
-                path: config.storage_path.display().to_string(),
+                path: loop_config.storage_path.display().to_string(),
             },
             ingest: IngestToml {
-                reorg_window_blocks: None,
-                commit_batch_blocks: config.commit_batch_blocks.get(),
-            },
-            ingest_control,
-            backfill: BackfillToml {
-                from_height: if matches!(config.coverage, BackfillCoverage::Explicit) {
-                    config.from_height.map(BlockHeight::value)
-                } else {
-                    None
+                source: node_source_name(loop_config.node_source),
+                reorg_window_blocks: loop_config.reorg_window_blocks,
+                phases: IngestPhasesToml {
+                    catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
                 },
-                to_height: config.to_height.value(),
-                allow_near_tip_finalize: config.allow_near_tip_finalize,
-                checkpoint_height: config.checkpoint_height.map(BlockHeight::value),
-                coverage: config.coverage,
-            },
-        }
-    }
-}
-
-impl RedactedTipFollowConfigToml {
-    fn from_tip_follow_config(config: &TipFollowCommandConfig) -> Self {
-        Self {
-            network: NetworkToml::from_network(config.tip_follow.node.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            node: IngestNodeToml::from_target(
-                config.tip_follow.node_source,
-                &config.tip_follow.node,
-            ),
-            storage: PrimaryStorageToml {
-                path: config.tip_follow.storage_path.display().to_string(),
-            },
-            ingest: IngestToml {
-                reorg_window_blocks: Some(config.tip_follow.reorg_window_blocks),
-                commit_batch_blocks: config.tip_follow.commit_batch_blocks.get(),
+                bulk_catchup: IngestBulkCatchupToml {
+                    commit_batch_blocks: loop_config.bulk_catchup.commit_batch_blocks.get(),
+                    fetch_concurrency: loop_config.bulk_catchup.fetch_concurrency.get(),
+                },
+                tip_follow: IngestTipFollowToml {
+                    poll_interval_ms: duration_as_millis_u64(loop_config.tip_follow.poll_interval),
+                    lag_threshold_blocks: loop_config.tip_follow.lag_threshold_blocks,
+                },
+                modifiers: IngestModifiersToml {
+                    target_height: loop_config.modifiers.target_height.map(BlockHeight::value),
+                    checkpoint_height: loop_config
+                        .modifiers
+                        .checkpoint_height
+                        .map(BlockHeight::value),
+                    allow_near_tip_finalize: loop_config.modifiers.allow_near_tip_finalize,
+                    coverage: config.coverage,
+                },
             },
             ingest_control: IngestControlWriterToml::from_resolved(
                 Some(config.ingest_control_listen_addr),
                 config.ingest_control_bearer_token_path.as_deref(),
             ),
             retention: RetentionToml::from_resolved(config.retention),
-            tip_follow: TipFollowToml {
-                poll_interval_ms: duration_as_millis_u64(config.tip_follow.poll_interval),
-                lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
-            },
         }
     }
 }
@@ -720,29 +597,50 @@ impl RedactedBackupConfigToml {
 
 #[derive(Serialize)]
 struct IngestToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reorg_window_blocks: Option<u32>,
+    source: &'static str,
+    reorg_window_blocks: u32,
+    phases: IngestPhasesToml,
+    bulk_catchup: IngestBulkCatchupToml,
+    tip_follow: IngestTipFollowToml,
+    modifiers: IngestModifiersToml,
+}
+
+#[derive(Serialize)]
+struct IngestPhasesToml {
+    catchup_threshold_blocks: u32,
+}
+
+#[derive(Serialize)]
+struct IngestBulkCatchupToml {
     commit_batch_blocks: u32,
+    fetch_concurrency: u32,
 }
 
 #[derive(Serialize)]
-struct BackfillToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from_height: Option<u32>,
-    to_height: u32,
-    allow_near_tip_finalize: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    checkpoint_height: Option<u32>,
-    coverage: BackfillCoverage,
-}
-
-#[derive(Serialize)]
-struct TipFollowToml {
+struct IngestTipFollowToml {
     poll_interval_ms: u64,
     lag_threshold_blocks: u64,
+}
+
+#[derive(Serialize)]
+struct IngestModifiersToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_height: Option<u32>,
+    allow_near_tip_finalize: bool,
+    coverage: IngestCoverage,
 }
 
 #[derive(Serialize)]
 struct BackupToml {
     to_path: String,
 }
+
+/// Re-export used by the `Duration` field above; the helper is the
+/// runtime crate's stable rendering for milliseconds.
+#[allow(
+    dead_code,
+    reason = "kept for forward-compat with code that touched it during refactor"
+)]
+const _: fn(Duration) -> u64 = duration_as_millis_u64;

@@ -298,10 +298,7 @@ async fn backfill_rejects_wrong_checkpoint_tree_metadata() -> Result<(), Box<dyn
             NodeCapabilities::default()
         }
 
-        async fn fetch_block_by_height(
-            &self,
-            _height: BlockHeight,
-        ) -> Result<SourceBlock, SourceError> {
+        async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
             Ok(self.block.clone())
         }
 
@@ -343,6 +340,8 @@ async fn backfill_rejects_wrong_checkpoint_tree_metadata() -> Result<(), Box<dyn
         from_height: BlockHeight::new(1),
         to_height: BlockHeight::new(1),
         commit_batch_blocks: NonZeroU32::new(1).ok_or("invalid batch size")?,
+        fetch_concurrency: NonZeroU32::new(4).ok_or("invalid fetch concurrency")?,
+        upstream_tip_hint: None,
         allow_near_tip_finalize: true,
         checkpoint: Some(SourceChainCheckpoint::new(
             bogus_checkpoint_height,

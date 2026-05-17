@@ -34,7 +34,7 @@ use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
@@ -118,11 +118,11 @@ async fn backfill_and_sample_tip_coinbase(
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     backfill_config.checkpoint = Some(checkpoint);
-    let BackfillOutcome::Committed(_) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
-    let block_at_tip = source.fetch_block_by_height(tip_height).await?;
+    let block_at_tip = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_coinbase_output(&block_at_tip)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

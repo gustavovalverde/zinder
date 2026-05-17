@@ -41,6 +41,15 @@ use crate::{CookieSource, DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 /// Default per-RPC node request timeout when the configuration omits one.
 pub const DEFAULT_NODE_REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Default poll cadence for [`NodeHealthConfig::poll_interval`].
+pub const DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS: u64 = 30_000;
+
+/// Default lower bound for [`NodeHealthConfig::verification_progress_floor`].
+pub const DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR: f64 = 0.999;
+
+/// Default upper bound for [`NodeHealthConfig::estimated_gap_floor_blocks`].
+pub const DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS: u32 = 10;
+
 /// Resolved upstream node endpoint shared across production binaries and live tests.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -62,12 +71,74 @@ pub struct NodeTarget {
     pub request_timeout: Duration,
     /// Maximum JSON-RPC response body size accepted from the node.
     pub max_response_bytes: NonZeroU64,
+    /// Resolved upstream-health probe configuration.
+    ///
+    /// `None` means the operator did not set `[node.health].addr`, so the
+    /// upstream-health signal falls back to the JSON-RPC
+    /// `getblockchaininfo.verificationprogress` path per
+    /// [ADR-0015 §Upstream sync detection].
+    ///
+    /// [ADR-0015 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    pub health: Option<NodeHealthConfig>,
+}
+
+/// Resolved `[node.health]` configuration for the upstream readiness probe.
+///
+/// All fields are post-default-application: a missing key in TOML resolves
+/// to the documented default before this type is constructed. The probe
+/// loop never re-applies defaults.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeHealthConfig {
+    /// Full URL of Zebra's `/ready` endpoint, e.g.
+    /// `http://127.0.0.1:18233/ready`.
+    pub addr: String,
+    /// Cadence at which the probe task hits the endpoint.
+    pub poll_interval: Duration,
+    /// Fallback threshold: the JSON-RPC path treats upstream as not-ready
+    /// when `verificationprogress < verification_progress_floor`.
+    pub verification_progress_floor: f64,
+    /// Fallback threshold: the JSON-RPC path treats upstream as not-ready
+    /// when `estimatedheight - blocks > estimated_gap_floor_blocks`.
+    pub estimated_gap_floor_blocks: u32,
+}
+
+impl NodeHealthConfig {
+    /// Builds a config from already-resolved required fields.
+    #[must_use]
+    pub const fn new(
+        addr: String,
+        poll_interval: Duration,
+        verification_progress_floor: f64,
+        estimated_gap_floor_blocks: u32,
+    ) -> Self {
+        Self {
+            addr,
+            poll_interval,
+            verification_progress_floor,
+            estimated_gap_floor_blocks,
+        }
+    }
+
+    /// Returns the floors used by the JSON-RPC fallback when no
+    /// [`NodeHealthConfig`] is attached to the source. Callers that
+    /// already hold a config should read its fields directly.
+    #[must_use]
+    pub const fn default_floors() -> (f64, u32) {
+        (
+            DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR,
+            DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS,
+        )
+    }
 }
 
 impl NodeTarget {
     /// Builds a [`NodeTarget`] from already-resolved required fields. The
     /// optional [`NodeTarget::indexer_grpc_addr`] defaults to `None`; opt
     /// in to streaming with [`NodeTarget::with_indexer_grpc_addr`].
+    /// [`NodeTarget::health`] also defaults to `None`; opt in to the
+    /// upstream-health probe with [`NodeTarget::with_health`].
     #[must_use]
     pub const fn new(
         network: Network,
@@ -83,6 +154,7 @@ impl NodeTarget {
             node_auth,
             request_timeout,
             max_response_bytes,
+            health: None,
         }
     }
 
@@ -91,6 +163,14 @@ impl NodeTarget {
     #[must_use]
     pub fn with_indexer_grpc_addr(mut self, indexer_grpc_addr: Option<String>) -> Self {
         self.indexer_grpc_addr = indexer_grpc_addr;
+        self
+    }
+
+    /// Returns a new [`NodeTarget`] with [`NodeTarget::health`] replaced by
+    /// `health`.
+    #[must_use]
+    pub fn with_health(mut self, health: Option<NodeHealthConfig>) -> Self {
+        self.health = health;
         self
     }
 
@@ -132,6 +212,7 @@ impl NodeTarget {
                 reason: "node.max_response_bytes must be greater than zero",
             })?;
         let node_auth = resolve_node_auth(section.auth)?;
+        let health = resolve_node_health(section.health)?;
 
         Ok(Self::new(
             network,
@@ -140,7 +221,8 @@ impl NodeTarget {
             request_timeout,
             max_response_bytes,
         )
-        .with_indexer_grpc_addr(section.indexer_grpc_addr))
+        .with_indexer_grpc_addr(section.indexer_grpc_addr)
+        .with_health(health))
     }
 
     /// Resolves a [`NodeTarget`] directly from the unified env-var schema.
@@ -175,6 +257,21 @@ impl NodeTarget {
                 path: read_optional("ZINDER_NODE__AUTH__PATH").map(PathBuf::from),
                 cookie: read_optional("ZINDER_NODE__AUTH__COOKIE"),
             },
+            health: NodeHealthSection {
+                addr: read_optional("ZINDER_NODE__HEALTH__ADDR"),
+                poll_interval_ms: read_optional_parsed::<u64>(
+                    "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
+                    "node.health.poll_interval_ms",
+                )?,
+                verification_progress_floor: read_optional_parsed::<f64>(
+                    "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
+                    "node.health.verification_progress_floor",
+                )?,
+                estimated_gap_floor_blocks: read_optional_parsed::<u32>(
+                    "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
+                    "node.health.estimated_gap_floor_blocks",
+                )?,
+            },
         };
 
         Self::resolve(network, section)
@@ -183,6 +280,12 @@ impl NodeTarget {
 
 /// Raw `[node]` config section. Each binary's typed `Config` embeds one of
 /// these and passes it to [`NodeTarget::resolve`].
+///
+/// `[node]` describes the upstream node itself (endpoint, transport, auth).
+/// Ingest's choice of which adapter implementation to instantiate lives on
+/// `[ingest].source` per [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
+/// because it is a writer-private implementation decision, not a property
+/// of the node.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
@@ -199,6 +302,36 @@ pub struct NodeSection {
     pub max_response_bytes: Option<u64>,
     /// Authentication subsection.
     pub auth: NodeAuthSection,
+    /// Upstream-readiness probe subsection.
+    pub health: NodeHealthSection,
+}
+
+/// Raw `[node.health]` config section.
+///
+/// Defaults applied during [`NodeTarget::resolve`]. The probe is opt-in:
+/// omitting [`Self::addr`] leaves the resolved
+/// [`NodeTarget::health`] at `None` and the writer falls back to the
+/// `verificationprogress` JSON-RPC path per
+/// [ADR-0015 §Upstream sync detection].
+///
+/// [ADR-0015 §Upstream sync detection]:
+///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeHealthSection {
+    /// Full URL of Zebra's `/ready` endpoint when the operator exposes it.
+    pub addr: Option<String>,
+    /// Probe cadence in milliseconds. Defaults to
+    /// [`DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS`].
+    pub poll_interval_ms: Option<u64>,
+    /// Lower bound for `verificationprogress` used by the JSON-RPC
+    /// fallback. Defaults to
+    /// [`DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR`].
+    pub verification_progress_floor: Option<f64>,
+    /// Upper bound for `estimatedheight - blocks` used by the JSON-RPC
+    /// fallback. Defaults to
+    /// [`DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS`].
+    pub estimated_gap_floor_blocks: Option<u32>,
 }
 
 /// Raw `[node.auth]` config section.
@@ -261,6 +394,40 @@ pub enum NodeConfigError {
         /// Parse failure reason.
         reason: String,
     },
+}
+
+fn resolve_node_health(
+    section: NodeHealthSection,
+) -> Result<Option<NodeHealthConfig>, NodeConfigError> {
+    let Some(addr) = section.addr else {
+        return Ok(None);
+    };
+    let poll_interval_ms = section
+        .poll_interval_ms
+        .unwrap_or(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS);
+    if poll_interval_ms == 0 {
+        return Err(NodeConfigError::Invalid {
+            reason: "node.health.poll_interval_ms must be greater than zero",
+        });
+    }
+    let verification_progress_floor = section
+        .verification_progress_floor
+        .unwrap_or(DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR);
+    if !(verification_progress_floor > 0.0 && verification_progress_floor < 1.0) {
+        return Err(NodeConfigError::Invalid {
+            reason: "node.health.verification_progress_floor must be in (0.0, 1.0)",
+        });
+    }
+    let estimated_gap_floor_blocks = section
+        .estimated_gap_floor_blocks
+        .unwrap_or(DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS);
+
+    Ok(Some(NodeHealthConfig::new(
+        addr,
+        Duration::from_millis(poll_interval_ms),
+        verification_progress_floor,
+        estimated_gap_floor_blocks,
+    )))
 }
 
 fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigError> {
@@ -365,6 +532,7 @@ mod tests {
                 path: None,
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
 
@@ -393,6 +561,7 @@ mod tests {
                 path: None,
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
 
@@ -427,6 +596,7 @@ mod tests {
                 path: Some(PathBuf::from("/etc/zebra/cookie")),
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
 
@@ -453,6 +623,7 @@ mod tests {
                 path: Some(PathBuf::from("/var/run/auth/.cookie")),
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
 
@@ -477,6 +648,7 @@ mod tests {
                 path: None,
                 cookie: Some("user:cookie-secret".to_owned()),
             },
+            health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
 
@@ -501,6 +673,7 @@ mod tests {
                 path: Some(PathBuf::from("/var/run/auth/.cookie")),
                 cookie: Some("user:cookie-secret".to_owned()),
             },
+            health: NodeHealthSection::default(),
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
 
@@ -526,6 +699,7 @@ mod tests {
                 path: None,
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
 
@@ -551,6 +725,7 @@ mod tests {
                 path: None,
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
         };
         let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
 
@@ -558,5 +733,104 @@ mod tests {
             outcome,
             Err(NodeConfigError::UnknownAuthMethod { method }) if method == "oauth"
         ));
+    }
+
+    #[test]
+    fn resolve_omits_health_when_addr_unset() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection::default(),
+            health: NodeHealthSection::default(),
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+        assert!(target.health.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_health_applies_defaults_when_addr_set() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection::default(),
+            health: NodeHealthSection {
+                addr: Some("http://127.0.0.1:18233/ready".to_owned()),
+                poll_interval_ms: None,
+                verification_progress_floor: None,
+                estimated_gap_floor_blocks: None,
+            },
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+        let health = target.health.ok_or(NodeConfigError::Invalid {
+            reason: "expected resolved health config",
+        })?;
+        assert_eq!(health.addr, "http://127.0.0.1:18233/ready");
+        assert_eq!(
+            health.poll_interval,
+            Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS)
+        );
+        assert!(
+            (health.verification_progress_floor - DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            health.estimated_gap_floor_blocks,
+            DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_health_rejects_zero_poll_interval() {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection::default(),
+            health: NodeHealthSection {
+                addr: Some("http://127.0.0.1:18233/ready".to_owned()),
+                poll_interval_ms: Some(0),
+                verification_progress_floor: None,
+                estimated_gap_floor_blocks: None,
+            },
+        };
+        assert!(matches!(
+            NodeTarget::resolve(Network::ZcashRegtest, section),
+            Err(NodeConfigError::Invalid {
+                reason: "node.health.poll_interval_ms must be greater than zero",
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_health_rejects_progress_floor_out_of_range() {
+        for floor in [0.0_f64, 1.0_f64, -0.5_f64, 1.5_f64] {
+            let section = NodeSection {
+                json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+                indexer_grpc_addr: None,
+                request_timeout_secs: None,
+                max_response_bytes: None,
+                auth: NodeAuthSection::default(),
+                health: NodeHealthSection {
+                    addr: Some("http://127.0.0.1:18233/ready".to_owned()),
+                    poll_interval_ms: None,
+                    verification_progress_floor: Some(floor),
+                    estimated_gap_floor_blocks: None,
+                },
+            };
+            assert!(matches!(
+                NodeTarget::resolve(Network::ZcashRegtest, section),
+                Err(NodeConfigError::Invalid {
+                    reason: "node.health.verification_progress_floor must be in (0.0, 1.0)",
+                })
+            ));
+        }
     }
 }

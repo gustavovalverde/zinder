@@ -17,9 +17,9 @@ use zinder_testkit::live::{init, require_live, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    BackfillConfigToml, WalletServingBackfillConfigToml, assert_native_wallet_read_responses,
-    backfill_config_toml, basic_auth_credentials, fetch_live_network_upgrade_activations,
-    live_backfill_config, wallet_serving_backfill_config_toml, zebra_source_from_backfill,
+    BoundedIngestConfigToml, WalletServingIngestConfigToml, assert_native_wallet_read_responses,
+    basic_auth_credentials, bounded_ingest_config_toml, fetch_live_network_upgrade_activations,
+    live_backfill_config, wallet_serving_ingest_config_toml, zebra_source_from_backfill,
     zinder_ingest_command,
 };
 
@@ -27,7 +27,7 @@ const WALLET_SERVING_BOUNDED_DEPTH_BLOCKS: u32 = 150;
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn cli_backfills_initial_range_from_config() -> Result<()> {
+async fn cli_runs_bounded_ingest_loop_from_config() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live()? else {
         return Ok(());
@@ -37,21 +37,20 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    let to_height = match env.network() {
+    let target_height = match env.network() {
         Network::ZcashRegtest => BlockHeight::new(1),
         Network::ZcashTestnet | Network::ZcashMainnet => BlockHeight::new(2),
         other => return Err(eyre!("unsupported network for CLI test: {other:?}")),
     };
     fs::write(
         &config_path,
-        backfill_config_toml(&BackfillConfigToml {
+        bounded_ingest_config_toml(&BoundedIngestConfigToml {
             network_name: encode_zinder_native_chain_name(env.network()),
             json_rpc_addr: &env.target.json_rpc_addr,
             node_auth_username: username,
             node_auth_password: password,
             storage_path: &storage_path,
-            from_height: 1,
-            to_height: to_height.value(),
+            target_height: target_height.value(),
             request_timeout_secs: env.target.request_timeout.as_secs(),
             allow_near_tip_finalize: true,
         })?,
@@ -63,7 +62,6 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
             config_path
                 .to_str()
                 .ok_or_else(|| eyre!("config path not utf-8"))?,
-            "backfill",
         ])
         .output()?;
 
@@ -72,7 +70,7 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
     assert!(stderr.contains("event=\"chain_committed\""), "{stderr}");
     assert!(stderr.contains("chain_epoch_id=1"), "{stderr}");
     assert!(
-        stderr.contains(&format!("tip_height={}", to_height.value())),
+        stderr.contains(&format!("tip_height={}", target_height.value())),
         "{stderr}"
     );
 
@@ -80,13 +78,19 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     let reader = store.current_chain_epoch_reader()?;
     let compact_block = reader
-        .compact_block_at(to_height)?
+        .compact_block_at(target_height)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip compact block artifact"))?;
 
-    assert_eq!(compact_block.height, to_height);
+    assert_eq!(compact_block.height, target_height);
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    assert_native_wallet_read_responses(&store, env.network(), 1, to_height.value(), activations)
-        .await?;
+    assert_native_wallet_read_responses(
+        &store,
+        env.network(),
+        1,
+        target_height.value(),
+        activations,
+    )
+    .await?;
     Ok(())
 }
 
@@ -96,7 +100,7 @@ async fn cli_backfills_initial_range_from_config() -> Result<()> {
     clippy::too_many_lines,
     reason = "live CLI smoke keeps node-derived floor resolution, process execution, and wallet-read assertions in one auditable scenario"
 )]
-async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> {
+async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
         return Ok(());
@@ -140,13 +144,13 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
 
     fs::write(
         &config_path,
-        wallet_serving_backfill_config_toml(&WalletServingBackfillConfigToml {
+        wallet_serving_ingest_config_toml(&WalletServingIngestConfigToml {
             network_name: encode_zinder_native_chain_name(env.network()),
             json_rpc_addr: &env.target.json_rpc_addr,
             node_auth_username: username,
             node_auth_password: password,
             storage_path: &storage_path,
-            to_height: to_height.value(),
+            target_height: to_height.value(),
             request_timeout_secs: env.target.request_timeout.as_secs(),
         })?,
     )?;
@@ -157,7 +161,6 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
             config_path
                 .to_str()
                 .ok_or_else(|| eyre!("config path not utf-8"))?,
-            "backfill",
         ])
         .output()?;
 
@@ -165,7 +168,7 @@ async fn cli_backfills_bounded_wallet_serving_floor_from_config() -> Result<()> 
     let stderr = String::from_utf8(output.stderr)?;
     let checkpoint_height = BlockHeight::new(wallet_serving_floor.value() - 1);
     assert!(
-        stderr.contains("event=\"wallet_serving_backfill_floor_resolved\""),
+        stderr.contains("event=\"wallet_serving_modifiers_resolved\""),
         "{stderr}"
     );
     assert!(

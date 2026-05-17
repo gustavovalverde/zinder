@@ -18,28 +18,11 @@ use crate::chain_ingest::{
     fetch_block_with_retry, next_chain_epoch_id, next_chain_epoch_id_after,
     populate_subtree_root_artifacts,
 };
+use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
 };
-
-/// Maximum number of historical block fetches kept in flight against the
-/// upstream node during backfill.
-///
-/// Zebra's JSON-RPC serves one fetch per request and each block requires four
-/// sequential calls (`getblockhash`, `getblockheader`, `getblock`,
-/// `z_gettreestate`). A serial backfill loop is bounded by the resulting
-/// round-trip latency: at ~10ms per call on a colocated `PaaS` network, the
-/// effective rate is ~25 blocks/sec, which is unacceptable for a multi-million
-/// block historical sync. The bottleneck is the network round trip, not the
-/// node's own cost-per-block, so concurrent fetches scale the throughput nearly
-/// linearly until the node's connection pool or CPU saturates.
-///
-/// 32 is the conservative ceiling that keeps the local socket budget low while
-/// extracting the bulk of the speedup. Operators that drive ingest against a
-/// dedicated node can raise this; operators sharing the node with other readers
-/// should not.
-const BACKFILL_FETCH_CONCURRENCY: usize = 32;
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -57,6 +40,19 @@ pub struct BackfillConfig {
     pub to_height: BlockHeight,
     /// Maximum number of blocks committed in one chain epoch.
     pub commit_batch_blocks: NonZeroU32,
+    /// Number of historical block fetches kept in flight against the
+    /// upstream node. Zebra's JSON-RPC serves one fetch per request, and
+    /// each block costs four sequential calls (`getblockhash`,
+    /// `getblockheader`, `getblock`, `z_gettreestate`); concurrent fetches
+    /// hide the round-trip latency until the node's connection pool or
+    /// CPU saturates. Operator-tunable via `ingest.bulk_catchup.fetch_concurrency`.
+    pub fetch_concurrency: NonZeroU32,
+    /// Pre-observed upstream tip height. When set, `backfill_with_store`
+    /// uses this in place of an internal `tip_id()` round-trip for its
+    /// finality-bound validation. The unified ingest loop reuses the tip
+    /// it observed at the top of each iteration; one-shot callers leave
+    /// this `None` so the call observes the tip itself.
+    pub upstream_tip_hint: Option<BlockHeight>,
     /// Allows finalizing blocks inside the upstream node's current reorg window.
     pub allow_near_tip_finalize: bool,
     /// Optional starting checkpoint for an empty store.
@@ -69,39 +65,19 @@ pub struct BackfillConfig {
     pub checkpoint: Option<SourceChainCheckpoint>,
 }
 
-/// Outcome of a historical backfill run.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub enum BackfillOutcome {
-    /// The run committed at least one new chain epoch.
-    Committed(Box<ChainEpochCommitOutcome>),
-    /// The requested range was already present in the canonical store.
-    AlreadyComplete {
-        /// Current chain epoch that already covers the requested range.
-        chain_epoch: ChainEpoch,
-    },
-}
-
-impl BackfillOutcome {
-    /// Returns the chain epoch visible after this backfill run.
-    #[must_use]
-    pub const fn chain_epoch(&self) -> ChainEpoch {
-        match self {
-            Self::Committed(commit_outcome) => commit_outcome.chain_epoch,
-            Self::AlreadyComplete { chain_epoch } => *chain_epoch,
-        }
-    }
-}
-
 /// Runs a historical backfill and commits the requested range to canonical storage.
 ///
-/// Opens the [`PrimaryChainStore`] internally; callers that want to share the store with
-/// other writers (e.g. an `IngestControl` gRPC server that reads chain events during
-/// backfill) should open the store themselves and call [`backfill_with_store`] instead.
+/// Returns `Some(commit_outcome)` when at least one chain epoch was
+/// committed and `None` when the requested range was already present
+/// in the canonical store. Opens the [`PrimaryChainStore`] internally;
+/// callers that want to share the store with other writers (e.g. an
+/// `IngestControl` gRPC server that reads chain events during backfill)
+/// should open the store themselves and call [`backfill_with_store`]
+/// instead.
 pub async fn backfill<Source>(
     config: &BackfillConfig,
     source: &Source,
-) -> Result<BackfillOutcome, IngestError>
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
@@ -112,21 +88,34 @@ where
 
 /// Runs a historical backfill against a caller-owned [`PrimaryChainStore`].
 ///
-/// The supplied store must have been opened with the same [`ChainStoreOptions`] backfill
-/// expects (`ChainStoreOptions::for_network(config.node.network)`); `RocksDB` enforces a
-/// single primary handle per database, so a caller that needs to expose readable surfaces
-/// (the `IngestControl` gRPC service) during backfill must open the store once and pass
-/// it to this entry point.
+/// Returns `Some(commit_outcome)` when at least one chain epoch was
+/// committed and `None` when the requested range was already present in
+/// the store. The supplied store must have been opened with the same
+/// [`ChainStoreOptions`] backfill expects
+/// (`ChainStoreOptions::for_network(config.node.network)`); `RocksDB`
+/// enforces a single primary handle per database, so a caller that
+/// needs to expose readable surfaces (the `IngestControl` gRPC service)
+/// during backfill must open the store once and pass it to this entry
+/// point.
+///
+/// When [`BackfillConfig::upstream_tip_hint`] is `Some`, the call skips
+/// its own `tip_id()` round-trip and uses the caller-supplied tip for
+/// the finality-bound validation. The unified ingest loop sets the hint
+/// from the tip it already observed at the top of each iteration, which
+/// removes a serial RPC per batch on the bulk-catchup hot path.
 pub async fn backfill_with_store<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
-) -> Result<BackfillOutcome, IngestError>
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
     let store_options = ChainStoreOptions::for_network(config.node.network);
-    let node_tip_height = source.tip_id().await?.height;
+    let node_tip_height = match config.upstream_tip_hint {
+        Some(height) => height,
+        None => source.tip_id().await?.height,
+    };
     validate_backfill_finality_bound(config, node_tip_height, store_options.reorg_window_blocks)?;
     warn_if_checkpoint_within_reorg_window(
         config,
@@ -146,32 +135,34 @@ where
     let Some(backfill_start) =
         backfill_start(current_chain_epoch, config.from_height, config.to_height)?
     else {
-        return Ok(BackfillOutcome::AlreadyComplete {
-            chain_epoch: current_chain_epoch.ok_or(IngestError::BackfillProducedNoCommit)?,
-        });
+        // Range already covered; no new commit. Callers that need the
+        // current chain epoch read it from `store.current_chain_epoch()`.
+        let _ = current_chain_epoch.ok_or(IngestError::BackfillProducedNoCommit)?;
+        return Ok(None);
     };
     let mut artifact_builder =
         IngestArtifactBuilder::with_initial_tip_metadata(backfill_start.initial_tip_metadata);
 
     backfill_from_source_with_store(config, source, store, &mut artifact_builder, backfill_start)
         .await
-        .map(Box::new)
-        .map(BackfillOutcome::Committed)
+        .map(Some)
 }
 
 /// Runs a historical backfill until the requested range is covered.
 ///
-/// Retryable upstream-node failures move readiness to `node_unavailable` and
-/// keep polling instead of ending the writer process. Fatal configuration,
-/// source protocol, storage, and artifact errors still return immediately.
-/// One-shot callers that want process-fatal retry deadlines should call
-/// [`backfill_with_store`] directly.
+/// Returns the commit outcome (when at least one chain epoch was
+/// committed) or `None` when the range was already covered. Retryable
+/// upstream-node failures move readiness to `node_unavailable` and keep
+/// polling instead of ending the writer process. Fatal configuration,
+/// source protocol, storage, and artifact errors still return
+/// immediately. One-shot callers that want process-fatal retry
+/// deadlines should call [`backfill_with_store`] directly.
 pub async fn backfill_until_complete<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
     readiness: &Readiness,
-) -> Result<BackfillOutcome, IngestError>
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
@@ -180,9 +171,14 @@ where
 
     loop {
         match backfill_with_store(config, source, store).await {
-            Ok(outcome) => {
-                let chain_epoch = outcome.chain_epoch();
-                readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
+            Ok(commit_outcome) => {
+                let tip_height = match &commit_outcome {
+                    Some(commit) => Some(commit.chain_epoch.tip_height.value()),
+                    None => store
+                        .current_chain_epoch()?
+                        .map(|chain_epoch| chain_epoch.tip_height.value()),
+                };
+                readiness.set(ReadinessState::ready(tip_height));
                 if outage.take().is_some() {
                     tracing::info!(
                         target: "zinder::ingest",
@@ -190,7 +186,7 @@ where
                         "backfill source recovered"
                     );
                 }
-                return Ok(outcome);
+                return Ok(commit_outcome);
             }
             Err(error) => match decide_recovery(&error, recovery_backoff) {
                 SourceRecoveryDecision::Recover {
@@ -237,14 +233,6 @@ fn advance_backfill_outage(
         *outage = Some((detail.clone(), Instant::now()));
         detail
     }
-}
-
-fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
-    store
-        .current_chain_epoch()
-        .ok()
-        .flatten()
-        .map(|chain_epoch| chain_epoch.tip_height.value())
 }
 
 #[cfg(test)]
@@ -312,6 +300,11 @@ where
     // the run-wide budget (`retry_state` above) still gates the
     // subtree-root and finalization tail.
     let request_timeout = config.node.request_timeout;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
+    )]
+    let fetch_concurrency = config.fetch_concurrency.get() as usize;
     let mut block_stream = futures_util::stream::iter(BlockHeightRange::inclusive(
         backfill_start.from_height,
         config.to_height,
@@ -322,7 +315,7 @@ where
             fetch_block_with_retry(request_timeout, source, height, &mut fetch_retry_state).await
         }
     })
-    .buffered(BACKFILL_FETCH_CONCURRENCY);
+    .buffered(fetch_concurrency);
 
     while let Some(fetch_result) = block_stream.next().await {
         let source_block = fetch_result?;
@@ -711,31 +704,15 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn backfill_retries_retryable_block_unavailable_failures() -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("retryable-block-unavailable-store");
-        let source = FlakyNodeSource {
-            delegate: TestNodeSource {
-                tip_height: BlockHeight::new(200),
-                network: Network::ZcashRegtest,
-            },
-            failure: FlakySourceFailure::BlockUnavailable,
-            retryable_failures_before_success: AtomicU32::new(2),
-            fetch_attempts: AtomicU32::new(0),
-        };
-        let config = test_backfill_config(&storage_path, 1, 1, 1, false)?;
-
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let commit_outcome =
-            backfill_from_source_with_artifact_builder(&config, &source, &mut artifact_builder)
-                .await?;
-
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
-        assert_eq!(source.fetch_attempts.load(Ordering::SeqCst), 3);
-
-        Ok(())
-    }
+    // `BlockUnavailable` retry-then-success is intentionally NOT covered as a
+    // per-call test: per [ADR-0013](../../../docs/adrs/0013-source-failure-recovery-topology.md)
+    // the per-call retry window only covers transient transport failures
+    // (`NodeUnreachable`, `StreamDisconnected`). `UpstreamViewChanged` (which
+    // `BlockUnavailable` maps to) is recoverable at the loop layer because
+    // retrying the same RPC against a stale view cannot succeed; only
+    // re-observing the upstream tip can. The loop-layer recovery contract
+    // for `BlockUnavailable` is tested by
+    // `source_recovery::tests::view_stale_block_unavailable_is_recoverable`.
 
     #[tokio::test]
     async fn backfill_does_not_retry_protocol_mismatch_failures() -> Result<(), Box<dyn Error>> {
@@ -1152,6 +1129,8 @@ mod tests {
             to_height: BlockHeight::new(to_height),
             commit_batch_blocks: NonZeroU32::new(commit_batch_blocks)
                 .ok_or("invalid test batch size")?,
+            fetch_concurrency: NonZeroU32::new(4).ok_or("invalid test fetch concurrency")?,
+            upstream_tip_hint: None,
             allow_near_tip_finalize,
             checkpoint: None,
         })
@@ -1172,19 +1151,14 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FlakySourceFailure {
         NodeUnavailable,
-        BlockUnavailable,
         ProtocolMismatch,
     }
 
     impl FlakySourceFailure {
-        fn source_error(self, height: BlockHeight) -> SourceError {
+        fn source_error(self, _height: BlockHeight) -> SourceError {
             match self {
                 Self::NodeUnavailable => SourceError::NodeUnavailable {
                     reason: "temporary node outage".to_owned(),
-                },
-                Self::BlockUnavailable => SourceError::BlockUnavailable {
-                    height,
-                    reason: "node returned block error".to_owned(),
                 },
                 Self::ProtocolMismatch => SourceError::SourceProtocolMismatch {
                     reason: "node payload missing required field",
@@ -1199,10 +1173,7 @@ mod tests {
             self.delegate.capabilities()
         }
 
-        async fn fetch_block_by_height(
-            &self,
-            height: BlockHeight,
-        ) -> Result<SourceBlock, SourceError> {
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             self.fetch_attempts.fetch_add(1, Ordering::SeqCst);
             if self
                 .retryable_failures_before_success
@@ -1214,7 +1185,7 @@ mod tests {
                 return Err(self.failure.source_error(height));
             }
 
-            self.delegate.fetch_block_by_height(height).await
+            self.delegate.fetch_block_at(height).await
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
@@ -1239,10 +1210,7 @@ mod tests {
             ZebraJsonRpcSource::baseline_capabilities()
         }
 
-        async fn fetch_block_by_height(
-            &self,
-            height: BlockHeight,
-        ) -> Result<SourceBlock, SourceError> {
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             let source_hash = block_hash(height.value());
             let parent_hash = block_hash(height.value().saturating_sub(1));
             let header = SourceBlockHeader {

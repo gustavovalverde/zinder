@@ -28,7 +28,7 @@ use std::num::NonZeroU32;
 use eyre::{Result, eyre};
 use tempfile::tempdir;
 use zinder_core::{BlockHeight, MinedTransaction, Network, TransactionArtifact, TxStatus};
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
@@ -94,9 +94,9 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
     if let Some(checkpoint_height) = checkpoint_height {
         backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
-    let BackfillOutcome::Committed(_outcome) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

@@ -141,7 +141,7 @@ async fn fetches_tip_block_and_rejects_invalid_transaction() -> Result<()> {
     let source = zebra_source(&env)?;
 
     let tip_height = source.tip_id().await?.height;
-    let source_block = source.fetch_block_by_height(tip_height).await?;
+    let source_block = source.fetch_block_at(tip_height).await?;
     let subtree_roots = source
         .fetch_subtree_roots(
             ShieldedProtocol::Sapling,
@@ -277,7 +277,7 @@ async fn parse_coinbase_transaction_id(
     height: BlockHeight,
 ) -> Result<TransactionId> {
     use zebra_chain::serialization::ZcashDeserializeInto;
-    let source_block = source.fetch_block_by_height(height).await?;
+    let source_block = source.fetch_block_at(height).await?;
     let parsed_block: zebra_chain::block::Block = source_block
         .raw_block_bytes
         .as_slice()

@@ -128,7 +128,7 @@ impl NodeSource for StaticValuePoolSource {
         self.capabilities
     }
 
-    async fn fetch_block_by_height(
+    async fn fetch_block_at(
         &self,
         height: BlockHeight,
     ) -> std::result::Result<SourceBlock, SourceError> {

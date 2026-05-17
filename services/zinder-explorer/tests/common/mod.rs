@@ -34,6 +34,7 @@ pub(crate) fn live_backfill_config(
     commit_batch_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
 ) -> BackfillConfig {
+    const FETCH_CONCURRENCY: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
     BackfillConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
@@ -41,6 +42,8 @@ pub(crate) fn live_backfill_config(
         from_height,
         to_height,
         commit_batch_blocks,
+        fetch_concurrency: FETCH_CONCURRENCY,
+        upstream_tip_hint: None,
         allow_near_tip_finalize,
         checkpoint: None,
     }

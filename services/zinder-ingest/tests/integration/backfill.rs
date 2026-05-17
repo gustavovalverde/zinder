@@ -13,9 +13,7 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, Network, ShieldedProtocol, SubtreeRootIndex,
 };
-use zinder_ingest::{
-    BackfillConfig, BackfillOutcome, NodeSourceKind, backfill, backfill_until_complete,
-};
+use zinder_ingest::{BackfillConfig, NodeSourceKind, backfill, backfill_until_complete};
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
@@ -64,13 +62,15 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
+        upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
 
-    let BackfillOutcome::Committed(outcome) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected checkpoint backfill to commit"));
-    };
+    let outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected checkpoint backfill to commit"))?;
 
     assert_eq!(outcome.chain_epoch.network, Network::ZcashTestnet);
     assert_current_artifact_schema(outcome.chain_epoch);
@@ -154,13 +154,15 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
+        upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
 
-    let BackfillOutcome::Committed(outcome) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected checkpoint backfill to commit"));
-    };
+    let outcome = backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected checkpoint backfill to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_metadata, expected_tip_metadata);
 
@@ -199,6 +201,8 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
+        upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
@@ -208,11 +212,9 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
     )?;
     let readiness = Readiness::default();
 
-    let BackfillOutcome::Committed(outcome) =
-        backfill_until_complete(&backfill_config, &source, &store, &readiness).await?
-    else {
-        return Err(eyre!("expected recovered backfill to commit"));
-    };
+    let outcome = backfill_until_complete(&backfill_config, &source, &store, &readiness)
+        .await?
+        .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
     assert_eq!(*pending_retryable_fetch_failures.lock(), 0);
@@ -248,7 +250,7 @@ impl NodeSource for FixtureCheckpointSource {
         NodeCapabilities::default()
     }
 
-    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetched_heights.lock().push(height);
 
         let mut pending_retryable_fetch_failures = self.pending_retryable_fetch_failures.lock();

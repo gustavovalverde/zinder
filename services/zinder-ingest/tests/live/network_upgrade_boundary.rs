@@ -35,7 +35,7 @@ use zinder_core::{
     BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations,
     TransactionArtifact, TxStatus,
 };
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
@@ -123,9 +123,9 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     if let Some(checkpoint_height) = checkpoint_height {
         backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
-    let BackfillOutcome::Committed(_outcome) = backfill(&backfill_config, &source).await? else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

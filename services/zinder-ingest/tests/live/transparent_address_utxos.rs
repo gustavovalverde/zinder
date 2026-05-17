@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
-use zinder_ingest::{BackfillOutcome, backfill};
+use zinder_ingest::backfill;
 use zinder_query::{TransparentAddressUtxosRequest, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
@@ -70,10 +70,9 @@ async fn transparent_address_utxos_surface_through_typed_wallet_query() -> Resul
         true,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
-    let BackfillOutcome::Committed(_commit_outcome) = backfill(&backfill_config, &source).await?
-    else {
-        return Err(eyre!("expected committed backfill outcome"));
-    };
+    backfill(&backfill_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

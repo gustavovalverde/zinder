@@ -1,4 +1,4 @@
-# Reference `zinder-ingest tip-follow` configuration (mounted at
+# Reference `zinder-ingest` configuration (mounted at
 # /etc/zinder/config.toml in the single-container image).
 #
 # Each binary strict-parses its own TOML schema (deny_unknown_fields), so the
@@ -19,7 +19,6 @@
 name = "zcash-testnet"
 
 [node]
-source = "zebra-json-rpc"
 # Z3 in-network DNS. JSON-RPC: 8232 (mainnet) / 18232 (testnet).
 # Zebra indexer gRPC: 8230 (mainnet) / 18230 (testnet).
 json_rpc_addr = "http://zebra:18232"
@@ -35,11 +34,17 @@ path = "/var/run/auth/.cookie"
 path = "/var/lib/zinder/store"
 
 [ingest]
+source = "zebra-json-rpc"
 reorg_window_blocks = 100
+
+# Bulk-catchup runs on cold stores and after long downtime; the unified
+# loop bounces back when the gap closes through the threshold.
+[ingest.bulk_catchup]
 commit_batch_blocks = 1000
+fetch_concurrency = 32
+
+[ingest.tip_follow]
+poll_interval_ms = 2000
 
 [ingest_control]
 listen_addr = "0.0.0.0:9100"
-
-[tip_follow]
-poll_interval_ms = 2000

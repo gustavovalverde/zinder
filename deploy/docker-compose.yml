@@ -1,5 +1,6 @@
-# Reference Compose topology pairing zinder-ingest (writer) and zinder-query
-# (public reader) against a single canonical volume.
+# Reference Compose topology pairing zinder-ingest (writer), zinder-query
+# (wallet-facing reader), and zinder-explorer (explorer-facing reader)
+# against a single canonical volume.
 #
 # This composes the per-service images at services/<svc>/Dockerfile rather
 # than the single-container s6-overlay image. Both shapes are supported;
@@ -38,38 +39,10 @@ networks:
     name: zinder-observability
 
 services:
-  # One-shot bulk catch-up. Runs before zinder-ingest so the writer doesn't
-  # spend days draining a multi-million-block backlog one block per poll
-  # cycle. Re-runs are idempotent: backfill exits `AlreadyComplete` when the
-  # target range is already covered.
-  zinder-ingest-backfill:
-    image: zinder-ingest:latest
-    build:
-      context: ..
-      dockerfile: services/zinder-ingest/Dockerfile
-    container_name: zinder-ingest-backfill
-    restart: "no"
-    networks: [z3]
-    volumes:
-      - zinder-data:/var/lib/zinder
-      - ./config/ingest.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
-      - ./bootstrap-backfill.sh:/usr/local/bin/bootstrap-backfill.sh:ro
-    environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
-      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:18230}
-      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
-      BACKFILL_TIP_OFFSET: ${BACKFILL_TIP_OFFSET:-100}
-    entrypoint: ["/bin/sh"]
-    command: ["/usr/local/bin/bootstrap-backfill.sh"]
-    # The one-shot inherits the writer's healthcheck from the image, which is
-    # meaningless here (the readiness contract belongs to long-lived services).
-    # `service_completed_successfully` already gates downstream on exit 0.
-    healthcheck:
-      disable: true
-
+  # Unified ingest loop per ADR-0015. The single process classifies
+  # the gap to the upstream tip on every iteration and dispatches to
+  # AwaitingUpstream / BulkCatchup / FollowingTip; bulk catch-up is no
+  # longer a separate Compose service.
   zinder-ingest:
     image: zinder-ingest:latest
     build:
@@ -77,9 +50,6 @@ services:
       dockerfile: services/zinder-ingest/Dockerfile
     container_name: zinder-ingest
     restart: on-failure
-    depends_on:
-      zinder-ingest-backfill:
-        condition: service_completed_successfully
     networks: [z3, zinder-observability]
     volumes:
       - zinder-data:/var/lib/zinder
@@ -144,9 +114,43 @@ services:
       start_period: 60s
       retries: 3
 
+  # Explorer-facing reader. Serves ExplorerQuery gRPC on 9068 (block
+  # summaries, transaction details, typed search, mempool views) per
+  # ADR-0009. Co-located with zinder-query on the same canonical volume;
+  # both attach as RocksDB secondaries. Consumed by zexplorer-style
+  # explorer frontends.
+  zinder-explorer:
+    build:
+      context: ..
+      dockerfile: services/zinder-explorer/Dockerfile
+    image: zinder-explorer:latest
+    container_name: zinder-explorer
+    restart: on-failure
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    networks: [z3, zinder-observability]
+    volumes:
+      - zinder-data:/var/lib/zinder
+      - ./config/explorer.toml:/etc/zinder/config.toml:ro
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      # Explorer delegates some reads to the wallet plane via in-network DNS.
+      ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: ${ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT:-http://zinder-query:9101}
+    ports:
+      # ExplorerQuery gRPC published so cross-host clients can reach it.
+      - "9068:9068"
+      - "127.0.0.1:9069:9069"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9069/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
   # Always-on metrics collection. Scrapes zinder-ingest:9105 + zinder-query:9106
-  # over the shared zinder-observability network. Survives every restart of
-  # the writer or reader. ADR: docs/architecture/upstream-platform-binding.md.
+  # + zinder-explorer:9069 over the shared zinder-observability network.
+  # Survives every restart. ADR: docs/architecture/upstream-platform-binding.md.
   zinder-prometheus:
     image: prom/prometheus:v3.2.0
     container_name: zinder-prometheus

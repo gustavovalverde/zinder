@@ -13,13 +13,70 @@ use std::{borrow::Cow, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use zinder_proto::v1::ops as ops_proto;
+use zinder_proto::v1::{ingest as ingest_proto, ops as ops_proto};
+
+/// Current phase of the unified ingest loop ([ADR-0015]).
+///
+/// `phase` is orthogonal to [`ReadinessCause`]: an ingest writer in
+/// [`IngestPhase::BulkCatchup`] may report `cause=syncing` (normal) or
+/// `cause=upstream_not_ready` (Zebra itself is behind). Non-ingest binaries
+/// have no phase and serialize `phase = None`.
+///
+/// Wire shape: snake-case strings (`awaiting_upstream`, `bulk_catchup`,
+/// `following_tip`) on both `/readyz` JSON and the proto
+/// `zinder.v1.ingest.WriterPhase` enum. The wire shape is part of the
+/// public contract; the Rust enum spelling is an implementation detail.
+///
+/// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IngestPhase {
+    /// Upstream tip is below the catch-up floor (regtest near genesis or
+    /// freshly initialized nodes). The loop polls on the upstream-health
+    /// interval and emits `cause=upstream_not_ready` until enough chain
+    /// exists to commit.
+    AwaitingUpstream,
+    /// Gap to the upstream tip is above `ingest.phases.catchup_threshold_blocks`.
+    /// The bulk-catchup driver runs pipelined block fetches and commits
+    /// batches with `FinalizeThrough`.
+    BulkCatchup,
+    /// Gap is within the catch-up threshold. The serial tip-follow driver
+    /// commits one block per poll cycle.
+    FollowingTip,
+}
+
+impl IngestPhase {
+    /// Stable snake-case label used in metric label sets and structured
+    /// log fields. Matches the JSON and proto wire shape.
+    #[must_use]
+    pub const fn wire_label(self) -> &'static str {
+        match self {
+            Self::AwaitingUpstream => "awaiting_upstream",
+            Self::BulkCatchup => "bulk_catchup",
+            Self::FollowingTip => "following_tip",
+        }
+    }
+}
+
+impl From<IngestPhase> for ingest_proto::WriterPhase {
+    fn from(phase: IngestPhase) -> Self {
+        match phase {
+            IngestPhase::AwaitingUpstream => Self::AwaitingUpstream,
+            IngestPhase::BulkCatchup => Self::BulkCatchup,
+            IngestPhase::FollowingTip => Self::FollowingTip,
+        }
+    }
+}
 
 /// Stable readiness cause matching `docs/architecture/service-operations.md`.
 ///
 /// Causes that carry operator-actionable detail use struct variants so the
 /// data is reachable by `serde_json` consumers without an out-of-band lookup.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+///
+/// `Eq` is not derived because [`UpstreamNotReadyDetail::upstream_verification_progress`]
+/// holds an `f64`; use [`PartialEq`] to compare causes.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessCause {
@@ -96,6 +153,12 @@ pub enum ReadinessCause {
     },
     /// Service is shutting down and no longer accepting new traffic.
     ShuttingDown,
+    /// Upstream node is reachable but reports it is itself behind the
+    /// network tip. ADR-0015 §Upstream sync detection. Payload carries the
+    /// signal source (`zebra_ready_endpoint` or
+    /// `verification_progress_fallback`) and the sentinel string that
+    /// triggered, so operators can triage from `/readyz` alone.
+    UpstreamNotReady(UpstreamNotReadyDetail),
 }
 
 /// Operator-actionable narrative for [`ReadinessCause::NodeUnavailable`].
@@ -126,6 +189,55 @@ pub struct NodeUnavailableDetail {
     pub consecutive_failures: u32,
     /// Seconds since the first failure of the current outage window.
     pub outage_seconds: u32,
+}
+
+/// Operator-actionable narrative for [`ReadinessCause::UpstreamNotReady`].
+///
+/// Surfaces in `/readyz` JSON, the proto report, and the
+/// `zinder_readiness_state{cause="upstream_not_ready"}` Prometheus label
+/// set. Carries the dual-path probe output: the upstream's reported
+/// heights, the signal source label, and the sentinel string from
+/// Zebra's `/ready` response or the fallback predicate name. See
+/// [ADR-0015 §Upstream sync detection].
+///
+/// [ADR-0015 §Upstream sync detection]:
+///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct UpstreamNotReadyDetail {
+    /// Upstream's last committed tip height when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_committed_height: Option<u32>,
+    /// Upstream's wall-clock-extrapolated estimate of network tip height
+    /// when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_estimated_height: Option<u32>,
+    /// Upstream's reported verification progress in `[0.0, 1.0]` when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_verification_progress: Option<f64>,
+    /// Nested upstream-health diagnostic. The JSON shape `{source, reason}`
+    /// is documented in the [Initial sync runbook]
+    /// (`docs/runbooks/initial-sync.md`).
+    pub upstream_health: UpstreamHealth,
+}
+
+/// Source + reason pair carried inside [`UpstreamNotReadyDetail`].
+///
+/// The JSON shape is `{ "source": "...", "reason": "..." }`; agents
+/// parsing `/readyz` can build a closed dispatch table from the
+/// enumerated source labels and the sentinel-string set documented in
+/// ADR-0015.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UpstreamHealth {
+    /// Stable kebab-case label naming the signal source:
+    /// `zebra_ready_endpoint` (HTTP `/ready` probe) or
+    /// `verification_progress_fallback` (JSON-RPC derivation).
+    pub source: &'static str,
+    /// Sentinel string surfaced by the signal source. For
+    /// `zebra_ready_endpoint` this is the body of Zebra's 503 response
+    /// (`syncing`, `no tip`, `tip_age=<N>s`, `lag=<N> blocks`,
+    /// `insufficient peers`); for `verification_progress_fallback` it is
+    /// the predicate name that triggered.
+    pub reason: Cow<'static, str>,
 }
 
 impl NodeUnavailableDetail {
@@ -193,6 +305,7 @@ impl ReadinessCause {
         "mempool_source_unavailable",
         "mempool_hydration_lagging",
         "shutting_down",
+        "upstream_not_ready",
     ];
 
     /// Stable Prometheus label for this readiness cause.
@@ -214,6 +327,7 @@ impl ReadinessCause {
             Self::MempoolSourceUnavailable => "mempool_source_unavailable",
             Self::MempoolHydrationLagging { .. } => "mempool_hydration_lagging",
             Self::ShuttingDown => "shutting_down",
+            Self::UpstreamNotReady(_) => "upstream_not_ready",
         }
     }
 
@@ -241,7 +355,8 @@ impl ReadinessCause {
             | Self::MempoolCursorAtRisk { .. }
             | Self::MempoolSourceUnavailable
             | Self::MempoolHydrationLagging { .. }
-            | Self::ShuttingDown => None,
+            | Self::ShuttingDown
+            | Self::UpstreamNotReady(_) => None,
         }
     }
 
@@ -264,7 +379,7 @@ impl ReadinessCause {
 }
 
 /// Snapshot of the current readiness state surfaced to operators.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReadinessReport {
     /// `true` when the service is healthy enough to receive production traffic.
     pub is_ready: bool,
@@ -274,6 +389,13 @@ pub struct ReadinessReport {
     pub current_height: Option<u32>,
     /// Node-observed target height when known.
     pub target_height: Option<u32>,
+    /// Ingest loop phase ([ADR-0015]). `Some` only for `zinder-ingest`;
+    /// reader binaries serialize `phase: null` (omitted from JSON via
+    /// `skip_serializing_if`). Orthogonal to [`Self::cause`].
+    ///
+    /// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<IngestPhase>,
 }
 
 impl ReadinessReport {
@@ -285,6 +407,7 @@ impl ReadinessReport {
             cause: ReadinessCause::Starting,
             current_height: None,
             target_height: None,
+            phase: None,
         }
     }
 }
@@ -316,6 +439,36 @@ impl Readiness {
         *self.inner.lock() = state;
     }
 
+    /// Atomically mutates the current readiness state.
+    ///
+    /// Use when a write depends on the field values it does not change
+    /// (for example: setting a new `cause` while preserving the
+    /// concurrently-updated `current_height` or `phase`). The lock is
+    /// held for the duration of `update`, so concurrent readers and
+    /// writers see the pre- and post-state but never a torn read.
+    pub fn update<F>(&self, update: F)
+    where
+        F: FnOnce(&mut ReadinessState),
+    {
+        update(&mut self.inner.lock());
+    }
+
+    /// Sets the [`IngestPhase`] on the current state without disturbing
+    /// any other field. Used by the unified ingest loop's per-iteration
+    /// classifier stamp.
+    pub fn set_phase(&self, phase: IngestPhase) {
+        self.inner.lock().phase = Some(phase);
+    }
+
+    /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
+    /// preserving the writer's last visible `current_height` and any
+    /// concurrently-set ingest phase. Used by the upstream-health probe.
+    pub fn set_upstream_not_ready(&self, detail: UpstreamNotReadyDetail) {
+        let mut guard = self.inner.lock();
+        guard.cause = ReadinessCause::UpstreamNotReady(detail);
+        guard.target_height = None;
+    }
+
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
@@ -325,12 +478,13 @@ impl Readiness {
             cause: state.cause,
             current_height: state.current_height,
             target_height: state.target_height,
+            phase: state.phase,
         }
     }
 }
 
 /// Mutable readiness state owned by the service's runtime task.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReadinessState {
     /// Stable readiness cause.
     pub cause: ReadinessCause,
@@ -338,6 +492,12 @@ pub struct ReadinessState {
     pub current_height: Option<u32>,
     /// Node-observed target height when known.
     pub target_height: Option<u32>,
+    /// Ingest loop phase ([ADR-0015]). Reader binaries leave this `None`
+    /// for the life of the process. The ingest binary updates it on every
+    /// classifier iteration via [`Self::with_phase`].
+    ///
+    /// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+    pub phase: Option<IngestPhase>,
 }
 
 impl ReadinessState {
@@ -348,6 +508,7 @@ impl ReadinessState {
             cause: ReadinessCause::Starting,
             current_height: None,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -363,6 +524,7 @@ impl ReadinessState {
             cause: ReadinessCause::Ready,
             current_height,
             target_height: current_height,
+            phase: None,
         }
     }
 
@@ -381,6 +543,7 @@ impl ReadinessState {
             cause: ReadinessCause::Syncing { lag_blocks },
             current_height,
             target_height,
+            phase: None,
         }
     }
 
@@ -396,6 +559,7 @@ impl ReadinessState {
             cause,
             current_height: None,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -415,6 +579,7 @@ impl ReadinessState {
             cause: ReadinessCause::NodeUnavailable(detail),
             current_height,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -433,6 +598,7 @@ impl ReadinessState {
             cause: ReadinessCause::ReorgWindowExceeded { depth, configured },
             current_height,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -446,6 +612,7 @@ impl ReadinessState {
             cause: ReadinessCause::NodeCapabilityMissing { capability },
             current_height: None,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -456,6 +623,7 @@ impl ReadinessState {
             cause: ReadinessCause::ReplicaLagging { lag_chain_epochs },
             current_height,
             target_height: None,
+            phase: None,
         }
     }
 
@@ -473,6 +641,7 @@ impl ReadinessState {
             },
             current_height,
             target_height: current_height,
+            phase: None,
         }
     }
 
@@ -490,6 +659,7 @@ impl ReadinessState {
             },
             current_height,
             target_height: current_height,
+            phase: None,
         }
     }
 
@@ -500,6 +670,7 @@ impl ReadinessState {
             cause: ReadinessCause::MempoolSourceUnavailable,
             current_height,
             target_height: current_height,
+            phase: None,
         }
     }
 
@@ -515,7 +686,40 @@ impl ReadinessState {
             },
             current_height,
             target_height: current_height,
+            phase: None,
         }
+    }
+
+    /// Returns an upstream-not-ready state with the dual-path probe
+    /// payload.
+    ///
+    /// `current_height` carries the writer's last visible tip so
+    /// operators see how far Zinder has committed while waiting for
+    /// Zebra to catch up. `detail` carries the signal-source label and
+    /// sentinel string per [ADR-0015 §Upstream sync detection].
+    ///
+    /// [ADR-0015 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    #[must_use]
+    pub fn upstream_not_ready_with_detail(
+        detail: UpstreamNotReadyDetail,
+        current_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::UpstreamNotReady(detail),
+            current_height,
+            target_height: None,
+            phase: None,
+        }
+    }
+
+    /// Returns a copy of `self` tagged with the supplied ingest loop
+    /// phase. Ingest binaries chain this onto every state transition;
+    /// reader binaries never call it.
+    #[must_use]
+    pub fn with_phase(mut self, phase: IngestPhase) -> Self {
+        self.phase = Some(phase);
+        self
     }
 }
 
@@ -537,6 +741,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::MempoolSourceUnavailable => Self::MempoolSourceUnavailable,
             ReadinessCause::MempoolHydrationLagging { .. } => Self::MempoolHydrationLagging,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
+            ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
         }
     }
 }
@@ -548,6 +753,10 @@ impl From<ReadinessCause> for ops_proto::ReadinessCause {
 }
 
 impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one-payload-per-cause dispatch reads as a single auditable contract; splitting it would scatter the cause-to-detail mapping across helpers without simplifying any single arm"
+    )]
     fn from(cause: &ReadinessCause) -> Self {
         let payload = match cause {
             ReadinessCause::Syncing { lag_blocks } => {
@@ -612,6 +821,17 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     },
                 )
             }
+            ReadinessCause::UpstreamNotReady(detail) => {
+                ops_proto::readiness_cause_detail::Payload::UpstreamNotReady(
+                    ops_proto::UpstreamNotReadyDetail {
+                        upstream_committed_height: detail.upstream_committed_height,
+                        upstream_estimated_height: detail.upstream_estimated_height,
+                        upstream_verification_progress: detail.upstream_verification_progress,
+                        upstream_health_source: detail.upstream_health.source.to_owned(),
+                        upstream_health_reason: detail.upstream_health.reason.clone().into_owned(),
+                    },
+                )
+            }
             ReadinessCause::Starting
             | ReadinessCause::Ready
             | ReadinessCause::StorageUnavailable
@@ -654,6 +874,118 @@ mod tests {
         assert!(report.is_ready);
         assert!(matches!(report.cause, ReadinessCause::Ready));
         assert_eq!(report.current_height, Some(10));
+    }
+
+    #[test]
+    fn ingest_phase_serializes_snake_case() -> Result<(), serde_json::Error> {
+        for (phase, expected) in [
+            (IngestPhase::AwaitingUpstream, "\"awaiting_upstream\""),
+            (IngestPhase::BulkCatchup, "\"bulk_catchup\""),
+            (IngestPhase::FollowingTip, "\"following_tip\""),
+        ] {
+            let rendered = serde_json::to_string(&phase)?;
+            assert_eq!(
+                rendered, expected,
+                "wire shape for {phase:?} must be snake_case"
+            );
+            assert_eq!(phase.wire_label(), expected.trim_matches('"'));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn report_carries_phase_when_set() {
+        let state = ReadinessState::syncing(Some(3), Some(10), Some(13))
+            .with_phase(IngestPhase::BulkCatchup);
+        let readiness = Readiness::new(state);
+        let report = readiness.report();
+        assert_eq!(report.phase, Some(IngestPhase::BulkCatchup));
+    }
+
+    #[test]
+    fn report_omits_phase_for_reader_binaries() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        let report = readiness.report();
+        assert_eq!(report.phase, None);
+    }
+
+    #[test]
+    fn report_json_includes_phase_when_set() -> Result<(), serde_json::Error> {
+        let state = ReadinessState::syncing(Some(3), Some(10), Some(13))
+            .with_phase(IngestPhase::FollowingTip);
+        let readiness = Readiness::new(state);
+        let rendered = serde_json::to_value(readiness.report())?;
+        assert_eq!(rendered["phase"], "following_tip");
+        Ok(())
+    }
+
+    #[test]
+    fn report_json_omits_phase_when_unset() -> Result<(), serde_json::Error> {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        let rendered = serde_json::to_value(readiness.report())?;
+        assert!(
+            rendered.get("phase").is_none(),
+            "reader binaries must not surface a `phase` field; got {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_not_ready_serializes_full_substructure() -> Result<(), serde_json::Error> {
+        let detail = UpstreamNotReadyDetail {
+            upstream_committed_height: Some(600_000),
+            upstream_estimated_height: Some(4_016_431),
+            upstream_verification_progress: Some(0.149),
+            upstream_health: UpstreamHealth {
+                source: "zebra_ready_endpoint",
+                reason: Cow::Borrowed("syncing"),
+            },
+        };
+        let state = ReadinessState::upstream_not_ready_with_detail(detail, Some(600_000))
+            .with_phase(IngestPhase::FollowingTip);
+        let report = Readiness::new(state).report();
+        let rendered = serde_json::to_value(&report)?;
+        assert_eq!(rendered["phase"], "following_tip");
+        let cause = &rendered["cause"]["upstream_not_ready"];
+        assert_eq!(cause["upstream_committed_height"], 600_000);
+        assert_eq!(cause["upstream_estimated_height"], 4_016_431);
+        assert_eq!(cause["upstream_verification_progress"], 0.149);
+        assert_eq!(cause["upstream_health"]["source"], "zebra_ready_endpoint");
+        assert_eq!(cause["upstream_health"]["reason"], "syncing");
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_not_ready_does_not_permit_traffic() {
+        let detail = UpstreamNotReadyDetail {
+            upstream_committed_height: None,
+            upstream_estimated_height: None,
+            upstream_verification_progress: None,
+            upstream_health: UpstreamHealth {
+                source: "verification_progress_fallback",
+                reason: Cow::Borrowed("verification_progress_below_floor"),
+            },
+        };
+        let state = ReadinessState::upstream_not_ready_with_detail(detail, None);
+        let report = Readiness::new(state).report();
+        assert!(!report.is_ready);
+        assert_eq!(report.cause.metric_label(), "upstream_not_ready");
+    }
+
+    #[test]
+    fn ingest_phase_maps_to_writer_phase_proto() {
+        assert_eq!(
+            ingest_proto::WriterPhase::from(IngestPhase::AwaitingUpstream),
+            ingest_proto::WriterPhase::AwaitingUpstream
+        );
+        assert_eq!(
+            ingest_proto::WriterPhase::from(IngestPhase::BulkCatchup),
+            ingest_proto::WriterPhase::BulkCatchup
+        );
+        assert_eq!(
+            ingest_proto::WriterPhase::from(IngestPhase::FollowingTip),
+            ingest_proto::WriterPhase::FollowingTip
+        );
     }
 
     #[test]
@@ -782,6 +1114,15 @@ mod tests {
                 recent_hydration_failures: 0,
             },
             ReadinessCause::ShuttingDown,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: None,
+                upstream_estimated_height: None,
+                upstream_verification_progress: None,
+                upstream_health: UpstreamHealth {
+                    source: "zebra_ready_endpoint",
+                    reason: Cow::Borrowed("syncing"),
+                },
+            }),
         ];
         for cause in every_cause {
             let label = cause.metric_label();
@@ -826,6 +1167,7 @@ mod tests {
                 ops_proto::ReadinessCause::MempoolHydrationLagging
             }
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
+            ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
         }
     }
 
@@ -875,6 +1217,15 @@ mod tests {
                 recent_hydration_failures: 0,
             },
             ReadinessCause::ShuttingDown,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: None,
+                upstream_estimated_height: None,
+                upstream_verification_progress: None,
+                upstream_health: UpstreamHealth {
+                    source: "zebra_ready_endpoint",
+                    reason: Cow::Borrowed("syncing"),
+                },
+            }),
         ]
     }
 
@@ -888,6 +1239,7 @@ mod tests {
             },
             current_height: Some(100),
             target_height: None,
+            phase: None,
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -919,6 +1271,7 @@ mod tests {
             cause: ReadinessCause::StorageUnavailable,
             current_height: None,
             target_height: None,
+            phase: None,
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -941,6 +1294,7 @@ mod tests {
             }),
             current_height: Some(4_013_801),
             target_height: None,
+            phase: None,
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);

@@ -233,6 +233,8 @@ async fn healthz_handler() -> impl IntoResponse {
 #[derive(Serialize)]
 struct ReadinessResponseBody {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<crate::IngestPhase>,
     cause: crate::ReadinessCause,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_height: Option<u32>,
@@ -253,6 +255,7 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         } else {
             "not_ready"
         },
+        phase: report.phase,
         cause: report.cause,
         current_height: report.current_height,
         target_height: report.target_height,
@@ -335,7 +338,8 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::MempoolCursorAtRisk { .. }
         | crate::ReadinessCause::MempoolSourceUnavailable
         | crate::ReadinessCause::MempoolHydrationLagging { .. }
-        | crate::ReadinessCause::ShuttingDown => 0.0,
+        | crate::ReadinessCause::ShuttingDown
+        | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }
 }
 
@@ -355,7 +359,8 @@ fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::MempoolCursorAtRisk { .. }
         | crate::ReadinessCause::MempoolSourceUnavailable
         | crate::ReadinessCause::MempoolHydrationLagging { .. }
-        | crate::ReadinessCause::ShuttingDown => 0.0,
+        | crate::ReadinessCause::ShuttingDown
+        | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }
 }
 

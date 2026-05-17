@@ -127,10 +127,11 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 
 | Term | Meaning |
 |------|---------|
-| `TipFollowConfig` | Service-specific configuration for polling the upstream node tip and committing live changes |
 | `RetentionConfig` | Service-specific configuration for chain-event and mempool-event retention windows |
 | `secondary_path` | Process-unique RocksDB secondary metadata directory for a colocated reader |
 | `ingest_control_addr` | Private ingest-control gRPC endpoint used by secondary readers to compute replica lag and proxy chain-event subscriptions |
+| `IngestPhase` | The unified ingest loop's classifier output (`AwaitingUpstream`, `BulkCatchup`, `TipFollow`); orthogonal to readiness `cause`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
+| `BlockStreamOptions` | Typed options struct on `NodeSource::stream_block_range` (per-call `omit_tree_state`, `max_blocks`). See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
 
 ### Avoid
 
@@ -191,7 +192,7 @@ Methods that ask the server about itself rather than about chain data:
 
 ### Rule 6 — Verb forms inside `zinder-source`
 
-The source boundary uses `fetch_*` for outbound calls because the result is a remote observation, not a local read. `fetch_block_by_height(height)` is consistent with Rule 1; `tip_id()` follows Rule 5 and uses no `fetch_` prefix because the noun-named accessor matches the local-API symmetry.
+The source boundary uses `fetch_*` for outbound calls because the result is a remote observation, not a local read. `fetch_block_at(height)` follows Rule 1 unchanged; `stream_block_range(range, options)` is the bulk-catchup counterpart per [ADR-0016](../adrs/0016-source-streaming-pipeline.md); `tip_id()` follows Rule 5 and uses no `fetch_` prefix because the noun-named accessor matches the local-API symmetry. Earlier source-boundary spellings (`fetch_block_by_height`) are retired so the boundary stops carrying redundant `_by_<key>` qualifiers when every method on the trait is keyed by chain position.
 
 ### Forbidden mixed forms
 
@@ -350,7 +351,6 @@ name = "zcash-mainnet"
 listen_addr = "127.0.0.1:9106"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "127.0.0.1:8232"
 request_timeout_ms = 30000
 max_response_bytes = 16777216
@@ -359,6 +359,15 @@ max_response_bytes = 16777216
 method = "basic"
 username = "..."
 password = "..."
+
+[node.health]
+# Optional. When `addr` is set, the writer polls Zebra's `/ready` as the
+# primary upstream-sync signal. Otherwise it derives the signal from
+# `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015].
+# addr = "http://127.0.0.1:8080"
+poll_interval_ms = 30000
+verification_progress_floor = 0.999
+estimated_gap_floor_blocks = 10
 
 [storage]
 path = "/var/lib/zinder"
@@ -388,19 +397,34 @@ mempool_event_retention_check_interval_ms = 30000
 mempool_cursor_at_risk_warning_minutes = 12
 
 [ingest]
+# Source-adapter selector. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md)
+# for the full enum vocabulary (`auto`, `zebra-json-rpc`,
+# `zebra-indexer-grpc`, `zebra-in-process`).
+source = "zebra-json-rpc"
+# Chain-truth invariant; classifier defaults to this.
 reorg_window_blocks = 100
-commit_batch_blocks = 1000
 
-[backfill]
-from_height = 1
-to_height = 1000000
-allow_near_tip_finalize = false
+[ingest.phases]
+# Phase classifier boundary; defaults to ingest.reorg_window_blocks.
+catchup_threshold_blocks = 100
+
+[ingest.bulk_catchup]
+commit_batch_blocks = 1000
+fetch_concurrency = 32
+
+[ingest.tip_follow]
+poll_interval_ms = 1000
+lag_threshold_blocks = 1
+
+[ingest.modifiers]
+# Optional one-shot or disposable-store knobs.
+# target_height = 4000000           # process exits 0 after reaching this height
+# checkpoint_height = 3999999       # pre-seed an empty store from this checkpoint
+# allow_near_tip_finalize = false   # disposable-store override; invalid with coverage="wallet-serving"
+# coverage = "explicit"             # "explicit" | "wallet-serving"
 
 [backup]
 to_path = "/var/backups/zinder/checkpoint-2026-04-28"
-
-[tip_follow]
-poll_interval_ms = 1000
 
 [query]
 listen_addr = "127.0.0.1:9101"
@@ -462,10 +486,25 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
+| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
+| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. |
+| `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
+| `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
 | `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9106` query, `9107` compat, `9069` explorer). Set to an empty string to disable the endpoint entirely. |
-| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. Set to an empty string to disable the endpoint (used by backfill). |
+| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. Set to an empty string to disable the endpoint for diagnostic one-shot runs (such as `--target-height` pre-seed). |
 | `ZINDER_INGEST_CONTROL__ADDR` | zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
 | `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
+| `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
+| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
+| `ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phases.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
+| `ZINDER_INGEST__BULK_CATCHUP__COMMIT_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_batch_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
+| `ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fetch_concurrency` | Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32. |
+| `ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.tip_follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
+| `ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.tip_follow.lag_threshold_blocks` | Block lag at which tip-follow reports `cause=syncing`. Defaults to 1. |
+| `ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT` | zinder-ingest | Optional | `ingest.modifiers.target_height` | One-shot stop-at modifier; the loop exits 0 after committing this height. Renamed from `to_height`. |
+| `ZINDER_INGEST__MODIFIERS__CHECKPOINT_HEIGHT` | zinder-ingest | Optional | `ingest.modifiers.checkpoint_height` | Pre-seed an empty store from an upstream-supplied checkpoint at this height. |
+| `ZINDER_INGEST__MODIFIERS__ALLOW_NEAR_TIP_FINALIZE` | zinder-ingest | Optional | `ingest.modifiers.allow_near_tip_finalize` | Disposable-store override: lets bulk-catchup finalize inside the reorg window. Invalid combined with `coverage = "wallet-serving"`. |
+| `ZINDER_INGEST__MODIFIERS__COVERAGE` | zinder-ingest | Optional | `ingest.modifiers.coverage` | Ingest coverage mode: `"explicit"` or `"wallet-serving"`. Defaults to `"explicit"`. |
 | `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS` | zinder-ingest, zinder-query | Optional | `retention.chain_event_retention_hours` | Chain-event retention window in hours, enforced by `zinder-ingest` and advertised by `zinder-query` through `ServerInfo`. Defaults to 168 (7 days). `0` disables eviction. |
 | `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.chain_event_retention_check_interval_ms` | Chain-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 60000 (one minute). |
 | `ZINDER_RETENTION__CURSOR_AT_RISK_WARNING_HOURS` | zinder-ingest | Optional | `retention.cursor_at_risk_warning_hours` | Cursor-at-risk warning lead time in hours. Must be ≤ `retention.chain_event_retention_hours`. Defaults to 24. |
@@ -743,7 +782,7 @@ Public shapes describe behavior that production code can actually reach.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
 - Backfill ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
-- Wallet-serving backfill coverage is selected with `backfill.coverage = "wallet-serving"` or `zinder-ingest backfill --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives `from_height` and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
+- Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.
 - Operator-facing errors name the real cause and carry useful fields. Prefer `NoVisibleChainEpoch`, sequence-overflow, and payload-size errors over sentinel IDs or reused malformed-input errors.

@@ -51,10 +51,15 @@ enum ReadinessCause {
   READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING = 14;
   // Service is shutting down and no longer accepting new traffic.
   READINESS_CAUSE_SHUTTING_DOWN = 15;
+  // Upstream node is reachable but reports it is itself behind the network
+  // tip. Sourced from Zebra's `/ready` endpoint when configured, or from
+  // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
+  // See ADR-0015.
+  READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
 
   // Reserved slots for additive growth. Removing a reserved range is a
   // breaking change.
-  reserved 16 to 31;
+  reserved 17 to 31;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.
@@ -83,6 +88,7 @@ message ReadinessCauseDetail {
     MempoolCursorAtRiskDetail mempool_cursor_at_risk = 6;
     MempoolHydrationLaggingDetail mempool_hydration_lagging = 7;
     NodeUnavailableDetail node_unavailable = 8;
+    UpstreamNotReadyDetail upstream_not_ready = 9;
   }
 }
 
@@ -158,4 +164,32 @@ message NodeUnavailableDetail {
   // Seconds since the first failure of the current outage window, rounded
   // down. Zero on the first iteration of an outage.
   uint32 outage_seconds = 4;
+}
+
+// Detail for READINESS_CAUSE_UPSTREAM_NOT_READY.
+//
+// Carries the upstream-sync diagnostic the operator needs to distinguish
+// "we're up to date with Zebra" from "Zebra is itself syncing." The signal
+// is sourced from Zebra's HTTP `/ready` endpoint when configured, or from
+// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
+// See ADR-0015 §Upstream sync detection.
+message UpstreamNotReadyDetail {
+  // Upstream's last committed tip height when known.
+  optional uint32 upstream_committed_height = 1;
+  // Upstream's wall-clock-extrapolated estimate of network tip height when
+  // known.
+  optional uint32 upstream_estimated_height = 2;
+  // Upstream's reported verification progress in `[0.0, 1.0]` when known.
+  optional double upstream_verification_progress = 3;
+  // Stable kebab-case label naming where the upstream-sync signal came
+  // from: `zebra_ready_endpoint` (HTTP `/ready` probe) or
+  // `verification_progress_fallback` (JSON-RPC derivation).
+  string upstream_health_source = 4;
+  // Sentinel string surfaced by the signal source. For
+  // `zebra_ready_endpoint` this is the body of Zebra's 503 response
+  // (`syncing`, `no tip`, `tip_age=<N>s`, `lag=<N> blocks`,
+  // `insufficient peers`); for `verification_progress_fallback` it is the
+  // predicate that triggered (`verification_progress_below_floor`,
+  // `estimated_gap_above_floor`).
+  string upstream_health_reason = 5;
 }

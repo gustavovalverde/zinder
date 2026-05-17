@@ -12,7 +12,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [Storage backend](architecture/storage-backend.md)
 - [Chain ingestion](architecture/chain-ingestion.md)
 - [Chain events](architecture/chain-events.md)
-- [Node source boundary](architecture/node-source-boundary.md)
+- [Node source boundary](architecture/node-source-boundary.md): trait shape, capability model, and upstream-platform-binding catalogue (Z3 canonical, bare-Zebra, future in-process).
 - [Protocol boundary](architecture/protocol-boundary.md)
 - [Wallet data plane](architecture/wallet-data-plane.md)
 - [Derive plane](architecture/derive-plane.md)
@@ -38,6 +38,8 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0012: Typed explorer search and privacy refusal](adrs/0012-typed-explorer-search-and-privacy-refusal.md)
 - [ADR-0013: Source failure recovery topology](adrs/0013-source-failure-recovery-topology.md)
 - [ADR-0014: Shared configuration sections](adrs/0014-shared-configuration-sections.md)
+- [ADR-0015: Unified phase-driven ingest](adrs/0015-unified-phase-driven-ingest.md)
+- [ADR-0016: Source streaming pipeline](adrs/0016-source-streaming-pipeline.md)
 
 ## Reference
 
@@ -52,6 +54,7 @@ Current integration references and API support material:
 Operational procedures for running Zinder against the workspace and external systems. Edited in place when the procedure changes; never describes architectural intent (that role belongs to the architecture docs).
 
 - [Testing](runbooks/testing.md): T0-T3 test tiers, the default validation gate, consumer parity checks, live sweeps, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
+- [Initial sync](runbooks/initial-sync.md): how the unified ingest loop auto-classifies its phase, the operator-visible signals on `/readyz`, the upstream-sync diagnostic, and forked-store recovery.
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd for self-hosted single-VM deployments.
 - [Deploying on Railway](runbooks/deploying-on-railway.md): single-container image on Railway / Fly.io / Render-style PaaS targets.
 
