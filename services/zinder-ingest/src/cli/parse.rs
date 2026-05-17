@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use zinder_ingest::{IngestError, NodeSourceKind};
 use zinder_runtime::ConfigError;
 
-/// Parses the public node source configuration name.
+/// Parses the public `ingest.source` configuration name.
 pub(crate) fn parse_node_source(node_source: &str) -> Result<NodeSourceKind, IngestError> {
     match node_source {
         "zebra-json-rpc" => Ok(NodeSourceKind::ZebraJsonRpc),

@@ -611,7 +611,10 @@ where
         .map(Some);
     }
 
-    let next_height = BlockHeight::new(current_chain_epoch.tip_height.value().saturating_add(1));
+    let next_height = current_chain_epoch
+        .tip_height
+        .next()
+        .unwrap_or(current_chain_epoch.tip_height);
     let next_block = fetch_block_with_retry(
         config.node.request_timeout,
         source,

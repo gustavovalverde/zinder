@@ -567,34 +567,25 @@ impl NodeSource for ZebraJsonRpcSource {
             reason: error.message,
         };
 
-        let anchor_block_hash: String = self
-            .call_typed(
-                "getblockhash",
-                positional_params([Value::from(height.value())])?,
-                block_unavailable,
-            )
-            .await?;
-        let anchor_block_hash_bytes = decode_display_block_hash(&anchor_block_hash)?;
-
-        // `getblockheader`, `getblock`, and `z_gettreestate` all key on the
-        // same anchor hash and have no dependency on each other, so we drive
-        // them concurrently over the underlying HTTP/2 connection pool. This
-        // cuts the per-block round-trip count from four sequential calls to
-        // one (`getblockhash`) plus one parallel triple, which is the
-        // dominant cost when ingest runs against a colocated PaaS node.
+        // Three parallel RPCs keyed on the requested height directly; the
+        // optional serial `getblockhash` round trip is unnecessary because
+        // Zebra accepts a numeric height string on each method. Mid-flight
+        // reorgs surface through the cross-hash agreement checks below as
+        // `SourceError::BlockReorgDuringFetch`.
+        let height_param = Value::from(height.value().to_string());
         let header_call = self.call_typed::<ZebraBlockHeader>(
             "getblockheader",
-            positional_params([Value::from(anchor_block_hash.clone()), Value::from(true)])?,
+            positional_params([height_param.clone(), Value::from(true)])?,
             block_unavailable,
         );
         let raw_block_call = self.call_typed::<String>(
             "getblock",
-            positional_params([Value::from(anchor_block_hash.clone()), Value::from(0)])?,
+            positional_params([height_param.clone(), Value::from(0)])?,
             block_unavailable,
         );
         let tree_state_call = self.call_typed::<Value>(
             "z_gettreestate",
-            positional_params([Value::from(anchor_block_hash)])?,
+            positional_params([height_param])?,
             block_unavailable,
         );
         let (header_result, raw_block_result, tree_state_result) =
@@ -606,11 +597,6 @@ impl NodeSource for ZebraJsonRpcSource {
         if header.height != height.value() {
             return Err(SourceError::SourceProtocolMismatch {
                 reason: "block header height does not match requested height",
-            });
-        }
-        if decode_display_block_hash(&header.hash)? != anchor_block_hash_bytes {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "block header hash does not match height lookup hash",
             });
         }
 
@@ -905,6 +891,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         None => "none",
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
+        Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
         Some(SourceError::SourcePayloadEncodingFailed { .. }) => "source_payload_encoding_failed",
@@ -1070,8 +1057,11 @@ fn validate_zebra_header(
 ) -> Result<(), SourceError> {
     let hash = decode_display_block_hash(&header.hash)?;
     if source_block.hash != hash {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "block header hash does not match raw block header",
+        // Mid-flight reorg signature: `getblockheader` and the parsed
+        // `getblock` bytes observed different blocks at the same height.
+        return Err(SourceError::BlockReorgDuringFetch {
+            height: source_block.height,
+            reason: "block header hash disagrees with the parsed raw block hash",
         });
     }
 
@@ -1081,12 +1071,20 @@ fn validate_zebra_header(
         },
     )?)?;
     if source_block.parent_hash != parent_hash {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "block header parent hash does not match raw block header",
+        // Parent-hash disagreement on the same block hash would be a
+        // Zebra bug; reaching this arm under the new optimised path
+        // means the chain reorged between the parallel calls and the
+        // two responses describe different ancestries.
+        return Err(SourceError::BlockReorgDuringFetch {
+            height: source_block.height,
+            reason: "block header parent hash disagrees with the parsed raw block parent",
         });
     }
 
     if source_block.block_time_seconds != header.time {
+        // Hash agrees but time disagrees: impossible within a single
+        // consistent header observation, so this is a wire-contract
+        // violation rather than a reorg.
         return Err(SourceError::SourceProtocolMismatch {
             reason: "block header time does not match raw block header",
         });
@@ -1108,8 +1106,11 @@ fn validate_zebra_tree_state(
         })
         .and_then(decode_display_block_hash)?;
     if tree_state_hash != block_hash {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "tree-state hash does not match raw block hash",
+        // Mid-flight reorg: `z_gettreestate` and the parsed `getblock`
+        // bytes observed different blocks at the same height.
+        return Err(SourceError::BlockReorgDuringFetch {
+            height: requested_height,
+            reason: "tree-state hash disagrees with the parsed raw block hash",
         });
     }
 

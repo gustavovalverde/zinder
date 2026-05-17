@@ -183,6 +183,25 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// Concurrent observations of the same height disagreed.
+    ///
+    /// Produced when the JSON-RPC adapter's three height-keyed parallel
+    /// calls (`getblockheader`, `getblock`, `z_gettreestate`) observe
+    /// different blocks because the upstream chain reorged between the
+    /// requests. Distinct from [`Self::SourceProtocolMismatch`] (a wire-
+    /// contract violation: a broken node) and [`Self::BlockUnavailable`]
+    /// (a height that left the best chain before any fetch landed). The
+    /// loop treats this as a re-observation signal under the
+    /// [`SourceFailureClass::UpstreamViewChanged`] class.
+    #[error("upstream chain reorged during concurrent fetch at height {height:?}: {reason}")]
+    BlockReorgDuringFetch {
+        /// Requested block height.
+        height: BlockHeight,
+        /// Names which cross-call invariant failed (e.g. header-vs-block
+        /// hash disagreement, tree-state-vs-block hash disagreement).
+        reason: &'static str,
+    },
+
     /// The node returned an error for required subtree roots.
     #[error("{protocol:?} subtree roots from {start_index:?} are unavailable: {reason}")]
     SubtreeRootsUnavailable {
@@ -341,13 +360,13 @@ impl SourceError {
     pub const fn upstream_classification(&self) -> SourceFailureClass {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
-            Self::BlockUnavailable { .. } | Self::SubtreeRootsUnavailable { .. } => {
-                SourceFailureClass::UpstreamViewChanged
-            }
+            Self::BlockUnavailable { .. }
+            | Self::BlockReorgDuringFetch { .. }
+            | Self::SubtreeRootsUnavailable { .. }
+            | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
             Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {
                 SourceFailureClass::StreamDisconnected
             }
-            Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
             Self::NodeCapabilityMissing { .. } => SourceFailureClass::CapabilityMissing,
             Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,
             Self::TransactionBroadcastDisabled | Self::UnsupportedNodeAuth { .. } => {

@@ -426,9 +426,7 @@ fn build_bulk_catchup_batch_config(
     upstream_tip: BlockHeight,
 ) -> BackfillConfig {
     let from_height = match config.modifiers.checkpoint {
-        Some(checkpoint) if store_tip == 0 => {
-            BlockHeight::new(checkpoint.height.value().saturating_add(1))
-        }
+        Some(checkpoint) if store_tip == 0 => checkpoint.height.next().unwrap_or(checkpoint.height),
         _ => BlockHeight::new(store_tip.saturating_add(1)),
     };
     BackfillConfig {

@@ -43,12 +43,6 @@ pub trait NodeSource: Send + Sync + 'static {
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
 
-    async fn stream_block_range(
-        &self,
-        range: BlockHeightRange,
-        options: BlockStreamOptions,
-    ) -> Result<BoxStream<'_, Result<SourceBlock, SourceError>>, SourceError>;
-
     async fn tip_id(&self) -> Result<BlockId, SourceError>;
 
     async fn fetch_subtree_roots(
@@ -60,7 +54,7 @@ pub trait NodeSource: Send + Sync + 'static {
 }
 ```
 
-`fetch_block_at` and `stream_block_range` pair as point-vs-range. The bulk-catchup phase of the unified ingest loop ([ADR-0015](../adrs/0015-unified-phase-driven-ingest.md)) always calls `stream_block_range`; backends that lack native streaming use the default impl that fans `fetch_block_at` through `.buffered(N)`. Backends that stream natively implement `stream_block_range` directly and let the default `fetch_block_at` reduce to a one-element stream. Tip-follow and reorg-ancestor traversal always use `fetch_block_at` because random access at the live edge is the natural shape. The capability dispatch, throughput analysis, and backend roll-out are decided in [ADR-0016](../adrs/0016-source-streaming-pipeline.md).
+The bulk-catchup phase of the unified ingest loop ([ADR-0015](../adrs/0015-unified-phase-driven-ingest.md)) keeps `ingest.bulk_catchup.fetch_concurrency` (default 32) `fetch_block_at` calls in flight via `futures_util::stream::iter(...).buffered(N)`. Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports (Zebra Indexer `GetBlockRange` once it lands, in-process `ReadStateService` reader) will add their own trait method in a future ADR, alongside the backend that drives it; see [ADR-0016](../adrs/0016-source-streaming-pipeline.md) for the Phase 1 `getblockhash` drop and the reasoning for deferring the streaming surface.
 
 `tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
 

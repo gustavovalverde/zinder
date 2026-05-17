@@ -528,7 +528,7 @@ fn next_fetch_retry_backoff(current_backoff: Duration) -> Duration {
 /// failures ([`SourceFailureClass::UpstreamViewChanged`]) and structural
 /// failures are bubbled up to the loop, which re-observes the upstream
 /// before issuing dependent requests.
-pub(crate) fn per_call_retry_permitted(error: &SourceError) -> bool {
+fn per_call_retry_permitted(error: &SourceError) -> bool {
     matches!(
         error.upstream_classification(),
         SourceFailureClass::NodeUnreachable | SourceFailureClass::StreamDisconnected,
@@ -554,8 +554,10 @@ pub(crate) fn select_best_chain(
         .last()
         .ok_or(IngestError::EmptyIngestBatch)?;
 
-    if first_candidate.height
-        == BlockHeight::new(current_chain_epoch.tip_height.value().saturating_add(1))
+    if current_chain_epoch
+        .tip_height
+        .next()
+        .is_some_and(|next_tip| first_candidate.height == next_tip)
         && first_candidate.parent_hash == current_chain_epoch.tip_hash
     {
         return Ok(ReorgWindowChange::Extend {

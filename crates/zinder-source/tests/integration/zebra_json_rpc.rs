@@ -22,9 +22,12 @@ use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
 #[tokio::test]
 async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
+    // `fetch_block_at` keys the three parallel RPCs on the requested
+    // height directly; no separate `getblockhash` round trip. Pin the
+    // method set and parameter shape since operators read both through
+    // tracing.
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": fixture["hash"],
             "height": fixture["height"],
@@ -56,28 +59,26 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
         decode_display_block_hash(string_field(&fixture, "hash")?)?
     );
     let methods_called: HashSet<String> = requests.iter().map(|r| r.method.clone()).collect();
-    let expected: HashSet<String> = [
-        "getblockhash",
-        "getblockheader",
-        "getblock",
-        "z_gettreestate",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    assert_eq!(methods_called, expected);
-    assert_eq!(server.requests_for("getblockhash")?[0].params, json!([1]));
+    let expected: HashSet<String> = ["getblockheader", "getblock", "z_gettreestate"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        methods_called, expected,
+        "the three parallel RPCs key on the height directly; no `getblockhash` round trip",
+    );
+    assert!(
+        server.requests_for("getblockhash")?.is_empty(),
+        "`getblockhash` must not be called by the fetch path",
+    );
     assert_eq!(
         server.requests_for("getblockheader")?[0].params,
-        json!([fixture["hash"], true])
+        json!(["1", true]),
     );
-    assert_eq!(
-        server.requests_for("getblock")?[0].params,
-        json!([fixture["hash"], 0])
-    );
+    assert_eq!(server.requests_for("getblock")?[0].params, json!(["1", 0]),);
     assert_eq!(
         server.requests_for("z_gettreestate")?[0].params,
-        json!([fixture["hash"]])
+        json!(["1"]),
     );
     assert!(
         requests
@@ -90,14 +91,14 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
 
 #[tokio::test]
 async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> eyre::Result<()> {
-    // The Zebra string "height out of range" is the wire-level marker for
-    // the 2026-05-15 production scenario: the upstream's best chain shifted
-    // between the height resolution and the follow-up fetch. After the
-    // architectural change the adapter classifies this as
-    // `UpstreamViewChanged`, which the long-running loop treats as a
-    // recoverable signal — the writer no longer exits when this happens.
+    // Zebra's "height out of range" surfaces when the upstream's best
+    // chain shifted between the parallel calls. The error rides on any
+    // of the three height-keyed calls; mocking `getblockheader` is
+    // enough because the joined Result short-circuits on the first
+    // failure. The adapter classifies it as UpstreamViewChanged so the
+    // loop treats it as a recoverable signal instead of a fatal exit.
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::error("height out of range"))
+        method("getblockheader").reply(RpcReply::error("height out of range"))
     ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -127,14 +128,12 @@ async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> e
 
 #[tokio::test]
 async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> eyre::Result<()> {
-    // Warming-up was the only JSON-RPC error code we used to whitelist as
-    // retryable before the refactor. After the change, every JSON-RPC error
-    // maps onto a `SourceError` variant whose classification drives the
-    // loop's recovery posture; warming-up still surfaces as
-    // BlockUnavailable from a `getblockhash` failure and stays
-    // loop-recoverable through its UpstreamViewChanged class.
+    // Warming-up rides on any of the three parallel calls; mocking
+    // `getblockheader` is enough because the joined Result
+    // short-circuits on the first failure. Classifies as
+    // UpstreamViewChanged so the loop recovers.
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::error_with_code(-28, "node warming up"))
+        method("getblockheader").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -164,7 +163,7 @@ async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> e
 
 #[tokio::test]
 async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([method("getblockhash").reply(RpcReply::empty())])?;
+    let server = JsonRpcTestServer::start([method("getblockheader").reply(RpcReply::empty())])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -316,7 +315,6 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
 async fn header_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": fixture["hash"],
             "height": 2,
@@ -346,17 +344,24 @@ async fn header_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> 
         Err(error) => error,
     };
 
+    // `header.height` disagreeing with the requested height is a
+    // wire-contract violation (Zebra returned the wrong block), not a
+    // reorg signature; stays SourceProtocolMismatch.
     assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn header_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
+async fn header_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre::Result<()> {
+    // `getblockheader` and `getblock` can observe different blocks at
+    // the same height if a reorg lands between the parallel calls. The
+    // cross-hash agreement check is the de-facto reorg detector;
+    // BlockReorgDuringFetch lets the loop recover instead of treating
+    // the race as a broken node.
     let fixture = fixture_block()?;
     let mismatched_hash = "1111111111111111111111111111111111111111111111111111111111111111";
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": mismatched_hash,
             "height": fixture["height"],
@@ -386,7 +391,17 @@ async fn header_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
+    assert!(
+        matches!(
+            error,
+            SourceError::BlockReorgDuringFetch { height, .. } if height == BlockHeight::new(1)
+        ),
+        "expected BlockReorgDuringFetch, got {error:?}",
+    );
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
 
     Ok(())
 }
@@ -395,7 +410,6 @@ async fn header_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
 async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": fixture["hash"],
             "height": fixture["height"],
@@ -431,10 +445,12 @@ async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn tree_state_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
+async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre::Result<()> {
+    // Same shape as the header-hash test: tree-state hash disagreeing
+    // with the parsed raw block hash is the second reorg-during-fetch
+    // signature. Classified as UpstreamViewChanged so the loop recovers.
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": fixture["hash"],
             "height": fixture["height"],
@@ -462,7 +478,17 @@ async fn tree_state_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()
         Err(error) => error,
     };
 
-    assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
+    assert!(
+        matches!(
+            error,
+            SourceError::BlockReorgDuringFetch { height, .. } if height == BlockHeight::new(1)
+        ),
+        "expected BlockReorgDuringFetch, got {error:?}",
+    );
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
 
     Ok(())
 }
@@ -471,7 +497,6 @@ async fn tree_state_hash_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()
 async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
         method("getblockheader").reply(RpcReply::result(json!({
             "hash": fixture["hash"],
             "height": fixture["height"],
@@ -499,6 +524,8 @@ async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<
         Err(error) => error,
     };
 
+    // Tree-state returned the wrong height for the same request id —
+    // a Zebra wire-contract violation, not a reorg.
     assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
 
     Ok(())

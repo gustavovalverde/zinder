@@ -293,12 +293,11 @@ where
     )]
     let commit_batch_blocks = config.commit_batch_blocks.get() as usize;
 
-    // Pipeline the per-block fetches with bounded concurrency. The commit
+    // Pipeline per-block fetches with bounded concurrency. The commit
     // path stays strictly ordered because `buffered` yields completed
-    // futures in their submission order, so artifact assembly and RocksDB
-    // writes are unchanged. Each in-flight fetch gets its own retry state;
-    // the run-wide budget (`retry_state` above) still gates the
-    // subtree-root and finalization tail.
+    // futures in submission order. Each in-flight fetch gets its own
+    // retry state so the run-wide budget (`retry_state` above) stays
+    // exclusively on subtree-root and finalization-tail work.
     let request_timeout = config.node.request_timeout;
     #[allow(
         clippy::cast_possible_truncation,
@@ -447,7 +446,7 @@ fn bootstrap_from_checkpoint_if_needed(
     if store.current_chain_epoch()?.is_some() {
         return Ok(None);
     }
-    let expected_from_height = BlockHeight::new(checkpoint.height.value().saturating_add(1));
+    let expected_from_height = checkpoint.height.next().unwrap_or(checkpoint.height);
     if from_height != expected_from_height {
         return Err(IngestError::BackfillCheckpointMisaligned {
             checkpoint_height: checkpoint.height,
@@ -498,14 +497,11 @@ fn backfill_start(
         return Ok(None);
     }
 
-    if current_chain_epoch
-        .tip_height
-        .value()
-        .checked_add(1)
-        .is_some_and(|next_height| from_height <= BlockHeight::new(next_height))
+    if let Some(next_height) = current_chain_epoch.tip_height.next()
+        && from_height <= next_height
     {
         return Ok(Some(BackfillStart {
-            from_height: BlockHeight::new(current_chain_epoch.tip_height.value().saturating_add(1)),
+            from_height: next_height,
             initial_tip_metadata: current_chain_epoch.tip_metadata,
         }));
     }

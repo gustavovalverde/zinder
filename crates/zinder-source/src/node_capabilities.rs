@@ -169,6 +169,7 @@ mod tests {
         let capabilities = NodeCapabilities::new([
             NodeCapability::TransactionBroadcast,
             NodeCapability::BestChainBlocks,
+            NodeCapability::ChainValuePools,
         ])?;
 
         assert_eq!(
@@ -176,9 +177,11 @@ mod tests {
             vec![
                 NodeCapability::BestChainBlocks,
                 NodeCapability::TransactionBroadcast,
+                NodeCapability::ChainValuePools,
             ]
         );
         assert!(capabilities.supports(NodeCapability::BestChainBlocks));
+        assert!(capabilities.supports(NodeCapability::ChainValuePools));
         assert!(!capabilities.supports(NodeCapability::SubtreeRoots));
 
         Ok(())

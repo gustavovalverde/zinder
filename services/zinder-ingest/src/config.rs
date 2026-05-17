@@ -388,7 +388,11 @@ const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
-    let node_source_text = require_field(config.ingest.source.clone(), "ingest.source")?;
+    let node_source_text = config
+        .ingest
+        .source
+        .clone()
+        .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
     let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
 

@@ -24,7 +24,7 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
     ingest::{
-        ActiveTransport, WriterPhase, WriterStatusRequest, WriterStatusResponse,
+        WriterPhase, WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
@@ -793,7 +793,6 @@ impl IngestControl for StaticIngestControl {
             latest_writer_tip_height: Some(5),
             latest_writer_finalized_height: Some(4),
             phase: WriterPhase::FollowingTip.into(),
-            active_transport: ActiveTransport::PerBlockFetch.into(),
             gap_blocks: Some(0),
             upstream_not_ready: None,
         }))

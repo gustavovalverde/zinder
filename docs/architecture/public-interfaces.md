@@ -131,7 +131,6 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `secondary_path` | Process-unique RocksDB secondary metadata directory for a colocated reader |
 | `ingest_control_addr` | Private ingest-control gRPC endpoint used by secondary readers to compute replica lag and proxy chain-event subscriptions |
 | `IngestPhase` | The unified ingest loop's classifier output (`AwaitingUpstream`, `BulkCatchup`, `TipFollow`); orthogonal to readiness `cause`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
-| `BlockStreamOptions` | Typed options struct on `NodeSource::stream_block_range` (per-call `omit_tree_state`, `max_blocks`). See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
 
 ### Avoid
 

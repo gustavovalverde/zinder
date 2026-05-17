@@ -137,7 +137,6 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
         latest_writer_tip_height: Some(42),
         latest_writer_finalized_height: Some(40),
         phase: ingest::WriterPhase::FollowingTip.into(),
-        active_transport: ingest::ActiveTransport::PerBlockFetch.into(),
         gap_blocks: Some(1),
         upstream_not_ready: Some(ops::UpstreamNotReadyDetail {
             upstream_committed_height: Some(42),
@@ -154,10 +153,6 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(decoded_response.latest_writer_tip_height, Some(42));
     assert_eq!(decoded_response.latest_writer_finalized_height, Some(40));
     assert_eq!(decoded_response.phase(), ingest::WriterPhase::FollowingTip);
-    assert_eq!(
-        decoded_response.active_transport(),
-        ingest::ActiveTransport::PerBlockFetch
-    );
     assert_eq!(decoded_response.gap_blocks, Some(1));
     let detail = decoded_response
         .upstream_not_ready
@@ -182,41 +177,11 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
             latest_writer_tip_height: None,
             latest_writer_finalized_height: None,
             phase: phase.into(),
-            active_transport: ingest::ActiveTransport::Unspecified.into(),
             gap_blocks: None,
             upstream_not_ready: None,
         };
         let decoded = round_trip(&response)?;
         assert_eq!(decoded.phase(), phase, "phase round-trip failed: {phase:?}");
-    }
-
-    Ok(())
-}
-
-#[test]
-fn active_transport_enum_round_trips_each_variant() -> eyre::Result<()> {
-    for transport in [
-        ingest::ActiveTransport::Unspecified,
-        ingest::ActiveTransport::PerBlockFetch,
-        ingest::ActiveTransport::BlockRangeStream,
-        ingest::ActiveTransport::InProcess,
-    ] {
-        let response = ingest::WriterStatusResponse {
-            network_name: "zcash-regtest".to_owned(),
-            latest_writer_chain_epoch_id: None,
-            latest_writer_tip_height: None,
-            latest_writer_finalized_height: None,
-            phase: ingest::WriterPhase::Unspecified.into(),
-            active_transport: transport.into(),
-            gap_blocks: None,
-            upstream_not_ready: None,
-        };
-        let decoded = round_trip(&response)?;
-        assert_eq!(
-            decoded.active_transport(),
-            transport,
-            "active_transport round-trip failed: {transport:?}"
-        );
     }
 
     Ok(())

@@ -27,8 +27,7 @@ use zinder_client::{
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1, EXPLORER_SEARCH_V1,
     EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-    EXPLORER_VALUE_POOL_SUMMARY_V1, INGEST_CONTROL_ALWAYS_ON_CAPABILITIES,
-    INGEST_WRITER_ACTIVE_TRANSPORT_V1, INGEST_WRITER_PHASE_V1,
+    EXPLORER_VALUE_POOL_SUMMARY_V1, INGEST_CONTROL_ALWAYS_ON_CAPABILITIES, INGEST_WRITER_PHASE_V1,
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
     WALLET_ADDRESS_TRANSPARENT_UTXOS_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
     WALLET_EVENTS_MEMPOOL_V1, WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
@@ -149,20 +148,17 @@ fn capability_coverage_table_does_not_reference_retired_capabilities() {
 
 /// Regression guard for the unified-ingest wire surface.
 ///
-/// `ingest.writer.phase_v1` and `ingest.writer.active_transport_v1` must
-/// stay in the always-on list so federated clients can rely on the
-/// vocabulary advertised by every Zinder deployment.
-/// ADR-0015 + ADR-0016.
+/// `ingest.writer.phase_v1` must stay in the always-on list so federated
+/// clients can rely on the writer-phase vocabulary advertised by every
+/// Zinder deployment. ADR-0015.
 #[test]
 fn unified_ingest_capabilities_are_always_on() {
-    for capability in [INGEST_WRITER_PHASE_V1, INGEST_WRITER_ACTIVE_TRANSPORT_V1] {
-        assert!(
-            INGEST_CONTROL_ALWAYS_ON_CAPABILITIES.contains(&capability),
-            "{capability} must stay in INGEST_CONTROL_ALWAYS_ON_CAPABILITIES so every \
-             ingest deployment advertises it; the unified-ingest wire surface depends \
-             on this invariant."
-        );
-    }
+    assert!(
+        INGEST_CONTROL_ALWAYS_ON_CAPABILITIES.contains(&INGEST_WRITER_PHASE_V1),
+        "{INGEST_WRITER_PHASE_V1} must stay in INGEST_CONTROL_ALWAYS_ON_CAPABILITIES so every \
+         ingest deployment advertises it; the unified-ingest wire surface depends on this \
+         invariant."
+    );
 }
 
 /// Compile-time existence check for [`ChainIndex`] methods.

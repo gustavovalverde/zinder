@@ -48,27 +48,6 @@ enum WriterPhase {
   reserved 4 to 15;
 }
 
-// Transport the bulk-catchup phase is using to move block bytes off the
-// upstream node. Orthogonal to `WriterPhase`: phase answers "what is the
-// loop doing"; `active_transport` answers "how is the bulk phase moving
-// bytes". See ADR-0016.
-enum ActiveTransport {
-  // Default scalar so unset fields do not silently match a real transport.
-  ACTIVE_TRANSPORT_UNSPECIFIED = 0;
-  // Per-block fetches fanned through `.buffered(N)` over
-  // `NodeSource::fetch_block_at`. Default for the JSON-RPC backend.
-  ACTIVE_TRANSPORT_PER_BLOCK_FETCH = 1;
-  // Native streaming via `NodeSource::stream_block_range`. Set when the
-  // backend advertises `NodeCapability::BlockRangeStreaming`.
-  ACTIVE_TRANSPORT_BLOCK_RANGE_STREAM = 2;
-  // In-process backend reading through `ReadStateService`. Set when an
-  // in-process source is configured. ADR-0016 §Phase 3.
-  ACTIVE_TRANSPORT_IN_PROCESS = 3;
-
-  // Reserved slots for additive growth.
-  reserved 4 to 15;
-}
-
 // Private ingest control-plane response used by colocated secondary readers
 // to compute RocksDB-secondary replica lag.
 message WriterStatusResponse {
@@ -87,9 +66,10 @@ message WriterStatusResponse {
   // Current phase of the unified ingest loop. ADR-0015.
   WriterPhase phase = 5;
 
-  // Bulk-catchup transport in use. ADR-0016. Always
-  // `ACTIVE_TRANSPORT_PER_BLOCK_FETCH` until ADR-0016 Phase 2 ships.
-  ActiveTransport active_transport = 6;
+  // Reserved by a future ADR for the bulk-catchup transport identity.
+  // Skipped today because the JSON-RPC adapter is the only backend; the
+  // value would carry no signal.
+  reserved 6;
 
   // Distance from the writer's visible tip to the observed upstream tip
   // when known. Drives phase classification; populated whenever the writer

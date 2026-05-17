@@ -67,6 +67,20 @@ impl BlockHeight {
     pub const fn value(self) -> u32 {
         self.0
     }
+
+    /// Returns the next block height, or `None` when already at `u32::MAX`.
+    ///
+    /// Returning `Option` instead of saturating keeps callers honest at
+    /// the rollover edge: a loop walking forward through chain heights
+    /// should terminate when it hits the ceiling, not silently re-fetch
+    /// the same height.
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
 }
 
 /// Zcash block hash bytes.
