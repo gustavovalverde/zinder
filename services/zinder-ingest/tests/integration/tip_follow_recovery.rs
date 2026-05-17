@@ -57,9 +57,9 @@ async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> R
 
     wait_until_node_unavailable(&readiness).await?;
 
-    let detail = match readiness.report().cause {
-        ReadinessCause::NodeUnavailable(detail) => detail,
-        other => return Err(eyre!("expected NodeUnavailable, got {other:?}")),
+    let cause = readiness.report().cause;
+    let ReadinessCause::NodeUnavailable(ref detail) = cause else {
+        return Err(eyre!("expected NodeUnavailable, got {cause:?}"));
     };
     assert_eq!(detail.failure_class, "upstream_view_changed");
     assert!(
@@ -101,9 +101,9 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
     };
 
     wait_until_node_unavailable(&readiness).await?;
-    let detail = match readiness.report().cause {
-        ReadinessCause::NodeUnavailable(detail) => detail,
-        other => return Err(eyre!("expected NodeUnavailable, got {other:?}")),
+    let cause = readiness.report().cause;
+    let ReadinessCause::NodeUnavailable(ref detail) = cause else {
+        return Err(eyre!("expected NodeUnavailable, got {cause:?}"));
     };
     assert_eq!(detail.failure_class, "protocol_mismatch");
 
@@ -147,10 +147,11 @@ async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<
     };
 
     wait_until_node_unavailable(&readiness).await?;
-    let consecutive_after_first = match readiness.report().cause {
-        ReadinessCause::NodeUnavailable(detail) => detail.consecutive_failures,
-        other => return Err(eyre!("expected NodeUnavailable, got {other:?}")),
+    let cause = readiness.report().cause;
+    let ReadinessCause::NodeUnavailable(ref detail) = cause else {
+        return Err(eyre!("expected NodeUnavailable, got {cause:?}"));
     };
+    let consecutive_after_first = detail.consecutive_failures;
     assert!(consecutive_after_first >= 1);
 
     // Wait until either the counter grows or the node recovers, then assert
