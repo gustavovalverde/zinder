@@ -202,42 +202,120 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Maximum JSON-RPC response body size (bytes) accepted from the node.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__CONTROL__LISTEN_ADDR",
-        toml_path: "ingest.control.listen_addr",
+        name: "ZINDER_OPS__LISTEN_ADDR",
+        toml_path: "ops.listen_addr",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Listen address for the operational HTTP endpoint \
+                      (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service \
+                      loopback address (`127.0.0.1:9105` ingest, `9106` query, `9107` \
+                      compat, `9069` explorer). Set to an empty string to disable the \
+                      endpoint entirely.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST_CONTROL__LISTEN_ADDR",
+        toml_path: "ingest_control.listen_addr",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Listen address of the private IngestControl gRPC endpoint. Localhost-only \
-                      by default; cross-host deployments must add bearer-token auth per ADR-0006.",
+                      by default; cross-host deployments must add bearer-token auth per ADR-0006. \
+                      Set to an empty string to disable the endpoint (used by backfill).",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH",
-        toml_path: "ingest.control.bearer_token_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Path to the shared-secret bearer token the IngestControl endpoint enforces \
-                      on every request (ADR-0006). File-only by policy; inline secrets are \
-                      rejected at config load.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__INGEST_CONTROL_ADDR",
-        toml_path: "storage.ingest_control_addr",
+        name: "ZINDER_INGEST_CONTROL__ADDR",
+        toml_path: "ingest_control.addr",
         used_by: &["zinder-query", "zinder-compat-lightwalletd"],
-        requirement: Requirement::Required,
+        requirement: Requirement::Optional,
         sensitive: false,
         description: "URL of the colocated IngestControl writer (`http://host:port`). Readers \
                       use it for tip-change subscriptions, mempool reads, and writer-status \
-                      lookups.",
+                      lookups. Defaults to `http://127.0.0.1:9100`.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH",
-        toml_path: "storage.ingest_control_bearer_token_path",
-        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
+        name: "ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH",
+        toml_path: "ingest_control.bearer_token_path",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
         sensitive: false,
-        description: "Path to the bearer token file presented to the IngestControl writer when \
-                      the writer enforces auth (ADR-0006).",
+        description: "Path to the shared-secret bearer token the IngestControl endpoint enforces \
+                      on every request (ADR-0006). The writer reads it to verify; the readers \
+                      read the same file to present. File-only by policy; inline secrets are \
+                      rejected at config load.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS",
+        toml_path: "retention.chain_event_retention_hours",
+        used_by: &["zinder-ingest", "zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Chain-event retention window in hours, enforced by `zinder-ingest` and \
+                      advertised by `zinder-query` through `ServerInfo`. Defaults to 168 (7 days). \
+                      `0` disables eviction.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS",
+        toml_path: "retention.chain_event_retention_check_interval_ms",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Chain-event retention sweep cadence in milliseconds. Must be greater than \
+                      zero. Defaults to 60000 (one minute).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__CURSOR_AT_RISK_WARNING_HOURS",
+        toml_path: "retention.cursor_at_risk_warning_hours",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Cursor-at-risk warning lead time in hours. Must be \u{2264} \
+                      `retention.chain_event_retention_hours`. Defaults to 24.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_MINED_RETENTION_MINUTES",
+        toml_path: "retention.mempool_mined_retention_minutes",
+        used_by: &["zinder-ingest", "zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Mined-mempool retention window in minutes, enforced by `zinder-ingest` and \
+                      advertised by `zinder-query`. Defaults to 60. `0` disables retention.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_INVALIDATED_RETENTION_HOURS",
+        toml_path: "retention.mempool_invalidated_retention_hours",
+        used_by: &["zinder-ingest", "zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Invalidated-mempool retention window in hours, enforced by `zinder-ingest` \
+                      and advertised by `zinder-query`. Defaults to 24. `0` disables retention.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS",
+        toml_path: "retention.mempool_event_retention_check_interval_ms",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Mempool-event retention sweep cadence in milliseconds. Must be greater \
+                      than zero. Defaults to 30000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES",
+        toml_path: "retention.mempool_cursor_at_risk_warning_minutes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Mempool cursor-at-risk warning lead time in minutes. Must be \u{2264} the \
+                      shortest configured mempool retention window. Defaults to 12.",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__BEARER_TOKEN_PATH",

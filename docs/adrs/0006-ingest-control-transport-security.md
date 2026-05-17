@@ -96,11 +96,11 @@ an extra CI matrix dimension.
 ### Default: no auth, no TLS, loopback or trusted network
 
 The IngestControl endpoint runs plaintext h2c with no authentication when
-neither `[ingest.control] token_path` nor any equivalent reader-side
-config is set. Operators who run all processes on one host and bind the
-port to `127.0.0.1` (or who put the port on a private network they
-trust) configure nothing. This is the **localhost-default** story
-referenced throughout ADR-0003 and the service-operations doc.
+`[ingest_control] bearer_token_path` is unset on the writer. Operators
+who run all processes on one host and bind the port to `127.0.0.1` (or
+who put the port on a private network they trust) configure nothing.
+This is the **localhost-default** story referenced throughout ADR-0003
+and the service-operations doc.
 
 This default exists because the threat model collapses for single-host
 deployments: an attacker with local code execution on the writer's host
@@ -111,12 +111,14 @@ loopback gRPC port is theatre.
 
 When operators run a reader on a different host, or when they want
 defense in depth on top of a private-network ACL, they configure a
-shared-secret bearer token:
+shared-secret bearer token through the shared `[ingest_control]`
+section:
 
-- `[ingest.control] token_path` on `zinder-ingest`.
-- `[storage] ingest_control_token_path` on every reader
+- `[ingest_control] bearer_token_path` on every process — the writer
+  (`zinder-ingest`) reads the file to verify, and every reader
   (`zinder-query`, `zinder-compat-lightwalletd`, embedded
-  `zinder-client::LocalChainIndex` consumers).
+  `zinder-client::LocalChainIndex` consumers) reads the same file to
+  present.
 - The same value lives in the file referenced by every process.
 
 The writer's `BearerTokenServerInterceptor` validates the

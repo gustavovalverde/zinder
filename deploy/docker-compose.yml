@@ -52,7 +52,7 @@ services:
       - ./config/query.toml:/etc/zinder/config.toml:ro
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
-      ZINDER_STORAGE__INGEST_CONTROL_ADDR: http://zinder-ingest:9100
+      ZINDER_INGEST_CONTROL__ADDR: http://zinder-ingest:9100
     ports:
       - "9101:9101"
       - "127.0.0.1:9106:9106"

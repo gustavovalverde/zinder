@@ -46,7 +46,7 @@ WORKDIR /var/lib/zinder
 # port. Loopback is the in-process default (services/zinder-query/src/bin/
 # zinder-query/config.rs); override here for container deployments.
 ENV ZINDER_QUERY__LISTEN_ADDR=0.0.0.0:9101
-ENV ZINDER_OPS_LISTEN_ADDR=0.0.0.0:9106
+ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9106
 
 EXPOSE 9101 9106
 

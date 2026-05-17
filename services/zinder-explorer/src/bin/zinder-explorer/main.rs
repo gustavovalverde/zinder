@@ -10,8 +10,8 @@ use zinder_explorer::{
     ExplorerServerInfoSettings,
 };
 use zinder_runtime::{
-    OpsServer, Readiness, ReadinessState, StartupPhase, cancel_on_ctrl_c,
-    install_tracing_subscriber, spawn_ops_endpoint,
+    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 
 mod config;
@@ -96,7 +96,6 @@ async fn run_runtime(cli: Cli) -> ExitCode {
 async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
-    let ops_listen_addr_override = cli.ops_listen_addr;
     let explorer_config = match config::load_explorer_config(config_path, cli.into()) {
         Ok(cfg) => {
             load_config_phase.complete();
@@ -110,10 +109,13 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = explorer_config
-        .ops_listen_addr
-        .or(ops_listen_addr_override)
-        .map(|listen_addr| spawn_ops(listen_addr, &explorer_config, &readiness));
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Explorer,
+        explorer_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(explorer_config.network),
+        readiness.clone(),
+    );
 
     let store = match open_derive_store(&explorer_config) {
         Ok(store) => store,
@@ -209,22 +211,6 @@ fn spawn_block_summary_consumer(
     Some(tokio::spawn(async move {
         run_block_summary_consumer(store, endpoint, cancel).await;
     }))
-}
-
-fn spawn_ops(
-    listen_addr: SocketAddr,
-    explorer_config: &ExplorerConfig,
-    readiness: &Readiness,
-) -> zinder_runtime::OpsEndpointHandle {
-    spawn_ops_endpoint(
-        listen_addr,
-        OpsServer {
-            service_name: "zinder-explorer",
-            service_version: env!("CARGO_PKG_VERSION"),
-            network_name: encode_zinder_native_chain_name(explorer_config.network),
-        },
-        readiness.clone(),
-    )
 }
 
 fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {

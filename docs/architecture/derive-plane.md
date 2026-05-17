@@ -154,12 +154,14 @@ A derive consumer ships its own ops endpoints (`/healthz`, `/readyz`, `/metrics`
 Configuration follows the canonical TOML conventions ([Public Interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions)):
 
 ```toml
+[ops]
+listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
 storage_path = "/var/lib/zinder-explorer"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9101"   # zinder-query gRPC
-ops_listen_addr = "127.0.0.1:9069"
 
 [explorer.retention]
 view_retention_days = 365

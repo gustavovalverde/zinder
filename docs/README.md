@@ -37,6 +37,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0011: Explorer freshness envelope](adrs/0011-explorer-freshness-envelope.md)
 - [ADR-0012: Typed explorer search and privacy refusal](adrs/0012-typed-explorer-search-and-privacy-refusal.md)
 - [ADR-0013: Source failure recovery topology](adrs/0013-source-failure-recovery-topology.md)
+- [ADR-0014: Shared configuration sections](adrs/0014-shared-configuration-sections.md)
 
 ## Reference
 

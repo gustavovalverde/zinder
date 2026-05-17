@@ -7,11 +7,11 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    require_field,
+    OpsSection, OpsToml, ServiceIdentifier, load_bearer_token, parse_socket_addr, require_field,
+    resolve_ops_listen_addr,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
-const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9069";
 
 /// Resolved explorer-plane runtime configuration.
 #[derive(Clone, Debug)]
@@ -68,7 +68,7 @@ pub(crate) fn load_explorer_config(
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let raw: ExplorerRawConfig = ConfigLoader::new()
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
-        .with_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)?
+        .with_ops_section(ServiceIdentifier::Explorer)?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -114,17 +114,11 @@ struct ExplorerSection {
     wallet_query_endpoint: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct OpsSection {
-    listen_addr: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct ExplorerConfigToml {
     network: NetworkToml,
-    explorer: ExplorerToml,
     ops: OpsToml,
+    explorer: ExplorerToml,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,15 +130,11 @@ struct ExplorerToml {
     wallet_query_endpoint: String,
 }
 
-#[derive(Debug, Serialize)]
-struct OpsToml {
-    listen_addr: String,
-}
-
 impl ExplorerConfigToml {
     fn from_resolved(config: &ExplorerConfig) -> Self {
         Self {
             network: NetworkToml::from_network(config.network),
+            ops: OpsToml::from_resolved(config.ops_listen_addr),
             explorer: ExplorerToml {
                 listen_addr: config.listen_addr.to_string(),
                 storage_path: config.storage_path.to_string_lossy().into_owned(),
@@ -154,12 +144,6 @@ impl ExplorerConfigToml {
                     .map(|path| path.display().to_string()),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
             },
-            ops: OpsToml {
-                listen_addr: config
-                    .ops_listen_addr
-                    .map(|addr| addr.to_string())
-                    .unwrap_or_default(),
-            },
         }
     }
 }
@@ -167,23 +151,12 @@ impl ExplorerConfigToml {
 fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, ExplorerConfigError> {
     let network = raw.network.resolve()?;
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
-    let listen_addr = listen_addr_text
-        .parse::<SocketAddr>()
-        .map_err(|error| ConfigError::invalid(error.to_string()))?;
+    let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let storage_path_text = require_field(raw.explorer.storage_path, "explorer.storage_path")?;
     let storage_path = PathBuf::from(storage_path_text);
     let bearer_token_path = raw.explorer.bearer_token_path;
-    let bearer_token = bearer_token_path
-        .as_deref()
-        .map(BearerToken::from_file)
-        .transpose()?;
-    let ops_listen_addr = match raw.ops.listen_addr.as_deref() {
-        Some(text) if !text.is_empty() => Some(
-            text.parse::<SocketAddr>()
-                .map_err(|error| ConfigError::invalid(error.to_string()))?,
-        ),
-        _ => None,
-    };
+    let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
+    let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
     let wallet_query_endpoint = raw
         .explorer
         .wallet_query_endpoint

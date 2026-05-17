@@ -189,17 +189,19 @@ The wallet plane's privacy invariants ([ADR-0005](../adrs/0005-consumer-neutral-
 
 ## Operator surface
 
-`zinder-explorer` ships standard ops endpoints (`/healthz`, `/readyz`, `/metrics`) on a dedicated listener at `explorer.ops_listen_addr` (default `127.0.0.1:9069`). Prometheus metrics use the `zinder_explorer_*` prefix.
+`zinder-explorer` ships standard ops endpoints (`/healthz`, `/readyz`, `/metrics`) on the shared `[ops]` listener (default `127.0.0.1:9069` for the explorer). Prometheus metrics use the `zinder_explorer_*` prefix.
 
 Configuration follows the canonical TOML conventions:
 
 ```toml
+[ops]
+listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
 storage_path = "/var/lib/zinder-explorer"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9101"   # zinder-query gRPC
-ops_listen_addr = "127.0.0.1:9069"
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
@@ -208,13 +210,13 @@ warn_lag_blocks = 4              # readiness cause flips at this threshold
 
 When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The matching `zinder-query` process points its `[explorer]` config at the same secret before advertising the federated `explorer.transparent_address.balance_v1` capability.
 
-Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix:
+Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
 - `ZINDER_EXPLORER__LISTEN_ADDR`
 - `ZINDER_EXPLORER__STORAGE_PATH`
 - `ZINDER_EXPLORER__BEARER_TOKEN_PATH`
 - `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT`
-- `ZINDER_EXPLORER__OPS_LISTEN_ADDR`
+- `ZINDER_OPS__LISTEN_ADDR` (shared with every Zinder binary; default `127.0.0.1:9069` for the explorer)
 
 ## Failure isolation
 

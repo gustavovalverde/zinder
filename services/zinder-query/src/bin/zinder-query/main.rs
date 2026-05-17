@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    BearerToken, OpsServer, Readiness, StartupPhase, cancel_on_ctrl_c,
-    connect_authenticated_channel, install_tracing_subscriber, spawn_ops_endpoint,
+    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
+    connect_authenticated_channel, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -19,7 +19,7 @@ use zinder_store::SecondaryChainStore;
 
 mod config;
 
-use config::{QueryConfig, QueryConfigError, QueryConfigOverrides};
+use config::{QueryConfigError, QueryConfigOverrides};
 
 const REQUIRED_BROADCASTER_NODE_CAPABILITIES: &[NodeCapability] =
     &[NodeCapability::TransactionBroadcast];
@@ -124,7 +124,6 @@ async fn run_runtime(cli: Cli) -> ExitCode {
 async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
-    let ops_listen_addr = cli.ops_listen_addr;
     let query_config = match config::load_query_config(config_path, cli.into()) {
         Ok(query_config) => {
             load_config_phase.complete();
@@ -137,13 +136,18 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     };
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle =
-        ops_listen_addr.map(|listen_addr| spawn_ops(listen_addr, &query_config, &readiness));
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Query,
+        query_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(query_config.network),
+        readiness.clone(),
+    );
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store = match SecondaryChainStore::open(
-        &query_config.storage_path,
-        &query_config.secondary_path,
+        &query_config.storage.path,
+        &query_config.storage.secondary_path,
         zinder_store::ChainStoreOptions::for_network(query_config.network),
     ) {
         Ok(store) => {
@@ -205,9 +209,9 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let server_info = zinder_query::ServerInfoSettings {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         transaction_broadcast_enabled,
-        chain_event_retention_seconds: query_config.chain_event_retention_seconds,
-        mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds,
-        mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds,
+        chain_event_retention_seconds: query_config.chain_event_retention_seconds(),
+        mempool_mined_retention_seconds: query_config.mempool_mined_retention_seconds(),
+        mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds(),
         upstream_node_capabilities,
         chain_value_pools_enabled,
         ..zinder_query::ServerInfoSettings::default()
@@ -256,8 +260,10 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         store,
         readiness.clone(),
         zinder_query::SecondaryCatchupOptions {
-            interval: query_config.secondary_catchup_interval,
-            lag_threshold_chain_epochs: query_config.secondary_replica_lag_threshold_chain_epochs,
+            interval: query_config.storage.secondary_catchup_interval,
+            lag_threshold_chain_epochs: query_config
+                .storage
+                .secondary_replica_lag_threshold_chain_epochs,
             writer_status: Some(zinder_query::WriterStatusConfig {
                 endpoint: query_config.ingest_control_addr.clone(),
                 network: query_config.network,
@@ -443,22 +449,6 @@ fn require_broadcaster_node_capabilities(
     Ok(())
 }
 
-fn spawn_ops(
-    listen_addr: SocketAddr,
-    query_config: &QueryConfig,
-    readiness: &Readiness,
-) -> zinder_runtime::OpsEndpointHandle {
-    spawn_ops_endpoint(
-        listen_addr,
-        OpsServer {
-            service_name: "zinder-query",
-            service_version: env!("CARGO_PKG_VERSION"),
-            network_name: encode_zinder_native_chain_name(query_config.network),
-        },
-        readiness.clone(),
-    )
-}
-
 fn emit_runtime_error(error: &QueryConfigError) -> ExitCode {
     tracing::error!(
         target: "zinder::query",
@@ -476,11 +466,12 @@ impl From<Cli> for QueryConfigOverrides {
             storage_path: cli.storage_path,
             secondary_path: cli.secondary_path,
             ingest_control_addr: cli.ingest_control_addr,
-            ingest_control_token_path: cli.ingest_control_token_path,
+            ingest_control_bearer_token_path: cli.ingest_control_token_path,
             chain_event_retention_hours: cli.chain_event_retention_hours,
             mempool_mined_retention_minutes: cli.mempool_mined_retention_minutes,
             mempool_invalidated_retention_hours: cli.mempool_invalidated_retention_hours,
             listen_addr: cli.listen_addr,
+            ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
             explorer_endpoint: cli.explorer_endpoint,
             explorer_bearer_token_path: cli.explorer_bearer_token_path,

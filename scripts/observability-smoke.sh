@@ -266,7 +266,7 @@ path = "${storage_path}"
 reorg_window_blocks = 100
 commit_batch_blocks = ${COMMIT_BATCH_BLOCKS}
 
-[ingest.control]
+[ingest_control]
 listen_addr = "${INGEST_CONTROL_ADDR}"
 
 [backfill]

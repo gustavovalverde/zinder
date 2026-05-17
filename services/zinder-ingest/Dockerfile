@@ -49,15 +49,15 @@ USER zinder:zinder
 WORKDIR /var/lib/zinder
 
 # Default ops endpoint inside the container; operators override via
-# --ops-listen-addr or ZINDER_OPS_LISTEN_ADDR.
-ENV ZINDER_OPS_LISTEN_ADDR=0.0.0.0:9105
+# --ops-listen-addr or ZINDER_OPS__LISTEN_ADDR.
+ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9105
 
 # Ingest-control gRPC stays internal: bind on loopback by default. Inside
 # a single-container deployment this matches the topology in ADR-0003
 # (writer and reader colocated). For Kubernetes-style multi-pod setups
 # operators override to 0.0.0.0 explicitly and front the surface with
 # their cluster mTLS.
-ENV ZINDER_INGEST__CONTROL__LISTEN_ADDR=0.0.0.0:9100
+ENV ZINDER_INGEST_CONTROL__LISTEN_ADDR=0.0.0.0:9100
 
 EXPOSE 9100 9105
 

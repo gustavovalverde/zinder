@@ -17,7 +17,12 @@
 //! [ADR-0006](../../../docs/adrs/0006-ingest-control-transport-security.md))
 //! remain enforced at their respective config types.
 
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use ::config::{
     Config, ConfigBuilder, ConfigError as InnerConfigError, Environment, File, FileFormat, Value,
@@ -28,6 +33,10 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
 use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
+
+use crate::auth::{BearerToken, BearerTokenError};
+use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
+use crate::sections::{ServiceIdentifier, defaults::default_ops_listen_addr};
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
@@ -74,6 +83,32 @@ pub enum ConfigError {
         /// Public configuration field path.
         field: &'static str,
     },
+
+    /// The operator set an environment variable the loader recognized as
+    /// the source of a deserialization failure. Carries the original
+    /// `ZINDER_…` name plus a suggested correction so the operator does
+    /// not have to map a serde unknown-field message back to the env var
+    /// themselves.
+    #[error(
+        "rejected environment variable `{original_name}`: produced configuration key \
+         `{rejected_key}`, which is not a valid field. Zinder env vars use `__` (double \
+         underscore) between TOML section names and single `_` inside field names. \
+         {}See `docs/architecture/public-interfaces.md` for the canonical env-var table.",
+        suggestion_sentence(suggested_name.as_deref())
+    )]
+    RejectedEnvVar {
+        /// Original `ZINDER_…` name as set by the operator.
+        original_name: String,
+        /// Config-key path the env var produced.
+        rejected_key: String,
+        /// Suggested corrected env var name. `None` when the heuristic
+        /// cannot confidently propose an alternative.
+        suggested_name: Option<String>,
+    },
+}
+
+fn suggestion_sentence(suggested_name: Option<&str>) -> String {
+    suggested_name.map_or_else(String::new, |name| format!("Try `{name}` instead. "))
 }
 
 impl ConfigError {
@@ -96,6 +131,29 @@ impl ConfigError {
     pub const fn missing_field(field: &'static str) -> Self {
         Self::MissingField { field }
     }
+
+    fn from_rejected_env_var(rejection: RejectedEnvVar) -> Self {
+        Self::RejectedEnvVar {
+            original_name: rejection.original_name,
+            rejected_key: rejection.rejected_key,
+            suggested_name: rejection.suggested_name,
+        }
+    }
+
+    /// Translates an `InnerConfigError` to a [`ConfigError::RejectedEnvVar`]
+    /// when the failure can be attributed to an env var, falling back to
+    /// [`ConfigError::Load`] otherwise.
+    fn from_inner_with_env_diagnostics(
+        inner: InnerConfigError,
+        reverse_index: Option<&HashMap<String, String>>,
+    ) -> Self {
+        if let Some(reverse_index) = reverse_index
+            && let Some(rejection) = translate_env_error(&inner, reverse_index)
+        {
+            return Self::from_rejected_env_var(rejection);
+        }
+        Self::Load { source: inner }
+    }
 }
 
 impl From<NodeConfigError> for ConfigError {
@@ -117,17 +175,47 @@ impl From<NodeConfigError> for ConfigError {
     }
 }
 
-/// Builds the standard Zinder environment source for `config-rs`.
+/// Standard Zinder environment source for `config-rs`.
 ///
-/// Strips the `ZINDER_TEST_` prefix (used by `ZINDER_TEST_LIVE` and crash-
-/// recovery harness vars) so test-only acknowledgements cannot leak into
-/// production config. Secret values pass through unchanged; redaction is
-/// applied at emit boundaries (see [`NodeAuthToml`] and the `Debug` impls on
-/// [`NodeAuth`] and [`crate::auth::BearerToken`]).
-pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
-    let mut filtered_env = HashMap::new();
+/// Paired with the reverse mapping from produced config-key paths back to
+/// the original `ZINDER_…` names so the loader can attribute
+/// deserialization failures to specific env vars.
+#[derive(Debug)]
+pub struct ZinderEnvironmentSource {
+    /// `config-rs` source ready to be added to a [`ConfigBuilder`].
+    pub source: Environment,
+    /// Map from `config-rs`-style config-key path (e.g. `ops_listen_addr`,
+    /// `ops.listen_addr`) to the `ZINDER_…` name that produced it. Used by
+    /// the diagnostic loader to turn serde unknown-field errors back into
+    /// operator-actionable messages.
+    pub reverse_index: HashMap<String, String>,
+}
 
-    for (variable, env_value) in std::env::vars() {
+/// Builds the standard Zinder environment source from the process
+/// environment.
+///
+/// Reads `std::env::vars()`. Strips `ZINDER_TEST_*` prefixes so test-only
+/// acknowledgements cannot leak into production config. Secret values
+/// pass through unchanged; redaction happens at emit boundaries.
+pub fn zinder_environment_source() -> Result<ZinderEnvironmentSource, ConfigError> {
+    zinder_environment_source_from_map(std::env::vars())
+}
+
+/// Builds a Zinder environment source from an explicit iterator of
+/// `(name, value)` pairs.
+///
+/// Use this in tests that want deterministic env input without mutating
+/// the global process environment.
+pub fn zinder_environment_source_from_map<I>(
+    env_iter: I,
+) -> Result<ZinderEnvironmentSource, ConfigError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut filtered_env = HashMap::new();
+    let mut reverse_index = HashMap::new();
+
+    for (variable, env_value) in env_iter {
         if TEST_ENV_PREFIXES
             .iter()
             .any(|test_prefix| variable.starts_with(test_prefix))
@@ -135,17 +223,30 @@ pub fn zinder_environment_source() -> Result<Environment, ConfigError> {
             continue;
         }
 
-        let Some(config_key) = variable.strip_prefix(ENV_PREFIX) else {
+        let Some(env_key) = variable.strip_prefix(ENV_PREFIX) else {
             continue;
         };
 
-        filtered_env.insert(config_key.to_owned(), env_value);
+        reverse_index.insert(env_key_to_config_key(env_key), variable.clone());
+        filtered_env.insert(env_key.to_owned(), env_value);
     }
 
-    Ok(Environment::default()
+    let source = Environment::default()
         .separator("__")
         .try_parsing(true)
-        .source(Some(filtered_env)))
+        .source(Some(filtered_env));
+
+    Ok(ZinderEnvironmentSource {
+        source,
+        reverse_index,
+    })
+}
+
+/// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
+/// strip) into a config-key path: lowercase everything and treat `__` as
+/// a nesting separator. Single `_` stays inside the key segment.
+fn env_key_to_config_key(env_key: &str) -> String {
+    env_key.to_lowercase().replace("__", ".")
 }
 
 /// Returns `field_value` or a [`ConfigError::MissingField`] error pointing at
@@ -172,6 +273,27 @@ fn path_to_config_string(path: PathBuf, field: &'static str) -> Result<String, C
 #[must_use]
 pub fn duration_as_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Parses `text` as a [`SocketAddr`], producing a [`ConfigError::Invalid`]
+/// that names the offending field and value on failure.
+///
+/// Centralizing the error shape keeps the operator-visible message
+/// consistent across every section that takes a listen address.
+pub fn parse_socket_addr(field: &str, text: &str) -> Result<SocketAddr, ConfigError> {
+    text.parse::<SocketAddr>().map_err(|source| {
+        ConfigError::invalid(format!("{field} {text} is not a socket address: {source}"))
+    })
+}
+
+/// Loads a [`BearerToken`] from `path` when present.
+///
+/// Returns `Ok(None)` when no path is supplied, so callers can express the
+/// "optional secret" shape without branching on the inner result.
+pub fn load_bearer_token(path: Option<&Path>) -> Result<Option<BearerToken>, ConfigError> {
+    path.map(BearerToken::from_file)
+        .transpose()
+        .map_err(|source: BearerTokenError| ConfigError::invalid(source.to_string()))
 }
 
 /// Raw `[network]` config section shared by every Zinder service binary.
@@ -205,6 +327,7 @@ impl NetworkSection {
 #[must_use]
 pub struct ConfigLoader {
     builder: ConfigBuilder<DefaultState>,
+    env_reverse_index: Option<HashMap<String, String>>,
 }
 
 impl ConfigLoader {
@@ -212,6 +335,7 @@ impl ConfigLoader {
     pub fn new() -> Self {
         Self {
             builder: Config::builder(),
+            env_reverse_index: None,
         }
     }
 
@@ -239,11 +363,51 @@ impl ConfigLoader {
         self
     }
 
-    /// Adds the standard Zinder environment source (sensitive-leaf rejection
-    /// + `ZINDER_TEST_*` stripping).
-    pub fn with_zinder_env(mut self) -> Result<Self, ConfigError> {
-        self.builder = self.builder.add_source(zinder_environment_source()?);
-        Ok(self)
+    /// Adds the standard Zinder environment source from the process
+    /// environment.
+    ///
+    /// Strips `ZINDER_TEST_*` prefixes, refuses to start on any renamed env
+    /// var, and stores the env-key reverse index used by [`Self::load`] to
+    /// translate serde "unknown field" errors back to the env var that
+    /// caused them.
+    pub fn with_zinder_env(self) -> Result<Self, ConfigError> {
+        let env_source = zinder_environment_source()?;
+        Ok(self.attach_zinder_env_source(env_source))
+    }
+
+    /// Adds a Zinder environment source built from an explicit iterator of
+    /// `(name, value)` pairs.
+    ///
+    /// Use in tests that want deterministic env input without mutating the
+    /// global process environment. Behavior is otherwise identical to
+    /// [`Self::with_zinder_env`].
+    pub fn with_zinder_env_from_map<I>(self, env_iter: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let env_source = zinder_environment_source_from_map(env_iter)?;
+        Ok(self.attach_zinder_env_source(env_source))
+    }
+
+    fn attach_zinder_env_source(mut self, env_source: ZinderEnvironmentSource) -> Self {
+        self.builder = self.builder.add_source(env_source.source);
+        self.env_reverse_index = Some(merge_reverse_index(
+            self.env_reverse_index,
+            env_source.reverse_index,
+        ));
+        self
+    }
+
+    /// Wires the shared `[ops]` section with the per-service default
+    /// operational listen address.
+    ///
+    /// Every service binary calls this exactly once so the on-by-default
+    /// policy applies uniformly: a binary started without any TOML or env
+    /// override binds the loopback default for its service. Operators opt
+    /// out by setting `ops.listen_addr = ""` (or
+    /// `ZINDER_OPS__LISTEN_ADDR=` to the empty string).
+    pub fn with_ops_section(self, service: ServiceIdentifier) -> Result<Self, ConfigError> {
+        self.with_default("ops.listen_addr", default_ops_listen_addr(service))
     }
 
     /// Records an override for `key` when `override_for_key` is `Some`.
@@ -284,15 +448,36 @@ impl ConfigLoader {
     }
 
     /// Builds the merged configuration and deserializes it as `T`.
+    ///
+    /// When deserialization fails and the failure can be attributed to an
+    /// env var the operator set, returns [`ConfigError::RejectedEnvVar`]
+    /// with the original `ZINDER_…` name and a suggested correction.
+    /// Otherwise returns [`ConfigError::Load`] wrapping the underlying
+    /// `config-rs` error.
     pub fn load<T>(self) -> Result<T, ConfigError>
     where
         T: DeserializeOwned,
     {
-        self.builder
-            .build()
-            .map_err(ConfigError::load)?
-            .try_deserialize::<T>()
-            .map_err(ConfigError::load)
+        let reverse_index = self.env_reverse_index;
+        let built = self.builder.build().map_err(|inner| {
+            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
+        })?;
+        built.try_deserialize::<T>().map_err(|inner| {
+            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
+        })
+    }
+}
+
+fn merge_reverse_index(
+    existing: Option<HashMap<String, String>>,
+    incoming: HashMap<String, String>,
+) -> HashMap<String, String> {
+    match existing {
+        Some(mut existing) => {
+            existing.extend(incoming);
+            existing
+        }
+        None => incoming,
     }
 }
 

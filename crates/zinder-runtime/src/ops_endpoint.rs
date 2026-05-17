@@ -8,7 +8,10 @@ use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::{MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder};
+use crate::{
+    MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder,
+    sections::ServiceIdentifier,
+};
 
 /// Service identity surfaced by `/metrics` for build-time labeling.
 #[derive(Clone, Debug)]
@@ -80,6 +83,34 @@ impl OpsEndpointHandle {
             ),
         }
     }
+}
+
+/// Spawns the operational HTTP server for a known service identity when
+/// `listen_addr` is populated.
+///
+/// Returns `None` when the operator opted out (empty string in
+/// `ops.listen_addr` resolves to `None` before this function is called).
+/// Otherwise returns the spawned handle, identical to
+/// [`spawn_ops_endpoint`] but with `service_name` filled in from the
+/// [`ServiceIdentifier`] table so each binary cannot drift its own label.
+#[must_use = "drop the returned handle only on graceful shutdown"]
+pub fn spawn_ops_endpoint_for(
+    service: ServiceIdentifier,
+    listen_addr: Option<SocketAddr>,
+    service_version: &'static str,
+    network_name: &'static str,
+    readiness: Readiness,
+) -> Option<OpsEndpointHandle> {
+    let listen_addr = listen_addr?;
+    Some(spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: service.binary_name(),
+            service_version,
+            network_name,
+        },
+        readiness,
+    ))
 }
 
 /// Spawns the operational HTTP server on a tokio task and returns a handle

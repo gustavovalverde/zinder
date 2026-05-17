@@ -344,6 +344,11 @@ Field names are public contract because they are written into TOML files and env
 [network]
 name = "zcash-mainnet"
 
+[ops]
+# Per-service default: 127.0.0.1:9105 (ingest), :9106 (query), :9107 (compat), :9069 (explorer).
+# Set to "" to disable the operational endpoint entirely.
+listen_addr = "127.0.0.1:9106"
+
 [node]
 source = "zebra-json-rpc"
 json_rpc_addr = "127.0.0.1:8232"
@@ -357,32 +362,34 @@ password = "..."
 
 [storage]
 path = "/var/lib/zinder"
-max_size_bytes = 1099511627776
-sync_writes = true
 # Reader-only knobs (zinder-query, zinder-compat-lightwalletd):
 secondary_path = "/var/lib/zinder/query-secondary"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
-ingest_control_addr = "http://127.0.0.1:9100"
-chain_event_retention_hours = 168 # descriptor mirror for zinder-query ServerInfo
-mempool_mined_retention_minutes = 60 # descriptor mirror for zinder-query ServerInfo
-mempool_invalidated_retention_hours = 24 # descriptor mirror for zinder-query ServerInfo
 
-[ingest]
-reorg_window_blocks = 100
-commit_batch_blocks = 1000
+[ingest_control]
+# Writer-side (zinder-ingest): bind address. "" disables the endpoint.
+listen_addr = "127.0.0.1:9100"
+# Reader-side (zinder-query, zinder-compat-lightwalletd): writer URL.
+addr = "http://127.0.0.1:9100"
+# Shared: bearer-token file enforced by the writer and presented by readers
+# when ADR-0006 auth is enabled. File-only; inline secrets rejected.
+bearer_token_path = "/run/secrets/zinder-ingest-control"
 
-[ingest.retention]
+[retention]
+# Enforced by `zinder-ingest`; advertised by `zinder-query` through
+# `ServerInfo`. One section, one source of truth.
 chain_event_retention_hours = 168
 chain_event_retention_check_interval_ms = 60000
 cursor_at_risk_warning_hours = 24
 mempool_mined_retention_minutes = 60
 mempool_invalidated_retention_hours = 24
-mempool_event_retention_check_interval_ms = 60000
-mempool_cursor_at_risk_warning_minutes = 30
+mempool_event_retention_check_interval_ms = 30000
+mempool_cursor_at_risk_warning_minutes = 12
 
-[ingest.control]
-listen_addr = "127.0.0.1:9100"
+[ingest]
+reorg_window_blocks = 100
+commit_batch_blocks = 1000
 
 [backfill]
 from_height = 1
@@ -407,7 +414,7 @@ enable_health = true
 listen_addr = "127.0.0.1:9067"
 ```
 
-The retention fields appear twice on purpose. `[ingest.retention]` is authoritative: `zinder-ingest` enforces eviction against those values. The `[storage]` mirror is read by `zinder-query` when it builds `ServerCapabilities`, so wallet clients see the same retention windows the writer is enforcing. The two sets are not cross-validated at startup; operators are responsible for keeping them in sync, and `--print-config` against both binaries is the recommended check.
+`[retention]` is the single source of truth: `zinder-ingest` enforces eviction against it; `zinder-query` reads the same section when it builds `ServerCapabilities`, so wallet clients see the windows the writer is enforcing. `[ingest_control]` is also shared: the writer reads `listen_addr` to bind, the readers read `addr` to dial, and both read `bearer_token_path` when ADR-0006 auth is enabled.
 
 ### Unit suffix rule
 
@@ -426,7 +433,7 @@ A bare count (`max_compact_block_range`) is acceptable when the unit is intrinsi
 
 ### Environment variable mapping
 
-`ZINDER_<SECTION>__<FIELD>` is the convention. Nested sections double-underscore: `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_INGEST__RETENTION__CHAIN_EVENT_RETENTION_HOURS`. Every TOML field is reachable through this mapping.
+`ZINDER_<SECTION>__<FIELD>` is the convention. Nested sections double-underscore: `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS`, `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH`. Every TOML field is reachable through this mapping.
 
 Secrets are accepted through the environment; redaction happens at every emit boundary (`--print-config`, structured logs, `Debug` impls). The supported upstream-node auth shapes are:
 
@@ -436,7 +443,7 @@ Secrets are accepted through the environment; redaction happens at every emit bo
 | `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie` | Cookie auth from a file on disk |
 | `ZINDER_NODE__AUTH__METHOD=cookie` + `ZINDER_NODE__AUTH__COOKIE=<credentials>` | Cookie auth from inline credentials (PaaS pattern) |
 
-`__PATH` and `__COOKIE` are mutually exclusive. Per-surface file-only constraints that remain load-bearing for security reasons (the ingest-control bearer token at `ingest.control.token_path`, per [ADR-0006](../adrs/0006-ingest-control-transport-security.md)) are enforced at their respective config types, not as a blanket env-var policy.
+`__PATH` and `__COOKIE` are mutually exclusive. Per-surface file-only constraints that remain load-bearing for security reasons (the ingest-control bearer token at `ingest_control.bearer_token_path`, per [ADR-0006](../adrs/0006-ingest-control-transport-security.md)) are enforced at their respective config types, not as a blanket env-var policy.
 
 #### Operator-facing variables
 
@@ -455,10 +462,17 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
-| `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest.control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. |
-| `ZINDER_INGEST__CONTROL__BEARER_TOKEN_PATH` | zinder-ingest | Optional | `ingest.control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). File-only by policy; inline secrets are rejected at config load. |
-| `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | zinder-query, zinder-compat-lightwalletd | Required | `storage.ingest_control_addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. |
-| `ZINDER_STORAGE__INGEST_CONTROL_BEARER_TOKEN_PATH` | zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `storage.ingest_control_bearer_token_path` | Path to the bearer token file presented to the IngestControl writer when the writer enforces auth (ADR-0006). |
+| `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9106` query, `9107` compat, `9069` explorer). Set to an empty string to disable the endpoint entirely. |
+| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. Set to an empty string to disable the endpoint (used by backfill). |
+| `ZINDER_INGEST_CONTROL__ADDR` | zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
+| `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
+| `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS` | zinder-ingest, zinder-query | Optional | `retention.chain_event_retention_hours` | Chain-event retention window in hours, enforced by `zinder-ingest` and advertised by `zinder-query` through `ServerInfo`. Defaults to 168 (7 days). `0` disables eviction. |
+| `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.chain_event_retention_check_interval_ms` | Chain-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 60000 (one minute). |
+| `ZINDER_RETENTION__CURSOR_AT_RISK_WARNING_HOURS` | zinder-ingest | Optional | `retention.cursor_at_risk_warning_hours` | Cursor-at-risk warning lead time in hours. Must be ≤ `retention.chain_event_retention_hours`. Defaults to 24. |
+| `ZINDER_RETENTION__MEMPOOL_MINED_RETENTION_MINUTES` | zinder-ingest, zinder-query | Optional | `retention.mempool_mined_retention_minutes` | Mined-mempool retention window in minutes, enforced by `zinder-ingest` and advertised by `zinder-query`. Defaults to 60. `0` disables retention. |
+| `ZINDER_RETENTION__MEMPOOL_INVALIDATED_RETENTION_HOURS` | zinder-ingest, zinder-query | Optional | `retention.mempool_invalidated_retention_hours` | Invalidated-mempool retention window in hours, enforced by `zinder-ingest` and advertised by `zinder-query`. Defaults to 24. `0` disables retention. |
+| `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.mempool_event_retention_check_interval_ms` | Mempool-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 30000. |
+| `ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES` | zinder-ingest | Optional | `retention.mempool_cursor_at_risk_warning_minutes` | Mempool cursor-at-risk warning lead time in minutes. Must be ≤ the shortest configured mempool retention window. Defaults to 12. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
 | `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Filesystem path opened by `DeriveStore` for explorer-plane derive state. |

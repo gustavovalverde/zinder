@@ -2,12 +2,16 @@
 # (mounted at /etc/zinder/query.toml).
 #
 # The reader points at the in-process IngestControl writer over loopback;
-# operators wanting cross-host topology should set
-# `storage.ingest_control_addr` to the writer's external URL and add a
-# shared-secret bearer token (ADR-0006).
+# operators wanting cross-host topology should set `ingest_control.addr`
+# to the writer's external URL and add a shared-secret bearer token
+# (ADR-0006).
 
 [network]
 name = "zcash-testnet"
+
+[ops]
+# Per-service default `127.0.0.1:9106`; set to "" to disable the endpoint.
+listen_addr = "127.0.0.1:9106"
 
 [node]
 json_rpc_addr = "http://zebra:8232"
@@ -20,7 +24,14 @@ cookie = "REPLACE_VIA_ENV_VAR"
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
-ingest_control_addr = "http://127.0.0.1:9100"
+
+[ingest_control]
+addr = "http://127.0.0.1:9100"
+
+[retention]
+chain_event_retention_hours = 168
+mempool_mined_retention_minutes = 60
+mempool_invalidated_retention_hours = 24
 
 [query]
 listen_addr = "0.0.0.0:9101"

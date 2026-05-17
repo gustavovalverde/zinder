@@ -27,8 +27,8 @@ use zinder_ingest::{
     tip_follow_with_primary_store,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, StartupPhase,
-    cancel_on_ctrl_c, install_tracing_subscriber, spawn_ops_endpoint,
+    Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     ChainTipNotificationSource, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
@@ -225,10 +225,14 @@ fn run_print_config(cli: Cli) -> ExitCode {
 }
 
 async fn run_runtime(cli: Cli) -> ExitCode {
-    let ops_listen_addr = cli.ops_listen_addr;
+    let ops_listen_addr_override = cli.ops_listen_addr;
     let runtime_result = match cli.command {
-        Command::Backfill(args) => run_backfill(cli.config_path, args, ops_listen_addr).await,
-        Command::TipFollow(args) => run_tip_follow(cli.config_path, args, ops_listen_addr).await,
+        Command::Backfill(args) => {
+            run_backfill(cli.config_path, args, ops_listen_addr_override).await
+        }
+        Command::TipFollow(args) => {
+            run_tip_follow(cli.config_path, args, ops_listen_addr_override).await
+        }
         Command::Backup(args) => run_backup(cli.config_path, args),
     };
 
@@ -255,10 +259,12 @@ fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
 async fn run_backfill(
     config_path: Option<PathBuf>,
     args: BackfillArgs,
-    ops_listen_addr: Option<SocketAddr>,
+    ops_listen_addr_override: Option<SocketAddr>,
 ) -> Result<(), IngestConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
-    let mut command_config = match config::load_backfill_config(config_path, args.into()) {
+    let mut overrides: BackfillConfigOverrides = args.into();
+    overrides.ops_listen_addr = ops_listen_addr_override;
+    let mut command_config = match config::load_backfill_config(config_path, overrides) {
         Ok(cfg) => {
             load_config_phase.complete();
             cfg
@@ -270,13 +276,13 @@ async fn run_backfill(
     };
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = ops_listen_addr.map(|listen_addr| {
-        spawn_ingest_ops(
-            listen_addr,
-            encode_zinder_native_chain_name(command_config.node.network),
-            &readiness,
-        )
-    });
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Ingest,
+        command_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(command_config.node.network),
+        readiness.clone(),
+    );
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source =
@@ -576,10 +582,12 @@ fn zebra_json_rpc_source_for_target(
 async fn run_tip_follow(
     config_path: Option<PathBuf>,
     args: TipFollowArgs,
-    ops_listen_addr: Option<SocketAddr>,
+    ops_listen_addr_override: Option<SocketAddr>,
 ) -> Result<(), IngestConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
-    let command_config = match config::load_tip_follow_config(config_path, args.into()) {
+    let mut overrides: TipFollowConfigOverrides = args.into();
+    overrides.ops_listen_addr = ops_listen_addr_override;
+    let command_config = match config::load_tip_follow_config(config_path, overrides) {
         Ok(command_config) => {
             load_config_phase.complete();
             command_config
@@ -589,17 +597,23 @@ async fn run_tip_follow(
             return Err(error);
         }
     };
+    let ops_listen_addr = command_config.ops_listen_addr;
+    let ingest_control_listen_addr = command_config.ingest_control_listen_addr;
+    let ingest_control_bearer_token = command_config.ingest_control_bearer_token.clone();
+    let chain_event_retention = command_config.chain_event_retention();
+    let mempool_event_retention = command_config.mempool_event_retention();
+    let retention = command_config.retention;
     let tip_follow_config = command_config.tip_follow;
     let readiness = Readiness::default();
 
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = ops_listen_addr.map(|listen_addr| {
-        spawn_ingest_ops(
-            listen_addr,
-            encode_zinder_native_chain_name(tip_follow_config.node.network),
-            &readiness,
-        )
-    });
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Ingest,
+        ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(tip_follow_config.node.network),
+        readiness.clone(),
+    );
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store = match open_tip_follow_store(&tip_follow_config) {
@@ -647,25 +661,25 @@ async fn run_tip_follow(
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
     let mempool_index = MempoolIndex::new();
     let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
-        listen_addr: command_config.ingest_control_listen_addr,
+        listen_addr: ingest_control_listen_addr,
         network: tip_follow_config.node.network,
         store: store.clone(),
         mempool_index: mempool_index.clone(),
         node_source: Some(Arc::new(source.clone())),
-        bearer_token: command_config.ingest_control_bearer_token.clone(),
+        bearer_token: ingest_control_bearer_token,
         cancel: cancel.clone(),
     })
     .await?;
     let _retention_handle = spawn_chain_event_retention_task(
         store.clone(),
         readiness.clone(),
-        command_config.chain_event_retention,
+        chain_event_retention,
         cancel.clone(),
     );
     let _mempool_retention_handle = spawn_mempool_event_retention_task(
         store.clone(),
         readiness.clone(),
-        command_config.mempool_event_retention,
+        mempool_event_retention,
         cancel.clone(),
     );
     let mempool_source = build_mempool_source(&tip_follow_config.node, &source);
@@ -689,20 +703,10 @@ async fn run_tip_follow(
         lag_threshold_blocks = tip_follow_config.lag_threshold_blocks,
         poll_interval_ms = u64::try_from(tip_follow_config.poll_interval.as_millis())
             .unwrap_or(u64::MAX),
-        ingest_control_listen_addr = %command_config.ingest_control_listen_addr,
-        chain_event_retention_hours = command_config
-            .chain_event_retention
-            .retention_window
-            .map_or(0, |duration| duration.as_secs() / 3_600),
-        chain_event_retention_check_interval_ms = u64::try_from(command_config
-            .chain_event_retention
-            .check_interval
-            .as_millis())
-            .unwrap_or(u64::MAX),
-        cursor_at_risk_warning_hours = command_config
-            .chain_event_retention
-            .cursor_at_risk_warning
-            .as_secs() / 3_600,
+        ingest_control_listen_addr = %ingest_control_listen_addr,
+        chain_event_retention_hours = retention.chain_event_retention_hours,
+        chain_event_retention_check_interval_ms = retention.chain_event_retention_check_interval_ms,
+        cursor_at_risk_warning_hours = retention.cursor_at_risk_warning_hours,
         "tip-follow started"
     );
 
@@ -1103,22 +1107,6 @@ fn current_unix_seconds_f64() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-fn spawn_ingest_ops(
-    listen_addr: SocketAddr,
-    network_name: &'static str,
-    readiness: &Readiness,
-) -> OpsEndpointHandle {
-    spawn_ops_endpoint(
-        listen_addr,
-        OpsServer {
-            service_name: "zinder-ingest",
-            service_version: env!("CARGO_PKG_VERSION"),
-            network_name,
-        },
-        readiness.clone(),
-    )
-}
-
 fn print_backfill_config(
     config_path: Option<PathBuf>,
     args: BackfillArgs,
@@ -1161,6 +1149,7 @@ impl From<BackfillArgs> for BackfillConfigOverrides {
             allow_near_tip_finalize: args.allow_near_tip_finalize.then_some(true),
             checkpoint_height: args.checkpoint_height,
             wallet_serving: args.wallet_serving.then_some(true),
+            ops_listen_addr: None,
         }
     }
 }
@@ -1182,7 +1171,8 @@ impl From<TipFollowArgs> for TipFollowConfigOverrides {
             poll_interval_ms: args.poll_interval_ms,
             lag_threshold_blocks: args.lag_threshold_blocks,
             ingest_control_listen_addr: args.ingest_control_listen_addr,
-            ingest_control_token_path: args.ingest_control_token_path,
+            ingest_control_bearer_token_path: args.ingest_control_token_path,
+            ops_listen_addr: None,
         }
     }
 }

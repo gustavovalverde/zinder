@@ -51,7 +51,7 @@ Required readiness causes:
 - `schema_mismatch` — Zinder's expected schema version differs from the persisted store's schema fingerprint
 - `reorg_window_exceeded` — the selected branch requires replacing data outside the configured reorg window; operator action required
 - `replica_lagging` — a `zinder-query` or `zinder-compat-lightwalletd` secondary RocksDB reader is behind the writer by more than `secondary_replica_lag_threshold_chain_epochs` (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)); reads still serve from the last replayed state. Usually self-heals within one catchup interval; persistent lag indicates the writer is offline or under load
-- `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `storage.ingest_control_addr` and the ingest-control listener
+- `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `ingest_control.addr` and the ingest-control listener
 - `cursor_at_risk` — chain-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
 - `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0007 §Retention windows](../adrs/0007-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
 - `mempool_source_unavailable` — the mempool source stream cannot be opened or has emitted `MempoolStreamUnavailable`; the live `MempoolIndex` keeps the last known state but no new `Added`/`Invalidated`/`Mined` events are arriving. Operators check upstream node health and the indexer port (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for streaming, `getrawmempool` reachability for polling)
@@ -301,7 +301,7 @@ as backfill, plus a mode-specific `[tip_follow]` section:
 reorg_window_blocks = 100
 commit_batch_blocks = 1
 
-[ingest.control]
+[ingest_control]
 listen_addr = "127.0.0.1:9100"
 
 [tip_follow]
@@ -422,18 +422,18 @@ chooses one of three deployment patterns:
    travels in the proxied request. This is the same pattern
    `zinder-compat-lightwalletd` uses for public wallet traffic.
 
-The bearer token is configured by `[ingest.control] token_path` on the
-writer and `[storage] ingest_control_token_path` on every reader. The token
-is loaded from a file at startup, validated server-side with constant-time
-comparison, redacted from all logs and `--print-config` output, and never
-sourced from environment variables (env vars leak into process listings
-and debugger snapshots). Rotation requires updating the file on every host
-and restarting each process. With no token configured, the writer accepts
-every request, which is correct for pattern 1 and an explicit operator
-choice for the others.
+The bearer token is configured by `[ingest_control] bearer_token_path` on
+every process; the writer reads the file to verify and every reader reads
+the same file to present. The token is loaded at startup, validated
+server-side with constant-time comparison, redacted from all logs and
+`--print-config` output, and never sourced from environment variables (env
+vars leak into process listings and debugger snapshots). Rotation requires
+updating the file on every host and restarting each process. With no token
+configured, the writer accepts every request, which is correct for pattern
+1 and an explicit operator choice for the others.
 
 Writer-status clients must make wrong-endpoint failures diagnosable. A
-secondary reader that reaches the wrong service on `storage.ingest_control_addr`
+secondary reader that reaches the wrong service on `ingest_control.addr`
 reports `writer_status_unavailable`, and logs should name the configured target
 and expected `zinder.v1.ingest.IngestControl/WriterStatus` RPC method rather
 than repeating a generic "unimplemented" warning without context.

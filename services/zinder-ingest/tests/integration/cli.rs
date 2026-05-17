@@ -121,7 +121,7 @@ fn tip_follow_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[tip_follow]"));
     assert!(stdout.contains("reorg_window_blocks = 12"));
     assert!(stdout.contains("poll_interval_ms = 250"));
-    assert!(stdout.contains("[ingest.control]"));
+    assert!(stdout.contains("[ingest_control]"));
     assert!(stdout.contains("listen_addr = \"127.0.0.1:9100\""));
     assert!(stdout.contains("password = \"[REDACTED]\""));
     assert!(!stdout.contains("file-secret"));

@@ -21,10 +21,12 @@
 
 mod auth;
 mod config;
+mod env_diagnostics;
 mod env_var_docs;
 mod metrics;
 mod ops_endpoint;
 mod readiness;
+mod sections;
 mod startup_phase;
 
 pub use auth::{
@@ -33,7 +35,8 @@ pub use auth::{
 };
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeToml,
-    duration_as_millis_u64, require_field, zinder_environment_source,
+    ZinderEnvironmentSource, duration_as_millis_u64, load_bearer_token, parse_socket_addr,
+    require_field, zinder_environment_source, zinder_environment_source_from_map,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
@@ -42,9 +45,19 @@ pub use env_var_docs::{
 pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
+    spawn_ops_endpoint_for,
 };
 pub use readiness::{
     NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
+};
+pub use sections::{
+    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
+    PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlReader,
+    ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
+    ResolvedSecondaryStorage, RetentionSection, RetentionToml, SecondaryStorageSection,
+    SecondaryStorageToml, ServiceIdentifier, defaults as section_defaults,
+    resolve_ingest_control_reader, resolve_ingest_control_writer, resolve_ops_listen_addr,
+    resolve_primary_storage, resolve_retention, resolve_secondary_storage,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 

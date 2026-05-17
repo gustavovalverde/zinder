@@ -1,6 +1,6 @@
 //! Configuration loading for the `zinder-ingest` command.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,8 +10,12 @@ use zinder_ingest::{
     IngestError, MempoolEventRetentionWorkerConfig, NodeSourceKind, TipFollowConfig,
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    NodeToml, duration_as_millis_u64, require_field,
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
+    IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
+    PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
+    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, duration_as_millis_u64,
+    require_field, resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
+    resolve_retention,
 };
 use zinder_store::MempoolEventRetentionConfig;
 
@@ -24,16 +28,6 @@ const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
 const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
-const DEFAULT_INGEST_CONTROL_LISTEN_ADDR: &str = "127.0.0.1:9100";
-const DEFAULT_CHAIN_EVENT_RETENTION_HOURS: u64 = 168;
-const DEFAULT_CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 60_000;
-const DEFAULT_CURSOR_AT_RISK_WARNING_HOURS: u64 = 24;
-const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
-const DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS: u64 = 24;
-const DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 30_000;
-// Default warning fires at 80% of the shorter retention window.
-// 20% of `DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES` (60) is 12 minutes.
-const DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES: u64 = 12;
 
 /// Fully loaded command configuration for `zinder-ingest backfill`.
 #[derive(Debug)]
@@ -50,10 +44,12 @@ pub(crate) struct BackfillCommandConfig {
     /// Optional `IngestControl` gRPC listen address. When set, the backfill writer binds
     /// the control endpoint at start so colocated readers can connect immediately, even
     /// while a long cold-resume scan is in progress. Defaults to the same socket
-    /// `tip-follow` uses (`DEFAULT_INGEST_CONTROL_LISTEN_ADDR`); set
-    /// `ingest.control.listen_addr = ""` in the backfill TOML to disable.
+    /// `tip-follow` uses; set `ingest_control.listen_addr = ""` in the backfill TOML
+    /// to disable.
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
+    pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
+    pub(crate) ops_listen_addr: Option<SocketAddr>,
 }
 
 impl BackfillCommandConfig {
@@ -111,10 +107,31 @@ impl BackfillCoverage {
 pub(crate) struct TipFollowCommandConfig {
     pub(crate) tip_follow: TipFollowConfig,
     pub(crate) ingest_control_listen_addr: SocketAddr,
-    pub(crate) ingest_control_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
-    pub(crate) chain_event_retention: ChainEventRetentionConfig,
-    pub(crate) mempool_event_retention: MempoolEventRetentionWorkerConfig,
+    pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) retention: ResolvedRetention,
+}
+
+impl TipFollowCommandConfig {
+    pub(crate) fn chain_event_retention(&self) -> ChainEventRetentionConfig {
+        ChainEventRetentionConfig {
+            retention_window: self.retention.chain_event_window(),
+            check_interval: self.retention.chain_event_check_interval(),
+            cursor_at_risk_warning: self.retention.cursor_at_risk_warning(),
+        }
+    }
+
+    pub(crate) fn mempool_event_retention(&self) -> MempoolEventRetentionWorkerConfig {
+        MempoolEventRetentionWorkerConfig {
+            retention: MempoolEventRetentionConfig::new(
+                self.retention.mempool_mined_window(),
+                self.retention.mempool_invalidated_window(),
+            ),
+            check_interval: self.retention.mempool_check_interval(),
+            cursor_at_risk_warning: self.retention.mempool_cursor_at_risk_warning(),
+        }
+    }
 }
 
 /// Fully loaded command configuration for `zinder-ingest backup`.
@@ -143,6 +160,7 @@ pub(crate) struct BackfillConfigOverrides {
     pub(crate) allow_near_tip_finalize: Option<bool>,
     pub(crate) checkpoint_height: Option<u32>,
     pub(crate) wallet_serving: Option<bool>,
+    pub(crate) ops_listen_addr: Option<SocketAddr>,
 }
 
 /// Command-line overrides for the tip-follow command.
@@ -162,7 +180,8 @@ pub(crate) struct TipFollowConfigOverrides {
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
-    pub(crate) ingest_control_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
+    pub(crate) ops_listen_addr: Option<SocketAddr>,
 }
 
 /// Command-line overrides for the backup command.
@@ -219,6 +238,7 @@ pub(crate) fn load_backfill_config(
             "backfill.allow_near_tip_finalize",
             DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
         )?
+        .with_ops_section(ServiceIdentifier::Ingest)?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -243,6 +263,10 @@ pub(crate) fn load_backfill_config(
             (overrides.wallet_serving == Some(true))
                 .then_some(BackfillCoverage::WalletServing.as_kebab_case()),
         )?
+        .with_override_if(
+            "ops.listen_addr",
+            overrides.ops_listen_addr.map(|addr| addr.to_string()),
+        )?
         .load()?;
 
     resolve_backfill_config(raw_config)
@@ -264,34 +288,7 @@ pub(crate) fn load_tip_follow_config(
             "tip_follow.lag_threshold_blocks",
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
         )?
-        .with_default(
-            "ingest.retention.chain_event_retention_hours",
-            DEFAULT_CHAIN_EVENT_RETENTION_HOURS,
-        )?
-        .with_default(
-            "ingest.retention.chain_event_retention_check_interval_ms",
-            DEFAULT_CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS,
-        )?
-        .with_default(
-            "ingest.retention.cursor_at_risk_warning_hours",
-            DEFAULT_CURSOR_AT_RISK_WARNING_HOURS,
-        )?
-        .with_default(
-            "ingest.retention.mempool_mined_retention_minutes",
-            DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES,
-        )?
-        .with_default(
-            "ingest.retention.mempool_invalidated_retention_hours",
-            DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS,
-        )?
-        .with_default(
-            "ingest.retention.mempool_event_retention_check_interval_ms",
-            DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS,
-        )?
-        .with_default(
-            "ingest.retention.mempool_cursor_at_risk_warning_minutes",
-            DEFAULT_MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES,
-        )?
+        .with_ops_section(ServiceIdentifier::Ingest)?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -311,14 +308,18 @@ pub(crate) fn load_tip_follow_config(
             overrides.lag_threshold_blocks,
         )?
         .with_override_if(
-            "ingest.control.listen_addr",
+            "ingest_control.listen_addr",
             overrides
                 .ingest_control_listen_addr
                 .map(|addr| addr.to_string()),
         )?
         .with_override_path_if(
-            "ingest.control.token_path",
-            overrides.ingest_control_token_path,
+            "ingest_control.bearer_token_path",
+            overrides.ingest_control_bearer_token_path,
+        )?
+        .with_override_if(
+            "ops.listen_addr",
+            overrides.ops_listen_addr.map(|addr| addr.to_string()),
         )?
         .load()?;
 
@@ -372,9 +373,12 @@ pub(crate) fn redacted_backup_config_toml(
 #[serde(default, deny_unknown_fields)]
 struct IngestConfig {
     network: NetworkSection,
+    ops: OpsSection,
     node: IngestNodeConfig,
-    storage: StorageConfig,
+    storage: PrimaryStorageSection,
     ingest: IngestSectionConfig,
+    ingest_control: IngestControlSection,
+    retention: RetentionSection,
     backfill: BackfillSectionConfig,
     tip_follow: TipFollowSectionConfig,
     backup: BackupSectionConfig,
@@ -405,36 +409,9 @@ impl IngestNodeConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct StorageConfig {
-    path: Option<PathBuf>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
 struct IngestSectionConfig {
     reorg_window_blocks: Option<u32>,
     commit_batch_blocks: Option<u32>,
-    control: IngestControlSectionConfig,
-    retention: IngestRetentionSectionConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestControlSectionConfig {
-    listen_addr: Option<String>,
-    token_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestRetentionSectionConfig {
-    chain_event_retention_hours: Option<u64>,
-    chain_event_retention_check_interval_ms: Option<u64>,
-    cursor_at_risk_warning_hours: Option<u64>,
-    mempool_mined_retention_minutes: Option<u64>,
-    mempool_invalidated_retention_hours: Option<u64>,
-    mempool_event_retention_check_interval_ms: Option<u64>,
-    mempool_cursor_at_risk_warning_minutes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -471,10 +448,7 @@ fn resolve_backfill_config(
 ) -> Result<BackfillCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
     let node_source_text = require_field(config.node.source.clone(), "node.source")?;
-    let storage_path = config
-        .storage
-        .path
-        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
+    let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
     let coverage = config
         .backfill
         .coverage
@@ -505,32 +479,12 @@ fn resolve_backfill_config(
         .into());
     }
     let node_source = parse_node_source(&node_source_text)?;
-    let ingest_control_listen_addr_raw = config
-        .ingest
-        .control
-        .listen_addr
-        .clone()
-        .unwrap_or_else(|| DEFAULT_INGEST_CONTROL_LISTEN_ADDR.to_owned());
-    let ingest_control_listen_addr = if ingest_control_listen_addr_raw.trim().is_empty() {
-        None
-    } else {
-        Some(
-            ingest_control_listen_addr_raw
-                .parse::<SocketAddr>()
-                .map_err(|source| {
-                    ConfigError::invalid(format!(
-                        "ingest.control.listen_addr {ingest_control_listen_addr_raw} is not a socket address: {source}"
-                    ))
-                })?,
-        )
-    };
-    let ingest_control_bearer_token = config
-        .ingest
-        .control
-        .token_path
-        .as_deref()
-        .map(BearerToken::from_file)
-        .transpose()?;
+    let ResolvedIngestControlWriter {
+        listen_addr: ingest_control_listen_addr,
+        bearer_token_path: ingest_control_bearer_token_path,
+        bearer_token: ingest_control_bearer_token,
+    } = resolve_ingest_control_writer(config.ingest_control)?;
+    let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let node_target =
         NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
 
@@ -545,7 +499,9 @@ fn resolve_backfill_config(
         checkpoint_height: config.backfill.checkpoint_height.map(BlockHeight::new),
         coverage,
         ingest_control_listen_addr,
+        ingest_control_bearer_token_path,
         ingest_control_bearer_token,
+        ops_listen_addr,
     })
 }
 
@@ -566,19 +522,12 @@ fn resolve_backfill_from_height(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Tip-follow config validation intentionally stays in one resolver so field dependencies and error ordering are auditable."
-)]
 fn resolve_tip_follow_config(
     config: IngestConfig,
 ) -> Result<TipFollowCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
     let node_source_text = require_field(config.node.source.clone(), "node.source")?;
-    let storage_path = config
-        .storage
-        .path
-        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
+    let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
         "ingest.reorg_window_blocks",
@@ -595,93 +544,16 @@ fn resolve_tip_follow_config(
         config.tip_follow.lag_threshold_blocks,
         "tip_follow.lag_threshold_blocks",
     )?;
-    let ingest_control_listen_addr_string = config
-        .ingest
-        .control
-        .listen_addr
-        .unwrap_or_else(|| DEFAULT_INGEST_CONTROL_LISTEN_ADDR.to_owned());
-    let ingest_control_listen_addr =
-        ingest_control_listen_addr_string
-            .parse::<SocketAddr>()
-            .map_err(|source| {
-                ConfigError::invalid(format!(
-                    "ingest.control.listen_addr {ingest_control_listen_addr_string} is not a socket address: {source}"
-                ))
-            })?;
-    let ingest_control_token_path = config.ingest.control.token_path.clone();
-    let ingest_control_bearer_token = ingest_control_token_path
-        .as_deref()
-        .map(BearerToken::from_file)
-        .transpose()?;
-    let chain_event_retention_hours = require_field(
-        config.ingest.retention.chain_event_retention_hours,
-        "ingest.retention.chain_event_retention_hours",
-    )?;
-    let chain_event_retention_check_interval_ms = require_field(
-        config
-            .ingest
-            .retention
-            .chain_event_retention_check_interval_ms,
-        "ingest.retention.chain_event_retention_check_interval_ms",
-    )?;
-    let cursor_at_risk_warning_hours = require_field(
-        config.ingest.retention.cursor_at_risk_warning_hours,
-        "ingest.retention.cursor_at_risk_warning_hours",
-    )?;
-    let mempool_mined_retention_minutes = require_field(
-        config.ingest.retention.mempool_mined_retention_minutes,
-        "ingest.retention.mempool_mined_retention_minutes",
-    )?;
-    let mempool_invalidated_retention_hours = require_field(
-        config.ingest.retention.mempool_invalidated_retention_hours,
-        "ingest.retention.mempool_invalidated_retention_hours",
-    )?;
-    let mempool_event_retention_check_interval_ms = require_field(
-        config
-            .ingest
-            .retention
-            .mempool_event_retention_check_interval_ms,
-        "ingest.retention.mempool_event_retention_check_interval_ms",
-    )?;
-    let mempool_cursor_at_risk_warning_minutes = require_field(
-        config
-            .ingest
-            .retention
-            .mempool_cursor_at_risk_warning_minutes,
-        "ingest.retention.mempool_cursor_at_risk_warning_minutes",
-    )?;
-    if chain_event_retention_check_interval_ms == 0 {
-        return Err(ConfigError::invalid(
-            "ingest.retention.chain_event_retention_check_interval_ms must be greater than zero",
-        )
-        .into());
-    }
-    if mempool_event_retention_check_interval_ms == 0 {
-        return Err(ConfigError::invalid(
-            "ingest.retention.mempool_event_retention_check_interval_ms must be greater than zero",
-        )
-        .into());
-    }
-    if chain_event_retention_hours > 0 && cursor_at_risk_warning_hours > chain_event_retention_hours
-    {
-        return Err(ConfigError::invalid(
-            "ingest.retention.cursor_at_risk_warning_hours must be less than or equal to ingest.retention.chain_event_retention_hours",
-        )
-        .into());
-    }
-    let shortest_mempool_window_minutes = shortest_mempool_window_minutes_from(
-        mempool_mined_retention_minutes,
-        mempool_invalidated_retention_hours,
-    );
-    if let Some(shortest) = shortest_mempool_window_minutes
-        && mempool_cursor_at_risk_warning_minutes > shortest
-    {
-        return Err(ConfigError::invalid(
-            "ingest.retention.mempool_cursor_at_risk_warning_minutes must be less than or equal to the shortest configured mempool retention window",
-        )
-        .into());
-    }
+    let ResolvedIngestControlWriter {
+        listen_addr: ingest_control_listen_addr_opt,
+        bearer_token_path: ingest_control_bearer_token_path,
+        bearer_token: ingest_control_bearer_token,
+    } = resolve_ingest_control_writer(config.ingest_control)?;
+    let ingest_control_listen_addr = ingest_control_listen_addr_opt
+        .ok_or_else(|| ConfigError::missing_field("ingest_control.listen_addr"))?;
+    let retention = resolve_retention(config.retention)?;
     let node_source = parse_node_source(&node_source_text)?;
+    let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let node_target =
         NodeTarget::resolve(network, config.node.into_node_section()).map_err(ConfigError::from)?;
 
@@ -696,35 +568,11 @@ fn resolve_tip_follow_config(
             lag_threshold_blocks,
         },
         ingest_control_listen_addr,
-        ingest_control_token_path,
+        ingest_control_bearer_token_path,
         ingest_control_bearer_token,
-        chain_event_retention: ChainEventRetentionConfig {
-            retention_window: (chain_event_retention_hours > 0)
-                .then(|| Duration::from_hours(chain_event_retention_hours)),
-            check_interval: Duration::from_millis(chain_event_retention_check_interval_ms),
-            cursor_at_risk_warning: Duration::from_hours(cursor_at_risk_warning_hours),
-        },
-        mempool_event_retention: MempoolEventRetentionWorkerConfig {
-            retention: MempoolEventRetentionConfig::new(
-                (mempool_mined_retention_minutes > 0)
-                    .then(|| Duration::from_mins(mempool_mined_retention_minutes)),
-                (mempool_invalidated_retention_hours > 0)
-                    .then(|| Duration::from_hours(mempool_invalidated_retention_hours)),
-            ),
-            check_interval: Duration::from_millis(mempool_event_retention_check_interval_ms),
-            cursor_at_risk_warning: Duration::from_mins(mempool_cursor_at_risk_warning_minutes),
-        },
+        ops_listen_addr,
+        retention,
     })
-}
-
-fn shortest_mempool_window_minutes_from(mined_minutes: u64, invalidated_hours: u64) -> Option<u64> {
-    let mined = (mined_minutes > 0).then_some(mined_minutes);
-    let invalidated = (invalidated_hours > 0).then_some(invalidated_hours.saturating_mul(60));
-    match (mined, invalidated) {
-        (Some(mined), Some(invalidated)) => Some(mined.min(invalidated)),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
 }
 
 fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
@@ -748,25 +596,31 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
 #[derive(Serialize)]
 struct RedactedBackfillConfigToml {
     network: NetworkToml,
+    ops: OpsToml,
     node: IngestNodeToml,
-    storage: StorageToml,
+    storage: PrimaryStorageToml,
     ingest: IngestToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingest_control: Option<IngestControlWriterToml>,
     backfill: BackfillToml,
 }
 
 #[derive(Serialize)]
 struct RedactedTipFollowConfigToml {
     network: NetworkToml,
+    ops: OpsToml,
     node: IngestNodeToml,
-    storage: StorageToml,
+    storage: PrimaryStorageToml,
     ingest: IngestToml,
+    ingest_control: IngestControlWriterToml,
+    retention: RetentionToml,
     tip_follow: TipFollowToml,
 }
 
 #[derive(Serialize)]
 struct RedactedBackupConfigToml {
     network: NetworkToml,
-    storage: StorageToml,
+    storage: PrimaryStorageToml,
     backup: BackupToml,
 }
 
@@ -788,18 +642,24 @@ impl IngestNodeToml {
 
 impl RedactedBackfillConfigToml {
     fn from_backfill_config(config: &BackfillCommandConfig) -> Self {
+        let ingest_control = config.ingest_control_listen_addr.map(|listen_addr| {
+            IngestControlWriterToml::from_resolved(
+                Some(listen_addr),
+                config.ingest_control_bearer_token_path.as_deref(),
+            )
+        });
         Self {
             network: NetworkToml::from_network(config.node.network),
+            ops: OpsToml::from_resolved(config.ops_listen_addr),
             node: IngestNodeToml::from_target(config.node_source, &config.node),
-            storage: StorageToml {
+            storage: PrimaryStorageToml {
                 path: config.storage_path.display().to_string(),
             },
             ingest: IngestToml {
                 reorg_window_blocks: None,
                 commit_batch_blocks: config.commit_batch_blocks.get(),
-                control: None,
-                retention: None,
             },
+            ingest_control,
             backfill: BackfillToml {
                 from_height: if matches!(config.coverage, BackfillCoverage::Explicit) {
                     config.from_height.map(BlockHeight::value)
@@ -819,28 +679,23 @@ impl RedactedTipFollowConfigToml {
     fn from_tip_follow_config(config: &TipFollowCommandConfig) -> Self {
         Self {
             network: NetworkToml::from_network(config.tip_follow.node.network),
+            ops: OpsToml::from_resolved(config.ops_listen_addr),
             node: IngestNodeToml::from_target(
                 config.tip_follow.node_source,
                 &config.tip_follow.node,
             ),
-            storage: StorageToml {
+            storage: PrimaryStorageToml {
                 path: config.tip_follow.storage_path.display().to_string(),
             },
             ingest: IngestToml {
                 reorg_window_blocks: Some(config.tip_follow.reorg_window_blocks),
                 commit_batch_blocks: config.tip_follow.commit_batch_blocks.get(),
-                control: Some(IngestControlToml {
-                    listen_addr: config.ingest_control_listen_addr.to_string(),
-                    token_path: config
-                        .ingest_control_token_path
-                        .as_ref()
-                        .map(|path| path.display().to_string()),
-                }),
-                retention: Some(IngestRetentionToml::from_retention(
-                    config.chain_event_retention,
-                    config.mempool_event_retention,
-                )),
             },
+            ingest_control: IngestControlWriterToml::from_resolved(
+                Some(config.ingest_control_listen_addr),
+                config.ingest_control_bearer_token_path.as_deref(),
+            ),
+            retention: RetentionToml::from_resolved(config.retention),
             tip_follow: TipFollowToml {
                 poll_interval_ms: duration_as_millis_u64(config.tip_follow.poll_interval),
                 lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
@@ -853,7 +708,7 @@ impl RedactedBackupConfigToml {
     fn from_backup_config(config: &BackupCommandConfig) -> Self {
         Self {
             network: NetworkToml::from_network(config.network),
-            storage: StorageToml {
+            storage: PrimaryStorageToml {
                 path: config.storage_path.display().to_string(),
             },
             backup: BackupToml {
@@ -864,64 +719,10 @@ impl RedactedBackupConfigToml {
 }
 
 #[derive(Serialize)]
-struct StorageToml {
-    path: String,
-}
-
-#[derive(Serialize)]
 struct IngestToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     reorg_window_blocks: Option<u32>,
     commit_batch_blocks: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    control: Option<IngestControlToml>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retention: Option<IngestRetentionToml>,
-}
-
-#[derive(Serialize)]
-struct IngestControlToml {
-    listen_addr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_path: Option<String>,
-}
-
-#[derive(Serialize)]
-struct IngestRetentionToml {
-    chain_event_retention_hours: u64,
-    chain_event_retention_check_interval_ms: u64,
-    cursor_at_risk_warning_hours: u64,
-    mempool_mined_retention_minutes: u64,
-    mempool_invalidated_retention_hours: u64,
-    mempool_event_retention_check_interval_ms: u64,
-    mempool_cursor_at_risk_warning_minutes: u64,
-}
-
-impl IngestRetentionToml {
-    fn from_retention(
-        chain: ChainEventRetentionConfig,
-        mempool: MempoolEventRetentionWorkerConfig,
-    ) -> Self {
-        Self {
-            chain_event_retention_hours: chain.retention_window.map_or(0, duration_hours),
-            chain_event_retention_check_interval_ms: duration_as_millis_u64(chain.check_interval),
-            cursor_at_risk_warning_hours: duration_hours(chain.cursor_at_risk_warning),
-            mempool_mined_retention_minutes: mempool
-                .retention
-                .mined_retention
-                .map_or(0, duration_minutes),
-            mempool_invalidated_retention_hours: mempool
-                .retention
-                .invalidated_retention
-                .map_or(0, duration_hours),
-            mempool_event_retention_check_interval_ms: duration_as_millis_u64(
-                mempool.check_interval,
-            ),
-            mempool_cursor_at_risk_warning_minutes: duration_minutes(
-                mempool.cursor_at_risk_warning,
-            ),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -944,12 +745,4 @@ struct TipFollowToml {
 #[derive(Serialize)]
 struct BackupToml {
     to_path: String,
-}
-
-fn duration_hours(duration: Duration) -> u64 {
-    duration.as_secs() / 3_600
-}
-
-fn duration_minutes(duration: Duration) -> u64 {
-    duration.as_secs() / 60
 }

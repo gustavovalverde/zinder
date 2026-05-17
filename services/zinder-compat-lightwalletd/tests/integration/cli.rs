@@ -39,8 +39,9 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         )),
         "{stdout}"
     );
+    assert!(stdout.contains("[ingest_control]"), "{stdout}");
     assert!(
-        stdout.contains("ingest_control_addr = \"http://127.0.0.1:9100\""),
+        stdout.contains("addr = \"http://127.0.0.1:9100\""),
         "{stdout}"
     );
     assert!(!stderr.contains("ERROR"), "{stderr}");

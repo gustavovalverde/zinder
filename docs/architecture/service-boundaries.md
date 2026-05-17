@@ -65,12 +65,12 @@ Minimum production deployment (per [ADR-0003](../adrs/0003-canonical-storage-acc
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
-                           -> IngestControl.WriterStatus / ChainEvents -> [ingest.control] gRPC
+                           -> IngestControl.WriterStatus / ChainEvents -> [ingest_control] gRPC
 zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
-                           -> replica lag via storage.ingest_control_addr
+                           -> replica lag via ingest_control.addr
                            -> proxy subscriptions to the private ingest-control endpoint
 zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
-                           -> replica lag via storage.ingest_control_addr
+                           -> replica lag via ingest_control.addr
                            -> proxy only subscription-like RPCs present in CompactTxStreamer
                            -> CompactTxStreamer
 ```

@@ -9,15 +9,15 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    OpsServer, Readiness, StartupPhase, cancel_on_ctrl_c, install_tracing_subscriber,
-    spawn_ops_endpoint,
+    Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::SecondaryChainStore;
 
 mod config;
 
-use config::{LightwalletdConfig, LightwalletdConfigError, LightwalletdConfigOverrides};
+use config::{LightwalletdConfigError, LightwalletdConfigOverrides};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -100,7 +100,6 @@ async fn run_runtime(cli: Cli) -> ExitCode {
 async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
-    let ops_listen_addr = cli.ops_listen_addr;
     let lightwalletd_config = match config::load_lightwalletd_config(config_path, cli.into()) {
         Ok(cfg) => {
             load_config_phase.complete();
@@ -113,13 +112,18 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     };
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle =
-        ops_listen_addr.map(|listen_addr| spawn_ops(listen_addr, &lightwalletd_config, &readiness));
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::CompatLightwalletd,
+        lightwalletd_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(lightwalletd_config.network),
+        readiness.clone(),
+    );
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store = match SecondaryChainStore::open(
-        &lightwalletd_config.storage_path,
-        &lightwalletd_config.secondary_path,
+        &lightwalletd_config.storage.path,
+        &lightwalletd_config.storage.secondary_path,
         zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network),
     ) {
         Ok(handle) => {
@@ -200,8 +204,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         store,
         readiness.clone(),
         zinder_query::SecondaryCatchupOptions {
-            interval: lightwalletd_config.secondary_catchup_interval,
+            interval: lightwalletd_config.storage.secondary_catchup_interval,
             lag_threshold_chain_epochs: lightwalletd_config
+                .storage
                 .secondary_replica_lag_threshold_chain_epochs,
             writer_status: Some(zinder_query::WriterStatusConfig {
                 endpoint: lightwalletd_config.ingest_control_addr.clone(),
@@ -301,22 +306,6 @@ fn build_broadcaster(
     Ok(Some(source))
 }
 
-fn spawn_ops(
-    listen_addr: SocketAddr,
-    lightwalletd_config: &LightwalletdConfig,
-    readiness: &Readiness,
-) -> zinder_runtime::OpsEndpointHandle {
-    spawn_ops_endpoint(
-        listen_addr,
-        OpsServer {
-            service_name: "zinder-compat-lightwalletd",
-            service_version: env!("CARGO_PKG_VERSION"),
-            network_name: encode_zinder_native_chain_name(lightwalletd_config.network),
-        },
-        readiness.clone(),
-    )
-}
-
 fn emit_runtime_error(error: &LightwalletdConfigError) -> ExitCode {
     tracing::error!(
         target: "zinder::compat_lightwalletd",
@@ -334,8 +323,9 @@ impl From<Cli> for LightwalletdConfigOverrides {
             storage_path: cli.storage_path,
             secondary_path: cli.secondary_path,
             ingest_control_addr: cli.ingest_control_addr,
-            ingest_control_token_path: cli.ingest_control_token_path,
+            ingest_control_bearer_token_path: cli.ingest_control_token_path,
             listen_addr: cli.listen_addr,
+            ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
         }
     }

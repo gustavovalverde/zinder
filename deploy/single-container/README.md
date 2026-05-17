@@ -60,7 +60,7 @@ Set at least the following in each per-service config file (or override via `ZIN
   - `node.auth.method = "cookie"` + `node.auth.cookie` (inline credentials for PaaS environments without persistent disks)
   - `node.auth.method = "cookie"` + `node.auth.path` (file path)
 
-The reader additionally needs `storage.ingest_control_addr = "http://127.0.0.1:9100"` so it can reach the colocated writer.
+The reader additionally needs `ingest_control.addr = "http://127.0.0.1:9100"` so it can reach the colocated writer.
 
 ## Build
 

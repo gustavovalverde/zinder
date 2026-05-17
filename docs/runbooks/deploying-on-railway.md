@@ -69,8 +69,8 @@ Railway provides a UI for environment variables. Set:
 | `ZINDER_NODE__AUTH__COOKIE` | `user:cookie-content` | When `__METHOD=cookie` and the secret is inline |
 | `ZINDER_NODE__AUTH__USERNAME` | `zebra` | When `__METHOD=basic` |
 | `ZINDER_NODE__AUTH__PASSWORD` | `your-zebra-password` | When `__METHOD=basic` |
-| `ZINDER_INGEST__CONTROL__LISTEN_ADDR` | `127.0.0.1:9100` | Internal-only |
-| `ZINDER_STORAGE__INGEST_CONTROL_ADDR` | `http://127.0.0.1:9100` | Reader points at colocated writer |
+| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | `127.0.0.1:9100` | Internal-only |
+| `ZINDER_INGEST_CONTROL__ADDR` | `http://127.0.0.1:9100` | Reader points at colocated writer |
 
 The single-container image accepts the cookie content inline through `ZINDER_NODE__AUTH__COOKIE`; you do not need an entrypoint shim that materializes a cookie file.
 
@@ -147,7 +147,7 @@ For pinned-tag deploys, change the image tag back to the prior version and redep
 | `/readyz` stays `node_unavailable` | Zebra not reachable from Railway | Ensure the Zebra service is in the same Railway project, or that the public endpoint resolves from Railway egress IPs |
 | `/readyz` is `node_capability_missing` | Zebra too old | Upgrade Zebra to the version pinned in this Zinder release |
 | Logs show `outcome=aborted` (no explicit complete/fail) | A startup phase panicked | Inspect the prior log line for the panic reason; file an issue |
-| Volume fills | Retention windows are tuned for high-availability | Reduce `chain_event_retention_hours` in `[ingest.retention]` |
+| Volume fills | Retention windows are tuned for high-availability | Reduce `chain_event_retention_hours` in `[retention]` |
 | gRPC traffic returns "HTTP/2 not supported" | Railway routing not configured for gRPC | Enable HTTP/2 on the public endpoint in the networking tab |
 
 ## References

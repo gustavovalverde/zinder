@@ -323,7 +323,7 @@ path = "/var/lib/zinder/store"
 reorg_window_blocks = 100
 commit_batch_blocks = 100
 
-[ingest.control]
+[ingest_control]
 listen_addr = "127.0.0.1:9100"
 
 [tip_follow]
@@ -352,7 +352,9 @@ password = "REPLACE_VIA_ENV"
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
-ingest_control_addr = "http://127.0.0.1:9100"
+
+[ingest_control]
+addr = "http://127.0.0.1:9100"
 
 [query]
 listen_addr = "0.0.0.0:9101"

@@ -16,6 +16,10 @@
 [network]
 name = "zcash-testnet"
 
+[ops]
+# Per-service default `127.0.0.1:9105`; set to "" to disable the endpoint.
+listen_addr = "127.0.0.1:9105"
+
 [node]
 source = "zebra-json-rpc"
 json_rpc_addr = "http://zebra:8232"
@@ -32,8 +36,17 @@ path = "/var/lib/zinder/store"
 reorg_window_blocks = 100
 commit_batch_blocks = 1000
 
-[ingest.control]
+[ingest_control]
 listen_addr = "127.0.0.1:9100"
+
+[retention]
+chain_event_retention_hours = 168
+chain_event_retention_check_interval_ms = 60000
+cursor_at_risk_warning_hours = 24
+mempool_mined_retention_minutes = 60
+mempool_invalidated_retention_hours = 24
+mempool_event_retention_check_interval_ms = 30000
+mempool_cursor_at_risk_warning_minutes = 12
 
 [tip_follow]
 poll_interval_ms = 2000
