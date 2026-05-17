@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+# observability-smoke: runs Zinder binaries against a local Zebra to exercise
+# the observability stack (Prometheus + Grafana + scrape pipeline).
+#
+# Defaults assume a regtest Zebra at 127.0.0.1:39232 with basic auth disabled.
+# To run against a Z3 testnet stack instead:
+#
+#   export ZINDER_OBSERVABILITY_NETWORK=zcash-testnet
+#   export ZINDER_OBSERVABILITY_NODE_ADDR=http://127.0.0.1:18232
+#   # Extract the cookie from Z3's shared volume into a host file:
+#   docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie \
+#     > "${ZINDER_OBSERVABILITY_WORK_DIR:-/tmp}/z3-testnet.cookie"
+#   export ZINDER_NODE__AUTH__METHOD=cookie
+#   export ZINDER_NODE__AUTH__PATH="${ZINDER_OBSERVABILITY_WORK_DIR:-/tmp}/z3-testnet.cookie"
+#   ./scripts/observability-smoke.sh
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

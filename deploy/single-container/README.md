@@ -54,11 +54,11 @@ A single named Docker volume covering `/var/lib/zinder` is the simplest layout. 
 Set at least the following in each per-service config file (or override via `ZINDER_*` env vars; see [Public interfaces §Environment variable mapping](../../docs/architecture/public-interfaces.md#environment-variable-mapping)):
 
 - `network.name` (`zcash-mainnet`, `zcash-testnet`, `zcash-regtest`)
-- `node.json_rpc_addr` (e.g. `http://zebra:8232`)
+- `node.json_rpc_addr` — when attaching to a [Z3 stack](https://github.com/ZcashFoundation/z3) over its external Docker network, use `http://zebra:8232` (mainnet) or `http://zebra:18232` (testnet/regtest)
 - One of:
-  - `node.auth.method = "basic"` + `node.auth.username` + `node.auth.password`
+  - `node.auth.method = "cookie"` + `node.auth.path = "/var/run/auth/.cookie"` (recommended when attaching to Z3; mount the `z3-<network>-cookie` volume read-only)
   - `node.auth.method = "cookie"` + `node.auth.cookie` (inline credentials for PaaS environments without persistent disks)
-  - `node.auth.method = "cookie"` + `node.auth.path` (file path)
+  - `node.auth.method = "basic"` + `node.auth.username` + `node.auth.password` (only when the Zebra you target doesn't support cookie auth)
 
 The reader additionally needs `ingest_control.addr = "http://127.0.0.1:9100"` so it can reach the colocated writer.
 
@@ -69,6 +69,26 @@ docker build -f deploy/single-container/Dockerfile -t zinder-single-container .
 ```
 
 ## Run
+
+Attached to a running Z3 stack (recommended):
+
+```bash
+docker run --rm -d \
+  --name zinder \
+  --network z3-testnet \
+  -p 9101:9101 \
+  -p 9106:9106 \
+  -v zinder-data:/var/lib/zinder \
+  -v z3-testnet-cookie:/var/run/auth:ro \
+  -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
+  -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
+  -e ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
+  -e ZINDER_NODE__AUTH__METHOD=cookie \
+  -e ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie \
+  zinder-single-container
+```
+
+Standalone (legacy, against a non-Z3 Zebra):
 
 ```bash
 docker run --rm -d \

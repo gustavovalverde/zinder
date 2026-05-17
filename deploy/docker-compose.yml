@@ -6,32 +6,106 @@
 # use the single-container image when you want one process tree, this
 # Compose file when you want two containers with separate restart policies.
 
+# Per-network project name so the stack sits visually adjacent to its
+# Z3 binding in `docker compose ls` (zinder-testnet next to z3-testnet,
+# zinder-mainnet next to z3-mainnet). Without this, Compose defaults the
+# project name to the directory name (`deploy`), which is non-discoverable
+# and prone to collide across repos.
+name: zinder-${Z3_NETWORK_LOWER:-testnet}
+#
+# Zcash upstream dependency
+# -------------------------
+# Zinder reads chain data from a Zebra full node. This compose attaches to
+# a running Z3 stack via Z3's published platform contract:
+# https://github.com/ZcashFoundation/z3 (docs/contract.md). Bring up Z3
+# first; then bring up zinder.
+#
+# Use the per-network env helpers (recommended):
+#
+#   docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
+#   docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+#
+# Each helper sets Z3_NETWORK_LOWER (picks the z3-<network> external network
+# and z3-<network>-cookie volume), ZINDER_NETWORK__NAME, and the Zebra
+# JSON-RPC + indexer ports for that network. The defaults below match testnet
+# so the file remains usable without --env-file.
+
+networks:
+  z3:
+    external: true
+    name: z3-${Z3_NETWORK_LOWER:-testnet}
+  zinder-observability:
+    name: zinder-observability
+
 services:
-  zinder-ingest:
+  # One-shot bulk catch-up. Runs before zinder-ingest so the writer doesn't
+  # spend days draining a multi-million-block backlog one block per poll
+  # cycle. Re-runs are idempotent: backfill exits `AlreadyComplete` when the
+  # target range is already covered.
+  zinder-ingest-backfill:
+    image: zinder-ingest:latest
     build:
       context: ..
       dockerfile: services/zinder-ingest/Dockerfile
-    image: zinder-ingest:latest
-    container_name: zinder-ingest
-    restart: on-failure
+    container_name: zinder-ingest-backfill
+    restart: "no"
+    networks: [z3]
     volumes:
       - zinder-data:/var/lib/zinder
       - ./config/ingest.toml:/etc/zinder/config.toml:ro
+      - z3-cookie:/var/run/auth:ro
+      - ./bootstrap-backfill.sh:/usr/local/bin/bootstrap-backfill.sh:ro
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:18230}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      # Provide exactly one of ZINDER_NODE__AUTH__COOKIE or __PATH.
-      ZINDER_NODE__AUTH__COOKIE: ${ZINDER_NODE__AUTH__COOKIE:-}
-      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-}
-      ZINDER_NODE__AUTH__USERNAME: ${ZINDER_NODE__AUTH__USERNAME:-}
-      ZINDER_NODE__AUTH__PASSWORD: ${ZINDER_NODE__AUTH__PASSWORD:-}
+      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
+      BACKFILL_TIP_OFFSET: ${BACKFILL_TIP_OFFSET:-100}
+    entrypoint: ["/bin/sh"]
+    command: ["/usr/local/bin/bootstrap-backfill.sh"]
+    # The one-shot inherits the writer's healthcheck from the image, which is
+    # meaningless here (the readiness contract belongs to long-lived services).
+    # `service_completed_successfully` already gates downstream on exit 0.
+    healthcheck:
+      disable: true
+
+  zinder-ingest:
+    image: zinder-ingest:latest
+    build:
+      context: ..
+      dockerfile: services/zinder-ingest/Dockerfile
+    container_name: zinder-ingest
+    restart: on-failure
+    depends_on:
+      zinder-ingest-backfill:
+        condition: service_completed_successfully
+    networks: [z3, zinder-observability]
+    volumes:
+      - zinder-data:/var/lib/zinder
+      - ./config/ingest.toml:/etc/zinder/config.toml:ro
+      - z3-cookie:/var/run/auth:ro
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      # Default to Z3's in-network Zebra DNS name and per-network ports.
+      # Override these if attaching to a Zebra elsewhere or running mainnet.
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:18230}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
+      # Operators switching to basic auth export ZINDER_NODE__AUTH__METHOD=basic
+      # plus ZINDER_NODE__AUTH__USERNAME/PASSWORD (or AUTH__COOKIE for an
+      # inline cookie). Empty values aren't safe to emit alongside cookie auth;
+      # the validator treats an empty username as "set" and rejects the mix.
     ports:
       # ingest-control is internal-only; do not publish externally.
       - "127.0.0.1:9100:9100"
       - "127.0.0.1:9105:9105"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9105/readyz"]
+      # /healthz reports process liveness; /readyz reports sync progress
+      # (404 / 503 until caught up). Pinning the container healthcheck to
+      # /readyz would block dependent services for the full initial sync.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9105/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 60s
@@ -47,22 +121,90 @@ services:
     depends_on:
       zinder-ingest:
         condition: service_healthy
+    networks: [z3, zinder-observability]
     volumes:
       - zinder-data:/var/lib/zinder
       - ./config/query.toml:/etc/zinder/config.toml:ro
+      - z3-cookie:/var/run/auth:ro
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
-      ZINDER_INGEST_CONTROL__ADDR: http://zinder-ingest:9100
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
+      # Reader dials the writer's IngestControl gRPC; defaults match the
+      # in-network DNS name and port the writer publishes.
+      ZINDER_INGEST_CONTROL__ADDR: ${ZINDER_INGEST_CONTROL__ADDR:-http://zinder-ingest:9100}
     ports:
       - "9101:9101"
       - "127.0.0.1:9106:9106"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9106/readyz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9106/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 60s
       retries: 3
 
+  # Always-on metrics collection. Scrapes zinder-ingest:9105 + zinder-query:9106
+  # over the shared zinder-observability network. Survives every restart of
+  # the writer or reader. ADR: docs/architecture/upstream-platform-binding.md.
+  zinder-prometheus:
+    image: prom/prometheus:v3.2.0
+    container_name: zinder-prometheus
+    restart: unless-stopped
+    networks: [zinder-observability]
+    volumes:
+      - zinder-prometheus-data:/prometheus
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${ZINDER_PROMETHEUS_RETENTION:-30d}"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:${ZINDER_PROMETHEUS_PORT:-9095}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Operator-facing dashboards. Opt-in via `--profile observability` because
+  # many operators feed metrics to a sibling Grafana (Z3, Datadog, Grafana
+  # Cloud) and don't want a second one. The minimum is "metrics are always
+  # collected by zinder-prometheus"; Grafana is the visualization bonus.
+  zinder-grafana:
+    image: grafana/grafana:11.5.1
+    container_name: zinder-grafana
+    restart: unless-stopped
+    profiles: [observability]
+    networks: [zinder-observability]
+    depends_on:
+      zinder-prometheus:
+        condition: service_healthy
+    volumes:
+      - zinder-grafana-data:/var/lib/grafana
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${ZINDER_GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: light
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/zinder-overview.json
+    ports:
+      - "127.0.0.1:${ZINDER_GRAFANA_PORT:-3002}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 volumes:
   zinder-data:
     name: zinder-data
+  zinder-prometheus-data:
+    name: zinder-prometheus-data
+  zinder-grafana-data:
+    name: zinder-grafana-data
+  z3-cookie:
+    external: true
+    name: z3-${Z3_NETWORK_LOWER:-testnet}-cookie

@@ -1,0 +1,30 @@
+# zinder-query config. Tracked example; safe to edit. Docker Compose
+# mounts this file at /etc/zinder/config.toml.
+#
+# Env vars from deploy/.env.<network> (loaded via `--env-file`) override
+# anything below.
+
+[network]
+name = "zcash-testnet"
+
+[node]
+json_rpc_addr = "http://zebra:18232"
+request_timeout_secs = 30
+
+[node.auth]
+method = "cookie"
+path = "/var/run/auth/.cookie"
+
+[storage]
+path = "/var/lib/zinder/store"
+secondary_path = "/var/lib/zinder/secondary"
+
+[ingest_control]
+addr = "http://zinder-ingest:9100"
+
+[query]
+listen_addr = "0.0.0.0:9101"
+
+[query.grpc]
+enable_reflection = true
+enable_health = true

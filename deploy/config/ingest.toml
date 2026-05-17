@@ -1,0 +1,32 @@
+# zinder-ingest config. Tracked example; safe to edit. Docker Compose
+# mounts this file at /etc/zinder/config.toml.
+#
+# Env vars from deploy/.env.<network> (loaded via `--env-file`) override
+# anything below. The defaults here target Z3 testnet and match what
+# `Z3_NETWORK_LOWER=testnet docker compose up` expects.
+
+[network]
+name = "zcash-testnet"
+
+[node]
+source = "zebra-json-rpc"
+json_rpc_addr = "http://zebra:18232"
+indexer_grpc_addr = "http://zebra:18230"
+request_timeout_secs = 30
+
+[node.auth]
+method = "cookie"
+path = "/var/run/auth/.cookie"
+
+[storage]
+path = "/var/lib/zinder/store"
+
+[ingest]
+reorg_window_blocks = 100
+commit_batch_blocks = 1000
+
+[ingest_control]
+listen_addr = "0.0.0.0:9100"
+
+[tip_follow]
+poll_interval_ms = 2000

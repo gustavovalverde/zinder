@@ -1,33 +1,35 @@
-# Reference `zinder-ingest tip-follow` configuration for the single-container
-# image (mounted at /etc/zinder/ingest.toml).
+# Reference `zinder-ingest tip-follow` configuration (mounted at
+# /etc/zinder/config.toml in the single-container image).
 #
 # Each binary strict-parses its own TOML schema (deny_unknown_fields), so the
-# writer and reader live in separate files. Secrets prefer PaaS-injected env
-# vars:
+# writer and reader live in separate files. When attaching to a Z3 stack
+# (https://github.com/ZcashFoundation/z3) via the published platform
+# contract, prefer the mounted-cookie path (no secrets to inject by hand):
 #
-#   ZINDER_NODE__AUTH__METHOD=cookie
-#   ZINDER_NODE__AUTH__COOKIE=<cookie-content>
+#   docker run \
+#     --network z3-testnet \
+#     -v z3-testnet-cookie:/var/run/auth:ro \
+#     ...
 #
-# or, with a mounted cookie file:
-#
-#   ZINDER_NODE__AUTH__METHOD=cookie
-#   ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
+# For PaaS environments without a shared cookie volume, inject the cookie
+# content as an env var (ZINDER_NODE__AUTH__METHOD=cookie,
+# ZINDER_NODE__AUTH__COOKIE=<cookie-content>) instead.
 
 [network]
 name = "zcash-testnet"
 
-[ops]
-# Per-service default `127.0.0.1:9105`; set to "" to disable the endpoint.
-listen_addr = "127.0.0.1:9105"
-
 [node]
 source = "zebra-json-rpc"
-json_rpc_addr = "http://zebra:8232"
+# Z3 in-network DNS. JSON-RPC: 8232 (mainnet) / 18232 (testnet).
+# Zebra indexer gRPC: 8230 (mainnet) / 18230 (testnet).
+json_rpc_addr = "http://zebra:18232"
+indexer_grpc_addr = "http://zebra:18230"
 request_timeout_secs = 30
 
 [node.auth]
+# Reads the cookie from the Z3 shared cookie volume mounted at /var/run/auth.
 method = "cookie"
-cookie = "REPLACE_VIA_ENV_VAR"
+path = "/var/run/auth/.cookie"
 
 [storage]
 path = "/var/lib/zinder/store"
@@ -37,16 +39,7 @@ reorg_window_blocks = 100
 commit_batch_blocks = 1000
 
 [ingest_control]
-listen_addr = "127.0.0.1:9100"
-
-[retention]
-chain_event_retention_hours = 168
-chain_event_retention_check_interval_ms = 60000
-cursor_at_risk_warning_hours = 24
-mempool_mined_retention_minutes = 60
-mempool_invalidated_retention_hours = 24
-mempool_event_retention_check_interval_ms = 30000
-mempool_cursor_at_risk_warning_minutes = 12
+listen_addr = "0.0.0.0:9100"
 
 [tip_follow]
 poll_interval_ms = 2000

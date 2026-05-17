@@ -15,7 +15,7 @@ against the selected local upstream node:
 2. Backfills a fresh store from a checkpoint.
 3. Creates a RocksDB checkpoint backup and verifies that a restored
    `zinder-query` process can serve the checkpointed tip.
-4. Starts `zinder-ingest tip-follow`, `zinder-query`, and
+4. Starts `zinder-ingest`, `zinder-query`, and
    `zinder-compat-lightwalletd` with `/metrics` endpoints.
 5. Attempts to mine one regtest block so the live ingest writer path records a
    commit after startup.
@@ -134,7 +134,7 @@ Reports are written to:
 | `ZINDER_OBSERVABILITY_NETWORK` | `zcash-regtest` | Network written to service configs. |
 | `ZINDER_OBSERVABILITY_BACKFILL_BLOCKS` | `50` | Blocks backfilled after the checkpoint. |
 | `ZINDER_OBSERVABILITY_COMMIT_BATCH_BLOCKS` | `25` | Ingest commit batch size. |
-| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `1` | Regtest blocks to mine after tip-follow starts. Set `0` to skip. |
+| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `1` | Regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. Set `0` to skip. |
 | `ZINDER_OBSERVABILITY_RESET` | `1` | Reset `.tmp/observability` before a run. |
 | `ZINDER_OBSERVABILITY_BACKUP_RESTORE` | `1` | Create a checkpoint backup and verify it through a restored query process. |
 | `ZINDER_OBSERVABILITY_RUNS` | `5` | Number of smoke repetitions for `calibrate`. |

@@ -43,12 +43,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
+      # Pinned to the image Z3 ships with its v1 platform contract
+      # (https://github.com/ZcashFoundation/z3/blob/main/z3-contract.yaml).
+      # Cookie auth is disabled to mirror Z3's regtest topology; tests below
+      # send a no-op basic-auth pair that Zebra ignores in this mode.
       zebra:
-        image: zfnd/zebra:latest
+        image: zfnd/zebra:4.4.1
         ports:
           - 39232:39232
         env:
-          ZEBRA_NETWORK: Regtest
+          ZEBRA_NETWORK__NETWORK: Regtest
+          ZEBRA_RPC__LISTEN_ADDR: 0.0.0.0:39232
+          ZEBRA_RPC__ENABLE_COOKIE_AUTH: "false"
         options: >-
           --health-cmd "wget -q -O- http://localhost:39232 || true"
           --health-interval 10s

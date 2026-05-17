@@ -1,0 +1,35 @@
+# Scrape config for the deploy-mode observability (Prometheus running inside
+# deploy/docker-compose.yml, on the same Docker network as zinder-ingest and
+# zinder-query). The smoke-mode equivalent lives at
+# observability/prometheus/prometheus.yml and targets the local-binary ports
+# the smoke script spawns; this file targets the docker-compose service DNS.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "zinder-ingest"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["zinder-ingest:9105"]
+        labels:
+          stack: "zinder"
+          service: "zinder-ingest"
+
+  - job_name: "zinder-query"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["zinder-query:9106"]
+        labels:
+          stack: "zinder"
+          service: "zinder-query"
+
+  - job_name: "prometheus"
+    scrape_interval: 60s
+    static_configs:
+      - targets: ["localhost:9090"]

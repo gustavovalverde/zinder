@@ -66,10 +66,12 @@ Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three tests skip:
 `zebra_indexer_mempool_*` and
 `mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state`.
 
-Testnet (Zebra cookie auth):
+Testnet (Z3 stack with cookie auth):
 
 ```bash
-cookie=$(docker exec <zebra_container> cat /var/run/auth/.cookie)
+# Pull the cookie out of the Z3 shared cookie volume; works regardless of
+# Z3's container name and matches the pattern in z3/docs/integrations/.
+cookie=$(docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
@@ -93,10 +95,10 @@ ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR=http://127.0.0.1:9088 \
 
 `require_live()` rejects mainnet by default. Tests that target mainnet must opt in via `require_live_for(&[Network::ZcashMainnet])` or `require_live_mainnet()`. Local mainnet runs are supported against an operator-hosted Zebra.
 
-Mainnet (operator-hosted Zebra):
+Mainnet (Z3 stack):
 
 ```bash
-cookie=$(docker exec <zebra_mainnet_container> cat /var/run/auth/.cookie)
+cookie=$(docker run --rm -v z3-mainnet-cookie:/auth:ro alpine cat /auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-mainnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:8232 \

@@ -1,5 +1,5 @@
 # Reference `zinder-query` configuration for the single-container image
-# (mounted at /etc/zinder/query.toml).
+# (mounted at /etc/zinder/config.toml).
 #
 # The reader points at the in-process IngestControl writer over loopback;
 # operators wanting cross-host topology should set `ingest_control.addr`
@@ -9,29 +9,26 @@
 [network]
 name = "zcash-testnet"
 
-[ops]
-# Per-service default `127.0.0.1:9106`; set to "" to disable the endpoint.
-listen_addr = "127.0.0.1:9106"
-
 [node]
-json_rpc_addr = "http://zebra:8232"
+# Z3 in-network DNS. Mainnet uses port 8232; testnet/regtest use 18232.
+json_rpc_addr = "http://zebra:18232"
 request_timeout_secs = 30
 
 [node.auth]
+# Reads the cookie from the Z3 shared cookie volume mounted at /var/run/auth.
 method = "cookie"
-cookie = "REPLACE_VIA_ENV_VAR"
+path = "/var/run/auth/.cookie"
 
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
 
 [ingest_control]
-addr = "http://127.0.0.1:9100"
-
-[retention]
-chain_event_retention_hours = 168
-mempool_mined_retention_minutes = 60
-mempool_invalidated_retention_hours = 24
+addr = "http://zinder-ingest:9100"
 
 [query]
 listen_addr = "0.0.0.0:9101"
+
+[query.grpc]
+enable_reflection = true
+enable_health = true

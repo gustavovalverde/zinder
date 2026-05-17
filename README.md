@@ -1,37 +1,88 @@
 # Zinder
 
-Zinder is a service-oriented Zcash indexer. It separates the chain ingestion plane from the wallet-facing query plane so that one product can serve modern wallets, explorers, and application backends without forcing every concern into one runtime.
+Zinder is a self-hosted Zcash chain indexer for wallets, explorers, and application backends. It runs on top of a [Zebra](https://github.com/ZcashFoundation/zebra) full node and exposes a stable gRPC data plane that pins every read to a single chain epoch, so a sync batch never mixes data across competing tips.
 
-## Why Zinder
+It speaks two protocols on the same data: a native `WalletQuery` API for new clients, and a `CompactTxStreamer` compatibility surface for existing [lightwalletd](https://github.com/zcash/lightwalletd) wallets like [Zodl](https://github.com/zodl-inc/zodl-android). [Zallet](https://github.com/zcash/wallet) and other Rust consumers integrate through a typed client crate.
 
-Zinder is the Zcash chain indexer for wallets, explorers, and application backends that need a stable, epoch-consistent data plane on top of [Zebra](https://github.com/ZcashFoundation/zebra). The deployment target is a self-hosted, single-operator service backed by one configured Zebra node. Lightwalletd-compatible clients connect through the compatibility adapter; [Zallet](https://github.com/zcash/wallet) and Rust applications integrate through the typed client. Operators place TLS termination, authentication, rate limiting, and quota accounting in front of Zinder when they need a public endpoint.
+## Quickstart
 
-### Approach
+Zinder reads chain data from a Zebra node managed by the [Z3 platform stack](https://github.com/ZcashFoundation/z3). Bring up Z3 first, then attach zinder. Both can run on a laptop; there is no separate Z3 instance to provision.
 
-**A native `WalletQuery` protocol with a separate compatibility translator.** Zinder defines its own gRPC schema for wallets and applications. The lightwalletd `CompactTxStreamer` surface is served by a discrete adapter (`zinder-compat-lightwalletd`) that translates calls onto the native query API. New wallet capabilities land in `WalletQuery`; the compat layer keeps existing wallets supported without becoming the strategic destination.
+**Prerequisites.** Docker (or Docker Desktop) with Docker Compose v2, plus a clone of this repo.
 
-**A service-oriented split with one writer.** `zinder-ingest` is the only process that writes to canonical storage. `zinder-query` reads through an epoch-bounded read API. The compat shim translates without touching storage or upstream nodes. Reads pin to one chain epoch, so a sync batch never mixes data across competing tips. Ingestion and query scale independently.
+**1. Bring up the Z3 stack** (one-time, from your Z3 checkout):
 
-**Upstream-node coupling isolated to one crate.** All Zebra node integration lives in `zinder-source`. Domain types, storage, and protocol crates never import Zebra or source-specific types. A new source backend is a new module in `zinder-source` rather than a workspace-wide refactor.
+```bash
+# testnet (fast; ~10 GB chain)
+git clone https://github.com/ZcashFoundation/z3.git && cd z3
+Z3_NETWORK=testnet docker compose up -d
 
-### What to expect
+# or mainnet (~256 GB chain; expect a long initial sync)
+Z3_NETWORK=mainnet docker compose up -d
+```
 
-**For wallet developers.** A stable native gRPC API designed not to churn with Zebra releases, plus `CompactTxStreamer` compatibility for lightwalletd clients. The wallet surface covers compact blocks, tree state, subtree roots, transaction lookup, typed broadcast, chain events, mempool views, and transparent-address artifacts. Each feature has an explicit capability string rather than being hidden inside the read-sync API.
+This creates the `z3-<network>` Docker network and the `z3-<network>-cookie` volume that zinder attaches to.
 
-**For operators.** Explicit `/healthz`, `/readyz`, and `/metrics` endpoints with typed readiness causes (`syncing`, `node_unavailable`, `reorg_window_exceeded`, and others), so load balancers and incident response act on machine-readable state. Network-aware defaults for mainnet, testnet, and regtest. Production configuration that refuses to start with placeholder credentials, unsafe binds, or missing storage. Capability detection at source connection time instead of hard version pins.
+**2. Bring up zinder** (from this repo):
 
-**For explorer and application backends.** Epoch-consistent reads through a typed query API. A dedicated explorer plane (`zinder-explorer`) serving block summaries, transaction details, mempool views, and typed search alongside replayable materialized views that consume canonical artifacts and can be rebuilt without affecting wallet sync. Additive artifact families that land as new column families without central enum edits.
+```bash
+# testnet
+docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
 
-**For Rust consumers.** A typed client crate (`zinder-client`) exposing `ChainIndex`, with two implementations selected by deployment topology: `LocalChainIndex` for colocated consumers (RocksDB-secondary reads, no tonic round-trip) and `RemoteChainIndex` for cross-host consumers (gRPC). Zallet and Rust applications consume the same trait.
+# or mainnet
+docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+```
 
-### Upstream context
+The first `up -d` does two things in sequence:
 
-- [Zebra](https://github.com/ZcashFoundation/zebra): the ZFND Zcash node and Zinder's primary upstream node source.
-- [Zodl](https://github.com/zodl-inc/zodl-android): a mobile wallet served through Zinder's lightwalletd-compatible adapter.
-- [Zallet](https://github.com/zcash/wallet): the full-node wallet that integrates through Zinder's native typed Rust client.
-- [lightwalletd](https://github.com/zcash/lightwalletd): the `CompactTxStreamer` protocol Zinder implements as a compatibility surface.
+1. **Builds** `zinder-ingest:latest` and `zinder-query:latest` locally (5 to 10 minutes on a warm Docker).
+2. **Starts** `zinder-ingest` and `zinder-query`. The writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per epoch on a cold store (about 30 to 60 minutes on testnet, several hours on mainnet), then transitions to `TipFollow` automatically once the gap closes through the reorg window. No bootstrap step, no separate one-shot service.
 
-### Further reading
+From another terminal:
+
+```bash
+docker logs -f zinder-ingest                              # full event log
+docker logs zinder-ingest | grep ingest_phase_changed     # phase transitions
+```
+
+Subsequent `up -d` calls reuse the existing store. The loop picks up from wherever the writer left off: seconds of work in `TipFollow` after a brief restart; a return to `BulkCatchup` after a long absence until the gap closes.
+
+For the phase model, the upstream-sync diagnostic, alternative deployment shapes (bare-metal, Kubernetes), and forked-store recovery, see [Initial sync](docs/runbooks/initial-sync.md). For the architectural relationship between Zinder and Z3 (or any future upstream platform), and how observability federation works across the two stacks, see [Upstream platform binding](docs/architecture/upstream-platform-binding.md).
+
+**Observability is on by default.** Every `up -d` brings a `zinder-prometheus` container that scrapes the writer (`zinder-ingest:9105/metrics`) and the reader (`zinder-query:9106/metrics`) over a Zinder-owned Docker network. Metrics survive sync runs and restarts. Add `--profile observability` to also bring `zinder-grafana` (port 3002) with the bundled dashboards; skip the flag if you'd rather feed metrics into a sibling Grafana (Z3's, Grafana Cloud, etc.).
+
+**3. Verify both planes:**
+
+```bash
+# Writer: "ready" once the loop's BulkCatchup phase has filled the store and
+# the TipFollow phase has closed the last ~100 blocks of lag to Zebra's tip
+curl -sS http://127.0.0.1:9105/readyz
+# {"status":"ready","cause":"ready","current_height":4016431,"target_height":4016431}
+
+# Reader: always "ready" as soon as the writer has committed anything
+curl -sS http://127.0.0.1:9106/readyz
+# {"status":"ready","cause":"ready","current_height":4016431,"target_height":4016431}
+
+# Tail the writer as it follows the chain tip
+docker logs -f zinder-ingest
+```
+
+Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the reader is ready. The lightwalletd-compatible surface is a separate service shipped in the same workspace; see [single-container deployment](deploy/single-container/README.md) for the bundled topology that adds it.
+
+**Switching networks.** Stop the running stack (`docker compose -f deploy/docker-compose.yml down`), bring Z3 up on the other network, then bring zinder up with the matching `--env-file`. The `zinder-data` volume is shared across runs; rename or remove it if you want a clean slate per network.
+
+**Beyond Docker.** See the [VM runbook](docs/runbooks/deploying-on-a-vm.md) for systemd-managed deployments, the [Railway runbook](docs/runbooks/deploying-on-railway.md) for hosted topologies, and the [single-container](deploy/single-container/README.md) image when you want one process tree instead of two containers.
+
+## Where Zinder fits
+
+- **Wallet developers** get a native `WalletQuery` gRPC API alongside lightwalletd `CompactTxStreamer` compatibility. The wallet surface covers compact blocks, tree state, subtree roots, transaction lookup, typed broadcast, chain events, mempool views, and transparent-address artifacts. Capability strings advertise each feature so clients can negotiate explicitly rather than infer from version pins.
+- **Application backends** get epoch-consistent reads through a typed query API and a dedicated explorer plane (`zinder-explorer`) serving block summaries, transaction details, mempool views, and typed search. Materialized views consume canonical artifacts and can be rebuilt without affecting wallet sync.
+- **Rust consumers** depend on `zinder-client`, a typed crate exposing `ChainIndex` with two implementations selected by topology: `LocalChainIndex` for colocated readers (RocksDB-secondary, no tonic round-trip) and `RemoteChainIndex` for cross-host (gRPC). Zallet uses the same trait.
+- **Operators** get explicit `/healthz`, `/readyz`, and `/metrics` endpoints with a `phase` field (`bulk_catchup`, `following_tip`, `awaiting_upstream`) orthogonal to typed readiness causes (`syncing`, `node_unavailable`, `upstream_not_ready`, `reorg_window_exceeded`, others), so load balancers and incident response act on machine-readable state. Production configuration refuses to start with placeholder credentials, unsafe binds, or missing storage.
+
+The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
+
+## Further reading
 
 - [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
 - [Service boundaries](docs/architecture/service-boundaries.md): the boundary contract Zinder is built against.
@@ -72,7 +123,7 @@ flowchart LR
 ### Planes
 
 - **Node source boundary** (`zinder-source`). All Zebra node coupling is isolated here. Adapters normalize upstream node observations into `NodeSource` values; no other crate imports Zebra or source-specific types, so a new source backend is a new module here rather than a workspace-wide refactor. See [node source boundary](docs/architecture/node-source-boundary.md).
-- **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns backfill, tip following, reorg handling, artifact builders, and the atomic chain-epoch commit (`commit_ingest_batch`) that makes a new epoch visible. See [chain ingestion](docs/architecture/chain-ingestion.md) and [chain events](docs/architecture/chain-events.md).
+- **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns the unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, artifact builders, and the atomic chain-epoch commit (`commit_ingest_batch`) that makes a new epoch visible. See [chain ingestion](docs/architecture/chain-ingestion.md), [chain events](docs/architecture/chain-events.md), and [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md).
 - **Canonical storage** (`zinder-store`). RocksDB-backed `PrimaryChainStore` and `SecondaryChainStore` role handles exposed to services through the domain-shaped `ChainEpochReadApi`. RocksDB types are private; the public read API is epoch-bound, so callers always resolve one `ChainEpoch` before reading any artifact. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
 - **Wallet data plane** (`zinder-query`). Read-only wallet and application API over `WalletQueryApi`, served as the native `WalletQuery` gRPC service. Owns compact block ranges, tree state, subtree roots, transaction lookup, transaction broadcast, the public `ChainEvents` proxy, mempool snapshots/events, and transparent-address reads. Never calls upstream nodes, never writes storage, never custodies keys. See [wallet data plane](docs/architecture/wallet-data-plane.md).
 - **Compatibility plane** (`zinder-compat-lightwalletd`). Translates the vendored lightwalletd `CompactTxStreamer` calls onto `WalletQueryApi`. A pure translation layer: it has no source client, no canonical storage handle, and no parallel artifact construction. New compatibility adapters must use the same shape. See [protocol boundary](docs/architecture/protocol-boundary.md).
@@ -93,7 +144,7 @@ Domain crates under `crates/` define stable contracts with no service runtime:
 
 Deployable services under `services/`:
 
-- `zinder-ingest`: the only writer to canonical RocksDB. Owns backfill, tip-follow, backup checkpoints, artifact builders, the private writer-status endpoint, and the upstream-source config CLI.
+- `zinder-ingest`: the only writer to canonical RocksDB. Owns the unified ingest loop (bulk-catchup + tip-follow phases, see [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md)), backup checkpoints, artifact builders, the private writer-status endpoint, and the upstream-source config CLI.
 - `zinder-query`: read-only wallet and application API over `ChainEpochReadApi`. Provides `WalletQueryApi` (Rust) and `WalletQueryGrpcAdapter` (tonic).
 - `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service to `WalletQueryApi`.
 
