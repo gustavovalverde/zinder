@@ -2,6 +2,7 @@ use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::stream::StreamExt;
 use prost::Message;
+use std::time::Instant;
 use tokio::{
     sync::mpsc::{self, error::TrySendError},
     task::JoinHandle,
@@ -12,7 +13,6 @@ use zinder_core::{
     Network, TreeStateArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
-use std::time::Instant;
 
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceBlock};
@@ -271,12 +271,8 @@ fn update_outage_tracker(
     if let Some(existing) = tracker {
         let outage_seconds =
             u32::try_from(existing.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
-        let detail = detail_for_ongoing_outage(
-            &existing.detail,
-            failure_class,
-            last_reason,
-            outage_seconds,
-        );
+        let detail =
+            detail_for_ongoing_outage(&existing.detail, failure_class, last_reason, outage_seconds);
         existing.detail = detail.clone();
         detail
     } else {

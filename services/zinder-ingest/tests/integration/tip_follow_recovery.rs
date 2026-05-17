@@ -19,9 +19,7 @@ use eyre::{Result, eyre};
 use parking_lot::Mutex;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{
-    BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex,
-};
+use zinder_core::{BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex};
 use zinder_ingest::{NodeSourceKind, TipFollowConfig, tip_follow_with_primary_store};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
@@ -64,7 +62,11 @@ async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> R
         other => return Err(eyre!("expected NodeUnavailable, got {other:?}")),
     };
     assert_eq!(detail.failure_class, "upstream_view_changed");
-    assert!(detail.last_reason.contains("block height not in best chain"));
+    assert!(
+        detail
+            .last_reason
+            .contains("block height not in best chain")
+    );
 
     cancel.cancel();
     loop_handle.await??;
@@ -118,10 +120,11 @@ async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
     // Fail the first 4 fetches with the production view-stale shape, then
     // serve the chain normally.
-    let failure_script = zinder_testkit::NodeFailureScript::fail_next_fetches_with_block_unavailable(
-        4,
-        "block height not in best chain",
-    );
+    let failure_script =
+        zinder_testkit::NodeFailureScript::fail_next_fetches_with_block_unavailable(
+            4,
+            "block height not in best chain",
+        );
     let node = MockNodeSource::from_chain(chain).with_failure_script(failure_script);
     node.set_tip_height(BlockHeight::new(1));
     let storage_path = tempdir()?.path().join("tip-follow-outage-counter");
@@ -238,10 +241,7 @@ impl NodeSource for ViewChangingSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
-    async fn fetch_block_by_height(
-        &self,
-        height: BlockHeight,
-    ) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         *self.fetch_attempts.lock() += 1;
         Err(SourceError::BlockUnavailable {
             height,
@@ -293,10 +293,7 @@ impl NodeSource for ProtocolMismatchSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
-    async fn fetch_block_by_height(
-        &self,
-        height: BlockHeight,
-    ) -> Result<SourceBlock, SourceError> {
+    async fn fetch_block_by_height(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.chain
             .source_block_at(height)
             .ok_or(SourceError::SourceProtocolMismatch {
@@ -326,7 +323,10 @@ impl NodeSource for ProtocolMismatchSource {
 fn source_failure_class_labels_match_runbook_table() {
     // Pin the labels the runbook table promises operators. Renaming any of
     // these requires updating dashboards and alert rules in lock-step.
-    assert_eq!(SourceFailureClass::NodeUnreachable.label(), "node_unreachable");
+    assert_eq!(
+        SourceFailureClass::NodeUnreachable.label(),
+        "node_unreachable"
+    );
     assert_eq!(
         SourceFailureClass::UpstreamViewChanged.label(),
         "upstream_view_changed"
@@ -335,8 +335,14 @@ fn source_failure_class_labels_match_runbook_table() {
         SourceFailureClass::StreamDisconnected.label(),
         "stream_disconnected"
     );
-    assert_eq!(SourceFailureClass::ProtocolMismatch.label(), "protocol_mismatch");
-    assert_eq!(SourceFailureClass::CapabilityMissing.label(), "capability_missing");
+    assert_eq!(
+        SourceFailureClass::ProtocolMismatch.label(),
+        "protocol_mismatch"
+    );
+    assert_eq!(
+        SourceFailureClass::CapabilityMissing.label(),
+        "capability_missing"
+    );
     assert_eq!(SourceFailureClass::Malformed.label(), "malformed");
     assert_eq!(SourceFailureClass::Configuration.label(), "configuration");
 }

@@ -75,10 +75,7 @@ impl NodeFailureScript {
     /// cannot answer. Maps to
     /// [`SourceFailureClass::NodeUnreachable`](zinder_source::SourceFailureClass).
     #[must_use]
-    pub fn fail_next_fetches_with_node_unavailable(
-        count: u32,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn fail_next_fetches_with_node_unavailable(count: u32, reason: impl Into<String>) -> Self {
         Self {
             pending_fetch_failures: count,
             pending_fetch_failure_template: Some(FetchFailureTemplate::NodeUnavailable {
@@ -95,10 +92,7 @@ impl NodeFailureScript {
     /// This is the shape of the 2026-05-15 production incident
     /// (`"block height not in best chain"`).
     #[must_use]
-    pub fn fail_next_fetches_with_block_unavailable(
-        count: u32,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn fail_next_fetches_with_block_unavailable(count: u32, reason: impl Into<String>) -> Self {
         Self {
             pending_fetch_failures: count,
             pending_fetch_failure_template: Some(FetchFailureTemplate::BlockUnavailable {

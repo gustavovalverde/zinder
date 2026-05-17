@@ -218,12 +218,7 @@ pub(crate) fn detail_for_ongoing_outage(
     last_reason: Cow<'static, str>,
     outage_seconds: u32,
 ) -> NodeUnavailableDetail {
-    NodeUnavailableDetail::extend_with(
-        previous,
-        failure_class.label(),
-        last_reason,
-        outage_seconds,
-    )
+    NodeUnavailableDetail::extend_with(previous, failure_class.label(), last_reason, outage_seconds)
 }
 
 fn sanitize_reason(error: &SourceError) -> Cow<'static, str> {

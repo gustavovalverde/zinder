@@ -198,11 +198,8 @@ where
                     last_reason,
                     backoff,
                 } => {
-                    let detail = advance_backfill_outage(
-                        &mut outage,
-                        failure_class,
-                        last_reason.clone(),
-                    );
+                    let detail =
+                        advance_backfill_outage(&mut outage, failure_class, last_reason.clone());
                     if detail.consecutive_failures == 1 {
                         tracing::warn!(
                             target: "zinder::ingest",
