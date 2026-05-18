@@ -352,15 +352,10 @@ async fn build_freshness(
 
 fn highest_block_summary_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
     use crate::consumer::block_summary::BLOCK_SUMMARY_COLUMN_FAMILY;
-    let start_key = [0_u8; 4];
-    let end_key = [0xFF_u8; 4];
-    let entries = derive_store
-        .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key)
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let highest = entries
-        .last()
-        .map(|(key, _)| key.as_slice())
-        .and_then(|key| <[u8; 4]>::try_from(key).ok())
+    let highest = derive_store
+        .last_consumer_key(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .and_then(|key| <[u8; 4]>::try_from(key.as_slice()).ok())
         .map(u32::from_be_bytes);
     Ok(highest)
 }

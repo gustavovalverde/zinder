@@ -1,8 +1,8 @@
 //! Native gRPC adapter for wallet query reads.
 
-use std::{num::NonZeroU32, pin::Pin};
+use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_internal_transaction_id};
@@ -22,7 +22,7 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
 
-use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge};
+use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge, record_proxy_outcome};
 use zinder_store::{
     StreamCursorTokenV1, chain_epoch_from_message, chain_event_stream_family_from_message,
     stream_cursor_from_message_bytes,
@@ -67,19 +67,25 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
     explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
+    /// One cached HTTP/2 channel to the ingest-control writer, dialed lazily
+    /// on the first proxied request. Clones of the adapter share the cache
+    /// through `Arc<OnceCell<_>>` so concurrent RPCs never race to open
+    /// duplicate connections.
+    ingest_control_channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// Creates a gRPC adapter over a wallet query API with the deployment's
     /// `ServerCapabilities` descriptor.
     #[must_use]
-    pub const fn new(query_api: QueryApi, server_info: ServerInfoSettings) -> Self {
+    pub fn new(query_api: QueryApi, server_info: ServerInfoSettings) -> Self {
         Self {
             query_api,
             server_info,
             ingest_control_proxy_endpoint: None,
             ingest_control_bearer_token: None,
             explorer_proxy: None,
+            ingest_control_channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -101,6 +107,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
             ingest_control_bearer_token: None,
             explorer_proxy: None,
+            ingest_control_channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -344,99 +351,135 @@ where
         &self,
         request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
-        if let Some(endpoint) = &self.ingest_control_proxy_endpoint {
-            return proxy_chain_events(
-                endpoint.clone(),
-                self.ingest_control_bearer_token.clone(),
-                request,
-            )
-            .await;
+        let started_at = Instant::now();
+        let outcome: Result<Response<ChainEventsStream>, Status> = async {
+            if self.ingest_control_proxy_endpoint.is_some() {
+                let mut client = self
+                    .ingest_control_client(
+                        "ChainEvents requires the ingest-control proxy; \
+                         configure the writer endpoint",
+                    )
+                    .await?;
+                let response = client.chain_events(request).await?;
+                let stream: ChainEventsStream = Box::pin(response.into_inner());
+                return Ok(Response::new(stream));
+            }
+
+            let request = request.into_inner();
+            let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
+            let family = chain_event_stream_family_from_message(request.family)
+                .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
+            let network = self.server_info_network()?;
+            let address_filter = decode_address_filter(request.address_filter, network)
+                .map_err(|error| status_from_query_error(&error))?;
+            let query_api = self.query_api.clone();
+            let (event_sender, event_receiver) = mpsc::channel(16);
+            spawn_filtered_stream(query_api, from_cursor, family, address_filter, event_sender);
+
+            let stream: ChainEventsStream = Box::pin(ReceiverStream::new(event_receiver));
+            Ok(Response::new(stream))
         }
-
-        let request = request.into_inner();
-        let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
-        let family = chain_event_stream_family_from_message(request.family)
-            .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
-        let network = self.server_info_network()?;
-        let address_filter = decode_address_filter(request.address_filter, network)
-            .map_err(|error| status_from_query_error(&error))?;
-        let query_api = self.query_api.clone();
-        let (event_sender, event_receiver) = mpsc::channel(16);
-        spawn_filtered_stream(query_api, from_cursor, family, address_filter, event_sender);
-
-        Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
+        .await;
+        record_proxy_outcome("chain_events", started_at, &outcome);
+        outcome
     }
 
     async fn mempool_snapshot(
         &self,
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
-        let endpoint = self
-            .ingest_control_proxy_endpoint
-            .as_ref()
-            .ok_or_else(|| {
-                Status::unavailable(
-                    "MempoolSnapshot requires the ingest-control proxy; configure the writer endpoint",
+        let started_at = Instant::now();
+        let outcome = async {
+            let mut client = self
+                .ingest_control_client(
+                    "MempoolSnapshot requires the ingest-control proxy; \
+                     configure the writer endpoint",
                 )
-            })?
-            .clone();
-        proxy_mempool_snapshot(endpoint, self.ingest_control_bearer_token.clone(), request).await
+                .await?;
+            client.mempool_snapshot(request).await
+        }
+        .await;
+        record_proxy_outcome("mempool_snapshot", started_at, &outcome);
+        outcome
     }
 
     async fn mempool_events(
         &self,
         request: Request<wallet::MempoolEventsRequest>,
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
-        let endpoint = self
-            .ingest_control_proxy_endpoint
-            .as_ref()
-            .ok_or_else(|| {
-                Status::unavailable(
-                    "MempoolEvents requires the ingest-control proxy; configure the writer endpoint",
+        let started_at = Instant::now();
+        let outcome: Result<Response<MempoolEventsStream>, Status> = async {
+            let mut client = self
+                .ingest_control_client(
+                    "MempoolEvents requires the ingest-control proxy; \
+                     configure the writer endpoint",
                 )
-            })?
-            .clone();
-        proxy_mempool_events(endpoint, self.ingest_control_bearer_token.clone(), request).await
+                .await?;
+            let response = client.mempool_events(request).await?;
+            let stream: MempoolEventsStream = Box::pin(response.into_inner());
+            Ok(Response::new(stream))
+        }
+        .await;
+        record_proxy_outcome("mempool_events", started_at, &outcome);
+        outcome
     }
 
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
     ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        let endpoint = self.require_ingest_control_proxy_endpoint(
-            "TransparentMempoolOutputsByAddress requires the ingest-control proxy; \
-             configure the writer endpoint",
-        )?;
-        let request = request.into_inner();
-        let address_script_hash =
-            address_lookup_to_script_hash(request.address.clone(), self.server_info_network()?)
-                .map_err(|error| status_from_query_error(&error))?;
-        let normalized_request = wallet::TransparentMempoolOutputsByAddressRequest {
-            address: Some(typed_script_hash_address_lookup(
-                &address_script_hash.as_bytes(),
-            )),
-            max_entries: request.max_entries,
-        };
-        let mut client =
-            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+        let started_at = Instant::now();
+        let outcome = async {
+            let request = request.into_inner();
+            let address_script_hash =
+                address_lookup_to_script_hash(request.address.clone(), self.server_info_network()?)
+                    .map_err(|error| status_from_query_error(&error))?;
+            let normalized_request = wallet::TransparentMempoolOutputsByAddressRequest {
+                address: Some(typed_script_hash_address_lookup(
+                    &address_script_hash.as_bytes(),
+                )),
+                max_entries: request.max_entries,
+            };
+            let mut client = self
+                .ingest_control_client(
+                    "TransparentMempoolOutputsByAddress requires the ingest-control proxy; \
+                     configure the writer endpoint",
+                )
                 .await?;
-        client
-            .transparent_mempool_outputs_by_address(Request::new(normalized_request))
-            .await
+            client
+                .transparent_mempool_outputs_by_address(Request::new(normalized_request))
+                .await
+        }
+        .await;
+        record_proxy_outcome(
+            "transparent_mempool_outputs_by_address",
+            started_at,
+            &outcome,
+        );
+        outcome
     }
 
     async fn transparent_mempool_spend_by_outpoint(
         &self,
         request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
-        let endpoint = self.require_ingest_control_proxy_endpoint(
-            "TransparentMempoolSpendByOutpoint requires the ingest-control proxy; \
-             configure the writer endpoint",
-        )?;
-        let mut client =
-            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+        let started_at = Instant::now();
+        let outcome = async {
+            let mut client = self
+                .ingest_control_client(
+                    "TransparentMempoolSpendByOutpoint requires the ingest-control proxy; \
+                     configure the writer endpoint",
+                )
                 .await?;
-        client.transparent_mempool_spend_by_outpoint(request).await
+            client.transparent_mempool_spend_by_outpoint(request).await
+        }
+        .await;
+        record_proxy_outcome(
+            "transparent_mempool_spend_by_outpoint",
+            started_at,
+            &outcome,
+        );
+        outcome
     }
 
     async fn transparent_prevouts(
@@ -457,30 +500,40 @@ where
         &self,
         request: Request<wallet::TransparentMempoolPrevoutsRequest>,
     ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
-        let request_inner = request.get_ref();
-        reject_coinbase_sentinels(&request_inner.outpoints)?;
-        let endpoint = self.require_ingest_control_proxy_endpoint(
-            "TransparentMempoolPrevouts requires the ingest-control proxy; \
-             configure the writer endpoint",
-        )?;
-        let mut client =
-            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+        let started_at = Instant::now();
+        let outcome = async {
+            let request_inner = request.get_ref();
+            reject_coinbase_sentinels(&request_inner.outpoints)?;
+            let mut client = self
+                .ingest_control_client(
+                    "TransparentMempoolPrevouts requires the ingest-control proxy; \
+                     configure the writer endpoint",
+                )
                 .await?;
-        client.transparent_mempool_prevouts(request).await
+            client.transparent_mempool_prevouts(request).await
+        }
+        .await;
+        record_proxy_outcome("transparent_mempool_prevouts", started_at, &outcome);
+        outcome
     }
 
     async fn chain_value_pools_at_tip(
         &self,
         request: Request<wallet::ChainValuePoolsAtTipRequest>,
     ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
-        let endpoint = self.require_ingest_control_proxy_endpoint(
-            "ChainValuePoolsAtTip requires the ingest-control proxy; \
-             configure the writer endpoint",
-        )?;
-        let mut client =
-            connect_authenticated_proxy(&endpoint, self.ingest_control_bearer_token.as_ref())
+        let started_at = Instant::now();
+        let outcome = async {
+            let mut client = self
+                .ingest_control_client(
+                    "ChainValuePoolsAtTip requires the ingest-control proxy; \
+                     configure the writer endpoint",
+                )
                 .await?;
-        client.chain_value_pools_at_tip(request).await
+            client.chain_value_pools_at_tip(request).await
+        }
+        .await;
+        record_proxy_outcome("chain_value_pools_at_tip", started_at, &outcome);
+        outcome
     }
 
     async fn transparent_address_utxos(
@@ -585,36 +638,42 @@ where
         // adds the mempool overlay that canonical-only compute cannot supply.
         // Fall back to the always-on canonical-confirmed-balance path otherwise
         // so the RPC stays answerable without `zinder-explorer`.
-        if let Some(proxy) = self
-            .explorer_proxy
-            .as_ref()
-            .filter(|proxy| proxy.is_ready())
-        {
-            return proxy
-                .forward(request, |mut client, request| async move {
-                    client.transparent_address_balance(request).await
-                })
-                .await;
-        }
+        let started_at = Instant::now();
+        let outcome = async {
+            if let Some(proxy) = self
+                .explorer_proxy
+                .as_ref()
+                .filter(|proxy| proxy.is_ready())
+            {
+                return proxy
+                    .forward(request, |mut client, request| async move {
+                        client.transparent_address_balance(request).await
+                    })
+                    .await;
+            }
 
-        let network = self.server_info_network()?;
-        let inner = request.into_inner();
-        let at_epoch = inner
-            .at_epoch
-            .map(|message| {
-                chain_epoch_from_message(message)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))
-            })
-            .transpose()?;
-        transparent_address_confirmed_balance_response(
-            &self.query_api,
-            inner.addresses,
-            network,
-            at_epoch,
-        )
-        .await
-        .map(Response::new)
-        .map_err(|error| status_from_query_error(&error))
+            let network = self.server_info_network()?;
+            let inner = request.into_inner();
+            let at_epoch = inner
+                .at_epoch
+                .map(|message| {
+                    chain_epoch_from_message(message)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))
+                })
+                .transpose()?;
+            transparent_address_confirmed_balance_response(
+                &self.query_api,
+                inner.addresses,
+                network,
+                at_epoch,
+            )
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
+        }
+        .await;
+        record_proxy_outcome("transparent_address_balance", started_at, &outcome);
+        outcome
     }
 
     async fn server_info(
@@ -753,6 +812,38 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             .clone()
             .ok_or_else(|| Status::unavailable(unconfigured_message))
     }
+
+    /// Returns an `IngestControl` client backed by the adapter's cached
+    /// HTTP/2 channel.
+    ///
+    /// The first call to this method on a given adapter instance dials the
+    /// writer; subsequent calls reuse the cached
+    /// [`AuthenticatedChannel`] (cheap clone, transparent HTTP/2 reconnect).
+    /// `unconfigured_message` is the operation-specific `UNAVAILABLE` text
+    /// returned when no ingest-control endpoint has been configured.
+    ///
+    /// The `QueryApi: Sync` bound matches the bound on the `WalletQuery`
+    /// trait impl: a `Sync` adapter is required for the returned future to
+    /// be `Send`, which `tonic::async_trait` demands at the call site.
+    async fn ingest_control_client(
+        &self,
+        unconfigured_message: &'static str,
+    ) -> Result<AuthenticatedIngestControlClient, Status>
+    where
+        QueryApi: Sync,
+    {
+        let endpoint = self.require_ingest_control_proxy_endpoint(unconfigured_message)?;
+        let bearer_token = self.ingest_control_bearer_token.clone();
+        let channel = self
+            .ingest_control_channel
+            .get_or_try_init(|| async move {
+                connect_authenticated_channel(&endpoint, bearer_token.as_ref())
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))
+            })
+            .await?;
+        Ok(IngestControlClient::new(channel.clone()))
+    }
 }
 
 /// Builds an `AddressLookup` whose only populated arm is the typed
@@ -767,46 +858,6 @@ fn typed_script_hash_address_lookup(script_hash_bytes: &[u8]) -> wallet::Address
             script_hash_bytes.to_vec(),
         )),
     }
-}
-
-async fn proxy_chain_events(
-    endpoint: String,
-    bearer_token: Option<BearerToken>,
-    request: Request<wallet::ChainEventsRequest>,
-) -> Result<Response<ChainEventsStream>, Status> {
-    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
-    let response = client.chain_events(request).await?;
-
-    Ok(Response::new(Box::pin(response.into_inner())))
-}
-
-async fn proxy_mempool_snapshot(
-    endpoint: String,
-    bearer_token: Option<BearerToken>,
-    request: Request<wallet::MempoolSnapshotRequest>,
-) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
-    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
-    client.mempool_snapshot(request).await
-}
-
-async fn proxy_mempool_events(
-    endpoint: String,
-    bearer_token: Option<BearerToken>,
-    request: Request<wallet::MempoolEventsRequest>,
-) -> Result<Response<MempoolEventsStream>, Status> {
-    let mut client = connect_authenticated_proxy(&endpoint, bearer_token.as_ref()).await?;
-    let response = client.mempool_events(request).await?;
-    Ok(Response::new(Box::pin(response.into_inner())))
-}
-
-async fn connect_authenticated_proxy(
-    endpoint: &str,
-    bearer_token: Option<&BearerToken>,
-) -> Result<AuthenticatedIngestControlClient, Status> {
-    let channel = connect_authenticated_channel(endpoint, bearer_token)
-        .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    Ok(IngestControlClient::new(channel))
 }
 
 fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<TransactionId, Status> {

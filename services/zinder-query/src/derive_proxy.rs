@@ -7,9 +7,10 @@
 //! each federation body would otherwise duplicate:
 //!
 //! - Endpoint and bearer-token configuration for the underlying gRPC channel.
-//! - Lazy connection construction (one tonic channel per call today;
-//!   pool-friendly later because the same `connect_authenticated_channel` is
-//!   reused).
+//! - One cached HTTP/2 channel per proxy instance, dialed lazily on first
+//!   forwarded request and reused for the lifetime of the proxy. Clones of a
+//!   `DeriveProxy` share the cache through an [`Arc<OnceCell<_>>`], so the
+//!   binary's hot path never pays a fresh TCP/TLS/HTTP-2 handshake per RPC.
 //! - A shared [`DeriveReadinessGauge`] that a background probe loop updates
 //!   from the consumer's `ServerInfo` response.
 //! - Capability gating: [`DeriveProxy::is_ready`] reports whether the
@@ -40,7 +41,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{task::JoinHandle, time};
+use tokio::{sync::OnceCell, task::JoinHandle, time};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
@@ -119,6 +120,7 @@ pub struct DeriveProxy<Client> {
     config: DeriveProxyConfig,
     readiness: DeriveReadinessGauge,
     construct_client: fn(AuthenticatedChannel) -> Client,
+    channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl<Client> DeriveProxy<Client>
@@ -151,6 +153,7 @@ where
             config,
             readiness,
             construct_client,
+            channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -193,16 +196,23 @@ where
         if !self.is_ready() {
             return Err(derive_unavailable_status(self.config.capability));
         }
-        let channel =
-            connect_authenticated_channel(&self.config.endpoint, self.config.bearer_token.as_ref())
+        let channel = self
+            .channel
+            .get_or_try_init(|| async {
+                connect_authenticated_channel(
+                    &self.config.endpoint,
+                    self.config.bearer_token.as_ref(),
+                )
                 .await
                 .map_err(|error| {
                     Status::unavailable(format!(
                         "derive consumer at {} unreachable: {error}",
                         self.config.endpoint
                     ))
-                })?;
-        let client = (self.construct_client)(channel);
+                })
+            })
+            .await?;
+        let client = (self.construct_client)(channel.clone());
         invoke_remote(client, request).await
     }
 }

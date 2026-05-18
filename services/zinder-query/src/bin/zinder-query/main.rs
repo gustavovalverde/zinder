@@ -143,6 +143,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         encode_zinder_native_chain_name(query_config.network),
         readiness.clone(),
     );
+    zinder_query::describe_request_metrics();
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store = match SecondaryChainStore::open(

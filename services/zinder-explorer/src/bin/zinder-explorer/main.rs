@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
     BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter,
-    ExplorerServerInfoSettings,
+    ExplorerServerInfoSettings, describe_request_metrics,
 };
 use zinder_runtime::{
     Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
@@ -116,6 +116,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         encode_zinder_native_chain_name(explorer_config.network),
         readiness.clone(),
     );
+    describe_request_metrics();
 
     let store = match open_derive_store(&explorer_config) {
         Ok(store) => store,

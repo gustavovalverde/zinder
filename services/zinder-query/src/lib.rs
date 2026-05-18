@@ -967,6 +967,39 @@ fn map_transparent_utxo_store_error(error: StoreError) -> QueryError {
     }
 }
 
+/// Registers `# HELP` and `# TYPE` text for every metric this crate emits.
+///
+/// Call once at startup, after `install_metrics_recorder` returns and before
+/// the gRPC server records its first request. Subsequent calls overwrite the
+/// stored descriptions; emitting a metric without a prior describe is fine
+/// but leaves the Prometheus `/metrics` text without a `# HELP` line.
+pub fn describe_request_metrics() {
+    metrics::describe_histogram!(
+        "zinder_query_request_duration_seconds",
+        metrics::Unit::Seconds,
+        "Wall-clock duration of WalletQuery RPCs handled by this service. \
+         Labels: operation (snake_case RPC method, e.g. latest_block), status \
+         (ok|error), error_class. Typed RPCs (those backed by WalletQueryApi) \
+         carry the typed QueryError variant (e.g. invalid_block_range). Proxy \
+         RPCs (those forwarded to IngestControl or federated to ExplorerQuery) \
+         carry the tonic::Code name (e.g. unavailable). Both vocabularies use \
+         'none' on success."
+    );
+    metrics::describe_counter!(
+        "zinder_query_request_total",
+        metrics::Unit::Count,
+        "Total WalletQuery RPC outcomes observed by this service. Same labels \
+         as zinder_query_request_duration_seconds; sum across operations gives \
+         total RPC throughput."
+    );
+    metrics::describe_histogram!(
+        "zinder_query_compact_block_range_block_count",
+        metrics::Unit::Count,
+        "Number of blocks returned by a single CompactBlockRange response, labelled \
+         by status. Used to monitor request fan-out and page sizing."
+    );
+}
+
 fn record_wallet_query_outcome<Response>(
     operation: &'static str,
     started_at: Instant,
@@ -1033,6 +1066,62 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
 
 fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).map_or(u32::MAX, |converted| converted)
+}
+
+/// Records duration + outcome for a `WalletQuery` RPC that the gRPC adapter
+/// proxies to another service (ingest-control or the federated explorer
+/// plane).
+///
+/// Shares the `zinder_query_request_*` metric names with
+/// [`record_wallet_query_outcome`] so dashboards see one series per
+/// operation regardless of which layer handled the request. The
+/// `error_class` label carries the `tonic::Code` name rather than a typed
+/// `QueryError` variant, because the gRPC adapter handles the response as
+/// an opaque `Status`.
+pub(crate) fn record_proxy_outcome<ResponseT>(
+    operation: &'static str,
+    started_at: Instant,
+    proxy_outcome: &Result<tonic::Response<ResponseT>, tonic::Status>,
+) {
+    metrics::histogram!(
+        "zinder_query_request_duration_seconds",
+        "operation" => operation,
+        "status" => outcome_status(proxy_outcome),
+        "error_class" => proxy_error_class(proxy_outcome.as_ref().err())
+    )
+    .record(started_at.elapsed());
+    metrics::counter!(
+        "zinder_query_request_total",
+        "operation" => operation,
+        "status" => outcome_status(proxy_outcome),
+        "error_class" => proxy_error_class(proxy_outcome.as_ref().err())
+    )
+    .increment(1);
+}
+
+fn proxy_error_class(error: Option<&tonic::Status>) -> &'static str {
+    let Some(status) = error else {
+        return "none";
+    };
+    match status.code() {
+        tonic::Code::Ok => "none",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+        tonic::Code::Unknown => "unknown",
+    }
 }
 
 /// Latest visible block metadata bound to one chain epoch.

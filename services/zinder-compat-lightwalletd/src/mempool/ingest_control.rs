@@ -7,26 +7,28 @@
 //!
 //! ## Connection lifecycle and fan-out
 //!
-//! Each [`IngestControlMempoolSurface::mempool_snapshot_page`] and
-//! [`IngestControlMempoolSurface::mempool_events`] call opens a fresh gRPC
-//! channel via [`connect_authenticated_channel`] and drops it when the call
-//! returns. The alternative (a long-lived shared channel) requires
-//! reconnection-state machinery and a liveness-probe loop that the
-//! on-demand model side-steps.
+//! Each [`IngestControlMempoolSurface`] instance dials a single HTTP/2 channel
+//! to the writer the first time a method is invoked, caches it in an
+//! [`Arc<OnceCell<_>>`], and reuses it for every subsequent
+//! [`IngestControlMempoolSurface::mempool_snapshot_page`] /
+//! [`IngestControlMempoolSurface::mempool_events`] call. Tonic's `Channel`
+//! handles transparent HTTP/2 reconnect, so a transient writer outage does
+//! not require restarting the compat process.
 //!
 //! With N concurrent lightwalletd `GetMempoolStream` clients there are N
-//! concurrent `IngestControl` `MempoolEvents` subscriptions on the writer.
-//! Operators capping the public lightwalletd surface (Caddy, nginx) bound
-//! N at the proxy edge; Zinder does not enforce a process-wide cap.
-//! [`spawn_ingest_control_tip_change_publisher`] reuses the same on-demand
-//! pattern for `ChainEvents`, with a 500 ms backoff between reconnect
-//! attempts so a writer restart does not drive a tight reconnect loop.
+//! concurrent `IngestControl` `MempoolEvents` subscriptions multiplexed over
+//! the cached channel. Operators capping the public lightwalletd surface
+//! (Caddy, nginx) bound N at the proxy edge; Zinder does not enforce a
+//! process-wide cap.
+//! [`spawn_ingest_control_tip_change_publisher`] runs a separate session-per-
+//! reconnect loop for `ChainEvents`, with a 500 ms backoff between attempts
+//! so a writer restart does not drive a tight reconnect loop.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -58,16 +60,19 @@ const TIP_PUBLISHER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 pub struct IngestControlMempoolSurface {
     endpoint: String,
     bearer_token: Option<BearerToken>,
+    channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl IngestControlMempoolSurface {
-    /// Creates a mempool surface that connects to the writer's `IngestControl`
-    /// endpoint on demand.
+    /// Creates a mempool surface that dials the writer's `IngestControl`
+    /// endpoint on first use and caches the channel for the surface's
+    /// lifetime.
     #[must_use]
-    pub const fn new(endpoint: String) -> Self {
+    pub fn new(endpoint: String) -> Self {
         Self {
             endpoint,
             bearer_token: None,
+            channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -79,6 +84,29 @@ impl IngestControlMempoolSurface {
         self.bearer_token = Some(bearer_token);
         self
     }
+
+    /// Returns an `IngestControl` client backed by the surface's cached
+    /// HTTP/2 channel.
+    ///
+    /// The first call dials the writer; subsequent calls reuse the cached
+    /// [`AuthenticatedChannel`] (cheap clone, transparent HTTP/2 reconnect).
+    async fn ingest_control_client(
+        &self,
+    ) -> Result<AuthenticatedIngestControlClient, MempoolSurfaceError> {
+        let endpoint = self.endpoint.clone();
+        let bearer_token = self.bearer_token.clone();
+        let channel = self
+            .channel
+            .get_or_try_init(|| async move {
+                connect_authenticated_channel(&endpoint, bearer_token.as_ref())
+                    .await
+                    .map_err(|error| MempoolSurfaceError::Unavailable {
+                        reason: error.to_string(),
+                    })
+            })
+            .await?;
+        Ok(IngestControlClient::new(channel.clone()))
+    }
 }
 
 #[async_trait]
@@ -88,9 +116,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
         max_entries: u32,
         from_cursor: Option<Vec<u8>>,
     ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
-        let mut client =
-            connect_authenticated_ingest_control(&self.endpoint, self.bearer_token.as_ref())
-                .await?;
+        let mut client = self.ingest_control_client().await?;
         let response = client
             .mempool_snapshot(wallet::MempoolSnapshotRequest {
                 max_entries,
@@ -128,9 +154,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
         &self,
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
-        let mut client =
-            connect_authenticated_ingest_control(&self.endpoint, self.bearer_token.as_ref())
-                .await?;
+        let mut client = self.ingest_control_client().await?;
         let cursor_bytes = from_cursor
             .as_ref()
             .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec());

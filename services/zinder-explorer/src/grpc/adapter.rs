@@ -8,8 +8,19 @@
 //! composed from the live mempool point lookups (also via `WalletQuery`).
 //! The explorer plane owns no balance column family; the wire shape is the
 //! durable contract.
+//!
+//! The adapter holds a single cached `WalletQuery` channel and reuses it
+//! across requests. The first request that needs the channel pays the
+//! handshake cost; later requests just clone the cached
+//! [`AuthenticatedChannel`] (a `tonic` `Channel` is internally pooled and
+//! clone-cheap) so the explorer never opens one HTTP/2 connection per
+//! request.
 
-use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::OnceCell;
+use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
@@ -77,18 +88,20 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
     derive_store: Option<DeriveStore>,
+    wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl ExplorerQueryGrpcAdapter {
     /// Creates a new explorer-query adapter without a federated balance path.
     #[must_use]
-    pub const fn new(settings: ExplorerServerInfoSettings) -> Self {
+    pub fn new(settings: ExplorerServerInfoSettings) -> Self {
         Self {
             settings,
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
             bearer_token: None,
             derive_store: None,
+            wallet_channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -158,6 +171,18 @@ impl ExplorerQueryGrpcAdapter {
     }
 }
 
+/// Pair of operation labels used by every `ExplorerQuery` handler.
+///
+/// `method` mirrors the proto method name in `Status` text so operators see
+/// the same identifier the generated `WalletQueryClient` would use. `metric`
+/// is the `snake_case` Prometheus label so the `zinder_explorer_request_*`
+/// series follows the recorder's naming convention. Colocating both in a
+/// single `const` per handler stops the two forms from drifting apart.
+struct OperationNames {
+    method: &'static str,
+    metric: &'static str,
+}
+
 #[tonic::async_trait]
 impl ExplorerQuery for ExplorerQueryGrpcAdapter {
     async fn server_info(
@@ -181,125 +206,195 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         &self,
         request: Request<TransparentAddressBalanceRequest>,
     ) -> Result<Response<TransparentAddressBalanceResponse>, Status> {
-        let endpoint = self.wallet_query_endpoint.as_deref().ok_or_else(|| {
-            Status::unavailable(
-                "TransparentAddressBalance requires a wallet_query_endpoint; \
-                 configure --wallet-query-endpoint",
-            )
-        })?;
-        let request_inner = request.into_inner();
-        if request_inner.addresses.is_empty() {
-            return Err(Status::invalid_argument("addresses list must not be empty"));
+        const OP: OperationNames = OperationNames {
+            method: "TransparentAddressBalance",
+            metric: "transparent_address_balance",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            self.require_wallet_endpoint(OP.method)?;
+            let request_inner = request.into_inner();
+            if request_inner.addresses.is_empty() {
+                return Err(Status::invalid_argument("addresses list must not be empty"));
+            }
+            let mut client = self.wallet_client(OP.method).await?;
+            compute_transparent_address_balance(&mut client, request_inner)
+                .await
+                .map(Response::new)
         }
-
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        compute_transparent_address_balance(&mut client, request_inner)
-            .await
-            .map(Response::new)
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn transaction_detail(
         &self,
         request: Request<TransactionDetailRequest>,
     ) -> Result<Response<TransactionDetailResponse>, Status> {
-        let endpoint = self.wallet_query_endpoint.as_deref().ok_or_else(|| {
-            Status::unavailable(
-                "TransactionDetail requires a wallet_query_endpoint; \
-                 configure --wallet-query-endpoint",
-            )
-        })?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_transaction_detail(&mut client, self.settings.network, request).await
+        const OP: OperationNames = OperationNames {
+            method: "TransactionDetail",
+            metric: "transaction_detail",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_transaction_detail(&mut client, self.settings.network, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn block_summaries_in_range(
         &self,
         request: Request<BlockSummariesInRangeRequest>,
     ) -> Result<Response<BlockSummariesInRangeResponse>, Status> {
-        let derive_store = self.require_derive_store("BlockSummariesInRange")?;
-        let endpoint = self.require_wallet_endpoint("BlockSummariesInRange")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_block_summaries_in_range(derive_store, &mut client, request).await
+        const OP: OperationNames = OperationNames {
+            method: "BlockSummariesInRange",
+            metric: "block_summaries_in_range",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_block_summaries_in_range(derive_store, &mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn block_detail(
         &self,
         request: Request<BlockDetailRequest>,
     ) -> Result<Response<BlockDetailResponse>, Status> {
-        let derive_store = self.require_derive_store("BlockDetail")?;
-        let endpoint = self.require_wallet_endpoint("BlockDetail")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_block_detail(derive_store, &mut client, request).await
+        const OP: OperationNames = OperationNames {
+            method: "BlockDetail",
+            metric: "block_detail",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_block_detail(derive_store, &mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn search(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("Search")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_search(
-            self.derive_store.as_ref(),
-            &mut client,
-            self.settings.network,
-            request,
-        )
-        .await
+        const OP: OperationNames = OperationNames {
+            method: "Search",
+            metric: "search",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_search(
+                self.derive_store.as_ref(),
+                &mut client,
+                self.settings.network,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn mempool_summary(
         &self,
         request: Request<MempoolSummaryRequest>,
     ) -> Result<Response<MempoolSummaryResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("MempoolSummary")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_mempool_summary(&mut client, self.settings.network, request).await
+        const OP: OperationNames = OperationNames {
+            method: "MempoolSummary",
+            metric: "mempool_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_mempool_summary(&mut client, self.settings.network, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn mempool_activity(
         &self,
         request: Request<MempoolActivityRequest>,
     ) -> Result<Response<MempoolActivityResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("MempoolActivity")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_mempool_activity(&mut client, self.settings.network, request).await
+        const OP: OperationNames = OperationNames {
+            method: "MempoolActivity",
+            metric: "mempool_activity",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_mempool_activity(&mut client, self.settings.network, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn transparent_address_activity(
         &self,
         request: Request<TransparentAddressActivityRequest>,
     ) -> Result<Response<TransparentAddressActivityResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("TransparentAddressActivity")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_transparent_address_activity(&mut client, request).await
+        const OP: OperationNames = OperationNames {
+            method: "TransparentAddressActivity",
+            metric: "transparent_address_activity",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_transparent_address_activity(&mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn fee_summary(
         &self,
         request: Request<FeeSummaryRequest>,
     ) -> Result<Response<FeeSummaryResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("FeeSummary")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_fee_summary(&mut client, self.settings.network, request).await
+        const OP: OperationNames = OperationNames {
+            method: "FeeSummary",
+            metric: "fee_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_fee_summary(&mut client, self.settings.network, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 
     async fn value_pool_summary(
         &self,
         request: Request<ValuePoolSummaryRequest>,
     ) -> Result<Response<ValuePoolSummaryResponse>, Status> {
-        let endpoint = self.require_wallet_endpoint("ValuePoolSummary")?;
-        let mut client =
-            connect_wallet_query(endpoint, self.wallet_query_bearer_token.as_ref()).await?;
-        handle_value_pool_summary(&mut client, request).await
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolSummary",
+            metric: "value_pool_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_summary(&mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
     }
 }
 
@@ -320,6 +415,29 @@ impl ExplorerQueryGrpcAdapter {
                  --wallet-query-endpoint"
             ))
         })
+    }
+
+    /// Returns a `WalletQueryClient` that shares one cached HTTP/2 channel
+    /// across every request handled by this adapter.
+    ///
+    /// The first call pays the dial cost; subsequent calls clone the cached
+    /// channel, which is `tonic::transport::Channel` internally (cheap clone,
+    /// transparent HTTP/2 reconnect).
+    async fn wallet_client(
+        &self,
+        method: &'static str,
+    ) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
+        let endpoint = self.require_wallet_endpoint(method)?;
+        let token = self.wallet_query_bearer_token.clone();
+        let channel = self
+            .wallet_channel
+            .get_or_try_init(|| async {
+                connect_authenticated_channel(endpoint, token.as_ref())
+                    .await
+                    .map_err(connect_error_to_status)
+            })
+            .await?;
+        Ok(WalletQueryClient::new(channel.clone()))
     }
 }
 
@@ -432,20 +550,93 @@ fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
     })
 }
 
-async fn connect_wallet_query(
-    endpoint: &str,
-    bearer_token: Option<&BearerToken>,
-) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
-    let channel = connect_authenticated_channel(endpoint, bearer_token)
-        .await
-        .map_err(connect_error_to_status)?;
-    Ok(WalletQueryClient::new(channel))
-}
-
 #[allow(
     clippy::needless_pass_by_value,
     reason = "BearerTokenConnectError is moved out of the Result by the caller; the helper takes ownership"
 )]
 fn connect_error_to_status(error: BearerTokenConnectError) -> Status {
     Status::unavailable(format!("WalletQuery endpoint unreachable: {error}"))
+}
+
+/// Registers `# HELP` and `# TYPE` text for every metric this module emits.
+///
+/// Call once at startup, after `install_metrics_recorder` returns and before
+/// the gRPC server records its first request. Subsequent calls overwrite the
+/// stored descriptions; emitting a metric without a prior describe is fine
+/// but leaves the Prometheus `/metrics` text without a `# HELP` line.
+pub fn describe_request_metrics() {
+    metrics::describe_histogram!(
+        "zinder_explorer_request_duration_seconds",
+        metrics::Unit::Seconds,
+        "Wall-clock duration of ExplorerQuery RPCs handled by this service. \
+         Labels: operation (snake_case RPC method, e.g. transaction_detail), \
+         status (ok|error), error_class (tonic::Code name on error, 'none' on ok)."
+    );
+    metrics::describe_counter!(
+        "zinder_explorer_request_total",
+        metrics::Unit::Count,
+        "Total ExplorerQuery RPC outcomes observed by this service. Same labels \
+         as zinder_explorer_request_duration_seconds; sum across operations gives \
+         total RPC throughput."
+    );
+}
+
+/// Records per-RPC duration + status counters into the process-wide
+/// Prometheus recorder.
+///
+/// Mirrors the pattern `zinder-query` uses for its own request surface
+/// (`record_wallet_query_outcome`), making explorer reads observable in the
+/// same Grafana dashboards. The metrics live in the
+/// [`metrics::histogram!`] / [`metrics::counter!`] facade so they share the
+/// recorder installed by `zinder_runtime::install_metrics_recorder`. The
+/// histogram suffix matches `_duration_seconds` so the runtime applies the
+/// global bucket configuration.
+///
+/// `error_class` carries the `tonic::Code` name because explorer handlers
+/// return `Status` directly, so its vocabulary is coarser than zinder-query's
+/// per-error-variant labels (`invalid_block_range`, `artifact_unavailable`,
+/// ...). When the explorer grows a typed domain-error type, swap
+/// [`status_error_class`] for a domain-aware mapper to match.
+fn record_explorer_request(operation: &'static str, elapsed: Duration, error: Option<&Status>) {
+    let status = if error.is_some() { "error" } else { "ok" };
+    let error_class = error.map_or("none", |status| status_error_class(status));
+    metrics::histogram!(
+        "zinder_explorer_request_duration_seconds",
+        "operation" => operation,
+        "status" => status,
+        "error_class" => error_class
+    )
+    .record(elapsed);
+    metrics::counter!(
+        "zinder_explorer_request_total",
+        "operation" => operation,
+        "status" => status,
+        "error_class" => error_class
+    )
+    .increment(1);
+}
+
+/// Maps a `tonic::Status::code()` to the short string label the BFF and
+/// dashboards filter on. Mirrors `zinder-query`'s `query_error_class` so the
+/// two services share the same vocabulary.
+fn status_error_class(status: &Status) -> &'static str {
+    match status.code() {
+        Code::Ok => "none",
+        Code::Cancelled => "cancelled",
+        Code::InvalidArgument => "invalid_argument",
+        Code::DeadlineExceeded => "deadline_exceeded",
+        Code::NotFound => "not_found",
+        Code::AlreadyExists => "already_exists",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::Aborted => "aborted",
+        Code::OutOfRange => "out_of_range",
+        Code::Unimplemented => "unimplemented",
+        Code::Internal => "internal",
+        Code::Unavailable => "unavailable",
+        Code::DataLoss => "data_loss",
+        Code::Unauthenticated => "unauthenticated",
+        Code::Unknown => "unknown",
+    }
 }

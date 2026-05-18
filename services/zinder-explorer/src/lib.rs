@@ -31,7 +31,7 @@ pub use consumer::{
     MempoolConsumerEventVariant, RevertedRange,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
-pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
 pub use store::{
     ConsumerEntry, DERIVE_SCHEMA_VERSION, DeriveCursorEntry, DeriveStore, DeriveStoreOptions,
     DeriveStoreTable,

@@ -298,6 +298,31 @@ impl DeriveStore {
         Ok(entries)
     }
 
+    /// Returns the lexicographically last key in a consumer-owned column
+    /// family, or `None` when the column family is empty.
+    ///
+    /// Uses `RocksDB`'s reverse iterator (`IteratorMode::End`) so the lookup
+    /// is bounded by one seek plus one block read regardless of how many
+    /// entries the column family holds. Callers that need the "highest"
+    /// height-keyed materialized record use this instead of a full-table
+    /// scan to compute derive-cursor lag at request time.
+    pub fn last_consumer_key(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut iterator = self.db.iterator_cf(&handle, IteratorMode::End);
+        let Some(entry) = iterator.next() else {
+            return Ok(None);
+        };
+        let (key, _payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation: "last_key",
+            name: column_family,
+            source,
+        })?;
+        Ok(Some(key.to_vec()))
+    }
+
     fn validate_or_initialize_schema_version(&self) -> Result<(), DeriveStoreError> {
         let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, SCHEMA_VERSION_KEY)? else {
             return self.put(
@@ -393,6 +418,40 @@ mod tests {
         assert_eq!(store.get_cursor(TEST_CONSUMER)?, Some(vec![1, 2, 3]));
         store.put_cursor(TEST_CONSUMER, &[4, 5])?;
         assert_eq!(store.get_cursor(TEST_CONSUMER)?, Some(vec![4, 5]));
+        Ok(())
+    }
+
+    #[test]
+    fn last_consumer_key_returns_none_for_empty_column_family() -> Result<()> {
+        let tempdir = tempdir()?;
+        let options = DeriveStoreOptions {
+            consumer_column_families: &["test_cf"],
+            ..DeriveStoreOptions::default()
+        };
+        let store = DeriveStore::open(tempdir.path(), options)?;
+        assert_eq!(store.last_consumer_key("test_cf")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn last_consumer_key_returns_lexicographically_last_key() -> Result<()> {
+        let tempdir = tempdir()?;
+        let options = DeriveStoreOptions {
+            consumer_column_families: &["test_cf"],
+            ..DeriveStoreOptions::default()
+        };
+        let store = DeriveStore::open(tempdir.path(), options)?;
+        let handle = store.consumer_column_family("test_cf")?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&handle, 1_u32.to_be_bytes(), b"a");
+        batch.put_cf(&handle, 42_u32.to_be_bytes(), b"b");
+        batch.put_cf(&handle, 7_u32.to_be_bytes(), b"c");
+        drop(handle);
+        store.write_batch(&batch)?;
+        assert_eq!(
+            store.last_consumer_key("test_cf")?,
+            Some(42_u32.to_be_bytes().to_vec())
+        );
         Ok(())
     }
 
