@@ -10,6 +10,7 @@ use std::{
 };
 
 use rust_rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions};
+use zinder_core::BlockHeight;
 
 use crate::{
     consumer::DeriveConsumerName,
@@ -267,23 +268,60 @@ impl DeriveStore {
             })
     }
 
-    /// Iterates a consumer-owned column family, returning every entry whose
-    /// key lies in `[start_key, end_key_inclusive]` in ascending order. The
-    /// returned `Vec` is bounded by the caller's range; the helper collects
-    /// eagerly so the iterator's `RocksDB` snapshot is dropped before the
-    /// helper returns.
+    /// Batch-reads multiple keys from a consumer-owned column family.
+    ///
+    /// Returns one entry per input key in input order: `None` when the key
+    /// has no value. Issues one `multi_get_cf` so an N-key page costs one
+    /// round-trip into `RocksDB` rather than N point lookups.
+    pub fn multi_get_consumer<K>(
+        &self,
+        column_family: &'static str,
+        keys: &[K],
+    ) -> Result<Vec<Option<Vec<u8>>>, DeriveStoreError>
+    where
+        K: AsRef<[u8]>,
+    {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let handle = self.consumer_column_family(column_family)?;
+        let inputs = keys
+            .iter()
+            .map(|key| (&handle, key.as_ref()))
+            .collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(keys.len());
+        for outcome in self.db.multi_get_cf(inputs) {
+            let bytes = outcome.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "multi_get",
+                name: column_family,
+                source,
+            })?;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+
+    /// Iterates a consumer-owned column family, returning at most
+    /// `entries_cap` entries whose keys lie in `[start_key, end_key_inclusive]`
+    /// in ascending order. The helper short-circuits the scan as soon as
+    /// the cap is reached so memory is bounded by the cap rather than the
+    /// size of the prefix.
     pub fn range_iterate_consumer(
         &self,
         column_family: &'static str,
         start_key: &[u8],
         end_key_inclusive: &[u8],
+        entries_cap: usize,
     ) -> Result<Vec<ConsumerEntry>, DeriveStoreError> {
+        if entries_cap == 0 {
+            return Ok(Vec::new());
+        }
         let handle = self.consumer_column_family(column_family)?;
         let iterator = self.db.iterator_cf(
             &handle,
             IteratorMode::From(start_key, rust_rocksdb::Direction::Forward),
         );
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(entries_cap.min(64));
         for entry in iterator {
             let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
                 operation: "range_iterate",
@@ -294,6 +332,9 @@ impl DeriveStore {
                 break;
             }
             entries.push((key.to_vec(), payload.to_vec()));
+            if entries.len() >= entries_cap {
+                break;
+            }
         }
         Ok(entries)
     }
@@ -321,6 +362,75 @@ impl DeriveStore {
             source,
         })?;
         Ok(Some(key.to_vec()))
+    }
+
+    /// Returns the highest height materialized in an ascending-height
+    /// derive column family, or `None` when the column family is empty.
+    ///
+    /// Decodes the lexicographically last key as a four-byte big-endian
+    /// height via [`zinder_core::wire::decode_height_key_ascending`]. Use
+    /// this on column families whose primary key is exactly four bytes of
+    /// ascending height (the `BlockSummary` projection). Returns
+    /// [`DeriveStoreError::Decode`] when the last key is not four bytes,
+    /// which signals a column-family schema mismatch and should fail loudly.
+    pub fn last_materialized_height_ascending(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<BlockHeight>, DeriveStoreError> {
+        let Some(key) = self.last_consumer_key(column_family)? else {
+            return Ok(None);
+        };
+        zinder_core::wire::decode_height_key_ascending(&key)
+            .map(Some)
+            .map_err(|error| DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason: format!(
+                    "consumer column family `{column_family}` last key is not a 4-byte ascending height: {error}"
+                ),
+            })
+    }
+
+    /// Returns the highest height materialized in a descending-height
+    /// derive column family, or `None` when the column family is empty.
+    ///
+    /// Descending-keyed column families lay the newest block at the start
+    /// of the lexicographic range, so the highest materialized height is
+    /// the *first* key, not the last. This helper reads the first key via
+    /// the reverse iterator's complement direction so the lookup remains
+    /// bounded by one seek. Inverts the encoding from
+    /// [`zinder_core::wire::decode_height_key_descending`] for callers that
+    /// key on `(reverse_height, ...)` composites by inspecting the leading
+    /// four bytes.
+    pub fn last_materialized_height_descending(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<BlockHeight>, DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut iterator = self.db.iterator_cf(&handle, IteratorMode::Start);
+        let Some(entry) = iterator.next() else {
+            return Ok(None);
+        };
+        let (key, _payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation: "first_key",
+            name: column_family,
+            source,
+        })?;
+        let prefix = key.get(..zinder_core::wire::HEIGHT_KEY_LEN).ok_or_else(|| {
+            DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason: format!(
+                    "consumer column family `{column_family}` first key is shorter than the descending-height prefix"
+                ),
+            }
+        })?;
+        zinder_core::wire::decode_height_key_descending(prefix)
+            .map(Some)
+            .map_err(|error| DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason: format!(
+                    "consumer column family `{column_family}` first key descending-height prefix invalid: {error}"
+                ),
+            })
     }
 
     fn validate_or_initialize_schema_version(&self) -> Result<(), DeriveStoreError> {

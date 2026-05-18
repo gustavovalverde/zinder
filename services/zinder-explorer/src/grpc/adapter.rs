@@ -24,8 +24,9 @@ use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedSe
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
-    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1, EXPLORER_SEARCH_V1,
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
+    EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1, EXPLORER_SEARCH_V1, EXPLORER_SERVER_INFO_V1,
+    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_RECENT_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
     EXPLORER_VALUE_POOL_SUMMARY_V1,
 };
@@ -33,11 +34,13 @@ use zinder_proto::v1::{
     explorer::{
         BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
         BlockSummariesInRangeResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
-        MempoolActivityRequest, MempoolActivityResponse, MempoolSummaryRequest,
-        MempoolSummaryResponse, SearchRequest, SearchResponse, ServerInfoRequest,
+        MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
+        MempoolEventCountsResponse, MempoolSummaryRequest, MempoolSummaryResponse,
+        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
         ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
         TransparentAddressActivityRequest, TransparentAddressActivityResponse,
-        ValuePoolSummaryRequest, ValuePoolSummaryResponse,
+        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
+        VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -48,12 +51,21 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
-    connect_authenticated_channel,
+    RpcMetricNames, RpcOutcome, connect_authenticated_channel, describe_rpc_metrics,
+    record_rpc_request,
 };
+
+/// Metric pair the `ExplorerQuery` adapter emits per request.
+const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
+    "zinder_explorer_request_duration_seconds",
+    "zinder_explorer_request_total",
+);
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::fee_summary::handle_fee_summary;
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
+use super::mempool_event_counts::handle_mempool_event_counts;
+use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
 use super::search::handle_search;
 use super::transaction_detail::handle_transaction_detail;
 use super::transparent_address_activity::handle_transparent_address_activity;
@@ -89,6 +101,8 @@ pub struct ExplorerQueryGrpcAdapter {
     bearer_token: Option<BearerToken>,
     derive_store: Option<DeriveStore>,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
+    prevout_resolution_online: bool,
+    payment_disclosure_verifier_online: bool,
 }
 
 impl ExplorerQueryGrpcAdapter {
@@ -102,6 +116,8 @@ impl ExplorerQueryGrpcAdapter {
             bearer_token: None,
             derive_store: None,
             wallet_channel: Arc::new(OnceCell::new()),
+            prevout_resolution_online: false,
+            payment_disclosure_verifier_online: false,
         }
     }
 
@@ -141,6 +157,33 @@ impl ExplorerQueryGrpcAdapter {
         self
     }
 
+    /// Marks transparent prevout resolution as online so the adapter
+    /// advertises the per-tx paid-fee capability.
+    ///
+    /// The binary sets this flag once the `TransactionFeesConsumer` has
+    /// started and the upstream wallet plane advertises
+    /// `WALLET_READ_TRANSPARENT_PREVOUTS_V1`. The flag is the single source
+    /// of truth for whether paid-fee fields appear in `TransactionDetail`
+    /// and `MempoolActivity` responses; downstream handlers branch on
+    /// presence of materialized rows rather than re-reading this flag.
+    #[must_use]
+    pub const fn with_prevout_resolution_online(mut self, online: bool) -> Self {
+        self.prevout_resolution_online = online;
+        self
+    }
+
+    /// Marks the hosted payment-disclosure verifier as online so the adapter
+    /// advertises `EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1`.
+    ///
+    /// Operator-opt-in (default off): the consumer sees no capability and
+    /// falls back to local verification. Wiring the verifier is the binary's
+    /// responsibility; the flag only controls advertisement.
+    #[must_use]
+    pub const fn with_payment_disclosure_verifier_online(mut self, online: bool) -> Self {
+        self.payment_disclosure_verifier_online = online;
+        self
+    }
+
     /// Wraps the adapter into a tonic [`ExplorerQueryServer`] ready to be
     /// added to a `tonic::transport::Server` builder.
     #[must_use]
@@ -151,21 +194,47 @@ impl ExplorerQueryGrpcAdapter {
         ExplorerQueryServer::with_interceptor(self, interceptor)
     }
 
-    fn advertised_capabilities(&self) -> Vec<String> {
-        let mut capabilities = vec![EXPLORER_SERVER_INFO_V1.to_owned()];
-        if self.wallet_query_endpoint.is_some() {
-            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1.to_owned());
-            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1.to_owned());
-            capabilities.push(EXPLORER_SEARCH_V1.to_owned());
-            capabilities.push(EXPLORER_MEMPOOL_SUMMARY_V1.to_owned());
-            capabilities.push(EXPLORER_MEMPOOL_ACTIVITY_V1.to_owned());
-            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1.to_owned());
-            capabilities.push(EXPLORER_FEE_SUMMARY_V1.to_owned());
-            capabilities.push(EXPLORER_VALUE_POOL_SUMMARY_V1.to_owned());
+    /// Returns the capability strings the adapter currently advertises.
+    ///
+    /// Single source of truth for capability gating: `ServerInfo`, the ops
+    /// endpoint `/healthz`, and any future advertisement surface all read
+    /// from this method so a flag flip in one place reaches every consumer.
+    /// Per ADR-0018, each capability lights up only when the upstream
+    /// state it depends on is satisfied; the adapter never advertises a
+    /// capability whose handler would return `Unavailable`.
+    #[must_use]
+    pub fn advertised_capabilities(&self) -> Vec<&'static str> {
+        let wallet_query_online = self.wallet_query_endpoint.is_some();
+        let derive_store_online = self.derive_store.is_some();
+        let prevout_resolution_online = self.prevout_resolution_online && wallet_query_online;
+        let payment_disclosure_verifier_online = self.payment_disclosure_verifier_online;
+
+        let mut capabilities = vec![EXPLORER_SERVER_INFO_V1];
+        if wallet_query_online {
+            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
+            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1);
+            capabilities.push(EXPLORER_SEARCH_V1);
+            capabilities.push(EXPLORER_MEMPOOL_SUMMARY_V1);
+            capabilities.push(EXPLORER_MEMPOOL_ACTIVITY_V1);
+            capabilities.push(EXPLORER_FEE_SUMMARY_V1);
+            capabilities.push(EXPLORER_VALUE_POOL_SUMMARY_V1);
         }
-        if self.derive_store.is_some() && self.wallet_query_endpoint.is_some() {
-            capabilities.push(EXPLORER_BLOCK_SUMMARY_V1.to_owned());
-            capabilities.push(EXPLORER_BLOCK_DETAIL_V1.to_owned());
+        if derive_store_online && wallet_query_online {
+            capabilities.push(EXPLORER_BLOCK_SUMMARY_V1);
+            capabilities.push(EXPLORER_BLOCK_DETAIL_V1);
+            capabilities.push(EXPLORER_MEMPOOL_EVENT_COUNTS_V1);
+            capabilities.push(EXPLORER_TRANSACTION_RECENT_V1);
+            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1);
+            // ADR-0018: TRANSACTION_FEES_V1 surfaces paid_fee_zat on
+            // TransactionDetail / RecentTransactions / MempoolActivity,
+            // all of which need the transparent-prevouts upstream to be
+            // online. Advertise only when both gates are satisfied.
+            if prevout_resolution_online {
+                capabilities.push(EXPLORER_TRANSACTION_FEES_V1);
+            }
+        }
+        if payment_disclosure_verifier_online {
+            capabilities.push(EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1);
         }
         capabilities
     }
@@ -195,7 +264,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                     network: encode_zinder_native_chain_name(self.settings.network).to_owned(),
                     service_name: env!("CARGO_PKG_NAME").to_owned(),
                     service_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    capabilities: self.advertised_capabilities(),
+                    capabilities: self
+                        .advertised_capabilities()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                 }),
                 vendor: "Zinder".to_owned(),
             }),
@@ -238,7 +311,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transaction_detail(&mut client, self.settings.network, request).await
+            handle_transaction_detail(
+                &mut client,
+                self.derive_store.as_ref(),
+                self.settings.network,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -353,8 +432,17 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                Status::unavailable("TransparentAddressActivity requires a derive store")
+            })?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transparent_address_activity(&mut client, request).await
+            handle_transparent_address_activity(
+                derive_store,
+                &mut client,
+                self.settings.network,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -393,6 +481,81 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             handle_value_pool_summary(&mut client, request).await
         }
         .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn mempool_event_counts(
+        &self,
+        request: Request<MempoolEventCountsRequest>,
+    ) -> Result<Response<MempoolEventCountsResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "MempoolEventCounts",
+            metric: "mempool_event_counts",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self
+                .derive_store
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("MempoolEventCounts requires a derive store"))?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_mempool_event_counts(derive_store, &mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    type RecentTransactionsStream = RecentTransactionsStream;
+
+    async fn recent_transactions(
+        &self,
+        request: Request<RecentTransactionsRequest>,
+    ) -> Result<Response<Self::RecentTransactionsStream>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "RecentTransactions",
+            metric: "recent_transactions",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self
+                .derive_store
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("RecentTransactions requires a derive store"))?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_recent_transactions(derive_store, &mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn verify_payment_disclosure(
+        &self,
+        _request: Request<VerifyPaymentDisclosureRequest>,
+    ) -> Result<Response<VerifyPaymentDisclosureResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "VerifyPaymentDisclosure",
+            metric: "verify_payment_disclosure",
+        };
+        let started = Instant::now();
+        // ZIP-311 verifier opt-in (off by default). Operator-flagged because
+        // verification work would otherwise execute on bytes the operator
+        // never approved. The handler never logs or spans
+        // `request.payment_disclosure_bytes`; that is the redaction
+        // contract documented alongside the RPC.
+        let outcome: Result<Response<VerifyPaymentDisclosureResponse>, Status> = if self
+            .payment_disclosure_verifier_online
+        {
+            Err(Status::failed_precondition(
+                "VerifyPaymentDisclosure is wired but no ZIP-311 verifier is bundled in this build",
+            ))
+        } else {
+            Err(Status::unimplemented(
+                "VerifyPaymentDisclosure is disabled on this server; consumer must fall back to local verification",
+            ))
+        };
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -561,59 +724,25 @@ fn connect_error_to_status(error: BearerTokenConnectError) -> Status {
 /// Registers `# HELP` and `# TYPE` text for every metric this module emits.
 ///
 /// Call once at startup, after `install_metrics_recorder` returns and before
-/// the gRPC server records its first request. Subsequent calls overwrite the
-/// stored descriptions; emitting a metric without a prior describe is fine
-/// but leaves the Prometheus `/metrics` text without a `# HELP` line.
+/// the gRPC server records its first request. Delegates to
+/// [`describe_rpc_metrics`] so every Zinder service shares one description
+/// template.
 pub fn describe_request_metrics() {
-    metrics::describe_histogram!(
-        "zinder_explorer_request_duration_seconds",
-        metrics::Unit::Seconds,
-        "Wall-clock duration of ExplorerQuery RPCs handled by this service. \
-         Labels: operation (snake_case RPC method, e.g. transaction_detail), \
-         status (ok|error), error_class (tonic::Code name on error, 'none' on ok)."
-    );
-    metrics::describe_counter!(
-        "zinder_explorer_request_total",
-        metrics::Unit::Count,
-        "Total ExplorerQuery RPC outcomes observed by this service. Same labels \
-         as zinder_explorer_request_duration_seconds; sum across operations gives \
-         total RPC throughput."
-    );
+    describe_rpc_metrics(EXPLORER_RPC_METRICS, "ExplorerQuery");
 }
 
-/// Records per-RPC duration + status counters into the process-wide
-/// Prometheus recorder.
+/// Records per-RPC duration + status counters via
+/// [`record_rpc_request`].
 ///
-/// Mirrors the pattern `zinder-query` uses for its own request surface
-/// (`record_wallet_query_outcome`), making explorer reads observable in the
-/// same Grafana dashboards. The metrics live in the
-/// [`metrics::histogram!`] / [`metrics::counter!`] facade so they share the
-/// recorder installed by `zinder_runtime::install_metrics_recorder`. The
-/// histogram suffix matches `_duration_seconds` so the runtime applies the
-/// global bucket configuration.
-///
-/// `error_class` carries the `tonic::Code` name because explorer handlers
-/// return `Status` directly, so its vocabulary is coarser than zinder-query's
-/// per-error-variant labels (`invalid_block_range`, `artifact_unavailable`,
-/// ...). When the explorer grows a typed domain-error type, swap
-/// [`status_error_class`] for a domain-aware mapper to match.
+/// Explorer handlers return [`tonic::Status`] directly, so the
+/// `error_class` vocabulary is the tonic [`Code`] name. When the explorer
+/// grows a typed domain-error type, swap [`status_error_class`] for a
+/// domain-aware mapper to keep labels aligned with operator dashboards.
 fn record_explorer_request(operation: &'static str, elapsed: Duration, error: Option<&Status>) {
-    let status = if error.is_some() { "error" } else { "ok" };
-    let error_class = error.map_or("none", |status| status_error_class(status));
-    metrics::histogram!(
-        "zinder_explorer_request_duration_seconds",
-        "operation" => operation,
-        "status" => status,
-        "error_class" => error_class
-    )
-    .record(elapsed);
-    metrics::counter!(
-        "zinder_explorer_request_total",
-        "operation" => operation,
-        "status" => status,
-        "error_class" => error_class
-    )
-    .increment(1);
+    let outcome = error.map_or(RpcOutcome::Ok, |status| RpcOutcome::Error {
+        class: status_error_class(status),
+    });
+    record_rpc_request(EXPLORER_RPC_METRICS, operation, elapsed, outcome);
 }
 
 /// Maps a `tonic::Status::code()` to the short string label the BFF and

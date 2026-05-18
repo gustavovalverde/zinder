@@ -59,6 +59,9 @@ pub(crate) enum ExplorerConfigError {
 
     #[error("invalid explorer bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),
+
+    #[error("derive consumer setup failed: {0}")]
+    ConsumerSetup(String),
 }
 
 /// Loads and validates explorer configuration from defaults, file, environment, and CLI overrides.

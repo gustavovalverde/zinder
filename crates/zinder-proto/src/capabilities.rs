@@ -145,6 +145,43 @@ pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 /// `ChainValuePoolsAtTip` primitive. The response preserves upstream pool ids
 /// instead of projecting into a fixed list of known pools.
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
+/// Capability advertised for the per-transaction paid-fee surface.
+///
+/// Signals that the explorer plane has the transparent prevout index
+/// online and the `TransactionFeesConsumer` has materialized per-tx fee
+/// rows. When advertised, `TransactionDetail` responses populate
+/// `paid_fee_zat` and `transparent_inputs[].value_zat`; absent, those
+/// fields stay default and consumers fall back to
+/// `zip317_conventional_fee_zat` with a `prevout_resolution_status` chip.
+pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
+/// Capability advertised for `ExplorerQuery.RecentTransactions`.
+///
+/// Signals that the explorer plane materializes a time-descending
+/// projection of the most recent transactions into the
+/// `recent_transactions` derive column family, served as a single
+/// streaming RPC. Eliminates the consumer-side N+1 round-trip tree of
+/// `BlockSummariesInRange` + per-block `BlockDetail` + per-tx
+/// `TransactionDetail` calls a "recent transactions" panel would
+/// otherwise issue.
+pub const EXPLORER_TRANSACTION_RECENT_V1: &str = "explorer.transaction.recent_v1";
+/// Capability advertised for `ExplorerQuery.MempoolEventCounts`.
+///
+/// Signals that the explorer plane materializes per-second counters of
+/// `Added`, `Mined`, `Invalidated`, and `Suppressed` mempool events into
+/// a derive column family. Replaces the in-memory ring buffer the BFF
+/// used to keep alongside its own `WalletQuery.MempoolEvents`
+/// subscription; the count surface survives consumer restarts and works
+/// across horizontally scaled consumer replicas.
+pub const EXPLORER_MEMPOOL_EVENT_COUNTS_V1: &str = "explorer.mempool.event_counts_v1";
+/// Capability advertised for `ExplorerQuery.VerifyPaymentDisclosure`.
+///
+/// Signals that the explorer plane runs the
+/// [ZIP-311](https://zips.z.cash/zip-0311) payment-disclosure verifier
+/// in-process with strict request-bytes redaction. Operator opt-in:
+/// disabled by default. When the capability is absent, the consumer
+/// falls back to its own local verifier; presence is the consumer's
+/// signal to route to the hosted path.
+pub const EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1: &str = "explorer.payment_disclosure.verify_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -259,6 +296,9 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
     EXPLORER_FEE_SUMMARY_V1,
     EXPLORER_VALUE_POOL_SUMMARY_V1,
+    EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+    EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_TRANSACTION_RECENT_V1,
 ];
 
 /// Helpers for client-side capability discovery.

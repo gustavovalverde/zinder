@@ -39,3 +39,16 @@ pub const UNIFIED_RECEIVER_UNKNOWN_TYPECODE: &str =
 /// addresses constrain the sender to transparent inputs only; on chain the
 /// output is indistinguishable from the underlying P2PKH.
 pub const TEX_TRANSPARENT_SOURCE_ONLY: &str = "TEX address: transparent inputs only";
+
+/// Sapling, Orchard, or Sprout address on the mainnet HRP family.
+pub const SHIELDED_RECEIVER_MAINNET_NO_HISTORY: &str =
+    "Shielded receiver (mainnet): no public history by protocol design";
+
+/// Sapling, Orchard, or Sprout address on the testnet or regtest HRP family.
+pub const SHIELDED_RECEIVER_TESTNET_NO_HISTORY: &str =
+    "Shielded receiver (testnet/regtest): no public history by protocol design";
+
+/// Unified address that decoded successfully but exposes no transparent
+/// receiver, so the explorer has nothing publicly indexable to route to.
+pub const UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER: &str =
+    "Unified address: no transparent receiver to route to public history";

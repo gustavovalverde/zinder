@@ -26,6 +26,7 @@ mod env_var_docs;
 mod metrics;
 mod ops_endpoint;
 mod readiness;
+mod rpc_metrics;
 mod sections;
 mod startup_phase;
 
@@ -51,6 +52,7 @@ pub use readiness::{
     IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
     UpstreamHealth, UpstreamNotReadyDetail,
 };
+pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
     IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlReader,

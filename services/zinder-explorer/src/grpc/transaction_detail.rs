@@ -11,19 +11,21 @@
 use tonic::{Request, Response, Status};
 use zinder_core::{
     BlockHeight, ConsensusBranchId, LockTime as CoreLockTime, NetworkUpgradeActivations,
-    PrivacyShape as CorePrivacyShape, TransactionPublicFacts as CoreFacts,
-    TransactionVersion as CoreTransactionVersion,
+    TransactionPublicFacts as CoreFacts, TransactionVersion as CoreTransactionVersion,
     wire::{decode_internal_transaction_id, encode_branch_id_hex, encode_internal_transaction_id},
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V1;
+use zinder_proto::wire::encode_privacy_shape;
+
+use crate::consumer::transaction_fees::TransactionFeesConsumer;
+use crate::store::DeriveStore;
 use zinder_proto::v1::{
     explorer::{
         ExplorerFreshness, LockTime as WireLockTime, LockTimeUnlocked, MempoolLocation,
-        MinedLocation, PrivacyShape as WirePrivacyShape, TransactionComponentCounts,
-        TransactionDetailRequest, TransactionDetailResponse,
-        TransactionLocation as WireTransactionLocation, TransactionPublicFacts as WireFacts,
-        TransactionVersion as WireVersion, TransactionVersionKind, lock_time as wire_lock_time,
-        transaction_location as wire_location,
+        MinedLocation, TransactionComponentCounts, TransactionDetailRequest,
+        TransactionDetailResponse, TransactionLocation as WireTransactionLocation,
+        TransactionPublicFacts as WireFacts, TransactionVersion as WireVersion,
+        TransactionVersionKind, lock_time as wire_lock_time, transaction_location as wire_location,
     },
     wallet::{self, transaction_status_response, wallet_query_client::WalletQueryClient},
 };
@@ -32,6 +34,7 @@ use zinder_runtime::AuthenticatedChannel;
 /// Executes one `ExplorerQuery.TransactionDetail` request.
 pub(crate) async fn handle_transaction_detail(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    derive_store: Option<&DeriveStore>,
     network: zinder_core::Network,
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
@@ -80,11 +83,25 @@ pub(crate) async fn handle_transaction_detail(
         unavailable: Vec::new(),
     };
 
+    let fees = derive_store
+        .and_then(|store| TransactionFeesConsumer::read_fees_record(store, transaction_id).ok())
+        .flatten();
+    let (paid_fee_zat, prevout_resolution_status, transparent_inputs) = match fees {
+        Some(record) => (
+            record.paid_fee_zat,
+            record.prevout_resolution_status,
+            record.transparent_inputs,
+        ),
+        None => (None, 0, Vec::new()),
+    };
     Ok(Response::new(TransactionDetailResponse {
         freshness: Some(freshness),
         facts: Some(encode_public_facts(&core_facts)),
         location: Some(location),
         raw_transaction_bytes: raw_bytes,
+        paid_fee_zat,
+        prevout_resolution_status,
+        transparent_inputs,
     }))
 }
 
@@ -191,17 +208,4 @@ fn encode_lock_time(lock_time: CoreLockTime) -> WireLockTime {
         CoreLockTime::UnixSeconds(seconds) => wire_lock_time::Kind::UnixSeconds(seconds),
     };
     WireLockTime { kind: Some(kind) }
-}
-
-const fn encode_privacy_shape(shape: CorePrivacyShape) -> WirePrivacyShape {
-    match shape {
-        CorePrivacyShape::TransparentOnly => WirePrivacyShape::TransparentOnly,
-        CorePrivacyShape::Shielding => WirePrivacyShape::Shielding,
-        CorePrivacyShape::Deshielding => WirePrivacyShape::Deshielding,
-        CorePrivacyShape::ShieldedOnly => WirePrivacyShape::ShieldedOnly,
-        CorePrivacyShape::Mixed => WirePrivacyShape::Mixed,
-        CorePrivacyShape::Coinbase => WirePrivacyShape::Coinbase,
-        CorePrivacyShape::ShieldedCoinbase => WirePrivacyShape::ShieldedCoinbase,
-        CorePrivacyShape::Unclassified => WirePrivacyShape::Unclassified,
-    }
 }

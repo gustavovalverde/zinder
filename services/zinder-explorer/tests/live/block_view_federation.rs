@@ -161,7 +161,11 @@ async fn build_block_summary_consumer(wallet_endpoint: &str) -> Result<BlockSumm
     let channel = connect_authenticated_channel(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer connect: {error}"))?;
-    Ok(BlockSummaryConsumer::new(WalletQueryClient::new(channel)))
+    let block_source = zinder_explorer::BlockSource::new(
+        WalletQueryClient::new(channel),
+        zinder_explorer::PrevoutResolver::Offline,
+    );
+    Ok(BlockSummaryConsumer::new(block_source))
 }
 
 fn make_synthetic_chain_epoch(network: Network, tip_height: BlockHeight) -> ChainEpoch {
@@ -520,7 +524,11 @@ async fn drive_once(
     let channel_for_consumer = connect_authenticated_channel(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer fetch connect: {error}"))?;
-    let mut consumer = BlockSummaryConsumer::new(WalletQueryClient::new(channel_for_consumer));
+    let block_source = zinder_explorer::BlockSource::new(
+        WalletQueryClient::new(channel_for_consumer),
+        zinder_explorer::PrevoutResolver::Offline,
+    );
+    let mut consumer = BlockSummaryConsumer::new(block_source);
     tokio::select! {
         outcome = run_chain_events_subscriber(&mut consumer, store, stream) => {
             outcome.map(|_| ()).map_err(|error| eyre!("subscriber: {error}"))

@@ -4,6 +4,8 @@ mod adapter;
 mod block_view;
 mod fee_summary;
 mod mempool;
+mod mempool_event_counts;
+mod recent_transactions;
 mod search;
 mod transaction_detail;
 mod transparent_address_activity;

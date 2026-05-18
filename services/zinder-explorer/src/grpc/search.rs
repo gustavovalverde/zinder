@@ -15,8 +15,10 @@
 
 use tonic::{Request, Response, Status};
 use zinder_core::explorer_reasons::{
-    SHIELDED_RECEIVER_IN_UNIFIED, SHIELDED_RECEIVER_NO_HISTORY, TEX_TRANSPARENT_SOURCE_ONLY,
-    UNIFIED_RECEIVER_UNKNOWN_TYPECODE, VIEWING_KEY_NEVER_INDEXED,
+    SHIELDED_RECEIVER_IN_UNIFIED, SHIELDED_RECEIVER_MAINNET_NO_HISTORY,
+    SHIELDED_RECEIVER_TESTNET_NO_HISTORY, TEX_TRANSPARENT_SOURCE_ONLY,
+    UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER, UNIFIED_RECEIVER_UNKNOWN_TYPECODE,
+    VIEWING_KEY_NEVER_INDEXED,
 };
 use zinder_core::explorer_search::{
     SearchClassification, ShieldedReceiverKind, TexAddressClassification,
@@ -81,15 +83,45 @@ async fn project_classification(
             search_candidate::Match::TexAddress(tex_match(&classification)),
             CONFIDENCE_HIGH,
         )]),
-        SearchClassification::UnifiedAddress(classification) => Ok(vec![candidate_with_match(
-            search_candidate::Match::UnifiedAddress(unified_match(network, classification)),
-            CONFIDENCE_HIGH,
-        )]),
-        SearchClassification::ShieldedAddress { canonical } => Ok(vec![candidate_with_match(
+        SearchClassification::UnifiedAddress(classification) => {
+            let has_transparent = classification.receivers.iter().any(|receiver| {
+                matches!(
+                    receiver,
+                    zinder_core::explorer_search::UnifiedAddressReceiverClassification::Transparent(
+                        _
+                    )
+                )
+            });
+            let mut candidates = vec![candidate_with_match(
+                search_candidate::Match::UnifiedAddress(unified_match(
+                    network,
+                    classification.clone(),
+                )),
+                CONFIDENCE_HIGH,
+            )];
+            if !has_transparent {
+                candidates.push(candidate_with_match(
+                    search_candidate::Match::ShieldedAddress(ShieldedAddressMatch {
+                        not_publicly_indexable: Some(NotPubliclyIndexable {
+                            reason: NotPubliclyIndexableReason::UnifiedAddressNoTransparentReceiver
+                                as i32,
+                            human_reason: UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER.to_owned(),
+                            canonical_form: Some(classification.canonical_form),
+                        }),
+                    }),
+                    CONFIDENCE_HIGH,
+                ));
+            }
+            Ok(candidates)
+        }
+        SearchClassification::ShieldedAddress {
+            canonical,
+            network: address_network,
+        } => Ok(vec![candidate_with_match(
             search_candidate::Match::ShieldedAddress(ShieldedAddressMatch {
                 not_publicly_indexable: Some(NotPubliclyIndexable {
-                    reason: NotPubliclyIndexableReason::ShieldedAddress as i32,
-                    human_reason: SHIELDED_RECEIVER_NO_HISTORY.to_owned(),
+                    reason: shielded_address_reason(address_network) as i32,
+                    human_reason: shielded_address_human_reason(address_network).to_owned(),
                     canonical_form: Some(canonical),
                 }),
             }),
@@ -320,6 +352,28 @@ const fn candidate_with_match(
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Network is non-exhaustive; any future variant must default to the privacy-conservative testnet vocabulary"
+)]
+const fn shielded_address_reason(network: zinder_core::Network) -> NotPubliclyIndexableReason {
+    match network {
+        zinder_core::Network::ZcashMainnet => NotPubliclyIndexableReason::ShieldedAddressMainnet,
+        _ => NotPubliclyIndexableReason::ShieldedAddressTestnet,
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Network is non-exhaustive; any future variant must default to the privacy-conservative testnet vocabulary"
+)]
+const fn shielded_address_human_reason(network: zinder_core::Network) -> &'static str {
+    match network {
+        zinder_core::Network::ZcashMainnet => SHIELDED_RECEIVER_MAINNET_NO_HISTORY,
+        _ => SHIELDED_RECEIVER_TESTNET_NO_HISTORY,
+    }
+}
+
 async fn build_freshness(
     derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -352,10 +406,8 @@ async fn build_freshness(
 
 fn highest_block_summary_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
     use crate::consumer::block_summary::BLOCK_SUMMARY_COLUMN_FAMILY;
-    let highest = derive_store
-        .last_consumer_key(BLOCK_SUMMARY_COLUMN_FAMILY)
+    Ok(derive_store
+        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
         .map_err(|error| Status::internal(error.to_string()))?
-        .and_then(|key| <[u8; 4]>::try_from(key.as_slice()).ok())
-        .map(u32::from_be_bytes);
-    Ok(highest)
+        .map(zinder_core::BlockHeight::value))
 }

@@ -44,7 +44,8 @@ pub use source_block::{
 pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::{
-    parse_transaction_public_facts, transparent_prevout_from_raw_transaction_bytes,
+    parse_transaction_public_facts, transaction_component_counts,
+    transparent_prevout_from_raw_transaction_bytes,
 };
 pub use transparent_address::transparent_address_matches_network;
 pub use upstream_health::{

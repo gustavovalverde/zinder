@@ -7,7 +7,9 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
     BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter,
-    ExplorerServerInfoSettings, describe_request_metrics,
+    ExplorerServerInfoSettings, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    RECENT_TRANSACTIONS_COLUMN_FAMILY, TRANSACTION_FEES_COLUMN_FAMILIES,
+    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES, describe_request_metrics,
 };
 use zinder_runtime::{
     Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
@@ -18,11 +20,28 @@ mod config;
 mod consumer_runner;
 
 use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
-use consumer_runner::run_block_summary_consumer;
 
-/// Column-family list passed to `DeriveStore::open` so every consumer-owned
-/// table the binary depends on is registered at startup.
-const CONSUMER_COLUMN_FAMILIES: &[&str] = &[BLOCK_SUMMARY_COLUMN_FAMILY];
+/// Column-family list passed to `DeriveStore::open` at startup.
+///
+/// Aggregated from each consumer's `*_COLUMN_FAMILIES` constant so a new
+/// consumer's additional column families are picked up by adding one
+/// slice entry here.
+fn consumer_column_families() -> Vec<&'static str> {
+    let mut families: Vec<&'static str> = Vec::new();
+    families.push(BLOCK_SUMMARY_COLUMN_FAMILY);
+    families.push(MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY);
+    families.push(RECENT_TRANSACTIONS_COLUMN_FAMILY);
+    families.extend_from_slice(TRANSACTION_FEES_COLUMN_FAMILIES);
+    families.extend_from_slice(TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES);
+    families
+}
+
+/// Leaked &'static slice the store retains across its lifetime. Built once at
+/// startup; size is bounded by the number of consumers compiled into the
+/// binary.
+fn consumer_column_families_static() -> &'static [&'static str] {
+    Box::leak(consumer_column_families().into_boxed_slice())
+}
 
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
@@ -50,8 +69,8 @@ struct Cli {
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
-    /// `WalletQuery` gRPC endpoint that backs the `TransparentAddressBalance`
-    /// federated read path. Empty/unset disables the balance capability.
+    /// `WalletQuery` gRPC endpoint that backs the federated read paths.
+    /// Empty/unset disables every capability that needs upstream reads.
     #[arg(long = "wallet-query-endpoint")]
     wallet_query_endpoint: Option<String>,
 }
@@ -109,14 +128,6 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Explorer,
-        explorer_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(explorer_config.network),
-        readiness.clone(),
-    );
-    describe_request_metrics();
 
     let store = match open_derive_store(&explorer_config) {
         Ok(store) => store,
@@ -125,11 +136,32 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             return Err(error);
         }
     };
-    let grpc_adapter = build_grpc_adapter(&explorer_config, store.clone());
+
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_ctrl_c(cancel.clone());
 
-    let consumer_handle = spawn_block_summary_consumer(&explorer_config, store, cancel.clone());
+    let (consumer_handles, prevouts_online) =
+        match maybe_spawn_consumers(&explorer_config, store.clone(), cancel.clone()).await {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
+
+    let grpc_adapter = build_grpc_adapter(&explorer_config, store, prevouts_online);
+    let advertised_capabilities = grpc_adapter.advertised_capabilities();
+
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Explorer,
+        explorer_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(explorer_config.network),
+        readiness.clone(),
+        advertised_capabilities,
+    );
+    describe_request_metrics();
+
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::ready(None));
@@ -157,8 +189,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
-
-    if let Some(handle) = consumer_handle {
+    for handle in consumer_handles {
         let _ = handle.await;
     }
 
@@ -171,7 +202,7 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
         &explorer_config.storage_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: CONSUMER_COLUMN_FAMILIES,
+            consumer_column_families: consumer_column_families_static(),
         },
     ) {
         Ok(handle) => {
@@ -189,11 +220,14 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
 fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     store: DeriveStore,
+    prevouts_online: bool,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
-    let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info).with_derive_store(store);
+    let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
+        .with_derive_store(store)
+        .with_prevout_resolution_online(prevouts_online);
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
@@ -203,15 +237,19 @@ fn build_grpc_adapter(
     grpc_adapter
 }
 
-fn spawn_block_summary_consumer(
+async fn maybe_spawn_consumers(
     explorer_config: &ExplorerConfig,
     store: DeriveStore,
     cancel: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let endpoint = explorer_config.wallet_query_endpoint.clone()?;
-    Some(tokio::spawn(async move {
-        run_block_summary_consumer(store, endpoint, cancel).await;
-    }))
+) -> Result<(Vec<tokio::task::JoinHandle<()>>, bool), ExplorerConfigError> {
+    let Some(endpoint) = explorer_config.wallet_query_endpoint.as_deref() else {
+        return Ok((Vec::new(), false));
+    };
+    let (env, prevouts_online) = consumer_runner::build_environment(store, endpoint)
+        .await
+        .map_err(|error| ExplorerConfigError::ConsumerSetup(error.to_string()))?;
+    let handles = consumer_runner::spawn_all(env, cancel);
+    Ok((handles, prevouts_online))
 }
 
 fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {

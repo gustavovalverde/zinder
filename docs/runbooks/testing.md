@@ -824,6 +824,9 @@ explorer.mempool.activity_v1
 explorer.transparent_address.activity_v1
 explorer.fee.summary_v1
 explorer.value_pool.summary_v1
+explorer.mempool.event_counts_v1
+explorer.transaction.fees_v1
+explorer.transaction.recent_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

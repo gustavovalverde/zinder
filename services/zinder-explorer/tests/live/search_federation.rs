@@ -224,9 +224,16 @@ async fn search_refuses_shielded_address_and_viewing_key_without_canonical_form(
             .not_publicly_indexable
             .as_ref()
             .ok_or_else(|| eyre!("ShieldedAddressMatch missing NotPubliclyIndexable body"))?;
-        assert_eq!(
-            refusal.reason,
-            NotPubliclyIndexableReason::ShieldedAddress as i32,
+        let reason = NotPubliclyIndexableReason::try_from(refusal.reason)
+            .map_err(|_| eyre!("unknown NotPubliclyIndexableReason code {}", refusal.reason))?;
+        assert!(
+            matches!(
+                reason,
+                NotPubliclyIndexableReason::ShieldedAddress
+                    | NotPubliclyIndexableReason::ShieldedAddressMainnet
+                    | NotPubliclyIndexableReason::ShieldedAddressTestnet,
+            ),
+            "expected a shielded-address refusal variant, got {reason:?}",
         );
         assert!(
             !refusal.human_reason.is_empty(),

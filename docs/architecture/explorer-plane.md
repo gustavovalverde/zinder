@@ -227,6 +227,30 @@ The explorer plane fails independently from canonical state.
 - An explorer derive view becoming inconsistent does not corrupt canonical state. Operators drop the explorer store and rebuild from `WalletQuery.ChainEvents` at `cursor = None`.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
+## Cursor expiry contract
+
+Every paginated explorer RPC that emits a `next_cursor`
+(`BlockSummariesInRange` does not, but the streaming `RecentTransactions`
+and the address-keyed `TransparentAddressActivity` do) treats the
+returned bytes as **valid for the lifetime of the column-family snapshot
+at issue time**. Concretely:
+
+- A cursor that resolves to a height range still present in the consumer
+  CF resumes cleanly on the next request.
+- A cursor that references a height range the consumer has dropped (a
+  rolling reorg removed it, or a deliberate operator rebuild started
+  fresh) is rejected with
+  `Status::FailedPrecondition` carrying a typed
+  `CursorExpiredError` in the gRPC status details. The error carries
+  `recommended_resume_height` (the new safe starting point) and `hint`
+  (a short sentence a UI may render verbatim).
+
+Consumers handle expiry by either re-issuing the request with an empty
+cursor (page from the head) or jumping to
+`recommended_resume_height`. Silently jumping past the rewound range is
+explicitly _not_ the server's responsibility; masking the discontinuity
+would lose the reorg signal a UI needs to render a "view refreshed" hint.
+
 ## Source-boundary extensions
 
 The explorer plane never calls upstream Zcash node RPCs. When a view needs a fact that is not in canonical artifacts or replayable events, the source boundary extends first:
@@ -253,6 +277,8 @@ The explorer plane lands incrementally. Each slice ships testable, capability-ad
 | ~~**5b**~~ | _Shipped._ `ValuePoolSummary` composes `WalletQuery.ChainValuePoolsAtTip`, which proxies through `IngestControl` to the writer-owned source handle. The response preserves upstream pool ids as repeated entries. | `explorer.value_pool.summary_v1` |
 
 Slices 2-5 landed after Slice 1 established the parser, freshness envelope, and federation patterns.
+
+Slice 6 (block-explorer consumer PRD) extended every existing surface with capability-gated optional fields and added four new column families: `transaction_fees`, `mempool_event_counts`, `transparent_address_activity` (rebuilt), `recent_transactions`. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the capability-gated field convention.
 
 ## Cross-references
 

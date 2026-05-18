@@ -11,6 +11,8 @@
 
 use prost::Message as _;
 use tonic::{Request, Response, Status};
+use zinder_core::BlockHeight;
+use zinder_core::wire::encode_height_key_ascending;
 use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
     BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
@@ -52,30 +54,36 @@ pub(crate) async fn handle_block_summaries_in_range(
         )));
     }
 
-    let start_key = start_height.to_be_bytes();
-    let end_key = end_height.to_be_bytes();
+    let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
+    let end_key = encode_height_key_ascending(BlockHeight::new(end_height));
     let entries = derive_store
-        .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key)
+        .range_iterate_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &start_key,
+            &end_key,
+            MAX_BLOCK_SUMMARIES_PER_REQUEST as usize,
+        )
         .map_err(|error| Status::internal(error.to_string()))?;
 
+    let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
     let mut summaries = Vec::with_capacity(entries.len());
     for (_, payload) in entries {
         let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
             Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?;
-        let summary = record
+        let mut summary = record
             .summary
             .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+        annotate_request_time_fields(&mut summary, canonical_tip);
         summaries.push(summary);
     }
 
-    let freshness = build_freshness(
+    let freshness = build_freshness_from_tip(
         derive_store,
-        wallet_client,
         EXPLORER_BLOCK_SUMMARY_V1,
-        summaries.last().map(|summary| summary.block_height),
-    )
-    .await?;
+        chain_epoch,
+        canonical_tip,
+    )?;
 
     Ok(Response::new(BlockSummariesInRangeResponse {
         freshness: Some(freshness),
@@ -90,7 +98,7 @@ pub(crate) async fn handle_block_detail(
 ) -> Result<Response<BlockDetailResponse>, Status> {
     let inner = request.into_inner();
     let height = resolve_block_height(wallet_client, &inner).await?;
-    let key = height.to_be_bytes();
+    let key = encode_height_key_ascending(BlockHeight::new(height));
     let payload = derive_store
         .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &key)
         .map_err(|error| Status::internal(error.to_string()))?
@@ -101,24 +109,36 @@ pub(crate) async fn handle_block_detail(
         })?;
     let record = BlockSummaryRecord::decode(payload.as_slice())
         .map_err(|error| Status::internal(format!("BlockSummaryRecord decode failed: {error}")))?;
-    let summary = record
+    let mut summary = record
         .summary
         .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
     let transaction_ids = record.transaction_ids;
 
-    let freshness = build_freshness(
+    let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
+    annotate_request_time_fields(&mut summary, canonical_tip);
+
+    let freshness = build_freshness_from_tip(
         derive_store,
-        wallet_client,
         EXPLORER_BLOCK_DETAIL_V1,
-        Some(summary.block_height),
-    )
-    .await?;
+        chain_epoch,
+        canonical_tip,
+    )?;
 
     Ok(Response::new(BlockDetailResponse {
         freshness: Some(freshness),
         summary: Some(summary),
         transaction_ids,
     }))
+}
+
+fn annotate_request_time_fields(
+    summary: &mut zinder_proto::v1::explorer::BlockSummary,
+    canonical_tip: u32,
+) {
+    summary.confirmations = canonical_tip
+        .saturating_sub(summary.block_height)
+        .saturating_add(1);
+    summary.is_canonical = summary.block_height <= canonical_tip;
 }
 
 async fn resolve_block_height(
@@ -150,12 +170,9 @@ async fn resolve_block_height(
     }
 }
 
-async fn build_freshness(
-    derive_store: &DeriveStore,
+async fn read_canonical_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    capability_version: &str,
-    highest_returned_height: Option<u32>,
-) -> Result<ExplorerFreshness, Status> {
+) -> Result<(wallet::ChainEpoch, u32), Status> {
     let latest = wallet_client
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
@@ -167,12 +184,23 @@ async fn build_freshness(
         .latest_block
         .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
         .height;
-    let derive_tip = highest_materialized_height(derive_store)?;
+    Ok((chain_epoch, canonical_tip))
+}
+
+fn build_freshness_from_tip(
+    derive_store: &DeriveStore,
+    capability_version: &str,
+    chain_epoch: wallet::ChainEpoch,
+    canonical_tip: u32,
+) -> Result<ExplorerFreshness, Status> {
+    let derive_tip = derive_store
+        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map(zinder_core::BlockHeight::value);
     let derive_cursor_lag_blocks = derive_tip.map_or_else(
         || u64::from(canonical_tip),
         |materialized| u64::from(canonical_tip.saturating_sub(materialized)),
     );
-    let _ = highest_returned_height;
     Ok(ExplorerFreshness {
         chain_epoch: Some(chain_epoch),
         snapshot_age_millis: 0,
@@ -181,13 +209,4 @@ async fn build_freshness(
         capability_version: capability_version.to_owned(),
         unavailable: Vec::new(),
     })
-}
-
-fn highest_materialized_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
-    let highest = derive_store
-        .last_consumer_key(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
-        .and_then(|key| <[u8; 4]>::try_from(key.as_slice()).ok())
-        .map(u32::from_be_bytes);
-    Ok(highest)
 }

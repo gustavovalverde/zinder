@@ -78,7 +78,7 @@ pub fn parse_transaction_public_facts(
                 reason: source.to_string(),
             })?;
     let version = classify_transaction_version(&transaction);
-    let counts = component_counts(&transaction);
+    let counts = transaction_component_counts(&transaction);
     let is_coinbase = transaction.is_coinbase();
     let unsupported_sections = if version.is_supported() {
         Vec::new()
@@ -120,7 +120,17 @@ fn classify_transaction_version(transaction: &ZebraTransaction) -> TransactionVe
     }
 }
 
-fn component_counts(transaction: &ZebraTransaction) -> TransactionComponentCounts {
+/// Counts the transparent / shielded components of a parsed Zcash transaction.
+///
+/// This is the canonical way to populate [`TransactionComponentCounts`] from
+/// a `zebra-chain` transaction; every explorer-plane and source-plane caller
+/// goes through this function so the counting rules stay in one place.
+///
+/// Each count is saturated at `u32::MAX` rather than overflowing; a
+/// transaction with more than four billion of any component would not
+/// validate, so the cap is defensive rather than load-bearing.
+#[must_use]
+pub fn transaction_component_counts(transaction: &ZebraTransaction) -> TransactionComponentCounts {
     let transparent_input_count = u32::try_from(transaction.inputs().len()).unwrap_or(u32::MAX);
     let transparent_output_count = u32::try_from(transaction.outputs().len()).unwrap_or(u32::MAX);
     let sapling_spend_count =

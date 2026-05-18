@@ -85,6 +85,9 @@ pub enum SearchClassification {
     ShieldedAddress {
         /// Canonical re-encoding of the input the handler may echo.
         canonical: String,
+        /// Network the address belongs to, used by the handler to pick
+        /// the mainnet vs testnet refusal vocabulary.
+        network: Network,
     },
 
     /// Viewing key (UIVK, UFVK, or Sapling extended viewing key). The
@@ -365,6 +368,7 @@ impl ClassifiedAddress {
                 }
                 SearchClassification::ShieldedAddress {
                     canonical: ZcashAddress::from_sprout(net, bytes).to_string(),
+                    network,
                 }
             }
             Self::Sapling { net, bytes } => {
@@ -373,6 +377,7 @@ impl ClassifiedAddress {
                 }
                 SearchClassification::ShieldedAddress {
                     canonical: ZcashAddress::from_sapling(net, bytes).to_string(),
+                    network,
                 }
             }
             Self::Unified { net, unified } => {

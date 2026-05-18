@@ -13,19 +13,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use zinder_core::wire::encode_internal_transaction_id;
 use zinder_core::{
-    NetworkUpgradeActivations, PrivacyShape as CorePrivacyShape,
-    TransactionPublicFacts as CoreFacts, TransactionVersion as CoreTransactionVersion,
+    NetworkUpgradeActivations, TransactionPublicFacts as CoreFacts,
+    TransactionVersion as CoreTransactionVersion,
 };
 use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
     ExplorerFreshness, MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse,
-    MempoolSummaryRequest, MempoolSummaryResponse, PrivacyShape as WirePrivacyShape,
-    PrivacyShapeCount, TransactionVersion as WireVersion, TransactionVersionCount,
-    TransactionVersionKind,
+    MempoolSummaryRequest, MempoolSummaryResponse, PrivacyShapeCount,
+    TransactionVersion as WireVersion, TransactionVersionCount, TransactionVersionKind,
 };
 use zinder_proto::v1::wallet::{
     self, MempoolEntry, MempoolSnapshotRequest, wallet_query_client::WalletQueryClient,
 };
+use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 
 /// Hard cap on the mempool entries the summary aggregates in one call.
@@ -169,12 +169,17 @@ pub(crate) async fn handle_mempool_activity(
             continue;
         }
         let facts = parse_facts(entry, &activations)?;
+        let counts = facts.counts;
+        let logical_actions = counts.logical_actions();
         entries.push(MempoolActivityEntry {
             transaction_id: encode_internal_transaction_id(facts.transaction_id).to_vec(),
             first_seen_unix_millis: entry.first_seen_unix_millis,
             size_bytes: facts.size_bytes,
             privacy_shape: encode_privacy_shape(facts.privacy_shape) as i32,
             version: Some(encode_transaction_version(facts.version)),
+            zip317_conventional_fee_zat: counts.zip317_conventional_fee_zat(),
+            paid_fee_zat: None,
+            logical_actions,
         });
         last_emitted = Some(position);
         if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
@@ -222,19 +227,6 @@ fn parse_facts(
 ) -> Result<CoreFacts, Status> {
     zinder_source::parse_transaction_public_facts(&entry.raw_transaction_bytes, None, activations)
         .map_err(|error| Status::internal(error.to_string()))
-}
-
-const fn encode_privacy_shape(shape: CorePrivacyShape) -> WirePrivacyShape {
-    match shape {
-        CorePrivacyShape::TransparentOnly => WirePrivacyShape::TransparentOnly,
-        CorePrivacyShape::Shielding => WirePrivacyShape::Shielding,
-        CorePrivacyShape::Deshielding => WirePrivacyShape::Deshielding,
-        CorePrivacyShape::ShieldedOnly => WirePrivacyShape::ShieldedOnly,
-        CorePrivacyShape::Mixed => WirePrivacyShape::Mixed,
-        CorePrivacyShape::Coinbase => WirePrivacyShape::Coinbase,
-        CorePrivacyShape::ShieldedCoinbase => WirePrivacyShape::ShieldedCoinbase,
-        CorePrivacyShape::Unclassified => WirePrivacyShape::Unclassified,
-    }
 }
 
 const fn encode_transaction_version_kind(

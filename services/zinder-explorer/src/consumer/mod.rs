@@ -2,8 +2,8 @@
 //!
 //! Every derive consumer implements [`DeriveConsumer`]. The trait is the seam
 //! between the consumer-agnostic infrastructure in this crate (store,
-//! `ChainEvents` subscriber, mempool subscriber) and the consumer-specific
-//! aggregation logic that lives in each consumer module.
+//! [`BlockSource`], `ChainEvents` subscriber, mempool subscriber) and the
+//! consumer-specific aggregation logic that lives in each consumer module.
 //!
 //! Two submodules layer subscriber primitives on top of the trait:
 //!
@@ -15,14 +15,28 @@
 //!   subscription with cursor persistence for consumers that observe
 //!   unconfirmed activity. Public entry point:
 //!   [`crate::run_mempool_events_subscriber`].
+//!
+//! A consumer that needs the parsed block in `apply_block` does NOT fetch
+//! `WalletQuery.FullBlock` itself. It pulls the parsed block from
+//! [`BlockSource::block`]; the source caches per-height contexts so the
+//! four-consumer fan-out parses each block once per commit.
 
+pub(crate) mod block_commit_context;
+pub(crate) mod block_source;
 pub(crate) mod block_summary;
 pub(crate) mod chain_events;
+pub(crate) mod mempool_event_counts;
 pub(crate) mod mempool_events;
+pub(crate) mod recent_transactions;
+pub(crate) mod transaction_fees;
+pub(crate) mod transparent_address_activity;
 
 use async_trait::async_trait;
 use rust_rocksdb::WriteBatch;
 use zinder_core::{BlockHeight, ChainEpoch};
+
+pub use block_commit_context::{BlockCommitContext, BlockCommitContextError, PrevoutResolver};
+pub use block_source::BlockSource;
 
 use crate::store::DeriveStore;
 
@@ -140,16 +154,17 @@ pub struct CommittedRange {
     pub end_height: BlockHeight,
 }
 
-/// Trait every derive consumer implements.
+/// Trait every chain-events derive consumer implements.
 ///
-/// The infrastructure in [`crate::run_chain_events_subscriber`] dispatches
-/// typed committed and reorged events to implementers; consumers stage their
-/// state writes through the [`DeriveConsumerCtx::batch`] handle so the SDK can
-/// commit consumer writes and the cursor advance atomically.
+/// The SDK dispatcher calls [`apply_chain_committed`](Self::apply_chain_committed)
+/// and [`apply_chain_reorged`](Self::apply_chain_reorged) per envelope.
+/// Consumers stage their state writes through the
+/// [`DeriveConsumerCtx::batch`] handle so the SDK can commit consumer
+/// writes and the cursor advance atomically.
 ///
-/// The trait is async because most implementations need to read previous
-/// running totals from the same [`DeriveStore`] they write to, which crosses
-/// a `RocksDB` boundary.
+/// Most production consumers implement [`BlockKeyedConsumer`] instead;
+/// a blanket impl gives them the per-height range-loop on top of this
+/// trait so they only write per-block logic, never the range scaffolding.
 #[async_trait]
 pub trait DeriveConsumer: Send + Sync {
     /// Stable consumer identity used for cursor and metadata key prefixes.
@@ -164,14 +179,107 @@ pub trait DeriveConsumer: Send + Sync {
     ) -> Result<(), DeriveConsumerError>;
 
     /// Apply a reorged event. Stage state writes into `ctx.batch`; the SDK
-    /// adds the cursor advance and commits atomically. Implementations decide
-    /// how to revert their derived state for the reverted range and how to
-    /// fold in the replacement range.
+    /// adds the cursor advance and commits atomically. Implementations
+    /// decide how to revert their derived state for the reverted range and
+    /// how to fold in the replacement range.
     async fn apply_chain_reorged(
         &mut self,
         event: &ChainReorgedEvent,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError>;
+}
+
+/// Per-block derive consumer.
+///
+/// The convention every production chain-events consumer follows. The
+/// blanket [`DeriveConsumer`] impl below walks the height range from each
+/// envelope and calls [`apply_block`](Self::apply_block) /
+/// [`revert_block`](Self::revert_block) per height, pulling parsed blocks
+/// from the shared [`BlockSource`] returned by
+/// [`block_source`](Self::block_source). Per-envelope fan-out across N
+/// consumers fetches and parses each block exactly once because the
+/// `BlockSource` cache is shared.
+///
+/// A consumer that observes range boundaries (or implements something
+/// other than "one block in, some rows out") implements [`DeriveConsumer`]
+/// directly instead.
+#[async_trait]
+pub trait BlockKeyedConsumer: Send + Sync {
+    /// Stable consumer identity used for cursor and metadata key prefixes.
+    fn name(&self) -> DeriveConsumerName;
+
+    /// Shared block source the dispatcher pulls parsed blocks from. Every
+    /// consumer in a process should be wired with the same `BlockSource`
+    /// clone so the cache dedupes their fan-out.
+    fn block_source(&self) -> &BlockSource;
+
+    /// Stages per-height writes derived from `block`. Implementations write
+    /// into `ctx.batch`; the SDK appends the cursor advance and commits
+    /// atomically.
+    async fn apply_block(
+        &mut self,
+        block: &BlockCommitContext,
+        ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError>;
+
+    /// Stages per-height deletes to revert state previously written for
+    /// `height`. Called once per reverted height by the blanket
+    /// [`DeriveConsumer::apply_chain_reorged`] impl.
+    async fn revert_block(
+        &mut self,
+        height: BlockHeight,
+        ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError>;
+}
+
+#[async_trait]
+impl<C: BlockKeyedConsumer + ?Sized> DeriveConsumer for C {
+    fn name(&self) -> DeriveConsumerName {
+        BlockKeyedConsumer::name(self)
+    }
+
+    async fn apply_chain_committed(
+        &mut self,
+        event: &ChainCommittedEvent,
+        ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError> {
+        for raw_height in event.start_height.value()..=event.end_height.value() {
+            let height = BlockHeight::new(raw_height);
+            let block = self
+                .block_source()
+                .block(height)
+                .await
+                .map_err(|error| Box::new(error) as DeriveConsumerError)?;
+            if let Some(context) = block {
+                self.apply_block(&context, ctx).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_chain_reorged(
+        &mut self,
+        event: &ChainReorgedEvent,
+        ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError> {
+        for raw_height in event.reverted.start_height.value()..=event.reverted.end_height.value() {
+            self.revert_block(BlockHeight::new(raw_height), ctx).await?;
+        }
+        for raw_height in
+            event.replacement.start_height.value()..=event.replacement.end_height.value()
+        {
+            let height = BlockHeight::new(raw_height);
+            let block = self
+                .block_source()
+                .block(height)
+                .await
+                .map_err(|error| Box::new(error) as DeriveConsumerError)?;
+            if let Some(context) = block {
+                self.apply_block(&context, ctx).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Mempool-event consumer trait.

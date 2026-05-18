@@ -111,13 +111,14 @@ fn regtest_p2pkh_classifies_against_regtest() -> Result<()> {
 #[test]
 fn sapling_classifies_as_shielded_address() -> Result<()> {
     let candidates = classify_search_input(MAINNET_SAPLING, Network::ZcashMainnet);
-    let Some(SearchClassification::ShieldedAddress { canonical }) = candidates
+    let Some(SearchClassification::ShieldedAddress { canonical, network }) = candidates
         .iter()
         .find(|candidate| matches!(candidate, SearchClassification::ShieldedAddress { .. }))
     else {
         return Err(eyre!("expected ShieldedAddress arm"));
     };
     assert_eq!(canonical, MAINNET_SAPLING);
+    assert_eq!(*network, Network::ZcashMainnet);
     Ok(())
 }
 

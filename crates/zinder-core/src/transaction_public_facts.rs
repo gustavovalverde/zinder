@@ -199,24 +199,20 @@ impl TransactionComponentCounts {
             || self.sprout_joinsplit_count > 0
     }
 
-    /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) conventional
-    /// fee floor in zatoshi computed from the component counts alone.
+    /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) logical-action
+    /// count for this component shape.
     ///
-    /// The conventional fee is `MARGINAL_FEE * max(logical_actions,
-    /// GRACE_ACTIONS)`, where `MARGINAL_FEE = 5_000`, `GRACE_ACTIONS =
-    /// 2`, and `logical_actions = max(transparent_input_count,
-    /// transparent_output_count, max(sapling_spend_count,
-    /// sapling_output_count), orchard_action_count)`. The result is the
-    /// minimum fee a wallet should attach to a transaction with this
-    /// shape; the actual fee a miner collected may differ and requires
-    /// prevout resolution to compute.
+    /// Computed as `max(transparent_input_count, transparent_output_count,
+    /// max(sapling_spend_count, sapling_output_count), orchard_action_count)`.
+    /// The grace-actions floor (a fee-compute concept) is **not** applied
+    /// here; this is the raw shape-derived count consumers surface on
+    /// per-transaction views.
     ///
-    /// Used by `ExplorerQuery.FeeSummary` to aggregate fee floors across
-    /// a block range without resolving every transparent input.
+    /// Sprout `JoinSplit`s are intentionally excluded: ZIP-317 was specified
+    /// after the Sprout pool was effectively frozen, and the spec scopes
+    /// logical actions to the Sapling/Orchard side.
     #[must_use]
-    pub const fn zip317_conventional_fee_zat(self) -> u64 {
-        const MARGINAL_FEE_ZAT: u64 = 5_000;
-        const GRACE_ACTIONS: u32 = 2;
+    pub const fn logical_actions(self) -> u32 {
         let sapling_logical = if self.sapling_spend_count > self.sapling_output_count {
             self.sapling_spend_count
         } else {
@@ -232,12 +228,31 @@ impl TransactionComponentCounts {
         if self.orchard_action_count > max_logical {
             max_logical = self.orchard_action_count;
         }
-        let logical_actions = if max_logical < GRACE_ACTIONS {
+        max_logical
+    }
+
+    /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) conventional
+    /// fee floor in zatoshi computed from the component counts alone.
+    ///
+    /// The conventional fee is `MARGINAL_FEE * max(logical_actions,
+    /// GRACE_ACTIONS)`, where `MARGINAL_FEE = 5_000` and `GRACE_ACTIONS = 2`.
+    /// The result is the minimum fee a wallet should attach to a
+    /// transaction with this shape; the actual fee a miner collected may
+    /// differ and requires prevout resolution to compute.
+    ///
+    /// Used by `ExplorerQuery.FeeSummary` to aggregate fee floors across
+    /// a block range without resolving every transparent input.
+    #[must_use]
+    pub const fn zip317_conventional_fee_zat(self) -> u64 {
+        const MARGINAL_FEE_ZAT: u64 = 5_000;
+        const GRACE_ACTIONS: u32 = 2;
+        let logical_actions = self.logical_actions();
+        let billable_actions = if logical_actions < GRACE_ACTIONS {
             GRACE_ACTIONS
         } else {
-            max_logical
+            logical_actions
         };
-        MARGINAL_FEE_ZAT * logical_actions as u64
+        MARGINAL_FEE_ZAT * billable_actions as u64
     }
 
     /// Returns `true` when the transaction has any shielded outputs

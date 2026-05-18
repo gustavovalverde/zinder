@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -22,6 +22,16 @@ pub struct OpsServer {
     pub service_version: &'static str,
     /// Network this binary is operating on.
     pub network_name: &'static str,
+    /// Snapshot of capability strings the binary expects to advertise.
+    ///
+    /// Surfaced verbatim through the `/healthz` JSON for discoverability so
+    /// dashboards and `curl` probes can branch without a gRPC round trip.
+    /// The list is a snapshot taken at startup: late-binding capabilities
+    /// (those gated on a runtime upstream probe) appear here only when the
+    /// binary computed them before calling `spawn_ops_endpoint*`. Each
+    /// capability string must come from
+    /// `zinder_proto::capabilities`.
+    pub advertised_capabilities: Vec<&'static str>,
 }
 
 /// Error returned by the operational HTTP server.
@@ -94,12 +104,17 @@ impl OpsEndpointHandle {
 /// [`spawn_ops_endpoint`] but with `service_name` filled in from the
 /// [`ServiceIdentifier`] table so each binary cannot drift its own label.
 #[must_use = "drop the returned handle only on graceful shutdown"]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service identity, listen address, version, network, readiness, and capability snapshot are all binding-time inputs; bundling them into a struct would only push the field count one layer out"
+)]
 pub fn spawn_ops_endpoint_for(
     service: ServiceIdentifier,
     listen_addr: Option<SocketAddr>,
     service_version: &'static str,
     network_name: &'static str,
     readiness: Readiness,
+    advertised_capabilities: Vec<&'static str>,
 ) -> Option<OpsEndpointHandle> {
     let listen_addr = listen_addr?;
     Some(spawn_ops_endpoint(
@@ -108,6 +123,7 @@ pub fn spawn_ops_endpoint_for(
             service_name: service.binary_name(),
             service_version,
             network_name,
+            advertised_capabilities,
         },
         readiness,
     ))
@@ -198,9 +214,26 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
         readiness: readiness.clone(),
         metrics,
     };
+    let healthz_body = HealthzBody {
+        status: "alive",
+        service: server.service_name,
+        version: server.service_version,
+        network: server.network_name,
+        capabilities: server
+            .advertised_capabilities
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect(),
+    };
 
     Router::new()
-        .route("/healthz", get(healthz_handler))
+        .route(
+            "/healthz",
+            get(move || {
+                let body = healthz_body.clone();
+                async move { (StatusCode::OK, Json(body)) }
+            }),
+        )
         .route(
             "/readyz",
             get(move || {
@@ -226,8 +259,13 @@ struct MetricsState {
     metrics: MetricsHandle,
 }
 
-async fn healthz_handler() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+#[derive(Clone, Serialize)]
+struct HealthzBody {
+    status: &'static str,
+    service: &'static str,
+    version: &'static str,
+    network: &'static str,
+    capabilities: Vec<String>,
 }
 
 #[derive(Serialize)]

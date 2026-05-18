@@ -4,6 +4,7 @@
 //! do not hand-write protocol-shaped payload structs.
 
 pub mod capabilities;
+pub mod wire;
 pub use capabilities::{CapabilityDescriptor, INGEST_CONTROL_CAPABILITIES, ZINDER_CAPABILITIES};
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.

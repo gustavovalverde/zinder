@@ -1,0 +1,106 @@
+# ADR-0018: Capability-gated optional payload fields
+
+Status: Accepted
+Date: 2026-05-19
+Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
+[ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md)
+
+## Context
+
+Several wire fields in the explorer plane carry values that depend on
+upstream state the operator may or may not have wired:
+
+- `TransactionDetailResponse.paid_fee_zat` requires the wallet plane's
+  transparent prevout resolution (capability
+  `wallet.read.transparent_prevouts_v1`) to be online.
+- `MempoolActivityEntry.paid_fee_zat` requires the same upstream
+  capability plus a per-mempool-tx lookup path.
+- `BlockSummary.paid_fees_collected_zat` requires the
+  `TransactionFeesConsumer` to have materialized rows for every
+  non-coinbase transaction in the block.
+- `TransparentAddressActivityEntry.net_value_zat` requires the same
+  prevout resolution; the row materializes either way.
+- `RecentTransactionEntry.zip317_conventional_fee_zat` is unset for
+  coinbase rows; non-coinbase rows always carry a value.
+
+We need one convention for "this field is present when capability X is
+online (or some equivalent precondition holds), absent otherwise" that
+consumers can branch on without inferring from sentinel values like
+zero.
+
+## Decision
+
+Optional payload fields paired with named capability strings are the
+convention. Specifically:
+
+1. The proto field is `optional <scalar>` (proto3 explicit-presence) or
+   `repeated <message>` (empty means absent). Sentinels like zero or
+   empty bytes are never overloaded to mean "absent"; proto3
+   field-presence handles that for us.
+
+2. When a field's absence has multiple causes a reader might want to
+   distinguish ("the upstream is offline" vs "this particular row
+   could not be resolved"), the message carries a companion enum
+   alongside the optional value. The current example is
+   `TransparentAddressActivityRecord.prevout_resolution_status`
+   (`Resolved | Partial | Unavailable | Unspecified`), which is set on
+   every row so the handler renders a chip rather than guessing.
+
+3. The capability string is registered in `zinder-proto::capabilities`,
+   added to `ZINDER_CAPABILITIES`, and added to the
+   `capability-coverage` test's `EXPECTED_METHOD_NAMES` table with the
+   method that owns the field.
+
+4. The handler returns the field as `None` / empty whenever the
+   underlying upstream is unavailable, and the field is fully populated
+   when present. The handler never emits the field with a partial
+   sentinel: never `paid_fee_zat = 0` to mean "unresolved", never
+   `net_value_zat = 0` to mean "we only saw one side of the
+   transaction".
+
+5. Capabilities are gated at the adapter's `advertised_capabilities()`
+   on a per-named-flag basis. The flags are set by the binary at
+   startup based on:
+
+   - probing the upstream's `ServerInfo`
+     (`wallet.read.transparent_prevouts_v1` flips on when the wallet
+     advertises it);
+   - local opt-in (the `payment_disclosure_verifier_online` flag);
+   - whether the derive store has been wired
+     (`derive_store_online` covers `BlockSummary`, `BlockDetail`,
+     `MempoolEventCounts`, `RecentTransactions`, and
+     `TransparentAddressActivity`).
+
+   `advertised_capabilities()` is the single source of truth: the gRPC
+   `ServerInfo`, the ops endpoint's `/healthz`, and any future
+   capability-surfacing endpoint all read from it. A flag flipped in
+   one place therefore reaches every consumer.
+
+## Examples shipped under this convention
+
+| Field | Capability | Status-companion field |
+| ----- | ---------- | ---------------------- |
+| `TransactionDetailResponse.paid_fee_zat` | `explorer.transaction.fees_v1` | `prevout_resolution_status` |
+| `TransactionDetailResponse.transparent_inputs[].value_zat` | `explorer.transaction.fees_v1` | (status on the parent) |
+| `MempoolActivityEntry.paid_fee_zat` | `explorer.transaction.fees_v1` (when mempool prevouts are online) | (none; fall back to ZIP-317 floor) |
+| `BlockSummary.paid_fees_collected_zat` | `explorer.transaction.fees_v1` (advertised when the consumer is wired and prevouts are online) | (none; the row carries `fees_collected_zat` as the ZIP-317 floor always) |
+| `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
+| `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
+| `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not resolved") |
+
+## Consequences
+
+- Consumers branch on proto field presence (`response.paid_fee_zat
+  .is_some()`) and on the capability list returned by
+  `ServerInfo.capabilities`, never on sentinel comparisons.
+- Adding a new field of this shape requires three diff sites in the
+  same change: the proto, the capability constant + uniqueness/coverage
+  tests, and the handler that populates it. When the field needs a
+  status companion, the record gains a fourth diff site.
+- Operators see in `/healthz` and `ExplorerQuery.ServerInfo` which
+  optional fields are populated on their deployment, since the
+  capability list mirrors the proto-field decisions.
+- The convention scales: when a future field requires its own upstream
+  flag, the binary adds a new named gate next to the existing ones,
+  `advertised_capabilities()` adds one `if flag` arm, and the
+  capability string lights up only when the gate is true.

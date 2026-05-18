@@ -203,6 +203,34 @@ message TransactionPublicFacts {
   bool is_coinbase = 11;
 }
 
+// Classification of a transaction's transparent prevout resolution state.
+//
+// `TransactionFeesConsumer` writes `RESOLVED` when every transparent input
+// has a known prevout value in the wallet plane's prevout index, `PARTIAL`
+// when at least one is missing, and `UNAVAILABLE` when the indexer is not
+// resolving prevouts at all (the upstream node does not advertise
+// `WALLET_READ_TRANSPARENT_PREVOUTS_V1`).
+enum PrevoutResolutionStatus {
+  PREVOUT_RESOLUTION_STATUS_UNSPECIFIED = 0;
+  PREVOUT_RESOLUTION_STATUS_RESOLVED = 1;
+  PREVOUT_RESOLUTION_STATUS_PARTIAL = 2;
+  PREVOUT_RESOLUTION_STATUS_UNAVAILABLE = 3;
+}
+
+// Per-input transparent prevout value carried on `TransactionDetail`.
+//
+// `input_index` is the zero-based position of the input in the
+// transaction's transparent input list. `value_zat` is populated when the
+// prevout could be resolved through the wallet plane's transparent prevout
+// index; it is absent for inputs whose source transaction is not in the
+// canonical index (for example, an old transaction the deployment's
+// retention has dropped). Shielded spends are not emitted here at all:
+// their values are encrypted by protocol and never derivable.
+message TransparentInputDetail {
+  uint32 input_index = 1;
+  optional uint64 value_zat = 2;
+}
+
 // Discriminated transaction location.
 //
 // A `TransactionDetail` response carries exactly one of `mined` or
@@ -244,11 +272,20 @@ message TransactionDetailRequest {
 // Carries the cross-cutting freshness envelope plus the parsed public
 // facts, location discriminator, and raw transaction bytes so consumers
 // can keep parsed and raw forms together (per the PRD's user story 16).
+//
+// `paid_fee_zat`, `prevout_resolution_status`, and `transparent_inputs`
+// are populated when the explorer advertises
+// `EXPLORER_TRANSACTION_FEES_V1` and the `TransactionFeesConsumer` has
+// materialized a row for `facts.transaction_id`. Otherwise the consumer
+// falls back to `TransactionPublicFacts.counts.zip317_conventional_fee_zat`.
 message TransactionDetailResponse {
   ExplorerFreshness freshness = 1;
   TransactionPublicFacts facts = 2;
   TransactionLocation location = 3;
   bytes raw_transaction_bytes = 4;
+  optional uint64 paid_fee_zat = 5;
+  PrevoutResolutionStatus prevout_resolution_status = 6;
+  repeated TransparentInputDetail transparent_inputs = 7;
 }
 
 // Compact summary of one canonical block.
@@ -272,6 +309,48 @@ message BlockSummary {
 
   // Previous block hash in internal byte order (32 bytes).
   bytes previous_block_hash = 5;
+
+  // Sum of serialized transaction byte lengths across the block. Includes
+  // the coinbase transaction. Materialized by `BlockSummaryConsumer` at
+  // commit time so the recent-blocks listing renders block size without
+  // re-fetching every transaction.
+  uint64 total_size_bytes = 6;
+
+  // Sum of `zip317_conventional_fee_zat` across every non-coinbase
+  // transaction in the block. ZIP-317 conventional floor; the actual
+  // paid-fee sum is in `paid_fees_collected_zat` and only populated when
+  // the `TransactionFeesConsumer` has resolved every transparent input.
+  uint64 fees_collected_zat = 7;
+
+  // Sum of actual paid fees across every non-coinbase transaction, when
+  // every transparent input could be resolved through the wallet plane's
+  // prevout index. Absent when at least one transaction is missing prevout
+  // values; consumers fall back to `fees_collected_zat`.
+  optional uint64 paid_fees_collected_zat = 8;
+
+  // Value the coinbase output(s) paid out, in zatoshis. Includes any
+  // shielded coinbase outputs per [ZIP-213](https://zips.z.cash/zip-0213).
+  uint64 coinbase_reward_zat = 9;
+
+  // Sum of Sapling output counts across every transaction in the block.
+  // Useful for tracking shielded-protocol throughput per block.
+  uint32 sapling_output_count = 10;
+
+  // Sum of Orchard action counts across every transaction in the block.
+  uint32 orchard_action_count = 11;
+
+  // Distance from this block to the canonical tip at response time.
+  // `1` when this block IS the tip, `2` for the block before, and so on.
+  // Computed at request time from
+  // `WalletQuery.LatestBlock.latest_block.height - block_height + 1`; not
+  // stored in the derive column family.
+  uint32 confirmations = 12;
+
+  // True when this block is part of the canonical best chain at response
+  // time. False during a rolling reorg window when the block has been
+  // rewound but not yet replaced by a heavier chain. Computed at request
+  // time; consumers render an "orphaned" badge when false.
+  bool is_canonical = 13;
 }
 
 // Materialized storage record for the `BlockSummary` derive view.
@@ -359,7 +438,8 @@ message NotPubliclyIndexable {
 enum NotPubliclyIndexableReason {
   NOT_PUBLICLY_INDEXABLE_REASON_UNSPECIFIED = 0;
 
-  // The input decoded as a shielded address (Sapling, Orchard, Sprout).
+  // The input decoded as a shielded address (Sapling, Orchard, Sprout)
+  // but the classifier could not narrow the network.
   NOT_PUBLICLY_INDEXABLE_REASON_SHIELDED_ADDRESS = 1;
 
   // The input decoded as a viewing key (UIVK, UFVK, Sapling extended
@@ -371,6 +451,24 @@ enum NotPubliclyIndexableReason {
   // `UnifiedAddressMatch` may still route transparent receivers from the
   // same input.
   NOT_PUBLICLY_INDEXABLE_REASON_SHIELDED_RECEIVER_IN_UNIFIED = 3;
+
+  // The input decoded as a mainnet shielded address (Sapling `zs1...`,
+  // Orchard, or Sprout). Lets the consumer render network-specific help
+  // text without inferring the network from the canonical form.
+  NOT_PUBLICLY_INDEXABLE_REASON_SHIELDED_ADDRESS_MAINNET = 4;
+
+  // The input decoded as a testnet or regtest shielded address (Sapling
+  // `zs1testsapling...` / `zregtestsapling...`, Orchard, or Sprout
+  // testnet form). Distinguishes from `MAINNET` so the consumer can warn
+  // a user that they may have switched networks.
+  NOT_PUBLICLY_INDEXABLE_REASON_SHIELDED_ADDRESS_TESTNET = 5;
+
+  // The input decoded as a [ZIP-316](https://zips.z.cash/zip-0316)
+  // unified address whose receiver list contains no transparent
+  // receiver. The address itself is valid but the explorer cannot route
+  // it to a transparent-history page; there is nothing publicly indexable
+  // to look up.
+  NOT_PUBLICLY_INDEXABLE_REASON_UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER = 6;
 }
 
 // Block candidate produced when the input parses as a height or a
@@ -638,6 +736,21 @@ message MempoolActivityEntry {
 
   // Coarse transaction version classification.
   TransactionVersion version = 5;
+
+  // ZIP-317 conventional fee floor for this entry, in zatoshis. Always
+  // populated.
+  uint64 zip317_conventional_fee_zat = 6;
+
+  // Actual paid fee, in zatoshis. Populated when the explorer advertises
+  // `EXPLORER_TRANSACTION_FEES_V1` and the wallet plane's mempool prevout
+  // index resolved every transparent input for this entry. Absent
+  // otherwise; consumers fall back to `zip317_conventional_fee_zat`.
+  optional uint64 paid_fee_zat = 7;
+
+  // ZIP-317 logical-action count for this entry. The fee floor formula's
+  // input; surfaced separately so consumers can render fee-per-action
+  // without re-deriving from the component counts.
+  uint32 logical_actions = 8;
 }
 
 // `ExplorerQuery.MempoolActivity` response.
@@ -649,70 +762,77 @@ message MempoolActivityResponse {
 
 // `ExplorerQuery.TransparentAddressActivity` request.
 //
-// Composes the canonical transparent-address history surface with the
-// live mempool overlay so a single call returns confirmed history and
-// pending entries together. Mempool entries appear before confirmed
-// entries when `descending=true`; the mempool overlay is included only
-// on the first page (`from_cursor` empty) so subsequent pages do not
-// re-emit transient state.
+// Returns confirmed transparent-address activity from the derive
+// projection. Mempool activity for a transparent address is served
+// separately through `MempoolActivity` so each surface has one source
+// of truth.
 message TransparentAddressActivityRequest {
   // Selector for the transparent address being queried.
   zinder.v1.wallet.AddressLookup address = 1;
 
-  // Inclusive minimum block height for the confirmed slice. Zero means
-  // start from genesis.
+  // Inclusive minimum block height. Zero means start from genesis.
   uint32 start_height = 2;
 
-  // Inclusive maximum block height for the confirmed slice.
+  // Inclusive maximum block height.
   uint32 end_height = 3;
 
-  // Server-bounded maximum entries per page (confirmed + mempool).
-  // Zero means use the server default; values larger than the
-  // server's configured cap are silently clamped.
+  // Server-bounded maximum entries per page. Zero means use the server
+  // default; values larger than the server's configured cap are silently
+  // clamped.
   uint32 max_entries = 4;
 
-  // Empty resumes from the head of the requested direction. Non-empty
-  // resumes strictly after the prior page's last confirmed entry; the
-  // cursor's encoded direction is authoritative.
+  // Empty resumes from the head of the timeline. Non-empty resumes
+  // strictly after the prior page's last entry.
+  //
+  // Ordering: rows are always emitted newest-first; the consumer's
+  // storage layout is descending by height. Clients that want oldest-
+  // first reverse the page client-side.
   bytes from_cursor = 5;
 
-  // Iterate newest-first when true.
-  bool descending = 6;
+  // Reserved tag for the deleted `descending` field. The handler always
+  // serves newest-first; the previous bool led to an ordering bug when
+  // requested as ascending, so the field was removed instead of fixed
+  // (clients reverse client-side when they need ascending order).
+  reserved 6;
+  reserved "descending";
 
-  // Include unmined mempool entries on the first page. Has no effect on
-  // subsequent pages so the wire shape does not re-emit transient state.
-  bool include_mempool = 7;
-
-  // Optional chain epoch pin for the confirmed slice.
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 8;
+  // Optional chain epoch pin.
+  optional zinder.v1.wallet.ChainEpoch at_epoch = 7;
 }
 
-// One transparent-address activity row.
+// One transparent-address confirmed-activity row.
 //
-// Unifies confirmed history rows (carrying `block_height`, `block_hash`,
-// `tx_index_in_block`) with mempool rows (`in_mempool=true`, carrying
-// `first_seen_unix_millis`). The two arms never coexist on one entry.
+// Materialized by `TransparentAddressActivityConsumer` at commit time.
+// `net_value_zat` is positive when the transaction paid the address and
+// negative when it spent from the address. Absent when prevout
+// resolution did not produce a complete picture; the
+// `prevout_resolution_status` field disambiguates why.
 message TransparentAddressActivityEntry {
-  // Canonical transaction identifier.
+  // Canonical transaction identifier (32 bytes, internal byte order).
   bytes transaction_id = 1;
 
-  // Zero when `in_mempool=true`; otherwise the canonical block height
-  // of the confirming block.
+  // Canonical block height of the confirming block.
   uint32 block_height = 2;
 
-  // Empty when `in_mempool=true`; otherwise the canonical block hash.
-  bytes block_hash = 3;
+  // `nTime` from the confirming block header.
+  int64 block_time_unix_seconds = 3;
 
-  // Zero when `in_mempool=true`; otherwise the canonical position of
-  // the transaction inside its block.
-  uint32 tx_index_in_block = 4;
+  // Signed net value, in zatoshis, the transaction moved into the
+  // address. Set only when every prevout the transaction spends for this
+  // address was resolved; see `prevout_resolution_status`.
+  optional sint64 net_value_zat = 4;
 
-  // True for mempool entries; the confirmed-slice fields are zero.
-  bool in_mempool = 5;
+  // Number of transparent inputs in the transaction that spent from
+  // this address. The parent message scopes the address; the field name
+  // does not repeat the discriminator.
+  uint32 input_count = 5;
 
-  // Zero unless `in_mempool=true`; wall-clock time when the indexer
-  // first observed the mempool entry funding this address.
-  uint64 first_seen_unix_millis = 6;
+  // Number of transparent outputs in the transaction that paid this
+  // address.
+  uint32 output_count = 6;
+
+  // Why `net_value_zat` is or is not set. Always populated.
+  PrevoutResolutionStatus prevout_resolution_status = 7;
 }
 
 // `ExplorerQuery.TransparentAddressActivity` response.
@@ -810,11 +930,11 @@ service ExplorerQuery {
   // Capability: `explorer.mempool.activity_v1`.
   rpc MempoolActivity(MempoolActivityRequest) returns (MempoolActivityResponse);
 
-  // Returns confirmed transparent-address history paged with the live
-  // mempool overlay. Confirmed rows page via the same cursor semantics
-  // as `WalletQuery.TransparentAddressTxIdsInRange`; mempool entries are
-  // emitted only on the first page when `include_mempool=true`.
-  // Capability: `explorer.transparent_address.activity_v1`.
+  // Returns the confirmed transparent-address activity feed materialized
+  // by `TransparentAddressActivityConsumer`. The mempool view for an
+  // address is served separately through `MempoolActivity` so each
+  // surface has one source of truth. Capability:
+  // `explorer.transparent_address.activity_v1`.
   rpc TransparentAddressActivity(TransparentAddressActivityRequest)
       returns (TransparentAddressActivityResponse);
 
@@ -827,6 +947,26 @@ service ExplorerQuery {
   // Composed from `WalletQuery.ChainValuePoolsAtTip`. Capability:
   // `explorer.value_pool.summary_v1`.
   rpc ValuePoolSummary(ValuePoolSummaryRequest) returns (ValuePoolSummaryResponse);
+
+  // Returns rolling counts of mempool events from the per-second counter
+  // column family. Replaces consumer-side in-memory ring buffers.
+  // Capability: `explorer.mempool.event_counts_v1`.
+  rpc MempoolEventCounts(MempoolEventCountsRequest)
+      returns (MempoolEventCountsResponse);
+
+  // Streams the newest-first projection of canonical transactions from
+  // the `recent_transactions` derive column family. Capability:
+  // `explorer.transaction.recent_v1`.
+  rpc RecentTransactions(RecentTransactionsRequest)
+      returns (stream RecentTransactionsChunk);
+
+  // Verifies a [ZIP-311](https://zips.z.cash/zip-0311) payment disclosure
+  // in-process. Operator opt-in. When the capability
+  // `explorer.payment_disclosure.verify_v1` is absent the consumer falls
+  // back to its own local verifier. The handler applies strict redaction
+  // so the request bytes never reach span attributes.
+  rpc VerifyPaymentDisclosure(VerifyPaymentDisclosureRequest)
+      returns (VerifyPaymentDisclosureResponse);
 }
 
 // `ExplorerQuery.ValuePoolSummary` request.
@@ -847,4 +987,211 @@ message ValuePoolSummaryResponse {
 
   // Tip height the upstream node observed when computing the pools.
   uint32 tip_height = 3;
+}
+
+// Per-row record materialized by `TransparentAddressActivityConsumer`.
+//
+// Storage-only: never returned directly on the wire. Encoded into the
+// `transparent_address_activity` column family value bytes; the key
+// carries `(address_script_hash, reverse_height, in_block_position)`.
+// The handler projects this onto the wire `TransparentAddressActivityEntry`
+// shape and pulls the height + timestamp it already knows from the key.
+message TransparentAddressActivityRecord {
+  bytes transaction_id = 1;
+  int64 block_time_unix_seconds = 2;
+  // Net transparent value the transaction moved for this address
+  // (`sum(outputs to address) - sum(prevouts spent from address)`).
+  //
+  // Set only when `prevout_resolution_status == Resolved` AND every
+  // prevout the transaction reads was successfully resolved. Partial
+  // resolution leaves this field unset rather than reporting a half-
+  // summed value as if it were complete (see ADR-0018).
+  optional sint64 net_value_zat = 3;
+  uint32 input_count = 4;
+  uint32 output_count = 5;
+  // Status of the prevout resolution that produced (or did not produce)
+  // `net_value_zat`. Always present so consumers can render a chip
+  // explaining why `net_value_zat` is unset rather than guessing.
+  PrevoutResolutionStatus prevout_resolution_status = 6;
+}
+
+// Per-transaction record materialized by `TransactionFeesConsumer`.
+//
+// Storage-only: never returned directly on the wire. The
+// `TransactionDetail` handler reads this record and projects the values
+// onto `TransactionDetailResponse`; the `MempoolActivity` handler reads
+// it to populate the per-entry `paid_fee_zat`. One record per non-
+// coinbase transaction the consumer has indexed; the key is the canonical
+// 32-byte transaction id.
+message TransactionFeesRecord {
+  // Paid fee in zatoshis (`sum(transparent_input_value) -
+  // sum(transparent_output_value)` for transparent-only transactions;
+  // unset for transactions with any shielded inputs since the shielded
+  // contribution stays inside the protocol pools).
+  optional uint64 paid_fee_zat = 1;
+
+  // Status of the prevout resolution that produced `paid_fee_zat`.
+  PrevoutResolutionStatus prevout_resolution_status = 2;
+
+  // Per-input transparent prevout values, indexed by transparent input
+  // position. Coinbase inputs are not represented (coinbase transactions
+  // do not appear in this column family).
+  repeated TransparentInputDetail transparent_inputs = 3;
+
+  // ZIP-317 logical-action count, mirrored from the parsed component
+  // counts so the mempool path can populate `MempoolActivityEntry.logical_actions`
+  // without re-parsing.
+  uint32 logical_actions = 4;
+}
+
+// `ExplorerQuery.RecentTransactions` request.
+//
+// Streams the newest-first projection of canonical transactions
+// materialized by `RecentTransactionsConsumer`. Replaces the
+// `BlockSummariesInRange` + per-block `BlockDetail` + per-tx
+// `TransactionDetail` round-trip tree a consumer would otherwise issue
+// for a "recent transactions" surface.
+message RecentTransactionsRequest {
+  // Hard cap on entries returned across all stream chunks. Server clamps
+  // to the configured maximum.
+  uint32 max_entries = 1;
+
+  // Empty resumes from the canonical tip. Non-empty resumes strictly
+  // after the prior page's last entry.
+  bytes from_cursor = 2;
+}
+
+// One streaming chunk of `RecentTransactions` entries.
+message RecentTransactionsChunk {
+  ExplorerFreshness freshness = 1;
+  bytes cursor = 2;
+  repeated RecentTransactionEntry entries = 3;
+}
+
+// One row in the `recent_transactions` projection.
+//
+// Denormalized to keep a "recent transactions" panel renderable from one
+// streaming RPC.
+//
+// Field-presence rules (see ADR-0018):
+// - `zip317_conventional_fee_zat` is set for every non-coinbase row and
+//   unset for coinbase. (Coinbase transactions collect block rewards
+//   rather than paying fees; treating zero as "no fee" would conflate
+//   "coinbase reward path" with "paid no fee", and a `Some(0)` sentinel
+//   would force readers to special-case coinbase anyway.)
+// - `paid_fee_zat` is set only when the consumer resolved every
+//   transparent prevout via `WalletQuery.TransparentPrevouts` AND the
+//   transaction has no shielded inputs.
+message RecentTransactionEntry {
+  bytes transaction_id = 1;
+  uint32 block_height = 2;
+  bytes block_hash = 3;
+  int64 block_time_unix_seconds = 4;
+  bool is_coinbase = 5;
+  PrivacyShape privacy_shape = 6;
+  TransactionComponentCounts component_counts = 7;
+  uint32 size_bytes = 8;
+  optional uint64 zip317_conventional_fee_zat = 9;
+  optional uint64 paid_fee_zat = 10;
+  // ZIP-317 logical-action count for the transaction. Always set,
+  // including for coinbase (which contributes a single transparent
+  // output and therefore logical_actions = 1 after the GRACE_ACTIONS
+  // floor is applied at the fee layer, but the unfloored count here is
+  // the raw shape value).
+  uint32 logical_actions = 11;
+}
+
+// `ExplorerQuery.MempoolEventCounts` request.
+//
+// Returns rolling counts of `Added`, `Mined`, `Invalidated`, and
+// `Suppressed` mempool events from the per-second counter column family
+// `MempoolEventCountsConsumer` writes. The server clamps `window_seconds`
+// to `[60, 3600]`; passing zero asks for the server default (300).
+message MempoolEventCountsRequest {
+  uint32 window_seconds = 1;
+}
+
+// `ExplorerQuery.MempoolEventCounts` response.
+message MempoolEventCountsResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Effective window size after server clamping.
+  uint32 window_seconds = 2;
+
+  // Number of `Added` events the source emitted during the window.
+  uint32 added_count = 3;
+
+  // Number of `Mined` events the source emitted during the window.
+  uint32 mined_count = 4;
+
+  // Number of `Invalidated` events the source emitted during the window.
+  uint32 invalidated_count = 5;
+
+  // Number of `Suppressed` events the source emitted during the window.
+  // Stays zero for sources that do not surface ZIP-401
+  // `RecentlyEvicted`-style admission refusals.
+  uint32 suppressed_count = 6;
+}
+
+// `ExplorerQuery.VerifyPaymentDisclosure` request.
+//
+// Carries the opaque [ZIP-311](https://zips.z.cash/zip-0311) payment-
+// disclosure bytes. The server applies strict redaction: the request
+// bytes never reach span attributes or logs; only the verdict and the
+// optional `public_facts` on a `VALID` response are observable.
+message VerifyPaymentDisclosureRequest {
+  bytes payment_disclosure_bytes = 1;
+}
+
+// `ExplorerQuery.VerifyPaymentDisclosure` response.
+message VerifyPaymentDisclosureResponse {
+  ExplorerFreshness freshness = 1;
+  PaymentDisclosureVerdict verdict = 2;
+
+  // Echoed only when `verdict` is `VALID`. The redaction rules above
+  // apply to anything echoed back through this field.
+  optional PaymentDisclosurePublicFacts public_facts = 3;
+}
+
+// Discrete verdict the payment-disclosure verifier returns.
+enum PaymentDisclosureVerdict {
+  PAYMENT_DISCLOSURE_VERDICT_UNSPECIFIED = 0;
+  PAYMENT_DISCLOSURE_VERDICT_VALID = 1;
+  PAYMENT_DISCLOSURE_VERDICT_INVALID_SIGNATURE = 2;
+  PAYMENT_DISCLOSURE_VERDICT_TRANSACTION_NOT_FOUND = 3;
+  PAYMENT_DISCLOSURE_VERDICT_MALFORMED = 4;
+}
+
+// Public facts the verifier echoes back on a `VALID` verdict.
+//
+// Field set is intentionally minimal so the verifier's output cannot be
+// used to bypass ZIP-311's redaction contract. The transaction id is
+// already public; the payment id binds the disclosure to a specific
+// payment subject; the disclosed amount is what the disclosure asserts
+// the payment moved.
+message PaymentDisclosurePublicFacts {
+  bytes transaction_id = 1;
+  bytes payment_id = 2;
+  uint64 disclosed_value_zat = 3;
+}
+
+// Typed error returned when a derive-RPC cursor has expired.
+//
+// Per the explorer-plane cursor contract (see
+// `docs/architecture/explorer-plane.md`): cursors are valid for the
+// lifetime of the column-family snapshot at issue time. The server
+// rejects a cursor that references a height range no longer in the store
+// (reorged out, or rolled off retention) with this typed error attached
+// to the gRPC status's `details`. Consumers re-issue from the start of
+// the range or jump to `recommended_resume_height`.
+message CursorExpiredError {
+  // Height the server now considers the safe starting point for a fresh
+  // cursor. Set to the canonical tip when the consumer should restart at
+  // the head of the projection; set to the lowest still-indexed height
+  // when the consumer should restart earlier.
+  uint32 recommended_resume_height = 1;
+
+  // Short reason hint a UI can render verbatim. The canonical sentences
+  // live in `crates/zinder-core/src/explorer_reasons.rs`.
+  string hint = 2;
 }

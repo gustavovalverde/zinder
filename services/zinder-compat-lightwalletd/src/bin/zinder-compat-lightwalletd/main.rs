@@ -118,6 +118,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(lightwalletd_config.network),
         readiness.clone(),
+        Vec::new(),
     );
 
     let open_storage_phase = StartupPhase::OpenStorage.start();

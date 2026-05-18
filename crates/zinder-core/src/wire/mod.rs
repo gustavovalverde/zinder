@@ -19,11 +19,18 @@
 //! forbidden patterns; the structural test at
 //! `crates/zinder-core/tests/wire_invariants.rs` enforces this.
 
+mod address_script_hash;
 mod block_hash;
 mod branch_id;
 mod chain_name;
+mod height_key;
+mod in_block_position;
 mod transaction_id;
+mod unix_seconds;
 
+pub use address_script_hash::{
+    ADDRESS_SCRIPT_HASH_LEN, decode_address_script_hash, encode_address_script_hash,
+};
 pub use block_hash::{
     decode_display_block_hash_hex, decode_internal_block_hash, encode_display_block_hash_hex,
     encode_internal_block_hash,
@@ -32,10 +39,18 @@ pub use branch_id::{decode_branch_id_hex, encode_branch_id_hex};
 pub use chain_name::{
     decode_zinder_native_chain_name, encode_bip70_chain_name, encode_zinder_native_chain_name,
 };
+pub use height_key::{
+    HEIGHT_KEY_LEN, decode_height_key_ascending, decode_height_key_descending,
+    encode_height_key_ascending, encode_height_key_descending,
+};
+pub use in_block_position::{
+    IN_BLOCK_POSITION_KEY_LEN, decode_in_block_position, encode_in_block_position,
+};
 pub use transaction_id::{
     decode_display_transaction_id_hex, decode_internal_transaction_id,
     encode_display_transaction_id_hex, encode_internal_transaction_id,
 };
+pub use unix_seconds::{UNIX_SECONDS_KEY_LEN, decode_unix_seconds, encode_unix_seconds};
 
 /// Errors returned by `decode_*` functions in [`crate::wire`].
 ///

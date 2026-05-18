@@ -27,6 +27,10 @@ async fn get_text(listen_addr: SocketAddr, path: &str) -> Result<(u16, String)> 
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "end-to-end test covers healthz, readyz, and metrics in a single fixture"
+)]
 async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr: SocketAddr = listener.local_addr()?;
@@ -39,6 +43,7 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
             service_name: "zinder-test",
             service_version: "0.0.0",
             network_name: "zcash-regtest",
+            advertised_capabilities: vec![zinder_proto::capabilities::WALLET_READ_LATEST_BLOCK_V1],
         },
         readiness.clone(),
     );

@@ -1,0 +1,162 @@
+# ADR-0017: Derive-consumer template, shared block context, and key codec convention
+
+Status: Accepted
+Date: 2026-05-19
+Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
+[ADR-0011](0011-explorer-freshness-envelope.md)
+
+## Context
+
+The explorer plane materializes column-family projections through derive
+consumers under `services/zinder-explorer/src/consumer/`. The block-explorer
+consumer PRD added four chain-events consumers
+(`BlockSummaryConsumer`, `TransactionFeesConsumer`,
+`TransparentAddressActivityConsumer`, `RecentTransactionsConsumer`).
+Each consumer needs (a) the parsed block at the height being applied,
+(b) optionally a resolved prevout map, and (c) a small per-height key
+encoding for whichever column-family layout the consumer chose.
+
+Letting each consumer roll its own block fetch, its own prevout
+resolver, its own key bytes, and its own range-loop scaffolding would
+multiply boilerplate by N and let drift between consumers compound. The
+first two consumers shipped under that pattern already diverged on error
+shapes, retry loops, and key encodings.
+
+## Decision
+
+### Per-block context shared across consumers
+
+A single [`BlockSource`](../../services/zinder-explorer/src/consumer/block_source.rs)
+fronts `WalletQuery.FullBlock` for every chain-events consumer in the
+process. It caches `Arc<BlockCommitContext>` by height for a short TTL
+(30 s; capacity 32 entries), so the per-envelope fan-out across N
+consumers fetches and parses each block exactly once. The
+[`BlockCommitContext`](../../services/zinder-explorer/src/consumer/block_commit_context.rs)
+carries the parsed `zebra-chain` block, the raw bytes, the block and
+parent hashes, and a lazily-hydrated prevout map (resolved through
+`WalletQuery.TransparentPrevouts` when the binary configured
+`PrevoutResolver::Online`).
+
+The binary builds one `BlockSource` at startup and clones it into every
+consumer. Consumers do not hold their own `WalletQueryClient`.
+
+### Consumer trait split
+
+`DeriveConsumer` is the SDK-facing trait the chain-events subscriber
+dispatches into; it has `apply_chain_committed` and `apply_chain_reorged`.
+
+`BlockKeyedConsumer` is the convention every production consumer
+implements:
+
+- `block_source(&self) -> &BlockSource`
+- `apply_block(&mut self, &BlockCommitContext, &mut DeriveConsumerCtx<'_>)`
+- `revert_block(&mut self, BlockHeight, &mut DeriveConsumerCtx<'_>)`
+
+A blanket `impl<C: BlockKeyedConsumer> DeriveConsumer for C` provides
+the range loop on top: `apply_chain_committed` walks
+`start_height..=end_height`, pulls each `BlockCommitContext` from the
+shared source, and calls `apply_block`; `apply_chain_reorged` walks the
+reverted range calling `revert_block` then walks the replacement range
+calling `apply_block`.
+
+Test-only consumers that don't fit the per-block shape implement
+`DeriveConsumer` directly without paying the per-block scaffolding tax.
+
+### Key codec primitives
+
+Key encoding lives in `crates/zinder-core/src/wire/`. Each primitive is
+a `pub fn encode_*` and matching `decode_*`:
+
+- `wire::height_key`: `encode_height_key_ascending(BlockHeight) -> [u8; 4]`
+  (lexicographic = oldest-first), `encode_height_key_descending` (=
+  `u32::MAX - height`, lexicographic = newest-first), and decoders.
+- `wire::address_script_hash`:
+  `encode_address_script_hash(TransparentAddressScriptHash) -> [u8; 32]`
+  and decoder.
+- `wire::in_block_position`:
+  `encode_in_block_position(u32) -> [u8; 4]` for the per-block tx
+  position component of composite keys.
+- `wire::unix_seconds`:
+  `encode_unix_seconds(u64) -> [u8; 8]` for time-bucketed projections.
+
+Composite keys are concatenations of the above plus per-consumer
+trailing tags. The conventions actually in use:
+
+- per-block ascending: `[height_key_ascending(4)]` (`BlockSummary`,
+  the `transaction_fees_index` family, the
+  `transparent_address_activity_index` family)
+- per-tx by id: `[transaction_id_internal(32)]`
+  (`TransactionFeesConsumer` primary records)
+- per-block-position descending: `[height_key_descending(4) | in_block_position(4)]`
+  (`RecentTransactionsConsumer`)
+- per-address descending: `[address_script_hash(32) | height_key_descending(4) | in_block_position(4)]`
+  (`TransparentAddressActivityConsumer` primary records)
+- per-second: `[unix_seconds(8)]`
+  (`MempoolEventCountsConsumer`)
+
+A consumer that needs a new shape adds the primitive to `wire/` and
+documents the layout here, rather than encoding bytes inline. Inline
+`.to_be_bytes()` on heights, positions, addresses, or unix seconds at
+derive-store boundaries is a forbidden pattern.
+
+### Freshness helpers
+
+`DeriveStore` ships two helpers paired with the height-key primitives:
+
+- `last_materialized_height_ascending(cf)` — decodes the last key as
+  four-byte big-endian ascending height. Used by `BlockSummaryConsumer`
+  and the explorer block-view handler.
+- `last_materialized_height_descending(cf)` — decodes the first key
+  (lowest reverse-height bytes correspond to highest height) as
+  descending-height bytes. Used by every consumer that keys on
+  reverse-height as the primary discriminator.
+
+A consumer whose freshness signal is not chain-height (a mempool-driven
+consumer, for example) defines its own helper on the store rather than
+decoding bytes inline in a handler.
+
+## Rewind contract
+
+Every chain-events consumer implements `revert_block(height, ctx)`. The
+shape of the implementation depends on the key layout:
+
+- **Per-height ascending key** (`BlockSummary`): one `delete_cf` per
+  height. The blanket `apply_chain_reorged` walks the reverted range
+  and calls `revert_block` per height.
+- **Per-block-position descending composite**
+  (`RecentTransactionsConsumer`): one `delete_range_cf` per height over
+  the 4-byte `height_key_descending` prefix.
+- **Composite where height is NOT a prefix**
+  (`TransparentAddressActivityConsumer`,
+  `TransactionFeesConsumer`): the consumer maintains a per-height
+  *index* column family keyed by ascending height whose value is the
+  concatenated list of secondary discriminators it wrote at that height
+  (txids for fees, `(address, in_block_position)` pairs for
+  address activity). On revert it reads the index for the reverted
+  height, deletes each primary row by the reconstructed composite key,
+  then deletes the index entry. All deletes go in the same batch as the
+  cursor advance.
+
+The two-CF index pattern is what makes rewind correct under reorg: the
+canonical block at the reverted height has changed, so re-fetching from
+the wallet would return the new block, not the one whose rows we
+actually wrote. The persisted index captures what was actually
+materialized at apply time.
+
+## Consequences
+
+- A new consumer that fits the per-block shape implements
+  `BlockKeyedConsumer` (three methods) plus a key codec and an error
+  enum. The trait blanket gives it the range-loop scaffolding for free.
+- A new wire-key shape requires one primitive in
+  `crates/zinder-core/src/wire/`. Subsequent consumers reuse it.
+- `wire_invariants.rs` extends with bans for inline
+  `.to_be_bytes()` on derive-store key fields when the temptation
+  arises.
+- The `BlockSource` cache bounds intra-envelope cost to one
+  `FullBlock` RPC and one parse per height, even as the consumer count
+  grows. The cache TTL is short enough that idle memory stays under one
+  block per process.
+- Composite-key consumers that don't have a height prefix accept the
+  index-CF overhead (a few dozen bytes per row at apply time) in
+  exchange for correct, single-batch rewinds.

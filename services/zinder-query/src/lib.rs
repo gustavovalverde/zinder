@@ -967,31 +967,22 @@ fn map_transparent_utxo_store_error(error: StoreError) -> QueryError {
     }
 }
 
+/// Metric pair the `WalletQuery` adapter emits per request.
+const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
+    zinder_runtime::RpcMetricNames::for_service(
+        "zinder_query_request_duration_seconds",
+        "zinder_query_request_total",
+    );
+
 /// Registers `# HELP` and `# TYPE` text for every metric this crate emits.
 ///
 /// Call once at startup, after `install_metrics_recorder` returns and before
-/// the gRPC server records its first request. Subsequent calls overwrite the
-/// stored descriptions; emitting a metric without a prior describe is fine
-/// but leaves the Prometheus `/metrics` text without a `# HELP` line.
+/// the gRPC server records its first request. Delegates the RPC metric pair
+/// to [`zinder_runtime::describe_rpc_metrics`] so every Zinder service
+/// shares one description template; the compact-block-range histogram is
+/// `WalletQuery`-specific and stays registered here.
 pub fn describe_request_metrics() {
-    metrics::describe_histogram!(
-        "zinder_query_request_duration_seconds",
-        metrics::Unit::Seconds,
-        "Wall-clock duration of WalletQuery RPCs handled by this service. \
-         Labels: operation (snake_case RPC method, e.g. latest_block), status \
-         (ok|error), error_class. Typed RPCs (those backed by WalletQueryApi) \
-         carry the typed QueryError variant (e.g. invalid_block_range). Proxy \
-         RPCs (those forwarded to IngestControl or federated to ExplorerQuery) \
-         carry the tonic::Code name (e.g. unavailable). Both vocabularies use \
-         'none' on success."
-    );
-    metrics::describe_counter!(
-        "zinder_query_request_total",
-        metrics::Unit::Count,
-        "Total WalletQuery RPC outcomes observed by this service. Same labels \
-         as zinder_query_request_duration_seconds; sum across operations gives \
-         total RPC throughput."
-    );
+    zinder_runtime::describe_rpc_metrics(QUERY_RPC_METRICS, "WalletQuery");
     metrics::describe_histogram!(
         "zinder_query_compact_block_range_block_count",
         metrics::Unit::Count,
@@ -1006,32 +997,27 @@ fn record_wallet_query_outcome<Response>(
     query_outcome: &Result<Response, QueryError>,
     block_count: Option<usize>,
 ) {
-    metrics::histogram!(
-        "zinder_query_request_duration_seconds",
-        "operation" => operation,
-        "status" => outcome_status(query_outcome),
-        "error_class" => query_error_class(query_outcome.as_ref().err())
-    )
-    .record(started_at.elapsed());
-    metrics::counter!(
-        "zinder_query_request_total",
-        "operation" => operation,
-        "status" => outcome_status(query_outcome),
-        "error_class" => query_error_class(query_outcome.as_ref().err())
-    )
-    .increment(1);
+    let outcome = outcome_from_query_result(query_outcome);
+    zinder_runtime::record_rpc_request(QUERY_RPC_METRICS, operation, started_at.elapsed(), outcome);
 
     if let Some(block_count) = block_count {
         metrics::histogram!(
             "zinder_query_compact_block_range_block_count",
-            "status" => outcome_status(query_outcome)
+            "status" => outcome.status_label()
         )
         .record(usize_to_u32_saturating(block_count));
     }
 }
 
-const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
-    if outcome.is_ok() { "ok" } else { "error" }
+fn outcome_from_query_result<Response>(
+    query_outcome: &Result<Response, QueryError>,
+) -> zinder_runtime::RpcOutcome {
+    match query_outcome {
+        Ok(_) => zinder_runtime::RpcOutcome::Ok,
+        Err(error) => zinder_runtime::RpcOutcome::Error {
+            class: query_error_class(Some(error)),
+        },
+    }
 }
 
 fn query_error_class(error: Option<&QueryError>) -> &'static str {
@@ -1083,20 +1069,13 @@ pub(crate) fn record_proxy_outcome<ResponseT>(
     started_at: Instant,
     proxy_outcome: &Result<tonic::Response<ResponseT>, tonic::Status>,
 ) {
-    metrics::histogram!(
-        "zinder_query_request_duration_seconds",
-        "operation" => operation,
-        "status" => outcome_status(proxy_outcome),
-        "error_class" => proxy_error_class(proxy_outcome.as_ref().err())
-    )
-    .record(started_at.elapsed());
-    metrics::counter!(
-        "zinder_query_request_total",
-        "operation" => operation,
-        "status" => outcome_status(proxy_outcome),
-        "error_class" => proxy_error_class(proxy_outcome.as_ref().err())
-    )
-    .increment(1);
+    let outcome = match proxy_outcome {
+        Ok(_) => zinder_runtime::RpcOutcome::Ok,
+        Err(status) => zinder_runtime::RpcOutcome::Error {
+            class: proxy_error_class(Some(status)),
+        },
+    };
+    zinder_runtime::record_rpc_request(QUERY_RPC_METRICS, operation, started_at.elapsed(), outcome);
 }
 
 fn proxy_error_class(error: Option<&tonic::Status>) -> &'static str {
