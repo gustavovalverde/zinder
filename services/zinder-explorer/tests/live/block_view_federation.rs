@@ -161,10 +161,8 @@ async fn build_block_summary_consumer(wallet_endpoint: &str) -> Result<BlockSumm
     let channel = connect_authenticated_channel(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer connect: {error}"))?;
-    let block_source = zinder_explorer::BlockSource::new(
-        WalletQueryClient::new(channel),
-        zinder_explorer::PrevoutResolver::Offline,
-    );
+    let block_source =
+        zinder_explorer::BlockSource::new(channel, zinder_explorer::PrevoutResolver::Offline);
     Ok(BlockSummaryConsumer::new(block_source))
 }
 
@@ -525,7 +523,7 @@ async fn drive_once(
         .await
         .map_err(|error| eyre!("consumer fetch connect: {error}"))?;
     let block_source = zinder_explorer::BlockSource::new(
-        WalletQueryClient::new(channel_for_consumer),
+        channel_for_consumer,
         zinder_explorer::PrevoutResolver::Offline,
     );
     let mut consumer = BlockSummaryConsumer::new(block_source);

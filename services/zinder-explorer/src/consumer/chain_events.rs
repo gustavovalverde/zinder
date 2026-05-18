@@ -62,10 +62,18 @@ where
     S: Stream<Item = Result<ChainEventEnvelope, Status>> + Unpin + Send,
 {
     let mut outcome = ChainEventsRunOutcome::default();
+    let consumer_label = consumer.name().as_str();
     while let Some(envelope_result) = stream.next().await {
         let envelope = envelope_result?;
         let event_sequence = envelope.event_sequence;
         dispatch(consumer, store, envelope).await?;
+        tracing::debug!(
+            target: "zinder::explorer",
+            event = "chain_events_envelope_applied",
+            consumer = consumer_label,
+            event_sequence,
+            "applied chain-events envelope; cursor written"
+        );
         outcome.applied_envelopes = outcome.applied_envelopes.saturating_add(1);
         outcome.last_event_sequence = Some(event_sequence);
     }

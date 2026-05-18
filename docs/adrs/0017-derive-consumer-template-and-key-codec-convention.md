@@ -40,6 +40,29 @@ parent hashes, and a lazily-hydrated prevout map (resolved through
 The binary builds one `BlockSource` at startup and clones it into every
 consumer. Consumers do not hold their own `WalletQueryClient`.
 
+### Channel-per-purpose to the wallet plane
+
+The explorer binary opens three independent `AuthenticatedChannel`
+connections to `zinder-query` at startup, each owned by a different
+caller:
+
+- one drives the four long-lived `WalletQuery.ChainEvents` server-streams;
+- one backs `BlockSource`'s `WalletQuery.FullBlock` unary calls;
+- one backs `PrevoutResolver::Online`'s
+  `WalletQuery.TransparentPrevouts` unary calls (built only when the
+  upstream advertises `wallet.read.transparent_prevouts_v1`).
+
+The reason is failure-domain isolation. A single tonic `Channel` is one
+HTTP/2 connection driven by one background hyper task. Mixing four
+long-lived server-streams and many short unary calls on that single
+driver task hit a degenerate state in practice: after a brief warmup the
+unary calls would stall indefinitely while the streams stayed open. The
+three-channel split removes the contention without sacrificing connection
+reuse (each channel still multiplexes its own family of calls), and it
+keeps the failure-domain boundaries readable: an outage in the prevouts
+upstream cannot wedge `BlockSource`, and an upstream backfill that
+pushes many envelopes through `ChainEvents` cannot starve `FullBlock`.
+
 ### Consumer trait split
 
 `DeriveConsumer` is the SDK-facing trait the chain-events subscriber

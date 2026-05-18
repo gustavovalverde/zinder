@@ -7,6 +7,13 @@
 //! consumers asking for the same height during the cache window get the
 //! same `Arc` without re-fetching or re-parsing.
 //!
+//! Concurrent misses on the same height are deduplicated by a per-height
+//! inflight map: only the first task issues the RPC, the others await its
+//! result and share the same `Arc<BlockCommitContext>`. Without this,
+//! four consumer tasks racing for a fresh height each issued their own
+//! RPC, defeated the cache, and (because they each held an independent
+//! `Arc`) re-ran prevout resolution N times.
+//!
 //! The cache is intentionally tiny (capacity 32, TTL 30 s): mainnet block
 //! cadence is ~75 s, so the cache survives the intra-envelope fan-out
 //! across N consumers without ever needing to hold more than a handful of
@@ -15,12 +22,12 @@
 //! unlikely to be re-requested once every consumer has advanced past
 //! them).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OnceCell;
 use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto as _;
@@ -48,19 +55,34 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Block fetcher shared across derive consumers.
 ///
 /// Hold one `BlockSource` per process and clone it (via [`Clone`], cheap
-/// because it wraps an `Arc`) into each consumer. The internal cache
-/// dedupes parallel `block(H)` calls from N consumers into a single
-/// upstream RPC and a single parse.
+/// because it wraps an `Arc`) into each consumer. Each `fetch_block` call
+/// constructs a fresh [`WalletQueryClient`] over the shared
+/// [`AuthenticatedChannel`]; HTTP/2 multiplexes the calls, so multiple
+/// consumers issue `FullBlock` RPCs concurrently without per-process
+/// serialization. The cache then deduplicates results so repeat lookups
+/// for the same height during the fan-out window skip the RPC entirely.
 #[derive(Clone)]
 pub struct BlockSource {
     inner: Arc<BlockSourceInner>,
 }
 
 struct BlockSourceInner {
-    wallet_client: AsyncMutex<WalletQueryClient<AuthenticatedChannel>>,
+    wallet_channel: AuthenticatedChannel,
     prevout_resolver: PrevoutResolver,
     cache: Mutex<VecDeque<CachedEntry>>,
+    inflight: Mutex<HashMap<BlockHeight, InflightCell>>,
 }
+
+/// Shared one-shot cell every concurrent miss for a given height attaches to.
+///
+/// The first task drives `fetch_block` through
+/// [`OnceCell::get_or_try_init`]; the others await the same future. On
+/// success, the cell holds the shared `Arc`; on failure, the cell stays
+/// empty so a later caller can retry (current waiters receive a cloned
+/// error). Either way, the inflight entry is dropped from the map once
+/// init resolves; the `Arc` keeps the cell alive for any waiters still
+/// holding their own clone.
+type InflightCell = Arc<OnceCell<Option<Arc<BlockCommitContext>>>>;
 
 /// Three-state cache outcome distinguishing miss from cached-absent.
 enum CacheLookup {
@@ -78,18 +100,16 @@ struct CachedEntry {
 }
 
 impl BlockSource {
-    /// Builds a block source backed by `wallet_client` and the configured
+    /// Builds a block source backed by `wallet_channel` and the configured
     /// prevout-resolution stance.
     #[must_use]
-    pub fn new(
-        wallet_client: WalletQueryClient<AuthenticatedChannel>,
-        prevout_resolver: PrevoutResolver,
-    ) -> Self {
+    pub fn new(wallet_channel: AuthenticatedChannel, prevout_resolver: PrevoutResolver) -> Self {
         Self {
             inner: Arc::new(BlockSourceInner {
-                wallet_client: AsyncMutex::new(wallet_client),
+                wallet_channel,
                 prevout_resolver,
                 cache: Mutex::new(VecDeque::with_capacity(CACHE_CAPACITY)),
+                inflight: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -105,9 +125,33 @@ impl BlockSource {
         height: BlockHeight,
     ) -> Result<Option<Arc<BlockCommitContext>>, BlockCommitContextError> {
         match self.cache_lookup(height) {
-            CacheLookup::HitPresent(context) => Ok(Some(context)),
-            CacheLookup::HitAbsent => Ok(None),
-            CacheLookup::Miss => self.fetch_and_cache(height).await,
+            CacheLookup::HitPresent(context) => return Ok(Some(context)),
+            CacheLookup::HitAbsent => return Ok(None),
+            CacheLookup::Miss => {}
+        }
+        let cell = self.acquire_inflight_cell(height);
+        let outcome = cell
+            .get_or_try_init(|| async {
+                let fetched = self.fetch_and_cache(height).await;
+                self.inner.inflight.lock().remove(&height);
+                fetched
+            })
+            .await?;
+        Ok(outcome.clone())
+    }
+
+    /// Returns a per-height inflight cell, creating one if no fetch is in
+    /// flight yet. Concurrent callers for the same height share the cell
+    /// and therefore share the single fetch its init future drives.
+    fn acquire_inflight_cell(&self, height: BlockHeight) -> InflightCell {
+        let mut inflight = self.inner.inflight.lock();
+        match inflight.entry(height) {
+            Entry::Occupied(slot) => Arc::clone(slot.get()),
+            Entry::Vacant(slot) => {
+                let cell: InflightCell = Arc::new(OnceCell::new());
+                slot.insert(Arc::clone(&cell));
+                cell
+            }
         }
     }
 
@@ -154,14 +198,13 @@ impl BlockSource {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockCommitContext>, BlockCommitContextError> {
-        let mut client = self.inner.wallet_client.lock().await;
+        let mut client = WalletQueryClient::new(self.inner.wallet_channel.clone());
         let response = client
             .full_block(Request::new(FullBlockRequest {
                 block_height: height.value(),
                 at_epoch: None,
             }))
             .await;
-        drop(client);
         let inner = match response {
             Ok(envelope) => envelope.into_inner(),
             Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),

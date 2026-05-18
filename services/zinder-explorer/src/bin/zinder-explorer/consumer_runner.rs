@@ -68,15 +68,23 @@ pub(crate) async fn build_environment(
     let prevouts_online = probe_prevouts_capability(&mut probe_client)
         .await
         .unwrap_or(false);
+    // BlockSource uses its own dedicated channel so the long-lived
+    // chain-events server-streams cannot share a connection-driver task
+    // with the per-height FullBlock unary RPCs. Sharing one channel
+    // showed pathological hangs where every concurrent FullBlock froze
+    // mid-stream once the chain-events streams had been open for ~1 s.
+    let block_source_channel = connect_authenticated_channel(wallet_endpoint, None)
+        .await
+        .map_err(|error| ConsumerRunnerError::Connect(error.to_string()))?;
     let prevout_resolver = if prevouts_online {
-        PrevoutResolver::online(WalletQueryClient::new(wallet_channel.clone()))
+        let prevouts_channel = connect_authenticated_channel(wallet_endpoint, None)
+            .await
+            .map_err(|error| ConsumerRunnerError::Connect(error.to_string()))?;
+        PrevoutResolver::online(prevouts_channel)
     } else {
         PrevoutResolver::Offline
     };
-    let block_source = BlockSource::new(
-        WalletQueryClient::new(wallet_channel.clone()),
-        prevout_resolver,
-    );
+    let block_source = BlockSource::new(block_source_channel, prevout_resolver);
     Ok((
         ConsumerRunnerEnvironment {
             store,
@@ -286,12 +294,6 @@ async fn run_with_reconnect<DispatchFn, DispatchFut>(
             }
         }
     }
-    tracing::info!(
-        target: "zinder::explorer",
-        event = "derive_consumer_stopped",
-        consumer = label,
-        "derive consumer stopped"
-    );
 }
 
 async fn dispatch_chain_events_once<C: DeriveConsumer>(

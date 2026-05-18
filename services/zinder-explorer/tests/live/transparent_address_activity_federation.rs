@@ -294,7 +294,7 @@ async fn drive_once(
         .await
         .map_err(|error| eyre!("consumer fetch connect: {error}"))?;
     let block_source = zinder_explorer::BlockSource::new(
-        WalletQueryClient::new(channel_for_consumer),
+        channel_for_consumer,
         zinder_explorer::PrevoutResolver::Offline,
     );
     let mut consumer = TransparentAddressActivityConsumer::new(block_source);

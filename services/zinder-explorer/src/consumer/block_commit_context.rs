@@ -15,7 +15,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
@@ -78,25 +77,26 @@ pub enum BlockCommitContextError {
 
 /// How [`BlockCommitContext::prevouts`] resolves missing values.
 ///
-/// `Online` carries the live wallet client; `Offline` short-circuits to
-/// `None` so consumers that branch on prevout availability never block on a
-/// resolution attempt the binary has explicitly disabled. The wallet
-/// client is boxed because the generated `WalletQueryClient` carries an
-/// internal codec table that pushes the inline size past 200 bytes.
+/// `Online` carries the wallet HTTP/2 channel; the resolver constructs a
+/// fresh [`WalletQueryClient`] per resolution so concurrent prevout
+/// requests multiplex on the channel rather than serializing through one
+/// client handle. `Offline` short-circuits to `None` so consumers that
+/// branch on prevout availability never block on a resolution attempt the
+/// binary has explicitly disabled.
 #[derive(Clone)]
 pub enum PrevoutResolver {
-    /// Resolve through `WalletQuery.TransparentPrevouts`. The boxed
-    /// client is `Clone`-cheap (it wraps a `tonic::Channel`).
-    Online(Box<WalletQueryClient<AuthenticatedChannel>>),
+    /// Resolve through `WalletQuery.TransparentPrevouts` over the wrapped
+    /// channel.
+    Online(AuthenticatedChannel),
     /// Prevout resolution is not available; `prevouts()` returns `None`.
     Offline,
 }
 
 impl PrevoutResolver {
-    /// Wraps a wallet client into the `Online` variant.
+    /// Wraps a wallet channel into the `Online` variant.
     #[must_use]
-    pub fn online(client: WalletQueryClient<AuthenticatedChannel>) -> Self {
-        Self::Online(Box::new(client))
+    pub fn online(wallet_channel: AuthenticatedChannel) -> Self {
+        Self::Online(wallet_channel)
     }
 }
 
@@ -130,7 +130,7 @@ pub struct BlockCommitContext {
     /// Block parsed once with `zebra-chain`.
     pub block: ZebraBlock,
     prevouts: OnceCell<Option<Arc<HashMap<TransparentOutPoint, transparent::Output>>>>,
-    resolver: Mutex<PrevoutResolver>,
+    resolver: PrevoutResolver,
 }
 
 /// Parsed-block payload [`BlockCommitContext::new`] takes by value.
@@ -152,7 +152,7 @@ impl BlockCommitContext {
             raw_block_bytes: payload.raw_block_bytes,
             block: payload.block,
             prevouts: OnceCell::new(),
-            resolver: Mutex::new(resolver),
+            resolver,
         }
     }
 
@@ -172,11 +172,11 @@ impl BlockCommitContext {
         let cached = self
             .prevouts
             .get_or_try_init(|| async {
-                let resolver = self.resolver.lock().clone();
-                match resolver {
+                match &self.resolver {
                     PrevoutResolver::Offline => Ok(None),
-                    PrevoutResolver::Online(mut client) => {
-                        let map = resolve_block_prevouts(client.as_mut(), &self.block).await?;
+                    PrevoutResolver::Online(channel) => {
+                        let mut client = WalletQueryClient::new(channel.clone());
+                        let map = resolve_block_prevouts(&mut client, &self.block).await?;
                         Ok(Some(Arc::new(map)))
                     }
                 }
