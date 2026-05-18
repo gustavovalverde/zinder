@@ -249,15 +249,35 @@ async fn run_with_reconnect<DispatchFn, DispatchFut>(
         if cancel.is_cancelled() {
             break;
         }
-        match dispatch_once(&env, &cancel).await {
-            Ok(()) => break,
+        let outcome = dispatch_once(&env, &cancel).await;
+        if cancel.is_cancelled() {
+            break;
+        }
+        match outcome {
+            Ok(()) => {
+                // Chain-events and mempool-events streams are server-streams
+                // intended to deliver indefinitely. A clean close from the
+                // server means the retained buffer ran out; we reconnect so
+                // the consumer picks up subsequent events. Cancellation is
+                // handled by the `cancel.is_cancelled()` check above.
+                tracing::debug!(
+                    target: "zinder::explorer",
+                    event = "derive_consumer_resubscribe",
+                    consumer = label,
+                    "derive consumer stream closed cleanly; resubscribing after backoff"
+                );
+                tokio::select! {
+                    () = sleep(RECONNECT_BACKOFF) => {}
+                    () = cancel.cancelled() => break,
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "zinder::explorer",
                     event = "derive_consumer_reconnect",
                     consumer = label,
                     error = %error,
-                    "derive consumer stream ended; reconnecting after backoff"
+                    "derive consumer stream errored; reconnecting after backoff"
                 );
                 tokio::select! {
                     () = sleep(RECONNECT_BACKOFF) => {}
