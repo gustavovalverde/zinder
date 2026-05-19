@@ -26,16 +26,10 @@
 
 use std::{path::Path, str::FromStr};
 
-use std::time::Duration;
-
 use secrecy::{ExposeSecret, SecretString};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tonic::{
-    Request, Status,
-    service::interceptor::InterceptedService,
-    transport::{Channel, Endpoint},
-};
+use tonic::{Request, Status, service::interceptor::InterceptedService, transport::Channel};
 
 /// Authenticated bearer token used by the private `IngestControl` gRPC
 /// channel.
@@ -216,68 +210,22 @@ fn format_bearer_metadata(
 ///
 /// Tonic's generated gRPC clients accept the intercepted service through
 /// `Client::new(channel)`, so callers wrap the value returned by
-/// [`connect_authenticated_channel`] in their service-specific client type.
+/// [`crate::transport::connect_zinder_grpc`] in their service-specific
+/// client type.
 pub type AuthenticatedChannel = InterceptedService<Channel, BearerTokenClientInterceptor>;
 
-/// Errors returned by [`connect_authenticated_channel`].
+/// Errors returned by [`crate::transport::connect_zinder_grpc`].
 #[derive(Debug, Error)]
 pub enum BearerTokenConnectError {
     /// The endpoint URL could not be parsed.
-    #[error("ingest-control endpoint URL is invalid: {0}")]
+    #[error("zinder gRPC endpoint URL is invalid: {0}")]
     InvalidEndpoint(#[source] tonic::transport::Error),
     /// The transport could not connect to the endpoint.
-    #[error("ingest-control transport connect failed: {0}")]
+    #[error("zinder gRPC transport connect failed: {0}")]
     Transport(#[source] tonic::transport::Error),
     /// The bearer token could not be encoded as gRPC metadata.
     #[error(transparent)]
     Token(#[from] BearerTokenError),
-}
-
-/// HTTP/2 ping interval that keeps idle channel connections healthy.
-///
-/// Without this, a `tonic::Channel` that has been idle since the peer
-/// restarted appears alive to the client but `await`s on it hang
-/// indefinitely: tonic does not surface the dead underlying connection
-/// until a request that hits TCP semantics times out, which can be
-/// minutes or never. A 30 s ping keeps the connection's health observable
-/// at human-meaningful latency.
-const CHANNEL_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Maximum time a single HTTP/2 keep-alive ping waits for an ACK before
-/// the channel treats the connection as dead.
-const CHANNEL_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// TCP-level keepalive probes. Catches the case where the peer process
-/// vanished but the kernel still holds a socket open, which HTTP/2
-/// keep-alive alone cannot detect on every platform.
-const CHANNEL_TCP_KEEP_ALIVE: Duration = Duration::from_mins(1);
-
-/// Connects to a private control-plane endpoint and attaches the bearer-token interceptor.
-///
-/// Returns the intercepted channel that callers wrap in their
-/// service-specific client type with `Client::new(channel)`. The channel
-/// has HTTP/2 + TCP keep-alives enabled so connections survive an idle
-/// period but fail fast (within seconds) when the upstream restarts or
-/// the connection is silently broken: without keep-alives, in-flight
-/// `await`s on a half-dead connection hang indefinitely instead of
-/// returning the error the caller's reconnect loop is designed to
-/// handle.
-pub async fn connect_authenticated_channel(
-    endpoint: &str,
-    bearer_token: Option<&BearerToken>,
-) -> Result<AuthenticatedChannel, BearerTokenConnectError> {
-    let endpoint = Endpoint::from_shared(endpoint.to_owned())
-        .map_err(BearerTokenConnectError::InvalidEndpoint)?
-        .http2_keep_alive_interval(CHANNEL_HTTP2_KEEP_ALIVE_INTERVAL)
-        .keep_alive_while_idle(true)
-        .keep_alive_timeout(CHANNEL_HTTP2_KEEP_ALIVE_TIMEOUT)
-        .tcp_keepalive(Some(CHANNEL_TCP_KEEP_ALIVE));
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(BearerTokenConnectError::Transport)?;
-    let interceptor = BearerTokenClientInterceptor::new(bearer_token)?;
-    Ok(InterceptedService::new(channel, interceptor))
 }
 
 #[cfg(test)]

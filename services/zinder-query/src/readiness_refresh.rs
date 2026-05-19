@@ -17,7 +17,7 @@ use zinder_core::{BlockHeight, ChainEpochId, Network};
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenError, Readiness,
-    ReadinessCause, ReadinessState, connect_authenticated_channel,
+    ReadinessCause, ReadinessState, connect_zinder_grpc,
 };
 use zinder_store::{PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, StoreError};
 
@@ -155,7 +155,7 @@ impl WriterStatusUpstream {
 
     async fn fetch_snapshot(&mut self) -> Result<WriterStatusSnapshot, WriterStatusFetchError> {
         if self.client.is_none() {
-            let channel = connect_authenticated_channel(&self.endpoint, self.bearer_token.as_ref())
+            let channel = connect_zinder_grpc(&self.endpoint, self.bearer_token.as_ref())
                 .await
                 .map_err(|error| writer_status_connect_error(error, self.endpoint.clone()))?;
             self.client = Some(IngestControlClient::new(channel));

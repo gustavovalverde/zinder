@@ -36,7 +36,7 @@ use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
     wallet::{self, MempoolEventStreamFamily},
 };
-use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
+use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     StreamCursorTokenV1, mempool_entry_from_message, mempool_event_envelope_from_message,
 };
@@ -98,7 +98,7 @@ impl IngestControlMempoolSurface {
         let channel = self
             .channel
             .get_or_try_init(|| async move {
-                connect_authenticated_channel(&endpoint, bearer_token.as_ref())
+                connect_zinder_grpc(&endpoint, bearer_token.as_ref())
                     .await
                     .map_err(|error| MempoolSurfaceError::Unavailable {
                         reason: error.to_string(),
@@ -321,7 +321,7 @@ async fn connect_authenticated_ingest_control(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
 ) -> Result<AuthenticatedIngestControlClient, MempoolSurfaceError> {
-    let channel = connect_authenticated_channel(endpoint, bearer_token)
+    let channel = connect_zinder_grpc(endpoint, bearer_token)
         .await
         .map_err(|error| MempoolSurfaceError::Unavailable {
             reason: error.to_string(),

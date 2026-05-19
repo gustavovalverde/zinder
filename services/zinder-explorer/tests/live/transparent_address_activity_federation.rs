@@ -37,7 +37,7 @@ use zinder_proto::v1::wallet::{
     address_lookup, wallet_query_client::WalletQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_runtime::connect_authenticated_channel;
+use zinder_runtime::connect_zinder_grpc;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
@@ -278,7 +278,7 @@ async fn drive_once(
     let cursor = store
         .get_cursor(TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME)?
         .unwrap_or_default();
-    let channel_for_stream = connect_authenticated_channel(wallet_endpoint, None)
+    let channel_for_stream = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer stream connect: {error}"))?;
     let mut stream_client = WalletQueryClient::new(channel_for_stream);
@@ -290,7 +290,7 @@ async fn drive_once(
         }))
         .await?
         .into_inner();
-    let channel_for_consumer = connect_authenticated_channel(wallet_endpoint, None)
+    let channel_for_consumer = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer fetch connect: {error}"))?;
     let block_source = zinder_explorer::BlockSource::new(

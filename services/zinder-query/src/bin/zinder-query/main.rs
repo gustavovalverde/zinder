@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
-    connect_authenticated_channel, install_tracing_subscriber, spawn_ops_endpoint_for,
+    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c, connect_zinder_grpc,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -332,7 +332,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
 }
 
 async fn probe_explorer_capability(endpoint: String, bearer_token: Option<BearerToken>) -> bool {
-    let Ok(channel) = connect_authenticated_channel(&endpoint, bearer_token.as_ref()).await else {
+    let Ok(channel) = connect_zinder_grpc(&endpoint, bearer_token.as_ref()).await else {
         return false;
     };
     let mut client = ExplorerQueryClient::new(channel);

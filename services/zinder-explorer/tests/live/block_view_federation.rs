@@ -61,7 +61,7 @@ use zinder_proto::v1::wallet::{
     wallet_query_client::WalletQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_runtime::connect_authenticated_channel;
+use zinder_runtime::connect_zinder_grpc;
 use zinder_source::{NodeSource as _, SourceBlock};
 use zinder_store::chain_epoch_message;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
@@ -158,7 +158,7 @@ async fn block_summary_consumer_reorg_rewind_deletes_orphaned_heights() -> Resul
 }
 
 async fn build_block_summary_consumer(wallet_endpoint: &str) -> Result<BlockSummaryConsumer> {
-    let channel = connect_authenticated_channel(wallet_endpoint, None)
+    let channel = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer connect: {error}"))?;
     let block_source =
@@ -507,7 +507,7 @@ async fn drive_once(
     let cursor = store
         .get_cursor(zinder_explorer::BLOCK_SUMMARY_CONSUMER_NAME)?
         .unwrap_or_default();
-    let channel_for_stream = connect_authenticated_channel(wallet_endpoint, None)
+    let channel_for_stream = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer stream connect: {error}"))?;
     let mut stream_client = WalletQueryClient::new(channel_for_stream);
@@ -519,7 +519,7 @@ async fn drive_once(
         }))
         .await?
         .into_inner();
-    let channel_for_consumer = connect_authenticated_channel(wallet_endpoint, None)
+    let channel_for_consumer = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| eyre!("consumer fetch connect: {error}"))?;
     let block_source = zinder_explorer::BlockSource::new(

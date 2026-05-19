@@ -34,7 +34,7 @@ use zinder_proto::v1::wallet::{
     MempoolEventStreamFamily as WireMempoolEventStreamFamily, MempoolEventsRequest,
     ServerInfoRequest, wallet_query_client::WalletQueryClient,
 };
-use zinder_runtime::{AuthenticatedChannel, connect_authenticated_channel};
+use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc};
 
 /// Backoff used between reconnect attempts after a transient stream failure.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
@@ -43,7 +43,7 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 /// call may take before the reconnect loop treats the attempt as failed.
 ///
 /// Belt-and-suspenders for the channel-level HTTP/2 + TCP keep-alives
-/// configured in [`zinder_runtime::connect_authenticated_channel`]: if a
+/// configured in [`zinder_runtime::connect_zinder_grpc`]: if a
 /// keep-alive somehow misses a half-dead connection, the subscribe-await
 /// still surfaces as a timeout instead of wedging the consumer task
 /// indefinitely.
@@ -71,7 +71,7 @@ pub(crate) async fn build_environment(
     store: DeriveStore,
     wallet_endpoint: &str,
 ) -> Result<(ConsumerRunnerEnvironment, bool), ConsumerRunnerError> {
-    let wallet_channel = connect_authenticated_channel(wallet_endpoint, None)
+    let wallet_channel = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| ConsumerRunnerError::Connect(error.to_string()))?;
     let mut probe_client = WalletQueryClient::new(wallet_channel.clone());
@@ -83,11 +83,11 @@ pub(crate) async fn build_environment(
     // with the per-height FullBlock unary RPCs. Sharing one channel
     // showed pathological hangs where every concurrent FullBlock froze
     // mid-stream once the chain-events streams had been open for ~1 s.
-    let block_source_channel = connect_authenticated_channel(wallet_endpoint, None)
+    let block_source_channel = connect_zinder_grpc(wallet_endpoint, None)
         .await
         .map_err(|error| ConsumerRunnerError::Connect(error.to_string()))?;
     let prevout_resolver = if prevouts_online {
-        let prevouts_channel = connect_authenticated_channel(wallet_endpoint, None)
+        let prevouts_channel = connect_zinder_grpc(wallet_endpoint, None)
             .await
             .map_err(|error| ConsumerRunnerError::Connect(error.to_string()))?;
         PrevoutResolver::online(prevouts_channel)

@@ -51,8 +51,7 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
-    RpcMetricNames, RpcOutcome, connect_authenticated_channel, describe_rpc_metrics,
-    record_rpc_request,
+    RpcMetricNames, RpcOutcome, connect_zinder_grpc, describe_rpc_metrics, record_rpc_request,
 };
 
 /// Metric pair the `ExplorerQuery` adapter emits per request.
@@ -595,7 +594,7 @@ impl ExplorerQueryGrpcAdapter {
         let channel = self
             .wallet_channel
             .get_or_try_init(|| async {
-                connect_authenticated_channel(endpoint, token.as_ref())
+                connect_zinder_grpc(endpoint, token.as_ref())
                     .await
                     .map_err(connect_error_to_status)
             })

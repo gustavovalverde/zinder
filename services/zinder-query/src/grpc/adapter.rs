@@ -20,7 +20,7 @@ use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
     wallet::{self, wallet_query_server},
 };
-use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
+use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge, record_proxy_outcome};
 use zinder_store::{
@@ -837,7 +837,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         let channel = self
             .ingest_control_channel
             .get_or_try_init(|| async move {
-                connect_authenticated_channel(&endpoint, bearer_token.as_ref())
+                connect_zinder_grpc(&endpoint, bearer_token.as_ref())
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))
             })

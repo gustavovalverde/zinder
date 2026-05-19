@@ -44,7 +44,7 @@ use std::{
 use tokio::{sync::OnceCell, task::JoinHandle, time};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
-use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_authenticated_channel};
+use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 /// Minimum interval between consecutive readiness probes.
 ///
@@ -61,7 +61,7 @@ pub struct DeriveProxyConfig {
     /// gRPC endpoint of the derive consumer (e.g. `http://127.0.0.1:9068`).
     pub endpoint: String,
     /// Optional shared-secret bearer token; passed through to
-    /// [`connect_authenticated_channel`].
+    /// [`connect_zinder_grpc`].
     pub bearer_token: Option<BearerToken>,
     /// Readiness capability advertised by the consumer's `ServerInfo`. The
     /// proxy reports `is_ready` only when its readiness gauge has observed
@@ -199,17 +199,14 @@ where
         let channel = self
             .channel
             .get_or_try_init(|| async {
-                connect_authenticated_channel(
-                    &self.config.endpoint,
-                    self.config.bearer_token.as_ref(),
-                )
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!(
-                        "derive consumer at {} unreachable: {error}",
-                        self.config.endpoint
-                    ))
-                })
+                connect_zinder_grpc(&self.config.endpoint, self.config.bearer_token.as_ref())
+                    .await
+                    .map_err(|error| {
+                        Status::unavailable(format!(
+                            "derive consumer at {} unreachable: {error}",
+                            self.config.endpoint
+                        ))
+                    })
             })
             .await?;
         let client = (self.construct_client)(channel.clone());

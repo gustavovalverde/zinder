@@ -29,10 +29,11 @@ mod readiness;
 mod rpc_metrics;
 mod sections;
 mod startup_phase;
+mod transport;
 
 pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
-    BearerTokenError, BearerTokenServerInterceptor, connect_authenticated_channel,
+    BearerTokenError, BearerTokenServerInterceptor,
 };
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeToml,
@@ -63,6 +64,7 @@ pub use sections::{
     resolve_primary_storage, resolve_retention, resolve_secondary_storage,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
+pub use transport::connect_zinder_grpc;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
