@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::ArrayParams;
-use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient, HttpClientBuilder};
+use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient};
 use jsonrpsee::types::ErrorObjectOwned;
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
@@ -363,12 +363,24 @@ impl ZebraJsonRpcSource {
             NodeAuth::Cookie(source) => Some(cookie_authorization_header(&source)?),
         };
 
-        let client = build_http_client(
+        let mut headers = HeaderMap::new();
+        if let Some(authorization) = authorization {
+            let header_value = HeaderValue::from_str(&authorization).map_err(|_| {
+                SourceError::NodeUnavailable {
+                    reason: "node authorization header is not a valid HTTP header value".to_owned(),
+                }
+            })?;
+            headers.insert("authorization", header_value);
+        }
+        let client = crate::transport::build_zebra_json_rpc_client(
             &json_rpc_addr.into(),
-            authorization,
             options.request_timeout,
             options.max_response_bytes,
-        )?;
+            headers,
+        )
+        .map_err(|error| SourceError::NodeUnavailable {
+            reason: error.to_string(),
+        })?;
 
         Ok(Self {
             network,
@@ -1004,34 +1016,6 @@ fn cookie_authorization_header(source: &CookieSource) -> Result<String, SourceEr
 /// Builds the `Authorization: Basic ...` header value from raw `username:password` credentials.
 fn basic_authorization_header_from_credentials(credentials: &str) -> String {
     format!("Basic {}", BASE64_STANDARD.encode(credentials))
-}
-
-/// Builds the configured jsonrpsee HTTP client used by the adapter.
-fn build_http_client(
-    json_rpc_addr: &str,
-    authorization: Option<String>,
-    request_timeout: Duration,
-    max_response_bytes: NonZeroU64,
-) -> Result<HttpClient, SourceError> {
-    let mut headers = HeaderMap::new();
-    if let Some(authorization) = authorization {
-        let header_value =
-            HeaderValue::from_str(&authorization).map_err(|_| SourceError::NodeUnavailable {
-                reason: "node authorization header is not a valid HTTP header value".to_owned(),
-            })?;
-        headers.insert("authorization", header_value);
-    }
-
-    let max_response_size = u32::try_from(max_response_bytes.get()).unwrap_or(u32::MAX);
-
-    HttpClientBuilder::default()
-        .request_timeout(request_timeout)
-        .max_response_size(max_response_size)
-        .set_headers(headers)
-        .build(json_rpc_addr)
-        .map_err(|source| SourceError::NodeUnavailable {
-            reason: source.to_string(),
-        })
 }
 
 /// Builds positional JSON-RPC parameters from an iterator of pre-typed JSON values.

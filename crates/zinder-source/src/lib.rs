@@ -15,6 +15,7 @@ mod source_error;
 mod source_subtree_root;
 mod source_transaction;
 mod transparent_address;
+mod transport;
 mod upstream_health;
 mod zebra_indexer_chain_tip;
 mod zebra_indexer_mempool;
@@ -48,6 +49,10 @@ pub use source_transaction::{
     transparent_prevout_from_raw_transaction_bytes,
 };
 pub use transparent_address::transparent_address_matches_network;
+pub use transport::{
+    ZebraIndexerChannelOptions, ZebraTransportError, build_zebra_json_rpc_client,
+    connect_zebra_indexer_channel,
+};
 pub use upstream_health::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR, UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS,
     UPSTREAM_HEALTH_REASON_NO_TIP, UPSTREAM_HEALTH_REASON_OK, UPSTREAM_HEALTH_REASON_SYNCING,

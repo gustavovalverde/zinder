@@ -28,7 +28,7 @@ use futures_util::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use zinder_core::{BlockHeight, BlockId};
 use zinder_proto::external::zebra_indexer_rpc::{
     BlockHashAndHeight, Empty, indexer_client::IndexerClient,
@@ -149,22 +149,17 @@ impl ZebraIndexerChainTipSource {
     }
 
     async fn connect(&self) -> Result<IndexerClient<Channel>, SourceError> {
-        let endpoint =
-            Endpoint::from_shared(self.target.endpoint_url.clone()).map_err(|error| {
-                SourceError::ChainTipStreamUnavailable {
-                    reason: format!("invalid indexer endpoint: {error}"),
-                }
-            })?;
-        let endpoint = endpoint
-            .connect_timeout(self.options.connect_timeout)
-            .timeout(self.options.request_timeout);
-        let channel =
-            endpoint
-                .connect()
-                .await
-                .map_err(|error| SourceError::ChainTipStreamUnavailable {
-                    reason: format!("indexer endpoint connect failed: {error}"),
-                })?;
+        let channel = crate::transport::connect_zebra_indexer_channel(
+            &self.target,
+            crate::transport::ZebraIndexerChannelOptions {
+                connect_timeout: self.options.connect_timeout,
+                request_timeout: self.options.request_timeout,
+            },
+        )
+        .await
+        .map_err(|error| SourceError::ChainTipStreamUnavailable {
+            reason: error.to_string(),
+        })?;
         Ok(IndexerClient::new(channel))
     }
 }
