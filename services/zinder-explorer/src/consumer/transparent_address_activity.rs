@@ -115,6 +115,10 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
         &self.block_source
     }
 
+    fn prefetch_prevouts(&self) -> bool {
+        true
+    }
+
     async fn apply_block(
         &mut self,
         block: &BlockCommitContext,

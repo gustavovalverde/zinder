@@ -32,6 +32,7 @@ pub(crate) mod transaction_fees;
 pub(crate) mod transparent_address_activity;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use rust_rocksdb::WriteBatch;
 use zinder_core::{BlockHeight, ChainEpoch};
 
@@ -230,7 +231,26 @@ pub trait BlockKeyedConsumer: Send + Sync {
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError>;
+
+    /// Whether this consumer's `apply_block` reads transparent prevouts.
+    ///
+    /// When `true`, the blanket pipeline primes
+    /// [`BlockCommitContext::prevouts`] inside the fetch lookahead so the
+    /// apply path never blocks on a cold `OnceCell`. Default is `false`;
+    /// consumers that call `block.prevouts().await` from `apply_block`
+    /// override this to `true`. Prefetching when the consumer never
+    /// consults prevouts would waste the prevouts channel's RPC budget.
+    fn prefetch_prevouts(&self) -> bool {
+        false
+    }
 }
+
+/// Maximum number of in-flight `BlockSource::block` futures the blanket
+/// pipeline keeps queued ahead of the apply loop.
+///
+/// Sized to match `BlockSource`'s cache capacity: prefetching beyond that
+/// just evicts entries before the apply loop reaches them.
+const PIPELINE_DEPTH: usize = 32;
 
 #[async_trait]
 impl<C: BlockKeyedConsumer + ?Sized> DeriveConsumer for C {
@@ -243,14 +263,28 @@ impl<C: BlockKeyedConsumer + ?Sized> DeriveConsumer for C {
         event: &ChainCommittedEvent,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        for raw_height in event.start_height.value()..=event.end_height.value() {
-            let height = BlockHeight::new(raw_height);
-            let block = self
-                .block_source()
-                .block(height)
-                .await
-                .map_err(|error| Box::new(error) as DeriveConsumerError)?;
-            if let Some(context) = block {
+        let block_source = self.block_source().clone();
+        let prefetch_prevouts = self.prefetch_prevouts();
+        let heights = (event.start_height.value()..=event.end_height.value()).map(BlockHeight::new);
+        let mut fetch_stream = futures_util::stream::iter(heights)
+            .map(|height| {
+                let block_source = block_source.clone();
+                async move {
+                    let context = block_source.block(height).await?;
+                    if prefetch_prevouts && let Some(context) = &context {
+                        // Prime the OnceCell while the apply loop is still
+                        // processing earlier heights. Errors are ignored
+                        // here because apply_block's prevouts().await call
+                        // will surface them after retrying the cell.
+                        let _ = context.prevouts().await;
+                    }
+                    Ok::<_, BlockCommitContextError>(context)
+                }
+            })
+            .buffered(PIPELINE_DEPTH);
+        while let Some(fetched) = fetch_stream.next().await {
+            let context = fetched.map_err(|error| Box::new(error) as DeriveConsumerError)?;
+            if let Some(context) = context {
                 self.apply_block(&context, ctx).await?;
             }
         }
@@ -265,16 +299,26 @@ impl<C: BlockKeyedConsumer + ?Sized> DeriveConsumer for C {
         for raw_height in event.reverted.start_height.value()..=event.reverted.end_height.value() {
             self.revert_block(BlockHeight::new(raw_height), ctx).await?;
         }
-        for raw_height in
-            event.replacement.start_height.value()..=event.replacement.end_height.value()
-        {
-            let height = BlockHeight::new(raw_height);
-            let block = self
-                .block_source()
-                .block(height)
-                .await
-                .map_err(|error| Box::new(error) as DeriveConsumerError)?;
-            if let Some(context) = block {
+        let block_source = self.block_source().clone();
+        let prefetch_prevouts = self.prefetch_prevouts();
+        let heights = (event.replacement.start_height.value()
+            ..=event.replacement.end_height.value())
+            .map(BlockHeight::new);
+        let mut fetch_stream = futures_util::stream::iter(heights)
+            .map(|height| {
+                let block_source = block_source.clone();
+                async move {
+                    let context = block_source.block(height).await?;
+                    if prefetch_prevouts && let Some(context) = &context {
+                        let _ = context.prevouts().await;
+                    }
+                    Ok::<_, BlockCommitContextError>(context)
+                }
+            })
+            .buffered(PIPELINE_DEPTH);
+        while let Some(fetched) = fetch_stream.next().await {
+            let context = fetched.map_err(|error| Box::new(error) as DeriveConsumerError)?;
+            if let Some(context) = context {
                 self.apply_block(&context, ctx).await?;
             }
         }
