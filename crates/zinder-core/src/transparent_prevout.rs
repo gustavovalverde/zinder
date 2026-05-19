@@ -27,7 +27,12 @@ use crate::{ChainEpoch, TransparentOutPoint};
 ///
 /// Requests above the cap are silently truncated to the first N outpoints so
 /// canonical, mempool, local, and remote paths expose the same batch contract.
-pub const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 256;
+/// The cap sizes against the wallet's server-side handler cost (one batched
+/// `multi_get_cf` on the Transaction column family plus one canonical-block
+/// read per unique height) and the explorer's per-block prevout fan-out
+/// (typical blocks carry a few dozen transparent inputs, so one batch usually
+/// drains a block).
+pub const MAX_TRANSPARENT_PREVOUTS_PER_REQUEST: usize = 1024;
 
 /// Resolved transparent output referenced by an outpoint.
 ///

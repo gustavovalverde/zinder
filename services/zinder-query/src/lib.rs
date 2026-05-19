@@ -4,7 +4,7 @@
 //! calling upstream node sources or mutating canonical storage.
 
 use std::{
-    collections::{HashMap, hash_map::Entry as HashMapEntry},
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     sync::Arc,
     time::Instant,
@@ -517,20 +517,38 @@ where
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
-            let mut entries = Vec::with_capacity(outpoints.len());
-            let mut payload_cache: HashMap<TransactionId, Option<Vec<u8>>> = HashMap::new();
 
+            // One batched store read for every distinct transaction id in the
+            // request: collapses the per-outpoint visibility lookup + Transaction
+            // CF read + block-artifact cross-check into N seeks + 1 multi_get +
+            // M block reads (M = unique block heights touched).
+            let unique_ids: Vec<TransactionId> = {
+                let mut seen: HashSet<TransactionId> = HashSet::with_capacity(outpoints.len());
+                outpoints
+                    .iter()
+                    .filter_map(|outpoint| {
+                        seen.insert(outpoint.transaction_id)
+                            .then_some(outpoint.transaction_id)
+                    })
+                    .collect()
+            };
+            let artifacts_by_id = reader.transactions_by_ids(&unique_ids)?;
+            let payloads_by_id: HashMap<TransactionId, Option<Vec<u8>>> = artifacts_by_id
+                .into_iter()
+                .map(|(transaction_id, artifact)| {
+                    (
+                        transaction_id,
+                        artifact.map(|artifact| artifact.payload_bytes),
+                    )
+                })
+                .collect();
+
+            let mut entries = Vec::with_capacity(outpoints.len());
             for outpoint in outpoints {
-                let cached_payload = match payload_cache.entry(outpoint.transaction_id) {
-                    HashMapEntry::Occupied(entry) => entry.into_mut(),
-                    HashMapEntry::Vacant(entry) => {
-                        let payload = reader
-                            .transaction_by_id(outpoint.transaction_id)?
-                            .map(|artifact| artifact.payload_bytes);
-                        entry.insert(payload)
-                    }
-                };
-                let prevout = match cached_payload {
+                let payload_bytes = payloads_by_id
+                    .get(&outpoint.transaction_id)
+                    .and_then(Option::as_deref);
+                let prevout = match payload_bytes {
                     None => None,
                     Some(payload_bytes) => transparent_prevout_from_raw_transaction_bytes(
                         payload_bytes,

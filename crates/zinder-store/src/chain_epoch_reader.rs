@@ -1,5 +1,6 @@
 //! Epoch-bound chain artifact reader.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
@@ -16,7 +17,9 @@ use crate::{
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
     kv::RocksChainStoreReadView,
     subtree_root::{SubtreeRootStore, read_subtree_root_artifacts},
-    transaction_artifact::{TransactionArtifactStore, read_transaction_artifact},
+    transaction_artifact::{
+        TransactionArtifactStore, read_transaction_artifact, read_transaction_artifacts_batch,
+    },
     transparent_utxo::{TransparentUtxoStore, read_transparent_address_utxos},
     tree_state::{TreeStateStore, read_tree_state_artifact},
 };
@@ -71,6 +74,14 @@ impl<'store> ChainEpochReader<'store> {
         transaction_id: TransactionId,
     ) -> Result<Option<TransactionArtifact>, StoreError> {
         read_transaction_artifact(&self.read_view, self.chain_epoch, transaction_id)
+    }
+
+    /// Reads transaction artifacts for many ids in one batched store read.
+    pub fn transactions_by_ids(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, Option<TransactionArtifact>>, StoreError> {
+        read_transaction_artifacts_batch(&self.read_view, self.chain_epoch, transaction_ids)
     }
 
     /// Reads a tree-state artifact by height.
@@ -137,6 +148,13 @@ impl TransactionArtifactStore for ChainEpochReader<'_> {
         transaction_id: TransactionId,
     ) -> Result<Option<TransactionArtifact>, StoreError> {
         self.transaction_by_id(transaction_id)
+    }
+
+    fn transactions_by_ids(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, Option<TransactionArtifact>>, StoreError> {
+        self.transactions_by_ids(transaction_ids)
     }
 }
 

@@ -210,6 +210,128 @@ async fn transparent_prevouts_grpc_rejects_coinbase_sentinel() -> eyre::Result<(
     Ok(())
 }
 
+/// Fixture: two committed blocks at distinct heights with three transactions
+/// (two in the first block, one in the second). Returns the chain epoch and
+/// the three transaction ids in commit order.
+fn commit_two_block_fixture(
+    store: &zinder_store::PrimaryChainStore,
+) -> eyre::Result<(ChainEpoch, [TransactionId; 3])> {
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockArtifact, BlockHash, ChainEpochId, ChainTipMetadata,
+        CompactBlockArtifact, Network, UnixTimestampMillis,
+    };
+
+    let first_height = BlockHeight::new(100);
+    let second_height = BlockHeight::new(101);
+    let first_hash = BlockHash::from_bytes([0x11; 32]);
+    let second_hash = BlockHash::from_bytes([0x22; 32]);
+
+    let chain_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        tip_height: second_height,
+        tip_hash: second_hash,
+        finalized_height: second_height,
+        finalized_hash: second_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_300_000),
+    };
+
+    let blocks = vec![
+        BlockArtifact::new(
+            first_height,
+            first_hash,
+            BlockHash::from_bytes([0x10; 32]),
+            b"raw-block-1-100".to_vec(),
+        ),
+        BlockArtifact::new(
+            second_height,
+            second_hash,
+            first_hash,
+            b"raw-block-1-101".to_vec(),
+        ),
+    ];
+    let compact_blocks = vec![
+        CompactBlockArtifact::new(first_height, first_hash, b"compact-block-1-100".to_vec()),
+        CompactBlockArtifact::new(second_height, second_hash, b"compact-block-1-101".to_vec()),
+    ];
+    let transactions = vec![
+        synthetic_p2pkh_transaction(first_height, first_hash, 0xA1, 0x11, 200)?,
+        synthetic_p2pkh_transaction(first_height, first_hash, 0xA2, 0x22, 200)?,
+        synthetic_p2pkh_transaction(second_height, second_hash, 0xB1, 0x33, 201)?,
+    ];
+    let ids = [
+        transactions[0].transaction_id,
+        transactions[1].transaction_id,
+        transactions[2].transaction_id,
+    ];
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(chain_epoch, blocks, compact_blocks)
+            .with_transactions(transactions),
+    )?;
+    Ok((chain_epoch, ids))
+}
+
+#[tokio::test]
+async fn transparent_prevouts_resolves_outpoints_across_multiple_blocks() -> eyre::Result<()> {
+    // Three transactions spread across two distinct heights, six outpoints
+    // (including a repeated one and an unknown one) in mixed order. Exercises
+    // the batch helper's dedup-by-height path: the canonical-block lookup
+    // runs once per unique height (2 reads, not 3), and the response still
+    // preserves per-outpoint input order.
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (chain_epoch, [txid_first_block_a, txid_first_block_b, txid_second_block]) =
+        commit_two_block_fixture(&store)?;
+    let unknown_transaction_id = TransactionId::from_bytes([0xEE; 32]);
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let outpoints = vec![
+        TransparentOutPoint::new(txid_second_block, 0),
+        TransparentOutPoint::new(txid_first_block_a, 0),
+        TransparentOutPoint::new(unknown_transaction_id, 0),
+        TransparentOutPoint::new(txid_first_block_b, 0),
+        TransparentOutPoint::new(txid_first_block_a, 0),
+        TransparentOutPoint::new(txid_second_block, 0),
+    ];
+    let response = wallet_query
+        .transparent_prevouts(outpoints.clone(), None::<ChainEpoch>)
+        .await?;
+
+    assert_eq!(response.chain_epoch, chain_epoch);
+    assert_eq!(response.entries.len(), outpoints.len());
+    for (index, entry) in response.entries.iter().enumerate() {
+        assert_eq!(entry.outpoint, outpoints[index]);
+    }
+    assert!(
+        response.entries[0].prevout.is_some(),
+        "second-block txn resolves"
+    );
+    assert!(
+        response.entries[1].prevout.is_some(),
+        "first-block txn A resolves"
+    );
+    assert!(
+        response.entries[2].prevout.is_none(),
+        "unknown txid resolves to None",
+    );
+    assert!(
+        response.entries[3].prevout.is_some(),
+        "first-block txn B resolves"
+    );
+    assert_eq!(
+        response.entries[1].prevout, response.entries[4].prevout,
+        "repeated first-block txn A returns identical prevout",
+    );
+    assert_eq!(
+        response.entries[0].prevout, response.entries[5].prevout,
+        "repeated second-block txn returns identical prevout",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn transparent_prevouts_preserves_input_order_and_dedupes_reads() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;

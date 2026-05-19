@@ -20,17 +20,13 @@ use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::transparent;
 use zinder_core::wire::encode_internal_transaction_id;
-use zinder_core::{BlockHeight, TransactionId, TransparentOutPoint};
+use zinder_core::{
+    BlockHeight, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, TransactionId, TransparentOutPoint,
+};
 use zinder_proto::v1::wallet::{
     self, TransparentPrevoutsRequest, wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
-
-/// Maximum prevouts fanned out in one [`TransparentPrevoutsRequest`].
-///
-/// Mirrors the cap the wallet-side handler enforces; batching above this
-/// returns `INVALID_ARGUMENT`.
-const MAX_PREVOUTS_PER_BATCH: usize = 256;
 
 /// Errors surfaced while hydrating a [`BlockCommitContext`] or resolving
 /// its prevouts.
@@ -208,10 +204,11 @@ async fn resolve_block_prevouts(
         return Ok(HashMap::new());
     }
     let mut resolved: HashMap<TransparentOutPoint, transparent::Output> = HashMap::new();
-    let mut buffer: Vec<TransparentOutPoint> = Vec::with_capacity(MAX_PREVOUTS_PER_BATCH);
+    let mut buffer: Vec<TransparentOutPoint> =
+        Vec::with_capacity(MAX_TRANSPARENT_PREVOUTS_PER_REQUEST);
     for outpoint in outpoints {
         buffer.push(outpoint);
-        if buffer.len() == MAX_PREVOUTS_PER_BATCH {
+        if buffer.len() == MAX_TRANSPARENT_PREVOUTS_PER_REQUEST {
             let batch = std::mem::take(&mut buffer);
             request_prevouts_batch(wallet_client, batch, &mut resolved).await?;
         }
