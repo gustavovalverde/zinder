@@ -108,9 +108,9 @@ pub fn resolve_ingest_control_reader(
     let addr = section
         .addr
         .unwrap_or_else(|| DEFAULT_INGEST_CONTROL_READER_URL.to_owned());
-    tonic::transport::Endpoint::from_shared(addr.clone()).map_err(|source| {
+    crate::transport::validate_zinder_grpc_endpoint(&addr).map_err(|source| {
         ConfigError::invalid(format!(
-            "ingest_control.addr {addr} is not a tonic endpoint: {source}"
+            "ingest_control.addr {addr} is not a valid endpoint: {source}"
         ))
     })?;
     let bearer_token = load_bearer_token(section.bearer_token_path.as_deref())?;

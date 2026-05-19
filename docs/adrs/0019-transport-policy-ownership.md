@@ -71,10 +71,13 @@ crate that owns an upstream surface:
 - [`crates/zinder-runtime/src/transport.rs`](../../crates/zinder-runtime/src/transport.rs)
   owns the contract for *intra-Zinder gRPC* (explorer ↔ query, query ↔
   ingest, compat ↔ ingest). Exposes `connect_zinder_grpc(endpoint,
-  bearer_token) -> Result<AuthenticatedChannel, _>` and the three
-  `ZINDER_GRPC_*` keep-alive constants. The `AuthenticatedChannel` type
-  alias and bearer-token primitives stay in `auth.rs` (they describe
-  *what the channel carries*, not how it is built).
+  bearer_token) -> Result<AuthenticatedChannel, _>`, the three
+  `ZINDER_GRPC_*` keep-alive constants, and
+  `validate_zinder_grpc_endpoint(addr) -> Result<(), InvalidZinderGrpcEndpoint>`
+  for the validation-at-load path config code uses to reject malformed
+  URLs at process start. The `AuthenticatedChannel` type alias and
+  bearer-token primitives stay in `auth.rs` (they describe *what the
+  channel carries*, not how it is built).
 
 - [`crates/zinder-source/src/transport.rs`](../../crates/zinder-source/src/transport.rs)
   owns the contract for every long-lived client to *Zebra* (one
@@ -163,11 +166,10 @@ grep one log target for the lifecycle events.
 
 ### Structural invariant
 
-[`crates/zinder-source/tests/transport_invariants.rs`](../../crates/zinder-source/tests/transport_invariants.rs)
+[`crates/zinder-source/tests/integration/transport_invariants.rs`](../../crates/zinder-source/tests/integration/transport_invariants.rs)
 walks the workspace source tree and asserts that
-`jsonrpsee::HttpClientBuilder`, `tonic::transport::Endpoint::from_shared`,
-and `reqwest::Client::builder` are referenced *only* inside the two
-transport modules. New code that reaches around the boundary fails the
+`Endpoint::from_shared`, `HttpClientBuilder`, and `reqwest::Client::builder`
+are referenced *only* inside the two transport modules. New code that reaches around the boundary fails the
 test with a message naming the offending file and pointing at the
 module to import from. This is the same enforcement pattern that
 `crates/zinder-core/tests/wire_invariants.rs` uses for byte-level wire

@@ -12,7 +12,7 @@ use zinder_runtime::{
     RetentionToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
     duration_as_millis_u64, load_bearer_token, parse_socket_addr, require_field,
     resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_retention,
-    resolve_secondary_storage,
+    resolve_secondary_storage, validate_zinder_grpc_endpoint,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
@@ -254,9 +254,9 @@ fn resolve_explorer_proxy_config(
     let Some(endpoint) = config.endpoint else {
         return Ok(None);
     };
-    tonic::transport::Endpoint::from_shared(endpoint.clone()).map_err(|source| {
+    validate_zinder_grpc_endpoint(&endpoint).map_err(|source| {
         ConfigError::invalid(format!(
-            "explorer.endpoint {endpoint} is not a tonic endpoint: {source}"
+            "explorer.endpoint {endpoint} is not a valid endpoint: {source}"
         ))
     })?;
     let probe_interval_ms = config.probe_interval_ms.unwrap_or_else(|| {

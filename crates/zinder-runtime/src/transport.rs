@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use thiserror::Error;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Endpoint;
 
@@ -66,4 +67,24 @@ pub async fn connect_zinder_grpc(
         .map_err(BearerTokenConnectError::Transport)?;
     let interceptor = BearerTokenClientInterceptor::new(bearer_token)?;
     Ok(InterceptedService::new(channel, interceptor))
+}
+
+/// The single failure mode [`validate_zinder_grpc_endpoint`] can raise.
+///
+/// Used by config-loading code that wants to reject malformed URLs at
+/// process start, before any connection is attempted.
+#[derive(Debug, Error)]
+#[error("invalid gRPC endpoint URL: {0}")]
+pub struct InvalidZinderGrpcEndpoint(String);
+
+/// Validates that `addr` parses as a gRPC endpoint URL.
+///
+/// Config loaders call this so a typo in a TOML field surfaces at
+/// startup, not at the first request. The actual connect happens later
+/// through [`connect_zinder_grpc`]; this seam exists so config code does
+/// not need to depend on [`tonic::transport::Endpoint`] directly.
+pub fn validate_zinder_grpc_endpoint(addr: &str) -> Result<(), InvalidZinderGrpcEndpoint> {
+    Endpoint::from_shared(addr.to_owned())
+        .map(|_| ())
+        .map_err(|source| InvalidZinderGrpcEndpoint(source.to_string()))
 }

@@ -64,7 +64,9 @@ pub use sections::{
     resolve_primary_storage, resolve_retention, resolve_secondary_storage,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
-pub use transport::connect_zinder_grpc;
+pub use transport::{
+    InvalidZinderGrpcEndpoint, connect_zinder_grpc, validate_zinder_grpc_endpoint,
+};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
