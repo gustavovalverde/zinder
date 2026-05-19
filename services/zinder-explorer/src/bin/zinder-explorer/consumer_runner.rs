@@ -39,6 +39,16 @@ use zinder_runtime::{AuthenticatedChannel, connect_authenticated_channel};
 /// Backoff used between reconnect attempts after a transient stream failure.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Maximum time the initial `chain_events` or `mempool_events` subscribe
+/// call may take before the reconnect loop treats the attempt as failed.
+///
+/// Belt-and-suspenders for the channel-level HTTP/2 + TCP keep-alives
+/// configured in [`zinder_runtime::connect_authenticated_channel`]: if a
+/// keep-alive somehow misses a half-dead connection, the subscribe-await
+/// still surfaces as a timeout instead of wedging the consumer task
+/// indefinitely.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Shared per-process state every consumer task needs.
 ///
 /// Built once at startup, cloned cheaply into each spawned consumer. The
@@ -308,15 +318,22 @@ async fn dispatch_chain_events_once<C: DeriveConsumer>(
         .get_cursor(consumer_name)
         .map_err(|error| ConsumerRunnerError::Setup(error.to_string()))?
         .unwrap_or_default();
-    let stream = wallet_client
-        .chain_events(Request::new(ChainEventsRequest {
+    let stream = tokio::time::timeout(
+        SUBSCRIBE_TIMEOUT,
+        wallet_client.chain_events(Request::new(ChainEventsRequest {
             from_cursor: cursor_bytes,
             family: WireChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
-        }))
-        .await
-        .map_err(|status| ConsumerRunnerError::Subscribe(status.to_string()))?
-        .into_inner();
+        })),
+    )
+    .await
+    .map_err(|_| {
+        ConsumerRunnerError::Subscribe(format!(
+            "chain_events subscribe exceeded {SUBSCRIBE_TIMEOUT:?}"
+        ))
+    })?
+    .map_err(|status| ConsumerRunnerError::Subscribe(status.to_string()))?
+    .into_inner();
     tokio::select! {
         outcome = run_chain_events_subscriber(&mut consumer, &env.store, stream) => {
             outcome
@@ -339,14 +356,21 @@ async fn dispatch_mempool_events_once<C: DeriveMempoolConsumer>(
         .get_cursor(consumer_name)
         .map_err(|error| ConsumerRunnerError::Setup(error.to_string()))?
         .unwrap_or_default();
-    let stream = wallet_client
-        .mempool_events(Request::new(MempoolEventsRequest {
+    let stream = tokio::time::timeout(
+        SUBSCRIBE_TIMEOUT,
+        wallet_client.mempool_events(Request::new(MempoolEventsRequest {
             from_cursor: cursor_bytes,
             family: WireMempoolEventStreamFamily::Mempool as i32,
-        }))
-        .await
-        .map_err(|status| ConsumerRunnerError::Subscribe(status.to_string()))?
-        .into_inner();
+        })),
+    )
+    .await
+    .map_err(|_| {
+        ConsumerRunnerError::Subscribe(format!(
+            "mempool_events subscribe exceeded {SUBSCRIBE_TIMEOUT:?}"
+        ))
+    })?
+    .map_err(|status| ConsumerRunnerError::Subscribe(status.to_string()))?
+    .into_inner();
     tokio::select! {
         outcome = run_mempool_events_subscriber(&mut consumer, &env.store, stream) => {
             outcome
