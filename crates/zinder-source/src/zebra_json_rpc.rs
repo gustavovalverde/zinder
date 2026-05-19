@@ -366,47 +366,34 @@ impl ZebraJsonRpcSource {
         node_auth: NodeAuth,
         options: ZebraJsonRpcSourceOptions,
     ) -> Result<Self, SourceError> {
-        let authorization = match node_auth {
-            NodeAuth::None => None,
-            NodeAuth::Basic { username, password } => {
-                Some(basic_authorization_header(&username, &password))
-            }
-            NodeAuth::Cookie(source) => Some(cookie_authorization_header(&source)?),
-        };
-
-        let mut headers = HeaderMap::new();
-        if let Some(authorization) = authorization {
-            let header_value = HeaderValue::from_str(&authorization).map_err(|_| {
-                SourceError::NodeUnavailable {
-                    reason: "node authorization header is not a valid HTTP header value".to_owned(),
-                }
-            })?;
-            headers.insert("authorization", header_value);
-        }
         let json_rpc_addr: String = json_rpc_addr.into();
         let request_timeout = options.request_timeout;
         let max_response_bytes = options.max_response_bytes;
 
+        let initial_headers = derive_authorization_headers(&node_auth)?;
         let initial_client = crate::transport::build_zebra_json_rpc_client(
             &json_rpc_addr,
             request_timeout,
             max_response_bytes,
-            headers.clone(),
+            initial_headers,
         )
         .map_err(|error| SourceError::NodeUnavailable {
             reason: error.to_string(),
         })?;
 
         let rebuilder_addr = json_rpc_addr;
-        let rebuilder_headers = headers;
+        let rebuilder_auth = node_auth;
         let client = ResilientClient::new(
             initial_client,
             ZEBRA_JSON_RPC_PEER_LABEL,
             ZEBRA_REBUILD_THRESHOLD,
             move || {
                 let addr = rebuilder_addr.clone();
-                let headers = rebuilder_headers.clone();
+                let auth = rebuilder_auth.clone();
                 async move {
+                    let headers = derive_authorization_headers(&auth).map_err(|error| {
+                        crate::transport::ZebraTransportError::ClientBuildFailed(error.to_string())
+                    })?;
                     crate::transport::build_zebra_json_rpc_client(
                         &addr,
                         request_timeout,
@@ -1042,6 +1029,35 @@ fn openrpc_supports_all_methods(method_names: &[&str], required_methods: &[&str]
 }
 
 /// Builds the `Authorization: Basic ...` header value from node credentials.
+/// Re-reads cookie credentials (when applicable) and assembles the
+/// `authorization` header used by every JSON-RPC call.
+///
+/// Called once at construction and again from the
+/// [`ResilientClient`] rebuilder closure. Re-reading on rebuild is
+/// load-bearing: Zebra rotates the cookie file on restart, so a
+/// rebuilder that captured headers once at startup would replay a stale
+/// credential and every newly-built client would hit 401 forever. The
+/// rebuilder owns a `NodeAuth` clone and re-derives the header each
+/// time the wrapper rebuilds.
+fn derive_authorization_headers(node_auth: &NodeAuth) -> Result<HeaderMap, SourceError> {
+    let authorization = match node_auth {
+        NodeAuth::None => None,
+        NodeAuth::Basic { username, password } => {
+            Some(basic_authorization_header(username, password))
+        }
+        NodeAuth::Cookie(source) => Some(cookie_authorization_header(source)?),
+    };
+    let mut headers = HeaderMap::new();
+    if let Some(authorization) = authorization {
+        let header_value =
+            HeaderValue::from_str(&authorization).map_err(|_| SourceError::NodeUnavailable {
+                reason: "node authorization header is not a valid HTTP header value".to_owned(),
+            })?;
+        headers.insert("authorization", header_value);
+    }
+    Ok(headers)
+}
+
 fn basic_authorization_header(username: &str, password: &SecretString) -> String {
     let credentials = format!("{}:{}", username, password.expose_secret());
     basic_authorization_header_from_credentials(&credentials)
@@ -1383,6 +1399,48 @@ mod tests {
         let authorization = cookie_authorization_header(&source)?;
 
         assert_eq!(authorization, "Basic emVicmE6c2VjcmV0");
+        Ok(())
+    }
+
+    #[test]
+    fn derive_authorization_headers_rereads_cookie_file_on_each_call() -> Result<(), eyre::Report> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut cookie_file = tempfile::NamedTempFile::new()?;
+        writeln!(cookie_file, "first:secret-one")?;
+
+        let source = CookieSource::File(cookie_file.path().to_path_buf());
+        let auth = NodeAuth::Cookie(source);
+
+        let headers_first = derive_authorization_headers(&auth)?;
+        let initial_value = headers_first
+            .get("authorization")
+            .ok_or_else(|| eyre::eyre!("expected authorization header on first read"))?
+            .to_str()?
+            .to_owned();
+
+        // Simulate Zebra rotating the cookie on restart by overwriting the
+        // file at the same path. A rebuilder that captured headers at
+        // construction would still emit `initial_value`; the helper must
+        // re-read the file and surface the rotated credential.
+        let mut handle = cookie_file.reopen()?;
+        handle.set_len(0)?;
+        handle.seek(SeekFrom::Start(0))?;
+        writeln!(handle, "second:secret-two")?;
+        handle.sync_all()?;
+
+        let headers_second = derive_authorization_headers(&auth)?;
+        let rotated_value = headers_second
+            .get("authorization")
+            .ok_or_else(|| eyre::eyre!("expected authorization header on second read"))?
+            .to_str()?
+            .to_owned();
+
+        assert_ne!(
+            initial_value, rotated_value,
+            "rebuilder must re-read the cookie file so a Zebra-side rotation \
+             surfaces in subsequent requests; captured header was reused instead",
+        );
         Ok(())
     }
 
