@@ -25,12 +25,13 @@ use zinder_core::{
 
 use crate::{
     CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
-    NodeSource, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoot,
-    SourceSubtreeRoots, TransactionBroadcaster, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    NodeSource, ResilientClient, SourceBlock, SourceChainCheckpoint, SourceError,
+    SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
-    decode_display_block_hash, source_block::wire_error_to_transaction_id_error,
-    zebra_ready_endpoint::ZebraReadyClient,
+    ZEBRA_REBUILD_THRESHOLD, decode_display_block_hash,
+    source_block::wire_error_to_transaction_id_error, zebra_ready_endpoint::ZebraReadyClient,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -106,11 +107,18 @@ const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
 
+/// Peer label for this source's [`ResilientClient`].
+///
+/// Surfaces on `zinder_transport_reconnect_total{peer}` and on
+/// `zinder::transport` log events. Matches the `source` label used by
+/// per-RPC metrics so operators can correlate the two.
+const ZEBRA_JSON_RPC_PEER_LABEL: &str = "zebra_json_rpc";
+
 /// Node source backed by Zebra's JSON-RPC API.
 #[derive(Clone)]
 pub struct ZebraJsonRpcSource {
     network: Network,
-    client: HttpClient,
+    client: ResilientClient<HttpClient>,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
     health_config: Option<NodeHealthConfig>,
     ready_http_client: Option<ZebraReadyClient>,
@@ -307,9 +315,12 @@ impl ZebraJsonRpcSource {
         let started_at = Instant::now();
         let response_body = self
             .client
+            .snapshot()
             .request::<Value, _>("rpc.discover", ArrayParams::new())
             .await;
         record_json_rpc_client_result("rpc.discover", started_at, &response_body);
+        self.client
+            .record_outcome(&jsonrpsee_transport_signal(&response_body));
 
         let json_rpc_capabilities = match response_body {
             Ok(openrpc_response) => parse_openrpc_capabilities(&openrpc_response),
@@ -372,15 +383,39 @@ impl ZebraJsonRpcSource {
             })?;
             headers.insert("authorization", header_value);
         }
-        let client = crate::transport::build_zebra_json_rpc_client(
-            &json_rpc_addr.into(),
-            options.request_timeout,
-            options.max_response_bytes,
-            headers,
+        let json_rpc_addr: String = json_rpc_addr.into();
+        let request_timeout = options.request_timeout;
+        let max_response_bytes = options.max_response_bytes;
+
+        let initial_client = crate::transport::build_zebra_json_rpc_client(
+            &json_rpc_addr,
+            request_timeout,
+            max_response_bytes,
+            headers.clone(),
         )
         .map_err(|error| SourceError::NodeUnavailable {
             reason: error.to_string(),
         })?;
+
+        let rebuilder_addr = json_rpc_addr;
+        let rebuilder_headers = headers;
+        let client = ResilientClient::new(
+            initial_client,
+            ZEBRA_JSON_RPC_PEER_LABEL,
+            ZEBRA_REBUILD_THRESHOLD,
+            move || {
+                let addr = rebuilder_addr.clone();
+                let headers = rebuilder_headers.clone();
+                async move {
+                    crate::transport::build_zebra_json_rpc_client(
+                        &addr,
+                        request_timeout,
+                        max_response_bytes,
+                        headers,
+                    )
+                }
+            },
+        );
 
         Ok(Self {
             network,
@@ -424,7 +459,14 @@ impl ZebraJsonRpcSource {
         Response: for<'de> Deserialize<'de>,
     {
         let started_at = Instant::now();
-        let rpc_outcome = match self.client.request::<Response, _>(method, params).await {
+        let client_result = self
+            .client
+            .snapshot()
+            .request::<Response, _>(method, params)
+            .await;
+        self.client
+            .record_outcome(&jsonrpsee_transport_signal(&client_result));
+        let rpc_outcome = match client_result {
             Ok(response) => Ok(response),
             Err(ClientError::Call(error)) => Err(map_call_error(JsonRpcCallError::from(error))),
             Err(error) => Err(map_transport_error(&error)),
@@ -480,9 +522,12 @@ impl ZebraJsonRpcSource {
         let started_at = Instant::now();
         let response = self
             .client
+            .snapshot()
             .request::<Value, _>("getrawtransaction", params)
             .await;
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
+        self.client
+            .record_outcome(&jsonrpsee_transport_signal(&response));
 
         match response {
             Ok(verbose_response) => {
@@ -541,9 +586,12 @@ impl ZebraJsonRpcSource {
         let started_at = Instant::now();
         let response = self
             .client
+            .snapshot()
             .request::<String, _>("getrawtransaction", params)
             .await;
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
+        self.client
+            .record_outcome(&jsonrpsee_transport_signal(&response));
 
         match response {
             Ok(raw_transaction_hex) => {
@@ -826,9 +874,12 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let started_at = Instant::now();
         let response = self
             .client
+            .snapshot()
             .request::<String, _>("sendrawtransaction", params)
             .await;
         record_json_rpc_client_result("sendrawtransaction", started_at, &response);
+        self.client
+            .record_outcome(&jsonrpsee_transport_signal(&response));
 
         match response {
             Ok(transaction_id_hex) => Ok(TransactionBroadcastResult::Accepted(BroadcastAccepted {
@@ -1204,6 +1255,24 @@ impl From<ErrorObjectOwned> for JsonRpcCallError {
 fn map_transport_error(error: &ClientError) -> SourceError {
     SourceError::NodeUnavailable {
         reason: error.to_string(),
+    }
+}
+
+/// Bridges a raw jsonrpsee result into the transport-class signal
+/// [`ResilientClient::record_outcome`] consumes.
+///
+/// A server-side JSON-RPC error ([`ClientError::Call`]) means the wire
+/// is fine but the server rejected the request; that must not advance
+/// the rebuild counter. Every other [`ClientError`] variant is a
+/// transport-layer failure (closed connection, deserialization on the
+/// transport layer, dispatch failure) and surfaces as
+/// [`SourceError::NodeUnavailable`] so the wrapper can react.
+fn jsonrpsee_transport_signal<Response>(
+    outcome: &Result<Response, ClientError>,
+) -> Result<(), SourceError> {
+    match outcome {
+        Ok(_) | Err(ClientError::Call(_)) => Ok(()),
+        Err(error) => Err(map_transport_error(error)),
     }
 }
 

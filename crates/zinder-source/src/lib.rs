@@ -50,8 +50,8 @@ pub use source_transaction::{
 };
 pub use transparent_address::transparent_address_matches_network;
 pub use transport::{
-    ZebraIndexerChannelOptions, ZebraTransportError, build_zebra_json_rpc_client,
-    connect_zebra_indexer_channel,
+    ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,
+    build_zebra_json_rpc_client, connect_zebra_indexer_channel, is_transport_failure,
 };
 pub use upstream_health::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR, UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS,

@@ -21,6 +21,7 @@ repository = "https://github.com/gustavovalverde/zinder"
 rust-version = "1.95"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 async-trait = "0.1.89"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22.1"
