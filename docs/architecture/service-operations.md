@@ -226,13 +226,15 @@ observability.
 ### What Zinder ships
 
 `deploy/docker-compose.yml` includes a `zinder-prometheus` service
-that scrapes `zinder-ingest:9105` and `zinder-query:9106` over a
-Zinder-owned Docker network (`zinder-observability`). The service
-is always on: it comes up with every `docker compose up -d`. It
-does not depend on whether the platform's observability is
-enabled, on whether the platform exists at all, or on which
-binding the operator chose. Metrics collection is continuous for
-the life of the deployment.
+that scrapes `zinder-ingest:9105`, `zinder-query:9106`, and
+`zinder-explorer:9069` over a project-scoped Docker network
+(`zinder-<network>-observability`). One Prometheus runs per zinder
+stack, so mainnet and testnet stay isolated and a single host can
+hold both. The service is always on: it comes up with every
+`docker compose up -d`. It does not depend on whether the platform's
+observability is enabled, on whether the platform exists at all, or
+on which binding the operator chose. Metrics collection is
+continuous for the life of the deployment.
 
 A `zinder-grafana` service ships behind `--profile observability`.
 It is opt-in because many operators feed Zinder's metrics into a

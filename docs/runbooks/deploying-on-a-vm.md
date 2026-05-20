@@ -23,7 +23,7 @@ Steps below assume a Debian-family VM with Docker Engine 24+ installed. Adapt pa
 │ │                    │    │   query (per-service images) │  │
 │ └────────────────────┘    └───┬─────────────────────────┘  │
 │                                │ /var/lib/docker/volumes/   │
-│                                │   zinder-data/             │
+│                                │   zinder-<network>-data/   │
 │                                ▼                            │
 │                            (canonical store + secondary)    │
 │                                                            │
@@ -58,26 +58,18 @@ sudo curl -fsSLo /etc/zinder/config/query.toml \
 
 Each Zinder binary strict-parses its own TOML schema (writer and reader fields do not share a section set), so the single-container image mounts two configs. Adjust the `[node]`, `[storage]`, and per-service blocks (`[ingest]` for `ingest.toml`, `[query]` for `query.toml`) to match your VM. Each example config documents every field.
 
-### 2. Wire the network to Z3 via env vars
+### 2. Pick a network env file
 
-The compose attaches to Z3's external network (`z3-<network>`) and mounts Z3's cookie volume (`z3-<network>-cookie`) read-only at `/var/run/auth/`. Inside that network Zebra resolves at the bare DNS name `zebra` on its per-network RPC port. Configure the network selector:
+The repo ships one env file per network: `deploy/.env.mainnet`, `deploy/.env.testnet`, `deploy/.env.regtest`. Each sets `Z3_NETWORK_LOWER` (picks the matching `z3-<network>` external network and `z3-<network>-cookie` external volume), the Zebra JSON-RPC + indexer URLs, and the per-network host-port matrix. Inside the Z3 network Zebra resolves at the bare DNS name `zebra` on its per-network RPC port.
 
 ```bash
-sudo install -m 0600 -o root -g root /dev/stdin /etc/zinder/env <<'EOF'
-# Pick the Z3 network to attach to. Testnet:
-ZINDER_NETWORK__NAME=zcash-testnet
-Z3_NETWORK_LOWER=testnet
-
-# Mainnet equivalent: ZINDER_NETWORK__NAME=zcash-mainnet, Z3_NETWORK_LOWER=mainnet
-# Regtest equivalent: ZINDER_NETWORK__NAME=zcash-regtest, Z3_NETWORK_LOWER=regtest
-
-# Default JSON-RPC address and cookie path are set by the compose file
-# (http://zebra:<per-network-port>, /var/run/auth/.cookie). Override only
-# if you attach to a Zebra outside the Z3 stack.
-EOF
+sudo curl -fsSLo /etc/zinder/env \
+    https://raw.githubusercontent.com/gustavovalverde/zinder/main/deploy/.env.mainnet
 ```
 
-The compose defaults `ZINDER_NODE__JSON_RPC_ADDR` to `http://zebra:18232` (testnet/regtest port) and `ZINDER_NODE__AUTH__METHOD=cookie` with `ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie`. For mainnet, override the RPC address to use port `8232`. For attaching to a Zebra outside Z3 (advanced), see the [legacy override section](#appendix-attaching-to-a-non-z3-zebra) below.
+(Substitute `.env.testnet` or `.env.regtest` for the other networks; the systemd unit always reads `/etc/zinder/env`.) Two flavours can coexist on one host: mainnet uses the canonical host ports (`9100`/`9101`/`9068`/`9069`/`9105`/`9106`/`9095`); testnet adds `+10000` (`19100`/`19101`/...); regtest adds `+20000`. Host-port assignments live in the env file; the compose file itself is shape-only.
+
+For attaching to a Zebra outside Z3 (advanced), see the [legacy override section](#appendix-attaching-to-a-non-z3-zebra) below.
 
 `--print-config` will redact every secret regardless of how it was injected.
 
@@ -117,8 +109,10 @@ The expected readiness sequence is `phase=awaiting_upstream cause=starting` → 
 
 ### 5. Hit the probes
 
+The commands below assume the canonical mainnet host ports. On testnet, add `+10000`; on regtest, `+20000`.
+
 ```bash
-# Liveness:
+# Liveness (mainnet):
 curl -fsS http://localhost:9106/readyz | jq .
 
 # Metrics (Prometheus scrape):
@@ -156,7 +150,7 @@ sudo sed -i 's|zinder-query:.*|zinder-query:v0.1.0|'  /etc/zinder/docker-compose
 sudo systemctl start zinder
 ```
 
-The canonical store at `/var/lib/docker/volumes/zinder-data` survives rollback. If a schema migration was introduced, consult that release's notes before downgrading.
+The canonical store at `/var/lib/docker/volumes/zinder-<network>-data` survives rollback. If a schema migration was introduced, consult that release's notes before downgrading.
 
 ## Troubleshooting
 

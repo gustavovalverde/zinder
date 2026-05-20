@@ -115,12 +115,65 @@ In both cases the loop keeps committing whatever blocks Zebra has made available
 A store that has diverged from the upstream history beyond the configured `reorg_window_blocks` fails closed with `cause=reorg_window_exceeded`. The loop does not attempt to recover; the operator is expected to drop the store and restart from cold. Preserve `chain_event_history` for the divergence point first if the incident is under investigation. The store path is whatever `[storage].path` resolves to (defaults to `/var/lib/zinder/store` in the shipped deployments).
 
 ```bash
-docker compose -f deploy/docker-compose.yml down
-docker volume rm zinder-data
-docker compose -f deploy/docker-compose.yml up -d
+docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml down
+docker volume rm zinder-mainnet-data
+docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 ```
 
+(For testnet substitute `.env.testnet` + `zinder-testnet-data`; for regtest substitute `.env.regtest` + `zinder-regtest-data`.)
+
 The fresh start runs `BulkCatchup` from the wallet-serving floor (or genesis, depending on `ingest.coverage`) and transitions to `TipFollow` when it catches up. No manual sequencing is needed.
+
+## Migrating from the legacy `zinder-data` volumes
+
+Earlier releases shipped three hardcoded volume names: `zinder-data` (the canonical RocksDB store), `zinder-prometheus-data` (TSDB samples), and `zinder-grafana-data` (Grafana's SQLite DB with user accounts, API keys, and any UI-created alert rules). The compose file now scopes all three per network (`zinder-<network>-data`, `zinder-<network>-prometheus`, `zinder-<network>-grafana`) so two stacks can coexist on one host. Operators with the legacy volumes should rename them before the first `up` against the new compose; otherwise each stack boots against empty volumes, and the canonical store re-syncs from cold.
+
+What's preserved by a migration vs lost on a drop:
+
+| Volume | Content | If dropped |
+| --- | --- | --- |
+| `zinder-data` | RocksDB canonical store + secondary handles | `BulkCatchup` from genesis (hours for testnet, days for mainnet) |
+| `zinder-prometheus-data` | TSDB samples (retention `30d`) | Metric history restarts; mounted scrape config and alert rules are unaffected |
+| `zinder-grafana-data` | Grafana SQLite DB (users, API keys, UI-created alerts, snapshots) | UI state is lost; provisioned dashboards and datasources are reapplied from the read-only mounts |
+
+Provisioning files under `observability/grafana/provisioning/` and `observability/grafana/dashboards/` are bind-mounted read-only, so dashboards and datasource definitions always come from disk and are not in the volume. The volume holds only state that Grafana writes itself.
+
+Volume rename is a copy (Docker has no native rename). Plan for one pass through each store size (24 GB testnet canonical, ~250 GB mainnet canonical at the time of writing; observability volumes are tens of MB).
+
+```bash
+# Stop the running stack so nothing is holding the volumes open.
+docker compose -p zinder-<network> down
+
+# Choose the destination network suffix once.
+net=testnet   # or mainnet, regtest
+
+for src in zinder-data zinder-prometheus-data zinder-grafana-data; do
+  case $src in
+    zinder-data)            dst=zinder-${net}-data ;;
+    zinder-prometheus-data) dst=zinder-${net}-prometheus ;;
+    zinder-grafana-data)    dst=zinder-${net}-grafana ;;
+  esac
+
+  docker volume create "$dst"
+  docker run --rm -v "$src":/from:ro -v "$dst":/to alpine \
+    sh -c 'cp -a /from/. /to/'
+
+  # Sanity check; sizes should match within a few KB.
+  docker run --rm -v "$src":/v alpine du -sh /v
+  docker run --rm -v "$dst":/v alpine du -sh /v
+done
+
+# Remove the legacy volumes once each rename is verified.
+docker volume rm zinder-data zinder-prometheus-data zinder-grafana-data
+```
+
+Bring the stack back up with the matching env file:
+
+```bash
+docker compose --env-file deploy/.env.${net} -f deploy/docker-compose.yml up -d
+```
+
+Operators who don't care about preserving the small observability volumes can skip them in the loop — `docker volume rm` followed by `up` lets the new `zinder-<network>-prometheus` and `zinder-<network>-grafana` start empty. Only the canonical `zinder-data` is expensive to lose.
 
 ## One-shot pre-seed
 

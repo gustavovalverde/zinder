@@ -69,7 +69,7 @@ docker logs -f zinder-ingest
 
 Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the reader is ready. The lightwalletd-compatible surface is a separate service shipped in the same workspace; see [single-container deployment](deploy/single-container/README.md) for the bundled topology that adds it.
 
-**Switching networks.** Stop the running stack (`docker compose -f deploy/docker-compose.yml down`), bring Z3 up on the other network, then bring zinder up with the matching `--env-file`. The `zinder-data` volume is shared across runs; rename or remove it if you want a clean slate per network.
+**Multiple networks side-by-side.** Each `--env-file` produces an independently named stack (`zinder-mainnet`, `zinder-testnet`, `zinder-regtest`) with its own volumes and host ports. Mainnet uses the canonical ports above; testnet adds `+10000` (`19101`, `19106`, ...); regtest adds `+20000`. Bringing up another network is `docker compose --env-file deploy/.env.<network> -f deploy/docker-compose.yml up -d` — the existing stack keeps running.
 
 **Beyond Docker.** See the [VM runbook](docs/runbooks/deploying-on-a-vm.md) for systemd-managed deployments, the [Railway runbook](docs/runbooks/deploying-on-railway.md) for hosted topologies, and the [single-container](deploy/single-container/README.md) image when you want one process tree instead of two containers.
 

@@ -40,6 +40,9 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0014: Shared configuration sections](adrs/0014-shared-configuration-sections.md)
 - [ADR-0015: Unified phase-driven ingest](adrs/0015-unified-phase-driven-ingest.md)
 - [ADR-0016: Source streaming pipeline](adrs/0016-source-streaming-pipeline.md)
+- [ADR-0017: Derive-consumer template and key-codec convention](adrs/0017-derive-consumer-template-and-key-codec-convention.md)
+- [ADR-0018: Capability-gated optional payload fields](adrs/0018-capability-gated-optional-payload-fields.md)
+- [ADR-0019: Transport policy ownership and self-healing](adrs/0019-transport-policy-ownership.md)
 
 ## Reference
 

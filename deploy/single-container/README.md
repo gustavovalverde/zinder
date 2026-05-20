@@ -72,13 +72,15 @@ docker build -f deploy/single-container/Dockerfile -t zinder-single-container .
 
 Attached to a running Z3 stack (recommended):
 
+Use a network-scoped volume name (`zinder-<network>-data`) and matching host ports so a single host can run mainnet and testnet single-container deployments side-by-side. The example below uses testnet (offset `+10000`); for mainnet drop the offset and substitute the `z3-mainnet` network + cookie volume.
+
 ```bash
 docker run --rm -d \
-  --name zinder \
+  --name zinder-testnet \
   --network z3-testnet \
-  -p 9101:9101 \
-  -p 9106:9106 \
-  -v zinder-data:/var/lib/zinder \
+  -p 19101:9101 \
+  -p 19106:9106 \
+  -v zinder-testnet-data:/var/lib/zinder \
   -v z3-testnet-cookie:/var/run/auth:ro \
   -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
   -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
@@ -92,10 +94,10 @@ Standalone (legacy, against a non-Z3 Zebra):
 
 ```bash
 docker run --rm -d \
-  --name zinder \
-  -p 9101:9101 \
-  -p 9106:9106 \
-  -v zinder-data:/var/lib/zinder \
+  --name zinder-testnet \
+  -p 19101:9101 \
+  -p 19106:9106 \
+  -v zinder-testnet-data:/var/lib/zinder \
   -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
   -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
   -e ZINDER_NODE__AUTH__COOKIE="${ZEBRA_COOKIE}" \

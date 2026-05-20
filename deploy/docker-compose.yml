@@ -12,7 +12,7 @@
 # zinder-mainnet next to z3-mainnet). Without this, Compose defaults the
 # project name to the directory name (`deploy`), which is non-discoverable
 # and prone to collide across repos.
-name: zinder-${Z3_NETWORK_LOWER:-testnet}
+name: zinder-${Z3_NETWORK_LOWER:-mainnet}
 #
 # Zcash upstream dependency
 # -------------------------
@@ -21,22 +21,31 @@ name: zinder-${Z3_NETWORK_LOWER:-testnet}
 # https://github.com/ZcashFoundation/z3 (docs/contract.md). Bring up Z3
 # first; then bring up zinder.
 #
+# Multi-network coexistence
+# -------------------------
+# Two zinder stacks (mainnet + testnet) can run side-by-side on one host.
+# Every container name, volume name, and internal network is scoped by the
+# project name (`zinder-${Z3_NETWORK_LOWER}`), and host ports are picked
+# from the env file: mainnet keeps the canonical ports (9100/9101/9068/
+# 9069/9105/9106/9095/3002); testnet receives a +10000 offset; regtest a
+# +20000 offset. See deploy/.env.testnet for the offset rationale.
+#
 # Use the per-network env helpers (recommended):
 #
-#   docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
 #   docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+#   docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
 #
 # Each helper sets Z3_NETWORK_LOWER (picks the z3-<network> external network
-# and z3-<network>-cookie volume), ZINDER_NETWORK__NAME, and the Zebra
-# JSON-RPC + indexer ports for that network. The defaults below match testnet
-# so the file remains usable without --env-file.
+# and z3-<network>-cookie volume), ZINDER_NETWORK__NAME, the Zebra JSON-RPC
+# + indexer ports, and the per-network host-port offsets. The defaults below
+# match mainnet so omitting --env-file deploys the mainnet flavour.
 
 networks:
   z3:
     external: true
-    name: z3-${Z3_NETWORK_LOWER:-testnet}
-  zinder-observability:
-    name: zinder-observability
+    name: z3-${Z3_NETWORK_LOWER:-mainnet}
+  observability:
+    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-observability
 
 services:
   # Unified ingest loop per ADR-0015. The single process classifies
@@ -48,19 +57,18 @@ services:
     build:
       context: ..
       dockerfile: services/zinder-ingest/Dockerfile
-    container_name: zinder-ingest
     restart: on-failure
-    networks: [z3, zinder-observability]
+    networks: [z3, observability]
     volumes:
-      - zinder-data:/var/lib/zinder
+      - data:/var/lib/zinder
       - ./config/ingest.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       # Default to Z3's in-network Zebra DNS name and per-network ports.
       # Override these if attaching to a Zebra elsewhere or running mainnet.
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
-      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:18230}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:8230}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
       # Operators switching to basic auth export ZINDER_NODE__AUTH__METHOD=basic
@@ -69,8 +77,8 @@ services:
       # the validator treats an empty username as "set" and rejects the mix.
     ports:
       # ingest-control is internal-only; do not publish externally.
-      - "127.0.0.1:9100:9100"
-      - "127.0.0.1:9105:9105"
+      - "127.0.0.1:${ZINDER_INGEST_CONTROL_HOST_PORT:-9100}:9100"
+      - "127.0.0.1:${ZINDER_INGEST_OPS_HOST_PORT:-9105}:9105"
     healthcheck:
       # /healthz reports process liveness; /readyz reports sync progress
       # (404 / 503 until caught up). Pinning the container healthcheck to
@@ -86,27 +94,26 @@ services:
       context: ..
       dockerfile: services/zinder-query/Dockerfile
     image: zinder-query:latest
-    container_name: zinder-query
     restart: on-failure
     depends_on:
       zinder-ingest:
         condition: service_healthy
-    networks: [z3, zinder-observability]
+    networks: [z3, observability]
     volumes:
-      - zinder-data:/var/lib/zinder
+      - data:/var/lib/zinder
       - ./config/query.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
       # Reader dials the writer's IngestControl gRPC; defaults match the
       # in-network DNS name and port the writer publishes.
       ZINDER_INGEST_CONTROL__ADDR: ${ZINDER_INGEST_CONTROL__ADDR:-http://zinder-ingest:9100}
     ports:
-      - "9101:9101"
-      - "127.0.0.1:9106:9106"
+      - "${ZINDER_QUERY_HOST_PORT:-9101}:9101"
+      - "127.0.0.1:${ZINDER_QUERY_OPS_HOST_PORT:-9106}:9106"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9106/healthz"]
       interval: 30s
@@ -124,23 +131,22 @@ services:
       context: ..
       dockerfile: services/zinder-explorer/Dockerfile
     image: zinder-explorer:latest
-    container_name: zinder-explorer
     restart: on-failure
     depends_on:
       zinder-ingest:
         condition: service_healthy
-    networks: [z3, zinder-observability]
+    networks: [z3, observability]
     volumes:
-      - zinder-data:/var/lib/zinder
+      - data:/var/lib/zinder
       - ./config/explorer.toml:/etc/zinder/config.toml:ro
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-testnet}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       # Explorer delegates some reads to the wallet plane via in-network DNS.
       ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: ${ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT:-http://zinder-query:9101}
     ports:
       # ExplorerQuery gRPC published so cross-host clients can reach it.
-      - "9068:9068"
-      - "127.0.0.1:9069:9069"
+      - "${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
+      - "127.0.0.1:${ZINDER_EXPLORER_OPS_HOST_PORT:-9069}:9069"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9069/healthz"]
       interval: 30s
@@ -149,15 +155,14 @@ services:
       retries: 3
 
   # Always-on metrics collection. Scrapes zinder-ingest:9105 + zinder-query:9106
-  # + zinder-explorer:9069 over the shared zinder-observability network.
+  # + zinder-explorer:9069 over the project-scoped observability network.
   # Survives every restart. ADR: docs/architecture/upstream-platform-binding.md.
   zinder-prometheus:
     image: prom/prometheus:v3.2.0
-    container_name: zinder-prometheus
     restart: unless-stopped
-    networks: [zinder-observability]
+    networks: [observability]
     volumes:
-      - zinder-prometheus-data:/prometheus
+      - prometheus:/prometheus
       - ../observability/prometheus/rules:/etc/prometheus/rules:ro
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
@@ -166,7 +171,7 @@ services:
       - "--storage.tsdb.retention.time=${ZINDER_PROMETHEUS_RETENTION:-30d}"
       - "--web.enable-lifecycle"
     ports:
-      - "127.0.0.1:${ZINDER_PROMETHEUS_PORT:-9095}:9090"
+      - "127.0.0.1:${ZINDER_PROMETHEUS_HOST_PORT:-9095}:9090"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
       interval: 30s
@@ -179,15 +184,14 @@ services:
   # collected by zinder-prometheus"; Grafana is the visualization bonus.
   zinder-grafana:
     image: grafana/grafana:11.5.1
-    container_name: zinder-grafana
     restart: unless-stopped
     profiles: [observability]
-    networks: [zinder-observability]
+    networks: [observability]
     depends_on:
       zinder-prometheus:
         condition: service_healthy
     volumes:
-      - zinder-grafana-data:/var/lib/grafana
+      - grafana:/var/lib/grafana
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
@@ -195,7 +199,7 @@ services:
       GF_USERS_DEFAULT_THEME: light
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/zinder-overview.json
     ports:
-      - "127.0.0.1:${ZINDER_GRAFANA_PORT:-3002}:3000"
+      - "127.0.0.1:${ZINDER_GRAFANA_HOST_PORT:-3002}:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
       interval: 30s
@@ -203,12 +207,12 @@ services:
       retries: 3
 
 volumes:
-  zinder-data:
-    name: zinder-data
-  zinder-prometheus-data:
-    name: zinder-prometheus-data
-  zinder-grafana-data:
-    name: zinder-grafana-data
+  data:
+    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-data
+  prometheus:
+    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus
+  grafana:
+    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-grafana
   z3-cookie:
     external: true
-    name: z3-${Z3_NETWORK_LOWER:-testnet}-cookie
+    name: z3-${Z3_NETWORK_LOWER:-mainnet}-cookie
