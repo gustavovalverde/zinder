@@ -3,14 +3,26 @@
 //! `DeriveStore` is intentionally separate from `zinder_store::PrimaryChainStore`:
 //! it lives in its own filesystem path, has its own column families, and uses
 //! its own schema version. The two stores never share keys.
+//!
+//! Both stores share one source of truth for `RocksDB` option choices:
+//! [`zinder_store::build_primary_db_options`] from
+//! [ADR-0020](../../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+//! That keeps the bulk-catchup-OOM trap, which is a property of unbounded
+//! `RocksDB` defaults rather than the canonical store's specific layout,
+//! impossible to recur in the derive plane.
 
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use rust_rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions};
+use rust_rocksdb::{
+    Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+};
 use zinder_core::BlockHeight;
+use zinder_store::{
+    StorageTuning, build_block_based_table_factory, build_block_cache, build_primary_db_options,
+};
 
 use crate::{
     consumer::DeriveConsumerName,
@@ -28,16 +40,15 @@ pub const DERIVE_SCHEMA_VERSION: u16 = 1;
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 
 /// Per-column-family options the derive plane tunes at open time.
-fn column_family_options() -> Options {
+///
+/// Adds `max_write_buffer_number = 2` on top of the canonical-store CF
+/// defaults (one block-based table factory bound to the shared block
+/// cache). Two write buffers let one rotate to immutable while another
+/// keeps absorbing puts during compaction.
+fn column_family_options(cache: &Cache) -> Options {
     let mut options = Options::default();
+    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     options.set_max_write_buffer_number(2);
-    options
-}
-
-fn primary_db_options() -> Options {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    options.create_missing_column_families(true);
     options
 }
 
@@ -79,7 +90,11 @@ impl DeriveStoreTable {
 }
 
 /// Configurable knobs the binary applies before opening the database.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `tuning` ships with [`StorageTuning::derive_defaults`] (half the
+/// canonical-store budget); operators override individual fields through
+/// `[storage.tuning]` in their TOML.
+#[derive(Clone, Copy, Debug)]
 pub struct DeriveStoreOptions {
     /// When set, every write is flushed to the OS page cache before returning.
     /// Default `false` matches the canonical store's tunable so operators can
@@ -89,6 +104,18 @@ pub struct DeriveStoreOptions {
     /// the canonical column-family name a consumer reads and writes through
     /// [`DeriveStore::consumer_column_family`].
     pub consumer_column_families: &'static [&'static str],
+    /// Bounded `RocksDB` resource budget applied at open time.
+    pub tuning: StorageTuning,
+}
+
+impl Default for DeriveStoreOptions {
+    fn default() -> Self {
+        Self {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: StorageTuning::derive_defaults(),
+        }
+    }
 }
 
 /// Owned `(key, payload)` pair returned by
@@ -134,14 +161,22 @@ impl DeriveStore {
         options: DeriveStoreOptions,
     ) -> Result<Self, DeriveStoreError> {
         let path = path.as_ref();
-        let db_options = primary_db_options();
+        options
+            .tuning
+            .validate()
+            .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
+        let block_cache = build_block_cache(options.tuning.block_cache_bytes);
+        let db_options = build_primary_db_options(options.tuning, &block_cache);
         let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
-            ColumnFamilyDescriptor::new(table.column_family_name(), column_family_options())
+            ColumnFamilyDescriptor::new(
+                table.column_family_name(),
+                column_family_options(&block_cache),
+            )
         });
         let consumer_families = options
             .consumer_column_families
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, column_family_options()));
+            .map(|name| ColumnFamilyDescriptor::new(*name, column_family_options(&block_cache)));
         let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
         let db = DB::open_cf_descriptors(&db_options, path, column_families).map_err(|source| {
             DeriveStoreError::Open {
@@ -149,6 +184,9 @@ impl DeriveStore {
                 source,
             }
         })?;
+        // RocksDB holds its own shared_ptr to the cache through
+        // `BlockBasedOptions::set_block_cache`, so the local `block_cache`
+        // can drop at end of scope without affecting the live DB.
         let store = Self {
             db: Arc::new(db),
             sync_writes: options.sync_writes,
@@ -583,6 +621,38 @@ mod tests {
                 persisted,
                 running,
             }) if persisted == DERIVE_SCHEMA_VERSION + 1 && running == DERIVE_SCHEMA_VERSION
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn opening_store_rejects_zero_wal_budget() -> Result<()> {
+        let tempdir = tempdir()?;
+        let mut options = DeriveStoreOptions::default();
+        options.tuning.max_wal_bytes = 0;
+
+        let outcome = DeriveStore::open(tempdir.path(), options);
+
+        assert!(matches!(
+            outcome,
+            Err(DeriveStoreError::InvalidOptions { reason })
+                if reason.contains("max_wal_bytes")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn opening_store_rejects_negative_open_file_budget() -> Result<()> {
+        let tempdir = tempdir()?;
+        let mut options = DeriveStoreOptions::default();
+        options.tuning.max_open_files = -1;
+
+        let outcome = DeriveStore::open(tempdir.path(), options);
+
+        assert!(matches!(
+            outcome,
+            Err(DeriveStoreError::InvalidOptions { reason })
+                if reason.contains("max_open_files")
         ));
         Ok(())
     }

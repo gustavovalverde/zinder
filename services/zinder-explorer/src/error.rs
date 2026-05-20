@@ -44,6 +44,12 @@ pub enum DeriveError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DeriveStoreError {
+    /// Store options would reopen an unbounded `RocksDB` resource path.
+    #[error("invalid derive store options: {reason}")]
+    InvalidOptions {
+        /// Validation failure reason.
+        reason: &'static str,
+    },
     /// `RocksDB` could not open the database at the configured path.
     #[error("derive store could not open RocksDB at {path:?}: {source}")]
     Open {

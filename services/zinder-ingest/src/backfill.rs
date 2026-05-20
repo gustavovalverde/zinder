@@ -34,6 +34,8 @@ pub struct BackfillConfig {
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
+    /// Bounded `RocksDB` resource budget applied when opening the store.
+    pub storage_tuning: zinder_store::StorageTuning,
     /// First block height to backfill.
     pub from_height: BlockHeight,
     /// Last block height to backfill.
@@ -47,6 +49,9 @@ pub struct BackfillConfig {
     /// hide the round-trip latency until the node's connection pool or
     /// CPU saturates. Operator-tunable via `ingest.bulk_catchup.fetch_concurrency`.
     pub fetch_concurrency: NonZeroU32,
+    /// Force a `RocksDB` flush after committing N epochs. See
+    /// [`crate::BulkCatchupConfig::flush_every_n_epochs`].
+    pub flush_every_n_epochs: NonZeroU32,
     /// Pre-observed upstream tip height. When set, `backfill_with_store`
     /// uses this in place of an internal `tip_id()` round-trip for its
     /// finality-bound validation. The unified ingest loop reuses the tip
@@ -81,7 +86,10 @@ pub async fn backfill<Source>(
 where
     Source: NodeSource,
 {
-    let store_options = ChainStoreOptions::for_network(config.node.network);
+    let store_options = ChainStoreOptions {
+        tuning: config.storage_tuning,
+        ..ChainStoreOptions::for_network(config.node.network)
+    };
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
     backfill_with_store(config, source, &store).await
 }
@@ -245,7 +253,10 @@ where
     Source: NodeSource,
     Builder: ArtifactBuilder,
 {
-    let store_options = ChainStoreOptions::for_network(config.node.network);
+    let store_options = ChainStoreOptions {
+        tuning: config.storage_tuning,
+        ..ChainStoreOptions::for_network(config.node.network)
+    };
     validate_backfill_finality_bound(
         config,
         source.tip_id().await?.height,
@@ -315,6 +326,8 @@ where
         }
     })
     .buffered(fetch_concurrency);
+    let flush_every_n_epochs = config.flush_every_n_epochs.get();
+    let mut epochs_since_last_flush: u32 = 0;
 
     while let Some(fetch_result) = block_stream.next().await {
         let source_block = fetch_result?;
@@ -363,6 +376,11 @@ where
             next_subtree_root_indexes = updated_subtree_root_indexes;
             chain_epoch_id = next_chain_epoch_id_after(chain_epoch_id)?;
             last_commit_outcome = Some(commit_outcome);
+            epochs_since_last_flush = epochs_since_last_flush.saturating_add(1);
+            if epochs_since_last_flush >= flush_every_n_epochs {
+                flush_primary_chain_store(store).await?;
+                epochs_since_last_flush = 0;
+            }
         }
     }
 
@@ -382,9 +400,27 @@ where
             &mut batch,
         )?;
         last_commit_outcome = Some(commit_outcome);
+        epochs_since_last_flush = epochs_since_last_flush.saturating_add(1);
+    }
+
+    if last_commit_outcome.is_some() && epochs_since_last_flush > 0 {
+        flush_primary_chain_store(store).await?;
     }
 
     last_commit_outcome.ok_or(IngestError::BackfillProducedNoCommit)
+}
+
+/// Wraps the synchronous `PrimaryChainStore::flush` in a `spawn_blocking`
+/// so a multi-second `RocksDB` flush during `BulkCatchup` does not stall
+/// the Tokio worker the backfill loop runs on.
+async fn flush_primary_chain_store(store: &PrimaryChainStore) -> Result<(), IngestError> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || store.flush())
+        .await
+        .map_err(|join_error| IngestError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        })?
+        .map_err(IngestError::from)
 }
 
 fn commit_finalized_backfill_batch(
@@ -1121,11 +1157,13 @@ mod tests {
             ),
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
+            storage_tuning: zinder_store::StorageTuning::for_local_tests(),
             from_height: BlockHeight::new(from_height),
             to_height: BlockHeight::new(to_height),
             commit_batch_blocks: NonZeroU32::new(commit_batch_blocks)
                 .ok_or("invalid test batch size")?,
             fetch_concurrency: NonZeroU32::new(4).ok_or("invalid test fetch concurrency")?,
+            flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
             upstream_tip_hint: None,
             allow_near_tip_finalize,
             checkpoint: None,

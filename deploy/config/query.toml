@@ -5,10 +5,10 @@
 # anything below.
 
 [network]
-name = "zcash-testnet"
+name = "zcash-mainnet"
 
 [node]
-json_rpc_addr = "http://zebra:18232"
+json_rpc_addr = "http://zebra:8232"
 request_timeout_secs = 30
 
 [node.auth]
@@ -18,6 +18,16 @@ path = "/var/run/auth/.cookie"
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
+
+# Bounded RocksDB resource budget. Uncomment to override the canonical
+# defaults (512 MiB block cache, 512 max open files). Secondaries don't
+# generate a WAL, so `max_wal_bytes` is a no-op on this side; setting it
+# anyway keeps the schema symmetric with the writer. See
+# docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+# [storage.tuning]
+# block_cache_bytes = 536870912
+# max_wal_bytes = 268435456
+# max_open_files = 512
 
 [ingest_control]
 addr = "http://zinder-ingest:9100"

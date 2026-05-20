@@ -64,6 +64,8 @@ pub struct IngestLoopConfig {
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
+    /// Bounded `RocksDB` resource budget applied when opening the store.
+    pub storage_tuning: zinder_store::StorageTuning,
     /// Reorg-window invariant. Bulk catch-up never finalizes blocks inside
     /// this window unless `modifiers.allow_near_tip_finalize` is true.
     pub reorg_window_blocks: u32,
@@ -93,6 +95,15 @@ pub struct BulkCatchupConfig {
     pub commit_batch_blocks: NonZeroU32,
     /// Number of concurrent block fetches in the pipelined fetcher.
     pub fetch_concurrency: NonZeroU32,
+    /// Force a `RocksDB` flush every N committed epochs.
+    ///
+    /// Caps the live WAL by writer cadence rather than `RocksDB`'s WAL-size
+    /// safety trigger. With the default `commit_batch_blocks = 1000` and
+    /// `flush_every_n_epochs = 5`, the writer truncates the WAL after
+    /// every 5,000 committed blocks, bounding crash-recovery RAM
+    /// proportionally. See
+    /// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
+    pub flush_every_n_epochs: NonZeroU32,
 }
 
 /// Resolved `[ingest.tip_follow]` configuration.
@@ -433,10 +444,12 @@ fn build_bulk_catchup_batch_config(
         node: config.node.clone(),
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
+        storage_tuning: config.storage_tuning,
         from_height,
         to_height: BlockHeight::new(batch_target),
         commit_batch_blocks: config.bulk_catchup.commit_batch_blocks,
         fetch_concurrency: config.bulk_catchup.fetch_concurrency,
+        flush_every_n_epochs: config.bulk_catchup.flush_every_n_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
         checkpoint: config.modifiers.checkpoint,
@@ -447,6 +460,7 @@ fn build_tip_follow_config(config: &IngestLoopConfig) -> TipFollowConfig {
     TipFollowConfig {
         node: config.node.clone(),
         storage_path: config.storage_path.clone(),
+        storage_tuning: config.storage_tuning,
         reorg_window_blocks: config.reorg_window_blocks,
         poll_interval: config.tip_follow.poll_interval,
         lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
@@ -503,6 +517,7 @@ mod tests {
             ),
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: PathBuf::from("/tmp/unit-test"),
+            storage_tuning: zinder_store::StorageTuning::for_local_tests(),
             reorg_window_blocks: 100,
             phases: PhasesConfig {
                 catchup_threshold_blocks: 100,
@@ -510,6 +525,7 @@ mod tests {
             bulk_catchup: BulkCatchupConfig {
                 commit_batch_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
                 fetch_concurrency: NonZeroU32::new(32).ok_or("invalid fetch concurrency")?,
+                flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
             },
             tip_follow: TipFollowPhaseConfig {
                 poll_interval: Duration::from_millis(10),

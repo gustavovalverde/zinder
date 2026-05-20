@@ -19,6 +19,10 @@ pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result
             reason: "reorg window blocks must be greater than zero",
         });
     }
+    options
+        .tuning
+        .validate()
+        .map_err(|reason| StoreError::InvalidChainStoreOptions { reason })?;
 
     Ok(())
 }

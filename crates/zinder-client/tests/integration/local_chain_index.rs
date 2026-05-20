@@ -34,6 +34,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         storage_path: store_fixture.tempdir_path().to_path_buf(),
         secondary_path: store_fixture.tempdir_path().join("zinder-client-secondary"),
         network: Network::ZcashRegtest,
+        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),

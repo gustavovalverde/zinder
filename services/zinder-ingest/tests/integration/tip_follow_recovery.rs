@@ -178,6 +178,7 @@ fn sample_tip_follow_config(storage_path: &std::path::Path) -> TipFollowConfig {
             DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
         ),
         storage_path: storage_path.to_path_buf(),
+        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         reorg_window_blocks: 100,
         poll_interval: Duration::from_millis(10),
         lag_threshold_blocks: 1,

@@ -30,6 +30,7 @@ tracing-subscriber.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
+zinder-store.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

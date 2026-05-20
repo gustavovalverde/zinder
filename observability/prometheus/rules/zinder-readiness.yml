@@ -81,3 +81,21 @@ groups:
         annotations:
           summary: "Zinder RocksDB compaction is running for too long"
           description: "{{ $labels.service }} {{ $labels.cf }} reports more than four running compactions for 15 minutes."
+
+      - alert: ZinderStoreWalGrowth
+        expr: max by (service) (zinder_store_wal_bytes) / max by (service) (zinder_store_wal_bytes_limit) > 0.75
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder RocksDB WAL approaching ceiling"
+          description: "{{ $labels.service }} live WAL is above 75% of storage.tuning.max_wal_bytes; investigate flush stalls before the bulk-catchup OOM trap fires (docs/runbooks/bulk-catchup-oom-recovery.md)."
+
+      - alert: ZinderStartupOpenStorageSlow
+        expr: histogram_quantile(0.95, sum by (service, phase, le) (rate(zinder_startup_phase_duration_seconds_bucket{phase="open_storage"}[10m]))) > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder open_storage p95 is high"
+          description: "{{ $labels.service }} open_storage p95 exceeds 60 seconds; sustained values point at WAL-replay-on-restart or filesystem contention."

@@ -27,6 +27,7 @@ Direct embedded reads outside that contract are allowed only for `zinder dev` co
 - Storage-control records, including the store network anchor.
 - Schema-version validation on open.
 - Checkpoint creation and fixture capture.
+- The bounded RocksDB resource budget and the shared option-factory functions (`build_primary_db_options`, `build_secondary_db_options`, `build_block_cache`, `build_block_based_table_factory`). [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) records the architectural invariants and the operator-tunable surface; both the canonical store and the derive store route through these factories so the bulk-catchup-OOM trap can only be reopened by changing the factory itself.
 
 `zinder-store` must not expose RocksDB handles as public API. Public callers use domain contracts.
 
@@ -161,7 +162,20 @@ Readiness causes and operational metrics are owned by [Service operations](servi
 - RocksDB block cache usage.
 - Curated RocksDB property gauges through `zinder_store_rocksdb_property`,
   including live data size, SST size, memtable size, table-reader memory,
-  pending compaction bytes, and running compaction count.
+  pending compaction bytes, running compaction count, and per-CF
+  active-memtable size.
+- WAL ceiling diagnostics through `zinder_store_wal_bytes` (live `*.log`
+  bytes inside the store path) and `zinder_store_wal_bytes_limit` (the
+  configured `storage.tuning.max_wal_bytes`). Both feed
+  `ZinderStoreWalGrowth` per [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
+- Block-cache capacity and usage through dedicated gauges
+  `zinder_store_block_cache_capacity_bytes` and
+  `zinder_store_block_cache_usage_bytes`. These are the canonical signals;
+  the same numbers are not republished as `zinder_store_rocksdb_property`
+  labels.
+- Startup-phase duration through `zinder_startup_phase_duration_seconds`,
+  labeled by `phase`, `outcome`, and `service`. Cold WAL replay durations
+  feed `ZinderStartupOpenStorageSlow`.
 - RocksDB read latency through `zinder_store_read_duration_seconds`, labeled by
   operation, column family, and status.
 - Visibility-index seek count through `zinder_store_visibility_seek_total`,

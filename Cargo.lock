@@ -5293,6 +5293,7 @@ dependencies = [
  "zinder-core",
  "zinder-proto",
  "zinder-source",
+ "zinder-store",
  "zinder-testkit",
 ]
 

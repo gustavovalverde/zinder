@@ -3,12 +3,12 @@
 #
 # zinder-explorer is the third long-lived service in the zinder stack
 # (alongside zinder-ingest and zinder-query). It reads canonical state
-# through a secondary RocksDB handle on the same `zinder-data` volume
-# and serves the ExplorerQuery gRPC surface that block-explorer clients
-# (like zexplorer) consume.
+# through a secondary RocksDB handle on the same per-network data volume
+# (`zinder-<network>-data`) and serves the ExplorerQuery gRPC surface
+# that block-explorer clients (like zexplorer) consume.
 
 [network]
-name = "zcash-testnet"
+name = "zcash-mainnet"
 
 [explorer]
 listen_addr = "0.0.0.0:9068"
@@ -17,6 +17,16 @@ storage_path = "/var/lib/zinder/secondary-explorer"
 # the in-network DNS name the query service publishes. ADR-0009 records
 # this co-located topology.
 wallet_query_endpoint = "http://zinder-query:9101"
+
+# Bounded RocksDB resource budget for the derive store. Uncomment to
+# override the derive defaults (128 MiB block cache, 64 MiB max WAL, 256
+# max open files); derive stores hold smaller working sets than the
+# canonical chain store so the budget is halved. See
+# docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+# [explorer.tuning]
+# block_cache_bytes = 134217728
+# max_wal_bytes = 67108864
+# max_open_files = 256
 
 [ops]
 listen_addr = "0.0.0.0:9069"

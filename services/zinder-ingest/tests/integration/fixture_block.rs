@@ -337,10 +337,12 @@ async fn backfill_rejects_wrong_checkpoint_tree_metadata() -> Result<(), Box<dyn
         ),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path,
+        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         from_height: BlockHeight::new(1),
         to_height: BlockHeight::new(1),
         commit_batch_blocks: NonZeroU32::new(1).ok_or("invalid batch size")?,
         fetch_concurrency: NonZeroU32::new(4).ok_or("invalid fetch concurrency")?,
+        flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: true,
         checkpoint: Some(SourceChainCheckpoint::new(

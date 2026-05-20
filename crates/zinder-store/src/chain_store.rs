@@ -17,7 +17,7 @@ use crate::{
     ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
-    MempoolEventRetentionReport, ReorgWindowChange, StoreError, StreamCursorTokenV1,
+    MempoolEventRetentionReport, ReorgWindowChange, StorageTuning, StoreError, StreamCursorTokenV1,
     block_hash_index::block_hash_index_put,
     format::{
         ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
@@ -43,7 +43,10 @@ use validation::{
 ///
 /// Construct one with [`ChainStoreOptions::for_network`] for production use, or
 /// [`ChainStoreOptions::for_local_tests`] for throwaway test stores. The struct
-/// has no `Default` so callers must pick a posture explicitly.
+/// has no `Default` so callers must pick a posture explicitly. The
+/// `tuning` field carries the bounded `RocksDB` resource budget described
+/// in [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md);
+/// operators override it through `[storage.tuning]` in their TOML.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainStoreOptions {
     /// Number of near-tip blocks that may be replaced by a reorg.
@@ -52,6 +55,8 @@ pub struct ChainStoreOptions {
     pub sync_writes: bool,
     /// Expected network for this store, used to persist and validate store metadata.
     pub network: Option<Network>,
+    /// Bounded `RocksDB` resource budget applied at open time.
+    pub tuning: StorageTuning,
 }
 
 impl ChainStoreOptions {
@@ -62,12 +67,14 @@ impl ChainStoreOptions {
             reorg_window_blocks: 100,
             sync_writes: true,
             network: Some(network),
+            tuning: StorageTuning::canonical_defaults(),
         }
     }
 
     /// Returns options suitable for throwaway local test stores.
     ///
-    /// Uses unsynchronized writes and a regtest network anchor. Production code
+    /// Uses unsynchronized writes, a regtest network anchor, and the
+    /// tighter [`StorageTuning::for_local_tests`] budget. Production code
     /// must use [`Self::for_network`] instead.
     #[must_use]
     pub const fn for_local_tests() -> Self {
@@ -75,6 +82,7 @@ impl ChainStoreOptions {
             reorg_window_blocks: 100,
             sync_writes: false,
             network: Some(Network::ZcashRegtest),
+            tuning: StorageTuning::for_local_tests(),
         }
     }
 }
@@ -309,7 +317,11 @@ impl PrimaryChainStore {
     /// Opens or creates the canonical chain store as the primary writer.
     pub fn open(path: impl AsRef<Path>, options: ChainStoreOptions) -> Result<Self, StoreError> {
         validate_chain_store_options(options)?;
-        let inner = Arc::new(RocksChainStore::open_primary(path, options.sync_writes)?);
+        let inner = Arc::new(RocksChainStore::open_primary(
+            path,
+            options.sync_writes,
+            options.tuning,
+        )?);
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
 
@@ -317,6 +329,18 @@ impl PrimaryChainStore {
             store,
             cached_visible_chain_epoch: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Flushes every column family's active memtable to `SST` and
+    /// truncates the WAL.
+    ///
+    /// Called by `zinder-ingest` between `BulkCatchup` batches to bound
+    /// the live WAL by writer cadence rather than `RocksDB`'s own
+    /// WAL-size trigger. See [the OOM-recovery
+    /// runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md) for
+    /// the rationale.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.store.inner.flush()
     }
 
     /// Reads the currently visible chain epoch.
@@ -456,6 +480,7 @@ impl SecondaryChainStore {
             primary_path,
             secondary_path,
             options.sync_writes,
+            options.tuning,
         )?);
         let store =
             ChainStoreInner::from_secondary_inner(inner, options, ChainStoreReadPosture::Direct)?;

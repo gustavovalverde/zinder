@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c, connect_zinder_grpc,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
+    connect_zinder_grpc, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -154,7 +154,10 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let store = match SecondaryChainStore::open(
         &query_config.storage.path,
         &query_config.storage.secondary_path,
-        zinder_store::ChainStoreOptions::for_network(query_config.network),
+        zinder_store::ChainStoreOptions {
+            tuning: query_config.storage.tuning,
+            ..zinder_store::ChainStoreOptions::for_network(query_config.network)
+        },
     ) {
         Ok(store) => {
             open_storage_phase.complete();
@@ -261,7 +264,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         }
         adapter
     };
-    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
         store,
         readiness.clone(),

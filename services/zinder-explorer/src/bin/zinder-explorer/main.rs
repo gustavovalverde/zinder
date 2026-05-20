@@ -12,7 +12,7 @@ use zinder_explorer::{
     TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES, describe_request_metrics,
 };
 use zinder_runtime::{
-    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
+    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
     install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 
@@ -138,7 +138,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     };
 
     let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
     let (consumer_handles, prevouts_online) =
         match maybe_spawn_consumers(&explorer_config, store.clone(), cancel.clone()).await {
@@ -203,6 +203,7 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
         DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: consumer_column_families_static(),
+            tuning: explorer_config.storage_tuning,
         },
     ) {
         Ok(handle) => {

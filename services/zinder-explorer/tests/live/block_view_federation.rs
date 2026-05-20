@@ -376,6 +376,7 @@ impl BlockViewFixture {
             DeriveStoreOptions {
                 sync_writes: false,
                 consumer_column_families: &[BLOCK_SUMMARY_COLUMN_FAMILY],
+                tuning: zinder_store::StorageTuning::for_local_tests(),
             },
         )?;
 

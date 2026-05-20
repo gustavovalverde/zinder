@@ -22,8 +22,8 @@ use zinder_ingest::{
     spawn_mempool_event_retention_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
-    Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
+    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     ChainTipNotificationSource, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
@@ -378,10 +378,13 @@ async fn run_ingest(
     recover_state_phase.complete();
 
     let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let store_options = ChainStoreOptions::for_network(command_config.loop_config.node.network);
+    let store_options = ChainStoreOptions {
+        tuning: command_config.loop_config.storage_tuning,
+        ..ChainStoreOptions::for_network(command_config.loop_config.node.network)
+    };
     let store =
         match PrimaryChainStore::open(&command_config.loop_config.storage_path, store_options) {
             Ok(store) => {
@@ -965,7 +968,10 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
     let backup_config = config::load_backup_config(config_path, args.into())?;
     let store = PrimaryChainStore::open(
         &backup_config.storage_path,
-        ChainStoreOptions::for_network(backup_config.network),
+        ChainStoreOptions {
+            tuning: backup_config.storage_tuning,
+            ..ChainStoreOptions::for_network(backup_config.network)
+        },
     )
     .map_err(IngestError::from)?;
     let started_at = Instant::now();

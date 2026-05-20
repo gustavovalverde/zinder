@@ -17,6 +17,7 @@ mod kv;
 mod mempool_event;
 mod mempool_event_store;
 mod proto_codec;
+mod storage_tuning;
 mod store_error;
 mod subtree_root;
 mod transaction_artifact;
@@ -47,6 +48,10 @@ pub use format::{
     TransparentHistoryStreamFamily, TransparentUtxoCursorPayload, TransparentUtxoStreamFamily,
 };
 pub use grpc_status::status_from_store_error;
+pub use kv::{
+    build_block_based_table_factory, build_block_cache, build_primary_db_options,
+    build_secondary_db_options,
+};
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope};
 pub use mempool_event_store::{
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest,
@@ -62,6 +67,7 @@ pub use proto_codec::{
     transparent_mempool_spend_message, transparent_prevout_entry_message,
     transparent_prevout_message,
 };
+pub use storage_tuning::StorageTuning;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::TransactionArtifactStore;

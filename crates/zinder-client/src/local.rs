@@ -37,6 +37,11 @@ pub struct LocalOpenOptions {
     pub secondary_path: PathBuf,
     /// Expected network stored in the canonical database.
     pub network: Network,
+    /// Bounded `RocksDB` resource budget applied when opening the
+    /// secondary. Defaults to
+    /// [`zinder_store::StorageTuning::canonical_defaults`] when callers
+    /// construct via the public field set.
+    pub storage_tuning: zinder_store::StorageTuning,
     /// Optional service endpoint used for subscriptions and command RPCs.
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
@@ -69,11 +74,15 @@ impl LocalChainIndex {
         let storage_path = options.storage_path.clone();
         let secondary_path = options.secondary_path.clone();
         let network = options.network;
+        let storage_tuning = options.storage_tuning;
         let store = join_blocking(tokio::task::spawn_blocking(move || {
             SecondaryChainStore::open(
                 storage_path,
                 secondary_path,
-                ChainStoreOptions::for_network(network),
+                ChainStoreOptions {
+                    tuning: storage_tuning,
+                    ..ChainStoreOptions::for_network(network)
+                },
             )
             .map_err(IndexerError::from_store_error)
         }))

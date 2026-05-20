@@ -177,6 +177,7 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
         ),
         node_source: NodeSourceKind::ZebraJsonRpc,
+        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: storage_path.to_path_buf(),
         reorg_window_blocks: 100,
         phases: PhasesConfig {
@@ -185,6 +186,7 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
         bulk_catchup: BulkCatchupConfig {
             commit_batch_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
             fetch_concurrency: NonZeroU32::new(32).ok_or_else(|| eyre!("nonzero"))?,
+            flush_every_n_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("nonzero"))?,
         },
         tip_follow: TipFollowPhaseConfig {
             poll_interval: Duration::from_millis(10),

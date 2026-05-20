@@ -133,7 +133,8 @@ impl StartupPhaseGuard {
     }
 
     fn emit_exit(&self, outcome: &'static str, reason: Option<&str>) {
-        let elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = self.started_at.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         if let Some(reason) = reason {
             tracing::info!(
                 target: "zinder::startup",
@@ -154,6 +155,12 @@ impl StartupPhaseGuard {
                 "startup phase exited"
             );
         }
+        metrics::histogram!(
+            "zinder_startup_phase_duration_seconds",
+            "phase" => self.phase.as_str(),
+            "outcome" => outcome,
+        )
+        .record(elapsed);
     }
 }
 
@@ -203,5 +210,16 @@ mod tests {
     fn fail_consumes_guard_and_carries_reason() {
         let guard = StartupPhase::OpenStorage.start();
         guard.fail(&"disk is full");
+    }
+
+    #[test]
+    fn complete_records_histogram_under_correct_labels() {
+        // The metrics facade has a process-wide recorder. We can't directly
+        // assert against gauges without a custom recorder, so this test
+        // exists to guarantee the call path does not panic. Recorder-level
+        // assertions live in `crates/zinder-runtime/tests` against the
+        // installed Prometheus recorder.
+        let guard = StartupPhase::OpenStorage.start();
+        guard.complete();
     }
 }

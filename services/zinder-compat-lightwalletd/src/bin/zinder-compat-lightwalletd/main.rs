@@ -9,8 +9,8 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, ServiceIdentifier, StartupPhase, cancel_on_ctrl_c, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::SecondaryChainStore;
@@ -125,7 +125,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let store = match SecondaryChainStore::open(
         &lightwalletd_config.storage.path,
         &lightwalletd_config.storage.secondary_path,
-        zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network),
+        zinder_store::ChainStoreOptions {
+            tuning: lightwalletd_config.storage.tuning,
+            ..zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network)
+        },
     ) {
         Ok(handle) => {
             open_storage_phase.complete();
@@ -184,7 +187,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         network_upgrade_activations.clone(),
     );
     let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_ctrl_c(cancel.clone());
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let mempool_surface = Arc::new({
         let mut surface =
             IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());

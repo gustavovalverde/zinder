@@ -193,7 +193,8 @@ pub(crate) fn decide_recovery(
         | IngestError::TipFollowParentMetadataUnavailable { .. }
         | IngestError::SystemTimeBeforeUnixEpoch { .. }
         | IngestError::TimestampTooLarge
-        | IngestError::ArtifactDerive(_) => SourceRecoveryDecision::Exit,
+        | IngestError::ArtifactDerive(_)
+        | IngestError::BlockingTaskFailed { .. } => SourceRecoveryDecision::Exit,
     }
 }
 

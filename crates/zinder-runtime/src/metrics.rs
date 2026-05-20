@@ -24,6 +24,19 @@ const DURATION_SECONDS_BUCKETS: &[f64] = &[
     1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0, 3.0, 10.0,
 ];
 
+/// Histogram bucket boundaries (in seconds) for the startup-phase
+/// duration histogram.
+///
+/// Startup phases span ~10 ms for config loading to several minutes for
+/// cold WAL replay, so the buckets cover 0.01 s to 600 s. The upper
+/// bucket alerts an SRE that a startup phase exceeded ten minutes, which
+/// is the shape `open_storage` takes during the bulk-catchup OOM trap
+/// described in
+/// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
+const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
+    0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
+];
+
 /// Handle used by `/metrics` to render the process-wide Prometheus snapshot.
 #[derive(Clone, Debug)]
 pub struct MetricsHandle {
@@ -66,6 +79,11 @@ pub fn install_metrics_recorder(server: &OpsServer) -> Result<MetricsHandle, Met
             return Ok(record_build_info(handle.clone(), server));
         }
         let prometheus = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full("zinder_startup_phase_duration_seconds".to_owned()),
+                STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
+            )
+            .map_err(|source| MetricsInstallError::Install { source })?
             .set_buckets_for_metric(
                 Matcher::Suffix("_duration_seconds".to_owned()),
                 DURATION_SECONDS_BUCKETS,

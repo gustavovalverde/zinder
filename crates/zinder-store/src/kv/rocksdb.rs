@@ -1,12 +1,12 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{fs, path::Path, sync::Arc, time::Instant};
 
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
-    ColumnFamilyDescriptor, DB, Options, SliceTransform, Snapshot, WriteBatch, WriteOptions,
-    checkpoint::Checkpoint,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, SliceTransform,
+    Snapshot, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 
-use crate::{StoreError, format::StoreKey, kv::StorageTable};
+use crate::{StorageTuning, StoreError, format::StoreKey, kv::StorageTable};
 
 type PrefixScanVisitor<'visitor> =
     &'visitor mut dyn FnMut(&[u8], &[u8]) -> Result<PrefixScanControl, StoreError>;
@@ -16,20 +16,25 @@ pub(crate) struct RocksChainStore {
     db: Arc<DB>,
     control_lock: Arc<Mutex<()>>,
     sync_writes: bool,
+    block_cache: Cache,
+    block_cache_capacity_bytes: u64,
+    wal_size_limit_bytes: u64,
 }
 
 impl RocksChainStore {
     pub(crate) fn open_primary(
         path: impl AsRef<Path>,
         sync_writes: bool,
+        tuning: StorageTuning,
     ) -> Result<Self, StoreError> {
-        let db_options = primary_db_options();
+        let block_cache = build_block_cache(tuning.block_cache_bytes);
+        let db_options = build_primary_db_options(tuning, &block_cache);
         let column_families = StorageTable::all()
             .into_iter()
             .map(|table| {
                 ColumnFamilyDescriptor::new(
                     table.column_family_name(),
-                    column_family_options(table),
+                    column_family_options(table, &block_cache),
                 )
             })
             .collect::<Vec<_>>();
@@ -41,6 +46,9 @@ impl RocksChainStore {
             db: Arc::new(db),
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
+            block_cache,
+            block_cache_capacity_bytes: tuning.block_cache_bytes,
+            wal_size_limit_bytes: tuning.max_wal_bytes,
         };
         store.record_rocksdb_properties();
 
@@ -51,14 +59,16 @@ impl RocksChainStore {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         sync_writes: bool,
+        tuning: StorageTuning,
     ) -> Result<Self, StoreError> {
-        let db_options = secondary_db_options();
+        let block_cache = build_block_cache(tuning.block_cache_bytes);
+        let db_options = build_secondary_db_options(tuning, &block_cache);
         let column_families = StorageTable::all()
             .into_iter()
             .map(|table| {
                 ColumnFamilyDescriptor::new(
                     table.column_family_name(),
-                    column_family_options(table),
+                    column_family_options(table, &block_cache),
                 )
             })
             .collect::<Vec<_>>();
@@ -75,6 +85,9 @@ impl RocksChainStore {
             db: Arc::new(db),
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
+            block_cache,
+            block_cache_capacity_bytes: tuning.block_cache_bytes,
+            wal_size_limit_bytes: tuning.max_wal_bytes,
         };
         store.record_rocksdb_properties();
 
@@ -315,12 +328,53 @@ impl RocksChainStore {
             .map_err(StoreError::secondary_catchup_failed)
     }
 
+    /// Forces every column family's active memtable to flush to `SST`
+    /// and truncates the WAL.
+    ///
+    /// Used by `zinder-ingest` between `BulkCatchup` batches to keep the
+    /// live WAL bounded by writer cadence instead of by `RocksDB`'s
+    /// WAL-size trigger alone. Atomic-flush is enabled at open, and
+    /// `flush_cfs_opt` names every column family that participates in the
+    /// per-epoch commit contract documented in ADR-0001.
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        let column_families = StorageTable::all()
+            .into_iter()
+            .map(|table| self.column_family(table))
+            .collect::<Result<Vec<_>, _>>()?;
+        let column_family_refs = column_families.iter().collect::<Vec<_>>();
+        self.db
+            .flush_cfs_opt(&column_family_refs, &FlushOptions::default())
+            .map_err(StoreError::storage_unavailable)
+    }
+
     pub(crate) fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
         let checkpoint =
             Checkpoint::new(self.db.as_ref()).map_err(StoreError::storage_unavailable)?;
         checkpoint
             .create_checkpoint(path.as_ref())
             .map_err(|source| StoreError::checkpoint_unavailable(path.as_ref(), source))
+    }
+
+    /// Walks the on-disk WAL files and returns their combined size in
+    /// bytes. Returns `None` when the store path is unreadable; the metric
+    /// scrape treats that as "no sample" rather than failing closed.
+    fn wal_size_bytes(&self) -> Option<u64> {
+        let entries = fs::read_dir(self.db.path()).ok()?;
+        let mut total_bytes = 0_u64;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Some(extension) = entry_path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("log") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            total_bytes = total_bytes.saturating_add(metadata.len());
+        }
+        Some(total_bytes)
     }
 
     #[cfg(test)]
@@ -350,7 +404,7 @@ impl RocksChainStore {
             let Ok(column_family) = self.column_family(table) else {
                 continue;
             };
-            for property in ROCKSDB_INT_PROPERTIES {
+            for property in PER_CF_INT_PROPERTIES {
                 let Ok(Some(property_sample)) =
                     self.db.property_int_value_cf(&column_family, property)
                 else {
@@ -364,24 +418,85 @@ impl RocksChainStore {
                 .set(u64_to_f64(property_sample));
             }
         }
+        if let Some(wal_bytes) = self.wal_size_bytes() {
+            metrics::gauge!("zinder_store_wal_bytes").set(u64_to_f64(wal_bytes));
+        }
+        metrics::gauge!("zinder_store_wal_bytes_limit").set(u64_to_f64(self.wal_size_limit_bytes));
+        metrics::gauge!("zinder_store_block_cache_capacity_bytes")
+            .set(u64_to_f64(self.block_cache_capacity_bytes));
+        metrics::gauge!("zinder_store_block_cache_usage_bytes")
+            .set(usize_to_f64(self.block_cache.get_usage()));
     }
 }
 
-fn primary_db_options() -> Options {
+/// Builds `RocksDB` options for any writer-posture instance in the workspace.
+///
+/// The canonical chain store and the derive store both route through this
+/// factory; ADR-0020 describes the bounded resource budget applied here.
+///
+/// Locked invariants applied here are non-tunable: write-ahead logging on
+/// (`disable_wal=false`), point-in-time recovery on (`RocksDB` default),
+/// atomic cross-CF flush on (`set_atomic_flush(true)`), and ordered
+/// writes on (`unordered_write=false`). See
+/// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
+/// for the full design.
+#[must_use]
+pub fn build_primary_db_options(tuning: StorageTuning, cache: &Cache) -> Options {
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
     db_options.create_missing_column_families(true);
     db_options.enable_statistics();
+    db_options.set_max_total_wal_size(tuning.max_wal_bytes);
+    db_options.set_max_open_files(tuning.max_open_files);
+    db_options.set_atomic_flush(true);
+    db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }
 
-fn secondary_db_options() -> Options {
+/// Builds `RocksDB` options for a secondary replica with the same
+/// bounded resource budget as the primary.
+///
+/// Secondaries replay the writer's WAL but do not generate one, so the WAL
+/// ceiling and atomic-flush flag are not applied here. Per-DB resource caps
+/// (block cache, open file handles) apply identically because the secondary's
+/// open-time RAM peak grows with store size the same way the primary's does.
+#[must_use]
+pub fn build_secondary_db_options(tuning: StorageTuning, cache: &Cache) -> Options {
     let mut db_options = Options::default();
     db_options.create_if_missing(false);
     db_options.create_missing_column_families(false);
-    db_options.set_max_open_files(-1);
     db_options.enable_statistics();
+    db_options.set_max_open_files(tuning.max_open_files);
+    db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
+}
+
+/// Allocates the bounded LRU block cache shared by every column family.
+///
+/// The cache holds data, index, and bloom-filter blocks together so total
+/// resident metadata stays bounded by `capacity_bytes`. Cloning the
+/// returned handle shares the underlying allocation (`RocksDB`'s `Cache`
+/// is reference counted), so callers needing the same cache across
+/// multiple open paths pass `&` references rather than reconstructing.
+#[must_use]
+pub fn build_block_cache(capacity_bytes: u64) -> Cache {
+    let capacity = usize::try_from(capacity_bytes).unwrap_or(usize::MAX);
+    Cache::new_lru_cache(capacity)
+}
+
+/// Builds the shared `BlockBasedOptions` every column family routes through.
+///
+/// Index and filter blocks are accounted to `cache` so the at-rest
+/// metadata budget stays bounded by [`StorageTuning::block_cache_bytes`].
+/// Public because the derive store re-uses the same factory; see
+/// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+#[must_use]
+pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
+    let mut bbt = BlockBasedOptions::default();
+    bbt.set_block_cache(cache);
+    bbt.set_cache_index_and_filter_blocks(true);
+    bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    bbt
 }
 
 pub(crate) trait RocksChainStoreRead {
@@ -730,10 +845,11 @@ fn exclusive_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(upper_bound)
 }
 
-const ROCKSDB_INT_PROPERTIES: [&str; 6] = [
+const PER_CF_INT_PROPERTIES: [&str; 7] = [
     "rocksdb.estimate-live-data-size",
     "rocksdb.total-sst-files-size",
     "rocksdb.size-all-mem-tables",
+    "rocksdb.cur-size-active-mem-table",
     "rocksdb.estimate-table-readers-mem",
     "rocksdb.estimate-pending-compaction-bytes",
     "rocksdb.num-running-compactions",
@@ -866,6 +982,14 @@ fn u64_to_f64(sample: u64) -> f64 {
     sample as f64
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 samples; block cache sizes are diagnostic magnitudes"
+)]
+fn usize_to_f64(sample: usize) -> f64 {
+    sample as f64
+}
+
 /// Per-CF memtable budget for column families whose live data stays under a
 /// few hundred KiB.
 ///
@@ -877,8 +1001,9 @@ fn u64_to_f64(sample: u64) -> f64 {
 /// shrinks the writer's resident memtable footprint by an order of magnitude.
 const SMALL_CF_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-fn column_family_options(table: StorageTable) -> Options {
+fn column_family_options(table: StorageTable, cache: &Cache) -> Options {
     let mut options = Options::default();
+    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
 
     if table == StorageTable::ReorgWindow {
         options.set_prefix_extractor(SliceTransform::create(

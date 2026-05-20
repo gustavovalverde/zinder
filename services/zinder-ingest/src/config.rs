@@ -23,12 +23,12 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
     IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, duration_as_millis_u64,
-    require_field, resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
-    resolve_retention,
+    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageTuningToml,
+    duration_as_millis_u64, require_field, resolve_ingest_control_writer, resolve_ops_listen_addr,
+    resolve_primary_storage, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
-use zinder_store::MempoolEventRetentionConfig;
+use zinder_store::{MempoolEventRetentionConfig, StorageTuning};
 
 use crate::cli::parse::{
     parse_commit_batch_blocks, parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks,
@@ -37,6 +37,7 @@ use crate::cli::parse::{
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
 const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1_000;
 const DEFAULT_FETCH_CONCURRENCY: u32 = 32;
+const DEFAULT_FLUSH_EVERY_N_EPOCHS: u32 = 5;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
@@ -107,6 +108,7 @@ impl Default for IngestCoverage {
 pub(crate) struct BackupCommandConfig {
     pub(crate) network: zinder_core::Network,
     pub(crate) storage_path: PathBuf,
+    pub(crate) storage_tuning: StorageTuning,
     pub(crate) to_path: PathBuf,
 }
 
@@ -189,6 +191,10 @@ pub(crate) fn load_ingest_config(
         .with_default(
             "ingest.bulk_catchup.fetch_concurrency",
             DEFAULT_FETCH_CONCURRENCY,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.flush_every_n_epochs",
+            DEFAULT_FLUSH_EVERY_N_EPOCHS,
         )?
         .with_default(
             "ingest.tip_follow.poll_interval_ms",
@@ -352,6 +358,7 @@ struct IngestPhasesSection {
 struct IngestBulkCatchupSection {
     commit_batch_blocks: Option<u32>,
     fetch_concurrency: Option<u32>,
+    flush_every_n_epochs: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -394,7 +401,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .clone()
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
-    let ResolvedPrimaryStorage { path: storage_path } = resolve_primary_storage(config.storage)?;
+    let ResolvedPrimaryStorage {
+        path: storage_path,
+        tuning: storage_tuning,
+    } = resolve_primary_storage(config.storage)?;
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -420,6 +430,14 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     )?;
     let fetch_concurrency = NonZeroU32::new(fetch_concurrency_raw).ok_or_else(|| {
         ConfigError::invalid("ingest.bulk_catchup.fetch_concurrency must be greater than zero")
+    })?;
+
+    let flush_every_n_epochs_raw = require_field(
+        config.ingest.bulk_catchup.flush_every_n_epochs,
+        "ingest.bulk_catchup.flush_every_n_epochs",
+    )?;
+    let flush_every_n_epochs = NonZeroU32::new(flush_every_n_epochs_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.bulk_catchup.flush_every_n_epochs must be greater than zero")
     })?;
 
     let poll_interval_ms = require_field(
@@ -480,6 +498,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         node: node_target,
         node_source,
         storage_path,
+        storage_tuning,
         reorg_window_blocks,
         phases: PhasesConfig {
             catchup_threshold_blocks,
@@ -487,6 +506,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         bulk_catchup: BulkCatchupConfig {
             commit_batch_blocks,
             fetch_concurrency,
+            flush_every_n_epochs,
         },
         tip_follow: TipFollowPhaseConfig {
             poll_interval,
@@ -508,10 +528,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
 fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
-    let storage_path = config
-        .storage
-        .path
-        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
+    let ResolvedPrimaryStorage {
+        path: storage_path,
+        tuning: storage_tuning,
+    } = resolve_primary_storage(config.storage)?;
     let to_path = config
         .backup
         .to_path
@@ -520,6 +540,7 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
     Ok(BackupCommandConfig {
         network,
         storage_path,
+        storage_tuning,
         to_path,
     })
 }
@@ -551,6 +572,7 @@ impl RedactedIngestConfigToml {
             node: NodeToml::from_node_target(&loop_config.node),
             storage: PrimaryStorageToml {
                 path: loop_config.storage_path.display().to_string(),
+                tuning: StorageTuningToml::from_resolved(loop_config.storage_tuning),
             },
             ingest: IngestToml {
                 source: node_source_name(loop_config.node_source),
@@ -561,6 +583,7 @@ impl RedactedIngestConfigToml {
                 bulk_catchup: IngestBulkCatchupToml {
                     commit_batch_blocks: loop_config.bulk_catchup.commit_batch_blocks.get(),
                     fetch_concurrency: loop_config.bulk_catchup.fetch_concurrency.get(),
+                    flush_every_n_epochs: loop_config.bulk_catchup.flush_every_n_epochs.get(),
                 },
                 tip_follow: IngestTipFollowToml {
                     poll_interval_ms: duration_as_millis_u64(loop_config.tip_follow.poll_interval),
@@ -591,6 +614,7 @@ impl RedactedBackupConfigToml {
             network: NetworkToml::from_network(config.network),
             storage: PrimaryStorageToml {
                 path: config.storage_path.display().to_string(),
+                tuning: StorageTuningToml::from_resolved(config.storage_tuning),
             },
             backup: BackupToml {
                 to_path: config.to_path.display().to_string(),
@@ -618,6 +642,7 @@ struct IngestPhasesToml {
 struct IngestBulkCatchupToml {
     commit_batch_blocks: u32,
     fetch_concurrency: u32,
+    flush_every_n_epochs: u32,
 }
 
 #[derive(Serialize)]

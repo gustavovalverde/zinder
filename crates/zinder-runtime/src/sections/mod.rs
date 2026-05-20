@@ -23,6 +23,6 @@ pub use retention::{ResolvedRetention, RetentionSection, RetentionToml, resolve_
 pub use service::ServiceIdentifier;
 pub use storage::{
     PrimaryStorageSection, PrimaryStorageToml, ResolvedPrimaryStorage, ResolvedSecondaryStorage,
-    SecondaryStorageSection, SecondaryStorageToml, resolve_primary_storage,
-    resolve_secondary_storage,
+    SecondaryStorageSection, SecondaryStorageToml, StorageTuningSection, StorageTuningToml,
+    resolve_primary_storage, resolve_secondary_storage, resolve_storage_tuning,
 };

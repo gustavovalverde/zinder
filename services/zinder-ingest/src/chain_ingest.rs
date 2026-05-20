@@ -235,6 +235,14 @@ pub enum IngestError {
     /// Canonical store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// A `spawn_blocking` task hosting a `RocksDB` call failed to join
+    /// (panic or runtime shutdown).
+    #[error("blocking storage task failed to join: {reason}")]
+    BlockingTaskFailed {
+        /// Reason from `tokio::task::JoinError::to_string`.
+        reason: String,
+    },
 }
 
 /// Builds canonical artifacts from one node source block.
@@ -949,6 +957,7 @@ fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::Source(_)) => "source",
         Some(IngestError::ArtifactDerive(_)) => "artifact_derive",
         Some(IngestError::Store(_)) => "store",
+        Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
     }
 }
 

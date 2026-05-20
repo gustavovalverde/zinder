@@ -2,15 +2,15 @@
 # mounts this file at /etc/zinder/config.toml.
 #
 # Env vars from deploy/.env.<network> (loaded via `--env-file`) override
-# anything below. The defaults here target Z3 testnet and match what
-# `Z3_NETWORK_LOWER=testnet docker compose up` expects.
+# anything below. The defaults here target Z3 mainnet and match what
+# `docker compose up` (without --env-file) produces.
 
 [network]
-name = "zcash-testnet"
+name = "zcash-mainnet"
 
 [node]
-json_rpc_addr = "http://zebra:18232"
-indexer_grpc_addr = "http://zebra:18230"
+json_rpc_addr = "http://zebra:8232"
+indexer_grpc_addr = "http://zebra:8230"
 request_timeout_secs = 30
 
 [node.auth]
@@ -20,6 +20,14 @@ path = "/var/run/auth/.cookie"
 [storage]
 path = "/var/lib/zinder/store"
 
+# Bounded RocksDB resource budget. Uncomment to override the canonical
+# defaults (512 MiB block cache, 256 MiB max WAL, 512 max open files).
+# See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+# [storage.tuning]
+# block_cache_bytes = 536870912
+# max_wal_bytes = 268435456
+# max_open_files = 512
+
 [ingest]
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
@@ -27,6 +35,11 @@ reorg_window_blocks = 100
 [ingest.bulk_catchup]
 commit_batch_blocks = 1000
 fetch_concurrency = 32
+# Force a RocksDB flush every N committed epochs (≈ N × commit_batch_blocks
+# blocks). Caps the live WAL by writer cadence and bounds crash-recovery
+# RAM. Default is 5; uncomment to override. See
+# docs/runbooks/bulk-catchup-oom-recovery.md.
+# flush_every_n_epochs = 5
 
 [ingest.tip_follow]
 poll_interval_ms = 2000

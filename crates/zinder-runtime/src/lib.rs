@@ -13,7 +13,7 @@
 //!   that every service binary uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
-//!   [`cancel_on_ctrl_c`] and [`install_tracing_subscriber`].
+//!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`].
 //! - The process-wide Prometheus metrics recorder
 //!   ([`install_metrics_recorder`]).
 //!
@@ -59,9 +59,10 @@ pub use sections::{
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlReader,
     ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
     ResolvedSecondaryStorage, RetentionSection, RetentionToml, SecondaryStorageSection,
-    SecondaryStorageToml, ServiceIdentifier, defaults as section_defaults,
-    resolve_ingest_control_reader, resolve_ingest_control_writer, resolve_ops_listen_addr,
-    resolve_primary_storage, resolve_retention, resolve_secondary_storage,
+    SecondaryStorageToml, ServiceIdentifier, StorageTuningSection, StorageTuningToml,
+    defaults as section_defaults, resolve_ingest_control_reader, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention, resolve_secondary_storage,
+    resolve_storage_tuning,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{
@@ -71,19 +72,71 @@ pub use transport::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Spawns a task that cancels `cancel` when the process receives `SIGINT`
-/// (Ctrl-C). Returns the join handle for the spawned task; callers usually
-/// drop it.
+/// Spawns a task that cancels `cancel` when the process receives a
+/// terminating signal. Returns the join handle for the spawned task;
+/// callers usually drop it.
 ///
 /// Used by every Zinder binary so the same shutdown semantics apply
 /// regardless of which service is running.
+///
+/// Cancels on both `SIGINT` (`Ctrl-C` at a terminal) and `SIGTERM`
+/// (`docker stop`, `kubectl delete pod`, `systemctl stop`). Without the
+/// `SIGTERM` branch, Docker waits the stop-timeout, sends `SIGKILL`, and
+/// the binary never gets a chance to drop its `RocksDB` handle. A hard
+/// kill leaves the WAL un-flushed; the next start has to replay the
+/// stranded writes from disk, which is the entry condition for the
+/// bulk-catchup OOM trap recorded in
+/// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
-pub fn cancel_on_ctrl_c(cancel: CancellationToken) -> JoinHandle<()> {
+pub fn cancel_on_terminating_signal(cancel: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel.cancel();
-        }
+        await_terminating_signal().await;
+        cancel.cancel();
     })
+}
+
+#[cfg(unix)]
+async fn await_terminating_signal() {
+    use tokio::signal::unix::{Signal, SignalKind, signal};
+
+    fn install(kind: SignalKind, name: &'static str) -> Option<Signal> {
+        match signal(kind) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::runtime",
+                    %error,
+                    signal = name,
+                    "failed to install terminating-signal handler"
+                );
+                None
+            }
+        }
+    }
+
+    let interrupt = install(SignalKind::interrupt(), "SIGINT");
+    let terminate = install(SignalKind::terminate(), "SIGTERM");
+
+    match (interrupt, terminate) {
+        (Some(mut interrupt), Some(mut terminate)) => {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        (Some(mut interrupt), None) => {
+            let _ = interrupt.recv().await;
+        }
+        (None, Some(mut terminate)) => {
+            let _ = terminate.recv().await;
+        }
+        (None, None) => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn await_terminating_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Installs the standard Zinder tracing subscriber as the global default.

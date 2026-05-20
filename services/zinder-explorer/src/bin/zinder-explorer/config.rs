@@ -18,6 +18,8 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 pub(crate) struct ExplorerConfig {
     pub(crate) network: Network,
     pub(crate) storage_path: PathBuf,
+    /// Bounded `RocksDB` resource budget applied to the derive store.
+    pub(crate) storage_tuning: zinder_store::StorageTuning,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) bearer_token_path: Option<PathBuf>,
@@ -100,6 +102,19 @@ pub(crate) fn explorer_config_toml(config: &ExplorerConfig) -> Result<String, Ex
     Ok(toml_text)
 }
 
+/// Merges explorer `[explorer.tuning]` overrides onto the derive defaults.
+///
+/// Backed by [`zinder_store::StorageTuning::derive_defaults`]; derive
+/// stores hold smaller working sets than the canonical chain store, so
+/// the derive defaults halve the canonical-store budget.
+fn resolve_explorer_storage_tuning(
+    section: zinder_runtime::StorageTuningSection,
+) -> Result<zinder_store::StorageTuning, ExplorerConfigError> {
+    let tuning = section.apply_to(zinder_store::StorageTuning::derive_defaults());
+    tuning.validate().map_err(ConfigError::invalid)?;
+    Ok(tuning)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ExplorerRawConfig {
@@ -115,6 +130,7 @@ struct ExplorerSection {
     storage_path: Option<String>,
     bearer_token_path: Option<PathBuf>,
     wallet_query_endpoint: Option<String>,
+    tuning: zinder_runtime::StorageTuningSection,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +147,7 @@ struct ExplorerToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
     wallet_query_endpoint: String,
+    tuning: zinder_runtime::StorageTuningToml,
 }
 
 impl ExplorerConfigToml {
@@ -146,6 +163,7 @@ impl ExplorerConfigToml {
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
+                tuning: zinder_runtime::StorageTuningToml::from_resolved(config.storage_tuning),
             },
         }
     }
@@ -157,6 +175,7 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let storage_path_text = require_field(raw.explorer.storage_path, "explorer.storage_path")?;
     let storage_path = PathBuf::from(storage_path_text);
+    let storage_tuning = resolve_explorer_storage_tuning(raw.explorer.tuning)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
     let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
@@ -167,10 +186,44 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
     Ok(ExplorerConfig {
         network,
         storage_path,
+        storage_tuning,
         listen_addr,
         ops_listen_addr,
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explorer_tuning_rejects_zero_wal_budget() {
+        let outcome = resolve_explorer_storage_tuning(zinder_runtime::StorageTuningSection {
+            max_wal_bytes: Some(0),
+            ..zinder_runtime::StorageTuningSection::default()
+        });
+
+        assert!(matches!(
+            outcome,
+            Err(ExplorerConfigError::Config(ConfigError::Invalid { reason }))
+                if reason.contains("max_wal_bytes")
+        ));
+    }
+
+    #[test]
+    fn explorer_tuning_rejects_negative_open_file_budget() {
+        let outcome = resolve_explorer_storage_tuning(zinder_runtime::StorageTuningSection {
+            max_open_files: Some(-1),
+            ..zinder_runtime::StorageTuningSection::default()
+        });
+
+        assert!(matches!(
+            outcome,
+            Err(ExplorerConfigError::Config(ConfigError::Invalid { reason }))
+                if reason.contains("max_open_files")
+        ));
+    }
 }

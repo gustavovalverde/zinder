@@ -114,6 +114,50 @@ fn zero_reorg_window_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
+fn zero_max_wal_bytes_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let mut tuning = zinder_store::StorageTuning::for_local_tests();
+    tuning.max_wal_bytes = 0;
+    let Err(error) = PrimaryChainStore::open(
+        tempdir.path(),
+        ChainStoreOptions {
+            tuning,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    ) else {
+        return Err(eyre!(
+            "expected invalid options: max_wal_bytes = 0 reopens the OOM trap"
+        ));
+    };
+
+    assert!(matches!(error, StoreError::InvalidChainStoreOptions { .. }));
+
+    Ok(())
+}
+
+#[test]
+fn negative_max_open_files_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let mut tuning = zinder_store::StorageTuning::for_local_tests();
+    tuning.max_open_files = -1;
+    let Err(error) = PrimaryChainStore::open(
+        tempdir.path(),
+        ChainStoreOptions {
+            tuning,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    ) else {
+        return Err(eyre!(
+            "expected invalid options: max_open_files = -1 pins every SST's metadata"
+        ));
+    };
+
+    assert!(matches!(error, StoreError::InvalidChainStoreOptions { .. }));
+
+    Ok(())
+}
+
+#[test]
 fn concurrent_same_epoch_commits_do_not_both_publish() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;

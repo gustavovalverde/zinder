@@ -205,4 +205,5 @@ zinder-ingest \
 - [ADR-0016: Source streaming pipeline](../adrs/0016-source-streaming-pipeline.md)
 - [Deploying on a VM](deploying-on-a-vm.md)
 - [Deploying on Railway](deploying-on-railway.md)
+- [Bulk-catchup OOM recovery](bulk-catchup-oom-recovery.md)
 - [Zebra health endpoints](https://zebra.zfnd.org/user/health.html)
