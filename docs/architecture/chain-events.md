@@ -45,7 +45,7 @@ pub enum ChainEvent {
 }
 ```
 
-Use `ChainReorged` when one durable transition both invalidates a visible non-finalized range and commits the replacement range. Use `ChainCommitted` for a pure append or finalized-boundary advance. Zinder does not expose an explicit rollback transition without a replacement range.
+Use `ChainReorged` when one durable transition both invalidates a visible non-finalized range and commits the replacement range. Use `ChainCommitted` for a pure append or finalized-boundary advance. A `ChainCommitted` event whose `committed.block_range.start > committed.block_range.end` advances epoch metadata without publishing block artifacts; derive consumers should advance their cursor and apply no block contexts. Zinder does not expose an explicit rollback transition without a replacement range.
 
 Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` before `commit_chain_epoch` succeeds.
 
@@ -101,15 +101,14 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 
 ## Resume Semantics
 
-Derived consumers resume through
-`chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })` or
-the equivalent private ingest subscription RPC. The shipped consumer-side
-helper `zinder_explorer::run_chain_events_subscriber` drains the stream into a
-`DeriveConsumer` and persists each cursor advance atomically with the
-consumer's `WriteBatch`. Fresh consumers whose persisted cursor sits below the
-retention floor cold-start through `zinder_explorer::backfill_then_attach`,
-which drains `compact_block_range` for the gap before attaching to the live
-stream.
+Ingest-hosted derived consumers resume through
+`chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })`
+during startup repair. `zinder-ingest` reads the lowest durable derive cursor,
+replays retained events after that cursor, and dispatches each event through
+`zinder_derive::DeriveStore::write_chain_event`. The derive store persists each
+cursor advance atomically with consumer writes. Fresh consumers whose persisted
+cursor sits below the retention floor rebuild from canonical artifacts before
+resuming retained-event replay.
 
 Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The cursor protocol below is the same for both consumer paths.
 

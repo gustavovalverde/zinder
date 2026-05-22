@@ -308,14 +308,14 @@ The compute shape is compute at read time: canonical confirmed totals are summed
 
 A pair of canonical wallet-plane reads that resolve outpoints to their referenced outputs. Both share the new wire-level `OutPoint` message, the `TransparentPrevout` payload, and a `repeated TransparentPrevoutEntry` response shape with `optional TransparentPrevout prevout` per entry.
 
-- The canonical method reads `TransactionArtifact.payload_bytes` and uses `zinder_source::transparent_prevout_from_raw_transaction_bytes` to extract one output by index. Shape C compute-at-read-time; no new column family.
+- The canonical method reads first-class `transparent_prevout` rows from `zinder-store`. Shape B canonical row lookup; latest reads use the exact current projection, while explicit historical reads use `transparent_prevout_history` with the row's block identity for visibility checks.
 - The mempool method reads `MempoolEntry.transparent_outputs` through `MempoolIndex::transparent_prevouts_by_outpoints`. Proxied through `IngestControl` because secondary readers cannot observe live writer state.
-- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 256`) and reject the coinbase sentinel outpoint at the wallet adapter.
+- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 1024`) and reject the coinbase sentinel outpoint at the wallet adapter.
 - Capability strings: `wallet.read.transparent_prevouts_v1` (canonical) and `wallet.mempool.transparent_prevouts_v1` (mempool).
 - `ChainIndex` exposes three methods: `transparent_prevouts`, `transparent_prevouts_at_epoch`, `transparent_mempool_prevouts`.
 - No compat-shim counterpart: `CompactTxStreamer` has no prevout endpoint, and the cookbook forbids inventing one.
 
-The **compute-at-read-time pattern** is the current read-model rule: a parse helper in `zinder-source` extracts the requested view from an existing artifact's payload at read time without committing new storage. The public wire shape and capability string never depend on the storage shape, so a future dedicated column family would not bump the capability or change the response message.
+The public wire shape and capability string do not expose the storage layout. Dedicated current `transparent_prevout` rows plus `transparent_prevout_history` rows are the canonical storage shape for mined outputs; the store also maintains a block-local index for bounded reorg repair. The response remains a list of per-request entries so consumers can decode canonical and mempool prevout resolution through the same path.
 
 ## Common mistakes
 

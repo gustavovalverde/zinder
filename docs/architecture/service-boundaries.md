@@ -6,10 +6,10 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 
 | Boundary                     | Owns                                                                                                                    | Must Not Own                                                                    |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `zinder-ingest`              | Upstream node connections, unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, canonical artifact commits, migrations | Public wallet traffic, user wallet secrets, explorer analytics                  |
+| `zinder-ingest`              | Upstream node connections, unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, canonical artifact commits, ingest-hosted derive commits, migrations | Public wallet traffic, user wallet secrets, explorer query serving              |
 | `zinder-query`               | Wallet-facing APIs, explorer read APIs, transaction broadcast facade, response consistency                              | Chain selection, canonical writes, migrations, derived-index repair             |
 | `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
-| `zinder-explorer`            | Replayable materialized views, explorer-specific indexes, analytics-specific schemas, `ChainEvent` consumption          | Wallet sync, canonical chain state, source truth                                |
+| `zinder-explorer`            | Explorer query serving, secondary derive-store reads, explorer-specific APIs and capability advertising                 | Wallet sync, canonical chain state, source truth, derive-store primary writes   |
 
 ## Why This Split Exists
 
@@ -38,11 +38,11 @@ The services must not share:
 
 ## Storage Ownership
 
-`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
+`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections, dispatching derive consumers in the same ingest pipeline after canonical commits. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
-`zinder-explorer` writes derived storage. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern this service exercises and stay derive-shaped so future consumers can link the same SDK; only the product-facing binary, config namespace, capability prefix, and Prometheus prefix rebrand. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; only the product-facing binary, config namespace, capability prefix, and Prometheus prefix rebrand. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md) and [ADR-0023](../adrs/0023-derive-plane-hosted-by-ingest.md).
 
 ## Development Profile
 
@@ -78,10 +78,11 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
 Extended production deployment (adds derived plane):
 
 ```text
-zinder-ingest              -> canonical RocksDB (primary) + ChainEventEnvelope
+zinder-ingest              -> canonical RocksDB (primary)
+                           -> derive RocksDB (primary, nested under canonical storage path)
 zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
 zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi -> CompactTxStreamer
-zinder-explorer            -> ChainEventEnvelope or snapshots -> derived storage -> ExplorerQuery
+zinder-explorer            -> derive RocksDB (secondary, unique secondary_path) -> ExplorerQuery
 ```
 
 Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).

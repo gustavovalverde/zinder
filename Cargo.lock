@@ -5149,18 +5149,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-derive"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "prost",
+ "rust-rocksdb",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zebra-chain",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-source",
+ "zinder-store",
+]
+
+[[package]]
 name = "zinder-explorer"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "clap",
  "config",
  "eyre",
- "futures-util",
  "hex",
- "parking_lot",
  "prost",
- "rust-rocksdb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5175,6 +5187,7 @@ dependencies = [
  "tracing",
  "zebra-chain",
  "zinder-core",
+ "zinder-derive",
  "zinder-ingest",
  "zinder-proto",
  "zinder-query",
@@ -5212,6 +5225,7 @@ dependencies = [
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
+ "zinder-derive",
  "zinder-proto",
  "zinder-query",
  "zinder-runtime",

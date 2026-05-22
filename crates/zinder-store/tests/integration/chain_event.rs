@@ -511,7 +511,7 @@ fn synthetic_epoch_with_finalized(
             tip_hash: source_hash,
             finalized_height: BlockHeight::new(finalized_height),
             finalized_hash: block_hash(finalized_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            artifact_schema_version: ArtifactSchemaVersion::new(4),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },

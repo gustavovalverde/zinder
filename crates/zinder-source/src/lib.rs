@@ -44,10 +44,7 @@ pub use source_block::{
 };
 pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
-pub use source_transaction::{
-    parse_transaction_public_facts, transaction_component_counts,
-    transparent_prevout_from_raw_transaction_bytes,
-};
+pub use source_transaction::{parse_transaction_public_facts, transaction_component_counts};
 pub use transparent_address::transparent_address_matches_network;
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,

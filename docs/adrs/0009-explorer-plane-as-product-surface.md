@@ -5,7 +5,9 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Service topology, explorer wire surface, capability namespace, federation contract |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0005](0005-consumer-neutral-wallet-data-plane.md), [ADR-0006](0006-ingest-control-transport-security.md), [ADR-0007](0007-mempool-topology-and-retention.md), [Explorer plane](../architecture/explorer-plane.md), [Derive plane](../architecture/derive-plane.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0005](0005-consumer-neutral-wallet-data-plane.md), [ADR-0006](0006-ingest-control-transport-security.md), [ADR-0007](0007-mempool-topology-and-retention.md), [ADR-0023](0023-derive-plane-hosted-by-ingest.md), [Explorer plane](../architecture/explorer-plane.md), [Derive plane](../architecture/derive-plane.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md) |
+
+ADR-0023 supersedes this ADR's original writer topology: bundled derive writes now run inside `zinder-ingest`, and `zinder-explorer` is a secondary-reader gateway. The product namespace decision in this ADR remains current.
 
 ## Context
 
@@ -13,7 +15,7 @@ The original derive plane shipped as `zinder-derive`: a fourth deployable that o
 
 Explorer support is a product surface, not an implementation pattern. The product question is "what does the block explorer call?" The answer should be `zinder-explorer`, not "the derive consumer named explorer running inside `zinder-derive`." Operators reading `ps aux`, contributors reading `services/`, and integrators reading the capability list should all see the same word.
 
-At the same time, the SDK that powers the explorer is reusable. `DeriveConsumer`, `DeriveStore`, `DeriveProxy`, `run_chain_events_subscriber`, and `run_mempool_events_subscriber` describe a pattern (chain-events flowing into a stateful consumer with atomic cursor persistence), not the explorer product specifically. A second consumer some day (analytics, search index sink, anything else) would link the same SDK and ship its own service binary.
+At the same time, the SDK that powers the explorer is reusable. `DeriveConsumer`, `DeriveStore`, `DeriveProxy`, and the `DeriveStore::write_*` dispatch entry points describe a pattern (chain and mempool events flowing into stateful consumers with atomic cursor persistence), not the explorer product specifically. A second consumer some day (analytics, search index sink, anything else) would link the same SDK and ship its own service binary.
 
 The decisions to record here are:
 
@@ -62,7 +64,7 @@ The reusable SDK abstractions keep their `Derive*` names because they describe t
 - `DeriveConsumerCtx` (per-event context with `&DeriveStore` + `&mut WriteBatch`)
 - `DeriveProxy<Client>` (federation primitive in `services/zinder-query/src/derive_proxy.rs`)
 - `DeriveReadinessGauge`, `spawn_derive_readiness_probe`
-- `run_chain_events_subscriber`, `run_mempool_events_subscriber`
+- `DeriveStore::write_chain_event`, `DeriveStore::write_mempool_event`
 
 The boundary is "Zinder process or library entity belonging to the running explorer service" → renames; "reusable SDK abstraction representing the derive pattern" → keeps its name. A future second consumer (`zinder-analytics`, hypothetical) would link the same SDK without confusion.
 
@@ -145,6 +147,6 @@ Rejected. Zinder has no external compatibility burden ([ADR-0005](0005-consumer-
 
 ## Out of Scope
 
-- Splitting the SDK into a dedicated `zinder-derive-sdk` crate. The shipped helpers under `services/zinder-explorer/src/consumer/` are reusable as a module path; extraction waits until a second consumer justifies the crate boundary.
+- Splitting the SDK into another crate. The reusable consumer traits, store wrapper, and dispatch entry points live in `crates/zinder-derive`; another split waits until a second consumer justifies the crate boundary.
 - Renaming the chain-event subscription endpoint (`WalletQuery.ChainEvents`). The wallet-plane RPC stays in place; explorer consumers subscribe to it through `WalletQuery`, not through a parallel `ExplorerQuery.ChainEvents`.
-- The explorer plane's full wire surface beyond `ServerInfo` and `TransparentAddressBalance`. Adding `TransactionDetail`, `BlockSummary`, `MempoolSummary`, `Search`, `FeeSummary`, `ValuePoolSummary`, `TransparentAddressActivity` is the work of subsequent slices and is documented in [Explorer plane](../architecture/explorer-plane.md). This ADR records the topology and namespace decision; the message vocabulary lands incrementally.
+- The explorer plane's full wire vocabulary is owned by [Explorer plane](../architecture/explorer-plane.md). This ADR records the topology and namespace decision.

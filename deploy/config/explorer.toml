@@ -2,17 +2,20 @@
 # mounts this file at /etc/zinder/config.toml.
 #
 # zinder-explorer is the third long-lived service in the zinder stack
-# (alongside zinder-ingest and zinder-query). It reads canonical state
-# through a secondary RocksDB handle on the same per-network data volume
-# (`zinder-<network>-data`) and serves the ExplorerQuery gRPC surface
-# that block-explorer clients (like zexplorer) consume.
+# (alongside zinder-ingest and zinder-query). It opens the writer-owned
+# derive store as a RocksDB secondary under the canonical store path on the
+# same per-network data volume (`zinder-<network>-data`) and serves the
+# ExplorerQuery gRPC surface that block-explorer clients consume.
 
 [network]
 name = "zcash-mainnet"
 
 [explorer]
 listen_addr = "0.0.0.0:9068"
-storage_path = "/var/lib/zinder/secondary-explorer"
+# Canonical store path. The derive secondary opens
+# /var/lib/zinder/store/derive, and its scratch directory lives under that
+# derive path.
+storage_path = "/var/lib/zinder/store"
 # The explorer plane delegates some reads to the wallet plane through
 # the in-network DNS name the query service publishes. ADR-0009 records
 # this co-located topology.

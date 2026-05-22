@@ -1,28 +1,42 @@
-use std::{num::NonZeroU32, path::PathBuf, time::Instant};
+use std::{
+    future::Future,
+    num::NonZeroU32,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use futures_util::stream::StreamExt;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
-    TreeStateArtifact,
 };
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
-use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint, SourceFailureClass};
+use zinder_source::{
+    NodeSource, NodeTarget, SourceBlock, SourceChainCheckpoint, SourceFailureClass,
+};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
     ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
 };
 
+use crate::artifact_builder::{
+    CommitmentTreeSizes, DerivedBlockArtifacts, derive_block, finalize_derived_block,
+};
 use crate::chain_ingest::{
-    ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
-    IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch, current_unix_millis,
-    fetch_block_with_retry, next_chain_epoch_id, next_chain_epoch_id_after,
-    populate_subtree_root_artifacts,
+    IngestBatch, IngestBatchBudget, IngestBatchCommitTrigger, IngestBatchWorkCost, IngestError,
+    IngestRetryState, IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch,
+    current_unix_millis, fetch_block_with_retry, ingest_error_class, next_chain_epoch_id,
+    next_chain_epoch_id_after, populate_subtree_root_artifacts, record_ingest_batch_commit_trigger,
+    record_ingest_batch_work_cost, record_ingest_derive_outcome,
 };
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
 };
+
+const BACKFILL_STAGE_AWAIT_DERIVED_BLOCK: &str = "await_derived_block";
+const BACKFILL_STAGE_POPULATE_SUBTREE_ROOTS: &str = "populate_subtree_roots";
+const BACKFILL_STAGE_FLUSH_STORE: &str = "flush_store";
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -42,16 +56,26 @@ pub struct BackfillConfig {
     pub to_height: BlockHeight,
     /// Maximum number of blocks committed in one chain epoch.
     pub commit_batch_blocks: NonZeroU32,
+    /// Maximum unique transparent prevouts read from the store per chain epoch.
+    pub max_transparent_prevout_store_lookups_per_batch: NonZeroU32,
     /// Number of historical block fetches kept in flight against the
-    /// upstream node. Zebra's JSON-RPC serves one fetch per request, and
-    /// each block costs four sequential calls (`getblockhash`,
-    /// `getblockheader`, `getblock`, `z_gettreestate`); concurrent fetches
-    /// hide the round-trip latency until the node's connection pool or
-    /// CPU saturates. Operator-tunable via `ingest.bulk_catchup.fetch_concurrency`.
+    /// upstream node. Zebra's JSON-RPC serves one fetch per request and
+    /// each block costs three concurrent calls (`getblockheader`,
+    /// `getblock`, `z_gettreestate`); buffering hides the round-trip
+    /// latency until the node's connection pool or CPU saturates.
+    /// Operator-tunable via `ingest.bulk_catchup.fetch_concurrency`.
     pub fetch_concurrency: NonZeroU32,
-    /// Force a `RocksDB` flush after committing N epochs. See
-    /// [`crate::BulkCatchupConfig::flush_every_n_epochs`].
-    pub flush_every_n_epochs: NonZeroU32,
+    /// Number of parallel `derive_block` invocations kept in flight on the
+    /// Tokio blocking pool. Per-block derivation is CPU-bound (block
+    /// deserialization, per-tx canonical re-serialization, compact-block
+    /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
+    /// scales nearly linearly with cores up to the commit-batch boundary.
+    /// Operator-tunable via `ingest.derive.concurrency`.
+    /// See [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
+    pub derive_concurrency: NonZeroU32,
+    /// Force a `RocksDB` flush after committing this many epochs. See
+    /// [`crate::BulkCatchupConfig::flush_interval_epochs`].
+    pub flush_interval_epochs: NonZeroU32,
     /// Pre-observed upstream tip height. When set, `backfill_with_store`
     /// uses this in place of an internal `tip_id()` round-trip for its
     /// finality-bound validation. The unified ingest loop reuses the tip
@@ -68,6 +92,80 @@ pub struct BackfillConfig {
     /// `from_height` must equal `checkpoint.height + 1` in this mode. Reads
     /// at heights below the checkpoint return `ArtifactUnavailable`.
     pub checkpoint: Option<SourceChainCheckpoint>,
+}
+
+/// Mutable flush cadence carried across bulk-catchup backfill batches.
+///
+/// The unified ingest loop invokes `backfill_until_complete` once per
+/// bulk-catchup batch so it can re-classify the phase after each commit.
+/// This state keeps the WAL flush cadence tied to committed epochs rather
+/// than to that one-batch call boundary.
+#[derive(Debug, Default)]
+pub(crate) struct BackfillFlushState {
+    epochs_since_last_flush: u32,
+}
+
+impl BackfillFlushState {
+    fn record_committed_epoch(&mut self) {
+        self.epochs_since_last_flush = self.epochs_since_last_flush.saturating_add(1);
+    }
+
+    fn should_flush(&self, flush_interval_epochs: NonZeroU32) -> bool {
+        self.epochs_since_last_flush >= flush_interval_epochs.get()
+    }
+
+    fn mark_flushed(&mut self) {
+        self.epochs_since_last_flush = 0;
+    }
+
+    fn has_pending_epochs(&self) -> bool {
+        self.epochs_since_last_flush > 0
+    }
+
+    #[cfg(test)]
+    fn pending_epoch_count(&self) -> u32 {
+        self.epochs_since_last_flush
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackfillCompletionFlush {
+    FlushPending,
+    PreservePending,
+}
+
+impl BackfillCompletionFlush {
+    const fn flushes_pending(self) -> bool {
+        matches!(self, Self::FlushPending)
+    }
+}
+
+/// Stable dependencies for one backfill run.
+///
+/// Keeping these handles together prevents the bulk-catchup hot path from
+/// growing long positional argument lists as the writer gains operational
+/// state such as flush cadence and readiness reporting.
+pub(crate) struct BackfillRunContext<'a, Source> {
+    config: &'a BackfillConfig,
+    source: &'a Source,
+    store: &'a PrimaryChainStore,
+    derive_store: &'a zinder_derive::DeriveStore,
+}
+
+impl<'a, Source> BackfillRunContext<'a, Source> {
+    pub(crate) const fn new(
+        config: &'a BackfillConfig,
+        source: &'a Source,
+        store: &'a PrimaryChainStore,
+        derive_store: &'a zinder_derive::DeriveStore,
+    ) -> Self {
+        Self {
+            config,
+            source,
+            store,
+            derive_store,
+        }
+    }
 }
 
 /// Runs a historical backfill and commits the requested range to canonical storage.
@@ -91,7 +189,11 @@ where
         ..ChainStoreOptions::for_network(config.node.network)
     };
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    backfill_with_store(config, source, &store).await
+    let derive_store = crate::derive_consumers::open_primary_derive_store_for_canonical(
+        &config.storage_path,
+        config.storage_tuning,
+    )?;
+    backfill_with_store(config, source, &store, &derive_store).await
 }
 
 /// Runs a historical backfill against a caller-owned [`PrimaryChainStore`].
@@ -115,14 +217,34 @@ pub async fn backfill_with_store<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
+    let mut flush_state = BackfillFlushState::default();
+    let run = BackfillRunContext::new(config, source, store, derive_store);
+    backfill_with_store_inner(
+        &run,
+        &mut flush_state,
+        BackfillCompletionFlush::FlushPending,
+    )
+    .await
+}
+
+async fn backfill_with_store_inner<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    flush_state: &mut BackfillFlushState,
+    completion_flush: BackfillCompletionFlush,
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
+where
+    Source: NodeSource,
+{
+    let config = run.config;
     let store_options = ChainStoreOptions::for_network(config.node.network);
     let node_tip_height = match config.upstream_tip_hint {
         Some(height) => height,
-        None => source.tip_id().await?.height,
+        None => run.source.tip_id().await?.height,
     };
     validate_backfill_finality_bound(config, node_tip_height, store_options.reorg_window_blocks)?;
     warn_if_checkpoint_within_reorg_window(
@@ -132,13 +254,13 @@ where
     );
 
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
-        store,
+        run.store,
         config.node.network,
         config.checkpoint,
         config.from_height,
     )? {
         Some(bootstrapped) => Some(bootstrapped),
-        None => store.current_chain_epoch()?,
+        None => run.store.current_chain_epoch()?,
     };
     let Some(backfill_start) =
         backfill_start(current_chain_epoch, config.from_height, config.to_height)?
@@ -148,10 +270,8 @@ where
         let _ = current_chain_epoch.ok_or(IngestError::BackfillProducedNoCommit)?;
         return Ok(None);
     };
-    let mut artifact_builder =
-        IngestArtifactBuilder::with_initial_tip_metadata(backfill_start.initial_tip_metadata);
 
-    backfill_from_source_with_store(config, source, store, &mut artifact_builder, backfill_start)
+    backfill_from_source_with_store(run, backfill_start, flush_state, completion_flush)
         .await
         .map(Some)
 }
@@ -169,7 +289,45 @@ pub async fn backfill_until_complete<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
     readiness: &Readiness,
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
+where
+    Source: NodeSource,
+{
+    let mut flush_state = BackfillFlushState::default();
+    let run = BackfillRunContext::new(config, source, store, derive_store);
+    backfill_until_complete_inner(
+        &run,
+        readiness,
+        &mut flush_state,
+        BackfillCompletionFlush::FlushPending,
+    )
+    .await
+}
+
+pub(crate) async fn backfill_until_complete_with_flush_state<Source>(
+    run: BackfillRunContext<'_, Source>,
+    readiness: &Readiness,
+    flush_state: &mut BackfillFlushState,
+) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
+where
+    Source: NodeSource,
+{
+    backfill_until_complete_inner(
+        &run,
+        readiness,
+        flush_state,
+        BackfillCompletionFlush::PreservePending,
+    )
+    .await
+}
+
+async fn backfill_until_complete_inner<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    readiness: &Readiness,
+    flush_state: &mut BackfillFlushState,
+    completion_flush: BackfillCompletionFlush,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
@@ -178,15 +336,16 @@ where
     let mut outage: Option<(NodeUnavailableDetail, Instant)> = None;
 
     loop {
-        match backfill_with_store(config, source, store).await {
+        match backfill_with_store_inner(run, flush_state, completion_flush).await {
             Ok(commit_outcome) => {
                 let tip_height = match &commit_outcome {
                     Some(commit) => Some(commit.chain_epoch.tip_height.value()),
-                    None => store
+                    None => run
+                        .store
                         .current_chain_epoch()?
                         .map(|chain_epoch| chain_epoch.tip_height.value()),
                 };
-                readiness.set(ReadinessState::ready(tip_height));
+                readiness.set(backfill_readiness_state(run.config, tip_height));
                 if outage.take().is_some() {
                     tracing::info!(
                         target: "zinder::ingest",
@@ -215,13 +374,43 @@ where
                     }
                     readiness.set(ReadinessState::node_unavailable_with_detail(
                         detail,
-                        current_chain_height(store),
+                        current_chain_height(run.store),
                     ));
                     tokio::time::sleep(backoff).await;
                 }
                 SourceRecoveryDecision::Exit => return Err(error),
             },
         }
+    }
+}
+
+pub(crate) async fn flush_pending_backfill_writes(
+    store: &PrimaryChainStore,
+    flush_state: &mut BackfillFlushState,
+) -> Result<(), IngestError> {
+    if !flush_state.has_pending_epochs() {
+        return Ok(());
+    }
+    flush_primary_chain_store(store).await?;
+    flush_state.mark_flushed();
+    Ok(())
+}
+
+fn backfill_readiness_state(
+    config: &BackfillConfig,
+    current_height: Option<u32>,
+) -> ReadinessState {
+    let Some(current_height) = current_height else {
+        return ReadinessState::ready(None);
+    };
+    let Some(upstream_tip) = config.upstream_tip_hint.map(BlockHeight::value) else {
+        return ReadinessState::ready(Some(current_height));
+    };
+    let lag_blocks = u64::from(upstream_tip.saturating_sub(current_height));
+    if lag_blocks == 0 {
+        ReadinessState::ready(Some(current_height))
+    } else {
+        ReadinessState::syncing(Some(lag_blocks), Some(current_height), Some(upstream_tip))
     }
 }
 
@@ -243,15 +432,119 @@ fn advance_backfill_outage(
     }
 }
 
-#[cfg(test)]
-async fn backfill_from_source_with_artifact_builder<Source, Builder>(
-    config: &BackfillConfig,
-    source: &Source,
-    artifact_builder: &mut Builder,
+async fn backfill_from_source_with_store<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    backfill_start: BackfillStart,
+    flush_state: &mut BackfillFlushState,
+    completion_flush: BackfillCompletionFlush,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource,
-    Builder: ArtifactBuilder,
+{
+    let config = run.config;
+    let request_timeout = config.node.request_timeout;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
+    )]
+    let fetch_concurrency = config.fetch_concurrency.get() as usize;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
+    )]
+    let derive_concurrency = config.derive_concurrency.get() as usize;
+    let derive_stream = build_derive_stream(
+        run.source,
+        BackfillDeriveStreamConfig {
+            request_timeout,
+            from_height: backfill_start.from_height,
+            to_height: config.to_height,
+            fetch_concurrency,
+            derive_concurrency,
+        },
+        |source_block| async move {
+            tokio::task::spawn_blocking(move || {
+                derive_block(&source_block).map_err(IngestError::from)
+            })
+            .await
+            .map_err(|join_error| IngestError::BlockingTaskFailed {
+                reason: join_error.to_string(),
+            })?
+        },
+    );
+
+    run_backfill_commit_loop(
+        run,
+        derive_stream,
+        backfill_start,
+        flush_state,
+        completion_flush,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct BackfillDeriveStreamConfig {
+    request_timeout: Duration,
+    from_height: BlockHeight,
+    to_height: BlockHeight,
+    fetch_concurrency: usize,
+    derive_concurrency: usize,
+}
+
+fn build_derive_stream<'a, Source, F, Fut>(
+    source: &'a Source,
+    config: BackfillDeriveStreamConfig,
+    derive_fn: F,
+) -> impl futures_util::Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Unpin + 'a
+where
+    Source: NodeSource + 'a,
+    F: Fn(SourceBlock) -> Fut + Copy + 'a,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + 'a,
+{
+    // Pipeline per-block fetches and derives with bounded concurrency.
+    // The commit path stays strictly ordered because both `buffered`
+    // slot pools yield completed futures in submission order.
+    futures_util::stream::iter(BlockHeightRange::inclusive(
+        config.from_height,
+        config.to_height,
+    ))
+    .map(move |height| {
+        let mut fetch_retry_state = IngestRetryState::default();
+        async move {
+            fetch_block_with_retry(
+                config.request_timeout,
+                source,
+                height,
+                &mut fetch_retry_state,
+            )
+            .await
+        }
+    })
+    .buffered(config.fetch_concurrency)
+    .map(move |fetch_result| {
+        let derive_fn = derive_fn;
+        async move {
+            let source_block = fetch_result?;
+            let derive_started_at = Instant::now();
+            let derive_outcome = derive_fn(source_block).await;
+            record_ingest_derive_outcome(derive_started_at, &derive_outcome);
+            derive_outcome
+        }
+    })
+    .buffered(config.derive_concurrency)
+}
+
+#[cfg(test)]
+async fn backfill_from_source_with_mock_derive<Source, F>(
+    config: &BackfillConfig,
+    source: &Source,
+    derive_fn: F,
+) -> Result<ChainEpochCommitOutcome, IngestError>
+where
+    Source: NodeSource,
+    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+        + Copy,
 {
     let store_options = ChainStoreOptions {
         tuning: config.storage_tuning,
@@ -264,11 +557,20 @@ where
     )?;
 
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    backfill_from_source_with_store(
+    let derive_store = zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(&config.storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?;
+    backfill_from_source_with_store_using_derive_fn(
         config,
         source,
         &store,
-        artifact_builder,
+        &derive_store,
+        derive_fn,
         BackfillStart {
             from_height: config.from_height,
             initial_tip_metadata: ChainTipMetadata::empty(),
@@ -277,154 +579,273 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(
-    clippy::too_many_lines,
-    reason = "pipelined fetch + ordered commit happens in one function so the back-pressure shape stays visible"
+    clippy::too_many_arguments,
+    reason = "test seam mirrors the production backfill path plus an injected derive function"
 )]
-async fn backfill_from_source_with_store<Source, Builder>(
+async fn backfill_from_source_with_store_using_derive_fn<Source, F>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    artifact_builder: &mut Builder,
+    derive_store: &zinder_derive::DeriveStore,
+    derive_fn: F,
     backfill_start: BackfillStart,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource,
-    Builder: ArtifactBuilder,
+    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+        + Copy,
 {
-    let mut chain_epoch_id = next_chain_epoch_id(store)?;
-    let mut batch = IngestBatch::default();
-    let mut next_subtree_root_indexes =
-        IngestSubtreeRootIndexes::from_tip_metadata(backfill_start.initial_tip_metadata);
-    let mut last_commit_outcome = None;
-    let mut retry_state = IngestRetryState::default();
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
-    )]
-    let commit_batch_blocks = config.commit_batch_blocks.get() as usize;
-
-    // Pipeline per-block fetches with bounded concurrency. The commit
-    // path stays strictly ordered because `buffered` yields completed
-    // futures in submission order. Each in-flight fetch gets its own
-    // retry state so the run-wide budget (`retry_state` above) stays
-    // exclusively on subtree-root and finalization-tail work.
     let request_timeout = config.node.request_timeout;
     #[allow(
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
     let fetch_concurrency = config.fetch_concurrency.get() as usize;
-    let mut block_stream = futures_util::stream::iter(BlockHeightRange::inclusive(
-        backfill_start.from_height,
-        config.to_height,
-    ))
-    .map(|height| {
-        let mut fetch_retry_state = IngestRetryState::default();
-        async move {
-            fetch_block_with_retry(request_timeout, source, height, &mut fetch_retry_state).await
-        }
-    })
-    .buffered(fetch_concurrency);
-    let flush_every_n_epochs = config.flush_every_n_epochs.get();
-    let mut epochs_since_last_flush: u32 = 0;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
+    )]
+    let derive_concurrency = config.derive_concurrency.get() as usize;
+    let derive_stream = build_derive_stream(
+        source,
+        BackfillDeriveStreamConfig {
+            request_timeout,
+            from_height: backfill_start.from_height,
+            to_height: config.to_height,
+            fetch_concurrency,
+            derive_concurrency,
+        },
+        move |source_block| async move { derive_fn(&source_block).map_err(IngestError::from) },
+    );
 
-    while let Some(fetch_result) = block_stream.next().await {
-        let source_block = fetch_result?;
-        let built_artifacts = artifact_builder.build(&source_block)?;
+    let mut flush_state = BackfillFlushState::default();
+    let run = BackfillRunContext::new(config, source, store, derive_store);
+    run_backfill_commit_loop(
+        &run,
+        derive_stream,
+        backfill_start,
+        &mut flush_state,
+        BackfillCompletionFlush::FlushPending,
+    )
+    .await
+}
 
-        if let Some(tree_state_payload_bytes) = source_block.tree_state_payload_bytes {
-            batch.tree_states.push(TreeStateArtifact::new(
-                source_block.height,
-                source_block.hash,
-                tree_state_payload_bytes,
-            ));
-        }
+async fn run_backfill_commit_loop<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    derive_stream: impl futures_util::Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Unpin,
+    backfill_start: BackfillStart,
+    flush_state: &mut BackfillFlushState,
+    completion_flush: BackfillCompletionFlush,
+) -> Result<ChainEpochCommitOutcome, IngestError>
+where
+    Source: NodeSource,
+{
+    let mut chain_epoch_id = next_chain_epoch_id(run.store)?;
+    let mut batch = IngestBatch::default();
+    let mut next_subtree_root_indexes =
+        IngestSubtreeRootIndexes::from_tip_metadata(backfill_start.initial_tip_metadata);
+    let mut last_commit_outcome = None;
+    let mut retry_state = IngestRetryState::default();
+    let mut running_tree_sizes =
+        CommitmentTreeSizes::from_tip_metadata(backfill_start.initial_tip_metadata);
+    let batch_budget = IngestBatchBudget::new(
+        run.config.commit_batch_blocks,
+        run.config.max_transparent_prevout_store_lookups_per_batch,
+    );
+    let mut derive_stream = derive_stream;
 
-        batch.finalized_blocks.push(built_artifacts.block);
-        batch.compact_blocks.push(built_artifacts.compact_block);
-        batch.transactions.extend(built_artifacts.transactions);
-        batch
-            .transparent_address_utxos
-            .extend(built_artifacts.transparent_address_utxos);
-        batch
-            .transparent_utxo_spends
-            .extend(built_artifacts.transparent_utxo_spends);
-        batch
-            .transparent_address_tx_index
-            .extend(built_artifacts.transparent_address_tx_index);
-        batch
-            .transparent_address_tx_index_spend_candidates
-            .extend(built_artifacts.transparent_address_tx_index_spend_candidates);
-        batch.tip_metadata = Some(built_artifacts.tip_metadata);
+    loop {
+        let await_derived_block_started_at = Instant::now();
+        let Some(derive_result) = derive_stream.next().await else {
+            break;
+        };
+        record_backfill_stage_duration(
+            BACKFILL_STAGE_AWAIT_DERIVED_BLOCK,
+            await_derived_block_started_at,
+            derive_result.as_ref().err(),
+        );
+        let built_outcome = derive_result.and_then(|derived| {
+            finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
+        });
+        let built = built_outcome?;
 
-        if batch.len() == commit_batch_blocks {
-            let updated_subtree_root_indexes = populate_subtree_root_artifacts(
-                config.node.request_timeout,
-                source,
+        batch.absorb(built);
+        let batch_cost = batch.work_cost();
+        record_ingest_batch_work_cost(batch_cost);
+
+        if let Some(commit_trigger) = batch_budget.commit_trigger(batch_cost) {
+            record_backfill_batch_commit_trigger(run.config, batch_cost, commit_trigger);
+            let updated_subtree_root_indexes = populate_backfill_subtree_roots(
+                run,
                 &mut batch,
                 next_subtree_root_indexes,
                 &mut retry_state,
             )
             .await?;
-            let commit_outcome = commit_finalized_backfill_batch(
-                store,
-                config.node.network,
+            let (commit_outcome, returned_batch) = commit_finalized_backfill_batch(
+                run.store,
+                run.derive_store,
+                run.config.node.network,
                 chain_epoch_id,
-                &mut batch,
-            )?;
+                batch,
+            )
+            .await?;
+            batch = returned_batch;
             next_subtree_root_indexes = updated_subtree_root_indexes;
             chain_epoch_id = next_chain_epoch_id_after(chain_epoch_id)?;
             last_commit_outcome = Some(commit_outcome);
-            epochs_since_last_flush = epochs_since_last_flush.saturating_add(1);
-            if epochs_since_last_flush >= flush_every_n_epochs {
-                flush_primary_chain_store(store).await?;
-                epochs_since_last_flush = 0;
-            }
+            flush_state.record_committed_epoch();
+            flush_backfill_writes_if_due(run, flush_state).await?;
         }
     }
 
     if !batch.is_empty() {
-        let _updated_subtree_root_indexes = populate_subtree_root_artifacts(
-            config.node.request_timeout,
-            source,
+        let _updated_subtree_root_indexes = populate_backfill_subtree_roots(
+            run,
             &mut batch,
             next_subtree_root_indexes,
             &mut retry_state,
         )
         .await?;
-        let commit_outcome = commit_finalized_backfill_batch(
-            store,
-            config.node.network,
+        let (commit_outcome, _drained_batch) = commit_finalized_backfill_batch(
+            run.store,
+            run.derive_store,
+            run.config.node.network,
             chain_epoch_id,
-            &mut batch,
-        )?;
+            batch,
+        )
+        .await?;
         last_commit_outcome = Some(commit_outcome);
-        epochs_since_last_flush = epochs_since_last_flush.saturating_add(1);
+        flush_state.record_committed_epoch();
     }
 
-    if last_commit_outcome.is_some() && epochs_since_last_flush > 0 {
-        flush_primary_chain_store(store).await?;
+    if completion_flush.flushes_pending() && last_commit_outcome.is_some() {
+        flush_pending_backfill_writes(run.store, flush_state).await?;
     }
 
     last_commit_outcome.ok_or(IngestError::BackfillProducedNoCommit)
+}
+
+async fn flush_backfill_writes_if_due<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    flush_state: &mut BackfillFlushState,
+) -> Result<(), IngestError>
+where
+    Source: NodeSource,
+{
+    if flush_state.should_flush(run.config.flush_interval_epochs) {
+        flush_pending_backfill_writes(run.store, flush_state).await?;
+    }
+    Ok(())
+}
+
+async fn populate_backfill_subtree_roots<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    batch: &mut IngestBatch,
+    next_subtree_root_indexes: IngestSubtreeRootIndexes,
+    retry_state: &mut IngestRetryState,
+) -> Result<IngestSubtreeRootIndexes, IngestError>
+where
+    Source: NodeSource,
+{
+    let started_at = Instant::now();
+    let outcome = populate_subtree_root_artifacts(
+        run.config.node.request_timeout,
+        run.source,
+        batch,
+        next_subtree_root_indexes,
+        retry_state,
+    )
+    .await;
+    record_backfill_stage_duration(
+        BACKFILL_STAGE_POPULATE_SUBTREE_ROOTS,
+        started_at,
+        outcome.as_ref().err(),
+    );
+    outcome
 }
 
 /// Wraps the synchronous `PrimaryChainStore::flush` in a `spawn_blocking`
 /// so a multi-second `RocksDB` flush during `BulkCatchup` does not stall
 /// the Tokio worker the backfill loop runs on.
 async fn flush_primary_chain_store(store: &PrimaryChainStore) -> Result<(), IngestError> {
+    let flush_started_at = Instant::now();
     let store = store.clone();
-    tokio::task::spawn_blocking(move || store.flush())
+    let flush_outcome = tokio::task::spawn_blocking(move || store.flush())
         .await
         .map_err(|join_error| IngestError::BlockingTaskFailed {
             reason: join_error.to_string(),
         })?
-        .map_err(IngestError::from)
+        .map_err(IngestError::from);
+    record_backfill_stage_duration(
+        BACKFILL_STAGE_FLUSH_STORE,
+        flush_started_at,
+        flush_outcome.as_ref().err(),
+    );
+    flush_outcome
 }
 
-fn commit_finalized_backfill_batch(
+fn record_backfill_stage_duration(
+    stage: &'static str,
+    started_at: Instant,
+    stage_error: Option<&IngestError>,
+) {
+    let status = if stage_error.is_some() { "error" } else { "ok" };
+    metrics::histogram!(
+        "zinder_ingest_backfill_stage_duration_seconds",
+        "stage" => stage,
+        "status" => status,
+        "error_class" => ingest_error_class(stage_error)
+    )
+    .record(started_at.elapsed());
+}
+
+fn record_backfill_batch_commit_trigger(
+    config: &BackfillConfig,
+    batch_cost: IngestBatchWorkCost,
+    commit_trigger: IngestBatchCommitTrigger,
+) {
+    record_ingest_batch_commit_trigger(commit_trigger);
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "bulk_catchup_batch_budget_reached",
+        trigger = commit_trigger.metric_label(),
+        block_count = batch_cost.block_count,
+        transparent_prevout_store_lookup_count =
+            batch_cost.transparent_prevout_store_lookup_count,
+        max_blocks = config.commit_batch_blocks.get(),
+        max_transparent_prevout_store_lookups = config
+            .max_transparent_prevout_store_lookups_per_batch
+            .get(),
+        "bulk-catchup batch budget reached; committing accumulated artifacts"
+    );
+}
+
+/// Commits a finalized backfill batch and returns the drained batch buffer.
+async fn commit_finalized_backfill_batch(
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
+    network: Network,
+    chain_epoch_id: ChainEpochId,
+    batch: IngestBatch,
+) -> Result<(ChainEpochCommitOutcome, IngestBatch), IngestError> {
+    let mut batch = batch;
+    let outcome = commit_finalized_backfill_batch_inner(
+        store,
+        derive_store,
+        network,
+        chain_epoch_id,
+        &mut batch,
+    )
+    .await?;
+    Ok((outcome, batch))
+}
+
+async fn commit_finalized_backfill_batch_inner(
+    store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
     network: Network,
     chain_epoch_id: ChainEpochId,
     batch: &mut IngestBatch,
@@ -449,10 +870,12 @@ fn commit_finalized_backfill_batch(
     };
     commit_ingest_batch(
         store,
+        derive_store,
         chain_epoch,
         batch,
         ReorgWindowChange::FinalizeThrough { height: tip_height },
     )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,25 +1040,81 @@ mod tests {
         sync::atomic::{AtomicU32, Ordering},
     };
 
-    use prost::Message;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockArtifact, BlockHash, BlockId, CompactBlockArtifact, SUBTREE_LEAF_COUNT,
-        ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, UnixTimestampMillis,
-        wire::encode_internal_block_hash,
+        BlockArtifact, BlockHash, BlockId, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
+        SubtreeRootIndex, TransactionId, TransparentOutPoint, TransparentUtxoSpendArtifact,
+        UnixTimestampMillis, wire::encode_internal_block_hash,
     };
-    use zinder_proto::compat::lightwalletd::{
-        ChainMetadata, CompactBlock as LightwalletdCompactBlock,
-    };
+    use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
         NodeCapabilities, SourceBlock, SourceBlockHeader, SourceError, SourceSubtreeRoot,
         SourceSubtreeRoots, ZebraJsonRpcSource,
     };
     use zinder_store::ChainEventHistoryRequest;
 
-    use crate::{ArtifactDeriveError, chain_ingest::BuiltArtifacts};
+    use crate::ArtifactDeriveError;
 
     use super::*;
+
+    #[test]
+    fn backfill_flush_state_preserves_epoch_cadence() -> Result<(), Box<dyn Error>> {
+        let flush_interval = NonZeroU32::new(3).ok_or("invalid flush interval")?;
+        let mut flush_state = BackfillFlushState::default();
+
+        flush_state.record_committed_epoch();
+        assert!(!flush_state.should_flush(flush_interval));
+        assert_eq!(flush_state.pending_epoch_count(), 1);
+
+        flush_state.record_committed_epoch();
+        assert!(!flush_state.should_flush(flush_interval));
+        assert_eq!(flush_state.pending_epoch_count(), 2);
+
+        flush_state.record_committed_epoch();
+        assert!(flush_state.should_flush(flush_interval));
+        assert_eq!(flush_state.pending_epoch_count(), 3);
+
+        flush_state.mark_flushed();
+        assert_eq!(flush_state.pending_epoch_count(), 0);
+        assert!(!flush_state.should_flush(flush_interval));
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_readiness_state_reports_syncing_until_upstream_tip_hint()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("readiness-syncing-store");
+        let mut config = test_backfill_config(&storage_path, 101, 150, 50, false)?;
+        config.upstream_tip_hint = Some(BlockHeight::new(200));
+
+        let state = backfill_readiness_state(&config, Some(150));
+
+        assert!(matches!(
+            state.cause,
+            zinder_runtime::ReadinessCause::Syncing {
+                lag_blocks: Some(50)
+            }
+        ));
+        assert_eq!(state.current_height, Some(150));
+        assert_eq!(state.target_height, Some(200));
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_readiness_state_reports_ready_at_upstream_tip_hint() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("readiness-ready-store");
+        let mut config = test_backfill_config(&storage_path, 101, 200, 50, false)?;
+        config.upstream_tip_hint = Some(BlockHeight::new(200));
+
+        let state = backfill_readiness_state(&config, Some(200));
+
+        assert_eq!(state.cause, zinder_runtime::ReadinessCause::Ready);
+        assert_eq!(state.current_height, Some(200));
+        assert_eq!(state.target_height, Some(200));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn backfill_rejects_near_tip_finalize_without_explicit_override()
@@ -648,12 +1127,9 @@ mod tests {
         };
         let config = test_backfill_config(&storage_path, 101, 150, 50, false)?;
 
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let error = match backfill_from_source_with_artifact_builder(
-            &config,
-            &source,
-            &mut artifact_builder,
-        )
+        let error = match backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
         .await
         {
             Ok(commit_outcome) => {
@@ -689,13 +1165,56 @@ mod tests {
         };
         let config = test_backfill_config(&storage_path, 1, 10, 5, false)?;
 
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let commit_outcome =
-            backfill_from_source_with_artifact_builder(&config, &source, &mut artifact_builder)
-                .await?;
+        let commit_outcome = backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
+        .await?;
 
         assert_eq!(commit_outcome.chain_epoch.id, ChainEpochId::new(2));
         assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(10));
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        assert_eq!(
+            store
+                .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
+                .len(),
+            2
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backfill_commits_when_prevout_store_lookup_budget_is_reached()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("prevout-budget-store");
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+        let mut config = test_backfill_config(&storage_path, 1, 3, 10, true)?;
+        config.max_transparent_prevout_store_lookups_per_batch =
+            NonZeroU32::new(2).ok_or("invalid prevout budget")?;
+
+        let commit_outcome = backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            let mut derived = test_derived_block(sb, 0, 0);
+            let mut transaction_id_bytes = [0; 32];
+            transaction_id_bytes[..4].copy_from_slice(&sb.height.value().to_be_bytes());
+            derived
+                .transparent_utxo_spends
+                .push(TransparentUtxoSpendArtifact::new(
+                    TransparentOutPoint::new(TransactionId::from_bytes(transaction_id_bytes), 0),
+                    sb.height,
+                    sb.hash,
+                ));
+            Ok(derived)
+        })
+        .await?;
+
+        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(3));
         let store = PrimaryChainStore::open(
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
@@ -725,10 +1244,10 @@ mod tests {
         };
         let config = test_backfill_config(&storage_path, 1, 1, 1, false)?;
 
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let commit_outcome =
-            backfill_from_source_with_artifact_builder(&config, &source, &mut artifact_builder)
-                .await?;
+        let commit_outcome = backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
+        .await?;
 
         assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
         assert_eq!(source.fetch_attempts.load(Ordering::SeqCst), 3);
@@ -761,12 +1280,9 @@ mod tests {
         };
         let config = test_backfill_config(&storage_path, 1, 1, 1, false)?;
 
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let error = match backfill_from_source_with_artifact_builder(
-            &config,
-            &source,
-            &mut artifact_builder,
-        )
+        let error = match backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
         .await
         {
             Ok(commit_outcome) => {
@@ -821,13 +1337,10 @@ mod tests {
         };
         let config = test_backfill_config(&storage_path, 1, 1, 1, false)?;
 
-        let mut artifact_builder = TestArtifactBuilder {
-            sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
-            orchard_commitment_tree_size: 0,
-        };
-        let commit_outcome =
-            backfill_from_source_with_artifact_builder(&config, &source, &mut artifact_builder)
-                .await?;
+        let commit_outcome = backfill_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, SUBTREE_LEAF_COUNT, 0))
+        })
+        .await?;
 
         assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
         let store = PrimaryChainStore::open(
@@ -959,12 +1472,9 @@ mod tests {
             network: Network::ZcashRegtest,
         };
 
-        let mut artifact_builder = TestArtifactBuilder::default();
-        let commit_outcome = backfill_from_source_with_artifact_builder_and_bootstrap(
-            &config,
-            &source,
-            &mut artifact_builder,
-        )
+        let commit_outcome = backfill_with_bootstrap_using_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
         .await?;
 
         assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(12));
@@ -1011,15 +1521,13 @@ mod tests {
             network: Network::ZcashRegtest,
         };
 
-        let mut artifact_builder = TestArtifactBuilder {
-            sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
-            orchard_commitment_tree_size: 0,
-        };
-        let commit_outcome = backfill_from_source_with_artifact_builder_and_bootstrap(
-            &config,
-            &source,
-            &mut artifact_builder,
-        )
+        // Checkpoint already carries SUBTREE_LEAF_COUNT outputs, so the
+        // post-checkpoint block contributes a zero delta. The defense
+        // under test is that the writer does not re-fetch the
+        // already-recorded subtree root for the checkpoint range.
+        let commit_outcome = backfill_with_bootstrap_using_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
         .await?;
 
         assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(11));
@@ -1097,18 +1605,19 @@ mod tests {
         Ok(())
     }
 
-    /// Wraps `backfill_from_source_with_artifact_builder` after running the
-    /// checkpoint bootstrap path so unit tests can exercise both phases
-    /// without spawning a real upstream node client.
+    /// Test helper that runs the checkpoint bootstrap and then the
+    /// commit loop with `derive_fn` substituted for `derive_block`, so
+    /// unit tests can exercise both phases without parsing real Zcash
+    /// block bytes.
     #[cfg(test)]
-    async fn backfill_from_source_with_artifact_builder_and_bootstrap<Source, Builder>(
+    async fn backfill_with_bootstrap_using_mock_derive<Source, F>(
         config: &BackfillConfig,
         source: &Source,
-        artifact_builder: &mut Builder,
+        derive_fn: F,
     ) -> Result<ChainEpochCommitOutcome, IngestError>
     where
         Source: NodeSource,
-        Builder: ArtifactBuilder,
+        F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> + Copy,
     {
         let store_options = ChainStoreOptions::for_network(config.node.network);
         validate_backfill_finality_bound(
@@ -1127,11 +1636,20 @@ mod tests {
             .map_or_else(ChainTipMetadata::empty, |chain_epoch| {
                 chain_epoch.tip_metadata
             });
-        backfill_from_source_with_store(
+        let derive_store = zinder_derive::DeriveStore::open(
+            zinder_derive::DeriveStore::path_for_canonical(&config.storage_path),
+            zinder_derive::DeriveStoreOptions {
+                sync_writes: false,
+                consumer_column_families: &[],
+                tuning: zinder_store::StorageTuning::for_local_tests(),
+            },
+        )?;
+        backfill_from_source_with_store_using_derive_fn(
             config,
             source,
             &store,
-            artifact_builder,
+            &derive_store,
+            derive_fn,
             BackfillStart {
                 from_height: config.from_height,
                 initial_tip_metadata,
@@ -1162,8 +1680,11 @@ mod tests {
             to_height: BlockHeight::new(to_height),
             commit_batch_blocks: NonZeroU32::new(commit_batch_blocks)
                 .ok_or("invalid test batch size")?,
+            max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+                .ok_or("invalid test prevout budget")?,
             fetch_concurrency: NonZeroU32::new(4).ok_or("invalid test fetch concurrency")?,
-            flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
+            derive_concurrency: NonZeroU32::new(4).ok_or("invalid test derive concurrency")?,
+            flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
             upstream_tip_hint: None,
             allow_near_tip_finalize,
             checkpoint: None,
@@ -1325,66 +1846,48 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestArtifactBuilder {
-        sapling_commitment_tree_size: u32,
-        orchard_commitment_tree_size: u32,
-    }
-
-    impl ArtifactBuilder for TestArtifactBuilder {
-        fn build(
-            &mut self,
-            source_block: &SourceBlock,
-        ) -> Result<BuiltArtifacts, ArtifactDeriveError> {
-            Ok(BuiltArtifacts {
-                block: BlockArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    source_block.parent_hash,
-                    source_block.raw_block_bytes.clone(),
-                ),
-                compact_block: CompactBlockArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    test_compact_block_payload(
-                        source_block.height,
-                        source_block.hash,
-                        self.sapling_commitment_tree_size,
-                        self.orchard_commitment_tree_size,
-                    ),
-                ),
-                transactions: Vec::new(),
-                transparent_address_utxos: Vec::new(),
-                transparent_utxo_spends: Vec::new(),
-                transparent_address_tx_index: Vec::new(),
-                transparent_address_tx_index_spend_candidates: Vec::new(),
-                tip_metadata: ChainTipMetadata::new(
-                    self.sapling_commitment_tree_size,
-                    self.orchard_commitment_tree_size,
-                ),
-            })
+    /// Constructs a synthetic [`DerivedBlockArtifacts`] for tests that
+    /// drive the commit loop without parsing real Zcash bytes.
+    ///
+    /// The mock partial compact block carries the same identifiers the
+    /// production derive would emit; `finalize_derived_block` then folds
+    /// the supplied tree-size additions and stamps the final
+    /// `chain_metadata` before encoding the proto.
+    fn test_derived_block(
+        source_block: &SourceBlock,
+        sapling_tree_size_addition: u32,
+        orchard_tree_size_addition: u32,
+    ) -> DerivedBlockArtifacts {
+        DerivedBlockArtifacts {
+            block: BlockArtifact::new(
+                source_block.height,
+                source_block.hash,
+                source_block.parent_hash,
+                source_block.raw_block_bytes.clone(),
+            ),
+            parsed_block: None,
+            partial_compact_block: LightwalletdCompactBlock {
+                proto_version: 1,
+                height: u64::from(source_block.height.value()),
+                hash: encode_internal_block_hash(source_block.hash).to_vec(),
+                prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
+                time: source_block.block_time_seconds,
+                header: Vec::new(),
+                vtx: Vec::new(),
+                chain_metadata: None,
+            },
+            tree_size_additions: CommitmentTreeSizes {
+                sapling: sapling_tree_size_addition,
+                orchard: orchard_tree_size_addition,
+            },
+            observed_tree_sizes: None,
+            tree_state: None,
+            transactions: Vec::new(),
+            transparent_address_utxos: Vec::new(),
+            transparent_prevouts: Vec::new(),
+            transparent_utxo_spends: Vec::new(),
+            transparent_address_tx_index: Vec::new(),
+            transparent_address_tx_index_spend_candidates: Vec::new(),
         }
-    }
-
-    fn test_compact_block_payload(
-        height: BlockHeight,
-        block_hash: BlockHash,
-        sapling_commitment_tree_size: u32,
-        orchard_commitment_tree_size: u32,
-    ) -> Vec<u8> {
-        LightwalletdCompactBlock {
-            proto_version: 1,
-            height: u64::from(height.value()),
-            hash: encode_internal_block_hash(block_hash).into(),
-            prev_hash: vec![0; 32],
-            time: 1_774_668_400,
-            header: Vec::new(),
-            vtx: Vec::new(),
-            chain_metadata: Some(ChainMetadata {
-                sapling_commitment_tree_size,
-                orchard_commitment_tree_size,
-            }),
-        }
-        .encode_to_vec()
     }
 }

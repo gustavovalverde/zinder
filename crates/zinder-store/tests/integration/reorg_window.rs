@@ -197,8 +197,7 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
         committed.event,
         ChainEvent::ChainCommitted { committed }
             if committed.chain_epoch == finalized_epoch
-                && committed.block_range.start == BlockHeight::new(2)
-                && committed.block_range.end == BlockHeight::new(2)
+                && committed.block_range == BlockHeightRange::empty_at(BlockHeight::new(2))
     ));
     assert_eq!(store.current_chain_epoch()?, Some(finalized_epoch));
     let finalized_reader = store.current_chain_epoch_reader()?;
@@ -783,7 +782,7 @@ fn synthetic_epoch(
             tip_hash: hash,
             finalized_height: BlockHeight::new(finalized_height),
             finalized_hash: block_hash(finalized_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            artifact_schema_version: ArtifactSchemaVersion::new(4),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),
         },

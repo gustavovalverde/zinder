@@ -1,86 +1,58 @@
 # ADR-0017: Derive-consumer template, shared block context, and key codec convention
 
-Status: Accepted
+Status: Accepted; hosting updated by [ADR-0023](0023-derive-plane-hosted-by-ingest.md)
 Date: 2026-05-19
 Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
-[ADR-0011](0011-explorer-freshness-envelope.md)
+[ADR-0011](0011-explorer-freshness-envelope.md),
+[ADR-0023](0023-derive-plane-hosted-by-ingest.md)
+
+ADR-0023 places bundled derive writes inside `zinder-ingest`. The durable
+contract in this ADR is the shared per-block context, `BlockKeyedConsumer`
+range dispatch convention, key codecs in `zinder-core::wire`, and atomic
+derive cursor persistence. Current implementations live in
+`crates/zinder-derive`, and `zinder-ingest` hosts bundled derive writes.
 
 ## Context
 
-The explorer plane materializes column-family projections through derive
-consumers under `services/zinder-explorer/src/consumer/`. The block-explorer
-consumer PRD added four chain-events consumers
-(`BlockSummaryConsumer`, `TransactionFeesConsumer`,
-`TransparentAddressActivityConsumer`, `RecentTransactionsConsumer`).
+The explorer plane materializes column-family projections through reusable
+derive consumers: `BlockSummaryConsumer`, `TransactionFeesConsumer`,
+`TransparentAddressActivityConsumer`, and `RecentTransactionsConsumer`.
 Each consumer needs (a) the parsed block at the height being applied,
 (b) optionally a resolved prevout map, and (c) a small per-height key
 encoding for whichever column-family layout the consumer chose.
 
-Letting each consumer roll its own block fetch, its own prevout
-resolver, its own key bytes, and its own range-loop scaffolding would
-multiply boilerplate by N and let drift between consumers compound. The
-first two consumers shipped under that pattern already diverged on error
-shapes, retry loops, and key encodings.
+Letting each consumer roll its own block fetch, its own prevout resolver,
+its own key bytes, and its own range-loop scaffolding would multiply
+boilerplate by N and let drift between consumers compound.
 
 ## Decision
 
 ### Per-block context shared across consumers
 
-A single [`BlockSource`](../../services/zinder-explorer/src/consumer/block_source.rs)
-fronts `WalletQuery.FullBlock` for every chain-events consumer in the
-process. It caches `Arc<BlockCommitContext>` by height for a short TTL
-(30 s; capacity 32 entries), so the per-envelope fan-out across N
-consumers fetches and parses each block exactly once. The
-[`BlockCommitContext`](../../services/zinder-explorer/src/consumer/block_commit_context.rs)
-carries the parsed `zebra-chain` block, the raw bytes, the block and
-parent hashes, and a lazily-hydrated prevout map (resolved through
-`WalletQuery.TransparentPrevouts` when the binary configured
-`PrevoutResolver::Online`).
-
-The binary builds one `BlockSource` at startup and clones it into every
-consumer. Consumers do not hold their own `WalletQueryClient`.
-
-### Channel-per-purpose to the wallet plane
-
-The explorer binary opens three independent `AuthenticatedChannel`
-connections to `zinder-query` at startup, each owned by a different
-caller:
-
-- one drives the four long-lived `WalletQuery.ChainEvents` server-streams;
-- one backs `BlockSource`'s `WalletQuery.FullBlock` unary calls;
-- one backs `PrevoutResolver::Online`'s
-  `WalletQuery.TransparentPrevouts` unary calls (built only when the
-  upstream advertises `wallet.read.transparent_prevouts_v1`).
-
-The reason is failure-domain isolation. A single tonic `Channel` is one
-HTTP/2 connection driven by one background hyper task. Mixing four
-long-lived server-streams and many short unary calls on that single
-driver task hit a degenerate state in practice: after a brief warmup the
-unary calls would stall indefinitely while the streams stayed open. The
-three-channel split removes the contention without sacrificing connection
-reuse (each channel still multiplexes its own family of calls), and it
-keeps the failure-domain boundaries readable: an outage in the prevouts
-upstream cannot wedge `BlockSource`, and an upstream backfill that
-pushes many envelopes through `ChainEvents` cannot starve `FullBlock`.
+`zinder-ingest` constructs one `BlockCommitContext` per committed block and
+passes shared references to every chain-events consumer observing that height.
+The context carries the parsed `zebra-chain` block, block identity, raw block
+size, and a precomputed prevout map when the commit path resolved prevouts.
+Consumers do not fetch `WalletQuery.FullBlock`, hold `WalletQueryClient`
+handles, or resolve prevouts over gRPC.
 
 ### Consumer trait split
 
-`DeriveConsumer` is the SDK-facing trait the chain-events subscriber
-dispatches into; it has `apply_chain_committed` and `apply_chain_reorged`.
+`DeriveConsumer` is the SDK-facing trait the chain-events dispatcher calls;
+it has `apply_chain_committed` and `apply_chain_reorged`.
 
-`BlockKeyedConsumer` is the convention every production consumer
-implements:
+`BlockKeyedConsumer` is the convention every production consumer implements:
 
-- `block_source(&self) -> &BlockSource`
+- `name(&self) -> DeriveConsumerName`
 - `apply_block(&mut self, &BlockCommitContext, &mut DeriveConsumerCtx<'_>)`
 - `revert_block(&mut self, BlockHeight, &mut DeriveConsumerCtx<'_>)`
 
 A blanket `impl<C: BlockKeyedConsumer> DeriveConsumer for C` provides
 the range loop on top: `apply_chain_committed` walks
 `start_height..=end_height`, pulls each `BlockCommitContext` from the
-shared source, and calls `apply_block`; `apply_chain_reorged` walks the
-reverted range calling `revert_block` then walks the replacement range
-calling `apply_block`.
+writer-provided in-memory map, and calls `apply_block`;
+`apply_chain_reorged` walks the reverted range calling `revert_block` then
+walks the replacement range calling `apply_block`.
 
 Test-only consumers that don't fit the per-block shape implement
 `DeriveConsumer` directly without paying the per-block scaffolding tax.
@@ -176,10 +148,9 @@ materialized at apply time.
 - `wire_invariants.rs` extends with bans for inline
   `.to_be_bytes()` on derive-store key fields when the temptation
   arises.
-- The `BlockSource` cache bounds intra-envelope cost to one
-  `FullBlock` RPC and one parse per height, even as the consumer count
-  grows. The cache TTL is short enough that idle memory stays under one
-  block per process.
+- Shared `BlockCommitContext` values bound intra-commit cost to one parse
+  and one prevout-resolution pass per height, even as the consumer count
+  grows.
 - Composite-key consumers that don't have a height prefix accept the
   index-CF overhead (a few dozen bytes per row at apply time) in
   exchange for correct, single-batch rewinds.

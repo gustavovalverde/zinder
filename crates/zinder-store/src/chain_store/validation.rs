@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     SubtreeRootArtifact, TransactionArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentUtxoSpendArtifact, TreeStateArtifact,
+    TransparentPrevoutArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
 };
 
 use crate::{
@@ -63,6 +63,12 @@ pub(super) fn validate_chain_epoch_artifacts(
         tip_height,
         &block_hash_by_height,
     )?;
+    validate_transparent_prevout_artifacts(
+        &artifacts.transparent_prevouts,
+        &artifacts.transparent_address_utxos,
+        tip_height,
+        &block_hash_by_height,
+    )?;
     validate_transparent_utxo_spend_artifacts(
         &artifacts.transparent_utxo_spends,
         tip_height,
@@ -79,8 +85,7 @@ pub(super) fn committed_block_range(
     }
 
     if finalized_only_commit_without_artifacts(artifacts) {
-        return Ok(BlockHeightRange::inclusive(
-            artifacts.chain_epoch.finalized_height,
+        return Ok(BlockHeightRange::empty_at(
             artifacts.chain_epoch.finalized_height,
         ));
     }
@@ -123,6 +128,7 @@ fn finalized_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> b
         && artifacts.tree_states.is_empty()
         && artifacts.subtree_roots.is_empty()
         && artifacts.transparent_address_utxos.is_empty()
+        && artifacts.transparent_prevouts.is_empty()
         && artifacts.transparent_utxo_spends.is_empty()
 }
 
@@ -742,6 +748,64 @@ fn validate_transparent_address_utxo_artifacts(
                 reason: "transparent address UTXO artifacts cannot repeat an outpoint",
             });
         }
+    }
+
+    Ok(())
+}
+
+fn validate_transparent_prevout_artifacts(
+    transparent_prevouts: &[TransparentPrevoutArtifact],
+    transparent_address_utxos: &[TransparentAddressUtxoArtifact],
+    tip_height: BlockHeight,
+    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
+) -> Result<(), StoreError> {
+    let mut prevouts_by_outpoint =
+        HashMap::<TransparentOutPoint, &TransparentPrevoutArtifact>::new();
+    for prevout in transparent_prevouts {
+        if prevout.block_height > tip_height {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent prevout height cannot exceed tip height",
+            });
+        }
+
+        if block_hash_by_height.get(&prevout.block_height) != Some(&prevout.block_hash) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent prevout artifact must match a block artifact at the same height",
+            });
+        }
+
+        if prevouts_by_outpoint
+            .insert(prevout.outpoint, prevout)
+            .is_some()
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent prevout artifacts cannot repeat an outpoint",
+            });
+        }
+    }
+
+    for utxo in transparent_address_utxos {
+        let Some(prevout) = prevouts_by_outpoint.get(&utxo.outpoint) else {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent address UTXO artifacts require matching transparent prevout artifacts",
+            });
+        };
+        if prevout.value_zat != utxo.value_zat
+            || prevout.script_pub_key != utxo.script_pub_key
+            || prevout.address_script_hash != utxo.address_script_hash
+            || prevout.block_height != utxo.block_height
+            || prevout.block_hash != utxo.block_hash
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent prevout artifact must match its transparent address UTXO artifact",
+            });
+        }
+    }
+
+    if prevouts_by_outpoint.len() != transparent_address_utxos.len() {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transparent prevout artifacts require matching transparent address UTXO artifacts",
+        });
     }
 
     Ok(())

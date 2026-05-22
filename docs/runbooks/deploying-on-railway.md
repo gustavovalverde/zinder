@@ -1,6 +1,6 @@
 # Deploying Zinder on Railway
 
-This runbook gets a fresh Zinder deployment onto Railway (or a structurally similar PaaS like Fly.io or Render) in roughly 30 minutes. Target shape: the single-container image (`deploy/single-container/Dockerfile`) running `zinder-ingest` + `zinder-query` together under s6-overlay, against a Zebra deployment hosted somewhere reachable from Railway's network.
+This runbook gets a fresh Zinder deployment onto Railway (or a structurally similar PaaS like Fly.io or Render) in roughly 30 minutes. Target shape: the `zinder-single-container` target in `deploy/Dockerfile`, running `zinder-ingest` + `zinder-query` together under s6-overlay against a Zebra deployment hosted somewhere reachable from Railway's network.
 
 The same shape applies to any PaaS that:
 
@@ -137,7 +137,7 @@ For pinned-tag deploys, change the image tag back to the prior version and redep
 ## Cost optimization
 
 - Railway charges by CPU + memory time + egress. Most of the cost for steady-state Zinder is egress; the deployment serves compact blocks at scale to subscribers.
-- The single-container image runs the writer and reader in the same process tree; you pay for one container's resources. Splitting into separate Railway services per process is supported via the per-service Dockerfiles but doubles the fixed cost.
+- The single-container image runs the writer and reader in the same process tree; you pay for one container's resources. Splitting into separate Railway services per process is supported via the per-service targets in `deploy/Dockerfile` but doubles the fixed cost.
 
 ## Troubleshooting
 

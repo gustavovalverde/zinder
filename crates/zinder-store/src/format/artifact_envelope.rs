@@ -29,6 +29,10 @@ pub(crate) enum PayloadFormat {
     /// Zinder protobuf payload for a transparent address tx-history index
     /// artifact.
     ZinderTransparentAddressTxIndexArtifactV1 = 8,
+    /// Zinder protobuf payload for a transparent prevout artifact.
+    ZinderTransparentPrevoutArtifactV1 = 9,
+    /// Zinder protobuf payload for the block-local transparent prevout index.
+    ZinderTransparentPrevoutBlockIndexV1 = 10,
 }
 
 impl PayloadFormat {
@@ -42,6 +46,8 @@ impl PayloadFormat {
             6 => Some(Self::ZinderTransparentAddressUtxoArtifactV1),
             7 => Some(Self::ZinderTransparentUtxoSpendArtifactV1),
             8 => Some(Self::ZinderTransparentAddressTxIndexArtifactV1),
+            9 => Some(Self::ZinderTransparentPrevoutArtifactV1),
+            10 => Some(Self::ZinderTransparentPrevoutBlockIndexV1),
             _ => None,
         }
     }

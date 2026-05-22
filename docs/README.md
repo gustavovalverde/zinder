@@ -44,6 +44,9 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0018: Capability-gated optional payload fields](adrs/0018-capability-gated-optional-payload-fields.md)
 - [ADR-0019: Transport policy ownership and self-healing](adrs/0019-transport-policy-ownership.md)
 - [ADR-0020: Bounded RocksDB resource budget](adrs/0020-bounded-rocksdb-resource-budget.md)
+- [ADR-0021: Parallel block derivation in `BulkCatchup`](adrs/0021-parallel-block-derivation.md)
+- [ADR-0022: Transparent prevout rows remove commit-time transaction re-reads](adrs/0022-transparent-prevout-index.md)
+- [ADR-0023: Derive plane hosted by ingest](adrs/0023-derive-plane-hosted-by-ingest.md)
 
 ## Reference
 

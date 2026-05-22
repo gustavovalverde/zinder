@@ -11,13 +11,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
-futures-util.workspace = true
-parking_lot.workspace = true
 prost.workspace = true
-rust-rocksdb.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
@@ -29,6 +25,7 @@ tonic-reflection.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
+zinder-derive.workspace = true
 zinder-proto.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true

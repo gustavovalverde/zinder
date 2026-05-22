@@ -39,6 +39,8 @@ pub enum ArtifactFamily {
     SubtreeRoot,
     /// Transparent address UTXO artifact.
     TransparentAddressUtxo,
+    /// Transparent prevout artifact keyed by outpoint.
+    TransparentPrevout,
     /// Transparent UTXO spend artifact.
     TransparentUtxoSpend,
     /// Transparent address tx-history index artifact.
@@ -154,6 +156,21 @@ pub enum StoreError {
         persisted_version: u16,
         /// Highest artifact schema version supported by the running binary.
         supported_version: u16,
+    },
+
+    /// Persisted artifact schema is older than this binary requires.
+    ///
+    /// The project is pre-release; breaking schema changes do not ship
+    /// compatibility shims. Wipe the store and resync. See
+    /// [ADR-0022](../../docs/adrs/0022-transparent-prevout-index.md).
+    #[error(
+        "store artifact schema is too old: persisted {persisted_version}, required {required_version}; wipe the store and resync"
+    )]
+    SchemaTooOld {
+        /// Artifact schema version recorded on disk.
+        persisted_version: u16,
+        /// Artifact schema version this binary requires.
+        required_version: u16,
     },
 
     /// Another primary process already owns the `RocksDB` lock.
@@ -299,7 +316,7 @@ pub enum StoreError {
         reason: &'static str,
     },
 
-    /// Requested feature is not implemented by this storage slice.
+    /// Requested feature is not implemented by this storage backend.
     #[error("unsupported storage feature: {feature}")]
     Unsupported {
         /// Unsupported feature name.

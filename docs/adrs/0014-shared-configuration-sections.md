@@ -76,10 +76,10 @@ Per-service sections (`[ingest]`, `[backup]`, `[query]`, `[compat]`,
 [ADR-0015](0015-unified-phase-driven-ingest.md) collapses the earlier
 `[backfill]` and `[tip_follow]` writer-side splits into the
 sub-sectioned `[ingest.phases]`, `[ingest.bulk_catchup]`,
-`[ingest.tip_follow]`, and `[ingest.modifiers]` schema, and adds a
-new shared `[node.health]` sub-section on the existing `[node]`
-schema so the upstream-health knobs are operator-readable from every
-binary that wants them.
+`[ingest.derive]`, `[ingest.tip_follow]`, and `[ingest.modifiers]`
+schema, and adds a new shared `[node.health]` sub-section on the
+existing `[node]` schema so the upstream-health knobs are
+operator-readable from every binary that wants them.
 
 ### Defaults
 

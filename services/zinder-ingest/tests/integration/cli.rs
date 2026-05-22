@@ -78,8 +78,11 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("reorg_window_blocks = 100"));
     assert!(stdout.contains("[ingest.phases]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
+    assert!(stdout.contains("[ingest.derive]"));
+    assert!(stdout.contains("concurrency ="));
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("commit_batch_blocks = 1000"));
+    assert!(stdout.contains("max_transparent_prevout_store_lookups_per_batch = 250000"));
     assert!(stdout.contains("fetch_concurrency = 32"));
     assert!(stdout.contains("[ingest.tip_follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
@@ -401,6 +404,62 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("ingest.bulk_catchup.commit_batch_blocks must be greater than zero"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zero_prevout_store_lookup_budget_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("zero-prevout-budget-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--max-transparent-prevout-store-lookups-per-batch",
+            "0",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch must be greater than zero"
+        ),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zero_derive_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("zero-derive-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--derive-concurrency",
+            "0",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("ingest.derive.concurrency must be greater than zero"),
         "{stderr}"
     );
 

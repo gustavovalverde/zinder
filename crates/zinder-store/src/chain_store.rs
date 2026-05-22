@@ -2,15 +2,21 @@
 
 mod validation;
 
-use std::{num::NonZeroU32, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use parking_lot::RwLock;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionArtifact,
+    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionArtifact,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
-    UnixTimestampMillis,
+    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutArtifact,
+    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -18,20 +24,24 @@ use crate::{
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
     MempoolEventRetentionReport, ReorgWindowChange, StorageTuning, StoreError, StreamCursorTokenV1,
+    block_artifact::read_block_artifact,
     block_hash_index::block_hash_index_put,
     format::{
         ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
         StoreKey, decode_chain_epoch, decode_chain_event_envelope, decode_mempool_event_envelope,
-        decode_mempool_event_kind, decode_mempool_event_observed_at, encode_block_artifact,
-        encode_chain_epoch, encode_chain_event_envelope, encode_compact_block_artifact,
-        encode_mempool_event_envelope, encode_subtree_root_artifact, encode_transaction_artifact,
+        decode_mempool_event_kind, decode_mempool_event_observed_at,
+        decode_transparent_prevout_block_index, encode_block_artifact, encode_chain_epoch,
+        encode_chain_event_envelope, encode_compact_block_artifact, encode_mempool_event_envelope,
+        encode_subtree_root_artifact, encode_transaction_artifact,
         encode_transparent_address_tx_index_artifact, encode_transparent_address_utxo_artifact,
+        encode_transparent_prevout_artifact, encode_transparent_prevout_block_index,
         encode_transparent_utxo_spend_artifact, encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
         StorageTable,
     },
+    transparent_prevout::read_transparent_prevout_from_history_with_block_visibility,
 };
 
 use validation::{
@@ -87,9 +97,16 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 1;
+const STORE_SCHEMA_VERSION: u16 = 4;
 /// Durable artifact schema version written by this binary.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(1);
+///
+/// Version 4 splits transparent prevout storage into an exact current
+/// projection plus epoch-suffixed history for historical readers.
+/// (see [ADR-0022](../../../docs/adrs/0022-transparent-prevout-index.md)).
+/// Stores written under earlier versions must be wiped and re-synced before
+/// opening with this binary; the project is pre-release and breaking
+/// changes are deliberate.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(4);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 
@@ -618,7 +635,7 @@ impl ChainStoreInner {
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view();
         let chain_epoch = require_current_chain_epoch(&read_view)?;
-        Ok(ChainEpochReader::new(chain_epoch, read_view))
+        Ok(ChainEpochReader::current(chain_epoch, read_view))
     }
 
     /// Opens a reader pinned to a specific chain epoch.
@@ -628,7 +645,7 @@ impl ChainStoreInner {
     ) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view();
         let chain_epoch = read_chain_epoch(&read_view, chain_epoch)?;
-        Ok(ChainEpochReader::new(chain_epoch, read_view))
+        Ok(ChainEpochReader::at_epoch(chain_epoch, read_view))
     }
 
     /// Atomically commits artifacts for one chain epoch and advances the visible pointer.
@@ -651,6 +668,16 @@ impl ChainStoreInner {
         let chain_epoch = artifacts.chain_epoch;
         let block_range = committed_block_range(&artifacts, current_chain_epoch)?;
         let reorg_window_change = artifacts.reorg_window_change.clone();
+        let current_projection_protected_outpoints = artifacts
+            .transparent_prevouts
+            .iter()
+            .map(|prevout| prevout.outpoint)
+            .collect::<HashSet<_>>();
+        let committed_block_hashes = artifacts
+            .finalized_blocks
+            .iter()
+            .map(|block| (block.height, block.block_hash))
+            .collect::<HashMap<_, _>>();
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(
             event_sequence,
@@ -663,11 +690,18 @@ impl ChainStoreInner {
         if let Some(store_metadata_put) = store_metadata_put {
             puts.push(store_metadata_put);
         }
-        let deletes = build_reorg_window_deletes(
+        let projection_repairs = build_reorg_window_projection_repairs(
             self.inner.as_ref(),
-            current_chain_epoch,
-            &reorg_window_change,
-        );
+            TransparentPrevoutProjectionRepairInputs {
+                previous_chain_epoch: current_chain_epoch,
+                chain_epoch,
+                reorg_window_change: &reorg_window_change,
+                protected_outpoints: &current_projection_protected_outpoints,
+                committed_block_hashes: &committed_block_hashes,
+            },
+        )?;
+        puts.extend(projection_repairs.puts);
+        let deletes = projection_repairs.deletes;
 
         self.inner.write_batch(puts, deletes)?;
 
@@ -1514,6 +1548,12 @@ fn ensure_supported_artifact_schema(inner: &impl RocksChainStoreRead) -> Result<
             supported_version: MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
         });
     }
+    if persisted_version < CURRENT_ARTIFACT_SCHEMA_VERSION.value() {
+        return Err(StoreError::SchemaTooOld {
+            persisted_version,
+            required_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        });
+    }
 
     Ok(())
 }
@@ -1692,6 +1732,7 @@ fn build_chain_epoch_puts(
         tree_states,
         subtree_roots,
         transparent_address_utxos,
+        transparent_prevouts,
         transparent_utxo_spends,
         transparent_address_tx_index,
         reorg_window_change: _,
@@ -1709,6 +1750,7 @@ fn build_chain_epoch_puts(
     push_tree_state_artifact_puts(&mut puts, chain_epoch, tree_states)?;
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
     push_transparent_address_utxo_artifact_puts(&mut puts, chain_epoch, transparent_address_utxos)?;
+    push_transparent_prevout_artifact_puts(&mut puts, chain_epoch, transparent_prevouts)?;
     push_transparent_utxo_spend_artifact_puts(&mut puts, chain_epoch, transparent_utxo_spends)?;
     push_transparent_address_tx_index_artifact_puts(
         &mut puts,
@@ -1720,12 +1762,160 @@ fn build_chain_epoch_puts(
     Ok(puts)
 }
 
-fn build_reorg_window_deletes(
-    _inner: &impl RocksChainStoreRead,
-    _previous_chain_epoch: Option<ChainEpoch>,
-    _reorg_window_change: &ReorgWindowChange,
-) -> Vec<StorageDelete> {
-    Vec::new()
+struct TransparentPrevoutProjectionRepairs {
+    puts: Vec<StoragePut>,
+    deletes: Vec<StorageDelete>,
+}
+
+#[derive(Clone, Copy)]
+struct TransparentPrevoutProjectionRepairInputs<'input> {
+    previous_chain_epoch: Option<ChainEpoch>,
+    chain_epoch: ChainEpoch,
+    reorg_window_change: &'input ReorgWindowChange,
+    protected_outpoints: &'input HashSet<TransparentOutPoint>,
+    committed_block_hashes: &'input HashMap<BlockHeight, BlockHash>,
+}
+
+fn build_reorg_window_projection_repairs(
+    inner: &impl RocksChainStoreRead,
+    inputs: TransparentPrevoutProjectionRepairInputs<'_>,
+) -> Result<TransparentPrevoutProjectionRepairs, StoreError> {
+    let ReorgWindowChange::Replace { from_height } = inputs.reorg_window_change else {
+        return Ok(TransparentPrevoutProjectionRepairs {
+            puts: Vec::new(),
+            deletes: Vec::new(),
+        });
+    };
+
+    let mut puts = Vec::new();
+    let mut deletes = Vec::new();
+    let previous_chain_epoch =
+        inputs
+            .previous_chain_epoch
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "reorg replacement requires an existing previous chain epoch",
+            })?;
+    let reverted_outpoints =
+        read_reverted_transparent_prevout_outpoints(inner, previous_chain_epoch, *from_height)?;
+    for outpoint in reverted_outpoints {
+        if inputs.protected_outpoints.contains(&outpoint) {
+            continue;
+        }
+
+        let current_key = StoreKey::transparent_prevout(inputs.chain_epoch.network, outpoint);
+        let mut post_reorg_block_is_visible = |height: BlockHeight, expected_hash: BlockHash| {
+            if height >= *from_height {
+                return Ok(inputs
+                    .committed_block_hashes
+                    .get(&height)
+                    .is_some_and(|block_hash| *block_hash == expected_hash));
+            }
+
+            let Some(block) = read_block_artifact(inner, inputs.chain_epoch, height)? else {
+                return Ok(false);
+            };
+            Ok(block.block_hash == expected_hash)
+        };
+        match read_transparent_prevout_from_history_with_block_visibility(
+            inner,
+            inputs.chain_epoch,
+            outpoint,
+            &mut post_reorg_block_is_visible,
+        )? {
+            Some(restored_prevout) => {
+                puts.push(StoragePut {
+                    table: StorageTable::TransparentPrevout,
+                    key: current_key,
+                    value: encode_transparent_prevout_artifact(restored_prevout)?,
+                });
+            }
+            None => deletes.push(StorageDelete {
+                table: StorageTable::TransparentPrevout,
+                key: current_key,
+            }),
+        }
+    }
+
+    Ok(TransparentPrevoutProjectionRepairs { puts, deletes })
+}
+
+fn read_reverted_transparent_prevout_outpoints(
+    inner: &impl RocksChainStoreRead,
+    previous_chain_epoch: ChainEpoch,
+    from_height: BlockHeight,
+) -> Result<Vec<TransparentOutPoint>, StoreError> {
+    let mut outpoints = HashSet::new();
+    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height) {
+        outpoints.extend(read_visible_transparent_prevout_block_outpoints(
+            inner,
+            previous_chain_epoch,
+            height,
+        )?);
+    }
+
+    let mut outpoints = outpoints.into_iter().collect::<Vec<_>>();
+    sort_transparent_outpoints(&mut outpoints);
+    Ok(outpoints)
+}
+
+fn read_visible_transparent_prevout_block_outpoints(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+) -> Result<Vec<TransparentOutPoint>, StoreError> {
+    let Some(block) = read_block_artifact(inner, chain_epoch, height)? else {
+        return Ok(Vec::new());
+    };
+
+    let prefix = StoreKey::transparent_prevout_block_index_prefix(chain_epoch.network, height);
+    let mut outpoints = None;
+    let mut scan_error = None;
+    inner.scan_prefix_reverse(
+        StorageTable::TransparentPrevoutBlockIndex,
+        &prefix,
+        &mut |key_bytes, envelope_bytes| {
+            let key = StoreKey::from_raw_bytes(key_bytes);
+            let Some(source_epoch) = StoreKey::transparent_artifact_chain_epoch_id(key_bytes)
+            else {
+                scan_error = Some(StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::TransparentPrevout,
+                    key: key.into(),
+                    reason: "transparent prevout block index key is malformed",
+                });
+                return Ok(PrefixScanControl::Stop);
+            };
+            if source_epoch > chain_epoch.id {
+                return Ok(PrefixScanControl::Continue);
+            }
+
+            match decode_transparent_prevout_block_index(&key, envelope_bytes) {
+                Ok((block_hash, block_outpoints)) if block_hash == block.block_hash => {
+                    outpoints = Some(block_outpoints);
+                    Ok(PrefixScanControl::Stop)
+                }
+                Ok(_) => Ok(PrefixScanControl::Continue),
+                Err(error) => {
+                    scan_error = Some(error);
+                    Ok(PrefixScanControl::Stop)
+                }
+            }
+        },
+    )?;
+
+    if let Some(error) = scan_error {
+        return Err(error);
+    }
+
+    Ok(outpoints.unwrap_or_default())
+}
+
+fn sort_transparent_outpoints(outpoints: &mut [TransparentOutPoint]) {
+    outpoints.sort_by(|left, right| {
+        left.transaction_id
+            .as_bytes()
+            .cmp(&right.transaction_id.as_bytes())
+            .then(left.output_index.cmp(&right.output_index))
+    });
 }
 
 fn push_block_artifact_puts(
@@ -1883,6 +2073,61 @@ fn push_transparent_address_utxo_artifact_puts(
             table: StorageTable::TransparentAddressUtxo,
             key,
             value: encoded_utxo,
+        });
+    }
+
+    Ok(())
+}
+
+fn push_transparent_prevout_artifact_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    transparent_prevouts: Vec<TransparentPrevoutArtifact>,
+) -> Result<(), StoreError> {
+    let mut block_outpoints = HashMap::<(BlockHeight, BlockHash), Vec<TransparentOutPoint>>::new();
+    for artifact in transparent_prevouts {
+        let current_key = StoreKey::transparent_prevout(chain_epoch.network, artifact.outpoint);
+        let history_key = StoreKey::transparent_prevout_history(
+            chain_epoch.network,
+            artifact.outpoint,
+            chain_epoch.id,
+        );
+        block_outpoints
+            .entry((artifact.block_height, artifact.block_hash))
+            .or_default()
+            .push(artifact.outpoint);
+        let encoded = encode_transparent_prevout_artifact(artifact)?;
+        puts.push(StoragePut {
+            table: StorageTable::TransparentPrevout,
+            key: current_key,
+            value: encoded.clone(),
+        });
+        puts.push(StoragePut {
+            table: StorageTable::TransparentPrevoutHistory,
+            key: history_key,
+            value: encoded,
+        });
+    }
+
+    let mut block_outpoints = block_outpoints.into_iter().collect::<Vec<_>>();
+    block_outpoints.sort_by(
+        |((left_height, left_hash), _), ((right_height, right_hash), _)| {
+            left_height
+                .cmp(right_height)
+                .then(left_hash.as_bytes().cmp(&right_hash.as_bytes()))
+        },
+    );
+    for ((block_height, block_hash), mut outpoints) in block_outpoints {
+        sort_transparent_outpoints(&mut outpoints);
+        outpoints.dedup();
+        puts.push(StoragePut {
+            table: StorageTable::TransparentPrevoutBlockIndex,
+            key: StoreKey::transparent_prevout_block_index(
+                chain_epoch.network,
+                block_height,
+                chain_epoch.id,
+            ),
+            value: encode_transparent_prevout_block_index(block_hash, &outpoints)?,
         });
     }
 
@@ -2432,15 +2677,15 @@ mod tests {
 
     use tempfile::tempdir;
     use zinder_core::{
-        ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata,
-        CompactBlockArtifact, TreeStateArtifact, UnixTimestampMillis,
+        BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
+        TreeStateArtifact, UnixTimestampMillis,
     };
 
     use super::*;
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 1);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 4);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
@@ -2633,7 +2878,7 @@ mod tests {
                 tip_hash: source_hash,
                 finalized_height: block_height,
                 finalized_hash: source_hash,
-                artifact_schema_version: ArtifactSchemaVersion::new(1),
+                artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
                 tip_metadata: ChainTipMetadata::empty(),
                 created_at: UnixTimestampMillis::new(1_774_668_500_000 + u64::from(height)),
             },

@@ -47,6 +47,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `MempoolEvent` | Typed mempool transition (`Added`, `Invalidated`, `Mined`) carried in the event log |
 | `MempoolEventEnvelope` | Cursor-bound mempool-event message exposed natively on `WalletQuery.MempoolEvents` |
 | `MempoolSnapshotView` | Bounded, pageable point-in-time projection of the live mempool with `snapshot_age_millis` |
+| `TransparentOutPoint` | Canonical transparent output identifier: transaction id plus output index |
+| `TransparentPrevoutArtifact` | Durable mined transparent-output row carrying value, `script_pub_key`, address script hash, and producing block identity; stored in the current `transparent_prevout` projection and `transparent_prevout_history`, with its outpoint referenced by the block-local repair index |
 | `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
 | `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
 | `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
@@ -102,7 +104,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 
 | Term | Meaning |
 |------|---------|
-| `DeriveStore` | Per-consumer `RocksDB` wrapper colocated with the consumer binary; never colocated with canonical storage. Owns the `cursor` and `consumer_metadata` column families. Today's only consumer is `zinder-explorer`. |
+| `DeriveStore` | Projection `RocksDB` wrapper opened as primary by `zinder-ingest` and as secondary by reader gateways. Owns the `chain_event_cursor`, `mempool_event_cursor`, and `consumer_metadata` column families. |
 | `DeriveStoreTable` | Logical column-family identifier referenced by reads and `WriteBatch` puts |
 | `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
 | `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
@@ -110,8 +112,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `DeriveConsumerCtx` | Per-event consumer context carrying a `&DeriveStore` borrow for reads and a `&mut WriteBatch` consumers stage their writes into; the SDK appends the cursor advance to the same batch and commits atomically |
 | `ChainCommittedEvent`, `ChainReorgedEvent` | Typed wrappers around the wire chain-event variants, decoded into `zinder-core` primitives so consumers never see prost-generated types |
 | `MempoolConsumerEvent` | Typed wrapper around one `MempoolEventEnvelope`, carrying borrowed transaction-id and raw-transaction-bytes slices for the duration of the apply call |
-| `run_chain_events_subscriber` | Drains a `Stream<ChainEventEnvelope>` into a `DeriveConsumer`, persisting the cursor atomically with consumer writes after every envelope |
-| `run_mempool_events_subscriber` | Mirror of the chain-events subscriber for `MempoolEventEnvelope` streams and `DeriveMempoolConsumer` |
+| `DeriveStore::write_chain_event` | Ingest-hosted dispatcher that applies `BlockKeyedConsumer` implementations and persists the chain-event cursor atomically with consumer writes |
+| `DeriveStore::write_mempool_event` | Ingest-hosted dispatcher that applies a `DeriveMempoolConsumer` and persists the mempool-event cursor atomically with consumer writes |
 
 ### Cursors, events, errors
 
@@ -407,8 +409,12 @@ reorg_window_blocks = 100
 # Phase classifier boundary; defaults to ingest.reorg_window_blocks.
 catchup_threshold_blocks = 100
 
+[ingest.derive]
+concurrency = 32
+
 [ingest.bulk_catchup]
 commit_batch_blocks = 1000
+max_transparent_prevout_store_lookups_per_batch = 250000
 fetch_concurrency = 32
 
 [ingest.tip_follow]
@@ -497,7 +503,10 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phases.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
 | `ZINDER_INGEST__BULK_CATCHUP__COMMIT_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_batch_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
+| `ZINDER_INGEST__BULK_CATCHUP__MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH` | zinder-ingest | Optional | `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch` | Maximum unique transparent prevouts read from the store per bulk-catchup commit batch. Defaults to 250000. |
 | `ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fetch_concurrency` | Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32. |
+| `ZINDER_INGEST__DERIVE__CONCURRENCY` | zinder-ingest | Optional | `ingest.derive.concurrency` | Parallel CPU-bound derive and replay block hydration tasks on the blocking pool. Defaults to `clamp(available_parallelism() - 1, 4, 32)`. |
+| `ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS` | zinder-ingest | Optional | `ingest.bulk_catchup.flush_interval_epochs` | Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater than zero. Defaults to 5. |
 | `ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.tip_follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
 | `ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.tip_follow.lag_threshold_blocks` | Block lag at which tip-follow reports `cause=syncing`. Defaults to 1. |
 | `ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT` | zinder-ingest | Optional | `ingest.modifiers.target_height` | One-shot stop-at modifier; the loop exits 0 after committing this height. Renamed from `to_height`. |
@@ -513,7 +522,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES` | zinder-ingest | Optional | `retention.mempool_cursor_at_risk_warning_minutes` | Mempool cursor-at-risk warning lead time in minutes. Must be ≤ the shortest configured mempool retention window. Defaults to 12. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
-| `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Filesystem path opened by `DeriveStore` for explorer-plane derive state. |
+| `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Canonical store path used to locate the writer-owned derive store at its `derive` subdirectory. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. Empty/unset disables the `explorer.transparent_address.balance_v1` capability. |
 <!-- env-var-table:public-interfaces:end -->
 

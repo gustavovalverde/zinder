@@ -37,10 +37,14 @@ path = "/var/lib/zinder/store"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
+[ingest.derive]
+concurrency = 8
+
 # Bulk-catchup runs on cold stores and after long downtime; the unified
 # loop bounces back when the gap closes through the threshold.
 [ingest.bulk_catchup]
 commit_batch_blocks = 1000
+max_transparent_prevout_store_lookups_per_batch = 250000
 fetch_concurrency = 32
 
 [ingest.tip_follow]

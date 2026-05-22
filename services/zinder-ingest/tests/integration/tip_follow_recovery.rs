@@ -14,6 +14,7 @@
 
 use std::{
     num::NonZeroU32,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -36,6 +37,17 @@ use zinder_source::{
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
+fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
+}
+
 /// Exact production scenario: `BlockUnavailable` with the production reason
 /// string surfaces, the writer stays alive, and readiness payload reports
 /// the right class.
@@ -48,6 +60,7 @@ async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> R
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
+    let derive_store = test_derive_store(&storage_path)?;
     let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
@@ -57,8 +70,17 @@ async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> R
         let cancel = cancel.clone();
         let source = view_changing_source.clone();
         tokio::spawn(async move {
-            tip_follow_with_primary_store(&config, &source, store, &readiness, None, None, cancel)
-                .await
+            tip_follow_with_primary_store(
+                &config,
+                &source,
+                store,
+                derive_store,
+                &readiness,
+                None,
+                None,
+                cancel,
+            )
+            .await
         })
     };
 
@@ -93,6 +115,7 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
+    let derive_store = test_derive_store(&storage_path)?;
     let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
@@ -102,8 +125,17 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
         let cancel = cancel.clone();
         let source = mismatching_source.clone();
         tokio::spawn(async move {
-            tip_follow_with_primary_store(&config, &source, store, &readiness, None, None, cancel)
-                .await
+            tip_follow_with_primary_store(
+                &config,
+                &source,
+                store,
+                derive_store,
+                &readiness,
+                None,
+                None,
+                cancel,
+            )
+            .await
         })
     };
 
@@ -138,6 +170,7 @@ async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
+    let derive_store = test_derive_store(&storage_path)?;
     let config = sample_tip_follow_config(&storage_path);
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
@@ -147,8 +180,17 @@ async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<
         let cancel = cancel.clone();
         let source = node.clone();
         tokio::spawn(async move {
-            tip_follow_with_primary_store(&config, &source, store, &readiness, None, None, cancel)
-                .await
+            tip_follow_with_primary_store(
+                &config,
+                &source,
+                store,
+                derive_store,
+                &readiness,
+                None,
+                None,
+                cancel,
+            )
+            .await
         })
     };
 

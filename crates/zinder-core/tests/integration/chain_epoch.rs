@@ -5,8 +5,8 @@
 
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    Network, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
+    ChainTipMetadata, Network, UnixTimestampMillis,
 };
 
 #[test]
@@ -21,7 +21,7 @@ fn chain_epoch_carries_the_visible_consistency_boundary() {
         tip_hash,
         finalized_height: BlockHeight::new(1),
         finalized_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -38,7 +38,7 @@ fn chain_epoch_carries_the_visible_consistency_boundary() {
     assert_eq!(chain_epoch.finalized_hash, finalized_hash);
     assert_eq!(
         chain_epoch.artifact_schema_version,
-        ArtifactSchemaVersion::new(1)
+        ArtifactSchemaVersion::new(4)
     );
     assert_eq!(
         chain_epoch.created_at,
@@ -58,4 +58,15 @@ fn block_height_next_advances_by_one_and_saturates_at_ceiling() {
         "BlockHeight::next must surface None at the chain-position ceiling so \
          stream-recovery loops terminate instead of overflowing"
     );
+}
+
+#[test]
+fn block_height_range_empty_at_iterates_no_heights() {
+    let empty_range = BlockHeightRange::empty_at(BlockHeight::new(100));
+    assert!(empty_range.start > empty_range.end);
+    assert_eq!(empty_range.into_iter().next(), None);
+
+    let ceiling_empty_range = BlockHeightRange::empty_at(BlockHeight::new(u32::MAX));
+    assert!(ceiling_empty_range.start > ceiling_empty_range.end);
+    assert_eq!(ceiling_empty_range.into_iter().next(), None);
 }

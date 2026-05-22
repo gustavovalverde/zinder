@@ -1,15 +1,13 @@
 //! Zinder explorer-plane gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter,
-    ExplorerServerInfoSettings, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
-    RECENT_TRANSACTIONS_COLUMN_FAMILY, TRANSACTION_FEES_COLUMN_FAMILIES,
-    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES, describe_request_metrics,
+    DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
+    describe_request_metrics,
 };
 use zinder_runtime::{
     Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
@@ -17,31 +15,12 @@ use zinder_runtime::{
 };
 
 mod config;
-mod consumer_runner;
 
 use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 
-/// Column-family list passed to `DeriveStore::open` at startup.
-///
-/// Aggregated from each consumer's `*_COLUMN_FAMILIES` constant so a new
-/// consumer's additional column families are picked up by adding one
-/// slice entry here.
-fn consumer_column_families() -> Vec<&'static str> {
-    let mut families: Vec<&'static str> = Vec::new();
-    families.push(BLOCK_SUMMARY_COLUMN_FAMILY);
-    families.push(MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY);
-    families.push(RECENT_TRANSACTIONS_COLUMN_FAMILY);
-    families.extend_from_slice(TRANSACTION_FEES_COLUMN_FAMILIES);
-    families.extend_from_slice(TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES);
-    families
-}
-
-/// Leaked &'static slice the store retains across its lifetime. Built once at
-/// startup; size is bounded by the number of consumers compiled into the
-/// binary.
-fn consumer_column_families_static() -> &'static [&'static str] {
-    Box::leak(consumer_column_families().into_boxed_slice())
-}
+/// Cadence the background task uses to advance the secondary's view to the
+/// primary's latest durable state.
+const DERIVE_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
@@ -56,7 +35,10 @@ struct Cli {
     /// Network name, such as zcash-regtest.
     #[arg(long)]
     network: Option<String>,
-    /// Filesystem path opened by `DeriveStore`.
+    /// Filesystem path of the canonical store the writer opens as primary.
+    ///
+    /// The derive store the explorer reads in secondary mode is at the
+    /// `derive` subdirectory of this path (see [`DeriveStore::path_for_canonical`]).
     #[arg(long = "storage-path")]
     storage_path: Option<PathBuf>,
     /// `ExplorerQuery` gRPC listen address, such as 127.0.0.1:9068.
@@ -140,16 +122,9 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
-    let (consumer_handles, prevouts_online) =
-        match maybe_spawn_consumers(&explorer_config, store.clone(), cancel.clone()).await {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                start_api_phase.fail(&error);
-                return Err(error);
-            }
-        };
+    let catchup_handle = spawn_derive_catchup_task(store.clone(), cancel.clone());
 
-    let grpc_adapter = build_grpc_adapter(&explorer_config, store, prevouts_online);
+    let grpc_adapter = build_grpc_adapter(&explorer_config, store);
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
 
     let ops_handle = spawn_ops_endpoint_for(
@@ -189,20 +164,21 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
-    for handle in consumer_handles {
-        let _ = handle.await;
-    }
+    let _ = catchup_handle.await;
 
     server_result.map_err(ExplorerConfigError::Transport)
 }
 
 fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, ExplorerConfigError> {
+    let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage_path);
+    let secondary_path = derive_path.join("secondary-explorer");
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    match DeriveStore::open(
-        &explorer_config.storage_path,
+    match DeriveStore::open_secondary(
+        &derive_path,
+        &secondary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: consumer_column_families_static(),
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
             tuning: explorer_config.storage_tuning,
         },
     ) {
@@ -218,17 +194,40 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
     }
 }
 
+fn spawn_derive_catchup_task(
+    store: DeriveStore,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DERIVE_CATCHUP_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = store.try_catch_up() {
+                        tracing::warn!(
+                            target: "zinder::explorer",
+                            event = "derive_secondary_catchup_failed",
+                            error = %error,
+                            "derive store secondary catchup failed"
+                        );
+                    }
+                }
+                () = cancel.cancelled() => break,
+            }
+        }
+    })
+}
+
 fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     store: DeriveStore,
-    prevouts_online: bool,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
         .with_derive_store(store)
-        .with_prevout_resolution_online(prevouts_online);
+        .with_prevout_resolution_online(true);
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
@@ -236,21 +235,6 @@ fn build_grpc_adapter(
         grpc_adapter = grpc_adapter.with_bearer_token(token);
     }
     grpc_adapter
-}
-
-async fn maybe_spawn_consumers(
-    explorer_config: &ExplorerConfig,
-    store: DeriveStore,
-    cancel: CancellationToken,
-) -> Result<(Vec<tokio::task::JoinHandle<()>>, bool), ExplorerConfigError> {
-    let Some(endpoint) = explorer_config.wallet_query_endpoint.as_deref() else {
-        return Ok((Vec::new(), false));
-    };
-    let (env, prevouts_online) = consumer_runner::build_environment(store, endpoint)
-        .await
-        .map_err(|error| ExplorerConfigError::ConsumerSetup(error.to_string()))?;
-    let handles = consumer_runner::spawn_all(env, cancel);
-    Ok((handles, prevouts_online))
 }
 
 fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {

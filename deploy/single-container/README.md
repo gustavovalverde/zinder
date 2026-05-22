@@ -65,8 +65,15 @@ The reader additionally needs `ingest_control.addr = "http://127.0.0.1:9100"` so
 ## Build
 
 ```bash
-docker build -f deploy/single-container/Dockerfile -t zinder-single-container .
+docker build -f deploy/Dockerfile --target zinder-single-container -t zinder .
 ```
+
+All runtime images are targets in `deploy/Dockerfile`. The shared
+`zinder-binaries` stage compiles every shipped runtime binary once with
+BuildKit cache mounts for Cargo registry, Cargo git, and `CARGO_TARGET_DIR`;
+the per-service and single-container targets only package those artifacts. New
+image shapes should add a target to this Dockerfile so local and CI builds
+reuse the same toolchain, native RocksDB build, and Cargo cache policy.
 
 ## Run
 
@@ -87,7 +94,7 @@ docker run --rm -d \
   -e ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
   -e ZINDER_NODE__AUTH__METHOD=cookie \
   -e ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie \
-  zinder-single-container
+  zinder
 ```
 
 Standalone (legacy, against a non-Z3 Zebra):
@@ -101,7 +108,7 @@ docker run --rm -d \
   -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
   -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
   -e ZINDER_NODE__AUTH__COOKIE="${ZEBRA_COOKIE}" \
-  zinder-single-container
+  zinder
 ```
 
 ## Health and readiness probes
@@ -121,7 +128,7 @@ The Docker `HEALTHCHECK` directive probes `/readyz` every 30s; the first probe w
 
 ## When NOT to use this image
 
-Use the per-service Dockerfiles in `services/<svc>/Dockerfile` when:
+Use the per-service targets in `deploy/Dockerfile` when:
 
 - you run Kubernetes/Nomad and want sidecar-style separation
 - you need to scale readers independently of writers (read replicas)

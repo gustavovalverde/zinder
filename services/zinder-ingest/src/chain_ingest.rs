@@ -9,31 +9,34 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU32,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
-use zebra_chain::{
-    serialization::ZcashDeserializeInto, transaction::Transaction as ZebraTransaction,
-};
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zebra_chain::block::Block as ZebraBlock;
+use zinder_core::wire::{encode_display_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootIndex, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    TransparentPrevoutArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 use zinder_source::{NodeSource, SourceBlock, SourceError, SourceFailureClass, SourceSubtreeRoots};
 use zinder_store::{
-    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
-    StoreError,
+    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochReader, ChainEvent, PrimaryChainStore,
+    ReorgWindowChange, StoreError,
 };
 
 use crate::{
     ArtifactDeriveError,
-    artifact_builder::{CompactBlockArtifactBuilder, TransparentAddressTxIndexSpendCandidate},
-    derive_block_artifact,
+    artifact_builder::TransparentAddressTxIndexSpendCandidate,
+    transparent_prevout_lookup::{
+        TransparentPrevoutLookupMode, TransparentPrevoutLookupStage,
+        read_chunked_transparent_prevouts_by_outpoints,
+    },
 };
 
 const FETCH_RETRY_MAX_ATTEMPTS: u32 = 5;
@@ -43,8 +46,12 @@ const FETCH_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const FETCH_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
 const FETCH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const FETCH_RETRY_FAILURE_BUDGET: u32 = 100;
+const COMMIT_STAGE_RESOLVE_SPEND_ADDRESSES: &str = "resolve_spend_addresses";
+const COMMIT_STAGE_BUILD_DERIVE_CONTEXTS: &str = "build_derive_contexts";
+const COMMIT_STAGE_STORE_COMMIT: &str = "store_commit";
+const COMMIT_STAGE_DISPATCH_DERIVE: &str = "dispatch_derive";
 
-/// Supported node source kinds for the current ingestion slice.
+/// Supported node source kinds for ingestion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeSourceKind {
     /// Zebra JSON-RPC source.
@@ -108,6 +115,14 @@ pub enum IngestError {
         /// Unsupported shielded protocol.
         protocol: ShieldedProtocol,
     },
+
+    /// Derive-plane dispatch (consumer apply or store write) failed.
+    #[error("derive dispatch failed: {0}")]
+    DeriveDispatch(String),
+
+    /// Derive-store open or operation failed.
+    #[error(transparent)]
+    DeriveStore(#[from] zinder_derive::DeriveStoreError),
 
     /// Internal batching produced an empty commit.
     #[error("internal error: attempted to commit an empty ingest batch")]
@@ -245,75 +260,51 @@ pub enum IngestError {
     },
 }
 
-/// Builds canonical artifacts from one node source block.
-pub(crate) trait ArtifactBuilder {
-    /// Builds canonical artifacts from `source_block`, advancing internal
-    /// commitment-tree state as the chain extends.
-    fn build(&mut self, source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError>;
-}
-
-/// Canonical artifacts produced by one [`ArtifactBuilder::build`] call.
+/// Finalized canonical artifacts produced for one source block.
+///
+/// Output of [`finalize_derived_block`](crate::artifact_builder::finalize_derived_block).
+/// Each field is final once this struct exists; the consumer absorbs it
+/// into an `IngestBatch` and the batch is then committed atomically.
 #[derive(Debug)]
-pub(crate) struct BuiltArtifacts {
-    pub(crate) block: BlockArtifact,
-    pub(crate) compact_block: CompactBlockArtifact,
-    pub(crate) transactions: Vec<TransactionArtifact>,
-    pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
-    pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
-    pub(crate) transparent_address_tx_index_spend_candidates:
-        Vec<TransparentAddressTxIndexSpendCandidate>,
-    pub(crate) tip_metadata: ChainTipMetadata,
-}
-
-/// Live-source [`ArtifactBuilder`] that tracks commitment-tree size across
-/// contiguous block builds.
-#[derive(Debug)]
-pub(crate) struct IngestArtifactBuilder {
-    compact_block_artifact_builder: CompactBlockArtifactBuilder,
-}
-
-impl IngestArtifactBuilder {
-    /// Creates a builder seeded with `initial_tip_metadata` so the first build
-    /// produces tree-size deltas relative to the parent chain state.
-    pub(crate) fn with_initial_tip_metadata(initial_tip_metadata: ChainTipMetadata) -> Self {
-        Self {
-            compact_block_artifact_builder: CompactBlockArtifactBuilder::with_initial_tip_metadata(
-                initial_tip_metadata,
-            ),
-        }
-    }
-}
-
-impl ArtifactBuilder for IngestArtifactBuilder {
-    fn build(&mut self, source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError> {
-        let block = derive_block_artifact(source_block)?;
-        let compact_block_build = self.compact_block_artifact_builder.build(source_block)?;
-
-        Ok(BuiltArtifacts {
-            block,
-            compact_block: compact_block_build.compact_block,
-            transactions: compact_block_build.transactions,
-            transparent_address_utxos: compact_block_build.transparent_address_utxos,
-            transparent_utxo_spends: compact_block_build.transparent_utxo_spends,
-            transparent_address_tx_index: compact_block_build.transparent_address_tx_index,
-            transparent_address_tx_index_spend_candidates: compact_block_build
-                .transparent_address_tx_index_spend_candidates,
-            tip_metadata: compact_block_build.tip_metadata,
-        })
-    }
+pub struct BuiltArtifacts {
+    /// Durable full-block artifact.
+    pub block: BlockArtifact,
+    /// Parsed block from the parallel derive phase, when available.
+    pub parsed_block: Option<Arc<ZebraBlock>>,
+    /// Lightwalletd compact block with final `chain_metadata` stamped.
+    pub compact_block: CompactBlockArtifact,
+    /// Per-transaction durable artifacts in block order.
+    pub transactions: Vec<TransactionArtifact>,
+    /// Transparent-output index entries.
+    pub transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    /// Transparent prevout artifacts keyed by outpoint.
+    pub transparent_prevouts: Vec<TransparentPrevoutArtifact>,
+    /// Transparent-input spend records.
+    pub transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    /// Transparent-address transaction-index entries (output side).
+    pub transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
+    /// Spend-input candidates awaiting prevout resolution at commit time.
+    pub transparent_address_tx_index_spend_candidates: Vec<TransparentAddressTxIndexSpendCandidate>,
+    /// Running commitment-tree position after this block is folded in.
+    pub tip_metadata: ChainTipMetadata,
+    /// Tree-state payload archived for canonical recovery, if any.
+    pub tree_state: Option<zinder_core::TreeStateArtifact>,
 }
 
 /// In-flight artifact batch accumulated between commits.
 #[derive(Default)]
 pub(crate) struct IngestBatch {
     pub(crate) finalized_blocks: Vec<BlockArtifact>,
+    pub(crate) parsed_blocks: Vec<Option<Arc<ZebraBlock>>>,
     pub(crate) compact_blocks: Vec<CompactBlockArtifact>,
     pub(crate) transactions: Vec<TransactionArtifact>,
     pub(crate) tree_states: Vec<TreeStateArtifact>,
     pub(crate) subtree_roots: Vec<SubtreeRootArtifact>,
     pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    pub(crate) transparent_prevouts: Vec<TransparentPrevoutArtifact>,
     pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    transparent_prevout_output_outpoints: HashSet<TransparentOutPoint>,
+    transparent_prevout_spend_outpoints: HashSet<TransparentOutPoint>,
     pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
     pub(crate) transparent_address_tx_index_spend_candidates:
         Vec<TransparentAddressTxIndexSpendCandidate>,
@@ -321,12 +312,118 @@ pub(crate) struct IngestBatch {
 }
 
 impl IngestBatch {
-    pub(crate) fn len(&self) -> usize {
-        self.finalized_blocks.len()
+    /// Appends one block's finalized artifacts into the in-flight batch.
+    ///
+    /// Called once per `finalize_derived_block` result. Each field is
+    /// moved into its matching `IngestBatch` vector; the running tip
+    /// metadata is overwritten with the latest finalized value.
+    pub(crate) fn absorb(&mut self, built: BuiltArtifacts) {
+        if let Some(tree_state) = built.tree_state {
+            self.tree_states.push(tree_state);
+        }
+        for prevout in &built.transparent_prevouts {
+            self.transparent_prevout_output_outpoints
+                .insert(prevout.outpoint);
+        }
+        for spend in &built.transparent_utxo_spends {
+            self.transparent_prevout_spend_outpoints
+                .insert(spend.spent_outpoint);
+        }
+        self.finalized_blocks.push(built.block);
+        self.parsed_blocks.push(built.parsed_block);
+        self.compact_blocks.push(built.compact_block);
+        self.transactions.extend(built.transactions);
+        self.transparent_address_utxos
+            .extend(built.transparent_address_utxos);
+        self.transparent_prevouts.extend(built.transparent_prevouts);
+        self.transparent_utxo_spends
+            .extend(built.transparent_utxo_spends);
+        self.transparent_address_tx_index
+            .extend(built.transparent_address_tx_index);
+        self.transparent_address_tx_index_spend_candidates
+            .extend(built.transparent_address_tx_index_spend_candidates);
+        self.tip_metadata = Some(built.tip_metadata);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.finalized_blocks.is_empty()
+    }
+
+    pub(crate) fn work_cost(&self) -> IngestBatchWorkCost {
+        let transparent_prevout_store_lookup_count = self
+            .transparent_prevout_spend_outpoints
+            .difference(&self.transparent_prevout_output_outpoints)
+            .count();
+        IngestBatchWorkCost {
+            block_count: self.finalized_blocks.len(),
+            transparent_prevout_store_lookup_count,
+        }
+    }
+
+    fn clear_work_cost(&mut self) {
+        self.transparent_prevout_output_outpoints.clear();
+        self.transparent_prevout_spend_outpoints.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IngestBatchWorkCost {
+    pub(crate) block_count: usize,
+    pub(crate) transparent_prevout_store_lookup_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IngestBatchBudget {
+    max_blocks: NonZeroU32,
+    max_transparent_prevout_store_lookups: NonZeroU32,
+}
+
+impl IngestBatchBudget {
+    pub(crate) const fn new(
+        max_blocks: NonZeroU32,
+        max_transparent_prevout_store_lookups: NonZeroU32,
+    ) -> Self {
+        Self {
+            max_blocks,
+            max_transparent_prevout_store_lookups,
+        }
+    }
+
+    pub(crate) fn commit_trigger(
+        self,
+        cost: IngestBatchWorkCost,
+    ) -> Option<IngestBatchCommitTrigger> {
+        if cost.block_count >= nonzero_u32_to_usize(self.max_blocks) {
+            return Some(IngestBatchCommitTrigger::BlockCount);
+        }
+        if cost.transparent_prevout_store_lookup_count
+            >= nonzero_u32_to_usize(self.max_transparent_prevout_store_lookups)
+        {
+            return Some(IngestBatchCommitTrigger::TransparentPrevoutStoreLookupCount);
+        }
+        None
+    }
+}
+
+fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
+    match usize::try_from(amount.get()) {
+        Ok(converted) => converted,
+        Err(_error) => usize::MAX,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IngestBatchCommitTrigger {
+    BlockCount,
+    TransparentPrevoutStoreLookupCount,
+}
+
+impl IngestBatchCommitTrigger {
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::BlockCount => "block_count",
+            Self::TransparentPrevoutStoreLookupCount => "transparent_prevout_store_lookup_count",
+        }
     }
 }
 
@@ -705,77 +802,185 @@ fn append_subtree_root_artifacts(
 /// tip-follower issues `Extend` for tip advancement and `Replace` for
 /// reorgs, then advances finalization separately once the new tip is at
 /// least `reorg_window_blocks` deep.
-pub(crate) fn commit_ingest_batch(
+pub(crate) async fn commit_ingest_batch(
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
     chain_epoch: ChainEpoch,
     batch: &mut IngestBatch,
     reorg_window_change: ReorgWindowChange,
 ) -> Result<ChainEpochCommitOutcome, IngestError> {
     let started_at = Instant::now();
-    let block_count = batch.len();
+    let batch_cost = batch.work_cost();
     if batch.is_empty() {
         let commit_outcome = Err(IngestError::EmptyIngestBatch);
-        record_ingest_commit_outcome(started_at, block_count, &commit_outcome);
+        record_ingest_commit_outcome(started_at, batch_cost, &commit_outcome);
         return commit_outcome;
     }
-    append_transparent_spend_tx_index_artifacts(store, batch)?;
-    batch.tip_metadata = None;
-    let mut artifacts = ChainEpochArtifacts::new(
-        chain_epoch,
-        std::mem::take(&mut batch.finalized_blocks),
-        std::mem::take(&mut batch.compact_blocks),
+
+    let derive_contexts = build_derive_contexts_for_commit(store, derive_store, batch)?;
+    let resolved_prevouts = derive_contexts
+        .as_ref()
+        .map(|contexts| contexts.prevouts_by_outpoint.as_ref());
+
+    let resolve_spend_addresses_started_at = Instant::now();
+    let resolve_spend_addresses_outcome =
+        append_transparent_spend_tx_index_artifacts(store, batch, resolved_prevouts);
+    record_ingest_commit_stage_outcome(
+        COMMIT_STAGE_RESOLVE_SPEND_ADDRESSES,
+        resolve_spend_addresses_started_at,
+        &resolve_spend_addresses_outcome,
     );
+    resolve_spend_addresses_outcome?;
 
-    if !batch.transactions.is_empty() {
-        artifacts = artifacts.with_transactions(std::mem::take(&mut batch.transactions));
-    }
+    batch.tip_metadata = None;
 
-    if !batch.tree_states.is_empty() {
-        artifacts = artifacts.with_tree_states(std::mem::take(&mut batch.tree_states));
-    }
+    let artifacts = drain_batch_into_chain_epoch_artifacts(chain_epoch, batch, reorg_window_change);
+    record_ingest_batch_work_cost(batch.work_cost());
 
-    if !batch.subtree_roots.is_empty() {
-        artifacts = artifacts.with_subtree_roots(std::mem::take(&mut batch.subtree_roots));
-    }
-
-    if !batch.transparent_address_utxos.is_empty() {
-        artifacts = artifacts
-            .with_transparent_address_utxos(std::mem::take(&mut batch.transparent_address_utxos));
-    }
-
-    if !batch.transparent_utxo_spends.is_empty() {
-        artifacts = artifacts
-            .with_transparent_utxo_spends(std::mem::take(&mut batch.transparent_utxo_spends));
-    }
-
-    if !batch.transparent_address_tx_index.is_empty() {
-        artifacts = artifacts.with_transparent_address_tx_index(std::mem::take(
-            &mut batch.transparent_address_tx_index,
-        ));
-    }
-
-    let commit_result = store
-        .commit_chain_epoch(artifacts.with_reorg_window_change(reorg_window_change))
-        .map_err(IngestError::from);
+    let store_commit_started_at = Instant::now();
+    let commit_result = commit_chain_epoch_blocking(store.clone(), artifacts).await;
+    record_ingest_commit_stage_outcome(
+        COMMIT_STAGE_STORE_COMMIT,
+        store_commit_started_at,
+        &commit_result,
+    );
 
     match commit_result {
         Ok(commit_summary) => {
             record_commit_outcome(&commit_summary);
+            if let Some(contexts) = derive_contexts.as_ref() {
+                let dispatch_derive_started_at = Instant::now();
+                let dispatch_derive_outcome =
+                    dispatch_derive_for_committed(derive_store, &commit_summary, &contexts.blocks);
+                record_ingest_commit_stage_outcome(
+                    COMMIT_STAGE_DISPATCH_DERIVE,
+                    dispatch_derive_started_at,
+                    &dispatch_derive_outcome,
+                );
+                dispatch_derive_outcome?;
+            }
             let commit_outcome = Ok(commit_summary);
-            record_ingest_commit_outcome(started_at, block_count, &commit_outcome);
+            record_ingest_commit_outcome(started_at, batch_cost, &commit_outcome);
             commit_outcome
         }
         Err(error) => {
             let commit_outcome = Err(error);
-            record_ingest_commit_outcome(started_at, block_count, &commit_outcome);
+            record_ingest_commit_outcome(started_at, batch_cost, &commit_outcome);
             commit_outcome
         }
     }
 }
 
+fn build_derive_contexts_for_commit(
+    store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
+    batch: &IngestBatch,
+) -> Result<Option<crate::derive_consumers::BatchBlockContexts>, IngestError> {
+    let build_derive_contexts_started_at = Instant::now();
+    let derive_contexts_outcome = if derive_store.has_consumer_column_families() {
+        let build_contexts = || {
+            crate::derive_consumers::build_block_contexts_from_batch(
+                store,
+                &batch.finalized_blocks,
+                &batch.parsed_blocks,
+                &batch.transparent_prevouts,
+            )
+        };
+        if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(build_contexts).map(Some)
+        } else {
+            build_contexts().map(Some)
+        }
+    } else {
+        Ok(None)
+    };
+    record_ingest_commit_stage_outcome(
+        COMMIT_STAGE_BUILD_DERIVE_CONTEXTS,
+        build_derive_contexts_started_at,
+        &derive_contexts_outcome,
+    );
+    derive_contexts_outcome
+}
+
+fn drain_batch_into_chain_epoch_artifacts(
+    chain_epoch: ChainEpoch,
+    batch: &mut IngestBatch,
+    reorg_window_change: ReorgWindowChange,
+) -> ChainEpochArtifacts {
+    let mut artifacts = ChainEpochArtifacts::new(
+        chain_epoch,
+        std::mem::take(&mut batch.finalized_blocks),
+        std::mem::take(&mut batch.compact_blocks),
+    );
+    batch.parsed_blocks.clear();
+
+    if !batch.transactions.is_empty() {
+        artifacts = artifacts.with_transactions(std::mem::take(&mut batch.transactions));
+    }
+    if !batch.tree_states.is_empty() {
+        artifacts = artifacts.with_tree_states(std::mem::take(&mut batch.tree_states));
+    }
+    if !batch.subtree_roots.is_empty() {
+        artifacts = artifacts.with_subtree_roots(std::mem::take(&mut batch.subtree_roots));
+    }
+    if !batch.transparent_address_utxos.is_empty() {
+        artifacts = artifacts
+            .with_transparent_address_utxos(std::mem::take(&mut batch.transparent_address_utxos));
+    }
+    if !batch.transparent_prevouts.is_empty() {
+        artifacts =
+            artifacts.with_transparent_prevouts(std::mem::take(&mut batch.transparent_prevouts));
+    }
+    if !batch.transparent_utxo_spends.is_empty() {
+        artifacts = artifacts
+            .with_transparent_utxo_spends(std::mem::take(&mut batch.transparent_utxo_spends));
+    }
+    if !batch.transparent_address_tx_index.is_empty() {
+        artifacts = artifacts.with_transparent_address_tx_index(std::mem::take(
+            &mut batch.transparent_address_tx_index,
+        ));
+    }
+    batch.clear_work_cost();
+
+    artifacts.with_reorg_window_change(reorg_window_change)
+}
+
+async fn commit_chain_epoch_blocking(
+    store: PrimaryChainStore,
+    artifacts: ChainEpochArtifacts,
+) -> Result<ChainEpochCommitOutcome, IngestError> {
+    tokio::task::spawn_blocking(move || {
+        store
+            .commit_chain_epoch(artifacts)
+            .map_err(IngestError::from)
+    })
+    .await
+    .map_err(|join_error| IngestError::BlockingTaskFailed {
+        reason: join_error.to_string(),
+    })?
+}
+
+fn dispatch_derive_for_committed(
+    derive_store: &zinder_derive::DeriveStore,
+    commit_summary: &zinder_store::ChainEpochCommitOutcome,
+    contexts: &HashMap<BlockHeight, std::sync::Arc<zinder_derive::BlockCommitContext>>,
+) -> Result<(), IngestError> {
+    let inputs = zinder_derive::ChainEventDispatchInputs {
+        chain_epoch: commit_summary.chain_epoch,
+        chain_event: &commit_summary.event,
+        chain_cursor: commit_summary.event_envelope.cursor.as_bytes(),
+        event_sequence: commit_summary.event_envelope.event_sequence,
+        finalized_height: commit_summary.event_envelope.finalized_height,
+    };
+    crate::derive_consumers::dispatch_chain_event(derive_store, inputs, contexts)
+}
+
 fn append_transparent_spend_tx_index_artifacts(
     store: &PrimaryChainStore,
     batch: &mut IngestBatch,
+    resolved_prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevoutArtifact>>,
 ) -> Result<(), IngestError> {
     if batch
         .transparent_address_tx_index_spend_candidates
@@ -784,15 +989,30 @@ fn append_transparent_spend_tx_index_artifacts(
         return Ok(());
     }
 
-    let batch_transactions = batch
-        .transactions
-        .iter()
-        .map(|transaction| (transaction.transaction_id, transaction))
-        .collect::<HashMap<_, _>>();
+    // Build an in-batch outpoint -> address map so spends within the batch
+    // resolve without touching the store when derive consumers are disabled.
+    let in_batch_prevout_addresses: HashMap<TransparentOutPoint, TransparentAddressScriptHash> =
+        batch
+            .transparent_prevouts
+            .iter()
+            .map(|artifact| (artifact.outpoint, artifact.address_script_hash))
+            .collect();
+
     let current_chain_reader = if store.current_chain_epoch()?.is_some() {
         Some(store.current_chain_epoch_reader()?)
     } else {
         None
+    };
+    let spend_candidates = std::mem::take(&mut batch.transparent_address_tx_index_spend_candidates);
+    let store_prevout_addresses = if let Some(reader) = current_chain_reader.as_ref() {
+        resolve_spend_candidate_address_hashes_from_store(
+            reader,
+            &spend_candidates,
+            &in_batch_prevout_addresses,
+            resolved_prevouts,
+        )?
+    } else {
+        HashMap::new()
     };
     let mut emitted = batch
         .transparent_address_tx_index
@@ -806,17 +1026,26 @@ fn append_transparent_spend_tx_index_artifacts(
         })
         .collect::<HashSet<_>>();
 
-    for candidate in std::mem::take(&mut batch.transparent_address_tx_index_spend_candidates) {
-        let Some(script_pub_key) = transparent_prevout_script_pub_key(
-            candidate.spent_outpoint,
-            &batch_transactions,
-            current_chain_reader.as_ref(),
-        )?
-        else {
-            continue;
+    for candidate in spend_candidates {
+        let address_script_hash = if let Some(address_script_hash) = resolved_prevouts
+            .and_then(|prevouts| prevouts.get(&candidate.spent_outpoint))
+            .map(|prevout| prevout.address_script_hash)
+        {
+            address_script_hash
+        } else if let Some(address_script_hash) = in_batch_prevout_addresses
+            .get(&candidate.spent_outpoint)
+            .copied()
+        {
+            address_script_hash
+        } else {
+            match store_prevout_addresses
+                .get(&candidate.spent_outpoint)
+                .copied()
+            {
+                Some(address_script_hash) => address_script_hash,
+                None => continue,
+            }
         };
-        let address_script_hash =
-            TransparentAddressScriptHash::of_script_pub_key(script_pub_key.as_slice());
         if emitted.insert((
             address_script_hash,
             candidate.block_height,
@@ -837,43 +1066,35 @@ fn append_transparent_spend_tx_index_artifacts(
     Ok(())
 }
 
-fn transparent_prevout_script_pub_key(
-    outpoint: TransparentOutPoint,
-    batch_transactions: &HashMap<TransactionId, &TransactionArtifact>,
-    current_chain_reader: Option<&zinder_store::ChainEpochReader<'_>>,
-) -> Result<Option<Vec<u8>>, IngestError> {
-    if let Some(transaction) = batch_transactions.get(&outpoint.transaction_id) {
-        return transparent_output_script_pub_key(transaction, outpoint);
+fn resolve_spend_candidate_address_hashes_from_store(
+    reader: &ChainEpochReader<'_>,
+    spend_candidates: &[TransparentAddressTxIndexSpendCandidate],
+    in_batch_prevout_addresses: &HashMap<TransparentOutPoint, TransparentAddressScriptHash>,
+    resolved_prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevoutArtifact>>,
+) -> Result<HashMap<TransparentOutPoint, TransparentAddressScriptHash>, IngestError> {
+    let mut unresolved_outpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in spend_candidates {
+        let outpoint = candidate.spent_outpoint;
+        if in_batch_prevout_addresses.contains_key(&outpoint)
+            || resolved_prevouts.is_some_and(|prevouts| prevouts.contains_key(&outpoint))
+            || !seen.insert(outpoint)
+        {
+            continue;
+        }
+        unresolved_outpoints.push(outpoint);
     }
 
-    let Some(current_chain_reader) = current_chain_reader else {
-        return Ok(None);
-    };
-    let Some(transaction) = current_chain_reader.transaction_by_id(outpoint.transaction_id)? else {
-        return Ok(None);
-    };
-
-    transparent_output_script_pub_key(&transaction, outpoint)
-}
-
-fn transparent_output_script_pub_key(
-    transaction: &TransactionArtifact,
-    outpoint: TransparentOutPoint,
-) -> Result<Option<Vec<u8>>, IngestError> {
-    let transaction = transaction
-        .payload_bytes
-        .as_slice()
-        .zcash_deserialize_into::<ZebraTransaction>()
-        .map_err(|source| ArtifactDeriveError::TransactionParseFailed { source })?;
-    let output_index = u32_to_usize(outpoint.output_index);
-    let Some(output) = transaction.outputs().get(output_index) else {
-        return Err(IngestError::TransparentPrevoutOutputMissing {
-            transaction_id: outpoint.transaction_id,
-            output_index: outpoint.output_index,
-        });
-    };
-
-    Ok(Some(output.lock_script.as_raw_bytes().to_vec()))
+    let prevouts = read_chunked_transparent_prevouts_by_outpoints(
+        reader,
+        TransparentPrevoutLookupMode::WriterCommit,
+        TransparentPrevoutLookupStage::SpendAddressIndex,
+        &unresolved_outpoints,
+    )?;
+    Ok(prevouts
+        .into_iter()
+        .map(|(outpoint, prevout)| (outpoint, prevout.address_script_hash))
+        .collect())
 }
 
 fn record_ingest_source_outcome<Response>(
@@ -897,9 +1118,71 @@ fn record_ingest_source_outcome<Response>(
     .increment(1);
 }
 
+/// Records derive wall-clock and outcome for one source block.
+///
+/// In bulk catchup this wraps the parallel-safe `derive_block` call inside
+/// the buffered stream; in tip-follow this wraps the one-block artifact
+/// build. The histogram is the per-block CPU contribution to ingest
+/// throughput before serial finalization and commit work.
+pub(crate) fn record_ingest_derive_outcome<T>(
+    started_at: Instant,
+    derive_outcome: &Result<T, IngestError>,
+) {
+    metrics::histogram!(
+        "zinder_ingest_derive_duration_seconds",
+        "status" => outcome_status(derive_outcome),
+        "error_class" => ingest_error_class(derive_outcome.as_ref().err())
+    )
+    .record(started_at.elapsed());
+    metrics::counter!(
+        "zinder_ingest_derive_total",
+        "status" => outcome_status(derive_outcome),
+        "error_class" => ingest_error_class(derive_outcome.as_ref().err())
+    )
+    .increment(1);
+}
+
+fn record_ingest_commit_stage_outcome<T>(
+    stage: &'static str,
+    started_at: Instant,
+    stage_outcome: &Result<T, IngestError>,
+) {
+    metrics::histogram!(
+        "zinder_ingest_commit_stage_duration_seconds",
+        "stage" => stage,
+        "status" => outcome_status(stage_outcome),
+        "error_class" => ingest_error_class(stage_outcome.as_ref().err())
+    )
+    .record(started_at.elapsed());
+}
+
+/// Publishes the current work cost of an in-flight ingest batch.
+///
+/// Called after every successful absorb and after every commit so the
+/// gauges track the writer-visible queue. The block-count gauge climbs
+/// from `0` to `commit_batch_blocks`; the transparent-prevout gauge
+/// surfaces the store-lookup budget that can end a batch earlier.
+pub(crate) fn record_ingest_batch_work_cost(cost: IngestBatchWorkCost) {
+    metrics::gauge!("zinder_ingest_batch_accumulator_blocks")
+        .set(f64::from(usize_to_u32_saturating(cost.block_count)));
+    metrics::gauge!("zinder_ingest_batch_transparent_prevout_store_lookup_outpoints").set(
+        f64::from(usize_to_u32_saturating(
+            cost.transparent_prevout_store_lookup_count,
+        )),
+    );
+}
+
+pub(crate) fn record_ingest_batch_commit_trigger(trigger: IngestBatchCommitTrigger) {
+    metrics::counter!(
+        "zinder_ingest_batch_commit_trigger_total",
+        "trigger" => trigger.metric_label()
+    )
+    .increment(1);
+}
+
 fn record_ingest_commit_outcome(
     started_at: Instant,
-    block_count: usize,
+    batch_cost: IngestBatchWorkCost,
     commit_outcome: &Result<ChainEpochCommitOutcome, IngestError>,
 ) {
     metrics::histogram!(
@@ -912,14 +1195,21 @@ fn record_ingest_commit_outcome(
         "zinder_ingest_commit_batch_block_count",
         "status" => outcome_status(commit_outcome)
     )
-    .record(usize_to_u32_saturating(block_count));
+    .record(usize_to_u32_saturating(batch_cost.block_count));
+    metrics::histogram!(
+        "zinder_ingest_commit_batch_transparent_prevout_store_lookup_count",
+        "status" => outcome_status(commit_outcome)
+    )
+    .record(usize_to_u32_saturating(
+        batch_cost.transparent_prevout_store_lookup_count,
+    ));
 }
 
-const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
+pub(crate) const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
     if outcome.is_ok() { "ok" } else { "error" }
 }
 
-fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
+pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
     match error {
         None => "none",
         Some(IngestError::UnknownNodeSource { .. }) => "unknown_node_source",
@@ -958,6 +1248,8 @@ fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::ArtifactDerive(_)) => "artifact_derive",
         Some(IngestError::Store(_)) => "store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
+        Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
+        Some(IngestError::DeriveStore(_)) => "derive_store",
     }
 }
 
@@ -1051,9 +1343,7 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
 }
 
 fn display_block_hash(block_hash: BlockHash) -> String {
-    let mut bytes = block_hash.as_bytes();
-    bytes.reverse();
-    hex::encode(bytes)
+    encode_display_block_hash_hex(block_hash)
 }
 
 #[allow(
@@ -1126,6 +1416,7 @@ mod tests {
 
     use prost::Message;
     use serde_json::Value;
+    use tempfile::tempdir;
     use zinder_core::{Network, TransactionId, TransparentAddressScriptHash};
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{SourceBlock, decode_display_block_hash};
@@ -1133,10 +1424,80 @@ mod tests {
     use zinder_testkit::StoreFixture;
 
     use super::*;
-    use crate::{derive_compact_block_artifact, derive_transaction_artifacts};
+    use crate::artifact_builder::{
+        CommitmentTreeSizes, derive_block as derive_block_for_test, finalize_derived_block,
+    };
+
+    /// Test convenience: run the production two-stage pipeline on
+    /// `source_block` against a zeroed running tree-size offset.
+    fn derive_for_test(
+        source_block: &zinder_source::SourceBlock,
+    ) -> Result<BuiltArtifacts, ArtifactDeriveError> {
+        let derived = derive_block_for_test(source_block)?;
+        let mut counters = CommitmentTreeSizes::default();
+        finalize_derived_block(derived, &mut counters)
+    }
 
     #[test]
-    fn commit_ingest_batch_indexes_transparent_spend_only_history() -> Result<(), Box<dyn Error>> {
+    fn ingest_batch_work_cost_counts_deduped_store_prevout_lookups() {
+        let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x44; 32]), 0);
+        let mut batch = IngestBatch::default();
+
+        batch.absorb(test_built_artifacts(
+            1,
+            &[],
+            &[spent_outpoint, spent_outpoint],
+        ));
+
+        assert_eq!(
+            batch.work_cost(),
+            IngestBatchWorkCost {
+                block_count: 1,
+                transparent_prevout_store_lookup_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_batch_work_cost_excludes_in_batch_prevouts() {
+        let in_batch_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x55; 32]), 0);
+        let store_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x66; 32]), 0);
+        let mut batch = IngestBatch::default();
+
+        batch.absorb(test_built_artifacts(
+            1,
+            &[in_batch_outpoint],
+            &[in_batch_outpoint, store_outpoint],
+        ));
+
+        assert_eq!(
+            batch.work_cost(),
+            IngestBatchWorkCost {
+                block_count: 1,
+                transparent_prevout_store_lookup_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_batch_budget_triggers_on_prevout_store_lookup_limit() {
+        let budget = IngestBatchBudget::new(
+            NonZeroU32::MIN.saturating_add(999),
+            NonZeroU32::MIN.saturating_add(1),
+        );
+
+        assert_eq!(
+            budget.commit_trigger(IngestBatchWorkCost {
+                block_count: 3,
+                transparent_prevout_store_lookup_count: 2,
+            }),
+            Some(IngestBatchCommitTrigger::TransparentPrevoutStoreLookupCount)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_ingest_batch_indexes_transparent_spend_only_history()
+    -> Result<(), Box<dyn Error>> {
         let (store_fixture, prevout_block, prevout_transaction_id, address_script_hash) =
             committed_prevout_fixture()?;
         let store = store_fixture.chain_store().clone();
@@ -1156,15 +1517,26 @@ mod tests {
             spending_block_height,
             spending_block_hash,
         );
+        let derive_dir = tempdir()?;
+        let derive_store = zinder_derive::DeriveStore::open(
+            derive_dir.path(),
+            zinder_derive::DeriveStoreOptions {
+                sync_writes: false,
+                consumer_column_families: &[],
+                tuning: zinder_store::StorageTuning::for_local_tests(),
+            },
+        )?;
 
         commit_ingest_batch(
             &store,
+            &derive_store,
             spending_chain_epoch,
             &mut batch,
             ReorgWindowChange::FinalizeThrough {
                 height: spending_block_height,
             },
-        )?;
+        )
+        .await?;
 
         let page =
             store.transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
@@ -1190,6 +1562,47 @@ mod tests {
         Ok(())
     }
 
+    fn test_built_artifacts(
+        height: u32,
+        in_batch_prevouts: &[TransparentOutPoint],
+        spent_outpoints: &[TransparentOutPoint],
+    ) -> BuiltArtifacts {
+        let block_height = BlockHeight::new(height);
+        let block_hash = test_block_hash(u8::try_from(height).unwrap_or(u8::MAX));
+        let transparent_prevouts = in_batch_prevouts
+            .iter()
+            .copied()
+            .map(|outpoint| {
+                TransparentPrevoutArtifact::new(
+                    outpoint,
+                    1,
+                    vec![0x51],
+                    TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+                    block_height,
+                    block_hash,
+                )
+            })
+            .collect();
+        let transparent_utxo_spends = spent_outpoints
+            .iter()
+            .copied()
+            .map(|outpoint| TransparentUtxoSpendArtifact::new(outpoint, block_height, block_hash))
+            .collect();
+        BuiltArtifacts {
+            block: BlockArtifact::new(block_height, block_hash, test_block_hash(0), Vec::new()),
+            parsed_block: None,
+            compact_block: CompactBlockArtifact::new(block_height, block_hash, Vec::new()),
+            transactions: Vec::new(),
+            transparent_address_utxos: Vec::new(),
+            transparent_prevouts,
+            transparent_utxo_spends,
+            transparent_address_tx_index: Vec::new(),
+            transparent_address_tx_index_spend_candidates: Vec::new(),
+            tip_metadata: ChainTipMetadata::empty(),
+            tree_state: None,
+        }
+    }
+
     fn committed_prevout_fixture() -> Result<
         (
             StoreFixture,
@@ -1200,7 +1613,8 @@ mod tests {
         Box<dyn Error>,
     > {
         let prevout_block = fixture_source_block()?;
-        let prevout_transactions = derive_transaction_artifacts(&prevout_block)?;
+        let prevout_built = derive_for_test(&prevout_block)?;
+        let prevout_transactions = prevout_built.transactions.clone();
         let prevout_transaction_id = prevout_transactions
             .first()
             .ok_or("fixture block must contain a transaction")?
@@ -1220,10 +1634,12 @@ mod tests {
         store.commit_chain_epoch(
             ChainEpochArtifacts::new(
                 prevout_chain_epoch,
-                vec![derive_block_artifact(&prevout_block)?],
-                vec![derive_compact_block_artifact(&prevout_block)?],
+                vec![prevout_built.block.clone()],
+                vec![prevout_built.compact_block],
             )
-            .with_transactions(prevout_transactions),
+            .with_transactions(prevout_transactions)
+            .with_transparent_address_utxos(prevout_built.transparent_address_utxos)
+            .with_transparent_prevouts(prevout_built.transparent_prevouts),
         )?;
 
         Ok((
@@ -1298,7 +1714,7 @@ mod tests {
     fn first_transparent_output_script_pub_key(
         source_block: &SourceBlock,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
-        let compact_block_artifact = derive_compact_block_artifact(source_block)?;
+        let compact_block_artifact = derive_for_test(source_block)?.compact_block;
         let compact_block =
             LightwalletdCompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
         let transaction = compact_block

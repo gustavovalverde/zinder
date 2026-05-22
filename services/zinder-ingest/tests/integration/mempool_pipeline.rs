@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use eyre::Result;
 use tokio::net::TcpListener;
@@ -53,6 +53,17 @@ fn read_mempool_envelopes(
         cursor,
         DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS,
     ))
+}
+
+fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
 }
 
 /// End-to-end wire path: a hydrated mempool entry written through the
@@ -647,6 +658,7 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
         .committed_chain_epoch()
         .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = test_derive_store(store_fixture.tempdir_path())?;
     let mempool_index = MempoolIndex::new();
 
     let (source, control) = MockMempoolSource::streaming();
@@ -658,10 +670,12 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
     let orchestrator_handle = {
         let mempool_index = mempool_index.clone();
         let store_for_orchestrator = store.clone();
+        let derive_store_for_orchestrator = derive_store.clone();
         tokio::spawn(async move {
             run_mempool_orchestrator(
                 Arc::new(source),
                 store_for_orchestrator,
+                derive_store_for_orchestrator,
                 mempool_index,
                 move |outcome| {
                     // SourceStreamOpened is a one-shot lifecycle signal,

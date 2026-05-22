@@ -1,7 +1,7 @@
 //! `ExplorerQuery.MempoolEventCounts` handler.
 //!
 //! Reads the per-second counter rows written by
-//! [`crate::consumer::mempool_event_counts::MempoolEventCountsConsumer`]
+//! [`zinder_derive::MempoolEventCountsConsumer`]
 //! and aggregates them across the requested window.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,10 +14,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
-use crate::consumer::mempool_event_counts::{
-    MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer,
-};
-use crate::store::DeriveStore;
+use zinder_derive::{DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer};
 
 /// Minimum window size accepted by the handler.
 const MIN_WINDOW_SECONDS: u32 = 60;

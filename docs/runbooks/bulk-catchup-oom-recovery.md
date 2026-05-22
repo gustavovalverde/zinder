@@ -128,14 +128,20 @@ max_wal_bytes = 67108864        # 64 MiB
 max_open_files = 256
 ```
 
-Plus a periodic-flush knob under `[ingest.bulk_catchup]` that bounds the live WAL by writer cadence:
+Plus the bulk-catchup ingest knobs:
 
 ```toml
+[ingest.derive]
+concurrency = 8                # parallel derive and replay hydration tasks
+
 [ingest.bulk_catchup]
-flush_every_n_epochs = 5
+fetch_concurrency = 32         # in-flight block fetches
+flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
 
-With `commit_batch_blocks = 1000` and `flush_every_n_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+With `commit_batch_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+
+`ingest.derive.concurrency` adds at most `N × (avg SourceBlock + avg DerivedBlockArtifacts)` of in-flight RAM (roughly 100 KB per slot on mainnet). At the default `clamp(available_parallelism() - 1, 4, 32)`, the in-flight derive contribution is at most a few MiB and is negligible alongside the batch accumulator and RocksDB write buffers. Startup derive replay uses the same cap while hydrating one retained canonical event at a time. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
 RAM-constrained hosts drop the cache to 128 MiB and the WAL ceiling to 64 MiB; high-throughput hosts can raise the cache to 1 GiB. The architectural invariants (WAL on, point-in-time recovery, atomic cross-CF flush, ordered writes) are not exposed to operator tuning because each one is a contract of the per-`ChainEpoch` commit guarantee.
 

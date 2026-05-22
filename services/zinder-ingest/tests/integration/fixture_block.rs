@@ -16,19 +16,36 @@ use zinder_core::{
     Network, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    ArtifactDeriveError, BlockMismatchField, derive_block_artifact, derive_compact_block_artifact,
-    derive_transaction_artifacts,
+    ArtifactDeriveError, BlockMismatchField, BuiltArtifacts, CommitmentTreeSizes, derive_block,
+    finalize_derived_block,
 };
+
+/// Runs the production two-stage pipeline against an empty offset.
+///
+/// Calls `derive_block` then `finalize_derived_block` on `source_block`
+/// with a zeroed running commitment-tree position, returning the
+/// finalized `BuiltArtifacts`. Use this when a test wants the full
+/// artifact set from one fixture block.
+fn derive_for_test(source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError> {
+    let derived = derive_block(source_block)?;
+    let mut counters = CommitmentTreeSizes::default();
+    finalize_derived_block(derived, &mut counters)
+}
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{SourceBlock, decode_display_block_hash};
 use zinder_store::ChainEpochArtifacts;
 use zinder_testkit::StoreFixture;
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "this end-to-end fixture test asserts the full artifact surface in one place"
+)]
 fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
-    let block_artifact = derive_block_artifact(&source_block)?;
-    let compact_block_artifact = derive_compact_block_artifact(&source_block)?;
+    let built = derive_for_test(&source_block)?;
+    let block_artifact = built.block;
+    let compact_block_artifact = built.compact_block;
 
     assert_eq!(block_artifact.height, BlockHeight::new(1));
     assert_eq!(block_artifact.block_hash, source_block.hash);
@@ -95,7 +112,7 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         tip_hash: source_block.hash,
         finalized_height: source_block.height,
         finalized_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -119,7 +136,10 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
 #[test]
 fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
-    let transactions = derive_transaction_artifacts(&source_block)?;
+    let built = derive_for_test(&source_block)?;
+    let block_artifact = built.block;
+    let compact_block_artifact = built.compact_block;
+    let transactions = built.transactions;
     assert_eq!(
         transactions.len(),
         1,
@@ -134,9 +154,6 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         !coinbase.payload_bytes.is_empty(),
         "coinbase serialized payload bytes must be present"
     );
-
-    let block_artifact = derive_block_artifact(&source_block)?;
-    let compact_block_artifact = derive_compact_block_artifact(&source_block)?;
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let chain_epoch = ChainEpoch {
@@ -146,7 +163,7 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         tip_hash: source_block.hash,
         finalized_height: source_block.height,
         finalized_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -175,7 +192,7 @@ fn testnet_sapling_block_compact_artifact_carries_sapling_outputs() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
     )?;
-    let compact_block_artifact = derive_compact_block_artifact(&source_block)?;
+    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
@@ -211,7 +228,7 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
     )?;
-    let compact_block_artifact = derive_compact_block_artifact(&source_block)?;
+    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
@@ -246,11 +263,9 @@ fn compact_block_builder_rejects_observed_tree_size_mismatch() -> Result<(), Box
         br#"{"sapling":{"commitments":{"size":1}},"orchard":{"commitments":{"size":0}}}"#.to_vec(),
     );
 
-    let error = match derive_compact_block_artifact(&source_block) {
-        Ok(compact_block_artifact) => {
-            return Err(
-                format!("expected tree-size mismatch, got {compact_block_artifact:?}").into(),
-            );
+    let error = match derive_for_test(&source_block) {
+        Ok(built) => {
+            return Err(format!("expected tree-size mismatch, got {built:?}").into());
         }
         Err(error) => error,
     };
@@ -341,8 +356,11 @@ async fn backfill_rejects_wrong_checkpoint_tree_metadata() -> Result<(), Box<dyn
         from_height: BlockHeight::new(1),
         to_height: BlockHeight::new(1),
         commit_batch_blocks: NonZeroU32::new(1).ok_or("invalid batch size")?,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            .ok_or("invalid prevout budget")?,
         fetch_concurrency: NonZeroU32::new(4).ok_or("invalid fetch concurrency")?,
-        flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
+        derive_concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
+        flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: true,
         checkpoint: Some(SourceChainCheckpoint::new(
@@ -435,12 +453,9 @@ fn assert_compact_block_mismatch(
     source_block: &SourceBlock,
     expected_field: BlockMismatchField,
 ) -> Result<(), Box<dyn Error>> {
-    let error = match derive_compact_block_artifact(source_block) {
-        Ok(compact_block_artifact) => {
-            return Err(format!(
-                "expected compact block build failure, got {compact_block_artifact:?}"
-            )
-            .into());
+    let error = match derive_for_test(source_block) {
+        Ok(built) => {
+            return Err(format!("expected compact block build failure, got {built:?}").into());
         }
         Err(error) => error,
     };

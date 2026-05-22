@@ -10,7 +10,7 @@ use tonic::{Code, Request};
 use tonic_types::StatusExt;
 use zinder_core::{
     ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentAddressUtxoArtifact,
-    TransparentOutPoint,
+    TransparentOutPoint, TransparentPrevoutArtifact,
 };
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
@@ -236,9 +236,27 @@ fn commit_transparent_address_utxos(
         ));
     }
 
+    let prevouts = utxos
+        .iter()
+        .map(transparent_prevout_from_utxo)
+        .collect::<Vec<_>>();
     let mut artifacts = ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block]);
     artifacts = artifacts.with_transparent_address_utxos(utxos.clone());
+    artifacts = artifacts.with_transparent_prevouts(prevouts);
     store.commit_chain_epoch(artifacts)?;
 
     Ok(utxos)
+}
+
+fn transparent_prevout_from_utxo(
+    utxo: &TransparentAddressUtxoArtifact,
+) -> TransparentPrevoutArtifact {
+    TransparentPrevoutArtifact::new(
+        utxo.outpoint,
+        utxo.value_zat,
+        utxo.script_pub_key.clone(),
+        utxo.address_script_hash,
+        utxo.block_height,
+        utxo.block_hash,
+    )
 }

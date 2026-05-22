@@ -7,6 +7,7 @@
 mod artifact_builder;
 mod backfill;
 mod chain_ingest;
+mod derive_consumers;
 mod ingest_control;
 mod ingest_loop;
 mod mempool;
@@ -14,18 +15,23 @@ mod phase;
 mod retention;
 mod source_recovery;
 mod tip_follow;
+mod transparent_prevout_lookup;
 mod upstream_health_probe;
 
 pub use artifact_builder::{
-    ArtifactDeriveError, BlockMismatchField, derive_block_artifact, derive_compact_block_artifact,
-    derive_transaction_artifacts,
+    ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
+    ObservedCommitmentTreeSizes, TransparentAddressTxIndexSpendCandidate, derive_block,
+    finalize_derived_block,
 };
 pub use backfill::{BackfillConfig, backfill, backfill_until_complete, backfill_with_store};
-pub use chain_ingest::{IngestError, NodeSourceKind};
+pub use chain_ingest::{BuiltArtifacts, IngestError, NodeSourceKind};
+pub use derive_consumers::{
+    catch_up_derive_store_to_canonical, open_primary_derive_store_for_canonical,
+};
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use ingest_loop::{
-    BulkCatchupConfig, IngestLoopConfig, IngestModifiers, PhasesConfig, TipFollowPhaseConfig,
-    TipFollowSubsystems, TipFollowSubsystemsLauncher, run_ingest_loop,
+    BulkCatchupConfig, IngestDeriveConfig, IngestLoopConfig, IngestModifiers, PhasesConfig,
+    TipFollowPhaseConfig, TipFollowSubsystems, TipFollowSubsystemsLauncher, run_ingest_loop,
 };
 pub use mempool::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolOrchestratorError,

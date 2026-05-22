@@ -27,18 +27,17 @@
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zebra_chain::transparent;
 use zinder_core::wire::{encode_height_key_ascending, encode_internal_transaction_id};
-use zinder_core::{BlockHeight, TransactionId, TransparentOutPoint};
+use zinder_core::{BlockHeight, TransactionId, TransparentOutPoint, TransparentPrevout};
 use zinder_proto::v1::explorer::{
     PrevoutResolutionStatus, TransactionFeesRecord, TransparentInputDetail,
 };
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockSource, DeriveConsumerCtx, DeriveConsumerError,
+    BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
 };
 
@@ -64,16 +63,14 @@ pub const TRANSACTION_FEES_CONSUMER_NAME: DeriveConsumerName =
 const TXID_LEN: usize = 32;
 
 /// Materializes per-tx paid-fee records.
-pub struct TransactionFeesConsumer {
-    block_source: BlockSource,
-}
+#[derive(Default)]
+pub struct TransactionFeesConsumer;
 
 impl TransactionFeesConsumer {
-    /// Builds a consumer reading parsed blocks (and lazily-resolved
-    /// prevouts) from `block_source`.
+    /// Builds the consumer.
     #[must_use]
-    pub const fn new(block_source: BlockSource) -> Self {
-        Self { block_source }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Returns the persisted [`TransactionFeesRecord`] for `transaction_id`,
@@ -121,26 +118,17 @@ impl TransactionFeesConsumer {
     }
 }
 
-#[async_trait]
 impl BlockKeyedConsumer for TransactionFeesConsumer {
     fn name(&self) -> DeriveConsumerName {
         TRANSACTION_FEES_CONSUMER_NAME
     }
 
-    fn block_source(&self) -> &BlockSource {
-        &self.block_source
-    }
-
-    fn prefetch_prevouts(&self) -> bool {
-        true
-    }
-
-    async fn apply_block(
+    fn apply_block(
         &mut self,
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let prevouts = block.prevouts().await?;
+        let prevouts = block.prevouts()?;
         let fees_cf = ctx
             .store
             .consumer_column_family(TRANSACTION_FEES_COLUMN_FAMILY)?;
@@ -171,7 +159,7 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
         Ok(())
     }
 
-    async fn revert_block(
+    fn revert_block(
         &mut self,
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,
@@ -207,7 +195,7 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
 
 fn build_fee_record(
     transaction: &ZebraTransaction,
-    prevouts: Option<&HashMap<TransparentOutPoint, transparent::Output>>,
+    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
 ) -> TransactionFeesRecord {
     let counts = zinder_source::transaction_component_counts(transaction);
     let logical_actions = counts.logical_actions();
@@ -233,7 +221,7 @@ fn build_fee_record(
                     TransactionId::from_bytes(outpoint.hash.0),
                     outpoint.index,
                 );
-                let value_zat = prevouts_map.get(&outpoint).map(|out| i64::from(out.value));
+                let value_zat = prevouts_map.get(&outpoint).map(|out| out.value_zat);
                 if let Some(zat) = value_zat {
                     total_transparent_input_zat =
                         total_transparent_input_zat.saturating_add(i128::from(zat));
@@ -242,7 +230,7 @@ fn build_fee_record(
                 }
                 transparent_inputs.push(TransparentInputDetail {
                     input_index,
-                    value_zat: value_zat.and_then(|amount| u64::try_from(amount).ok()),
+                    value_zat,
                 });
             }
             transparent::Input::Coinbase { .. } => {}

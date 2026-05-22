@@ -35,8 +35,8 @@ docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 
 The first `up -d` does two things in sequence:
 
-1. **Builds** `zinder-ingest:latest` and `zinder-query:latest` locally (5 to 10 minutes on a warm Docker).
-2. **Starts** `zinder-ingest` and `zinder-query`. The writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per epoch on a cold store (about 30 to 60 minutes on testnet, several hours on mainnet), then transitions to `TipFollow` automatically once the gap closes through the reorg window. No bootstrap step, no separate one-shot service.
+1. **Builds** `zinder-ingest:latest`, `zinder-query:latest`, and `zinder-explorer:latest` locally from the shared `deploy/Dockerfile` builder. The first target compiles every shipped runtime binary once; later targets reuse the same BuildKit Cargo cache.
+2. **Starts** `zinder-ingest`, `zinder-query`, and `zinder-explorer`. The writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per epoch on a cold store (about 30 to 60 minutes on testnet, several hours on mainnet), then transitions to `TipFollow` automatically once the gap closes through the reorg window. No bootstrap step, no separate one-shot service.
 
 From another terminal:
 

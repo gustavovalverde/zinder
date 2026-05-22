@@ -10,7 +10,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    Network, TreeStateArtifact,
+    Network,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
@@ -21,11 +21,14 @@ use zinder_store::{
     ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
 };
 
+use crate::artifact_builder::{
+    CommitmentTreeSizes, DerivedBlockArtifacts, derive_block, finalize_derived_block,
+};
 use crate::chain_ingest::{
-    ArtifactBuilder, IngestArtifactBuilder, IngestBatch, IngestError, IngestRetryState,
-    IngestSubtreeRootIndexes, commit_ingest_batch, current_unix_millis, fetch_block_with_retry,
-    next_chain_epoch_id_after, next_chain_epoch_id_from, populate_subtree_root_artifacts,
-    record_commit_outcome, select_best_chain,
+    IngestBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
+    current_unix_millis, fetch_block_with_retry, next_chain_epoch_id_after,
+    next_chain_epoch_id_from, populate_subtree_root_artifacts, record_commit_outcome,
+    record_ingest_derive_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
 use crate::phase::current_chain_height;
@@ -81,7 +84,21 @@ where
     Source: NodeSource,
 {
     let store = open_tip_follow_store(config)?;
-    tip_follow_with_primary_store(config, source, store, readiness, None, None, cancel).await
+    let derive_store = crate::derive_consumers::open_primary_derive_store_for_canonical(
+        &config.storage_path,
+        config.storage_tuning,
+    )?;
+    tip_follow_with_primary_store(
+        config,
+        source,
+        store,
+        derive_store,
+        readiness,
+        None,
+        None,
+        cancel,
+    )
+    .await
 }
 
 /// Opens the primary store with the tip-follow reorg-window policy.
@@ -114,6 +131,7 @@ pub async fn tip_follow_with_primary_store<Source>(
     config: &TipFollowConfig,
     source: &Source,
     store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
     chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
@@ -126,37 +144,41 @@ where
         config,
         source,
         store,
+        derive_store,
         readiness,
         mempool_ready_gate,
         chain_tip_source,
         cancel,
-        IngestArtifactBuilder::with_initial_tip_metadata,
+        derive_block,
     )
     .await
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "tip-follow loop tests inject the artifact builder while production callers keep the public dependency list explicit."
+    reason = "tip-follow loop tests inject the derive function while production callers keep the public dependency list explicit."
 )]
 #[allow(
     clippy::too_many_lines,
     reason = "the tip-follow loop is one auditable sequence of select+recover+commit+finalize+readiness; splitting it would scatter the contract across helpers without simplifying any single decision."
 )]
-async fn run_tip_follow_loop<Source, Builder, MakeBuilder>(
+async fn run_tip_follow_loop<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
     chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
     cancel: CancellationToken,
-    make_artifact_builder: MakeBuilder,
+    derive_fn: Derive,
 ) -> Result<(), IngestError>
 where
     Source: NodeSource,
-    Builder: ArtifactBuilder,
-    MakeBuilder: Fn(ChainTipMetadata) -> Builder + Copy,
+    Derive: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+        + Copy
+        + Send
+        + Sync,
 {
     let mut retry_state = IngestRetryState::default();
     let chain_tip_task_cancel = cancel.child_token();
@@ -172,12 +194,13 @@ where
             () = tokio::time::sleep(config.poll_interval) => {}
         }
 
-        let mut iteration = match tip_follow_once_with_artifact_builder(
+        let mut iteration = match tip_follow_once(
             config,
             source,
             &store,
+            &derive_store,
             &mut retry_state,
-            make_artifact_builder,
+            derive_fn,
         )
         .await
         {
@@ -491,17 +514,22 @@ pub(crate) struct TipFollowIteration {
     pub(crate) commit_outcome: Option<ChainEpochCommitOutcome>,
 }
 
-async fn tip_follow_once_with_artifact_builder<Source, Builder, MakeBuilder>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tip-follow iteration owns config, source, two stores, readiness, optional mempool coordination, cancellation, and an injected derive function"
+)]
+async fn tip_follow_once<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
     retry_state: &mut IngestRetryState,
-    make_builder: MakeBuilder,
+    derive_fn: Derive,
 ) -> Result<TipFollowIteration, IngestError>
 where
     Source: NodeSource,
-    Builder: ArtifactBuilder,
-    MakeBuilder: FnOnce(ChainTipMetadata) -> Builder,
+    Derive:
+        Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError> + Send + Sync,
 {
     let observed_tip_id = source.tip_id().await?;
     let current_chain_epoch = store.current_chain_epoch()?;
@@ -520,13 +548,13 @@ where
             commit_outcome: None,
         });
     };
-    let mut artifact_builder = make_builder(plan.parent_tip_metadata);
 
     let commit_outcome = commit_tip_follow_blocks(
         config,
         source,
         store,
-        &mut artifact_builder,
+        derive_store,
+        &derive_fn,
         plan,
         current_chain_epoch,
         retry_state,
@@ -780,22 +808,25 @@ fn tip_metadata_at(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "private commit helper keeps artifact-builder test injection visible"
+    reason = "private commit helper keeps the derive-function test injection visible"
 )]
-async fn commit_tip_follow_blocks<Source, Builder>(
+async fn commit_tip_follow_blocks<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    artifact_builder: &mut Builder,
+    derive_store: &zinder_derive::DeriveStore,
+    derive_fn: &Derive,
     plan: TipFollowPlan,
     current_chain_epoch: Option<ChainEpoch>,
     retry_state: &mut IngestRetryState,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource,
-    Builder: ArtifactBuilder,
+    Derive:
+        Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError> + Send + Sync,
 {
     let mut batch = IngestBatch::default();
+    let mut running_tree_sizes = CommitmentTreeSizes::from_tip_metadata(plan.parent_tip_metadata);
     for source_block in plan.source_blocks {
         if source_block.network != config.node.network {
             return Err(IngestError::Source(
@@ -805,30 +836,15 @@ where
             ));
         }
 
-        let built_artifacts = artifact_builder.build(&source_block)?;
-        if let Some(tree_state_payload_bytes) = source_block.tree_state_payload_bytes {
-            batch.tree_states.push(TreeStateArtifact::new(
-                source_block.height,
-                source_block.hash,
-                tree_state_payload_bytes,
-            ));
-        }
-        batch.finalized_blocks.push(built_artifacts.block);
-        batch.compact_blocks.push(built_artifacts.compact_block);
-        batch.transactions.extend(built_artifacts.transactions);
-        batch
-            .transparent_address_utxos
-            .extend(built_artifacts.transparent_address_utxos);
-        batch
-            .transparent_utxo_spends
-            .extend(built_artifacts.transparent_utxo_spends);
-        batch
-            .transparent_address_tx_index
-            .extend(built_artifacts.transparent_address_tx_index);
-        batch
-            .transparent_address_tx_index_spend_candidates
-            .extend(built_artifacts.transparent_address_tx_index_spend_candidates);
-        batch.tip_metadata = Some(built_artifacts.tip_metadata);
+        let derive_started_at = Instant::now();
+        let built_outcome = derive_fn(&source_block)
+            .map_err(IngestError::from)
+            .and_then(|derived| {
+                finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
+            });
+        record_ingest_derive_outcome(derive_started_at, &built_outcome);
+        let built = built_outcome?;
+        batch.absorb(built);
     }
 
     let next_subtree_root_indexes =
@@ -849,7 +865,14 @@ where
         &batch,
     )?;
 
-    commit_ingest_batch(store, chain_epoch, &mut batch, plan.reorg_window_change)
+    commit_ingest_batch(
+        store,
+        derive_store,
+        chain_epoch,
+        &mut batch,
+        plan.reorg_window_change,
+    )
+    .await
 }
 
 fn chain_epoch_for_tip_commit(
@@ -944,15 +967,9 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::stream;
     use parking_lot::Mutex;
-    use prost::Message;
     use tempfile::tempdir;
-    use zinder_core::{
-        BlockArtifact, CompactBlockArtifact, SubtreeRootHash, SubtreeRootIndex,
-        wire::encode_internal_block_hash,
-    };
-    use zinder_proto::compat::lightwalletd::{
-        ChainMetadata, CompactBlock as LightwalletdCompactBlock,
-    };
+    use zinder_core::{SubtreeRootHash, SubtreeRootIndex};
+    use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_runtime::ReadinessCause;
     use zinder_source::{
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
@@ -960,7 +977,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::chain_ingest::BuiltArtifacts;
 
     #[tokio::test]
     async fn tip_follow_commits_first_available_height() -> Result<(), Box<dyn Error>> {
@@ -1141,6 +1157,7 @@ mod tests {
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
+        let derive_store = test_derive_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1151,11 +1168,12 @@ mod tests {
                     &config,
                     &source,
                     store,
+                    derive_store,
                     &readiness,
                     None,
                     None,
                     cancel,
-                    |_| TestArtifactBuilder,
+                    test_derive_block_fn,
                 )
                 .await
             })
@@ -1184,6 +1202,7 @@ mod tests {
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
+        let derive_store = test_derive_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1194,11 +1213,12 @@ mod tests {
                     &config,
                     &source,
                     store,
+                    derive_store,
                     &readiness,
                     None,
                     None,
                     cancel,
-                    |_| TestArtifactBuilder,
+                    test_derive_block_fn,
                 )
                 .await
             })
@@ -1352,12 +1372,73 @@ mod tests {
         store: &PrimaryChainStore,
         retry_state: &mut IngestRetryState,
     ) -> Result<Option<ChainEpochCommitOutcome>, IngestError> {
-        let iteration =
-            tip_follow_once_with_artifact_builder(config, source, store, retry_state, |_| {
-                TestArtifactBuilder
-            })
-            .await?;
+        let derive_store = test_derive_store(&config.storage_path)?;
+        let iteration = tip_follow_once(
+            config,
+            source,
+            store,
+            &derive_store,
+            retry_state,
+            test_derive_block_fn,
+        )
+        .await?;
         Ok(iteration.commit_outcome)
+    }
+
+    fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore, IngestError> {
+        Ok(zinder_derive::DeriveStore::open(
+            zinder_derive::DeriveStore::path_for_canonical(storage_path),
+            zinder_derive::DeriveStoreOptions {
+                sync_writes: false,
+                consumer_column_families: &[],
+                tuning: zinder_store::StorageTuning::for_local_tests(),
+            },
+        )?)
+    }
+
+    /// Test derive function for the tip-follow loop.
+    ///
+    /// Ignores the source block content and returns a synthetic
+    /// `DerivedBlockArtifacts`, so tests can drive the loop against
+    /// `TestNodeSource`'s mock blocks (which carry
+    /// `format!("raw-block-{height}")` payloads rather than real Zcash
+    /// bytes that would parse through `derive_block`).
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "must match the Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, _> shape tip-follow expects"
+    )]
+    fn test_derive_block_fn(
+        source_block: &SourceBlock,
+    ) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError> {
+        Ok(DerivedBlockArtifacts {
+            block: zinder_core::BlockArtifact::new(
+                source_block.height,
+                source_block.hash,
+                source_block.parent_hash,
+                source_block.raw_block_bytes.clone(),
+            ),
+            parsed_block: None,
+            partial_compact_block: LightwalletdCompactBlock {
+                proto_version: 1,
+                height: u64::from(source_block.height.value()),
+                hash: zinder_core::wire::encode_internal_block_hash(source_block.hash).to_vec(),
+                prev_hash: zinder_core::wire::encode_internal_block_hash(source_block.parent_hash)
+                    .to_vec(),
+                time: source_block.block_time_seconds,
+                header: Vec::new(),
+                vtx: Vec::new(),
+                chain_metadata: None,
+            },
+            tree_size_additions: CommitmentTreeSizes::default(),
+            observed_tree_sizes: None,
+            tree_state: None,
+            transactions: Vec::new(),
+            transparent_address_utxos: Vec::new(),
+            transparent_prevouts: Vec::new(),
+            transparent_utxo_spends: Vec::new(),
+            transparent_address_tx_index: Vec::new(),
+            transparent_address_tx_index_spend_candidates: Vec::new(),
+        })
     }
 
     struct TestNodeSource {
@@ -1565,52 +1646,6 @@ mod tests {
 
     fn test_tree_state_payload() -> Vec<u8> {
         br#"{"sapling":{"commitments":{"size":0}},"orchard":{"commitments":{"size":0}}}"#.to_vec()
-    }
-
-    struct TestArtifactBuilder;
-
-    impl ArtifactBuilder for TestArtifactBuilder {
-        fn build(
-            &mut self,
-            source_block: &SourceBlock,
-        ) -> Result<crate::chain_ingest::BuiltArtifacts, crate::ArtifactDeriveError> {
-            Ok(BuiltArtifacts {
-                block: BlockArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    source_block.parent_hash,
-                    source_block.raw_block_bytes.clone(),
-                ),
-                compact_block: CompactBlockArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    test_compact_block_payload(source_block.height, source_block.hash),
-                ),
-                transactions: Vec::new(),
-                transparent_address_utxos: Vec::new(),
-                transparent_utxo_spends: Vec::new(),
-                transparent_address_tx_index: Vec::new(),
-                transparent_address_tx_index_spend_candidates: Vec::new(),
-                tip_metadata: ChainTipMetadata::empty(),
-            })
-        }
-    }
-
-    fn test_compact_block_payload(height: BlockHeight, block_hash: BlockHash) -> Vec<u8> {
-        LightwalletdCompactBlock {
-            proto_version: 1,
-            height: u64::from(height.value()),
-            hash: encode_internal_block_hash(block_hash).into(),
-            prev_hash: Vec::new(),
-            time: 1_774_668_400,
-            header: Vec::new(),
-            vtx: Vec::new(),
-            chain_metadata: Some(ChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-            }),
-        }
-        .encode_to_vec()
     }
 
     fn block_hash(seed: u32) -> BlockHash {

@@ -13,6 +13,8 @@ on:
       - ".dockerignore"
       - "crates/**"
       - "services/**"
+      - "deploy/Dockerfile"
+      - "deploy/docker-compose.yml"
       - "deploy/single-container/**"
       - "buf.yaml"
       - ".github/workflows/build-images.yml"
@@ -27,53 +29,42 @@ concurrency:
 
 jobs:
   build:
-    name: build ${{ matrix.image.name }}
+    name: build runtime images
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        image:
-          - name: zinder-ingest
-            dockerfile: services/zinder-ingest/Dockerfile
-            help_entrypoint: zinder-ingest
-          - name: zinder-query
-            dockerfile: services/zinder-query/Dockerfile
-            help_entrypoint: zinder-query
-          - name: zinder-compat-lightwalletd
-            dockerfile: services/zinder-compat-lightwalletd/Dockerfile
-            help_entrypoint: zinder-compat-lightwalletd
-          - name: zinder-explorer
-            dockerfile: services/zinder-explorer/Dockerfile
-            help_entrypoint: zinder-explorer
-          - name: zinder
-            dockerfile: deploy/single-container/Dockerfile
-            help_entrypoint: zinder-query
     env:
-      IMAGE_NAME: ${{ matrix.image.name }}
-      HELP_ENTRYPOINT: ${{ matrix.image.help_entrypoint }}
       PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}
+      CACHE_SCOPE: zinder-rust-pr
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.image.dockerfile }}
-          push: false
-          load: true
-          tags: ${{ matrix.image.name }}:${{ env.PR_TAG }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
-
-      - name: Inspect image
+      - name: Build and smoke test images
         run: |
-          docker image inspect "$IMAGE_NAME:$PR_TAG" \
-            --format 'image={{.Id}} size_bytes={{.Size}}'
+          set -euo pipefail
 
-      - name: Smoke test CLI help
-        run: |
-          docker run --rm --entrypoint="$HELP_ENTRYPOINT" "$IMAGE_NAME:$PR_TAG" --help
+          images=(
+            "zinder-ingest:zinder-ingest:zinder-ingest"
+            "zinder-query:zinder-query:zinder-query"
+            "zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd"
+            "zinder-explorer:zinder-explorer:zinder-explorer"
+            "zinder:zinder-single-container:zinder-query"
+          )
+
+          for image in "${images[@]}"; do
+            IFS=: read -r image_name target help_entrypoint <<< "$image"
+
+            docker buildx build \
+              --file deploy/Dockerfile \
+              --target "$target" \
+              --load \
+              --tag "${image_name}:${PR_TAG}" \
+              --cache-from "type=gha,scope=${CACHE_SCOPE}" \
+              --cache-to "type=gha,scope=${CACHE_SCOPE},mode=max" \
+              .
+
+            docker image inspect "${image_name}:${PR_TAG}" \
+              --format 'image={{.Id}} size_bytes={{.Size}}'
+            docker run --rm --entrypoint="$help_entrypoint" "${image_name}:${PR_TAG}" --help
+          done

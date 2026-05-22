@@ -257,8 +257,10 @@ fn network_to_wire_string_match_lives_only_in_wire_module() -> Result<()> {
 
 #[test]
 fn deleted_chain_name_helpers_have_no_lingering_references() -> Result<()> {
-    // Phase 2 deleted these helpers and their tests; assert no caller resurrects
-    // them. Each banned identifier was a private alias that drifted from
+    // These helpers were private aliases that drifted from the canonical wire
+    // encoders. Assert no caller resurrects them.
+    //
+    // Each banned identifier was a private alias that drifted from
     // `zinder_core::wire::encode_bip70_chain_name` or `encode_zinder_native_chain_name`.
     const BANNED_IDENTIFIERS: &[&str] = &[
         "lightwalletd_chain_name",
@@ -285,7 +287,8 @@ fn deleted_chain_name_helpers_have_no_lingering_references() -> Result<()> {
 
     assert!(
         offenders.is_empty(),
-        "Phase 2 deleted these helpers; replace any remaining call sites with \
+        "deleted chain-name helpers must not be referenced; replace any remaining \
+         call sites with \
          `zinder_core::wire::*`:\n  {}\n\
          (Tracking doc: {})",
         offenders

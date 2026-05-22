@@ -60,6 +60,13 @@ pub enum MempoolOrchestratorError {
         #[source]
         source: StoreError,
     },
+    /// Applying a mempool event to the derive plane failed.
+    #[error("mempool derive dispatch failed")]
+    DeriveDispatch {
+        /// Underlying derive dispatch failure.
+        #[source]
+        source: crate::IngestError,
+    },
     /// The chain store returned an error while reading the visible chain
     /// epoch for hydration.
     #[error("mempool source observation could not stamp chain epoch")]
@@ -79,6 +86,7 @@ pub enum MempoolOrchestratorError {
 pub async fn run_mempool_orchestrator(
     source: Arc<dyn MempoolSource>,
     chain_store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     mempool_index: MempoolIndex,
     mut on_event_outcome: impl FnMut(MempoolOrchestratorEventOutcome),
 ) -> Result<(), MempoolOrchestratorError> {
@@ -99,6 +107,7 @@ pub async fn run_mempool_orchestrator(
                     visible_chain_epoch,
                     &mempool_index,
                     &chain_store,
+                    &derive_store,
                 )?
             }
             Err(_source_error) => {
@@ -120,6 +129,7 @@ fn commit_source_event(
     visible_chain_epoch: Option<ChainEpoch>,
     mempool_index: &MempoolIndex,
     chain_store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
 ) -> Result<MempoolOrchestratorEventOutcome, MempoolOrchestratorError> {
     let canonical_event = match canonical_event_from_source(source_event, visible_chain_epoch) {
         Ok(canonical_event) => canonical_event,
@@ -143,9 +153,13 @@ fn commit_source_event(
         return Ok(MempoolOrchestratorEventOutcome::NoChange);
     }
 
-    let _envelope = chain_store
+    let envelope = chain_store
         .append_mempool_event(canonical_event.clone(), UnixTimestampMillis::now())
         .map_err(|source| MempoolOrchestratorError::EventLogAppendFailed { source })?;
+    if derive_store.has_consumer_column_families() {
+        crate::derive_consumers::dispatch_mempool_event(derive_store, &envelope)
+            .map_err(|source| MempoolOrchestratorError::DeriveDispatch { source })?;
+    }
     let _apply_outcome = apply_to_index(mempool_index, canonical_event);
     record_mempool_size_gauges(mempool_index, chain_store);
     Ok(MempoolOrchestratorEventOutcome::Applied)

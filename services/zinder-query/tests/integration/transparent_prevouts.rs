@@ -7,45 +7,48 @@ use eyre::eyre;
 use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
-    BlockHeight, ChainEpoch, TransactionArtifact, TransactionId, TransparentOutPoint,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentPrevoutArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
-use zinder_store::ChainEpochArtifacts;
-use zinder_testkit::{
-    P2pkhSpendArgs, StoreFixture, TransparentAddress as TestkitTransparentAddress,
-    TransparentTestKey, sample_regtest_upgrade_activations,
-};
+use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::synthetic_chain_epoch;
 
-const FIXTURE_SEED: [u8; 32] = [
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10,
-    0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-];
-
-fn synthetic_p2pkh_transaction(
+fn synthetic_transparent_prevout_artifact(
     block_height: BlockHeight,
-    block_hash: zinder_core::BlockHash,
+    block_hash: BlockHash,
     transaction_id_seed: u8,
-    recipient_byte: u8,
-    target_height: u32,
-) -> eyre::Result<TransactionArtifact> {
-    let key = TransparentTestKey::from_seed(&FIXTURE_SEED)?;
-    let recipient = TestkitTransparentAddress::PublicKeyHash([recipient_byte; 20]);
-    let raw_bytes = key.build_p2pkh_spend(&P2pkhSpendArgs {
-        coinbase_txid_be: [0xAA; 32],
-        coinbase_vout: 0,
-        coinbase_value_zats: 10_000_000,
-        recipient: &recipient,
-        target_height,
-    })?;
-    Ok(TransactionArtifact::new(
-        TransactionId::from_bytes([transaction_id_seed; 32]),
+    script_seed: u8,
+) -> TransparentPrevoutArtifact {
+    let outpoint =
+        TransparentOutPoint::new(TransactionId::from_bytes([transaction_id_seed; 32]), 0);
+    let script_pub_key = vec![0x76, 0xa9, script_seed, 0x88, 0xac];
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
+    TransparentPrevoutArtifact::new(
+        outpoint,
+        10_000_000 + u64::from(script_seed),
+        script_pub_key,
+        address_script_hash,
         block_height,
         block_hash,
-        raw_bytes,
-    ))
+    )
+}
+
+fn transparent_address_utxo_from_prevout(
+    prevout: &TransparentPrevoutArtifact,
+) -> TransparentAddressUtxoArtifact {
+    TransparentAddressUtxoArtifact::new(
+        prevout.address_script_hash,
+        prevout.script_pub_key.clone(),
+        prevout.outpoint,
+        prevout.value_zat,
+        prevout.block_height,
+        prevout.block_hash,
+    )
 }
 
 #[tokio::test]
@@ -53,20 +56,19 @@ async fn transparent_prevouts_resolves_known_outpoint() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let transaction = synthetic_p2pkh_transaction(block.height, block.block_hash, 0xCC, 0x77, 120)?;
-    let transaction_id = transaction.transaction_id;
+    let prevout =
+        synthetic_transparent_prevout_artifact(block.height, block.block_hash, 0xCC, 0x77);
+    let outpoint = prevout.outpoint;
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transactions(vec![transaction]),
+            .with_transparent_address_utxos(vec![transparent_address_utxo_from_prevout(&prevout)])
+            .with_transparent_prevouts(vec![prevout]),
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
-        .transparent_prevouts(
-            vec![TransparentOutPoint::new(transaction_id, 0)],
-            None::<ChainEpoch>,
-        )
+        .transparent_prevouts(vec![outpoint], None::<ChainEpoch>)
         .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
@@ -74,11 +76,11 @@ async fn transparent_prevouts_resolves_known_outpoint() -> eyre::Result<()> {
     let prevout = response.entries[0]
         .prevout
         .as_ref()
-        .ok_or_else(|| eyre!("expected resolved prevout for indexed transaction"))?;
-    assert!(prevout.value_zat > 0, "P2PKH spend should produce a value");
+        .ok_or_else(|| eyre!("expected resolved indexed transparent prevout"))?;
+    assert!(prevout.value_zat > 0, "prevout should carry a value");
     assert!(
         !prevout.script_pub_key.is_empty(),
-        "P2PKH spend should produce a non-empty scriptPubKey",
+        "prevout should carry a non-empty scriptPubKey",
     );
     Ok(())
 }
@@ -119,12 +121,14 @@ async fn transparent_prevouts_returns_none_for_out_of_bounds_index() -> eyre::Re
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let transaction = synthetic_p2pkh_transaction(block.height, block.block_hash, 0xAB, 0x33, 120)?;
-    let transaction_id = transaction.transaction_id;
+    let prevout =
+        synthetic_transparent_prevout_artifact(block.height, block.block_hash, 0xAB, 0x33);
+    let transaction_id = prevout.outpoint.transaction_id;
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transactions(vec![transaction]),
+            .with_transparent_address_utxos(vec![transparent_address_utxo_from_prevout(&prevout)])
+            .with_transparent_prevouts(vec![prevout]),
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
@@ -233,7 +237,7 @@ fn commit_two_block_fixture(
         tip_hash: second_hash,
         finalized_height: second_height,
         finalized_hash: second_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000),
     };
@@ -256,20 +260,28 @@ fn commit_two_block_fixture(
         CompactBlockArtifact::new(first_height, first_hash, b"compact-block-1-100".to_vec()),
         CompactBlockArtifact::new(second_height, second_hash, b"compact-block-1-101".to_vec()),
     ];
-    let transactions = vec![
-        synthetic_p2pkh_transaction(first_height, first_hash, 0xA1, 0x11, 200)?,
-        synthetic_p2pkh_transaction(first_height, first_hash, 0xA2, 0x22, 200)?,
-        synthetic_p2pkh_transaction(second_height, second_hash, 0xB1, 0x33, 201)?,
+    let prevouts = vec![
+        synthetic_transparent_prevout_artifact(first_height, first_hash, 0xA1, 0x11),
+        synthetic_transparent_prevout_artifact(first_height, first_hash, 0xA2, 0x22),
+        synthetic_transparent_prevout_artifact(second_height, second_hash, 0xB1, 0x33),
     ];
     let ids = [
-        transactions[0].transaction_id,
-        transactions[1].transaction_id,
-        transactions[2].transaction_id,
+        prevouts[0].outpoint.transaction_id,
+        prevouts[1].outpoint.transaction_id,
+        prevouts[2].outpoint.transaction_id,
     ];
+    let utxos = prevouts
+        .iter()
+        .map(transparent_address_utxo_from_prevout)
+        .collect::<Vec<_>>();
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, blocks, compact_blocks)
-            .with_transactions(transactions),
+            .with_transparent_address_utxos(utxos)
+            .with_transparent_prevouts(prevouts)
+            .with_reorg_window_change(ReorgWindowChange::Extend {
+                block_range: BlockHeightRange::inclusive(first_height, second_height),
+            }),
     )?;
     Ok((chain_epoch, ids))
 }
@@ -278,9 +290,8 @@ fn commit_two_block_fixture(
 async fn transparent_prevouts_resolves_outpoints_across_multiple_blocks() -> eyre::Result<()> {
     // Three transactions spread across two distinct heights, six outpoints
     // (including a repeated one and an unknown one) in mixed order. Exercises
-    // the batch helper's dedup-by-height path: the canonical-block lookup
-    // runs once per unique height (2 reads, not 3), and the response still
-    // preserves per-outpoint input order.
+    // direct indexed prevout lookup across visible blocks while preserving
+    // per-outpoint input order.
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, [txid_first_block_a, txid_first_block_b, txid_second_block]) =
@@ -337,12 +348,14 @@ async fn transparent_prevouts_preserves_input_order_and_dedupes_reads() -> eyre:
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let transaction = synthetic_p2pkh_transaction(block.height, block.block_hash, 0xCC, 0x55, 120)?;
-    let transaction_id = transaction.transaction_id;
+    let prevout =
+        synthetic_transparent_prevout_artifact(block.height, block.block_hash, 0xCC, 0x55);
+    let transaction_id = prevout.outpoint.transaction_id;
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transactions(vec![transaction]),
+            .with_transparent_address_utxos(vec![transparent_address_utxo_from_prevout(&prevout)])
+            .with_transparent_prevouts(vec![prevout]),
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));

@@ -1,7 +1,6 @@
 //! Configuration loading for the `zinder-ingest` binary.
 //!
-//! Two top-level shapes ship in Phase 3 of
-//! [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md):
+//! The ingest binary has two top-level config shapes:
 //!
 //! - [`IngestCommandConfig`] resolves the unified loop's input
 //!   (`zinder-ingest --config X` default invocation, and `zinder-ingest
@@ -16,8 +15,8 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
     BulkCatchupConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-    IngestError, IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig,
-    NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
+    IngestDeriveConfig, IngestError, IngestLoopConfig, IngestModifiers,
+    MempoolEventRetentionWorkerConfig, NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
@@ -36,8 +35,11 @@ use crate::cli::parse::{
 
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
 const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1_000;
+const DEFAULT_MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH: u32 = 250_000;
 const DEFAULT_FETCH_CONCURRENCY: u32 = 32;
-const DEFAULT_FLUSH_EVERY_N_EPOCHS: u32 = 5;
+const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
+const DERIVE_CONCURRENCY_FLOOR: u32 = 4;
+const DERIVE_CONCURRENCY_CEILING: u32 = 32;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
@@ -127,7 +129,9 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) reorg_window_blocks: Option<u32>,
     pub(crate) catchup_threshold_blocks: Option<u32>,
     pub(crate) commit_batch_blocks: Option<u32>,
+    pub(crate) max_transparent_prevout_store_lookups_per_batch: Option<u32>,
     pub(crate) fetch_concurrency: Option<u32>,
+    pub(crate) derive_concurrency: Option<u32>,
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) target_height: Option<u32>,
@@ -189,12 +193,17 @@ pub(crate) fn load_ingest_config(
             DEFAULT_COMMIT_BATCH_BLOCKS,
         )?
         .with_default(
+            "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+            DEFAULT_MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH,
+        )?
+        .with_default(
             "ingest.bulk_catchup.fetch_concurrency",
             DEFAULT_FETCH_CONCURRENCY,
         )?
+        .with_default("ingest.derive.concurrency", default_derive_concurrency())?
         .with_default(
-            "ingest.bulk_catchup.flush_every_n_epochs",
-            DEFAULT_FLUSH_EVERY_N_EPOCHS,
+            "ingest.bulk_catchup.flush_interval_epochs",
+            DEFAULT_FLUSH_INTERVAL_EPOCHS,
         )?
         .with_default(
             "ingest.tip_follow.poll_interval_ms",
@@ -234,9 +243,14 @@ pub(crate) fn load_ingest_config(
             overrides.commit_batch_blocks,
         )?
         .with_override_if(
+            "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+            overrides.max_transparent_prevout_store_lookups_per_batch,
+        )?
+        .with_override_if(
             "ingest.bulk_catchup.fetch_concurrency",
             overrides.fetch_concurrency,
         )?
+        .with_override_if("ingest.derive.concurrency", overrides.derive_concurrency)?
         .with_override_if(
             "ingest.tip_follow.poll_interval_ms",
             overrides.poll_interval_ms,
@@ -339,6 +353,8 @@ struct IngestSection {
     reorg_window_blocks: Option<u32>,
     /// Phase classifier knobs.
     phases: IngestPhasesSection,
+    /// Shared derive execution knobs.
+    derive: IngestDeriveSection,
     /// Pipelined-fetch knobs for bulk catch-up.
     bulk_catchup: IngestBulkCatchupSection,
     /// Serial-loop knobs for tip-follow.
@@ -355,10 +371,17 @@ struct IngestPhasesSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct IngestDeriveSection {
+    concurrency: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct IngestBulkCatchupSection {
     commit_batch_blocks: Option<u32>,
+    max_transparent_prevout_store_lookups_per_batch: Option<u32>,
     fetch_concurrency: Option<u32>,
-    flush_every_n_epochs: Option<u32>,
+    flush_interval_epochs: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -424,6 +447,20 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     )?;
     let commit_batch_blocks = parse_commit_batch_blocks(commit_batch_blocks_raw)?;
 
+    let max_transparent_prevout_store_lookups_per_batch_raw = require_field(
+        config
+            .ingest
+            .bulk_catchup
+            .max_transparent_prevout_store_lookups_per_batch,
+        "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+    )?;
+    let max_transparent_prevout_store_lookups_per_batch =
+        NonZeroU32::new(max_transparent_prevout_store_lookups_per_batch_raw).ok_or_else(|| {
+            ConfigError::invalid(
+                "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch must be greater than zero",
+            )
+        })?;
+
     let fetch_concurrency_raw = require_field(
         config.ingest.bulk_catchup.fetch_concurrency,
         "ingest.bulk_catchup.fetch_concurrency",
@@ -432,12 +469,20 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ConfigError::invalid("ingest.bulk_catchup.fetch_concurrency must be greater than zero")
     })?;
 
-    let flush_every_n_epochs_raw = require_field(
-        config.ingest.bulk_catchup.flush_every_n_epochs,
-        "ingest.bulk_catchup.flush_every_n_epochs",
+    let derive_concurrency_raw = require_field(
+        config.ingest.derive.concurrency,
+        "ingest.derive.concurrency",
     )?;
-    let flush_every_n_epochs = NonZeroU32::new(flush_every_n_epochs_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.bulk_catchup.flush_every_n_epochs must be greater than zero")
+    let derive_concurrency = NonZeroU32::new(derive_concurrency_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.derive.concurrency must be greater than zero")
+    })?;
+
+    let flush_interval_epochs_raw = require_field(
+        config.ingest.bulk_catchup.flush_interval_epochs,
+        "ingest.bulk_catchup.flush_interval_epochs",
+    )?;
+    let flush_interval_epochs = NonZeroU32::new(flush_interval_epochs_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.bulk_catchup.flush_interval_epochs must be greater than zero")
     })?;
 
     let poll_interval_ms = require_field(
@@ -503,10 +548,14 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         phases: PhasesConfig {
             catchup_threshold_blocks,
         },
+        derive: IngestDeriveConfig {
+            concurrency: derive_concurrency,
+        },
         bulk_catchup: BulkCatchupConfig {
             commit_batch_blocks,
+            max_transparent_prevout_store_lookups_per_batch,
             fetch_concurrency,
-            flush_every_n_epochs,
+            flush_interval_epochs,
         },
         tip_follow: TipFollowPhaseConfig {
             poll_interval,
@@ -580,10 +629,17 @@ impl RedactedIngestConfigToml {
                 phases: IngestPhasesToml {
                     catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
                 },
+                derive: IngestDeriveToml {
+                    concurrency: loop_config.derive.concurrency.get(),
+                },
                 bulk_catchup: IngestBulkCatchupToml {
                     commit_batch_blocks: loop_config.bulk_catchup.commit_batch_blocks.get(),
+                    max_transparent_prevout_store_lookups_per_batch: loop_config
+                        .bulk_catchup
+                        .max_transparent_prevout_store_lookups_per_batch
+                        .get(),
                     fetch_concurrency: loop_config.bulk_catchup.fetch_concurrency.get(),
-                    flush_every_n_epochs: loop_config.bulk_catchup.flush_every_n_epochs.get(),
+                    flush_interval_epochs: loop_config.bulk_catchup.flush_interval_epochs.get(),
                 },
                 tip_follow: IngestTipFollowToml {
                     poll_interval_ms: duration_as_millis_u64(loop_config.tip_follow.poll_interval),
@@ -628,6 +684,7 @@ struct IngestToml {
     source: &'static str,
     reorg_window_blocks: u32,
     phases: IngestPhasesToml,
+    derive: IngestDeriveToml,
     bulk_catchup: IngestBulkCatchupToml,
     tip_follow: IngestTipFollowToml,
     modifiers: IngestModifiersToml,
@@ -639,10 +696,32 @@ struct IngestPhasesToml {
 }
 
 #[derive(Serialize)]
+struct IngestDeriveToml {
+    concurrency: u32,
+}
+
+#[derive(Serialize)]
 struct IngestBulkCatchupToml {
     commit_batch_blocks: u32,
+    max_transparent_prevout_store_lookups_per_batch: u32,
     fetch_concurrency: u32,
-    flush_every_n_epochs: u32,
+    flush_interval_epochs: u32,
+}
+
+/// Computes the default `ingest.derive.concurrency` from available
+/// logical cores.
+///
+/// Subtracts one to leave a CPU for the Tokio reactor and other ingest
+/// work, then clamps into `[4, 32]`. The ceiling mirrors Zebra's
+/// `full_verify_concurrency_limit` precedent. See
+/// [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
+fn default_derive_concurrency() -> u32 {
+    let logical_cores =
+        u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
+            .unwrap_or(8);
+    logical_cores
+        .saturating_sub(1)
+        .clamp(DERIVE_CONCURRENCY_FLOOR, DERIVE_CONCURRENCY_CEILING)
 }
 
 #[derive(Serialize)]

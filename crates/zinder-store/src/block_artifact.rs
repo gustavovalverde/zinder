@@ -13,6 +13,12 @@ use crate::{
 pub trait FinalizedBlockStore {
     /// Reads the finalized block artifact at `height` for the reader's chain epoch.
     fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError>;
+
+    /// Reads finalized block artifacts in one batched store read.
+    fn blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockArtifact>>, StoreError>;
 }
 
 /// Read boundary for compact block artifacts.
@@ -49,6 +55,81 @@ pub(crate) fn read_block_artifact(
         family: ArtifactFamily::FinalizedBlock,
         key: key.into(),
     })
+}
+
+pub(crate) fn read_block_artifacts(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    block_range: BlockHeightRange,
+) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
+    let mut keys = Vec::new();
+    let mut heights = Vec::new();
+
+    for height in block_range {
+        if height > chain_epoch.tip_height {
+            heights.push(height);
+            keys.push(None);
+            continue;
+        }
+
+        let source_epoch = match visible_height_source_epoch(
+            inner,
+            chain_epoch,
+            height,
+            ArtifactFamily::FinalizedBlock,
+            HeightVisibilityIndex::FinalizedBlock,
+        ) {
+            Ok(source_epoch) => source_epoch,
+            Err(StoreError::ArtifactMissing { .. }) => {
+                heights.push(height);
+                keys.push(None);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        heights.push(height);
+        keys.push(Some(StoreKey::finalized_block(
+            chain_epoch.network,
+            source_epoch,
+            height,
+        )));
+    }
+
+    let block_keys = keys.iter().flatten().cloned().collect::<Vec<_>>();
+    let mut block_values = inner
+        .multi_get(StorageTable::FinalizedBlock, &block_keys)?
+        .into_iter();
+    let mut blocks = Vec::with_capacity(keys.len());
+
+    for (height, key) in heights.into_iter().zip(keys) {
+        let Some(key) = key else {
+            blocks.push(None);
+            continue;
+        };
+
+        let envelope_value = block_values.next().ok_or(StoreError::ArtifactMissing {
+            family: ArtifactFamily::FinalizedBlock,
+            key: key.clone().into(),
+        })?;
+        let Some(envelope_bytes) = envelope_value else {
+            return Err(StoreError::ArtifactMissing {
+                family: ArtifactFamily::FinalizedBlock,
+                key: key.into(),
+            });
+        };
+        let block = decode_block_artifact(&key, &envelope_bytes)?;
+        if block.height != height {
+            return Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::FinalizedBlock,
+                key: key.into(),
+                reason: "finalized block artifact height does not match requested height",
+            });
+        }
+
+        blocks.push(Some(block));
+    }
+
+    Ok(blocks)
 }
 
 pub(crate) fn read_compact_block_artifact(

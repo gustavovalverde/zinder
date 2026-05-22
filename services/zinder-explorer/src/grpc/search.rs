@@ -40,7 +40,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use crate::store::DeriveStore;
+use zinder_derive::DeriveStore;
 
 const CONFIDENCE_HIGH: f32 = 1.0;
 const CONFIDENCE_AMBIGUOUS: f32 = 0.5;
@@ -405,7 +405,7 @@ async fn build_freshness(
 }
 
 fn highest_block_summary_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
-    use crate::consumer::block_summary::BLOCK_SUMMARY_COLUMN_FAMILY;
+    use zinder_derive::BLOCK_SUMMARY_COLUMN_FAMILY;
     Ok(derive_store
         .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
         .map_err(|error| Status::internal(error.to_string()))?

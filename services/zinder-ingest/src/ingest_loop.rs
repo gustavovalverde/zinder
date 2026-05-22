@@ -9,7 +9,8 @@
 //! - [`IngestPhase::AwaitingUpstream`] parks until the upstream tip rises
 //!   above genesis;
 //! - [`IngestPhase::BulkCatchup`] runs one pipelined batch via
-//!   [`backfill_until_complete`] and re-classifies after each batch;
+//!   `backfill_until_complete_with_flush_state` and re-classifies after
+//!   each batch;
 //! - [`IngestPhase::FollowingTip`] runs the serial
 //!   [`tip_follow_with_primary_store`] loop until the classifier would
 //!   bounce back to bulk catch-up.
@@ -29,9 +30,13 @@ use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceChainCheckpoint};
 use zinder_store::PrimaryChainStore;
 
+use crate::backfill::{
+    BackfillFlushState, BackfillRunContext, backfill_until_complete_with_flush_state,
+    flush_pending_backfill_writes,
+};
 use crate::{
-    BackfillConfig, IngestError, MempoolReadyGate, NodeSourceKind, TipFollowConfig,
-    backfill_until_complete, classify_phase, current_chain_height, tip_follow_with_primary_store,
+    BackfillConfig, IngestError, MempoolReadyGate, NodeSourceKind, TipFollowConfig, classify_phase,
+    current_chain_height, tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -71,7 +76,9 @@ pub struct IngestLoopConfig {
     pub reorg_window_blocks: u32,
     /// Phase-classifier knobs (`[ingest.phases]`).
     pub phases: PhasesConfig,
-    /// Pipelined-fetch knobs (`[ingest.bulk_catchup]`).
+    /// Shared derive execution knobs (`[ingest.derive]`).
+    pub derive: IngestDeriveConfig,
+    /// Pipelined-fetch and commit knobs (`[ingest.bulk_catchup]`).
     pub bulk_catchup: BulkCatchupConfig,
     /// Serial-loop knobs (`[ingest.tip_follow]`).
     pub tip_follow: TipFollowPhaseConfig,
@@ -88,22 +95,41 @@ pub struct PhasesConfig {
     pub catchup_threshold_blocks: u32,
 }
 
+/// Resolved `[ingest.derive]` configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IngestDeriveConfig {
+    /// Number of parallel CPU-bound block hydration tasks kept in flight
+    /// on the Tokio blocking pool.
+    ///
+    /// This cap applies to both the normal bulk-catchup `derive_block`
+    /// stage and startup derive replay. The default is
+    /// `clamp(available_parallelism() - 1, 4, 32)`; the ceiling at 32
+    /// mirrors Zebra's `full_verify_concurrency_limit` precedent and the
+    /// floor at 4 keeps small hosts pipelining I/O even when one CPU is
+    /// reserved for the Tokio reactor. See
+    /// [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
+    pub concurrency: NonZeroU32,
+}
+
 /// Resolved `[ingest.bulk_catchup]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkCatchupConfig {
     /// Maximum number of blocks committed in one bulk-catchup batch.
     pub commit_batch_blocks: NonZeroU32,
+    /// Maximum unique transparent prevouts read from the store in one
+    /// bulk-catchup batch.
+    pub max_transparent_prevout_store_lookups_per_batch: NonZeroU32,
     /// Number of concurrent block fetches in the pipelined fetcher.
     pub fetch_concurrency: NonZeroU32,
     /// Force a `RocksDB` flush every N committed epochs.
     ///
     /// Caps the live WAL by writer cadence rather than `RocksDB`'s WAL-size
     /// safety trigger. With the default `commit_batch_blocks = 1000` and
-    /// `flush_every_n_epochs = 5`, the writer truncates the WAL after
+    /// `flush_interval_epochs = 5`, the writer truncates the WAL after
     /// every 5,000 committed blocks, bounding crash-recovery RAM
     /// proportionally. See
     /// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
-    pub flush_every_n_epochs: NonZeroU32,
+    pub flush_interval_epochs: NonZeroU32,
 }
 
 /// Resolved `[ingest.tip_follow]` configuration.
@@ -189,7 +215,7 @@ pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems +
 /// - [`IngestPhase::BulkCatchup`] computes the per-batch target
 ///   `min(upstream_tip - reorg_window_blocks,
 ///       store_tip + commit_batch_blocks)` and calls
-///   [`backfill_until_complete`] for one batch.
+///   `backfill_until_complete_with_flush_state` for one batch.
 /// - [`IngestPhase::FollowingTip`] calls
 ///   [`tip_follow_with_primary_store`] with a child cancel token; a
 ///   parallel watcher task fires the child token if re-classification
@@ -210,6 +236,7 @@ pub async fn run_ingest_loop<Source>(
     config: &IngestLoopConfig,
     source: Arc<Source>,
     store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     cancel: CancellationToken,
     mut tip_follow_subsystems: Option<TipFollowSubsystemsLauncher>,
@@ -218,9 +245,11 @@ where
     Source: NodeSource,
 {
     let mut tip_subsystems: Option<TipFollowSubsystems> = None;
+    let mut bulk_flush_state = BackfillFlushState::default();
 
     loop {
         if cancel.is_cancelled() {
+            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
             return Ok(());
         }
         if reached_target_height(config.modifiers.target_height, &store) {
@@ -234,6 +263,7 @@ where
                     .map(|height| height.value()),
                 "unified loop reached configured target_height; exiting"
             );
+            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
             return Ok(());
         }
 
@@ -246,6 +276,7 @@ where
                     error = %error,
                     "upstream tip observation failed; retrying after backoff"
                 );
+                flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
                 if sleep_or_cancel(TIP_OBSERVATION_FAILURE_BACKOFF, &cancel)
                     .await
                     .is_break()
@@ -263,6 +294,9 @@ where
             config.phases.catchup_threshold_blocks,
         );
         readiness.set_phase(phase);
+        if !matches!(phase, IngestPhase::BulkCatchup) {
+            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+        }
 
         #[allow(
             clippy::wildcard_enum_match_arm,
@@ -290,6 +324,7 @@ where
                     // No height within the reorg window remains to be
                     // committed in bulk; let the next iteration re-
                     // classify (it will fall into `FollowingTip`).
+                    flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
                     if sleep_or_cancel(config.tip_follow.poll_interval, &cancel)
                         .await
                         .is_break()
@@ -305,7 +340,14 @@ where
                     batch_target,
                     BlockHeight::new(upstream_tip),
                 );
-                backfill_until_complete(&batch_config, source.as_ref(), &store, readiness).await?;
+                let backfill_run =
+                    BackfillRunContext::new(&batch_config, source.as_ref(), &store, &derive_store);
+                backfill_until_complete_with_flush_state(
+                    backfill_run,
+                    readiness,
+                    &mut bulk_flush_state,
+                )
+                .await?;
             }
             IngestPhase::FollowingTip => {
                 if tip_subsystems.is_none()
@@ -331,6 +373,7 @@ where
                     &tip_follow_config,
                     source.as_ref(),
                     store.clone(),
+                    derive_store.clone(),
                     readiness,
                     tip_subsystems
                         .as_ref()
@@ -448,8 +491,12 @@ fn build_bulk_catchup_batch_config(
         from_height,
         to_height: BlockHeight::new(batch_target),
         commit_batch_blocks: config.bulk_catchup.commit_batch_blocks,
+        max_transparent_prevout_store_lookups_per_batch: config
+            .bulk_catchup
+            .max_transparent_prevout_store_lookups_per_batch,
         fetch_concurrency: config.bulk_catchup.fetch_concurrency,
-        flush_every_n_epochs: config.bulk_catchup.flush_every_n_epochs,
+        derive_concurrency: config.derive.concurrency,
+        flush_interval_epochs: config.bulk_catchup.flush_interval_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
         checkpoint: config.modifiers.checkpoint,
@@ -522,10 +569,15 @@ mod tests {
             phases: PhasesConfig {
                 catchup_threshold_blocks: 100,
             },
+            derive: IngestDeriveConfig {
+                concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
+            },
             bulk_catchup: BulkCatchupConfig {
                 commit_batch_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
+                max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+                    .ok_or("invalid prevout budget")?,
                 fetch_concurrency: NonZeroU32::new(32).ok_or("invalid fetch concurrency")?,
-                flush_every_n_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
+                flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
             },
             tip_follow: TipFollowPhaseConfig {
                 poll_interval: Duration::from_millis(10),

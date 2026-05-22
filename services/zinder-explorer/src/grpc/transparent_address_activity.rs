@@ -1,7 +1,7 @@
 //! `ExplorerQuery.TransparentAddressActivity` handler.
 //!
 //! Reads the confirmed-activity feed materialized by
-//! [`crate::consumer::transparent_address_activity::TransparentAddressActivityConsumer`]
+//! [`zinder_derive::TransparentAddressActivityConsumer`]
 //! out of the consumer-owned `transparent_address_activity` column family.
 //! The storage layout sorts newest-first per address, so the handler
 //! serves pages in that order; clients that want oldest-first reverse
@@ -25,10 +25,9 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use crate::consumer::transparent_address_activity::{
-    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
+use zinder_derive::{
+    DeriveStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
 };
-use crate::store::DeriveStore;
 
 /// Hard cap on the activity rows one page returns.
 const MAX_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES_PER_REQUEST: u32 = 256;

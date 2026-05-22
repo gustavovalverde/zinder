@@ -10,11 +10,9 @@
 //! Replaces the round-trip tree a "recent transactions" panel would
 //! otherwise build: `BlockSummariesInRange` then per-block `BlockDetail`
 //! then per-tx `TransactionDetail`. The consumer pays the parse cost
-//! once at commit (shared with sibling consumers through
-//! [`BlockSource`]); the read path is a single bounded scan plus an
+//! once at commit; the read path is a single bounded scan plus an
 //! optional batched fee lookup.
 
-use async_trait::async_trait;
 use prost::Message as _;
 use zebra_chain::serialization::ZcashSerialize as _;
 use zinder_core::wire::{
@@ -27,7 +25,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::wire::encode_privacy_shape;
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockSource, DeriveConsumerCtx, DeriveConsumerError,
+    BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
 };
 
@@ -42,15 +40,14 @@ pub const RECENT_TRANSACTIONS_CONSUMER_NAME: DeriveConsumerName =
 const RECENT_TRANSACTIONS_KEY_LEN: usize = 8;
 
 /// Materializes one [`RecentTransactionEntry`] per canonical transaction.
-pub struct RecentTransactionsConsumer {
-    block_source: BlockSource,
-}
+#[derive(Default)]
+pub struct RecentTransactionsConsumer;
 
 impl RecentTransactionsConsumer {
-    /// Builds a consumer reading parsed blocks from `block_source`.
+    /// Builds the consumer.
     #[must_use]
-    pub const fn new(block_source: BlockSource) -> Self {
-        Self { block_source }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Returns the storage key for one `(height, in_block_position)` row.
@@ -66,17 +63,12 @@ impl RecentTransactionsConsumer {
     }
 }
 
-#[async_trait]
 impl BlockKeyedConsumer for RecentTransactionsConsumer {
     fn name(&self) -> DeriveConsumerName {
         RECENT_TRANSACTIONS_CONSUMER_NAME
     }
 
-    fn block_source(&self) -> &BlockSource {
-        &self.block_source
-    }
-
-    async fn apply_block(
+    fn apply_block(
         &mut self,
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
@@ -138,7 +130,7 @@ impl BlockKeyedConsumer for RecentTransactionsConsumer {
         Ok(())
     }
 
-    async fn revert_block(
+    fn revert_block(
         &mut self,
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,

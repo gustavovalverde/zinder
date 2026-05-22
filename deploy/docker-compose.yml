@@ -2,10 +2,10 @@
 # (wallet-facing reader), and zinder-explorer (explorer-facing reader)
 # against a single canonical volume.
 #
-# This composes the per-service images at services/<svc>/Dockerfile rather
-# than the single-container s6-overlay image. Both shapes are supported;
-# use the single-container image when you want one process tree, this
-# Compose file when you want two containers with separate restart policies.
+# This composes per-service runtime targets from deploy/Dockerfile rather than
+# the single-container s6-overlay target. Both shapes are supported; use the
+# single-container image when you want one process tree, this Compose file when
+# you want separate containers with separate restart policies.
 
 # Per-network project name so the stack sits visually adjacent to its
 # Z3 binding in `docker compose ls` (zinder-testnet next to z3-testnet,
@@ -56,7 +56,8 @@ services:
     image: zinder-ingest:latest
     build:
       context: ..
-      dockerfile: services/zinder-ingest/Dockerfile
+      dockerfile: deploy/Dockerfile
+      target: zinder-ingest
     restart: on-failure
     networks: [z3, observability]
     volumes:
@@ -92,7 +93,8 @@ services:
   zinder-query:
     build:
       context: ..
-      dockerfile: services/zinder-query/Dockerfile
+      dockerfile: deploy/Dockerfile
+      target: zinder-query
     image: zinder-query:latest
     restart: on-failure
     depends_on:
@@ -129,7 +131,8 @@ services:
   zinder-explorer:
     build:
       context: ..
-      dockerfile: services/zinder-explorer/Dockerfile
+      dockerfile: deploy/Dockerfile
+      target: zinder-explorer
     image: zinder-explorer:latest
     restart: on-failure
     depends_on:

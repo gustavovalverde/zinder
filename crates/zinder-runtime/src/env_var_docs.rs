@@ -333,12 +333,39 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Block count per bulk-catchup commit batch. Defaults to 1000.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH",
+        toml_path: "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum unique transparent prevouts read from the store per \
+                      bulk-catchup commit batch. Defaults to 250000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY",
         toml_path: "ingest.bulk_catchup.fetch_concurrency",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__CONCURRENCY",
+        toml_path: "ingest.derive.concurrency",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Parallel CPU-bound derive and replay block hydration tasks on the blocking \
+                      pool. Defaults to `clamp(available_parallelism() - 1, 4, 32)`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",
+        toml_path: "ingest.bulk_catchup.flush_interval_epochs",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater \
+                      than zero. Defaults to 5.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS",
@@ -480,7 +507,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-explorer"],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Filesystem path opened by `DeriveStore` for explorer-plane derive state.",
+        description: "Canonical store path used to locate the writer-owned derive store at its \
+                      `derive` subdirectory.",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",

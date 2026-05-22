@@ -77,7 +77,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
         tip_hash: checkpoint_hash,
         finalized_height: checkpoint_height,
         finalized_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };

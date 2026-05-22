@@ -42,7 +42,7 @@ use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
     fetch_live_tip_height, live_backfill_config, live_tip_follow_config, regtest_generate_blocks,
-    rpc_block_hash_at_height, rpc_invalidate_block, rpc_reconsider_block,
+    rpc_block_hash_at_height, rpc_invalidate_block, rpc_reconsider_block, test_derive_store,
     zebra_source_from_backfill, zebra_source_from_tip_follow,
 };
 
@@ -119,6 +119,7 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     // freshly-mined reorg blocks, which is fast.
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let derive_store = test_derive_store(&storage_path)?;
     let tip_follow_config = live_tip_follow_config(
         &env,
         &storage_path,
@@ -134,11 +135,13 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         let readiness = readiness.clone();
         let cancel = cancel.clone();
         let tip_follow_config = tip_follow_config.clone();
+        let derive_store = derive_store.clone();
         tokio::spawn(async move {
             tip_follow_with_primary_store(
                 &tip_follow_config,
                 &tip_follow_source,
                 store,
+                derive_store,
                 &readiness,
                 None,
                 None,

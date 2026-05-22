@@ -69,7 +69,7 @@ use super::search::handle_search;
 use super::transaction_detail::handle_transaction_detail;
 use super::transparent_address_activity::handle_transparent_address_activity;
 use super::value_pool_summary::handle_value_pool_summary;
-use crate::store::DeriveStore;
+use zinder_derive::DeriveStore;
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Copy, Debug)]
@@ -159,12 +159,12 @@ impl ExplorerQueryGrpcAdapter {
     /// Marks transparent prevout resolution as online so the adapter
     /// advertises the per-tx paid-fee capability.
     ///
-    /// The binary sets this flag once the `TransactionFeesConsumer` has
-    /// started and the upstream wallet plane advertises
-    /// `WALLET_READ_TRANSPARENT_PREVOUTS_V1`. The flag is the single source
-    /// of truth for whether paid-fee fields appear in `TransactionDetail`
-    /// and `MempoolActivity` responses; downstream handlers branch on
-    /// presence of materialized rows rather than re-reading this flag.
+    /// The binary sets this flag once it opens a derive store with the bundled
+    /// `TransactionFeesConsumer` column families. The flag is the single
+    /// source of truth for whether paid-fee fields appear in
+    /// `TransactionDetail` and `MempoolActivity` responses; downstream
+    /// handlers branch on presence of materialized rows rather than re-reading
+    /// this flag.
     #[must_use]
     pub const fn with_prevout_resolution_online(mut self, online: bool) -> Self {
         self.prevout_resolution_online = online;

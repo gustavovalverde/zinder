@@ -21,10 +21,10 @@ The decisions that govern this plane:
 
 `zinder-explorer` is a fourth deployable alongside `zinder-ingest`, `zinder-query`, and `zinder-compat-lightwalletd`. It:
 
-- **Consumes** canonical artifacts (via `WalletQuery` over gRPC) and replayable events (`WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents`).
-- **Owns** its own RocksDB at `explorer.storage_path`, distinct from canonical storage and from any other consumer's store.
+- **Consumes** the writer-owned derive store as a RocksDB secondary under `explorer.storage_path`, plus `WalletQuery` over gRPC for federated read paths.
+- **Owns** no primary RocksDB. `explorer.storage_path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
 - **Produces** the `ExplorerQuery` gRPC service plus federated additions to `WalletQuery` (currently `TransparentAddressBalance`'s mempool overlay).
-- **Does not** open the canonical RocksDB primary or secondary; does not call upstream Zcash node RPCs; does not custody any wallet secret.
+- **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret.
 
 The boundary rules:
 
@@ -34,7 +34,7 @@ The boundary rules:
 
 ## Wire surface
 
-The native gRPC service is `ExplorerQuery` in `zinder.v1.explorer`. The 2026-05 surface (post the explorer-plane initial slice) is:
+The native gRPC service is `ExplorerQuery` in `zinder.v1.explorer`. The service includes:
 
 ```proto
 service ExplorerQuery {
@@ -48,7 +48,7 @@ service ExplorerQuery {
 }
 ```
 
-Additional methods landed incrementally per [the slicing plan](#slicing-plan-deferred): `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`. Every method follows the same shape rules:
+The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, and `ValuePoolSummary`. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -73,7 +73,7 @@ message BlockSummary {
 
 `ExplorerQuery.BlockSummariesInRange` returns a range of `BlockSummary` rows ordered by ascending height. The handler reads the materialized record from the consumer store, projects the summary fields, and skips the transaction-id payload so the wire response stays cheap on long ranges.
 
-`ExplorerQuery.BlockDetail` resolves either a height or a hash to one `BlockSummary` plus the canonical-ordered list of transaction ids. Clients drill into per-transaction facts by calling `ExplorerQuery.TransactionDetail` with each id from the list. The first slice keeps the per-tx surface as ids only; richer block-detail rows (per-tx component counts, fees, privacy shape) require new derive-time aggregation and ship in a later `_v2` increment.
+`ExplorerQuery.BlockDetail` resolves either a height or a hash to one `BlockSummary` plus the canonical-ordered list of transaction ids. Clients drill into per-transaction facts by calling `ExplorerQuery.TransactionDetail` with each id from the list. Block detail intentionally keeps the per-transaction surface as ids; richer per-transaction facts belong in `TransactionDetail` or in a separately versioned aggregate view so block-detail rows stay bounded.
 
 The materialized record covers both reads so a `BlockDetail` request is one RocksDB get, and a `BlockSummariesInRange` request is one range scan. Storage cost is dominated by the transaction-id list: `~32 bytes × tx_count` per block, plus ~80 bytes for the summary fields.
 
@@ -92,7 +92,7 @@ Reorg rewind deletes every record in the reverted height range and re-fetches th
 
 The classifier short-circuits shielded forms before the handler issues any `WalletQuery` call, which is the structural invariant required by [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). The handler's only universal wallet call is `WalletQuery.LatestBlock`, issued once at the end to build the `ExplorerFreshness` envelope (a property of every explorer response, not the search candidate).
 
-A `SearchIndexConsumer` derive view that pre-builds sublinear address-prefix lookups for autocomplete is deferred to a later slice; the classifier alone gates the `explorer.search_v1` capability.
+Autocomplete indexes are separate materialized views and do not gate the `explorer.search_v1` capability; the local classifier is the capability's correctness boundary.
 
 ## Mempool views
 
@@ -262,23 +262,9 @@ The explorer plane never calls upstream Zcash node RPCs. When a view needs a fac
 
 Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
 
-## Slicing plan (deferred)
+## Derived views
 
-The explorer plane lands incrementally. Each slice ships testable, capability-advertised, doc-updated value:
-
-| Slice | Scope | Capabilities lit |
-| ----- | ----- | ---------------- |
-| ~~**0 (rename)**~~ | _Shipped._ Rebrand `zinder-derive` to `zinder-explorer`. Two existing capabilities become `explorer.server_info_v1` and `explorer.transparent_address.balance_v1`. | (renames) |
-| ~~**1 (tracer bullet)**~~ | _Shipped._ `TransactionPublicFacts` parser per [ADR-0010](../adrs/0010-transaction-public-facts.md) is the single source of truth in `zinder_source::parse_transaction_public_facts`. `ExplorerQuery.TransactionDetail` returns the typed shape plus the cross-cutting `ExplorerFreshness` envelope per [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). Both mined and mempool transactions are covered; conflicting-chain returns `FAILED_PRECONDITION`. | `explorer.transaction.detail_v1` |
-| **2** | `BlockSummary` and `BlockDetail` via the first real `BlockSummaryConsumer` derive view. Reorg-rewind test. | `explorer.block.summary_v1`, `explorer.block.detail_v1` |
-| ~~**3**~~ | _Shipped._ Typed `Search` with the local classifier in `crates/zinder-core/src/explorer_search.rs`. Privacy refusal for shielded inputs per [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). `SearchIndexConsumer` derive view for autocomplete is deferred. | `explorer.search_v1` |
-| ~~**4**~~ | _Shipped._ `MempoolSummary`, `MempoolActivity`, `TransparentAddressActivity`. All three compose existing `WalletQuery` primitives at request time; no derive consumer required. | `explorer.mempool.summary_v1`, `explorer.mempool.activity_v1`, `explorer.transparent_address.activity_v1` |
-| **5a** | _Shipped._ `FeeSummary` (Shape C, no consumer). Aggregates ZIP-317 conventional fee floors over a block range. Actual miner-collected fees are out of scope for v1 (would require per-input prevout resolution). | `explorer.fee.summary_v1` |
-| ~~**5b**~~ | _Shipped._ `ValuePoolSummary` composes `WalletQuery.ChainValuePoolsAtTip`, which proxies through `IngestControl` to the writer-owned source handle. The response preserves upstream pool ids as repeated entries. | `explorer.value_pool.summary_v1` |
-
-Slices 2-5 landed after Slice 1 established the parser, freshness envelope, and federation patterns.
-
-Slice 6 (block-explorer consumer PRD) extended every existing surface with capability-gated optional fields and added four new column families: `transaction_fees`, `mempool_event_counts`, `transparent_address_activity` (rebuilt), `recent_transactions`. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the capability-gated field convention.
+Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, and `RecentTransactionsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
 
 ## Cross-references
 

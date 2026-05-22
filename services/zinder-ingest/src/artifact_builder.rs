@@ -1,6 +1,6 @@
 //! Deterministic source-block artifact builders.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use prost::Message;
 use serde_json::Value;
@@ -14,9 +14,12 @@ use zebra_chain::{
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
     ShieldedProtocol, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentUtxoSpendArtifact,
-    wire::encode_internal_block_hash,
+    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutArtifact,
+    TransparentUtxoSpendArtifact, TreeStateArtifact,
+    wire::{encode_display_block_hash_hex, encode_internal_block_hash},
 };
+
+use crate::chain_ingest::BuiltArtifacts;
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
@@ -196,60 +199,33 @@ impl fmt::Display for BlockMismatchField {
     }
 }
 
-/// Derives the durable full-block artifact for one node source block.
-pub fn derive_block_artifact(
-    source_block: &SourceBlock,
-) -> Result<BlockArtifact, ArtifactDeriveError> {
-    validate_source_block_payload(source_block)?;
-
-    Ok(BlockArtifact::new(
-        source_block.height,
-        source_block.hash,
-        source_block.parent_hash,
-        source_block.raw_block_bytes.clone(),
-    ))
-}
-
-/// Derives the wallet-oriented compact block artifact for one node source block.
-pub fn derive_compact_block_artifact(
-    source_block: &SourceBlock,
-) -> Result<CompactBlockArtifact, ArtifactDeriveError> {
-    let mut artifact_builder = CompactBlockArtifactBuilder::default();
-    artifact_builder
-        .build(source_block)
-        .map(|artifact_build| artifact_build.compact_block)
-}
-
-/// Derives one [`TransactionArtifact`] per transaction in the source block.
+/// Commitment-tree position (Sapling and Orchard output counts) at one block boundary.
 ///
-/// Each artifact carries the canonical transaction id, the containing block
-/// height and hash, and the transaction's serialized bytes obtained by
-/// round-tripping through `zebra_chain`'s `ZcashSerialize`. Coinbase and
-/// non-coinbase transactions are emitted in block order.
-pub fn derive_transaction_artifacts(
-    source_block: &SourceBlock,
-) -> Result<Vec<TransactionArtifact>, ArtifactDeriveError> {
-    validate_source_block_payload(source_block)?;
-    let parsed_block = parse_source_block(source_block)?;
-    validate_parsed_block_identity(&parsed_block, source_block)?;
-    derive_transaction_artifacts_from_parsed(&parsed_block, source_block)
-}
-
+/// `derive_block` returns a per-block delta; `finalize_derived_block` folds
+/// those deltas into the running position. The same type expresses both
+/// shapes, so callers can carry one running offset through a serial loop
+/// or seed it from a `ChainTipMetadata` recovered from the store.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CommitmentTreeSizes {
-    sapling: u32,
-    orchard: u32,
+pub struct CommitmentTreeSizes {
+    /// Sapling output count contributed by (or accumulated up to) this point.
+    pub sapling: u32,
+    /// Orchard action count contributed by (or accumulated up to) this point.
+    pub orchard: u32,
 }
 
 impl CommitmentTreeSizes {
-    const fn from_tip_metadata(tip_metadata: ChainTipMetadata) -> Self {
+    /// Seeds a running offset from chain-tip metadata recovered from the
+    /// store.
+    #[must_use]
+    pub const fn from_tip_metadata(tip_metadata: ChainTipMetadata) -> Self {
         Self {
             sapling: tip_metadata.sapling_commitment_tree_size,
             orchard: tip_metadata.orchard_commitment_tree_size,
         }
     }
 
-    fn checked_add(self, additions: Self) -> Result<Self, ArtifactDeriveError> {
+    /// Sums two positions; errors if either pool overflows `u32`.
+    pub fn checked_add(self, additions: Self) -> Result<Self, ArtifactDeriveError> {
         let sapling = self.sapling.checked_add(additions.sapling).ok_or(
             ArtifactDeriveError::CommitmentTreeOverflow {
                 protocol: ShieldedProtocol::Sapling,
@@ -264,22 +240,35 @@ impl CommitmentTreeSizes {
         Ok(Self { sapling, orchard })
     }
 
-    fn chain_metadata(self) -> ChainMetadata {
+    /// Lowers to the lightwalletd `ChainMetadata` wire shape.
+    #[must_use]
+    pub const fn chain_metadata(self) -> ChainMetadata {
         ChainMetadata {
             sapling_commitment_tree_size: self.sapling,
             orchard_commitment_tree_size: self.orchard,
         }
     }
 
-    const fn tip_metadata(self) -> ChainTipMetadata {
+    /// Lowers to the canonical `ChainTipMetadata` stored alongside each
+    /// chain epoch.
+    #[must_use]
+    pub const fn tip_metadata(self) -> ChainTipMetadata {
         ChainTipMetadata::new(self.sapling, self.orchard)
     }
 }
 
+/// Source-supplied commitment-tree observation extracted from `z_gettreestate`.
+///
+/// Each pool is `Some` only when the node payload exposes a recognizable
+/// size shape. `finalize_derived_block` enforces equality against the
+/// post-fold running totals; absent observations skip the corresponding
+/// pool check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ObservedCommitmentTreeSizes {
-    sapling: Option<u32>,
-    orchard: Option<u32>,
+pub struct ObservedCommitmentTreeSizes {
+    /// Sapling pool size if the source disclosed it.
+    pub sapling: Option<u32>,
+    /// Orchard pool size if the source disclosed it.
+    pub orchard: Option<u32>,
 }
 
 impl ObservedCommitmentTreeSizes {
@@ -288,82 +277,112 @@ impl ObservedCommitmentTreeSizes {
     }
 }
 
+/// Parallel-safe derivation output for one source block.
+///
+/// `derive_block` populates every field that depends only on the block
+/// content. `finalize_derived_block` stamps the position-dependent fields
+/// (the `chain_metadata` inside `partial_compact_block` and the
+/// `tip_metadata` in the returned `BuiltArtifacts`) after folding
+/// `tree_size_additions` into the running commitment-tree position.
 #[derive(Debug)]
-pub(crate) struct CompactBlockArtifactBuild {
-    pub(crate) compact_block: CompactBlockArtifact,
-    pub(crate) tip_metadata: ChainTipMetadata,
-    pub(crate) transactions: Vec<TransactionArtifact>,
-    pub(crate) transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    pub(crate) transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
-    pub(crate) transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
-    pub(crate) transparent_address_tx_index_spend_candidates:
-        Vec<TransparentAddressTxIndexSpendCandidate>,
+pub struct DerivedBlockArtifacts {
+    /// Durable full-block artifact (canonical bytes plus identifiers).
+    pub block: BlockArtifact,
+    /// Parsed block produced during parallel derivation.
+    ///
+    /// Production derivation always fills this so the commit path does not
+    /// deserialize the same block bytes again when deriving explorer
+    /// contexts. Tests that use synthetic non-Zcash payloads leave it
+    /// absent; those tests also run with derive consumers disabled.
+    pub parsed_block: Option<Arc<ZebraBlock>>,
+    /// Lightwalletd compact block with `chain_metadata = None`; the
+    /// serial folder stamps the final tree-size position before encoding.
+    pub partial_compact_block: CompactBlock,
+    /// Commitment-tree-size delta this block contributes.
+    pub tree_size_additions: CommitmentTreeSizes,
+    /// Tree-size observation extracted from `z_gettreestate`, if the
+    /// source supplied one.
+    pub observed_tree_sizes: Option<ObservedCommitmentTreeSizes>,
+    /// Tree-state payload archived for canonical recovery, if any.
+    pub tree_state: Option<TreeStateArtifact>,
+    /// Per-transaction durable artifacts.
+    pub transactions: Vec<TransactionArtifact>,
+    /// Transparent-output index entries for this block.
+    pub transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    /// Transparent prevout artifacts for this block. One per transparent
+    /// output; writer, derive, and query paths resolve spent outputs from
+    /// these rows without re-fetching the producing transaction.
+    pub transparent_prevouts: Vec<TransparentPrevoutArtifact>,
+    /// Transparent-input spend records for this block.
+    pub transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    /// Transparent-address transaction-index entries (output side).
+    pub transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
+    /// Spend-input candidates awaiting prevout resolution at commit time.
+    pub transparent_address_tx_index_spend_candidates: Vec<TransparentAddressTxIndexSpendCandidate>,
 }
 
 /// Transparent-address tx-history row candidate derived from a transparent
 /// spend input.
 ///
-/// The spending transaction does not carry the spent output script. Commit-time
-/// resolution binds this candidate to the canonical prevout transaction before
-/// writing the address-index row.
+/// The spending transaction does not carry the spent output script.
+/// Commit-time resolution binds this candidate to the canonical prevout
+/// transaction before writing the address-index row.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TransparentAddressTxIndexSpendCandidate {
-    pub(crate) spent_outpoint: TransparentOutPoint,
-    pub(crate) block_height: BlockHeight,
-    pub(crate) block_hash: BlockHash,
-    pub(crate) tx_index_in_block: u32,
-    pub(crate) transaction_id: TransactionId,
+pub struct TransparentAddressTxIndexSpendCandidate {
+    /// The transparent outpoint being spent.
+    pub spent_outpoint: TransparentOutPoint,
+    /// Containing block height for the spending transaction.
+    pub block_height: BlockHeight,
+    /// Containing block hash for the spending transaction.
+    pub block_hash: BlockHash,
+    /// Spending transaction's position in the block.
+    pub tx_index_in_block: u32,
+    /// Spending transaction id.
+    pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct CompactBlockArtifactBuilder {
-    current_tree_sizes: CommitmentTreeSizes,
-}
-
-impl CompactBlockArtifactBuilder {
-    pub(crate) const fn with_initial_tip_metadata(initial_tip_metadata: ChainTipMetadata) -> Self {
-        Self {
-            current_tree_sizes: CommitmentTreeSizes::from_tip_metadata(initial_tip_metadata),
-        }
-    }
-
-    pub(crate) fn build(
-        &mut self,
-        source_block: &SourceBlock,
-    ) -> Result<CompactBlockArtifactBuild, ArtifactDeriveError> {
-        let artifact_build = build_compact_block_artifact(source_block, self.current_tree_sizes)?;
-        self.current_tree_sizes =
-            CommitmentTreeSizes::from_tip_metadata(artifact_build.tip_metadata);
-
-        Ok(artifact_build)
-    }
-}
-
-fn build_compact_block_artifact(
+/// Parallel-safe derivation: parse the source block and build every artifact
+/// that does not depend on the block's position in the running chain state.
+///
+/// The output's `partial_compact_block.chain_metadata` is left `None`;
+/// [`finalize_derived_block`] stamps the final commitment-tree position
+/// before encoding the proto and validating against any source-supplied
+/// observation.
+pub fn derive_block(
     source_block: &SourceBlock,
-    initial_tree_sizes: CommitmentTreeSizes,
-) -> Result<CompactBlockArtifactBuild, ArtifactDeriveError> {
+) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
     validate_source_block_payload(source_block)?;
     let parsed_block = parse_source_block(source_block)?;
     validate_parsed_block_identity(&parsed_block, source_block)?;
+    let parsed_block = Arc::new(parsed_block);
 
     let (compact_transactions, tree_size_additions) = compact_transactions(&parsed_block)?;
-    let (transparent_address_utxos, transparent_utxo_spends) =
-        transparent_utxo_artifacts(source_block, &compact_transactions)?;
+    let TransparentBlockArtifacts {
+        address_utxos: transparent_address_utxos,
+        prevouts: transparent_prevouts,
+        utxo_spends: transparent_utxo_spends,
+    } = transparent_utxo_artifacts(source_block, &compact_transactions)?;
     let transparent_address_tx_index =
         transparent_address_tx_index_artifacts(source_block, &compact_transactions)?;
     let transparent_address_tx_index_spend_candidates =
         transparent_address_tx_index_spend_candidates(source_block, &compact_transactions)?;
-    let final_tree_sizes = initial_tree_sizes.checked_add(tree_size_additions)?;
-    validate_observed_tree_sizes(source_block, final_tree_sizes)?;
-
     let transactions = derive_transaction_artifacts_from_parsed(&parsed_block, source_block)?;
     let block_header_bytes = parsed_block
         .header
         .zcash_serialize_to_vec()
         .map_err(|source| ArtifactDeriveError::BlockHeaderSerializationFailed { source })?;
-
-    let compact_block = CompactBlock {
+    let observed_tree_sizes = observed_tree_sizes(source_block)?;
+    let tree_state = source_block
+        .tree_state_payload_bytes
+        .as_ref()
+        .map(|bytes| TreeStateArtifact::new(source_block.height, source_block.hash, bytes.clone()));
+    let block = BlockArtifact::new(
+        source_block.height,
+        source_block.hash,
+        source_block.parent_hash,
+        source_block.raw_block_bytes.clone(),
+    );
+    let partial_compact_block = CompactBlock {
         proto_version: LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION,
         height: u64::from(source_block.height.value()),
         hash: encode_internal_block_hash(source_block.hash).to_vec(),
@@ -371,21 +390,77 @@ fn build_compact_block_artifact(
         time: source_block.block_time_seconds,
         header: block_header_bytes,
         vtx: compact_transactions,
-        chain_metadata: Some(final_tree_sizes.chain_metadata()),
+        chain_metadata: None,
     };
 
-    Ok(CompactBlockArtifactBuild {
-        compact_block: CompactBlockArtifact::new(
-            source_block.height,
-            source_block.hash,
-            compact_block.encode_to_vec(),
-        ),
-        tip_metadata: final_tree_sizes.tip_metadata(),
+    Ok(DerivedBlockArtifacts {
+        block,
+        parsed_block: Some(parsed_block),
+        partial_compact_block,
+        tree_size_additions,
+        observed_tree_sizes,
+        tree_state,
         transactions,
         transparent_address_utxos,
+        transparent_prevouts,
         transparent_utxo_spends,
         transparent_address_tx_index,
         transparent_address_tx_index_spend_candidates,
+    })
+}
+
+/// Serial fold over a single block's derived artifacts.
+///
+/// Applies `derived.tree_size_additions` to `running_tree_sizes`, stamps
+/// the final `chain_metadata` into the compact block, validates observed
+/// sizes if present, and returns the finalized [`BuiltArtifacts`].
+/// Mutates `running_tree_sizes` in place so a sequential loop can carry
+/// it forward across blocks.
+pub fn finalize_derived_block(
+    derived: DerivedBlockArtifacts,
+    running_tree_sizes: &mut CommitmentTreeSizes,
+) -> Result<BuiltArtifacts, ArtifactDeriveError> {
+    let DerivedBlockArtifacts {
+        block,
+        parsed_block,
+        mut partial_compact_block,
+        tree_size_additions,
+        observed_tree_sizes,
+        tree_state,
+        transactions,
+        transparent_address_utxos,
+        transparent_prevouts,
+        transparent_utxo_spends,
+        transparent_address_tx_index,
+        transparent_address_tx_index_spend_candidates,
+    } = derived;
+
+    let final_tree_sizes = running_tree_sizes.checked_add(tree_size_additions)?;
+    if let Some(observed) = observed_tree_sizes {
+        validate_observed_tree_sizes_against(observed, final_tree_sizes)?;
+    }
+
+    partial_compact_block.chain_metadata = Some(final_tree_sizes.chain_metadata());
+    let compact_block = CompactBlockArtifact::new(
+        block.height,
+        block.block_hash,
+        partial_compact_block.encode_to_vec(),
+    );
+
+    *running_tree_sizes = final_tree_sizes;
+
+    Ok(BuiltArtifacts {
+        block,
+        parsed_block,
+        compact_block,
+        transactions,
+        transparent_address_utxos,
+        transparent_prevouts,
+        transparent_utxo_spends,
+        transparent_address_tx_index,
+        transparent_address_tx_index_spend_candidates,
+        tip_metadata: final_tree_sizes.tip_metadata(),
+        tree_state,
     })
 }
 
@@ -597,17 +672,19 @@ fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTxO
         .collect()
 }
 
+/// Aggregated transparent artifacts derived from one block.
+struct TransparentBlockArtifacts {
+    address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    prevouts: Vec<TransparentPrevoutArtifact>,
+    utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+}
+
 fn transparent_utxo_artifacts(
     source_block: &SourceBlock,
     compact_transactions: &[CompactTx],
-) -> Result<
-    (
-        Vec<TransparentAddressUtxoArtifact>,
-        Vec<TransparentUtxoSpendArtifact>,
-    ),
-    ArtifactDeriveError,
-> {
+) -> Result<TransparentBlockArtifacts, ArtifactDeriveError> {
     let mut transparent_address_utxos = Vec::new();
+    let mut transparent_prevouts = Vec::new();
     let mut transparent_utxo_spends = Vec::new();
 
     for transaction in compact_transactions {
@@ -615,11 +692,22 @@ fn transparent_utxo_artifacts(
         for (output_index, output) in transaction.vout.iter().enumerate() {
             let output_index = u32::try_from(output_index)
                 .map_err(|_| ArtifactDeriveError::TransparentOutputIndexOverflow)?;
+            let address_script_hash =
+                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
+            let outpoint = TransparentOutPoint::new(transaction_id, output_index);
             transparent_address_utxos.push(TransparentAddressUtxoArtifact::new(
-                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key),
+                address_script_hash,
                 output.script_pub_key.clone(),
-                TransparentOutPoint::new(transaction_id, output_index),
+                outpoint,
                 output.value,
+                source_block.height,
+                source_block.hash,
+            ));
+            transparent_prevouts.push(TransparentPrevoutArtifact::new(
+                outpoint,
+                output.value,
+                output.script_pub_key.clone(),
+                address_script_hash,
                 source_block.height,
                 source_block.hash,
             ));
@@ -635,7 +723,11 @@ fn transparent_utxo_artifacts(
         }
     }
 
-    Ok((transparent_address_utxos, transparent_utxo_spends))
+    Ok(TransparentBlockArtifacts {
+        address_utxos: transparent_address_utxos,
+        prevouts: transparent_prevouts,
+        utxo_spends: transparent_utxo_spends,
+    })
 }
 
 pub(crate) fn transparent_address_tx_index_artifacts(
@@ -730,14 +822,10 @@ fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
         || !transaction.vout.is_empty()
 }
 
-fn validate_observed_tree_sizes(
-    source_block: &SourceBlock,
+fn validate_observed_tree_sizes_against(
+    observed_tree_sizes: ObservedCommitmentTreeSizes,
     expected_tree_sizes: CommitmentTreeSizes,
 ) -> Result<(), ArtifactDeriveError> {
-    let Some(observed_tree_sizes) = observed_tree_sizes(source_block)? else {
-        return Ok(());
-    };
-
     if let Some(observed_sapling) = observed_tree_sizes.sapling
         && observed_sapling != expected_tree_sizes.sapling
     {
@@ -881,12 +969,7 @@ fn count_to_u32(count: usize, field: &'static str) -> Result<u32, ArtifactDerive
 }
 
 fn format_block_hash(bytes: [u8; 32]) -> String {
-    let mut hex = String::with_capacity(64);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    encode_display_block_hash_hex(BlockHash::from_bytes(bytes))
 }
 
 #[cfg(test)]

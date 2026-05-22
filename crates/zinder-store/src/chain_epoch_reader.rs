@@ -5,20 +5,25 @@ use std::num::NonZeroU32;
 use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     SubtreeRootArtifact, SubtreeRootRange, TransactionArtifact, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TreeStateArtifact,
+    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
+    TransparentPrevoutArtifact, TreeStateArtifact,
 };
 
 use crate::{
     StoreError,
     block_artifact::{
-        CompactBlockStore, FinalizedBlockStore, read_block_artifact, read_compact_block_artifact,
-        read_compact_block_artifacts,
+        CompactBlockStore, FinalizedBlockStore, read_block_artifact, read_block_artifacts,
+        read_compact_block_artifact, read_compact_block_artifacts,
     },
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
     kv::RocksChainStoreReadView,
     subtree_root::{SubtreeRootStore, read_subtree_root_artifacts},
     transaction_artifact::{
         TransactionArtifactStore, read_transaction_artifact, read_transaction_artifacts_batch,
+    },
+    transparent_prevout::{
+        read_current_transparent_prevouts_by_outpoints,
+        read_historical_transparent_prevouts_by_outpoints,
     },
     transparent_utxo::{TransparentUtxoStore, read_transparent_address_utxos},
     tree_state::{TreeStateStore, read_tree_state_artifact},
@@ -28,16 +33,29 @@ use crate::{
 pub struct ChainEpochReader<'store> {
     chain_epoch: ChainEpoch,
     read_view: RocksChainStoreReadView<'store>,
+    is_current: bool,
 }
 
 impl<'store> ChainEpochReader<'store> {
-    pub(crate) const fn new(
+    pub(crate) const fn current(
         chain_epoch: ChainEpoch,
         read_view: RocksChainStoreReadView<'store>,
     ) -> Self {
         Self {
             chain_epoch,
             read_view,
+            is_current: true,
+        }
+    }
+
+    pub(crate) const fn at_epoch(
+        chain_epoch: ChainEpoch,
+        read_view: RocksChainStoreReadView<'store>,
+    ) -> Self {
+        Self {
+            chain_epoch,
+            read_view,
+            is_current: false,
         }
     }
 
@@ -50,6 +68,14 @@ impl<'store> ChainEpochReader<'store> {
     /// Reads a finalized block artifact by height.
     pub fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError> {
         read_block_artifact(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads finalized block artifacts in one batched store read.
+    pub fn blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
+        read_block_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
     /// Reads a compact block artifact by height.
@@ -125,11 +151,55 @@ impl<'store> ChainEpochReader<'store> {
     pub fn block_hash_lookup(&self, block_hash: BlockHash) -> Result<BlockHashLookup, StoreError> {
         read_block_hash_lookup(&self.read_view, self.chain_epoch, block_hash)
     }
+
+    /// Resolves transparent prevout artifacts by outpoint.
+    ///
+    /// This does not filter out spent rows: prevout resolution needs the
+    /// original value and script after the output has been spent. Current
+    /// readers use the exact current projection; pinned historical readers
+    /// scan epoch-suffixed history and verify producing-block visibility.
+    pub fn transparent_prevouts_by_outpoints(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>, StoreError> {
+        if self.is_current {
+            return read_current_transparent_prevouts_by_outpoints(
+                &self.read_view,
+                self.chain_epoch,
+                outpoints,
+            );
+        }
+        read_historical_transparent_prevouts_by_outpoints(
+            &self.read_view,
+            self.chain_epoch,
+            outpoints,
+        )
+    }
+
+    /// Resolves transparent prevout artifacts by outpoint on the primary writer's
+    /// commit path.
+    ///
+    /// This intentionally skips external-reader visibility and spend-state
+    /// filtering. Use it only while the writer is deriving a node-validated
+    /// batch against its own current epoch.
+    pub fn transparent_prevouts_by_outpoints_for_writer_commit(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>, StoreError> {
+        read_current_transparent_prevouts_by_outpoints(&self.read_view, self.chain_epoch, outpoints)
+    }
 }
 
 impl FinalizedBlockStore for ChainEpochReader<'_> {
     fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError> {
         self.block_at(height)
+    }
+
+    fn blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
+        self.blocks_in_range(block_range)
     }
 }
 

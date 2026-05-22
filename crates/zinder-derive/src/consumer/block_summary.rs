@@ -3,14 +3,10 @@
 //! Materializes one [`BlockSummaryRecord`] per canonical block in the
 //! consumer-owned `block_summary` column family per
 //! [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
-//! Reads parsed blocks from the shared [`BlockSource`] so the four
-//! chain-events consumers all observe the same parsed block per height
-//! without four `FullBlock` round-trips.
 //!
 //! Capability strings advertised when the view is wired and the cursor has
 //! caught up: [`EXPLORER_BLOCK_SUMMARY_V1`] and [`EXPLORER_BLOCK_DETAIL_V1`].
 
-use async_trait::async_trait;
 use prost::Message as _;
 use zebra_chain::block::Block as ZebraBlock;
 use zinder_core::BlockHeight;
@@ -21,7 +17,7 @@ use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMAR
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockSource, DeriveConsumerCtx, DeriveConsumerError,
+    BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
 };
 
@@ -41,15 +37,14 @@ pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] =
     &[EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_DETAIL_V1];
 
 /// Materializes one [`BlockSummaryRecord`] per canonical block.
-pub struct BlockSummaryConsumer {
-    block_source: BlockSource,
-}
+#[derive(Default)]
+pub struct BlockSummaryConsumer;
 
 impl BlockSummaryConsumer {
-    /// Builds a consumer that pulls parsed blocks through `block_source`.
+    /// Builds the consumer.
     #[must_use]
-    pub const fn new(block_source: BlockSource) -> Self {
-        Self { block_source }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Returns the canonical derive-store key for `height`.
@@ -59,17 +54,12 @@ impl BlockSummaryConsumer {
     }
 }
 
-#[async_trait]
 impl BlockKeyedConsumer for BlockSummaryConsumer {
     fn name(&self) -> DeriveConsumerName {
         BLOCK_SUMMARY_CONSUMER_NAME
     }
 
-    fn block_source(&self) -> &BlockSource {
-        &self.block_source
-    }
-
-    async fn apply_block(
+    fn apply_block(
         &mut self,
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
@@ -87,7 +77,7 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
         Ok(())
     }
 
-    async fn revert_block(
+    fn revert_block(
         &mut self,
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,
@@ -103,7 +93,7 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
 fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord {
     let block_time_unix_seconds = block.block.header.time.timestamp();
     let transaction_count = u32::try_from(block.block.transactions.len()).unwrap_or(u32::MAX);
-    let total_size_bytes = u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX);
+    let total_size_bytes = u64::try_from(block.raw_block_size_bytes).unwrap_or(u64::MAX);
     let aggregates = aggregate_block_facts(&block.block);
     let transaction_ids = block
         .block

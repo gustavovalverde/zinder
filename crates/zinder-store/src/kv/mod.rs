@@ -19,6 +19,9 @@ pub(crate) enum StorageTable {
     TreeState,
     SubtreeRoot,
     TransparentAddressUtxo,
+    TransparentPrevout,
+    TransparentPrevoutHistory,
+    TransparentPrevoutBlockIndex,
     TransparentUtxoSpend,
     TransparentAddressTxIndex,
     BlockHashIndex,
@@ -38,6 +41,9 @@ impl StorageTable {
             Self::TreeState => "tree_state",
             Self::SubtreeRoot => "subtree_root",
             Self::TransparentAddressUtxo => "transparent_address_utxo",
+            Self::TransparentPrevout => "transparent_prevout",
+            Self::TransparentPrevoutHistory => "transparent_prevout_history",
+            Self::TransparentPrevoutBlockIndex => "transparent_prevout_block_index",
             Self::TransparentUtxoSpend => "transparent_utxo_spend",
             Self::TransparentAddressTxIndex => "transparent_address_tx_index",
             Self::BlockHashIndex => "block_hash_index",
@@ -47,7 +53,7 @@ impl StorageTable {
         }
     }
 
-    pub(crate) const fn all() -> [Self; 14] {
+    pub(crate) const fn all() -> [Self; 17] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
@@ -57,6 +63,9 @@ impl StorageTable {
             Self::TreeState,
             Self::SubtreeRoot,
             Self::TransparentAddressUtxo,
+            Self::TransparentPrevout,
+            Self::TransparentPrevoutHistory,
+            Self::TransparentPrevoutBlockIndex,
             Self::TransparentUtxoSpend,
             Self::TransparentAddressTxIndex,
             Self::BlockHashIndex,

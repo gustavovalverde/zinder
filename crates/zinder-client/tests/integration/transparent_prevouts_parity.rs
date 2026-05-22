@@ -12,18 +12,11 @@ use tonic::transport::Server;
 use zinder_client::{
     BlockHeight, ChainEpochId, ChainIndex, LocalChainIndex, LocalOpenOptions,
     MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, RemoteChainIndex, RemoteOpenOptions,
-    TransactionArtifact, TransactionId, TransparentOutPoint,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressUtxoArtifact,
+    TransparentOutPoint,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_testkit::{
-    ChainFixture, P2pkhSpendArgs, StoreFixture, TransparentAddress as TestkitTransparentAddress,
-    TransparentTestKey, sample_regtest_upgrade_activations,
-};
-
-const FIXTURE_SEED: [u8; 32] = [
-    0xAA, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10,
-    0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-];
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 struct TransparentPrevoutParityHarness {
     _store_fixture: StoreFixture,
@@ -33,23 +26,24 @@ struct TransparentPrevoutParityHarness {
 }
 
 async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevoutParityHarness> {
-    let key = TransparentTestKey::from_seed(&FIXTURE_SEED)?;
-    let recipient = TestkitTransparentAddress::PublicKeyHash([0x42; 20]);
-    let raw_bytes = key.build_p2pkh_spend(&P2pkhSpendArgs {
-        coinbase_txid_be: [0xAA; 32],
-        coinbase_vout: 0,
-        coinbase_value_zats: 10_000_000,
-        recipient: &recipient,
-        target_height: 1,
-    })?;
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let block = chain_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture must contain block 1"))?;
+    let block_height = block.height;
+    let block_hash = block.hash;
     let transaction_id = TransactionId::from_bytes([0xCC; 32]);
-    let transaction_artifact =
-        TransactionArtifact::new(transaction_id, block.height, block.hash, raw_bytes);
-    let chain_fixture = chain_fixture.with_transaction_artifact(transaction_artifact);
+    let script_pub_key = vec![0x76, 0xa9, 0x42, 0x88, 0xac];
+    let outpoint = TransparentOutPoint::new(transaction_id, 0);
+    let chain_fixture =
+        chain_fixture.with_transparent_address_utxo(TransparentAddressUtxoArtifact::new(
+            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+            script_pub_key,
+            outpoint,
+            10_000_000,
+            block_height,
+            block_hash,
+        ));
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),

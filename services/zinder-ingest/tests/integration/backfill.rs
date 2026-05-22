@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -13,7 +13,11 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, Network, ShieldedProtocol, SubtreeRootIndex,
 };
-use zinder_ingest::{BackfillConfig, NodeSourceKind, backfill, backfill_until_complete};
+use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, decode_stored_record};
+use zinder_ingest::{
+    BackfillConfig, NodeSourceKind, backfill, backfill_until_complete,
+    catch_up_derive_store_to_canonical,
+};
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
@@ -25,6 +29,29 @@ use zinder_store::{
     PrimaryChainStore,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
+
+fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
+}
+
+fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: zinder_derive::DeriveStore::bundled_consumer_column_families(
+            ),
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
+}
 
 #[tokio::test]
 #[allow(
@@ -63,8 +90,12 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            .ok_or_else(|| eyre!("invalid prevout budget"))?,
         fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        flush_every_n_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
+        derive_concurrency: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
@@ -123,6 +154,110 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 }
 
 #[tokio::test]
+async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
+    let source_block = fixture_source_block()?;
+    let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
+    let checkpoint = SourceChainCheckpoint::new(
+        checkpoint_height,
+        source_block.parent_hash,
+        ChainTipMetadata::empty(),
+    );
+    let source = FixtureCheckpointSource {
+        block: source_block.clone(),
+        tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
+        fetched_heights: Arc::new(Mutex::new(Vec::new())),
+        pending_retryable_fetch_failures: Arc::new(Mutex::new(0)),
+    };
+
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("derive-replay-catchup-store");
+    let backfill_config = BackfillConfig {
+        node: NodeTarget::new(
+            Network::ZcashTestnet,
+            "http://127.0.0.1:39232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        ),
+        node_source: NodeSourceKind::ZebraJsonRpc,
+        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        storage_path: storage_path.clone(),
+        from_height: source_block.height,
+        to_height: source_block.height,
+        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            .ok_or_else(|| eyre!("invalid prevout budget"))?,
+        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
+        derive_concurrency: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
+        upstream_tip_hint: None,
+        allow_near_tip_finalize: false,
+        checkpoint: Some(checkpoint),
+    };
+    let store = PrimaryChainStore::open(
+        &storage_path,
+        ChainStoreOptions::for_network(Network::ZcashTestnet),
+    )?;
+    let derive_store_without_consumers = test_derive_store(&storage_path)?;
+    let readiness = Readiness::default();
+
+    backfill_until_complete(
+        &backfill_config,
+        &source,
+        &store,
+        &derive_store_without_consumers,
+        &readiness,
+    )
+    .await?
+    .ok_or_else(|| eyre!("expected backfill to commit"))?;
+    drop(derive_store_without_consumers);
+
+    let derive_store = bundled_derive_store(&storage_path)?;
+    catch_up_derive_store_to_canonical(
+        &store,
+        &derive_store,
+        NonZeroU32::new(2).ok_or_else(|| eyre!("invalid replay concurrency"))?,
+    )
+    .await?;
+
+    assert_chain_event_cursors_advanced(&derive_store)?;
+    assert_block_summary_materialized(&derive_store, source_block.height)?;
+
+    Ok(())
+}
+
+fn assert_chain_event_cursors_advanced(derive_store: &zinder_derive::DeriveStore) -> Result<()> {
+    for consumer_name in zinder_derive::DeriveStore::bundled_chain_event_consumer_names() {
+        assert!(
+            derive_store
+                .get_chain_event_cursor(*consumer_name)?
+                .is_some(),
+            "derive replay must advance {consumer_name:?} through the retained canonical events"
+        );
+    }
+    Ok(())
+}
+
+fn assert_block_summary_materialized(
+    derive_store: &zinder_derive::DeriveStore,
+    block_height: BlockHeight,
+) -> Result<()> {
+    let record_bytes = derive_store
+        .get_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &BlockSummaryConsumer::key_for_height(block_height),
+        )?
+        .ok_or_else(|| eyre!("derive replay did not materialize the block summary"))?;
+    let block_summary_record = decode_stored_record(&record_bytes)?;
+    let summary = block_summary_record
+        .summary
+        .ok_or_else(|| eyre!("block summary record did not carry a summary"))?;
+    assert_eq!(summary.block_height, block_height.value());
+    Ok(())
+}
+
+#[tokio::test]
 async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
     let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0);
     let expected_tip_metadata = ChainTipMetadata::new(107_796, 0);
@@ -157,8 +292,12 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            .ok_or_else(|| eyre!("invalid prevout budget"))?,
         fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        flush_every_n_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
+        derive_concurrency: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
@@ -206,8 +345,12 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         from_height: source_block.height,
         to_height: source_block.height,
         commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            .ok_or_else(|| eyre!("invalid prevout budget"))?,
         fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        flush_every_n_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
+        derive_concurrency: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
@@ -216,11 +359,13 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashTestnet),
     )?;
+    let derive_store = test_derive_store(&storage_path)?;
     let readiness = Readiness::default();
 
-    let outcome = backfill_until_complete(&backfill_config, &source, &store, &readiness)
-        .await?
-        .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
+    let outcome =
+        backfill_until_complete(&backfill_config, &source, &store, &derive_store, &readiness)
+            .await?
+            .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
     assert_eq!(*pending_retryable_fetch_failures.lock(), 0);

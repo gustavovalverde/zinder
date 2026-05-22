@@ -107,8 +107,32 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
+| `zinder_ingest_derive_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
+| `zinder_ingest_derive_total` | counter | `zinder-ingest` | Per-block bulk-catchup derive count by status and error class. |
+| `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Startup derive replay stage latency by stage, status, and error class. |
+| `zinder_ingest_derive_replay_events_total` | counter | `zinder-ingest` | Startup derive replay event count by status and error class. |
+| `zinder_ingest_derive_replay_blocks_total` | counter | `zinder-ingest` | Startup derive replay block count by status and error class. |
+| `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before startup derive replay. |
+| `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store during startup. |
+| `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Startup derive replay lag between replay progress and canonical tip. |
+| `zinder_ingest_derive_context_stage_duration_seconds` | histogram | `zinder-ingest` | Commit-time derive-context hydration latency by stage, status, and error class; stages include `hydrate_blocks` and `resolve_prevouts`. |
+| `zinder_ingest_prevout_resolution_total` | counter | `zinder-ingest` | Transparent prevouts resolved while building derive contexts by source: `in_batch`, `indexed_prevout`, or `unresolved`. |
+| `zinder_ingest_prevout_resolution_requested_outpoint_count` | histogram | `zinder-ingest` | Unique transparent prevouts requested while building one derive context batch. |
+| `zinder_ingest_prevout_store_lookup_active` | gauge | `zinder-ingest` | Whether a commit-time transparent-prevout store lookup is active by stage (`derive_context`, `spend_address_index`). |
+| `zinder_ingest_prevout_store_lookup_requested_outpoints` | gauge | `zinder-ingest` | Transparent prevout store lookups requested by the active batch by stage. |
+| `zinder_ingest_prevout_store_lookup_completed_outpoints` | gauge | `zinder-ingest` | Transparent prevout store lookups completed in the active batch by stage. |
+| `zinder_ingest_prevout_store_lookup_chunks` | gauge | `zinder-ingest` | Bounded lookup chunks planned for the active transparent-prevout store read by stage. |
+| `zinder_ingest_prevout_store_lookup_completed_chunks` | gauge | `zinder-ingest` | Bounded lookup chunks completed for the active transparent-prevout store read by stage. |
+| `zinder_ingest_prevout_store_lookup_chunk_duration_seconds` | histogram | `zinder-ingest` | Transparent prevout store lookup latency per bounded chunk by stage, status, and error class. |
+| `zinder_ingest_prevout_store_lookup_chunk_outpoint_count` | histogram | `zinder-ingest` | Transparent prevout outpoints requested per bounded lookup chunk by stage and status. |
+| `zinder_ingest_prevout_store_lookup_chunks_total` | counter | `zinder-ingest` | Transparent prevout lookup chunks by stage, status, and error class. |
+| `zinder_ingest_backfill_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup/backfill stage latency by stage, status, and error class; stages include `await_derived_block`, `populate_subtree_roots`, and `flush_store`. |
 | `zinder_ingest_commit_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit latency by status and error class. |
+| `zinder_ingest_commit_stage_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit substage latency by stage, status, and error class. |
 | `zinder_ingest_commit_batch_block_count` | histogram | `zinder-ingest` | Blocks per ingest commit batch by status. |
+| `zinder_ingest_commit_batch_transparent_prevout_store_lookup_count` | histogram | `zinder-ingest` | Unique transparent prevouts read from the store per ingest commit batch by status. |
+| `zinder_ingest_batch_transparent_prevout_store_lookup_outpoints` | gauge | `zinder-ingest` | Current in-flight batch's unique transparent prevouts that must be read from the store. |
+| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count` or `transparent_prevout_store_lookup_count`. |
 | `zinder_ingest_writer_has_chain_epoch` | gauge | `zinder-ingest` | Whether the ingest writer currently has a visible chain epoch. |
 | `zinder_ingest_writer_chain_epoch_id` | gauge | `zinder-ingest` | Latest visible chain-epoch id published by the ingest writer. |
 | `zinder_ingest_writer_tip_height` | gauge | `zinder-ingest` | Latest visible tip height published by the ingest writer. |
@@ -382,8 +406,12 @@ reorg_window_blocks = 100        # chain-truth invariant
 [ingest.phases]
 catchup_threshold_blocks = 100   # defaults to ingest.reorg_window_blocks
 
+[ingest.derive]
+concurrency = 32                 # CPU-bound derive and replay hydration width
+
 [ingest.bulk_catchup]
 commit_batch_blocks = 1000
+max_transparent_prevout_store_lookups_per_batch = 250000
 fetch_concurrency = 32
 
 [ingest.tip_follow]

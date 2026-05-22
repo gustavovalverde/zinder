@@ -71,6 +71,12 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
 | `tree_state` | Sapling and Orchard tree state metadata needed by wallet APIs |
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
+| `transparent_address_utxo` | Transparent address UTXO rows keyed for address-history and balance reads |
+| `transparent_prevout` | Exact current `(network, outpoint)` projection for transparent-prevout resolution hot paths |
+| `transparent_prevout_history` | Epoch-suffixed transparent-prevout history used by pinned historical reads and reorg repair |
+| `transparent_prevout_block_index` | Block-local transparent outpoint lists used to bound current-projection repair during reorg replacement |
+| `transparent_utxo_spend` | Transparent spent-outpoint rows used to attach spending transaction metadata |
+| `transparent_address_tx_index` | Transparent address transaction-history rows |
 | `block_hash_index` | Best-chain `(network, block_hash) -> (height, source_chain_epoch_id)` resolver written on every finalized-block commit. Monotonic: reorged-out hashes are filtered at read time and never deleted, so the family grows roughly one row per finalized block (~50K rows per year on mainnet). A future retention pass may prune rows older than the reorg window once an active-reader proof exists. |
 | `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable non-finalized links |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
@@ -104,7 +110,7 @@ Required steps inside `commit_chain_epoch`:
 
 1. Validate block links, compact block artifacts, transaction references, tree metadata, and reorg-window metadata.
 2. Serialize the read-validate-write window for the visible epoch pointer and event sequence pointer, or use an equivalent compare-and-swap write fence.
-3. Build the single `WriteBatch` covering artifacts, replaced non-finalized state, event envelope, sequence pointer, store metadata, and visible-epoch pointer.
+3. Build the single `WriteBatch` covering artifacts, transparent-prevout current-projection repair, event envelope, sequence pointer, store metadata, and visible-epoch pointer.
 4. Commit with the configured durability policy.
 5. Return the committed epoch and envelope only after the batch succeeds.
 6. Leave the previous visible epoch intact if the batch fails.

@@ -3,12 +3,7 @@
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
 //! calling upstream node sources or mutating canonical storage.
 
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-    sync::Arc,
-    time::Instant,
-};
+use std::{num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -21,10 +16,7 @@ use zinder_core::{
     TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutEntry,
     TransparentPrevoutsResponse, TxStatus,
 };
-use zinder_source::{
-    SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes,
-    transparent_prevout_from_raw_transaction_bytes,
-};
+use zinder_source::{SourceError, TransactionBroadcaster, block_header_info_from_raw_block_bytes};
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEpochReadApi, ChainEventEnvelope,
     ChainEventHistoryRequest, ChainEventStreamFamily, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
@@ -137,12 +129,10 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Resolves a batch of canonical-chain transparent outpoints to their
     /// referenced outputs.
     ///
-    /// Reads each unique `transaction_id` once from the canonical
-    /// transaction artifact and indexes into the transaction's `vout` list
-    /// (compute-at-read-time, no dedicated column family). Outpoints that
-    /// do not resolve at the response's [`ChainEpoch`] return an entry with
-    /// `prevout = None`. The response preserves input order; duplicate
-    /// outpoints emit duplicate entries.
+    /// Reads each unique outpoint from the canonical transparent prevout
+    /// index. Outpoints that do not resolve at the response's [`ChainEpoch`]
+    /// return an entry with `prevout = None`. The response preserves input
+    /// order; duplicate outpoints emit duplicate entries.
     ///
     async fn transparent_prevouts(
         &self,
@@ -518,47 +508,14 @@ where
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
 
-            // One batched store read for every distinct transaction id in the
-            // request: collapses the per-outpoint visibility lookup + Transaction
-            // CF read + block-artifact cross-check into N seeks + 1 multi_get +
-            // M block reads (M = unique block heights touched).
-            let unique_ids: Vec<TransactionId> = {
-                let mut seen: HashSet<TransactionId> = HashSet::with_capacity(outpoints.len());
-                outpoints
-                    .iter()
-                    .filter_map(|outpoint| {
-                        seen.insert(outpoint.transaction_id)
-                            .then_some(outpoint.transaction_id)
-                    })
-                    .collect()
-            };
-            let artifacts_by_id = reader.transactions_by_ids(&unique_ids)?;
-            let payloads_by_id: HashMap<TransactionId, Option<Vec<u8>>> = artifacts_by_id
-                .into_iter()
-                .map(|(transaction_id, artifact)| {
-                    (
-                        transaction_id,
-                        artifact.map(|artifact| artifact.payload_bytes),
-                    )
-                })
-                .collect();
+            let prevouts_by_outpoint = reader.transparent_prevouts_by_outpoints(&outpoints)?;
 
             let mut entries = Vec::with_capacity(outpoints.len());
             for outpoint in outpoints {
-                let payload_bytes = payloads_by_id
-                    .get(&outpoint.transaction_id)
-                    .and_then(Option::as_deref);
-                let prevout = match payload_bytes {
-                    None => None,
-                    Some(payload_bytes) => transparent_prevout_from_raw_transaction_bytes(
-                        payload_bytes,
-                        outpoint.output_index,
-                    )
-                    .map_err(|error| QueryError::ArtifactCorrupt {
-                        family: ArtifactFamily::Transaction,
-                        reason: error.to_string(),
-                    })?,
-                };
+                let prevout = prevouts_by_outpoint
+                    .get(&outpoint)
+                    .cloned()
+                    .map(zinder_core::TransparentPrevoutArtifact::into_prevout);
                 entries.push(TransparentPrevoutEntry { outpoint, prevout });
             }
 

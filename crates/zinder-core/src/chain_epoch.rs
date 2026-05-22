@@ -233,6 +233,26 @@ impl BlockHeightRange {
     pub const fn inclusive(start: BlockHeight, end: BlockHeight) -> Self {
         Self { start, end }
     }
+
+    /// Creates an empty range anchored at `height`.
+    ///
+    /// Empty ranges represent chain events that advance epoch metadata
+    /// without publishing new or replacement block artifacts. The iterator
+    /// yields no heights because `start > end`.
+    #[must_use]
+    pub const fn empty_at(height: BlockHeight) -> Self {
+        if height.0 == u32::MAX {
+            Self {
+                start: height,
+                end: BlockHeight(height.0 - 1),
+            }
+        } else {
+            Self {
+                start: BlockHeight(height.0 + 1),
+                end: height,
+            }
+        }
+    }
 }
 
 impl IntoIterator for BlockHeightRange {

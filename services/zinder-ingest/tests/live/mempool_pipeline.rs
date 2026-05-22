@@ -3,8 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use eyre::{Result, eyre};
 use prost::Message;
@@ -23,6 +22,17 @@ use zinder_source::{
 use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use zinder_testkit::StoreFixture;
 use zinder_testkit::live::{LiveTestEnv, init, require_live, require_live_for};
+
+fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
+}
 
 /// Validates canonical hydration from a real Zebra-emitted transaction.
 ///
@@ -183,16 +193,19 @@ async fn mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_sta
 
     let store_fixture = StoreFixture::with_single_block(env.network())?;
     let chain_store = store_fixture.chain_store().clone();
+    let derive_store = test_derive_store(store_fixture.tempdir_path())?;
     let mempool_index = MempoolIndex::new();
     let mempool_source: Arc<ZebraIndexerMempoolSource> =
         Arc::new(build_indexer_mempool_source(&env, indexer_endpoint_url)?);
 
     let orchestrator_index = mempool_index.clone();
     let chain_store_for_orchestrator = chain_store.clone();
+    let derive_store_for_orchestrator = derive_store.clone();
     let orchestrator_handle = tokio::spawn(async move {
         run_mempool_orchestrator(
             mempool_source,
             chain_store_for_orchestrator,
+            derive_store_for_orchestrator,
             orchestrator_index,
             |_outcome| {},
         )
@@ -497,6 +510,7 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let derive_store = test_derive_store(&storage_path)?;
     let readiness = Readiness::default();
 
     let cancel = CancellationToken::new();
@@ -505,11 +519,13 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
         let readiness = readiness.clone();
         let cancel = cancel.clone();
         let tip_follow_config = tip_follow_config.clone();
+        let derive_store = derive_store.clone();
         tokio::spawn(async move {
             tip_follow_with_primary_store(
                 &tip_follow_config,
                 &source,
                 store,
+                derive_store,
                 &readiness,
                 None,
                 None,

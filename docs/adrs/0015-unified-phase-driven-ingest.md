@@ -97,6 +97,9 @@ The loop is driven by an explicit phase classifier with three phases:
   per-batch target of
   `min(upstream_tip - ingest.reorg_window_blocks,
        store_tip + ingest.bulk_catchup.commit_batch_blocks)`.
+  The commit stage may close the batch earlier when out-of-batch
+  transparent prevout store-lookups reach
+  `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch`.
 - `IngestPhase::TipFollow` otherwise. Runs the serial fetch shape and
   commits with `Extend` or `Replace`, then advances the finalized
   boundary through the same `finalize_tip_if_ready` path that exists
@@ -138,8 +141,12 @@ splits the rest into four concern-named sub-sections:
 
 - `[ingest.phases]` carries the classifier boundary
   (`catchup_threshold_blocks`, defaults to `ingest.reorg_window_blocks`).
-- `[ingest.bulk_catchup]` carries the pipelined-fetch knobs
-  (`commit_batch_blocks`, `fetch_concurrency`).
+- `[ingest.derive]` carries shared CPU-bound derive execution knobs
+  (`concurrency`).
+- `[ingest.bulk_catchup]` carries the pipelined-fetch and commit-work
+  knobs (`commit_batch_blocks`,
+  `max_transparent_prevout_store_lookups_per_batch`,
+  `fetch_concurrency`).
 - `[ingest.tip_follow]` carries the serial-loop knobs
   (`poll_interval_ms`, `lag_threshold_blocks`).
 - `[ingest.modifiers]` carries the optional one-shot or
@@ -258,7 +265,9 @@ helper beside the phase classifier. `BackfillConfig` becomes
 both derived per iteration instead of carried as configuration. The
 `BACKFILL_FETCH_CONCURRENCY` constant becomes the
 `ingest.bulk_catchup.fetch_concurrency` config field, parameterized
-rather than hard-coded. The CLI surface tracks one front door, not two.
+rather than hard-coded. The bulk-catchup transparent-prevout store-read
+budget is also a named config field instead of being hidden inside block
+count. The CLI surface tracks one front door, not two.
 The duplicated `IngestNodeConfig` schema mirror in the ingest binary
 disappears in favor of consuming `NodeSection` directly through
 ADR-0014's `with_node_section` helper, so adding a field to the shared
@@ -343,9 +352,10 @@ capability (registered in `capability_coverage.rs`), the new
 `NodeCapability::ReadinessProbe` advertisement (already declared but
 previously unused), the `zinder-ingest probe` diagnostic subcommand,
 the sub-sectioned writer-private `[ingest.phases]`,
-`[ingest.bulk_catchup]`, `[ingest.tip_follow]`, `[ingest.modifiers]`
+`[ingest.derive]`, `[ingest.bulk_catchup]`, `[ingest.tip_follow]`, `[ingest.modifiers]`
 TOML sections with their `catchup_threshold_blocks`,
-`commit_batch_blocks`, `fetch_concurrency`, `poll_interval_ms`,
+`concurrency`, `commit_batch_blocks`,
+`max_transparent_prevout_store_lookups_per_batch`, `fetch_concurrency`, `poll_interval_ms`,
 `lag_threshold_blocks`, `target_height`, `checkpoint_height`,
 `allow_near_tip_finalize`, and `coverage` fields, and the new
 `[node.health]` sub-section on the shared `[node]` schema with
@@ -516,14 +526,18 @@ Config:
 
 - Restructure `[backfill]` and `[tip_follow]` into sub-sections of
   `[ingest]`: `[ingest.phases]` (classifier),
-  `[ingest.bulk_catchup]` (pipelined-fetch knobs),
-  `[ingest.tip_follow]` (serial-loop knobs), `[ingest.modifiers]`
-  (one-shot CLI modifiers). Keep `reorg_window_blocks` at the top of
-  `[ingest]` as a chain-truth invariant.
+  `[ingest.derive]` (shared CPU-bound derive execution),
+  `[ingest.bulk_catchup]` (pipelined-fetch knobs), `[ingest.tip_follow]`
+  (serial-loop knobs), `[ingest.modifiers]` (one-shot CLI modifiers).
+  Keep `reorg_window_blocks` at the top of `[ingest]` as a chain-truth
+  invariant.
 - Rename `to_height` to `target_height` and place it under
   `[ingest.modifiers]`.
 - Promote the `BACKFILL_FETCH_CONCURRENCY` constant to
   `ingest.bulk_catchup.fetch_concurrency` (default 32).
+- Add `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch`
+  so block count does not hide commit-time transparent-prevout store-read
+  cost.
 - Migrate `deploy/single-container/config.example.ingest.toml` and
   `deploy/config/ingest.toml` to the new shape.
 

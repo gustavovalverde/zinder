@@ -9,7 +9,8 @@ use zinder_core::{
     SubtreeRootHash, SubtreeRootIndex, TransactionArtifact, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    TransparentOutPoint, TransparentPrevoutArtifact, TransparentUtxoSpendArtifact,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -800,6 +801,123 @@ pub(crate) fn decode_transparent_address_utxo_artifact(
     ))
 }
 
+pub(crate) fn encode_transparent_prevout_artifact(
+    artifact: TransparentPrevoutArtifact,
+) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderTransparentPrevoutArtifactV1,
+        &TransparentPrevoutArtifactRecord {
+            transaction_id: artifact.outpoint.transaction_id.as_bytes().to_vec(),
+            output_index: artifact.outpoint.output_index,
+            value_zat: artifact.value_zat,
+            script_pub_key: Bytes::from(artifact.script_pub_key),
+            address_script_hash: artifact.address_script_hash.as_bytes().to_vec(),
+            block_height: artifact.block_height.value(),
+            block_hash: artifact.block_hash.as_bytes().to_vec(),
+        },
+    )
+}
+
+pub(crate) fn decode_transparent_prevout_artifact(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+    outpoint: TransparentOutPoint,
+) -> Result<TransparentPrevoutArtifact, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::TransparentPrevout,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderTransparentPrevoutArtifactV1,
+    )?;
+    let record = TransparentPrevoutArtifactRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransparentPrevout,
+            key: key.clone().into(),
+            reason: "transparent prevout artifact record is not valid protobuf",
+        }
+    })?;
+
+    let decoded_outpoint = TransparentOutPoint::new(
+        decode_transaction_id_for_family(
+            ArtifactFamily::TransparentPrevout,
+            key,
+            &record.transaction_id,
+        )?,
+        record.output_index,
+    );
+    if decoded_outpoint != outpoint {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransparentPrevout,
+            key: key.clone().into(),
+            reason: "transparent prevout artifact outpoint does not match its key",
+        });
+    }
+
+    Ok(TransparentPrevoutArtifact::new(
+        outpoint,
+        record.value_zat,
+        record.script_pub_key.to_vec(),
+        decode_transparent_address_script_hash(key, &record.address_script_hash)?,
+        BlockHeight::new(record.block_height),
+        decode_block_hash(ArtifactFamily::TransparentPrevout, key, &record.block_hash)?,
+    ))
+}
+
+pub(crate) fn encode_transparent_prevout_block_index(
+    block_hash: BlockHash,
+    outpoints: &[TransparentOutPoint],
+) -> Result<Vec<u8>, StoreError> {
+    let outpoints = outpoints
+        .iter()
+        .map(|outpoint| TransparentOutPointRecord {
+            transaction_id: outpoint.transaction_id.as_bytes().to_vec(),
+            output_index: outpoint.output_index,
+        })
+        .collect::<Vec<_>>();
+
+    encode_artifact_record(
+        PayloadFormat::ZinderTransparentPrevoutBlockIndexV1,
+        &TransparentPrevoutBlockIndexRecord {
+            block_hash: block_hash.as_bytes().to_vec(),
+            outpoints,
+        },
+    )
+}
+
+pub(crate) fn decode_transparent_prevout_block_index(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+) -> Result<(BlockHash, Vec<TransparentOutPoint>), StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::TransparentPrevout,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderTransparentPrevoutBlockIndexV1,
+    )?;
+    let record = TransparentPrevoutBlockIndexRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransparentPrevout,
+            key: key.clone().into(),
+            reason: "transparent prevout block index record is not valid protobuf",
+        }
+    })?;
+    let block_hash =
+        decode_block_hash(ArtifactFamily::TransparentPrevout, key, &record.block_hash)?;
+    let mut outpoints = Vec::with_capacity(record.outpoints.len());
+    for outpoint in record.outpoints {
+        outpoints.push(TransparentOutPoint::new(
+            decode_transaction_id_for_family(
+                ArtifactFamily::TransparentPrevout,
+                key,
+                &outpoint.transaction_id,
+            )?,
+            outpoint.output_index,
+        ));
+    }
+
+    Ok((block_hash, outpoints))
+}
+
 pub(crate) fn encode_transparent_address_tx_index_artifact(
     artifact: TransparentAddressTxIndexArtifact,
 ) -> Result<Vec<u8>, StoreError> {
@@ -1139,6 +1257,8 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
         PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1 => {
             ArtifactFamily::TransparentAddressTxIndex
         }
+        PayloadFormat::ZinderTransparentPrevoutArtifactV1
+        | PayloadFormat::ZinderTransparentPrevoutBlockIndexV1 => ArtifactFamily::TransparentPrevout,
     }
 }
 
@@ -1387,6 +1507,40 @@ struct TransparentAddressTxIndexArtifactRecord {
     transaction_id: Vec<u8>,
     #[prost(bytes, tag = "2")]
     block_hash: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentPrevoutArtifactRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    output_index: u32,
+    #[prost(uint64, tag = "3")]
+    value_zat: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    script_pub_key: Bytes,
+    #[prost(bytes, tag = "5")]
+    address_script_hash: Vec<u8>,
+    #[prost(uint32, tag = "6")]
+    block_height: u32,
+    #[prost(bytes, tag = "7")]
+    block_hash: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentPrevoutBlockIndexRecord {
+    #[prost(bytes, tag = "1")]
+    block_hash: Vec<u8>,
+    #[prost(message, repeated, tag = "2")]
+    outpoints: Vec<TransparentOutPointRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentOutPointRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    output_index: u32,
 }
 
 const MEMPOOL_EVENT_KIND_ADDED: u32 = 1;

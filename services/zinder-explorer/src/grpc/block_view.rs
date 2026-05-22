@@ -2,7 +2,7 @@
 //! handlers.
 //!
 //! Both reads project the materialized `BlockSummaryRecord` payloads written
-//! by [`crate::consumer::block_summary::BlockSummaryConsumer`] into the
+//! by [`zinder_derive::BlockSummaryConsumer`] into the
 //! public wire shapes. The handlers wrap reads in the cross-cutting
 //! [`ExplorerFreshness`] envelope per
 //! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md) and
@@ -23,8 +23,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use crate::consumer::block_summary::BLOCK_SUMMARY_COLUMN_FAMILY;
-use crate::store::DeriveStore;
+use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 
 /// Hard cap on the number of block summaries one range request returns.
 ///

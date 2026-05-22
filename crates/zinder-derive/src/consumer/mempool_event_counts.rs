@@ -15,7 +15,6 @@
 //! sliding window: rows older than 24 h are pruned in the same batch as
 //! the new write so storage stays `O(24 * 3600 * 16) = 1.3 MB` at most.
 
-use async_trait::async_trait;
 use zinder_core::wire::{UNIX_SECONDS_KEY_LEN, encode_unix_seconds};
 
 use crate::consumer::{
@@ -87,13 +86,12 @@ impl Default for MempoolEventCountsConsumer {
     }
 }
 
-#[async_trait]
 impl DeriveMempoolConsumer for MempoolEventCountsConsumer {
     fn name(&self) -> DeriveConsumerName {
         MEMPOOL_EVENT_COUNTS_CONSUMER_NAME
     }
 
-    async fn apply_mempool_event(
+    fn apply_mempool_event(
         &mut self,
         event: &MempoolConsumerEvent<'_>,
         ctx: &mut DeriveConsumerCtx<'_>,

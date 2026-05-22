@@ -9,21 +9,15 @@ use crate::consumer::DeriveConsumerError;
 
 /// Boundary error returned by the derive-plane runtime.
 ///
-/// `DeriveError` is the top-level error consumers see. It folds storage and
-/// transport failures behind named variants so the binary's operator-facing
-/// error path stays narrow.
+/// `DeriveError` is the top-level error consumers see. It folds storage,
+/// decode, and consumer failures behind named variants so the binary's
+/// operator-facing error path stays narrow.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DeriveError {
     /// `RocksDB`-shaped storage failure.
     #[error("derive store failure: {0}")]
     Store(#[from] DeriveStoreError),
-    /// gRPC client transport failure when talking to upstream `zinder-query`.
-    #[error("derive transport failure: {0}")]
-    Transport(#[from] tonic::transport::Error),
-    /// Upstream gRPC call returned a non-Ok status.
-    #[error("derive upstream error: {0}")]
-    Upstream(#[from] tonic::Status),
     /// Wire envelope failed to decode into the typed event shape the
     /// subscriber dispatches to consumers.
     #[error("derive event decode failure: {0}")]
@@ -34,6 +28,10 @@ pub enum DeriveError {
     /// Cursor delivered by upstream did not match the persisted cursor.
     #[error("derive cursor mismatch: persisted cursor disagrees with upstream stream resume")]
     CursorMismatch,
+    /// Chain-event dispatch was asked to process a variant no chain consumer
+    /// understands.
+    #[error("derive chain-event dispatch received an unsupported chain event variant")]
+    UnsupportedChainEvent,
 }
 
 /// `RocksDB`-shaped failure surfaced from `DeriveStore`.
@@ -130,8 +128,10 @@ pub enum DeriveStoreError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DeriveStoreColumnFamily {
-    /// `cursor` column family: per-consumer cursor persistence.
-    Cursor,
+    /// `chain_event_cursor` column family: per-chain-consumer cursor persistence.
+    ChainEventCursor,
+    /// `mempool_event_cursor` column family: per-mempool-consumer cursor persistence.
+    MempoolEventCursor,
     /// `consumer_metadata` column family: schema versions and per-consumer
     /// counters.
     ConsumerMetadata,
@@ -142,7 +142,8 @@ impl DeriveStoreColumnFamily {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Cursor => "cursor",
+            Self::ChainEventCursor => "chain_event_cursor",
+            Self::MempoolEventCursor => "mempool_event_cursor",
             Self::ConsumerMetadata => "consumer_metadata",
         }
     }

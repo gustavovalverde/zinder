@@ -22,6 +22,7 @@ mod store_error;
 mod subtree_root;
 mod transaction_artifact;
 mod transparent_address_tx_index;
+mod transparent_prevout;
 mod transparent_utxo;
 mod tree_state;
 

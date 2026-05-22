@@ -8,9 +8,9 @@ use std::{sync::Arc, thread};
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, TransactionArtifact, TransactionId,
-    TreeStateArtifact, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionArtifact,
+    TransactionId, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEvent, ChainEventHistoryRequest, ChainStoreOptions,
@@ -380,7 +380,7 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         tip_hash: bootstrap_hash,
         finalized_height: bootstrap_height,
         finalized_hash: bootstrap_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: bootstrap_tip_metadata,
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -392,6 +392,10 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
             }),
     )?;
     assert_eq!(committed.chain_epoch, bootstrap_chain_epoch);
+    assert_eq!(
+        committed.block_range,
+        BlockHeightRange::empty_at(bootstrap_height)
+    );
     assert_eq!(store.current_chain_epoch()?, Some(bootstrap_chain_epoch));
     let reader = store.current_chain_epoch_reader()?;
     assert_eq!(reader.chain_epoch(), bootstrap_chain_epoch);
@@ -430,7 +434,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: checkpoint_hash,
         finalized_height: checkpoint_height,
         finalized_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -455,7 +459,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: replaced_tip_hash,
         finalized_height: checkpoint_height,
         finalized_hash: replaced_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(4),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_001),
     };
@@ -521,7 +525,7 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            artifact_schema_version: ArtifactSchemaVersion::new(4),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },

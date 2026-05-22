@@ -44,6 +44,7 @@ const fn artifact_family_label(family: ArtifactFamily) -> &'static str {
         ArtifactFamily::TreeState => "tree_state",
         ArtifactFamily::SubtreeRoot => "subtree_root",
         ArtifactFamily::TransparentAddressUtxo => "transparent_address_utxo",
+        ArtifactFamily::TransparentPrevout => "transparent_prevout",
         ArtifactFamily::TransparentUtxoSpend => "transparent_utxo_spend",
         ArtifactFamily::TransparentAddressTxIndex => "transparent_address_tx_index",
         ArtifactFamily::BlockHashIndex => "block_hash_index",

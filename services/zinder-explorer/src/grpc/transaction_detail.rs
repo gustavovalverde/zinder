@@ -17,8 +17,7 @@ use zinder_core::{
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V1;
 use zinder_proto::wire::encode_privacy_shape;
 
-use crate::consumer::transaction_fees::TransactionFeesConsumer;
-use crate::store::DeriveStore;
+use zinder_derive::{DeriveStore, TransactionFeesConsumer};
 use zinder_proto::v1::{
     explorer::{
         ExplorerFreshness, LockTime as WireLockTime, LockTimeUnlocked, MempoolLocation,

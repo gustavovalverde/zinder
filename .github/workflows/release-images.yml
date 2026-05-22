@@ -1,17 +1,16 @@
 name: release-images
 
-# Build and push each service's Docker image plus the single-container image
-# to ghcr.io when a release tag lands. Use workflow_dispatch to dry-run.
+# Build and push each service Docker image plus the single-container image to
+# ghcr.io when a release tag lands. Use workflow_dispatch to dry-run.
 #
 # Tag convention:
 #   - tag is `v<semver>` (e.g. `v0.2.0`)
-#   - images published as ghcr.io/<owner>/<service>:v<semver> and :latest
+#   - images published as ghcr.io/<owner>/<image>:v<semver> and :latest
 #
-# Each (image, platform) pair builds on its native runner (amd64 on
-# `ubuntu-latest`, arm64 on `ubuntu-24.04-arm`) and pushes by digest. A
-# per-image merge job then assembles the multi-arch manifest with all tags.
-# Native runners avoid QEMU emulation, which makes the arm64 leg 5-10x slower
-# on the standard amd64 runner.
+# Each platform builds on its native runner. Within a platform job, every image
+# target shares the same `zinder-binaries` Docker stage and BuildKit cache scope,
+# so Rust dependencies and RocksDB native artifacts are compiled once per
+# platform instead of once per service image.
 
 on:
   push:
@@ -33,17 +32,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-per-service:
-    name: build ${{ matrix.service }} (${{ matrix.platform.name }})
+  build:
+    name: build images (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        service:
-          - zinder-ingest
-          - zinder-query
-          - zinder-compat-lightwalletd
-          - zinder-explorer
         platform:
           - name: amd64
             ref: linux/amd64
@@ -56,15 +50,6 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Resolve image name
-        id: name
-        env:
-          OWNER_RAW: ${{ github.repository_owner }}
-          SERVICE: ${{ matrix.service }}
-        run: |
-          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          printf 'image=ghcr.io/%s/%s\n' "$owner_lc" "$SERVICE" >> "$GITHUB_OUTPUT"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -75,168 +60,78 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: services/${{ matrix.service }}/Dockerfile
-          platforms: ${{ matrix.platform.ref }}
-          outputs: type=image,name=${{ steps.name.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.service }}-${{ matrix.platform.name }}-release
-          cache-to: type=gha,scope=${{ matrix.service }}-${{ matrix.platform.name }}-release,mode=max
-
-      - name: Export digest
+      - name: Build and push image digests
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          OWNER_RAW: ${{ github.repository_owner }}
+          PLATFORM_REF: ${{ matrix.platform.ref }}
+          PLATFORM_NAME: ${{ matrix.platform.name }}
+          CACHE_SCOPE: zinder-rust-${{ matrix.platform.name }}-release
         run: |
+          set -euo pipefail
+
+          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
 
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.service }}-${{ matrix.platform.name }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          images=(
+            "zinder-ingest:zinder-ingest"
+            "zinder-query:zinder-query"
+            "zinder-compat-lightwalletd:zinder-compat-lightwalletd"
+            "zinder-explorer:zinder-explorer"
+            "zinder:zinder-single-container"
+          )
 
-  merge-per-service:
-    name: merge ${{ matrix.service }}
-    needs: build-per-service
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        service:
-          - zinder-ingest
-          - zinder-query
-          - zinder-compat-lightwalletd
-          - zinder-explorer
-    steps:
-      - name: Resolve image and tags
-        id: tags
-        env:
-          OWNER_RAW: ${{ github.repository_owner }}
-          SERVICE: ${{ matrix.service }}
-          GIT_REF: ${{ github.event.inputs.ref || github.ref }}
-          GIT_SHA: ${{ github.sha }}
-        run: |
-          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          version="${GIT_REF#refs/tags/}"
-          if [ "$version" = "$GIT_REF" ]; then
-            version="manual-$(printf '%s' "$GIT_SHA" | cut -c1-12)"
-          fi
-          {
-            printf 'image=ghcr.io/%s/%s\n' "$owner_lc" "$SERVICE"
-            printf 'version=%s\n' "$version"
-          } >> "$GITHUB_OUTPUT"
+          for image in "${images[@]}"; do
+            IFS=: read -r image_name target <<< "$image"
+            image_ref="ghcr.io/${owner_lc}/${image_name}"
+            metadata_file="/tmp/metadata-${image_name}.json"
 
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-${{ matrix.service }}-*
-          merge-multiple: true
+            docker buildx build \
+              --file deploy/Dockerfile \
+              --target "$target" \
+              --platform "$PLATFORM_REF" \
+              --output "type=image,name=${image_ref},push-by-digest=true,name-canonical=true,push=true" \
+              --cache-from "type=gha,scope=${CACHE_SCOPE}" \
+              --cache-to "type=gha,scope=${CACHE_SCOPE},mode=max" \
+              --metadata-file "$metadata_file" \
+              .
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+            digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
+            if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+              echo "missing digest for ${image_name}" >&2
+              exit 1
+            fi
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create multi-arch manifest
-        working-directory: /tmp/digests
-        env:
-          IMAGE: ${{ steps.tags.outputs.image }}
-          VERSION: ${{ steps.tags.outputs.version }}
-        run: |
-          refs=()
-          for digest in *; do
-            refs+=("${IMAGE}@sha256:${digest}")
+            mkdir -p "/tmp/digests/${image_name}"
+            touch "/tmp/digests/${image_name}/${digest#sha256:}"
           done
 
-          docker buildx imagetools create \
-            -t "${IMAGE}:${VERSION}" \
-            -t "${IMAGE}:latest" \
-            "${refs[@]}"
-          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-
-  build-single-container:
-    name: build single-container (${{ matrix.platform.name }})
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: amd64
-            ref: linux/amd64
-            runner: ubuntu-latest
-          - name: arm64
-            ref: linux/arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
-
-      - name: Resolve image name
-        id: name
-        env:
-          OWNER_RAW: ${{ github.repository_owner }}
-        run: |
-          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          printf 'image=ghcr.io/%s/zinder\n' "$owner_lc" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/single-container/Dockerfile
-          platforms: ${{ matrix.platform.ref }}
-          outputs: type=image,name=${{ steps.name.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=zinder-single-container-${{ matrix.platform.name }}-release
-          cache-to: type=gha,scope=zinder-single-container-${{ matrix.platform.name }}-release,mode=max
-
-      - name: Export digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
-
-      - name: Upload digest
+      - name: Upload digests
         uses: actions/upload-artifact@v4
         with:
-          name: digests-single-container-${{ matrix.platform.name }}
-          path: /tmp/digests/*
+          name: digests-${{ matrix.platform.name }}
+          path: /tmp/digests/**
           if-no-files-found: error
           retention-days: 1
 
-  merge-single-container:
-    name: merge single-container
-    needs: build-single-container
+  merge:
+    name: merge ${{ matrix.image }}
+    needs: build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - zinder-ingest
+          - zinder-query
+          - zinder-compat-lightwalletd
+          - zinder-explorer
+          - zinder
     steps:
       - name: Resolve image and tags
         id: tags
         env:
           OWNER_RAW: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ matrix.image }}
           GIT_REF: ${{ github.event.inputs.ref || github.ref }}
           GIT_SHA: ${{ github.sha }}
         run: |
@@ -246,7 +141,7 @@ jobs:
             version="manual-$(printf '%s' "$GIT_SHA" | cut -c1-12)"
           fi
           {
-            printf 'image=ghcr.io/%s/zinder\n' "$owner_lc"
+            printf 'image=ghcr.io/%s/%s\n' "$owner_lc" "$IMAGE_NAME"
             printf 'version=%s\n' "$version"
           } >> "$GITHUB_OUTPUT"
 
@@ -254,7 +149,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-single-container-*
+          pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -268,11 +163,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create multi-arch manifest
-        working-directory: /tmp/digests
+        working-directory: /tmp/digests/${{ matrix.image }}
         env:
           IMAGE: ${{ steps.tags.outputs.image }}
           VERSION: ${{ steps.tags.outputs.version }}
         run: |
+          set -euo pipefail
+
           refs=()
           for digest in *; do
             refs+=("${IMAGE}@sha256:${digest}")

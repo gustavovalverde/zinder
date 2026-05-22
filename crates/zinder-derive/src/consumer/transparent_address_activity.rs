@@ -28,18 +28,20 @@
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use zebra_chain::transparent;
 use zinder_core::wire::{
     encode_address_script_hash, encode_height_key_ascending, encode_height_key_descending,
     encode_in_block_position, encode_internal_transaction_id,
 };
-use zinder_core::{BlockHeight, TransactionId, TransparentAddressScriptHash, TransparentOutPoint};
+use zinder_core::{
+    BlockHeight, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentPrevout,
+};
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockSource, DeriveConsumerCtx, DeriveConsumerError,
+    BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
 };
 
@@ -70,16 +72,14 @@ const POSITION_LEN: usize = 4;
 const INDEX_ENTRY_LEN: usize = ADDRESS_HASH_LEN + POSITION_LEN;
 
 /// Materializes confirmed per-address activity rows.
-pub struct TransparentAddressActivityConsumer {
-    block_source: BlockSource,
-}
+#[derive(Default)]
+pub struct TransparentAddressActivityConsumer;
 
 impl TransparentAddressActivityConsumer {
-    /// Builds a consumer reading parsed blocks (and lazily-resolved
-    /// prevouts) from `block_source`.
+    /// Builds the consumer.
     #[must_use]
-    pub const fn new(block_source: BlockSource) -> Self {
-        Self { block_source }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Returns the primary storage key for `(address, height, position)`.
@@ -105,26 +105,17 @@ impl TransparentAddressActivityConsumer {
     }
 }
 
-#[async_trait]
 impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
     fn name(&self) -> DeriveConsumerName {
         TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME
     }
 
-    fn block_source(&self) -> &BlockSource {
-        &self.block_source
-    }
-
-    fn prefetch_prevouts(&self) -> bool {
-        true
-    }
-
-    async fn apply_block(
+    fn apply_block(
         &mut self,
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let prevouts = block.prevouts().await?;
+        let prevouts = block.prevouts()?;
         let rows = aggregate_address_rows(block, prevouts.as_deref())?;
         let primary_cf = ctx
             .store
@@ -153,7 +144,7 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
         Ok(())
     }
 
-    async fn revert_block(
+    fn revert_block(
         &mut self,
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,
@@ -248,7 +239,7 @@ impl RowAccumulator {
 
 fn aggregate_address_rows(
     block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, transparent::Output>>,
+    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
 ) -> Result<
     HashMap<(TransparentAddressScriptHash, u32), TransparentAddressActivityRecord>,
     TransparentAddressActivityConsumerError,
@@ -299,15 +290,15 @@ fn aggregate_address_rows(
                     // and `prevout_resolution_status` rolls up as Partial when any row is incomplete.
                     continue;
                 };
-                let script_bytes = prevout.lock_script.as_raw_bytes();
-                let address = TransparentAddressScriptHash::of_script_pub_key(script_bytes);
+                let address =
+                    TransparentAddressScriptHash::of_script_pub_key(&prevout.script_pub_key);
                 let entry = accumulators
                     .entry((address, in_block_position))
                     .or_insert_with(|| RowAccumulator::new(transaction_id_bytes.to_vec()));
                 entry.input_count = entry.input_count.saturating_add(1);
                 entry.input_value_zat = entry
                     .input_value_zat
-                    .saturating_add(i128::from(i64::from(prevout.value)));
+                    .saturating_add(i128::from(prevout.value_zat));
             }
         }
     }
@@ -335,7 +326,7 @@ fn aggregate_address_rows(
 /// online for the consumer, Unavailable when offline.
 fn determine_resolution_status(
     _block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, transparent::Output>>,
+    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
 ) -> PrevoutResolutionStatus {
     if prevouts.is_some() {
         PrevoutResolutionStatus::Resolved
@@ -353,7 +344,7 @@ fn determine_resolution_status(
 fn flag_partial_rows(
     accumulators: &mut HashMap<(TransparentAddressScriptHash, u32), RowAccumulator>,
     block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, transparent::Output>>,
+    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
 ) {
     let Some(prevouts_map) = prevouts else {
         for entry in accumulators.values_mut() {

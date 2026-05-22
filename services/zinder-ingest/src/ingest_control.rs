@@ -178,10 +178,9 @@ impl IngestControl for IngestControlGrpcAdapter {
                 } else {
                     record_empty_writer_progress(self.network);
                 }
-                // ADR-0015 Phase 3 wires the unified loop; the writer
-                // still emits `Unspecified` for phase until that change
-                // lands so clients fall through to their "writer has not
-                // advertised yet" arm.
+                // This endpoint reports chain progress only. Loop phase is
+                // exposed through readiness, so the ingest-control proto keeps
+                // `WriterPhase::Unspecified` for this response.
                 Ok(Response::new(WriterStatusResponse {
                     network_name: encode_zinder_native_chain_name(self.network).to_owned(),
                     latest_writer_chain_epoch_id: chain_epoch.map(|epoch| epoch.id.value()),

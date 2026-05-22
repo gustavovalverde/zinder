@@ -31,7 +31,7 @@ stay on a separate operational footprint (see
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
 | `ZINDER_NETWORK` | Yes | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Must match the `zinder-query` deployment. |
-| `ZINDER_EXPLORER__STORAGE_PATH` | Yes | Filesystem path where the explorer derive store opens. |
+| `ZINDER_EXPLORER__STORAGE_PATH` | Yes | Canonical store path; explorer opens the writer-owned derive store at its `derive` subdirectory. |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | Yes | gRPC listen address (e.g. `0.0.0.0:9087`). |
 | `ZINDER_EXPLORER__OPS_LISTEN_ADDR` | Yes | HTTP listen address for `/healthz`, `/readyz`, `/metrics`. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | Yes | gRPC URL of the upstream `zinder-query`. |
@@ -87,7 +87,7 @@ User=zinder
 WorkingDirectory=/var/lib/zinder-explorer
 ExecStart=/usr/local/bin/zinder-explorer
 Environment=ZINDER_NETWORK=zcash-mainnet
-Environment=ZINDER_EXPLORER__STORAGE_PATH=/var/lib/zinder-explorer/store
+Environment=ZINDER_EXPLORER__STORAGE_PATH=/var/lib/zinder/store
 Environment=ZINDER_EXPLORER__LISTEN_ADDR=0.0.0.0:9087
 Environment=ZINDER_EXPLORER__OPS_LISTEN_ADDR=0.0.0.0:9088
 Environment=ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT=http://10.1.0.10:9085
@@ -107,7 +107,7 @@ services:
     restart: unless-stopped
     environment:
       ZINDER_NETWORK: zcash-mainnet
-      ZINDER_EXPLORER__STORAGE_PATH: /var/lib/zinder-explorer/store
+      ZINDER_EXPLORER__STORAGE_PATH: /var/lib/zinder/store
       ZINDER_EXPLORER__LISTEN_ADDR: 0.0.0.0:9087
       ZINDER_EXPLORER__OPS_LISTEN_ADDR: 0.0.0.0:9088
       ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: http://zinder-query:9085
@@ -116,12 +116,12 @@ services:
       - "9087:9087"
       - "9088:9088"
     volumes:
-      - explorer_store:/var/lib/zinder-explorer/store
+      - zinder_data:/var/lib/zinder
     secrets:
       - bearer_token
 
 volumes:
-  explorer_store: {}
+  zinder_data: {}
 
 secrets:
   bearer_token:

@@ -59,8 +59,8 @@ pub use transaction_public_facts::{
 pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_prevout::{
-    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, TransparentPrevout, TransparentPrevoutEntry,
-    TransparentPrevoutsResponse,
+    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, TransparentPrevout, TransparentPrevoutArtifact,
+    TransparentPrevoutEntry, TransparentPrevoutsResponse,
 };
 pub use transparent_utxo::{
     TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,

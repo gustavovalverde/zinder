@@ -6,21 +6,36 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use eyre::{Result, eyre};
+use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint};
-use zinder_core::Network;
+use zinder_core::{BlockHeight, ChainEpochId, Network, wire::encode_internal_block_hash};
+use zinder_derive::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
+    DeriveStoreOptions,
+};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::explorer::{
-    ServerInfoRequest, TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
+    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, ServerInfoRequest,
+    TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
 };
+use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
+
+type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
+
+struct SeededDeriveStore {
+    _tempdir: tempfile::TempDir,
+    secondary_store: DeriveStore,
+}
 
 #[tokio::test]
 async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> {
@@ -135,6 +150,161 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
     server_handle.abort();
     let _ = server_handle.await;
     Ok(())
+}
+
+#[tokio::test]
+async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Result<()> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let (mut client, explorer_handle) =
+        spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
+
+    let explorer_info = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_SUMMARY_V1);
+    assert_advertises_capability(&common.capabilities, EXPLORER_TRANSACTION_FEES_V1);
+
+    let response = client
+        .block_summaries_in_range(BlockSummariesInRangeRequest {
+            start_height: 1,
+            end_height: 1,
+            at_epoch: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.summaries.len(), 1);
+    assert_eq!(response.summaries[0].block_height, 1);
+    assert_eq!(response.summaries[0].confirmations, 1);
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+async fn spawn_wallet_query_server(
+    chain_fixture: &ChainFixture,
+) -> Result<(StoreFixture, SocketAddr, ServerHandle)> {
+    let store_fixture = StoreFixture::with_chain_committed(chain_fixture, ChainEpochId::new(1))?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let _channel = await_with_retry(addr).await?;
+    Ok((store_fixture, addr, handle))
+}
+
+fn seeded_block_summary_derive_store(chain_fixture: &ChainFixture) -> Result<SeededDeriveStore> {
+    let tempdir = tempfile::tempdir()?;
+    let primary_path = tempdir.path().join("derive-primary");
+    let secondary_path = tempdir.path().join("derive-secondary");
+    let primary_store = DeriveStore::open(
+        &primary_path,
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?;
+    seed_block_summary(&primary_store, chain_fixture)?;
+
+    let secondary_store = DeriveStore::open_secondary(
+        &primary_path,
+        &secondary_path,
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?;
+    secondary_store.try_catch_up()?;
+    Ok(SeededDeriveStore {
+        _tempdir: tempdir,
+        secondary_store,
+    })
+}
+
+fn seed_block_summary(derive_store: &DeriveStore, chain_fixture: &ChainFixture) -> Result<()> {
+    let fixture_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture block missing"))?;
+    let record = BlockSummaryRecord {
+        summary: Some(BlockSummary {
+            block_height: fixture_block.height.value(),
+            block_hash: encode_internal_block_hash(fixture_block.hash).to_vec(),
+            block_time_unix_seconds: i64::from(fixture_block.block_time_seconds),
+            transaction_count: 0,
+            previous_block_hash: encode_internal_block_hash(fixture_block.parent_hash).to_vec(),
+            total_size_bytes: u64::try_from(fixture_block.raw_block_bytes.len())?,
+            fees_collected_zat: 0,
+            paid_fees_collected_zat: None,
+            coinbase_reward_zat: 0,
+            sapling_output_count: 0,
+            orchard_action_count: 0,
+            confirmations: 0,
+            is_canonical: true,
+        }),
+        transaction_ids: Vec::new(),
+    };
+    derive_store.put_consumer(
+        BLOCK_SUMMARY_COLUMN_FAMILY,
+        &BlockSummaryConsumer::key_for_height(fixture_block.height),
+        &record.encode_to_vec(),
+    )?;
+    derive_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &[1])?;
+    Ok(())
+}
+
+async fn spawn_explorer_query_server(
+    derive_store: DeriveStore,
+    wallet_addr: SocketAddr,
+) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_derive_store(derive_store)
+    .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
+    .with_prevout_resolution_online(true);
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let channel = await_with_retry(addr).await?;
+    Ok((ExplorerQueryClient::new(channel), handle))
+}
+
+fn assert_advertises_capability(capabilities: &[String], capability: &str) {
+    assert!(
+        capabilities
+            .iter()
+            .any(|advertised| advertised == capability),
+        "expected capability {capability}",
+    );
 }
 
 #[tokio::test]

@@ -43,6 +43,19 @@ use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
 
+/// Opens a derive store with no consumer column families for tests that
+/// only need to satisfy writer API wiring.
+pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
+    Ok(zinder_derive::DeriveStore::open(
+        zinder_derive::DeriveStore::path_for_canonical(storage_path),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: &[],
+            tuning: zinder_store::StorageTuning::for_local_tests(),
+        },
+    )?)
+}
+
 /// Builds a `BackfillConfig` from a resolved live-test env plus per-test
 /// runtime knobs.
 #[allow(
@@ -66,8 +79,10 @@ pub(crate) fn live_backfill_config(
         from_height,
         to_height,
         commit_batch_blocks,
+        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::MIN.saturating_add(249_999),
         fetch_concurrency: FETCH_CONCURRENCY,
-        flush_every_n_epochs: NonZeroU32::MIN.saturating_add(4),
+        derive_concurrency: FETCH_CONCURRENCY,
+        flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
         allow_near_tip_finalize,
         checkpoint: None,

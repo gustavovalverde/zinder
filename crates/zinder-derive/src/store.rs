@@ -12,6 +12,8 @@
 //! impossible to recur in the derive plane.
 
 use std::{
+    collections::HashMap,
+    hash::BuildHasher,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -19,15 +21,42 @@ use std::{
 use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
 };
-use zinder_core::BlockHeight;
+use zinder_core::{BlockHeight, ChainEpoch};
 use zinder_store::{
-    StorageTuning, build_block_based_table_factory, build_block_cache, build_primary_db_options,
+    ChainEvent, StorageTuning, build_block_based_table_factory, build_block_cache,
+    build_primary_db_options, build_secondary_db_options,
 };
 
 use crate::{
-    consumer::DeriveConsumerName,
-    error::{DeriveStoreColumnFamily, DeriveStoreError},
+    consumer::block_summary::{BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME},
+    consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    consumer::recent_transactions::{
+        RECENT_TRANSACTIONS_COLUMN_FAMILY, RECENT_TRANSACTIONS_CONSUMER_NAME,
+    },
+    consumer::transaction_fees::{
+        TRANSACTION_FEES_COLUMN_FAMILY, TRANSACTION_FEES_CONSUMER_NAME,
+        TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
+    },
+    consumer::transparent_address_activity::{
+        TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
+        TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
+    },
+    consumer::{
+        BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
+        CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveMempoolConsumer,
+        RevertedRange, apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
+    },
+    error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError},
 };
+
+/// Conventional subdirectory of the canonical store path where the derive
+/// `RocksDB` instance lives.
+///
+/// Both the writer (`zinder-ingest`) and any reader process opening the
+/// store in secondary mode resolve the derive store with
+/// [`DeriveStore::path_for_canonical`], so operators only configure one
+/// `storage.path` per service.
+pub const DERIVE_STORE_SUBDIR: &str = "derive";
 
 /// On-disk schema version used by the derive plane.
 ///
@@ -35,9 +64,24 @@ use crate::{
 /// metadata payload format changes in a backwards-incompatible way. The
 /// version is persisted in the `consumer_metadata` column family on first
 /// open and validated on subsequent opens.
-pub const DERIVE_SCHEMA_VERSION: u16 = 1;
+pub const DERIVE_SCHEMA_VERSION: u16 = 2;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
+const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
+    BLOCK_SUMMARY_COLUMN_FAMILY,
+    MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    RECENT_TRANSACTIONS_COLUMN_FAMILY,
+    TRANSACTION_FEES_COLUMN_FAMILY,
+    TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
+];
+const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
+    BLOCK_SUMMARY_CONSUMER_NAME,
+    TRANSACTION_FEES_CONSUMER_NAME,
+    RECENT_TRANSACTIONS_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
+];
 
 /// Per-column-family options the derive plane tunes at open time.
 ///
@@ -60,8 +104,10 @@ fn column_family_options(cache: &Cache) -> Options {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DeriveStoreTable {
-    /// `cursor` column family: per-consumer cursor persistence.
-    Cursor,
+    /// `chain_event_cursor` column family: per-chain-consumer cursor persistence.
+    ChainEventCursor,
+    /// `mempool_event_cursor` column family: per-mempool-consumer cursor persistence.
+    MempoolEventCursor,
     /// `consumer_metadata` column family: schema versions and per-consumer
     /// counters.
     ConsumerMetadata,
@@ -72,20 +118,26 @@ impl DeriveStoreTable {
     #[must_use]
     pub const fn column_family_name(self) -> &'static str {
         match self {
-            Self::Cursor => "cursor",
+            Self::ChainEventCursor => "chain_event_cursor",
+            Self::MempoolEventCursor => "mempool_event_cursor",
             Self::ConsumerMetadata => "consumer_metadata",
         }
     }
 
     fn error_family(self) -> DeriveStoreColumnFamily {
         match self {
-            Self::Cursor => DeriveStoreColumnFamily::Cursor,
+            Self::ChainEventCursor => DeriveStoreColumnFamily::ChainEventCursor,
+            Self::MempoolEventCursor => DeriveStoreColumnFamily::MempoolEventCursor,
             Self::ConsumerMetadata => DeriveStoreColumnFamily::ConsumerMetadata,
         }
     }
 
-    fn all() -> [Self; 2] {
-        [Self::Cursor, Self::ConsumerMetadata]
+    fn all() -> [Self; 3] {
+        [
+            Self::ChainEventCursor,
+            Self::MempoolEventCursor,
+            Self::ConsumerMetadata,
+        ]
     }
 }
 
@@ -123,7 +175,7 @@ impl Default for DeriveStoreOptions {
 /// bytes copied out of the iterator's borrowed buffers.
 pub type ConsumerEntry = (Vec<u8>, Vec<u8>);
 
-/// Cursor entry observed by `DeriveStore::get_cursor`.
+/// Cursor entry observed by derive cursor readers.
 ///
 /// Carries the raw cursor bytes and a copy of the consumer name the caller
 /// queried with so callers can match cursors to their owning consumer when
@@ -134,6 +186,21 @@ pub struct DeriveCursorEntry {
     pub consumer: DeriveConsumerName,
     /// Opaque cursor bytes the consumer last persisted.
     pub cursor_bytes: Vec<u8>,
+}
+
+/// Inputs that bind a canonical chain event to one derive-store write.
+#[derive(Clone, Copy)]
+pub struct ChainEventDispatchInputs<'event> {
+    /// Chain epoch the canonical commit just produced.
+    pub chain_epoch: ChainEpoch,
+    /// Post-commit event emitted by the canonical store.
+    pub chain_event: &'event ChainEvent,
+    /// Chain-event cursor emitted by the canonical store.
+    pub chain_cursor: &'event [u8],
+    /// Monotonic event sequence assigned by the canonical store.
+    pub event_sequence: u64,
+    /// Finalized height observed at commit time.
+    pub finalized_height: BlockHeight,
 }
 
 /// `RocksDB`-backed durable storage for the derive plane.
@@ -151,6 +218,32 @@ pub struct DeriveStore {
 }
 
 impl DeriveStore {
+    /// Returns the conventional derive-store path for a canonical-store
+    /// path.
+    ///
+    /// Both writer and reader processes derive the path from the canonical
+    /// store path via this helper so the operator only configures one
+    /// `storage.path` per service. The convention nests the derive
+    /// `RocksDB` files in a [`DERIVE_STORE_SUBDIR`] subdirectory of the
+    /// canonical store path.
+    #[must_use]
+    pub fn path_for_canonical(canonical_path: &Path) -> PathBuf {
+        canonical_path.join(DERIVE_STORE_SUBDIR)
+    }
+
+    /// Returns the consumer-owned column families compiled into the bundled
+    /// derive-plane consumers.
+    #[must_use]
+    pub const fn bundled_consumer_column_families() -> &'static [&'static str] {
+        BUNDLED_CONSUMER_COLUMN_FAMILIES
+    }
+
+    /// Returns the bundled chain-event consumer cursor names.
+    #[must_use]
+    pub const fn bundled_chain_event_consumer_names() -> &'static [DeriveConsumerName] {
+        BUNDLED_CHAIN_EVENT_CONSUMER_NAMES
+    }
+
     /// Opens or creates a derive store at `path`.
     ///
     /// On a fresh path the schema version is written immediately. On an
@@ -197,37 +290,192 @@ impl DeriveStore {
         Ok(store)
     }
 
+    /// Opens the derive store in `RocksDB` secondary mode.
+    ///
+    /// `primary_path` is the same directory the writer process opened with
+    /// [`Self::open`]; `secondary_path` is a per-reader scratch directory
+    /// `RocksDB` uses for the secondary instance's bookkeeping (MANIFEST
+    /// tail, current view metadata). Multiple readers may open the same
+    /// primary path concurrently as long as each provides a distinct
+    /// secondary path.
+    ///
+    /// A secondary instance only catches up with the primary when
+    /// [`Self::try_catch_up`] is called; reads observe the snapshot from
+    /// the last successful catchup.
+    pub fn open_secondary(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        options: DeriveStoreOptions,
+    ) -> Result<Self, DeriveStoreError> {
+        let primary_path = primary_path.as_ref();
+        let secondary_path = secondary_path.as_ref();
+        options
+            .tuning
+            .validate()
+            .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
+        let block_cache = build_block_cache(options.tuning.block_cache_bytes);
+        let db_options = build_secondary_db_options(options.tuning, &block_cache);
+        let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
+            ColumnFamilyDescriptor::new(
+                table.column_family_name(),
+                column_family_options(&block_cache),
+            )
+        });
+        let consumer_families = options
+            .consumer_column_families
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, column_family_options(&block_cache)));
+        let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors_as_secondary(
+            &db_options,
+            primary_path,
+            secondary_path,
+            column_families,
+        )
+        .map_err(|source| DeriveStoreError::Open {
+            path: primary_path.to_path_buf(),
+            source,
+        })?;
+        let store = Self {
+            db: Arc::new(db),
+            sync_writes: options.sync_writes,
+            storage_path: primary_path.to_path_buf(),
+            consumer_column_families: options.consumer_column_families,
+        };
+        store.schema_version()?;
+        Ok(store)
+    }
+
+    /// Advances the secondary instance's view to the primary's latest
+    /// durable state.
+    ///
+    /// No-op on a primary instance: `RocksDB` returns immediately because
+    /// there is no upstream MANIFEST to tail.
+    pub fn try_catch_up(&self) -> Result<(), DeriveStoreError> {
+        self.db
+            .try_catch_up_with_primary()
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "try_catch_up_with_primary",
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })
+    }
+
     /// Returns the filesystem path the store opened from.
     #[must_use]
     pub fn storage_path(&self) -> &Path {
         &self.storage_path
     }
 
-    /// Reads a consumer's persisted cursor bytes, when present.
-    pub fn get_cursor(
+    /// Returns true when this store was opened with at least one
+    /// consumer-owned column family.
+    ///
+    /// The ingest writer uses this to skip derive dispatch for narrowly
+    /// scoped tests that exercise canonical storage with synthetic block
+    /// bytes and no derive consumers. Production opens the store through
+    /// the ingest/explorer column-family list, so real deployments always
+    /// dispatch.
+    #[must_use]
+    pub fn has_consumer_column_families(&self) -> bool {
+        !self.consumer_column_families.is_empty()
+    }
+
+    /// Dispatches chain-event consumers and atomically writes their rows plus
+    /// cursor advances.
+    ///
+    /// `blocks` contains the already-parsed committed block contexts for this
+    /// event. Callers own context construction because only the ingest writer
+    /// has the canonical commit batch and prevout read path in scope.
+    pub fn write_chain_event<S>(
+        &self,
+        consumers: &mut [&mut dyn BlockKeyedConsumer],
+        inputs: ChainEventDispatchInputs<'_>,
+        blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+    ) -> Result<(), DeriveError>
+    where
+        S: BuildHasher,
+    {
+        let mut batch = WriteBatch::default();
+        let mut ctx = DeriveConsumerCtx {
+            store: self,
+            batch: &mut batch,
+        };
+
+        for consumer in consumers.iter_mut() {
+            dispatch_chain_event_to_block_consumer(&mut **consumer, inputs, &mut ctx, blocks)?;
+        }
+
+        self.stage_chain_event_cursor_advances(&mut batch, consumers, inputs.chain_cursor)?;
+        self.write_batch(&batch)?;
+        Ok(())
+    }
+
+    /// Dispatches one mempool consumer and atomically writes its rows plus
+    /// cursor advance.
+    pub fn write_mempool_event(
+        &self,
+        consumer: &mut dyn DeriveMempoolConsumer,
+        event: &crate::consumer::MempoolConsumerEvent<'_>,
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveError> {
+        let mut batch = WriteBatch::default();
+        let mut ctx = DeriveConsumerCtx {
+            store: self,
+            batch: &mut batch,
+        };
+        consumer
+            .apply_mempool_event(event, &mut ctx)
+            .map_err(DeriveError::Consumer)?;
+        self.stage_mempool_event_cursor_advance(&mut batch, consumer.name(), cursor_bytes)?;
+        self.write_batch(&batch)?;
+        Ok(())
+    }
+
+    /// Reads a chain-event consumer's persisted cursor bytes, when present.
+    pub fn get_chain_event_cursor(
         &self,
         consumer: DeriveConsumerName,
     ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
-        self.get(DeriveStoreTable::Cursor, consumer.as_str().as_bytes())
+        self.get(
+            DeriveStoreTable::ChainEventCursor,
+            consumer.as_str().as_bytes(),
+        )
     }
 
-    /// Atomically persists `cursor_bytes` for `consumer`.
+    /// Atomically persists `cursor_bytes` for a chain-event consumer.
     ///
     /// Each call commits its own `WriteBatch`. Consumers that need to bundle
     /// cursor advances with their own data writes use [`Self::write_batch`]
     /// instead.
-    pub fn put_cursor(
+    pub fn put_chain_event_cursor(
         &self,
         consumer: DeriveConsumerName,
         cursor_bytes: &[u8],
     ) -> Result<(), DeriveStoreError> {
         let mut batch = WriteBatch::default();
-        let column_family = self.column_family(DeriveStoreTable::Cursor)?;
+        let column_family = self.column_family(DeriveStoreTable::ChainEventCursor)?;
         batch.put_cf(&column_family, consumer.as_str().as_bytes(), cursor_bytes);
         self.write(&batch)
             .map_err(|source| DeriveStoreError::Operation {
-                operation: "put_cursor",
-                column_family: DeriveStoreColumnFamily::Cursor,
+                operation: "put_chain_event_cursor",
+                column_family: DeriveStoreColumnFamily::ChainEventCursor,
+                source,
+            })
+    }
+
+    /// Atomically persists `cursor_bytes` for a mempool-event consumer.
+    pub fn put_mempool_event_cursor(
+        &self,
+        consumer: DeriveConsumerName,
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let mut batch = WriteBatch::default();
+        let column_family = self.column_family(DeriveStoreTable::MempoolEventCursor)?;
+        batch.put_cf(&column_family, consumer.as_str().as_bytes(), cursor_bytes);
+        self.write(&batch)
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "put_mempool_event_cursor",
+                column_family: DeriveStoreColumnFamily::MempoolEventCursor,
                 source,
             })
     }
@@ -301,6 +549,24 @@ impl DeriveStore {
             .get_cf(&handle, key)
             .map_err(|source| DeriveStoreError::ConsumerOperation {
                 operation: "get",
+                name: column_family,
+                source,
+            })
+    }
+
+    /// Writes a single value into a consumer-owned column family.
+    pub fn put_consumer(
+        &self,
+        column_family: &'static str,
+        key: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&handle, key, bytes);
+        self.write(&batch)
+            .map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "put",
                 name: column_family,
                 source,
             })
@@ -471,6 +737,30 @@ impl DeriveStore {
             })
     }
 
+    fn stage_chain_event_cursor_advances(
+        &self,
+        batch: &mut WriteBatch,
+        consumers: &[&mut dyn BlockKeyedConsumer],
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
+        for consumer in consumers {
+            batch.put_cf(&cf, consumer.name().as_str().as_bytes(), cursor_bytes);
+        }
+        Ok(())
+    }
+
+    fn stage_mempool_event_cursor_advance(
+        &self,
+        batch: &mut WriteBatch,
+        consumer_name: DeriveConsumerName,
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let cf = self.column_family(DeriveStoreTable::MempoolEventCursor)?;
+        batch.put_cf(&cf, consumer_name.as_str().as_bytes(), cursor_bytes);
+        Ok(())
+    }
+
     fn validate_or_initialize_schema_version(&self) -> Result<(), DeriveStoreError> {
         let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, SCHEMA_VERSION_KEY)? else {
             return self.put(
@@ -533,6 +823,54 @@ impl DeriveStore {
     }
 }
 
+fn dispatch_chain_event_to_block_consumer<C, S>(
+    consumer: &mut C,
+    inputs: ChainEventDispatchInputs<'_>,
+    ctx: &mut DeriveConsumerCtx<'_>,
+    blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+) -> Result<(), DeriveError>
+where
+    C: BlockKeyedConsumer + ?Sized,
+    S: BuildHasher,
+{
+    match inputs.chain_event {
+        ChainEvent::ChainCommitted { committed } => {
+            let event = ChainCommittedEvent::new(
+                inputs.event_sequence,
+                inputs.chain_epoch,
+                inputs.finalized_height,
+                committed.block_range.start,
+                committed.block_range.end,
+            );
+            apply_chain_committed_in_memory(consumer, &event, ctx, blocks)
+                .map_err(DeriveError::Consumer)
+        }
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } => {
+            let event = ChainReorgedEvent::new(
+                inputs.event_sequence,
+                inputs.chain_epoch,
+                inputs.finalized_height,
+                RevertedRange::new(
+                    reverted.chain_epoch,
+                    reverted.block_range.start,
+                    reverted.block_range.end,
+                ),
+                CommittedRange::new(
+                    committed.chain_epoch,
+                    committed.block_range.start,
+                    committed.block_range.end,
+                ),
+            );
+            apply_chain_reorged_in_memory(consumer, &event, ctx, blocks)
+                .map_err(DeriveError::Consumer)
+        }
+        _ => Err(DeriveError::UnsupportedChainEvent),
+    }
+}
+
 fn decode_schema_version(bytes: &[u8]) -> Result<u16, String> {
     let array: [u8; 2] = bytes
         .try_into()
@@ -561,11 +899,17 @@ mod tests {
     fn cursor_round_trip_persists_and_retrieves_bytes() -> Result<()> {
         let tempdir = tempdir()?;
         let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
-        assert!(store.get_cursor(TEST_CONSUMER)?.is_none());
-        store.put_cursor(TEST_CONSUMER, &[1, 2, 3])?;
-        assert_eq!(store.get_cursor(TEST_CONSUMER)?, Some(vec![1, 2, 3]));
-        store.put_cursor(TEST_CONSUMER, &[4, 5])?;
-        assert_eq!(store.get_cursor(TEST_CONSUMER)?, Some(vec![4, 5]));
+        assert!(store.get_chain_event_cursor(TEST_CONSUMER)?.is_none());
+        store.put_chain_event_cursor(TEST_CONSUMER, &[1, 2, 3])?;
+        assert_eq!(
+            store.get_chain_event_cursor(TEST_CONSUMER)?,
+            Some(vec![1, 2, 3])
+        );
+        store.put_chain_event_cursor(TEST_CONSUMER, &[4, 5])?;
+        assert_eq!(
+            store.get_chain_event_cursor(TEST_CONSUMER)?,
+            Some(vec![4, 5])
+        );
         Ok(())
     }
 

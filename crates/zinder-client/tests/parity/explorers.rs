@@ -10,21 +10,12 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, ChainIndex, IndexerError, LocalChainIndex, RemoteChainIndex, TransactionArtifact,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
-    TransparentAddressUtxosQuery, TransparentOutPoint,
-};
-use zinder_testkit::{
-    P2pkhSpendArgs, TransparentAddress as TestkitTransparentAddress, TransparentTestKey,
+    BlockHeight, ChainIndex, IndexerError, LocalChainIndex, RemoteChainIndex, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
+    TransparentAddressUtxoArtifact, TransparentAddressUtxosQuery, TransparentOutPoint,
 };
 
 use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
-
-const PARITY_PREVOUT_FIXTURE_SEED: [u8; 32] = [
-    0xC0, 0xFF, 0xEE, 0xC0, 0xDE, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE,
-    0xF0, 0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65, 0x43, 0x21, 0x0F, 0xE0, 0xDC, 0xBA, 0x98, 0x76, 0x54,
-];
 
 #[test]
 fn parity_chain_index_surface_compiles_for_block_explorers() {
@@ -138,27 +129,23 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
 
 #[tokio::test]
 async fn serves_explorer_transparent_prevouts_in_input_order() -> eyre::Result<()> {
-    let signer = TransparentTestKey::from_seed(&PARITY_PREVOUT_FIXTURE_SEED)?;
-    let recipient = TestkitTransparentAddress::PublicKeyHash([0x33; 20]);
-    let raw_transaction_bytes = signer.build_p2pkh_spend(&P2pkhSpendArgs {
-        coinbase_txid_be: [0xBB; 32],
-        coinbase_vout: 0,
-        coinbase_value_zats: 8_000_000,
-        recipient: &recipient,
-        target_height: 1,
-    })?;
     let base_fixture = parity_chain_fixture(1);
     let block = base_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture must contain block 1"))?;
+    let block_height = block.height;
+    let block_hash = block.hash;
     let indexed_transaction_id = TransactionId::from_bytes([0xAC; 32]);
-    let transaction_artifact = TransactionArtifact::new(
-        indexed_transaction_id,
-        block.height,
-        block.hash,
-        raw_transaction_bytes,
-    );
-    let chain_fixture = base_fixture.with_transaction_artifact(transaction_artifact);
+    let script_pub_key = vec![0x76, 0xa9, 0x33, 0x88, 0xac];
+    let chain_fixture =
+        base_fixture.with_transparent_address_utxo(TransparentAddressUtxoArtifact::new(
+            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+            script_pub_key,
+            TransparentOutPoint::new(indexed_transaction_id, 0),
+            8_000_000,
+            block_height,
+            block_hash,
+        ));
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let chain_index = open_local_chain_index(&store_fixture).await?;
 

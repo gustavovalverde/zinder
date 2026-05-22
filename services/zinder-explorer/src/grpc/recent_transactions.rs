@@ -1,7 +1,7 @@
 //! `ExplorerQuery.RecentTransactions` handler.
 //!
 //! Streams the newest-first projection materialized by
-//! [`crate::consumer::recent_transactions::RecentTransactionsConsumer`]
+//! [`zinder_derive::RecentTransactionsConsumer`]
 //! out of the consumer-owned `recent_transactions` column family. Joins
 //! the per-tx `transaction_fees` rows in a single `multi_get` so the page
 //! cost is one prefix scan plus one batched lookup.
@@ -20,9 +20,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
-use crate::consumer::recent_transactions::RECENT_TRANSACTIONS_COLUMN_FAMILY;
-use crate::consumer::transaction_fees::TransactionFeesConsumer;
-use crate::store::DeriveStore;
+use zinder_derive::{DeriveStore, RECENT_TRANSACTIONS_COLUMN_FAMILY, TransactionFeesConsumer};
 
 /// Server-side maximum entries the handler ever returns in one stream.
 const MAX_RECENT_TRANSACTIONS_PER_REQUEST: u32 = 1024;

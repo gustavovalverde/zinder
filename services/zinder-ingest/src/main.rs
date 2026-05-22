@@ -17,7 +17,8 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_ingest::{
     IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
     MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, classify_phase, current_chain_height, mempool_ready_channel,
+    TipFollowSubsystemsLauncher, catch_up_derive_store_to_canonical, classify_phase,
+    current_chain_height, mempool_ready_channel, open_primary_derive_store_for_canonical,
     run_ingest_loop, run_mempool_orchestrator, spawn_chain_event_retention_task,
     spawn_mempool_event_retention_task, spawn_upstream_health_probe_task,
 };
@@ -98,9 +99,18 @@ struct Cli {
     /// Maximum number of blocks committed in one bulk-catchup batch.
     #[arg(long = "commit-batch-blocks", global = true)]
     commit_batch_blocks: Option<u32>,
+    /// Maximum unique transparent prevouts read from the store in one bulk-catchup batch.
+    #[arg(
+        long = "max-transparent-prevout-store-lookups-per-batch",
+        global = true
+    )]
+    max_transparent_prevout_store_lookups_per_batch: Option<u32>,
     /// Number of concurrent block fetches in the pipelined bulk-catchup fetcher.
     #[arg(long = "fetch-concurrency", global = true)]
     fetch_concurrency: Option<u32>,
+    /// Number of parallel `derive_block` invocations on the blocking pool.
+    #[arg(long = "derive-concurrency", global = true)]
+    derive_concurrency: Option<u32>,
     /// Delay between upstream node tip polls, in milliseconds.
     #[arg(long = "poll-interval-ms", global = true)]
     poll_interval_ms: Option<u64>,
@@ -236,7 +246,10 @@ fn ingest_overrides_with_ops(
         reorg_window_blocks: cli.reorg_window_blocks,
         catchup_threshold_blocks: cli.catchup_threshold_blocks,
         commit_batch_blocks: cli.commit_batch_blocks,
+        max_transparent_prevout_store_lookups_per_batch: cli
+            .max_transparent_prevout_store_lookups_per_batch,
         fetch_concurrency: cli.fetch_concurrency,
+        derive_concurrency: cli.derive_concurrency,
         poll_interval_ms: cli.poll_interval_ms,
         lag_threshold_blocks: cli.lag_threshold_blocks,
         target_height: cli.target_height,
@@ -387,10 +400,7 @@ async fn run_ingest(
     };
     let store =
         match PrimaryChainStore::open(&command_config.loop_config.storage_path, store_options) {
-            Ok(store) => {
-                open_storage_phase.complete();
-                store
-            }
+            Ok(store) => store,
             Err(error) => {
                 let wrapped: IngestConfigError = IngestError::from(error).into();
                 open_storage_phase.fail(&wrapped);
@@ -398,6 +408,31 @@ async fn run_ingest(
                 return Err(wrapped);
             }
         };
+    let derive_store = match open_primary_derive_store_for_canonical(
+        &command_config.loop_config.storage_path,
+        command_config.loop_config.storage_tuning,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            let wrapped: IngestConfigError = IngestError::from(error).into();
+            open_storage_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
+    if let Err(error) = catch_up_derive_store_to_canonical(
+        &store,
+        &derive_store,
+        command_config.loop_config.derive.concurrency,
+    )
+    .await
+    {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
+    open_storage_phase.complete();
 
     let mempool_index = MempoolIndex::new();
     let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
@@ -428,7 +463,13 @@ async fn run_ingest(
         json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
         reorg_window_blocks = command_config.loop_config.reorg_window_blocks,
         catchup_threshold_blocks = command_config.loop_config.phases.catchup_threshold_blocks,
+        derive_concurrency = command_config.loop_config.derive.concurrency.get(),
         commit_batch_blocks = command_config.loop_config.bulk_catchup.commit_batch_blocks.get(),
+        max_transparent_prevout_store_lookups_per_batch = command_config
+            .loop_config
+            .bulk_catchup
+            .max_transparent_prevout_store_lookups_per_batch
+            .get(),
         fetch_concurrency = command_config.loop_config.bulk_catchup.fetch_concurrency.get(),
         poll_interval_ms = u64::try_from(
             command_config.loop_config.tip_follow.poll_interval.as_millis()
@@ -443,6 +484,7 @@ async fn run_ingest(
         command_config.loop_config.node.clone(),
         source.clone(),
         store.clone(),
+        derive_store.clone(),
         mempool_index,
         readiness.clone(),
         command_config.chain_event_retention(),
@@ -454,6 +496,7 @@ async fn run_ingest(
         &command_config.loop_config,
         Arc::new(source),
         store.clone(),
+        derive_store,
         &readiness,
         cancel.clone(),
         Some(launcher),
@@ -516,6 +559,7 @@ fn build_tip_follow_subsystems_launcher(
     node_target: NodeTarget,
     source: ZebraJsonRpcSource,
     store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     mempool_index: MempoolIndex,
     readiness: Readiness,
     chain_event_retention: zinder_ingest::ChainEventRetentionConfig,
@@ -541,6 +585,7 @@ fn build_tip_follow_subsystems_launcher(
         let mempool_handle = spawn_mempool_orchestrator(
             mempool_source,
             store.clone(),
+            derive_store.clone(),
             mempool_index,
             readiness.clone(),
             mempool_ready_signal,
@@ -859,6 +904,7 @@ const MEMPOOL_HYDRATION_LAGGING_THRESHOLD: u64 = 5;
 fn spawn_mempool_orchestrator(
     mempool_source: Arc<dyn MempoolSource>,
     store: PrimaryChainStore,
+    derive_store: zinder_derive::DeriveStore,
     mempool_index: MempoolIndex,
     readiness: Readiness,
     mempool_ready_signal: MempoolReadySignal,
@@ -886,6 +932,7 @@ fn spawn_mempool_orchestrator(
             let orchestrator = run_mempool_orchestrator(
                 Arc::clone(&mempool_source),
                 store.clone(),
+                derive_store.clone(),
                 mempool_index.clone(),
                 outcome_callback,
             );

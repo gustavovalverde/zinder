@@ -194,7 +194,9 @@ pub(crate) fn decide_recovery(
         | IngestError::SystemTimeBeforeUnixEpoch { .. }
         | IngestError::TimestampTooLarge
         | IngestError::ArtifactDerive(_)
-        | IngestError::BlockingTaskFailed { .. } => SourceRecoveryDecision::Exit,
+        | IngestError::BlockingTaskFailed { .. }
+        | IngestError::DeriveDispatch(_)
+        | IngestError::DeriveStore(_) => SourceRecoveryDecision::Exit,
     }
 }
 

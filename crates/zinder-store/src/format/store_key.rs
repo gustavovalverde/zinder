@@ -22,7 +22,10 @@ const TRANSPARENT_UTXO_SPEND_KEY_KIND: u8 = 7;
 const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
 const TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND: u8 = 9;
 const BLOCK_HASH_INDEX_KEY_KIND: u8 = 10;
-// Key kinds 11..=32 are reserved for future artifact families; visibility keys start at 33.
+const TRANSPARENT_PREVOUT_KEY_KIND: u8 = 11;
+const TRANSPARENT_PREVOUT_HISTORY_KEY_KIND: u8 = 12;
+const TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND: u8 = 13;
+// Key kinds 14..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -175,6 +178,60 @@ impl StoreKey {
         key.extend_from_slice(&network.id().to_be_bytes());
         key.extend_from_slice(&outpoint.transaction_id.as_bytes());
         key.extend_from_slice(&outpoint.output_index.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout_network_prefix(network: Network) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout(network: Network, outpoint: TransparentOutPoint) -> Self {
+        let mut key = Self::transparent_prevout_network_prefix(network).0;
+        key.extend_from_slice(&outpoint.transaction_id.as_bytes());
+        key.extend_from_slice(&outpoint.output_index.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout_history_prefix(
+        network: Network,
+        outpoint: TransparentOutPoint,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_HISTORY_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&outpoint.transaction_id.as_bytes());
+        key.extend_from_slice(&outpoint.output_index.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout_history(
+        network: Network,
+        outpoint: TransparentOutPoint,
+        chain_epoch: ChainEpochId,
+    ) -> Self {
+        let mut key = Self::transparent_prevout_history_prefix(network, outpoint).0;
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout_block_index_prefix(
+        network: Network,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&height.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_prevout_block_index(
+        network: Network,
+        height: BlockHeight,
+        chain_epoch: ChainEpochId,
+    ) -> Self {
+        let mut key = Self::transparent_prevout_block_index_prefix(network, height).0;
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
         Self(key)
     }
 
@@ -387,6 +444,8 @@ impl StoreKey {
             key_bytes[1],
             TRANSPARENT_ADDRESS_UTXO_KEY_KIND
                 | TRANSPARENT_UTXO_SPEND_KEY_KIND
+                | TRANSPARENT_PREVOUT_HISTORY_KEY_KIND
+                | TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND
                 | TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND
         ) {
             return None;
@@ -474,6 +533,16 @@ mod tests {
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
                 chain_epoch,
             ),
+            StoreKey::transparent_prevout(
+                network,
+                zinder_core::TransparentOutPoint::new(transaction_id, 0),
+            ),
+            StoreKey::transparent_prevout_history(
+                network,
+                zinder_core::TransparentOutPoint::new(transaction_id, 0),
+                chain_epoch,
+            ),
+            StoreKey::transparent_prevout_block_index(network, height, chain_epoch),
             StoreKey::transparent_address_tx_index(
                 network,
                 zinder_core::TransparentAddressScriptHash::from_bytes([0x55; 32]),

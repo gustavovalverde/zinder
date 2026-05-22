@@ -17,8 +17,8 @@ use zinder_core::{
     BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
     SubtreeRootIndex, TransactionArtifact, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
-    UnixTimestampMillis, wire::encode_internal_block_hash,
+    TransparentAddressUtxoArtifact, TransparentPrevoutArtifact, TransparentUtxoSpendArtifact,
+    TreeStateArtifact, UnixTimestampMillis, wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
@@ -141,6 +141,7 @@ pub struct ChainFixture {
     sapling_subtree_roots: Vec<SubtreeRootArtifact>,
     transaction_artifacts: Vec<TransactionArtifact>,
     transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    transparent_prevouts: Vec<TransparentPrevoutArtifact>,
     transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
     transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
 }
@@ -157,6 +158,7 @@ impl ChainFixture {
             sapling_subtree_roots: Vec::new(),
             transaction_artifacts: Vec::new(),
             transparent_address_utxos: Vec::new(),
+            transparent_prevouts: Vec::new(),
             transparent_utxo_spends: Vec::new(),
             transparent_address_tx_index: Vec::new(),
         }
@@ -237,6 +239,7 @@ impl ChainFixture {
             sapling_subtree_roots: Vec::new(),
             transaction_artifacts: Vec::new(),
             transparent_address_utxos: Vec::new(),
+            transparent_prevouts: Vec::new(),
             transparent_utxo_spends: Vec::new(),
             transparent_address_tx_index: Vec::new(),
         })
@@ -317,12 +320,25 @@ impl ChainFixture {
         self
     }
 
-    /// Attaches a [`TransparentAddressUtxoArtifact`] to this fixture's commit set.
+    /// Attaches a [`TransparentAddressUtxoArtifact`] to this fixture's
+    /// commit set and mirrors it into the canonical transparent-prevout index
+    /// so prevout reads and spend-side history lookups resolve.
+    ///
+    /// [ADR-0022]: ../../../docs/adrs/0022-transparent-prevout-index.md
     #[must_use]
     pub fn with_transparent_address_utxo(
         mut self,
         transparent_address_utxo: TransparentAddressUtxoArtifact,
     ) -> Self {
+        self.transparent_prevouts
+            .push(TransparentPrevoutArtifact::new(
+                transparent_address_utxo.outpoint,
+                transparent_address_utxo.value_zat,
+                transparent_address_utxo.script_pub_key.clone(),
+                transparent_address_utxo.address_script_hash,
+                transparent_address_utxo.block_height,
+                transparent_address_utxo.block_hash,
+            ));
         self.transparent_address_utxos
             .push(transparent_address_utxo);
         self
@@ -488,6 +504,10 @@ impl ChainFixture {
         if !self.transparent_address_utxos.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
                 .with_transparent_address_utxos(self.transparent_address_utxos.clone());
+        }
+        if !self.transparent_prevouts.is_empty() {
+            chain_epoch_artifacts =
+                chain_epoch_artifacts.with_transparent_prevouts(self.transparent_prevouts.clone());
         }
         if !self.transparent_utxo_spends.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
