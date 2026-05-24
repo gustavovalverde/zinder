@@ -531,7 +531,7 @@ Config:
   invariant.
 - Rename `to_height` to `target_height` and place it under
   `[ingest.modifiers]`.
-- Add `ingest.bulk_catchup.source_segment_max_blocks` (default 128) as the
+- Add `ingest.bulk_catchup.source_segment_max_blocks` (default 16) as the
   maximum source-segment block count; runtime request size adapts from
   source-response density.
 - Migrate `deploy/single-container/config.example.ingest.toml` and

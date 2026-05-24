@@ -39,10 +39,10 @@ requested block.
 
 Bulk catchup uses byte-watermarked source fetch config:
 
-- `source_segment_max_blocks = 128`
-- `source_segment_target_response_bytes = 50331648`
-- `source_fetch_max_in_flight_requests = 8`
-- `source_fetch_max_in_flight_bytes = 268435456`
+- `source_segment_max_blocks = 16`
+- `source_segment_target_response_bytes = 33554432`
+- `source_fetch_max_in_flight_requests = 12`
+- `source_fetch_max_in_flight_bytes = 402653184`
 - `fact_build_concurrency = min(available_parallelism, 16)`
 - `canonical_batch_max_blocks = 1000`
 - `canonical_batch_max_artifact_bytes = 536870912`
@@ -50,7 +50,9 @@ Bulk catchup uses byte-watermarked source fetch config:
 
 The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
-default is 64 MiB, so the default segment target is 48 MiB.
+default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
+fact build may complete out of order, but ordered reassembly is the only place
+that releases blocks to the serial finalization and commit boundary.
 
 Canonical storage writes tree state only at committed canonical epoch tips.
 Tip-follow writes one checkpoint per live committed tip. Bulk catchup fetches

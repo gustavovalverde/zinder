@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_epoch_artifacts_cover_every_block() -> Result<(), Box<dyn Error>> {
+    fn chain_epoch_artifacts_cover_every_block_and_tip_checkpoint() -> Result<(), Box<dyn Error>> {
         let fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
         let chain_epoch_artifacts = fixture
             .chain_epoch_artifacts(ChainEpochId::new(7))
@@ -792,7 +792,11 @@ mod tests {
 
         assert_eq!(chain_epoch_artifacts.block_headers.len(), 4);
         assert_eq!(chain_epoch_artifacts.compact_blocks.len(), 4);
-        assert_eq!(chain_epoch_artifacts.tree_states.len(), 4);
+        assert_eq!(chain_epoch_artifacts.tree_states.len(), 1);
+        assert_eq!(
+            chain_epoch_artifacts.tree_states[0].height,
+            BlockHeight::new(4)
+        );
         assert_eq!(chain_epoch_artifacts.chain_epoch.tip_height.value(), 4);
         assert_eq!(
             chain_epoch_artifacts.chain_epoch.network,

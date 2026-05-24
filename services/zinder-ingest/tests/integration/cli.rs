@@ -85,10 +85,10 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
-    assert!(stdout.contains("source_segment_max_blocks = 128"));
-    assert!(stdout.contains("source_segment_target_response_bytes = 50331648"));
-    assert!(stdout.contains("source_fetch_max_in_flight_requests = 8"));
-    assert!(stdout.contains("source_fetch_max_in_flight_bytes = 268435456"));
+    assert!(stdout.contains("source_segment_max_blocks = 16"));
+    assert!(stdout.contains("source_segment_target_response_bytes = 33554432"));
+    assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
+    assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));
     assert!(stdout.contains("fact_build_concurrency ="));
     assert!(stdout.contains("[ingest.tip_follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
@@ -330,12 +330,18 @@ fn max_response_bytes_can_be_overridden_from_cli() -> Result<(), Box<dyn Error>>
             path_str(&config_path)?,
             "--max-response-bytes",
             "8388608",
+            "--source-segment-target-response-bytes",
+            "8388608",
         ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("max_response_bytes = 8388608"), "{stdout}");
+    assert!(
+        stdout.contains("source_segment_target_response_bytes = 8388608"),
+        "{stdout}"
+    );
 
     Ok(())
 }

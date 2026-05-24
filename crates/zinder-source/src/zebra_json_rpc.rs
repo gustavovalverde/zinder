@@ -1745,8 +1745,8 @@ mod tests {
             source_error,
             SourceError::SourceResponseTooLarge {
                 operation: "batch_getblock",
-                max_response_bytes: 16_777_216,
-            }
+                max_response_bytes,
+            } if max_response_bytes == DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get()
         ));
     }
 

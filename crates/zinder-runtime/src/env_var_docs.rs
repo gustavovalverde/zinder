@@ -358,7 +358,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum connected blocks requested from the source in one bulk-catchup \
-                      segment. Defaults to 128.",
+                      segment. Defaults to 16.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
@@ -367,7 +367,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Target source response bytes for adaptive segment sizing. Defaults to \
-                      50331648.",
+                      33554432.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
@@ -375,7 +375,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum concurrent source segment requests. Defaults to 8.",
+        description: "Maximum concurrent source segment requests. Defaults to 12.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES",
@@ -384,7 +384,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum reserved source response bytes across in-flight fetches. Defaults \
-                      to 268435456.",
+                      to 402653184.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY",

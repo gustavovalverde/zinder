@@ -107,8 +107,11 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
+| `zinder_ingest_source_segment_reassembly_segments` | gauge | `zinder-ingest` | Completed source segments waiting for earlier heights before ordered bulk-catchup emission. |
+| `zinder_ingest_source_segment_reassembly_bytes` | gauge | `zinder-ingest` | Estimated response bytes held by completed source segments waiting in ordered reassembly. |
 | `zinder_ingest_fact_build_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
 | `zinder_ingest_fact_build_total` | counter | `zinder-ingest` | Per-block bulk-catchup derive count by status and error class. |
+| `zinder_ingest_fact_build_reassembly_blocks` | gauge | `zinder-ingest` | Completed derived blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
 | `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. |
@@ -437,10 +440,10 @@ replay_policy = "canonical-first"
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
-source_segment_max_blocks = 128
-source_segment_target_response_bytes = 50331648
-source_fetch_max_in_flight_requests = 8
-source_fetch_max_in_flight_bytes = 268435456
+source_segment_max_blocks = 16
+source_segment_target_response_bytes = 33554432
+source_fetch_max_in_flight_requests = 12
+source_fetch_max_in_flight_bytes = 402653184
 fact_build_concurrency = 16
 
 [ingest.tip_follow]

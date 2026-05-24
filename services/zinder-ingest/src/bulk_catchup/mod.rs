@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
@@ -10,7 +10,7 @@ use std::{
 use futures_util::{
     FutureExt,
     future::BoxFuture,
-    stream::{self, FuturesOrdered, Stream, StreamExt},
+    stream::{self, BoxStream, FuturesUnordered, Stream, StreamExt},
 };
 use parking_lot::Mutex;
 use zinder_core::{
@@ -547,33 +547,158 @@ where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
     Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
 {
-    let fact_build_concurrency = config.fact_build_concurrency;
-    build_source_block_stream(source, config)
-        .map(move |source_block_result| {
-            let derive_fn = derive_fn.clone();
-            async move {
-                let source_block = source_block_result?;
-                let fact_build_started_at = Instant::now();
-                let fact_build_outcome = derive_fn(source_block).await;
-                record_ingest_fact_build_outcome(fact_build_started_at, &fact_build_outcome);
-                fact_build_outcome
+    let fact_build_concurrency = config.fact_build_concurrency.max(1);
+    let from_height = config.from_height;
+    let to_height = config.to_height;
+    let state = FactBuildStreamState {
+        source_blocks: build_source_block_stream(source, config).boxed(),
+        in_flight_fact_builds: FuturesUnordered::new(),
+        completed_fact_builds: BTreeMap::new(),
+        derive_fn,
+        fact_build_concurrency,
+        next_emit_height: Some(from_height),
+        to_height,
+        source_exhausted: false,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        let next_derived_block = next_derived_block_from_fact_build_stream(&mut state).await;
+        next_derived_block.map(|derived_result| (derived_result, state))
+    })
+}
+
+struct PrefetchedDerivedBlock {
+    height: BlockHeight,
+    derived: DerivedBlockArtifacts,
+}
+
+struct FactBuildStreamState<'a, F> {
+    source_blocks: BoxStream<'a, Result<SourceBlock, IngestError>>,
+    in_flight_fact_builds:
+        FuturesUnordered<BoxFuture<'a, Result<PrefetchedDerivedBlock, IngestError>>>,
+    completed_fact_builds: BTreeMap<BlockHeight, DerivedBlockArtifacts>,
+    derive_fn: F,
+    fact_build_concurrency: usize,
+    next_emit_height: Option<BlockHeight>,
+    to_height: BlockHeight,
+    source_exhausted: bool,
+}
+
+async fn next_derived_block_from_fact_build_stream<'a, F, Fut>(
+    state: &mut FactBuildStreamState<'a, F>,
+) -> Option<Result<DerivedBlockArtifacts, IngestError>>
+where
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
+{
+    loop {
+        if let Some(next_emit_height) = state.next_emit_height
+            && let Some(derived) = state.completed_fact_builds.remove(&next_emit_height)
+        {
+            state.next_emit_height = next_emit_height
+                .next()
+                .filter(|height| *height <= state.to_height);
+            record_fact_build_reassembly_state(state);
+            return Some(Ok(derived));
+        }
+
+        let can_schedule_fact_build = state.can_schedule_fact_build();
+        if !can_schedule_fact_build && state.in_flight_fact_builds.is_empty() {
+            return None;
+        }
+
+        tokio::select! {
+            source_block_result = state.source_blocks.next(), if can_schedule_fact_build => {
+                match source_block_result {
+                    Some(Ok(source_block)) => schedule_fact_build(state, source_block),
+                    Some(Err(error)) => return Some(Err(error)),
+                    None => state.source_exhausted = true,
+                }
             }
-        })
-        .buffered(fact_build_concurrency.max(1))
+            fact_build_result = state.in_flight_fact_builds.next(), if !state.in_flight_fact_builds.is_empty() => {
+                let prefetched_derived = match fact_build_result {
+                    Some(Ok(prefetched_derived)) => prefetched_derived,
+                    Some(Err(error)) => return Some(Err(error)),
+                    None => continue,
+                };
+                if let Err(error) = insert_completed_fact_build(state, prefetched_derived) {
+                    return Some(Err(error));
+                }
+                record_fact_build_reassembly_state(state);
+            }
+        }
+    }
+}
+
+impl<F> FactBuildStreamState<'_, F> {
+    fn can_schedule_fact_build(&self) -> bool {
+        !self.source_exhausted
+            && self.in_flight_fact_builds.len() < self.fact_build_concurrency
+            && self.completed_fact_builds.len() < self.fact_build_concurrency
+    }
+}
+
+fn schedule_fact_build<'a, F, Fut>(state: &FactBuildStreamState<'a, F>, source_block: SourceBlock)
+where
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
+{
+    let derive_fn = state.derive_fn.clone();
+    state.in_flight_fact_builds.push(
+        async move {
+            let height = source_block.height;
+            let fact_build_started_at = Instant::now();
+            let fact_build_outcome = derive_fn(source_block).await;
+            record_ingest_fact_build_outcome(fact_build_started_at, &fact_build_outcome);
+            fact_build_outcome.map(|derived| PrefetchedDerivedBlock { height, derived })
+        }
+        .boxed(),
+    );
+}
+
+fn insert_completed_fact_build<F>(
+    state: &mut FactBuildStreamState<'_, F>,
+    prefetched_derived: PrefetchedDerivedBlock,
+) -> Result<(), IngestError> {
+    if prefetched_derived.height > state.to_height {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "derived block completed outside the requested bulk-catchup range",
+        }));
+    }
+    if state
+        .completed_fact_builds
+        .insert(prefetched_derived.height, prefetched_derived.derived)
+        .is_some()
+    {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "derived block completed twice during bulk catchup",
+        }));
+    }
+    Ok(())
+}
+
+fn record_fact_build_reassembly_state<F>(state: &FactBuildStreamState<'_, F>) {
+    metrics::gauge!("zinder_ingest_fact_build_reassembly_blocks").set(f64::from(
+        usize_to_u32_saturating(state.completed_fact_builds.len()),
+    ));
 }
 
 struct SourceBlockStreamState<'a, Source> {
     source: &'a Source,
     request_timeout: Duration,
+    from_height: BlockHeight,
     to_height: BlockHeight,
     source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
     max_response_bytes: NonZeroU64,
     target_response_payload_bytes: NonZeroU64,
     source_fetch_max_in_flight_requests: NonZeroU32,
     source_fetch_max_in_flight_bytes: NonZeroU64,
-    in_flight_source_bytes: u64,
+    source_fetch_watermark: SourceFetchWatermark,
     next_fetch_height: Option<BlockHeight>,
-    in_flight_segments: FuturesOrdered<BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>>,
+    next_emit_height: Option<BlockHeight>,
+    in_flight_segments:
+        FuturesUnordered<BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>>,
+    completed_segments: BTreeMap<BlockHeight, PrefetchedSourceSegment>,
     pending_blocks: VecDeque<SourceBlock>,
     last_connected_block_id: Option<BlockId>,
 }
@@ -588,15 +713,18 @@ where
     let state = SourceBlockStreamState {
         source,
         request_timeout: config.request_timeout,
+        from_height: config.from_height,
         to_height: config.to_height,
         source_segment_sizer: config.source_segment_sizer,
         max_response_bytes: config.max_response_bytes,
         target_response_payload_bytes: config.target_response_payload_bytes,
         source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
         source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
-        in_flight_source_bytes: 0,
+        source_fetch_watermark: SourceFetchWatermark::default(),
         next_fetch_height: Some(config.from_height),
-        in_flight_segments: FuturesOrdered::new(),
+        next_emit_height: Some(config.from_height),
+        in_flight_segments: FuturesUnordered::new(),
+        completed_segments: BTreeMap::new(),
         pending_blocks: VecDeque::new(),
         last_connected_block_id: None,
     };
@@ -619,6 +747,22 @@ where
         }
 
         fill_source_segment_prefetch_queue(state);
+        if let Some(prefetched_segment) = pop_next_completed_source_segment(state) {
+            let segment = prefetched_segment.segment;
+            if segment.is_empty() {
+                return None;
+            }
+
+            state
+                .source_segment_sizer
+                .lock()
+                .record_segment(segment.stats());
+            if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
+                return Some(Err(error));
+            }
+            continue;
+        }
+
         let prefetched_segment = match state.in_flight_segments.next().await {
             Some(Ok(prefetched_segment)) => prefetched_segment,
             Some(Err(error)) => {
@@ -626,22 +770,13 @@ where
             }
             None => return None,
         };
-        state.in_flight_source_bytes = state
-            .in_flight_source_bytes
-            .saturating_sub(prefetched_segment.reserved_response_bytes);
-        record_source_fetch_queue_state(state);
-        let segment = prefetched_segment.segment;
-        if segment.is_empty() {
-            return None;
-        }
-
         state
-            .source_segment_sizer
-            .lock()
-            .record_segment(segment.stats());
-        if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
+            .source_fetch_watermark
+            .record_completed_request(&prefetched_segment);
+        if let Err(error) = insert_completed_source_segment(state, prefetched_segment) {
             return Some(Err(error));
         }
+        record_source_fetch_queue_state(state);
     }
 }
 
@@ -669,14 +804,18 @@ where
             .target_response_payload_bytes
             .get()
             .min(state.max_response_bytes.get());
-        if !try_reserve_source_fetch_bytes(state, reserved_response_bytes) {
+        if !state.source_fetch_watermark.try_reserve(
+            state.source_fetch_max_in_flight_bytes,
+            reserved_response_bytes,
+        ) {
             break;
         }
         state
             .in_flight_segments
-            .push_back(fetch_prefetched_chain_segment(&SourceFetchRequest {
+            .push(fetch_prefetched_chain_segment(&SourceFetchRequest {
                 request_timeout: state.request_timeout,
                 source: state.source,
+                start_height: next_height,
                 cursor,
                 max_connected_blocks: source_segment_max_blocks,
                 target_response_bytes: state.target_response_payload_bytes,
@@ -693,6 +832,7 @@ where
 struct SourceFetchRequest<'a, Source> {
     request_timeout: Duration,
     source: &'a Source,
+    start_height: BlockHeight,
     cursor: SourceChainCursor,
     max_connected_blocks: NonZeroU32,
     target_response_bytes: NonZeroU64,
@@ -701,8 +841,11 @@ struct SourceFetchRequest<'a, Source> {
 }
 
 struct PrefetchedSourceSegment {
+    start_height: BlockHeight,
+    max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
     reserved_response_bytes: u64,
+    queued_response_bytes: u64,
 }
 
 fn fetch_prefetched_chain_segment<'a, Source>(
@@ -713,6 +856,7 @@ where
 {
     let request_timeout = request.request_timeout;
     let source = request.source;
+    let start_height = request.start_height;
     let cursor = request.cursor;
     let max_connected_blocks = request.max_connected_blocks;
     let target_response_bytes = request.target_response_bytes;
@@ -730,34 +874,118 @@ where
         let segment =
             fetch_chain_segment_with_retry(request_timeout, source, limits, &mut retry_state)
                 .await?;
+        let queued_response_bytes = queued_source_segment_bytes(&segment, reserved_response_bytes);
         Ok(PrefetchedSourceSegment {
+            start_height,
+            max_connected_blocks,
             segment,
             reserved_response_bytes,
+            queued_response_bytes,
         })
     }
     .boxed()
 }
 
-fn try_reserve_source_fetch_bytes<Source>(
+#[derive(Default)]
+struct SourceFetchWatermark {
+    active_reserved_bytes: u64,
+    completed_segment_bytes: u64,
+}
+
+impl SourceFetchWatermark {
+    fn try_reserve(&mut self, max_queued_bytes: NonZeroU64, reserved_response_bytes: u64) -> bool {
+        let current_queued_bytes = self.queued_bytes();
+        let max_queued_bytes = max_queued_bytes.get();
+        if current_queued_bytes == 0 && reserved_response_bytes > max_queued_bytes {
+            self.active_reserved_bytes = self
+                .active_reserved_bytes
+                .saturating_add(reserved_response_bytes);
+            return true;
+        }
+
+        let Some(next_queued_bytes) = current_queued_bytes.checked_add(reserved_response_bytes)
+        else {
+            return false;
+        };
+        if next_queued_bytes > max_queued_bytes {
+            return false;
+        }
+        self.active_reserved_bytes = self
+            .active_reserved_bytes
+            .saturating_add(reserved_response_bytes);
+        true
+    }
+
+    fn record_completed_request(&mut self, prefetched_segment: &PrefetchedSourceSegment) {
+        self.active_reserved_bytes = self
+            .active_reserved_bytes
+            .saturating_sub(prefetched_segment.reserved_response_bytes);
+        self.completed_segment_bytes = self
+            .completed_segment_bytes
+            .saturating_add(prefetched_segment.queued_response_bytes);
+    }
+
+    fn record_emitted_segment(&mut self, prefetched_segment: &PrefetchedSourceSegment) {
+        self.completed_segment_bytes = self
+            .completed_segment_bytes
+            .saturating_sub(prefetched_segment.queued_response_bytes);
+    }
+
+    const fn queued_bytes(&self) -> u64 {
+        self.active_reserved_bytes
+            .saturating_add(self.completed_segment_bytes)
+    }
+
+    const fn completed_segment_bytes(&self) -> u64 {
+        self.completed_segment_bytes
+    }
+}
+
+fn queued_source_segment_bytes(segment: &SourceChainSegment, reserved_response_bytes: u64) -> u64 {
+    let measured_response_bytes = segment.stats().response_payload_bytes();
+    if measured_response_bytes == 0 && !segment.is_empty() {
+        reserved_response_bytes
+    } else {
+        measured_response_bytes
+    }
+}
+
+fn pop_next_completed_source_segment<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
-    reserved_response_bytes: u64,
-) -> bool {
-    let max_in_flight_bytes = state.source_fetch_max_in_flight_bytes.get();
-    if state.in_flight_source_bytes == 0 && reserved_response_bytes > max_in_flight_bytes {
-        state.in_flight_source_bytes = reserved_response_bytes;
-        return true;
+) -> Option<PrefetchedSourceSegment> {
+    let next_emit_height = state.next_emit_height?;
+    let prefetched_segment = state.completed_segments.remove(&next_emit_height)?;
+    state
+        .source_fetch_watermark
+        .record_emitted_segment(&prefetched_segment);
+    state.next_emit_height =
+        next_height_after_segment(next_emit_height, prefetched_segment.max_connected_blocks)
+            .filter(|height| *height <= state.to_height);
+    record_source_fetch_queue_state(state);
+    Some(prefetched_segment)
+}
+
+fn insert_completed_source_segment<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+    prefetched_segment: PrefetchedSourceSegment,
+) -> Result<(), IngestError> {
+    if prefetched_segment.start_height < state.from_height
+        || prefetched_segment.start_height > state.to_height
+    {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "source chain segment completed outside the requested bulk-catchup range",
+        }));
     }
-    let Some(next_in_flight_bytes) = state
-        .in_flight_source_bytes
-        .checked_add(reserved_response_bytes)
-    else {
-        return false;
-    };
-    if next_in_flight_bytes > max_in_flight_bytes {
-        return false;
+    if state
+        .completed_segments
+        .insert(prefetched_segment.start_height, prefetched_segment)
+        .is_some()
+    {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "source chain segment completed twice during bulk catchup",
+        }));
     }
-    state.in_flight_source_bytes = next_in_flight_bytes;
-    true
+    Ok(())
 }
 
 fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
@@ -765,7 +993,13 @@ fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, So
         usize_to_u32_saturating(state.in_flight_segments.len()),
     ));
     metrics::gauge!("zinder_ingest_source_fetch_queue_bytes")
-        .set(u64_to_f64(state.in_flight_source_bytes));
+        .set(u64_to_f64(state.source_fetch_watermark.queued_bytes()));
+    metrics::gauge!("zinder_ingest_source_segment_reassembly_segments").set(f64::from(
+        usize_to_u32_saturating(state.completed_segments.len()),
+    ));
+    metrics::gauge!("zinder_ingest_source_segment_reassembly_bytes").set(u64_to_f64(
+        state.source_fetch_watermark.completed_segment_bytes(),
+    ));
 }
 
 fn enqueue_source_segment_max_blocks<Source>(
@@ -1952,6 +2186,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_fetch_schedules_past_slow_earlier_segment() -> Result<(), Box<dyn Error>> {
+        let fetch_events = Arc::new(Mutex::new(Vec::new()));
+        let source = DelayedSegmentSource {
+            fetch_events: Arc::clone(&fetch_events),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let fact_build_stream = build_fact_build_stream(
+            &source,
+            BackfillFactBuildStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(6),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(2)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(25 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                fact_build_concurrency: 2,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+        );
+        futures_util::pin_mut!(fact_build_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(next_block) = fact_build_stream.next().await {
+            observed_heights.push(next_block?.block_header.height.value());
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
+        let fetch_events = fetch_events.lock().clone();
+        let start_third_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Started {
+                start_height: BlockHeight::new(5),
+            },
+        )?;
+        let finish_first_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Finished {
+                start_height: BlockHeight::new(1),
+            },
+        )?;
+        assert!(
+            start_third_segment < finish_first_segment,
+            "expected later segment to start before the slow first segment finished; events: {fetch_events:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fact_build_schedules_past_slow_earlier_block() -> Result<(), Box<dyn Error>> {
+        let derive_events = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingSegmentSource {
+            requested_segments: Arc::new(Mutex::new(Vec::new())),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let derive_events_for_stream = Arc::clone(&derive_events);
+        let fact_build_stream = build_fact_build_stream(
+            &source,
+            BackfillFactBuildStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(6),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                fact_build_concurrency: 2,
+            },
+            move |source_block| {
+                let derive_events = Arc::clone(&derive_events_for_stream);
+                async move {
+                    let height = source_block.height;
+                    derive_events
+                        .lock()
+                        .push(FactBuildEvent::Started { height });
+                    match height.value() {
+                        1 => tokio::time::sleep(Duration::from_millis(80)).await,
+                        2 => tokio::time::sleep(Duration::from_millis(10)).await,
+                        _ => {}
+                    }
+                    derive_events
+                        .lock()
+                        .push(FactBuildEvent::Finished { height });
+                    Ok(test_derived_block(&source_block, 0, 0))
+                }
+            },
+        );
+        futures_util::pin_mut!(fact_build_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(next_block) = fact_build_stream.next().await {
+            observed_heights.push(next_block?.block_header.height.value());
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
+        let derive_events = derive_events.lock().clone();
+        let start_third_block = fact_build_event_index(
+            &derive_events,
+            FactBuildEvent::Started {
+                height: BlockHeight::new(3),
+            },
+        )?;
+        let finish_first_block = fact_build_event_index(
+            &derive_events,
+            FactBuildEvent::Finished {
+                height: BlockHeight::new(1),
+            },
+        )?;
+        assert!(
+            start_third_block < finish_first_block,
+            "expected later fact build to start before the slow first block finished; events: {derive_events:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn backfill_retries_retryable_block_fetch_failures() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("retryable-source-store");
@@ -2428,6 +2800,23 @@ mod tests {
         network: Network,
     }
 
+    struct DelayedSegmentSource {
+        fetch_events: Arc<Mutex<Vec<SegmentFetchEvent>>>,
+        network: Network,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SegmentFetchEvent {
+        Started { start_height: BlockHeight },
+        Finished { start_height: BlockHeight },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FactBuildEvent {
+        Started { height: BlockHeight },
+        Finished { height: BlockHeight },
+    }
+
     struct FlakyNodeSource {
         delegate: TestNodeSource,
         failure: FlakySourceFailure,
@@ -2451,6 +2840,65 @@ mod tests {
                     reason: "node payload missing required field",
                 },
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeSource for DelayedSegmentSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            ZebraJsonRpcSource::baseline_capabilities()
+        }
+
+        async fn fetch_chain_segment(
+            &self,
+            limits: SourceChainSegmentLimits,
+        ) -> Result<SourceChainSegment, SourceError> {
+            let Some(start_height) = limits.cursor.next_connected_height() else {
+                return Ok(SourceChainSegment::default());
+            };
+            self.fetch_events
+                .lock()
+                .push(SegmentFetchEvent::Started { start_height });
+
+            match start_height.value() {
+                1 => tokio::time::sleep(Duration::from_millis(80)).await,
+                3 => tokio::time::sleep(Duration::from_millis(10)).await,
+                _ => {}
+            }
+
+            self.fetch_events
+                .lock()
+                .push(SegmentFetchEvent::Finished { start_height });
+
+            let end_height = BlockHeight::new(
+                start_height
+                    .value()
+                    .saturating_add(limits.max_connected_blocks.get())
+                    .saturating_sub(1)
+                    .min(6),
+            );
+            let mut blocks = Vec::new();
+            let mut next_height = Some(start_height);
+            while let Some(height) = next_height {
+                if height > end_height {
+                    break;
+                }
+                blocks.push(test_source_block(self.network, height));
+                next_height = height.next();
+            }
+
+            Ok(SourceChainSegment::connected_blocks(blocks))
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            let _ = height;
+            Err(SourceError::SourceProtocolMismatch {
+                reason: "single-block fetch should not be used by segment backfill",
+            })
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(BlockHeight::new(6), block_hash(6)))
         }
     }
 
@@ -2628,6 +3076,28 @@ mod tests {
                 subtree_roots,
             ))
         }
+    }
+
+    fn fetch_event_index(
+        events: &[SegmentFetchEvent],
+        expected_event: SegmentFetchEvent,
+    ) -> Result<usize, Box<dyn Error>> {
+        events
+            .iter()
+            .position(|event| *event == expected_event)
+            .ok_or_else(|| {
+                format!("missing expected source fetch event: {expected_event:?}").into()
+            })
+    }
+
+    fn fact_build_event_index(
+        events: &[FactBuildEvent],
+        expected_event: FactBuildEvent,
+    ) -> Result<usize, Box<dyn Error>> {
+        events
+            .iter()
+            .position(|event| *event == expected_event)
+            .ok_or_else(|| format!("missing expected fact build event: {expected_event:?}").into())
     }
 
     fn test_source_block(network: Network, height: BlockHeight) -> SourceBlock {

@@ -135,7 +135,7 @@ Plus the bulk-catchup ingest knobs:
 concurrency = 8                # parallel derive and replay hydration tasks
 
 [ingest.bulk_catchup]
-source_segment_max_blocks = 128     # hard ceiling; runtime size adapts by response bytes
+source_segment_max_blocks = 16      # hard ceiling; runtime size adapts by response bytes
 flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
 
