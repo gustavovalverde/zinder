@@ -396,13 +396,23 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__REPLAY_CONCURRENCY",
-        toml_path: "ingest.derive.replay_concurrency",
+        name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES",
+        toml_path: "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Parallel block hydration slots used by derive replay. Defaults to \
-                      `min(available_parallelism(), 16)`.",
+        description: "Maximum reserved derived artifact bytes across active and completed \
+                      fact-build work. Defaults to 536870912.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
+        toml_path: "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum finalized artifact bytes that can accumulate while the previous \
+                      bulk-catchup batch is attaching metadata, committing, or flushing. \
+                      Defaults to 536870912.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS",
@@ -423,6 +433,53 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       replay under memory pressure so canonical ingest keeps the process budget. \
                       `continuous` replays retained chain events whenever they are available. \
                       Defaults to `canonical-first`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES",
+        toml_path: "ingest.derive.memory_budget_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Explicit derive replay memory budget in bytes. When unset, derive replay \
+                      uses the runtime cgroup `memory.high` or `memory.max` value when present.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__MEMORY_DEGRADE_RATIO",
+        toml_path: "ingest.derive.memory_degrade_ratio",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Memory pressure ratio at which derive replay shrinks the effective replay \
+                      batch size. Defaults to 0.85.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO",
+        toml_path: "ingest.derive.memory_pause_ratio",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Memory pressure ratio at which canonical-first derive replay pauses. \
+                      Defaults to 0.95.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO",
+        toml_path: "ingest.derive.memory_resume_ratio",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Memory pressure ratio below which degraded derive replay returns to the \
+                      normal replay batch size. Paused replay resumes as degraded work once \
+                      pressure falls below memory_pause_ratio. Defaults to 0.75.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__MIN_REPLAY_BATCH_BLOCKS",
+        toml_path: "ingest.derive.min_replay_batch_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Smallest effective derive replay batch size under memory degradation. \
+                      Must be greater than zero and no larger than replay_batch_blocks. Defaults \
+                      to 10.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",

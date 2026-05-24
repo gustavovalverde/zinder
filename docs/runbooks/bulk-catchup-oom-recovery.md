@@ -128,14 +128,24 @@ max_wal_bytes = 67108864        # 64 MiB
 max_open_files = 256
 ```
 
-Plus the bulk-catchup ingest knobs:
+Plus the derive and bulk-catchup ingest knobs:
 
 ```toml
 [ingest.derive]
-concurrency = 8                # parallel derive and replay hydration tasks
+replay_batch_blocks = 500
+memory_degrade_ratio = 0.85
+memory_pause_ratio = 0.95
+memory_resume_ratio = 0.75
+min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]
 source_segment_max_blocks = 16      # hard ceiling; runtime size adapts by response bytes
+source_segment_target_response_bytes = 33554432
+source_fetch_max_in_flight_requests = 20
+source_fetch_max_in_flight_bytes = 671088640
+fact_build_concurrency = 16
+fact_build_max_in_flight_artifact_bytes = 536870912
+commit_reassembly_max_queued_artifact_bytes = 536870912
 flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
 
@@ -151,7 +161,7 @@ large JSON payloads. If split bursts repeat immediately after every
 
 With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
 
-`ingest.bulk_catchup.fact_build_concurrency` adds at most `N × (avg SourceBlock + avg DerivedBlockArtifacts)` of in-flight RAM (roughly 100 KB per slot on mainnet). At the default `min(available_parallelism(), 16)`, the in-flight fact-build contribution is at most a few MiB and is negligible alongside the batch accumulator, source-response reservations, and RocksDB write buffers. Startup derive replay is bounded separately by `ingest.derive.replay_batch_blocks`, so replay does not hydrate an entire retained chain event in one in-memory unit. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
+`ingest.bulk_catchup.fact_build_concurrency` controls CPU workers; `fact_build_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
 RAM-constrained hosts drop the cache to 128 MiB and the WAL ceiling to 64 MiB; high-throughput hosts can raise the cache to 1 GiB. The architectural invariants (WAL on, point-in-time recovery, atomic cross-CF flush, ordered writes) are not exposed to operator tuning because each one is a contract of the per-`ChainEpoch` commit guarantee.
 
@@ -175,8 +185,10 @@ The metric set shipped alongside the bounded resource budget catches the trap be
 - `zinder_store_block_cache_capacity_bytes` and `zinder_store_block_cache_usage_bytes` — block cache size and current usage. These are the canonical signals for cache pressure; the same numbers are not republished as `zinder_store_rocksdb_property` labels.
 - `zinder_store_rocksdb_property` (gauge, labels `property`, `cf`) gained `rocksdb.cur-size-active-mem-table` so an oversized memtable shows up alongside the WAL gauge.
 - `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — the alert `ZinderStartupOpenStorageSlow` fires when `open_storage` p95 exceeds 60 seconds, the shape this trap takes during the restart loop.
+- `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` distinguish active source/fact reservations from completed out-of-order backlog.
+- `zinder_ingest_derive_replay_budget_state{state}` and `zinder_ingest_derive_replay_effective_batch_blocks` show whether derive replay is normal, degraded, or paused under memory pressure.
 
-All four signals appear on every service's `/metrics` endpoint and feed the existing Grafana dashboards under `observability/grafana/`.
+These signals appear on the relevant service `/metrics` endpoints and feed the existing Grafana dashboards under `observability/grafana/`.
 
 ## References
 

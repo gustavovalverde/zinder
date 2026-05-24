@@ -44,6 +44,8 @@ Bulk catchup uses byte-watermarked source fetch config:
 - `source_fetch_max_in_flight_requests = 12`
 - `source_fetch_max_in_flight_bytes = 402653184`
 - `fact_build_concurrency = min(available_parallelism, 16)`
+- `fact_build_max_in_flight_artifact_bytes = 536870912`
+- `commit_reassembly_max_queued_artifact_bytes = 536870912`
 - `canonical_batch_max_blocks = 1000`
 - `canonical_batch_max_artifact_bytes = 536870912`
 - `flush_interval_epochs = 5`
@@ -52,7 +54,13 @@ The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
 default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
 fact build may complete out of order, but ordered reassembly is the only place
-that releases blocks to the serial finalization and commit boundary.
+that releases blocks to the serial finalization boundary.
+
+The durable writer remains serial, but subtree-root attachment, checkpoint
+tree-state fetch, canonical commit, and flush run as one in-flight commit
+future while source fetch and fact build continue filling the next batch.
+`commit_reassembly_max_queued_artifact_bytes` bounds that next batch so commit
+overlap cannot become unbounded memory growth.
 
 Canonical storage writes tree state only at committed canonical epoch tips.
 Tip-follow writes one checkpoint per live committed tip. Bulk catchup fetches
@@ -86,3 +94,8 @@ The canonical ingest vocabulary is `CanonicalBatch`, `CanonicalBatchBudget`,
 `CanonicalBatchCost`, `CanonicalBatchCloseTrigger`, and
 `fact_build_concurrency`. `derive_replay_*` names are reserved for the async
 derive replay plane.
+
+Bulk-catchup observability uses stage labels from this ADR:
+`source_fetch`, `canonical_fact_build`, `canonical_finalize`,
+`subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
+`canonical_commit`, and `canonical_flush`.

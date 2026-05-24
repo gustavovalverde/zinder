@@ -39,9 +39,12 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.derive]
-replay_concurrency = 8
-replay_batch_blocks = 100
+replay_batch_blocks = 500
 replay_policy = "canonical-first"
+memory_degrade_ratio = 0.85
+memory_pause_ratio = 0.95
+memory_resume_ratio = 0.75
+min_replay_batch_blocks = 50
 
 # Bulk-catchup runs on cold stores and after long downtime; the unified
 # loop bounces back when the gap closes through the threshold.
@@ -50,9 +53,11 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 12
-source_fetch_max_in_flight_bytes = 402653184
+source_fetch_max_in_flight_requests = 20
+source_fetch_max_in_flight_bytes = 671088640
 fact_build_concurrency = 16
+fact_build_max_in_flight_artifact_bytes = 536870912
+commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
 poll_interval_ms = 2000

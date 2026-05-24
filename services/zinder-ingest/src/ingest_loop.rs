@@ -103,19 +103,8 @@ pub struct PhasesConfig {
 }
 
 /// Resolved `[ingest.derive]` configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IngestDeriveConfig {
-    /// Number of parallel CPU-bound block hydration tasks kept in flight
-    /// on the Tokio blocking pool.
-    ///
-    /// This cap applies to both the normal bulk-catchup `derive_block`
-    /// stage and startup derive replay. The default is
-    /// `clamp(available_parallelism() - 1, 4, 32)`; the ceiling at 32
-    /// mirrors Zebra's `full_verify_concurrency_limit` precedent and the
-    /// floor at 4 keeps small hosts pipelining I/O even when one CPU is
-    /// reserved for the Tokio reactor. See
-    /// [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub replay_concurrency: NonZeroU32,
     /// Maximum block contexts hydrated and dispatched in one derive replay
     /// write.
     ///
@@ -130,6 +119,21 @@ pub struct IngestDeriveConfig {
     /// projections under memory pressure. `Continuous` always lets the tailer
     /// replay retained chain events as soon as it observes them.
     pub replay_policy: DeriveReplayPolicy,
+    /// Optional explicit memory budget for derive replay pressure decisions.
+    ///
+    /// When unset, the replay budget uses the runtime cgroup `memory.high` or
+    /// `memory.max` value reported by [`crate::memory_pressure`].
+    pub memory_budget_bytes: Option<NonZeroU64>,
+    /// Memory ratio at which derive replay starts shrinking the effective
+    /// replay batch size.
+    pub memory_degrade_ratio: f64,
+    /// Memory ratio at which derive replay stops until pressure drops below
+    /// [`Self::memory_resume_ratio`].
+    pub memory_pause_ratio: f64,
+    /// Memory ratio below which derive replay resumes normal batch sizing.
+    pub memory_resume_ratio: f64,
+    /// Smallest effective replay batch while memory pressure is degraded.
+    pub min_replay_batch_blocks: NonZeroU32,
 }
 
 /// Runtime policy for replaying retained chain events into derive consumers.
@@ -173,6 +177,12 @@ pub struct BulkCatchupConfig {
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
     /// Parallel canonical fact-build slots.
     pub fact_build_concurrency: NonZeroU32,
+    /// Maximum reserved derived artifact bytes across active and completed
+    /// canonical fact builds.
+    pub fact_build_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Maximum finalized artifact bytes allowed to queue while the previous
+    /// canonical batch is attaching metadata, committing, or flushing.
+    pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
     /// Force a `RocksDB` flush every N committed epochs.
     ///
     /// Caps the live WAL by writer cadence rather than `RocksDB`'s WAL-size
@@ -556,6 +566,12 @@ fn build_bulk_catchup_batch_config(
             .source_fetch_max_in_flight_requests,
         source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
         fact_build_concurrency: config.bulk_catchup.fact_build_concurrency,
+        fact_build_max_in_flight_artifact_bytes: config
+            .bulk_catchup
+            .fact_build_max_in_flight_artifact_bytes,
+        commit_reassembly_max_queued_artifact_bytes: config
+            .bulk_catchup
+            .commit_reassembly_max_queued_artifact_bytes,
         flush_interval_epochs: config.bulk_catchup.flush_interval_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
@@ -636,9 +652,14 @@ mod tests {
                 catchup_threshold_blocks: 100,
             },
             derive: IngestDeriveConfig {
-                replay_concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
                 replay_batch_blocks: NonZeroU32::new(100).ok_or("invalid replay batch blocks")?,
                 replay_policy: DeriveReplayPolicy::DEFAULT,
+                memory_budget_bytes: None,
+                memory_degrade_ratio: 0.85,
+                memory_pause_ratio: 0.95,
+                memory_resume_ratio: 0.75,
+                min_replay_batch_blocks: NonZeroU32::new(10)
+                    .ok_or("invalid minimum replay batch blocks")?,
             },
             bulk_catchup: BulkCatchupConfig {
                 canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
@@ -653,6 +674,10 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid fact build slots")?,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
+                commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or("invalid commit reassembly bytes")?,
                 flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
             },
             tip_follow: TipFollowPhaseConfig {

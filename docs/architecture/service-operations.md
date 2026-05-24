@@ -107,6 +107,14 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
+| `zinder_ingest_bulk_pipeline_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup stage latency by stage, status, and error class. Stages include `canonical_fact_build`, `canonical_finalize`, `subtree_root_attachment`, `checkpoint_tree_state`, `canonical_commit`, and `canonical_flush`. |
+| `zinder_ingest_bulk_pipeline_queue_depth` | gauge | `zinder-ingest` | Active or queued work items by bulk-catchup stage. |
+| `zinder_ingest_bulk_pipeline_queue_bytes` | gauge | `zinder-ingest` | Byte reservations held by a bulk-catchup stage, labeled by stage. |
+| `zinder_ingest_bulk_pipeline_active` | gauge | `zinder-ingest` | Active work count by bulk-catchup stage. |
+| `zinder_ingest_bulk_pipeline_watermark_blocked_total` | counter | `zinder-ingest` | Bulk-catchup scheduling attempts blocked by a stage byte watermark. |
+| `zinder_ingest_bulk_pipeline_reorder_buffer_blocks` | gauge | `zinder-ingest` | Completed out-of-order blocks or segments waiting for ordered emission by stage. |
+| `zinder_ingest_bulk_pipeline_reorder_buffer_bytes` | gauge | `zinder-ingest` | Estimated bytes held by completed out-of-order blocks or segments waiting for ordered emission by stage. |
+| `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds` | histogram | `zinder-ingest` | Time later source segments spend waiting for an earlier segment before ordered emission. |
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | `zinder-ingest` | Completed source segments waiting for earlier heights before ordered bulk-catchup emission. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | `zinder-ingest` | Estimated response bytes held by completed source segments waiting in ordered reassembly. |
 | `zinder_ingest_fact_build_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
@@ -120,11 +128,14 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before a derive tailer catch-up pass. |
 | `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store by the tailer. |
 | `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between replay progress and canonical tip. |
+| `zinder_ingest_derive_replay_budget_state` | gauge | `zinder-ingest` | Current derive replay memory-budget state by state label: `normal`, `degraded`, or `paused`. |
+| `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
+| `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
+| `zinder_ingest_derive_replay_paused` | gauge | `zinder-ingest` | Compatibility operational gauge set to `1` only when derive replay is paused. |
 | `zinder_ingest_transparent_spend_fact_resolution_total` | counter | `zinder-ingest` | Transparent spend facts resolved during canonical ingest by status: `resolved` or `unresolved`. |
 | `zinder_ingest_transparent_spend_fact_read_total` | counter | `zinder-ingest` | Transparent spend facts read while building derive contexts by status: `resolved` or `unresolved`. |
 | `zinder_ingest_transparent_spend_fact_requested_outpoint_count` | histogram | `zinder-ingest` | Unique transparent outpoints requested while building one derive context batch. |
 | `zinder_ingest_raw_blob_disabled_total` | counter | `zinder-ingest` | Raw block or transaction blob rows intentionally skipped by `storage.raw_blob_policy`, labeled by table. |
-| `zinder_ingest_backfill_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup/backfill stage latency by stage, status, and error class; stages include `await_fact_build`, `populate_subtree_roots`, and `flush_store`. |
 | `zinder_ingest_commit_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit latency by status and error class. |
 | `zinder_ingest_commit_stage_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit substage latency by stage, status, and error class. |
 | `zinder_ingest_commit_batch_block_count` | histogram | `zinder-ingest` | Blocks per ingest commit batch by status. |
@@ -135,7 +146,7 @@ Implemented baseline metrics:
 | `zinder_ingest_batch_accumulator_transactions` | gauge | `zinder-ingest` | Transactions currently accumulated in the in-flight ingest batch. |
 | `zinder_ingest_batch_accumulator_transparent_outputs` | gauge | `zinder-ingest` | Transparent outputs currently accumulated in the in-flight ingest batch. |
 | `zinder_ingest_batch_accumulator_transparent_spend_references` | gauge | `zinder-ingest` | Transparent spend references currently accumulated in the in-flight ingest batch. |
-| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count`, `transactions`, `transparent_outputs`, or `transparent_spend_references`. |
+| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count`, `artifact_bytes`, `transactions`, `transparent_outputs`, or `transparent_spend_references`. |
 | `zinder_ingest_writer_has_chain_epoch` | gauge | `zinder-ingest` | Whether the ingest writer currently has a visible chain epoch. |
 | `zinder_ingest_writer_chain_epoch_id` | gauge | `zinder-ingest` | Latest visible chain-epoch id published by the ingest writer. |
 | `zinder_ingest_writer_tip_height` | gauge | `zinder-ingest` | Latest visible tip height published by the ingest writer. |
@@ -433,18 +444,23 @@ reorg_window_blocks = 100        # chain-truth invariant
 catchup_threshold_blocks = 100   # defaults to ingest.reorg_window_blocks
 
 [ingest.derive]
-replay_concurrency = 16          # derive replay context width
-replay_batch_blocks = 100        # bounded derive replay write chunk
+replay_batch_blocks = 500        # bounded derive replay write chunk
 replay_policy = "canonical-first"
+memory_degrade_ratio = 0.85
+memory_pause_ratio = 0.95
+memory_resume_ratio = 0.75
+min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 12
-source_fetch_max_in_flight_bytes = 402653184
+source_fetch_max_in_flight_requests = 20
+source_fetch_max_in_flight_bytes = 671088640
 fact_build_concurrency = 16
+fact_build_max_in_flight_artifact_bytes = 536870912
+commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
 poll_interval_ms = 1000

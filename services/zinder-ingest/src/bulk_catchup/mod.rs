@@ -13,6 +13,7 @@ use futures_util::{
     stream::{self, BoxStream, FuturesUnordered, Stream, StreamExt},
 };
 use parking_lot::Mutex;
+use prost::Message as _;
 use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata, ConsensusBranchId, Network,
     NetworkUpgradeActivations, TreeStateArtifact,
@@ -36,24 +37,35 @@ use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch,
     current_unix_millis, fetch_chain_segment_with_retry, fetch_tree_state_for_block_with_retry,
-    ingest_error_class, next_chain_epoch_id, next_chain_epoch_id_after,
-    populate_subtree_root_artifacts, record_ingest_batch_commit_trigger,
-    record_ingest_batch_work_cost, record_ingest_fact_build_outcome,
+    next_chain_epoch_id, next_chain_epoch_id_after, populate_subtree_root_artifacts,
+    record_ingest_batch_commit_trigger, record_ingest_batch_work_cost,
+    record_ingest_fact_build_outcome,
 };
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
 };
+use watermark::{
+    ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer,
+    record_stage_duration,
+};
+
+mod watermark;
 
 const SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT: usize = 64;
 const SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT: u32 = 8;
 const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
 const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
 
-const BACKFILL_STAGE_AWAIT_FACT_BUILD: &str = "await_fact_build";
-const BACKFILL_STAGE_POPULATE_SUBTREE_ROOTS: &str = "populate_subtree_roots";
-const BACKFILL_STAGE_FLUSH_STORE: &str = "flush_store";
+const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
+const BULK_STAGE_CANONICAL_FACT_BUILD: &str = "canonical_fact_build";
+const BULK_STAGE_CANONICAL_FINALIZE: &str = "canonical_finalize";
+const BULK_STAGE_SUBTREE_ROOT_ATTACHMENT: &str = "subtree_root_attachment";
+const BULK_STAGE_CHECKPOINT_TREE_STATE: &str = "checkpoint_tree_state";
+const BULK_STAGE_COMMIT_REASSEMBLY: &str = "commit_reassembly";
+const BULK_STAGE_CANONICAL_COMMIT: &str = "canonical_commit";
+const BULK_STAGE_CANONICAL_FLUSH: &str = "canonical_flush";
 
 /// Configuration for a one-shot historical backfill outside the reorg window.
 #[derive(Clone, Debug)]
@@ -98,6 +110,12 @@ pub struct BackfillConfig {
     /// Operator-tunable via `ingest.bulk_catchup.fact_build_concurrency`.
     /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
     pub fact_build_concurrency: NonZeroU32,
+    /// Maximum reserved derived artifact bytes across active and completed
+    /// fact-build work.
+    pub fact_build_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Maximum finalized artifact bytes that can accumulate while the previous
+    /// batch is attaching metadata, committing, or flushing.
+    pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
     /// Force a `RocksDB` flush after committing this many epochs. See
     /// [`crate::BulkCatchupConfig::flush_interval_epochs`].
     pub flush_interval_epochs: NonZeroU32,
@@ -499,6 +517,7 @@ where
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, backfill_start.from_height),
             fact_build_concurrency,
+            fact_build_max_in_flight_artifact_bytes: config.fact_build_max_in_flight_artifact_bytes,
         },
         move |source_block| {
             let activations = Arc::clone(&network_upgrade_activations);
@@ -535,6 +554,7 @@ struct BackfillFactBuildStreamConfig {
     source_fetch_max_in_flight_bytes: NonZeroU64,
     source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
     fact_build_concurrency: usize,
+    fact_build_max_in_flight_artifact_bytes: NonZeroU64,
 }
 
 fn build_fact_build_stream<'a, Source, F, Fut>(
@@ -550,12 +570,19 @@ where
     let fact_build_concurrency = config.fact_build_concurrency.max(1);
     let from_height = config.from_height;
     let to_height = config.to_height;
+    let fact_build_max_in_flight_artifact_bytes = config.fact_build_max_in_flight_artifact_bytes;
     let state = FactBuildStreamState {
         source_blocks: build_source_block_stream(source, config).boxed(),
         in_flight_fact_builds: FuturesUnordered::new(),
         completed_fact_builds: BTreeMap::new(),
+        completed_fact_build_bytes: 0,
+        pending_source_blocks: VecDeque::new(),
         derive_fn,
         fact_build_concurrency,
+        fact_build_watermark: ByteWatermark::new(
+            BULK_STAGE_CANONICAL_FACT_BUILD,
+            fact_build_max_in_flight_artifact_bytes,
+        ),
         next_emit_height: Some(from_height),
         to_height,
         source_exhausted: false,
@@ -570,15 +597,26 @@ where
 struct PrefetchedDerivedBlock {
     height: BlockHeight,
     derived: DerivedBlockArtifacts,
+    artifact_bytes: u64,
+    reservation: ByteReservation,
+}
+
+struct QueuedDerivedBlock {
+    derived: DerivedBlockArtifacts,
+    artifact_bytes: u64,
+    reservation: ByteReservation,
 }
 
 struct FactBuildStreamState<'a, F> {
     source_blocks: BoxStream<'a, Result<SourceBlock, IngestError>>,
     in_flight_fact_builds:
         FuturesUnordered<BoxFuture<'a, Result<PrefetchedDerivedBlock, IngestError>>>,
-    completed_fact_builds: BTreeMap<BlockHeight, DerivedBlockArtifacts>,
+    completed_fact_builds: BTreeMap<BlockHeight, QueuedDerivedBlock>,
+    completed_fact_build_bytes: u64,
+    pending_source_blocks: VecDeque<SourceBlock>,
     derive_fn: F,
     fact_build_concurrency: usize,
+    fact_build_watermark: ByteWatermark,
     next_emit_height: Option<BlockHeight>,
     to_height: BlockHeight,
     source_exhausted: bool,
@@ -593,13 +631,29 @@ where
 {
     loop {
         if let Some(next_emit_height) = state.next_emit_height
-            && let Some(derived) = state.completed_fact_builds.remove(&next_emit_height)
+            && let Some(queued) = state.completed_fact_builds.remove(&next_emit_height)
         {
             state.next_emit_height = next_emit_height
                 .next()
                 .filter(|height| *height <= state.to_height);
+            let QueuedDerivedBlock {
+                derived,
+                artifact_bytes,
+                reservation,
+            } = queued;
+            state.completed_fact_build_bytes = state
+                .completed_fact_build_bytes
+                .saturating_sub(artifact_bytes);
             record_fact_build_reassembly_state(state);
+            drop(reservation);
             return Some(Ok(derived));
+        }
+
+        if let Some(source_block) = state.pending_source_blocks.pop_front() {
+            match schedule_fact_build(state, source_block) {
+                Ok(()) => continue,
+                Err(source_block) => state.pending_source_blocks.push_front(source_block),
+            }
         }
 
         let can_schedule_fact_build = state.can_schedule_fact_build();
@@ -610,7 +664,11 @@ where
         tokio::select! {
             source_block_result = state.source_blocks.next(), if can_schedule_fact_build => {
                 match source_block_result {
-                    Some(Ok(source_block)) => schedule_fact_build(state, source_block),
+                    Some(Ok(source_block)) => {
+                        if let Err(source_block) = schedule_fact_build(state, source_block) {
+                            state.pending_source_blocks.push_front(source_block);
+                        }
+                    }
                     Some(Err(error)) => return Some(Err(error)),
                     None => state.source_exhausted = true,
                 }
@@ -633,16 +691,30 @@ where
 impl<F> FactBuildStreamState<'_, F> {
     fn can_schedule_fact_build(&self) -> bool {
         !self.source_exhausted
+            && self.pending_source_blocks.is_empty()
             && self.in_flight_fact_builds.len() < self.fact_build_concurrency
             && self.completed_fact_builds.len() < self.fact_build_concurrency
     }
 }
 
-fn schedule_fact_build<'a, F, Fut>(state: &FactBuildStreamState<'a, F>, source_block: SourceBlock)
+fn schedule_fact_build<'a, F, Fut>(
+    state: &FactBuildStreamState<'a, F>,
+    source_block: SourceBlock,
+) -> Result<(), SourceBlock>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
     Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
 {
+    if state.in_flight_fact_builds.len() >= state.fact_build_concurrency {
+        return Err(source_block);
+    }
+    let estimated_artifact_bytes = source_block.raw_block_bytes.len().max(1);
+    let Some(reservation) = state
+        .fact_build_watermark
+        .try_reserve(usize_to_u64_saturating(estimated_artifact_bytes))
+    else {
+        return Err(source_block);
+    };
     let derive_fn = state.derive_fn.clone();
     state.in_flight_fact_builds.push(
         async move {
@@ -650,10 +722,21 @@ where
             let fact_build_started_at = Instant::now();
             let fact_build_outcome = derive_fn(source_block).await;
             record_ingest_fact_build_outcome(fact_build_started_at, &fact_build_outcome);
-            fact_build_outcome.map(|derived| PrefetchedDerivedBlock { height, derived })
+            fact_build_outcome.map(|derived| {
+                let artifact_bytes = derived_block_artifact_bytes(&derived);
+                let mut reservation = reservation;
+                reservation.resize(artifact_bytes);
+                PrefetchedDerivedBlock {
+                    height,
+                    derived,
+                    artifact_bytes,
+                    reservation,
+                }
+            })
         }
         .boxed(),
     );
+    Ok(())
 }
 
 fn insert_completed_fact_build<F>(
@@ -665,9 +748,19 @@ fn insert_completed_fact_build<F>(
             reason: "derived block completed outside the requested bulk-catchup range",
         }));
     }
+    state.completed_fact_build_bytes = state
+        .completed_fact_build_bytes
+        .saturating_add(prefetched_derived.artifact_bytes);
     if state
         .completed_fact_builds
-        .insert(prefetched_derived.height, prefetched_derived.derived)
+        .insert(
+            prefetched_derived.height,
+            QueuedDerivedBlock {
+                derived: prefetched_derived.derived,
+                artifact_bytes: prefetched_derived.artifact_bytes,
+                reservation: prefetched_derived.reservation,
+            },
+        )
         .is_some()
     {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
@@ -681,6 +774,34 @@ fn record_fact_build_reassembly_state<F>(state: &FactBuildStreamState<'_, F>) {
     metrics::gauge!("zinder_ingest_fact_build_reassembly_blocks").set(f64::from(
         usize_to_u32_saturating(state.completed_fact_builds.len()),
     ));
+    record_queue_depth(
+        BULK_STAGE_CANONICAL_FACT_BUILD,
+        state.completed_fact_builds.len(),
+    );
+    record_reorder_buffer(
+        BULK_STAGE_CANONICAL_FACT_BUILD,
+        state.completed_fact_builds.len(),
+        state.completed_fact_build_bytes,
+    );
+}
+
+fn derived_block_artifact_bytes(derived: &DerivedBlockArtifacts) -> u64 {
+    let block_blob_bytes = derived
+        .block_blob
+        .as_ref()
+        .map_or(0usize, |block_blob| block_blob.raw_block_bytes.len());
+    let transaction_blob_bytes =
+        derived
+            .transaction_blobs
+            .iter()
+            .fold(0usize, |bytes, transaction_blob| {
+                bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
+            });
+    usize_to_u64_saturating(
+        block_blob_bytes
+            .saturating_add(derived.partial_compact_block.encoded_len())
+            .saturating_add(transaction_blob_bytes),
+    )
 }
 
 struct SourceBlockStreamState<'a, Source> {
@@ -692,8 +813,9 @@ struct SourceBlockStreamState<'a, Source> {
     max_response_bytes: NonZeroU64,
     target_response_payload_bytes: NonZeroU64,
     source_fetch_max_in_flight_requests: NonZeroU32,
-    source_fetch_max_in_flight_bytes: NonZeroU64,
-    source_fetch_watermark: SourceFetchWatermark,
+    source_fetch_watermark: ByteWatermark,
+    completed_segment_bytes: u64,
+    source_head_of_line_started_at: Option<Instant>,
     next_fetch_height: Option<BlockHeight>,
     next_emit_height: Option<BlockHeight>,
     in_flight_segments:
@@ -719,8 +841,12 @@ where
         max_response_bytes: config.max_response_bytes,
         target_response_payload_bytes: config.target_response_payload_bytes,
         source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-        source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
-        source_fetch_watermark: SourceFetchWatermark::default(),
+        source_fetch_watermark: ByteWatermark::new(
+            BULK_STAGE_SOURCE_FETCH,
+            config.source_fetch_max_in_flight_bytes,
+        ),
+        completed_segment_bytes: 0,
+        source_head_of_line_started_at: None,
         next_fetch_height: Some(config.from_height),
         next_emit_height: Some(config.from_height),
         in_flight_segments: FuturesUnordered::new(),
@@ -762,6 +888,7 @@ where
             }
             continue;
         }
+        record_source_head_of_line_wait_started(state);
 
         let prefetched_segment = match state.in_flight_segments.next().await {
             Some(Ok(prefetched_segment)) => prefetched_segment,
@@ -770,9 +897,6 @@ where
             }
             None => return None,
         };
-        state
-            .source_fetch_watermark
-            .record_completed_request(&prefetched_segment);
         if let Err(error) = insert_completed_source_segment(state, prefetched_segment) {
             return Some(Err(error));
         }
@@ -804,15 +928,15 @@ where
             .target_response_payload_bytes
             .get()
             .min(state.max_response_bytes.get());
-        if !state.source_fetch_watermark.try_reserve(
-            state.source_fetch_max_in_flight_bytes,
-            reserved_response_bytes,
-        ) {
+        let Some(reservation) = state
+            .source_fetch_watermark
+            .try_reserve(reserved_response_bytes)
+        else {
             break;
-        }
+        };
         state
             .in_flight_segments
-            .push(fetch_prefetched_chain_segment(&SourceFetchRequest {
+            .push(fetch_prefetched_chain_segment(SourceFetchRequest {
                 request_timeout: state.request_timeout,
                 source: state.source,
                 start_height: next_height,
@@ -821,6 +945,7 @@ where
                 target_response_bytes: state.target_response_payload_bytes,
                 max_response_bytes: state.max_response_bytes,
                 reserved_response_bytes,
+                reservation,
             }));
         record_source_fetch_queue_state(state);
         state.next_fetch_height = next_height_after_segment(next_height, source_segment_max_blocks)
@@ -828,7 +953,6 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
 struct SourceFetchRequest<'a, Source> {
     request_timeout: Duration,
     source: &'a Source,
@@ -838,18 +962,18 @@ struct SourceFetchRequest<'a, Source> {
     target_response_bytes: NonZeroU64,
     max_response_bytes: NonZeroU64,
     reserved_response_bytes: u64,
+    reservation: ByteReservation,
 }
 
 struct PrefetchedSourceSegment {
     start_height: BlockHeight,
     max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
-    reserved_response_bytes: u64,
     queued_response_bytes: u64,
 }
 
 fn fetch_prefetched_chain_segment<'a, Source>(
-    request: &SourceFetchRequest<'a, Source>,
+    request: SourceFetchRequest<'a, Source>,
 ) -> BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>
 where
     Source: NodeSource + 'a,
@@ -862,6 +986,7 @@ where
     let target_response_bytes = request.target_response_bytes;
     let max_response_bytes = request.max_response_bytes;
     let reserved_response_bytes = request.reserved_response_bytes;
+    let reservation = request.reservation;
 
     async move {
         let mut retry_state = IngestRetryState::default();
@@ -875,70 +1000,15 @@ where
             fetch_chain_segment_with_retry(request_timeout, source, limits, &mut retry_state)
                 .await?;
         let queued_response_bytes = queued_source_segment_bytes(&segment, reserved_response_bytes);
+        reservation.release();
         Ok(PrefetchedSourceSegment {
             start_height,
             max_connected_blocks,
             segment,
-            reserved_response_bytes,
             queued_response_bytes,
         })
     }
     .boxed()
-}
-
-#[derive(Default)]
-struct SourceFetchWatermark {
-    active_reserved_bytes: u64,
-    completed_segment_bytes: u64,
-}
-
-impl SourceFetchWatermark {
-    fn try_reserve(&mut self, max_queued_bytes: NonZeroU64, reserved_response_bytes: u64) -> bool {
-        let current_queued_bytes = self.queued_bytes();
-        let max_queued_bytes = max_queued_bytes.get();
-        if current_queued_bytes == 0 && reserved_response_bytes > max_queued_bytes {
-            self.active_reserved_bytes = self
-                .active_reserved_bytes
-                .saturating_add(reserved_response_bytes);
-            return true;
-        }
-
-        let Some(next_queued_bytes) = current_queued_bytes.checked_add(reserved_response_bytes)
-        else {
-            return false;
-        };
-        if next_queued_bytes > max_queued_bytes {
-            return false;
-        }
-        self.active_reserved_bytes = self
-            .active_reserved_bytes
-            .saturating_add(reserved_response_bytes);
-        true
-    }
-
-    fn record_completed_request(&mut self, prefetched_segment: &PrefetchedSourceSegment) {
-        self.active_reserved_bytes = self
-            .active_reserved_bytes
-            .saturating_sub(prefetched_segment.reserved_response_bytes);
-        self.completed_segment_bytes = self
-            .completed_segment_bytes
-            .saturating_add(prefetched_segment.queued_response_bytes);
-    }
-
-    fn record_emitted_segment(&mut self, prefetched_segment: &PrefetchedSourceSegment) {
-        self.completed_segment_bytes = self
-            .completed_segment_bytes
-            .saturating_sub(prefetched_segment.queued_response_bytes);
-    }
-
-    const fn queued_bytes(&self) -> u64 {
-        self.active_reserved_bytes
-            .saturating_add(self.completed_segment_bytes)
-    }
-
-    const fn completed_segment_bytes(&self) -> u64 {
-        self.completed_segment_bytes
-    }
 }
 
 fn queued_source_segment_bytes(segment: &SourceChainSegment, reserved_response_bytes: u64) -> u64 {
@@ -955,12 +1025,13 @@ fn pop_next_completed_source_segment<Source>(
 ) -> Option<PrefetchedSourceSegment> {
     let next_emit_height = state.next_emit_height?;
     let prefetched_segment = state.completed_segments.remove(&next_emit_height)?;
-    state
-        .source_fetch_watermark
-        .record_emitted_segment(&prefetched_segment);
+    state.completed_segment_bytes = state
+        .completed_segment_bytes
+        .saturating_sub(prefetched_segment.queued_response_bytes);
     state.next_emit_height =
         next_height_after_segment(next_emit_height, prefetched_segment.max_connected_blocks)
             .filter(|height| *height <= state.to_height);
+    record_source_head_of_line_wait_completed(state);
     record_source_fetch_queue_state(state);
     Some(prefetched_segment)
 }
@@ -976,6 +1047,7 @@ fn insert_completed_source_segment<Source>(
             reason: "source chain segment completed outside the requested bulk-catchup range",
         }));
     }
+    let queued_response_bytes = prefetched_segment.queued_response_bytes;
     if state
         .completed_segments
         .insert(prefetched_segment.start_height, prefetched_segment)
@@ -985,21 +1057,56 @@ fn insert_completed_source_segment<Source>(
             reason: "source chain segment completed twice during bulk catchup",
         }));
     }
+    state.completed_segment_bytes = state
+        .completed_segment_bytes
+        .saturating_add(queued_response_bytes);
     Ok(())
 }
 
 fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
+    let source_fetch_snapshot = state.source_fetch_watermark.snapshot();
     metrics::gauge!("zinder_ingest_source_fetch_queue_requests").set(f64::from(
         usize_to_u32_saturating(state.in_flight_segments.len()),
     ));
-    metrics::gauge!("zinder_ingest_source_fetch_queue_bytes")
-        .set(u64_to_f64(state.source_fetch_watermark.queued_bytes()));
+    metrics::gauge!("zinder_ingest_source_fetch_queue_bytes").set(u64_to_f64(
+        source_fetch_snapshot
+            .reserved_bytes
+            .saturating_add(state.completed_segment_bytes),
+    ));
     metrics::gauge!("zinder_ingest_source_segment_reassembly_segments").set(f64::from(
         usize_to_u32_saturating(state.completed_segments.len()),
     ));
-    metrics::gauge!("zinder_ingest_source_segment_reassembly_bytes").set(u64_to_f64(
-        state.source_fetch_watermark.completed_segment_bytes(),
-    ));
+    metrics::gauge!("zinder_ingest_source_segment_reassembly_bytes")
+        .set(u64_to_f64(state.completed_segment_bytes));
+    record_queue_depth(BULK_STAGE_SOURCE_FETCH, state.in_flight_segments.len());
+    record_reorder_buffer(
+        BULK_STAGE_SOURCE_FETCH,
+        state.completed_segments.len(),
+        state.completed_segment_bytes,
+    );
+}
+
+fn record_source_head_of_line_wait_started<Source>(state: &mut SourceBlockStreamState<'_, Source>) {
+    if state.completed_segments.is_empty() {
+        state.source_head_of_line_started_at = None;
+        return;
+    }
+    if state.source_head_of_line_started_at.is_none() {
+        state.source_head_of_line_started_at = Some(Instant::now());
+    }
+}
+
+fn record_source_head_of_line_wait_completed<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+) {
+    let Some(started_at) = state.source_head_of_line_started_at.take() else {
+        return;
+    };
+    metrics::histogram!(
+        "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds",
+        "stage" => BULK_STAGE_SOURCE_FETCH
+    )
+    .record(started_at.elapsed());
 }
 
 fn enqueue_source_segment_max_blocks<Source>(
@@ -1333,6 +1440,14 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).unwrap_or(u32::MAX)
 }
 
+fn usize_to_u64_saturating(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
+}
+
+fn nonzero_u64_to_usize(amount: NonZeroU64) -> usize {
+    usize::try_from(amount.get()).unwrap_or(usize::MAX)
+}
+
 fn record_source_segment_sizer_state(
     current_blocks: NonZeroU32,
     max_blocks: NonZeroU32,
@@ -1444,6 +1559,7 @@ where
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, backfill_start.from_height),
             fact_build_concurrency,
+            fact_build_max_in_flight_artifact_bytes: config.fact_build_max_in_flight_artifact_bytes,
         },
         move |source_block| async move { derive_fn(&source_block).map_err(IngestError::from) },
     );
@@ -1459,6 +1575,10 @@ where
     .await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "bulk catchup orchestration keeps the ordered finalization, in-flight commit, and flush-state transitions visible in one state machine"
+)]
 async fn run_backfill_commit_loop<Source>(
     run: &BackfillRunContext<'_, Source>,
     fact_build_stream: impl Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Send,
@@ -1474,7 +1594,9 @@ where
     let mut next_subtree_root_indexes =
         IngestSubtreeRootIndexes::from_tip_metadata(backfill_start.initial_tip_metadata);
     let mut last_commit_outcome = None;
-    let mut retry_state = IngestRetryState::default();
+    let mut retry_state = Some(IngestRetryState::default());
+    let mut loop_flush_state = Some(std::mem::take(flush_state));
+    let mut in_flight_commit = None;
     let mut running_tree_sizes =
         CommitmentTreeSizes::from_tip_metadata(backfill_start.initial_tip_metadata);
     let batch_budget = CanonicalBatchBudget::new(
@@ -1484,75 +1606,352 @@ where
     futures_util::pin_mut!(fact_build_stream);
 
     loop {
+        if in_flight_commit.is_some()
+            && commit_reassembly_should_wait(run.config, batch.work_cost())
+        {
+            record_backfill_commit_reassembly_blocked();
+            if let Err(error) = wait_for_in_flight_backfill_commit(
+                &mut in_flight_commit,
+                &mut next_subtree_root_indexes,
+                &mut retry_state,
+                &mut loop_flush_state,
+                &mut last_commit_outcome,
+            )
+            .await
+            {
+                restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+                return Err(error);
+            }
+        }
+
         let await_fact_build_started_at = Instant::now();
         let Some(fact_build_result) = fact_build_stream.next().await else {
             break;
         };
         record_backfill_stage_duration(
-            BACKFILL_STAGE_AWAIT_FACT_BUILD,
+            BULK_STAGE_CANONICAL_FACT_BUILD,
             await_fact_build_started_at,
             fact_build_result.as_ref().err(),
         );
+        let finalize_started_at = Instant::now();
         let built_outcome = fact_build_result.and_then(|derived| {
             finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
         });
-        let built = built_outcome?;
+        record_backfill_stage_duration(
+            BULK_STAGE_CANONICAL_FINALIZE,
+            finalize_started_at,
+            built_outcome.as_ref().err(),
+        );
+        let built = match built_outcome {
+            Ok(built) => built,
+            Err(error) => {
+                if let Err(commit_error) = wait_for_in_flight_backfill_commit(
+                    &mut in_flight_commit,
+                    &mut next_subtree_root_indexes,
+                    &mut retry_state,
+                    &mut loop_flush_state,
+                    &mut last_commit_outcome,
+                )
+                .await
+                {
+                    restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+                    return Err(commit_error);
+                }
+                restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+                return Err(error);
+            }
+        };
 
         batch.absorb(built);
         let batch_cost = batch.work_cost();
         record_ingest_batch_work_cost(batch_cost);
+        record_commit_reassembly_state(&batch);
 
         if let Some(commit_trigger) = batch_budget.commit_trigger(batch_cost) {
-            record_backfill_batch_commit_trigger(run.config, batch_cost, commit_trigger);
-            let updated_subtree_root_indexes = populate_backfill_subtree_roots(
-                run,
-                &mut batch,
-                next_subtree_root_indexes,
+            if let Err(error) = wait_for_in_flight_backfill_commit(
+                &mut in_flight_commit,
+                &mut next_subtree_root_indexes,
                 &mut retry_state,
+                &mut loop_flush_state,
+                &mut last_commit_outcome,
             )
-            .await?;
-            populate_backfill_tree_state_checkpoint(run, &mut batch, &mut retry_state).await?;
-            let (commit_outcome, returned_batch) = commit_finalized_backfill_batch(
-                run.store,
-                run.config.node.network,
-                chain_epoch_id,
-                batch,
-            )
-            .await?;
-            batch = returned_batch;
-            next_subtree_root_indexes = updated_subtree_root_indexes;
+            .await
+            {
+                restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+                return Err(error);
+            }
+            record_backfill_batch_commit_trigger(run.config, batch_cost, commit_trigger);
+            let commit_batch = std::mem::take(&mut batch);
+            let commit_retry_state = retry_state
+                .take()
+                .ok_or(IngestError::BackfillProducedNoCommit)?;
+            let commit_flush_state = loop_flush_state
+                .take()
+                .ok_or(IngestError::BackfillProducedNoCommit)?;
+            in_flight_commit = Some(commit_backfill_batch(
+                run,
+                BackfillCommitRequest {
+                    batch: commit_batch,
+                    next_subtree_root_indexes,
+                    retry_state: commit_retry_state,
+                    flush_state: commit_flush_state,
+                    chain_epoch_id,
+                },
+            ));
+            record_backfill_commit_active(true);
+            record_commit_reassembly_state(&batch);
             chain_epoch_id = next_chain_epoch_id_after(chain_epoch_id)?;
-            last_commit_outcome = Some(commit_outcome);
-            flush_state.record_committed_epoch();
-            flush_backfill_writes_if_due(run, flush_state).await?;
         }
     }
 
-    if !batch.is_empty() {
-        let _updated_subtree_root_indexes = populate_backfill_subtree_roots(
-            run,
-            &mut batch,
-            next_subtree_root_indexes,
-            &mut retry_state,
-        )
-        .await?;
-        populate_backfill_tree_state_checkpoint(run, &mut batch, &mut retry_state).await?;
-        let (commit_outcome, _drained_batch) = commit_finalized_backfill_batch(
-            run.store,
-            run.config.node.network,
-            chain_epoch_id,
-            batch,
-        )
-        .await?;
-        last_commit_outcome = Some(commit_outcome);
-        flush_state.record_committed_epoch();
+    if let Err(error) = wait_for_in_flight_backfill_commit(
+        &mut in_flight_commit,
+        &mut next_subtree_root_indexes,
+        &mut retry_state,
+        &mut loop_flush_state,
+        &mut last_commit_outcome,
+    )
+    .await
+    {
+        restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+        return Err(error);
     }
 
-    if completion_flush.flushes_pending() && last_commit_outcome.is_some() {
-        flush_pending_backfill_writes(run.store, flush_state).await?;
+    if !batch.is_empty() {
+        let commit_retry_state = retry_state
+            .take()
+            .ok_or(IngestError::BackfillProducedNoCommit)?;
+        let commit_flush_state = loop_flush_state
+            .take()
+            .ok_or(IngestError::BackfillProducedNoCommit)?;
+        let committed_batch = match commit_backfill_batch(
+            run,
+            BackfillCommitRequest {
+                batch,
+                next_subtree_root_indexes,
+                retry_state: commit_retry_state,
+                flush_state: commit_flush_state,
+                chain_epoch_id,
+            },
+        )
+        .await
+        {
+            Ok(committed_batch) => committed_batch,
+            Err(failure) => {
+                loop_flush_state = Some(failure.flush_state);
+                restore_backfill_flush_state(flush_state, &mut loop_flush_state);
+                return Err(failure.error);
+            }
+        };
+        apply_committed_backfill_batch(
+            committed_batch,
+            &mut next_subtree_root_indexes,
+            &mut retry_state,
+            &mut loop_flush_state,
+            &mut last_commit_outcome,
+        );
     }
+
+    let mut restored_flush_state = loop_flush_state
+        .take()
+        .ok_or(IngestError::BackfillProducedNoCommit)?;
+    if completion_flush.flushes_pending()
+        && last_commit_outcome.is_some()
+        && let Err(error) =
+            flush_pending_backfill_writes(run.store, &mut restored_flush_state).await
+    {
+        *flush_state = restored_flush_state;
+        return Err(error);
+    }
+    *flush_state = restored_flush_state;
 
     last_commit_outcome.ok_or(IngestError::BackfillProducedNoCommit)
+}
+
+type InFlightBackfillCommit<'a> =
+    BoxFuture<'a, Result<CommittedBackfillBatch, BackfillCommitFailure>>;
+
+struct CommittedBackfillBatch {
+    commit_outcome: ChainEpochCommitOutcome,
+    next_subtree_root_indexes: IngestSubtreeRootIndexes,
+    retry_state: IngestRetryState,
+    flush_state: BackfillFlushState,
+}
+
+struct BackfillCommitFailure {
+    error: IngestError,
+    retry_state: IngestRetryState,
+    flush_state: BackfillFlushState,
+}
+
+struct BackfillCommitRequest {
+    batch: CanonicalBatch,
+    next_subtree_root_indexes: IngestSubtreeRootIndexes,
+    retry_state: IngestRetryState,
+    flush_state: BackfillFlushState,
+    chain_epoch_id: ChainEpochId,
+}
+
+fn commit_backfill_batch<'a, Source>(
+    run: &'a BackfillRunContext<'_, Source>,
+    request: BackfillCommitRequest,
+) -> InFlightBackfillCommit<'a>
+where
+    Source: NodeSource,
+{
+    async move {
+        let mut batch = request.batch;
+        let mut retry_state = request.retry_state;
+        let mut flush_state = request.flush_state;
+        let updated_subtree_root_indexes = match populate_backfill_subtree_roots(
+            run,
+            &mut batch,
+            request.next_subtree_root_indexes,
+            &mut retry_state,
+        )
+        .await
+        {
+            Ok(updated_subtree_root_indexes) => updated_subtree_root_indexes,
+            Err(error) => {
+                return Err(BackfillCommitFailure {
+                    error,
+                    retry_state,
+                    flush_state,
+                });
+            }
+        };
+
+        if let Err(error) =
+            populate_backfill_tree_state_checkpoint(run, &mut batch, &mut retry_state).await
+        {
+            return Err(BackfillCommitFailure {
+                error,
+                retry_state,
+                flush_state,
+            });
+        }
+
+        let commit_outcome = match commit_finalized_backfill_batch(
+            run.store,
+            run.config.node.network,
+            request.chain_epoch_id,
+            batch,
+        )
+        .await
+        {
+            Ok((commit_outcome, _drained_batch)) => commit_outcome,
+            Err(error) => {
+                return Err(BackfillCommitFailure {
+                    error,
+                    retry_state,
+                    flush_state,
+                });
+            }
+        };
+
+        flush_state.record_committed_epoch();
+        if let Err(error) = flush_backfill_writes_if_due(run, &mut flush_state).await {
+            return Err(BackfillCommitFailure {
+                error,
+                retry_state,
+                flush_state,
+            });
+        }
+
+        Ok(CommittedBackfillBatch {
+            commit_outcome,
+            next_subtree_root_indexes: updated_subtree_root_indexes,
+            retry_state,
+            flush_state,
+        })
+    }
+    .boxed()
+}
+
+async fn wait_for_in_flight_backfill_commit(
+    in_flight_commit: &mut Option<InFlightBackfillCommit<'_>>,
+    next_subtree_root_indexes: &mut IngestSubtreeRootIndexes,
+    retry_state: &mut Option<IngestRetryState>,
+    flush_state: &mut Option<BackfillFlushState>,
+    last_commit_outcome: &mut Option<ChainEpochCommitOutcome>,
+) -> Result<(), IngestError> {
+    let Some(commit) = in_flight_commit.take() else {
+        return Ok(());
+    };
+    match commit.await {
+        Ok(committed_batch) => {
+            apply_committed_backfill_batch(
+                committed_batch,
+                next_subtree_root_indexes,
+                retry_state,
+                flush_state,
+                last_commit_outcome,
+            );
+            record_backfill_commit_active(false);
+            Ok(())
+        }
+        Err(failure) => {
+            *retry_state = Some(failure.retry_state);
+            *flush_state = Some(failure.flush_state);
+            record_backfill_commit_active(false);
+            Err(failure.error)
+        }
+    }
+}
+
+fn apply_committed_backfill_batch(
+    committed_batch: CommittedBackfillBatch,
+    next_subtree_root_indexes: &mut IngestSubtreeRootIndexes,
+    retry_state: &mut Option<IngestRetryState>,
+    flush_state: &mut Option<BackfillFlushState>,
+    last_commit_outcome: &mut Option<ChainEpochCommitOutcome>,
+) {
+    *next_subtree_root_indexes = committed_batch.next_subtree_root_indexes;
+    *retry_state = Some(committed_batch.retry_state);
+    *flush_state = Some(committed_batch.flush_state);
+    *last_commit_outcome = Some(committed_batch.commit_outcome);
+}
+
+fn restore_backfill_flush_state(
+    target: &mut BackfillFlushState,
+    source: &mut Option<BackfillFlushState>,
+) {
+    if let Some(flush_state) = source.take() {
+        *target = flush_state;
+    }
+}
+
+fn commit_reassembly_should_wait(config: &BackfillConfig, batch_cost: CanonicalBatchCost) -> bool {
+    batch_cost.blocks > 0
+        && batch_cost.artifact_bytes
+            >= nonzero_u64_to_usize(config.commit_reassembly_max_queued_artifact_bytes)
+}
+
+fn record_commit_reassembly_state(batch: &CanonicalBatch) {
+    let batch_cost = batch.work_cost();
+    record_queue_depth(BULK_STAGE_COMMIT_REASSEMBLY, batch_cost.blocks);
+    record_reorder_buffer(
+        BULK_STAGE_COMMIT_REASSEMBLY,
+        batch_cost.blocks,
+        usize_to_u64_saturating(batch_cost.artifact_bytes),
+    );
+}
+
+fn record_backfill_commit_reassembly_blocked() {
+    metrics::counter!(
+        "zinder_ingest_bulk_pipeline_watermark_blocked_total",
+        "stage" => BULK_STAGE_COMMIT_REASSEMBLY
+    )
+    .increment(1);
+}
+
+fn record_backfill_commit_active(is_active: bool) {
+    let active = if is_active { 1.0 } else { 0.0 };
+    metrics::gauge!(
+        "zinder_ingest_bulk_pipeline_active",
+        "stage" => BULK_STAGE_CANONICAL_COMMIT
+    )
+    .set(active);
 }
 
 async fn flush_backfill_writes_if_due<Source>(
@@ -1587,7 +1986,7 @@ where
     )
     .await;
     record_backfill_stage_duration(
-        BACKFILL_STAGE_POPULATE_SUBTREE_ROOTS,
+        BULK_STAGE_SUBTREE_ROOT_ATTACHMENT,
         started_at,
         outcome.as_ref().err(),
     );
@@ -1626,7 +2025,7 @@ where
     )
     .await;
     record_backfill_stage_duration(
-        "fetch_tree_state_checkpoint",
+        BULK_STAGE_CHECKPOINT_TREE_STATE,
         started_at,
         outcome.as_ref().err(),
     );
@@ -1656,7 +2055,7 @@ async fn flush_primary_chain_store(store: &PrimaryChainStore) -> Result<(), Inge
         })?
         .map_err(IngestError::from);
     record_backfill_stage_duration(
-        BACKFILL_STAGE_FLUSH_STORE,
+        BULK_STAGE_CANONICAL_FLUSH,
         flush_started_at,
         flush_outcome.as_ref().err(),
     );
@@ -1668,14 +2067,7 @@ fn record_backfill_stage_duration(
     started_at: Instant,
     stage_error: Option<&IngestError>,
 ) {
-    let status = if stage_error.is_some() { "error" } else { "ok" };
-    metrics::histogram!(
-        "zinder_ingest_backfill_stage_duration_seconds",
-        "stage" => stage,
-        "status" => status,
-        "error_class" => ingest_error_class(stage_error)
-    )
-    .record(started_at.elapsed());
+    record_stage_duration(stage, started_at, stage_error);
 }
 
 fn record_backfill_batch_commit_trigger(
@@ -1734,13 +2126,20 @@ async fn commit_finalized_backfill_batch_inner(
         tip_metadata,
         created_at: current_unix_millis()?,
     };
-    commit_ingest_batch(
+    let commit_started_at = Instant::now();
+    let commit_outcome = commit_ingest_batch(
         store,
         chain_epoch,
         batch,
         ReorgWindowChange::FinalizeThrough { height: tip_height },
     )
-    .await
+    .await;
+    record_backfill_stage_duration(
+        BULK_STAGE_CANONICAL_COMMIT,
+        commit_started_at,
+        commit_outcome.as_ref().err(),
+    );
+    commit_outcome
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2170,6 +2569,8 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 fact_build_concurrency: 2,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
@@ -2214,6 +2615,8 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 fact_build_concurrency: 2,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
@@ -2240,6 +2643,69 @@ mod tests {
         assert!(
             start_third_segment < finish_first_segment,
             "expected later segment to start before the slow first segment finished; events: {fetch_events:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_fetch_watermark_blocks_segments_until_active_bytes_release()
+    -> Result<(), Box<dyn Error>> {
+        let fetch_events = Arc::new(Mutex::new(Vec::new()));
+        let source = DelayedSegmentSource {
+            fetch_events: Arc::clone(&fetch_events),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let fact_build_stream = build_fact_build_stream(
+            &source,
+            BackfillFactBuildStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(6),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                fact_build_concurrency: 2,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+        );
+        futures_util::pin_mut!(fact_build_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(next_block) = fact_build_stream.next().await {
+            observed_heights.push(next_block?.block_header.height.value());
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
+        let fetch_events = fetch_events.lock().clone();
+        let finish_first_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Finished {
+                start_height: BlockHeight::new(1),
+            },
+        )?;
+        let start_second_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Started {
+                start_height: BlockHeight::new(3),
+            },
+        )?;
+        assert!(
+            finish_first_segment < start_second_segment,
+            "expected source byte watermark to block segment 3 until segment 1 released active bytes; events: {fetch_events:?}"
         );
 
         Ok(())
@@ -2275,6 +2741,8 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 fact_build_concurrency: 2,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
             },
             move |source_block| {
                 let derive_events = Arc::clone(&derive_events_for_stream);
@@ -2783,6 +3251,10 @@ mod tests {
             source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
                 .ok_or("invalid test source fetch bytes")?,
             fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid test derive concurrency")?,
+            fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .ok_or("invalid test fact build artifact bytes")?,
+            commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .ok_or("invalid test commit reassembly bytes")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
             upstream_tip_hint: None,
             allow_near_tip_finalize,

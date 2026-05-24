@@ -79,9 +79,12 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[ingest.phases]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
     assert!(stdout.contains("[ingest.derive]"));
-    assert!(stdout.contains("replay_concurrency ="));
     assert!(stdout.contains("replay_batch_blocks = 100"));
     assert!(stdout.contains("replay_policy = \"canonical-first\""));
+    assert!(stdout.contains("memory_degrade_ratio = 0.85"));
+    assert!(stdout.contains("memory_pause_ratio = 0.95"));
+    assert!(stdout.contains("memory_resume_ratio = 0.75"));
+    assert!(stdout.contains("min_replay_batch_blocks = 10"));
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
@@ -90,6 +93,8 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
     assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));
     assert!(stdout.contains("fact_build_concurrency ="));
+    assert!(stdout.contains("fact_build_max_in_flight_artifact_bytes = 536870912"));
+    assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
     assert!(stdout.contains("[ingest.tip_follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
     assert!(stdout.contains("lag_threshold_blocks ="));

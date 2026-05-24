@@ -100,6 +100,10 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
@@ -164,6 +168,10 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "scenario covers checkpoint bootstrap, backfill, derive replay, and materialized projection assertions end to end"
+)]
 async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
@@ -210,6 +218,10 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
@@ -230,11 +242,15 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         &store,
         &derive_store,
         IngestDeriveConfig {
-            replay_concurrency: NonZeroU32::new(2)
-                .ok_or_else(|| eyre!("invalid replay concurrency"))?,
             replay_batch_blocks: NonZeroU32::new(1)
                 .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
             replay_policy: DeriveReplayPolicy::DEFAULT,
+            memory_budget_bytes: None,
+            memory_degrade_ratio: 0.85,
+            memory_pause_ratio: 0.95,
+            memory_resume_ratio: 0.75,
+            min_replay_batch_blocks: NonZeroU32::new(1)
+                .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
         },
     )
     .await?;
@@ -322,6 +338,10 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,
@@ -385,6 +405,10 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
         allow_near_tip_finalize: false,

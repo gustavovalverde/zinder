@@ -12,7 +12,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZeroU32,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -46,22 +45,146 @@ const DERIVE_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
 const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
-const CANONICAL_FIRST_MEMORY_PRESSURE_HIGH_RATIO: f64 = 0.95;
 
 /// Default poll cadence for the derive tailer when the canonical store is
 /// ingesting faster than chain-event notifications arrive.
 pub const DEFAULT_DERIVE_TAILER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeriveReplayPauseReason {
-    MemoryPressure,
+enum DeriveReplayBudgetState {
+    Normal,
+    Degraded,
+    Paused,
 }
 
-impl DeriveReplayPauseReason {
+impl DeriveReplayBudgetState {
     const fn as_label(self) -> &'static str {
         match self {
-            Self::MemoryPressure => "memory_pressure",
+            Self::Normal => "normal",
+            Self::Degraded => "degraded",
+            Self::Paused => "paused",
         }
+    }
+
+    const fn is_paused(self) -> bool {
+        matches!(self, Self::Paused)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EffectiveDeriveReplayLimits {
+    state: DeriveReplayBudgetState,
+    batch_blocks: u32,
+    memory_budget_bytes: Option<u64>,
+    memory_pressure_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DeriveReplayBudget {
+    config: IngestDeriveConfig,
+    state: DeriveReplayBudgetState,
+}
+
+impl DeriveReplayBudget {
+    const fn new(config: IngestDeriveConfig) -> Self {
+        Self {
+            config,
+            state: DeriveReplayBudgetState::Normal,
+        }
+    }
+
+    fn evaluate_current(&mut self) -> EffectiveDeriveReplayLimits {
+        self.evaluate(RuntimeMemorySnapshot::sample())
+    }
+
+    fn evaluate(&mut self, memory_snapshot: RuntimeMemorySnapshot) -> EffectiveDeriveReplayLimits {
+        let memory_budget_bytes = self
+            .config
+            .memory_budget_bytes
+            .map(std::num::NonZeroU64::get)
+            .or(memory_snapshot.cgroup_high_bytes)
+            .or(memory_snapshot.cgroup_max_bytes);
+        let memory_pressure_ratio = memory_snapshot
+            .cgroup_current_bytes
+            .zip(memory_budget_bytes)
+            .and_then(|(current_bytes, budget_bytes)| {
+                (budget_bytes > 0).then(|| u64_to_f64(current_bytes) / u64_to_f64(budget_bytes))
+            });
+        self.state = next_budget_state(self.config, self.state, memory_pressure_ratio);
+        EffectiveDeriveReplayLimits {
+            state: self.state,
+            batch_blocks: effective_replay_batch_blocks(
+                self.config,
+                self.state,
+                memory_pressure_ratio,
+            ),
+            memory_budget_bytes,
+            memory_pressure_ratio,
+        }
+    }
+}
+
+fn next_budget_state(
+    config: IngestDeriveConfig,
+    current_state: DeriveReplayBudgetState,
+    memory_pressure_ratio: Option<f64>,
+) -> DeriveReplayBudgetState {
+    if config.replay_policy == DeriveReplayPolicy::Continuous {
+        return DeriveReplayBudgetState::Normal;
+    }
+    let Some(pressure_ratio) = memory_pressure_ratio else {
+        return DeriveReplayBudgetState::Normal;
+    };
+    match current_state {
+        DeriveReplayBudgetState::Normal => {
+            if pressure_ratio >= config.memory_pause_ratio {
+                DeriveReplayBudgetState::Paused
+            } else if pressure_ratio >= config.memory_degrade_ratio {
+                DeriveReplayBudgetState::Degraded
+            } else {
+                DeriveReplayBudgetState::Normal
+            }
+        }
+        DeriveReplayBudgetState::Degraded => {
+            if pressure_ratio >= config.memory_pause_ratio {
+                DeriveReplayBudgetState::Paused
+            } else if pressure_ratio < config.memory_resume_ratio {
+                DeriveReplayBudgetState::Normal
+            } else {
+                DeriveReplayBudgetState::Degraded
+            }
+        }
+        DeriveReplayBudgetState::Paused => {
+            if pressure_ratio >= config.memory_pause_ratio {
+                DeriveReplayBudgetState::Paused
+            } else if pressure_ratio >= config.memory_resume_ratio {
+                DeriveReplayBudgetState::Degraded
+            } else {
+                DeriveReplayBudgetState::Normal
+            }
+        }
+    }
+}
+
+fn effective_replay_batch_blocks(
+    config: IngestDeriveConfig,
+    state: DeriveReplayBudgetState,
+    memory_pressure_ratio: Option<f64>,
+) -> u32 {
+    let configured_blocks = config.replay_batch_blocks.get();
+    let min_blocks = config.min_replay_batch_blocks.get();
+    if state == DeriveReplayBudgetState::Normal {
+        return configured_blocks;
+    }
+    if state == DeriveReplayBudgetState::Paused {
+        return 0;
+    }
+    let midpoint = config.memory_degrade_ratio
+        + ((config.memory_pause_ratio - config.memory_degrade_ratio) / 2.0);
+    if memory_pressure_ratio.is_some_and(|ratio| ratio >= midpoint) {
+        min_blocks
+    } else {
+        configured_blocks.saturating_div(2).max(min_blocks)
     }
 }
 
@@ -108,22 +231,27 @@ pub fn spawn_derive_tailer_task(
             target: "zinder::ingest",
             event = "derive_tailer_started",
             poll_interval_ms = u64::try_from(poll_interval.as_millis()).unwrap_or(u64::MAX),
-            derive_replay_concurrency = derive_config.replay_concurrency.get(),
             replay_batch_blocks = derive_config.replay_batch_blocks.get(),
+            min_replay_batch_blocks = derive_config.min_replay_batch_blocks.get(),
             replay_policy = derive_config.replay_policy.as_kebab_case(),
             "derive chain-event tailer started"
         );
 
+        let mut replay_budget = DeriveReplayBudget::new(derive_config);
         loop {
-            let (memory_snapshot, pause_reason) = current_derive_replay_pause_reason(derive_config);
-            record_derive_replay_budget(derive_config.replay_policy, pause_reason, poll_interval);
-            if let Some(reason) = pause_reason {
+            let effective_limits = replay_budget.evaluate_current();
+            record_derive_replay_budget(
+                derive_config.replay_policy,
+                effective_limits,
+                poll_interval,
+            );
+            if effective_limits.state.is_paused() {
                 tracing::debug!(
                     target: "zinder::ingest",
                     event = "derive_tailer_replay_paused",
                     replay_policy = derive_config.replay_policy.as_kebab_case(),
-                    pause_reason = reason.as_label(),
-                    memory_pressure_ratio = ?memory_snapshot.pressure_ratio(),
+                    budget_state = effective_limits.state.as_label(),
+                    memory_pressure_ratio = ?effective_limits.memory_pressure_ratio,
                     "derive replay paused so canonical ingest keeps the memory budget"
                 );
 
@@ -142,9 +270,12 @@ pub fn spawn_derive_tailer_task(
             }
 
             let started_at = Instant::now();
-            let outcome =
-                catch_up_derive_store_to_canonical(&chain_store, &derive_store, derive_config)
-                    .await;
+            let outcome = catch_up_derive_store_to_canonical_with_budget(
+                &chain_store,
+                &derive_store,
+                &mut replay_budget,
+            )
+            .await;
             record_derive_tailer_tick(started_at, &outcome);
             if let Err(error) = outcome {
                 tracing::warn!(
@@ -183,10 +314,14 @@ pub fn spawn_derive_replay_budget_metrics_task(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut replay_budget = DeriveReplayBudget::new(derive_config);
         loop {
-            let (_memory_snapshot, pause_reason) =
-                current_derive_replay_pause_reason(derive_config);
-            record_derive_replay_budget(derive_config.replay_policy, pause_reason, poll_interval);
+            let effective_limits = replay_budget.evaluate_current();
+            record_derive_replay_budget(
+                derive_config.replay_policy,
+                effective_limits,
+                poll_interval,
+            );
 
             tokio::select! {
                 () = cancel.cancelled() => return,
@@ -194,26 +329,6 @@ pub fn spawn_derive_replay_budget_metrics_task(
             }
         }
     })
-}
-
-fn current_derive_replay_pause_reason(
-    derive_config: IngestDeriveConfig,
-) -> (RuntimeMemorySnapshot, Option<DeriveReplayPauseReason>) {
-    let memory_snapshot = RuntimeMemorySnapshot::sample();
-    let pause_reason = derive_replay_pause_reason(derive_config.replay_policy, memory_snapshot);
-    (memory_snapshot, pause_reason)
-}
-
-fn derive_replay_pause_reason(
-    replay_policy: DeriveReplayPolicy,
-    memory_snapshot: RuntimeMemorySnapshot,
-) -> Option<DeriveReplayPauseReason> {
-    if replay_policy == DeriveReplayPolicy::Continuous {
-        return None;
-    }
-    let pressure_ratio = memory_snapshot.pressure_ratio()?;
-    (pressure_ratio >= CANONICAL_FIRST_MEMORY_PRESSURE_HIGH_RATIO)
-        .then_some(DeriveReplayPauseReason::MemoryPressure)
 }
 
 /// Replays retained canonical chain events that have not reached the
@@ -228,6 +343,16 @@ pub async fn catch_up_derive_store_to_canonical(
     derive_store: &DeriveStore,
     derive_config: IngestDeriveConfig,
 ) -> Result<(), IngestError> {
+    let mut replay_budget = DeriveReplayBudget::new(derive_config);
+    catch_up_derive_store_to_canonical_with_budget(chain_store, derive_store, &mut replay_budget)
+        .await
+}
+
+async fn catch_up_derive_store_to_canonical_with_budget(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    replay_budget: &mut DeriveReplayBudget,
+) -> Result<(), IngestError> {
     if !derive_store.has_consumer_column_families() {
         return Ok(());
     }
@@ -236,6 +361,16 @@ pub async fn catch_up_derive_store_to_canonical(
 
     let mut cursor = persisted_chain_event_cursor(derive_store)?;
     loop {
+        let effective_limits = replay_budget.evaluate_current();
+        record_derive_replay_budget(
+            replay_budget.config.replay_policy,
+            effective_limits,
+            DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+        );
+        if effective_limits.state.is_paused() {
+            return Ok(());
+        }
+
         let read_started_at = Instant::now();
         let page_outcome = chain_store
             .chain_event_history(ChainEventHistoryRequest::with_default_limit(
@@ -253,29 +388,46 @@ pub async fn catch_up_derive_store_to_canonical(
         }
 
         for envelope in page {
-            cursor = Some(
-                replay_chain_event_to_derive(chain_store, derive_store, envelope, derive_config)
-                    .await?,
+            let effective_limits = replay_budget.evaluate_current();
+            record_derive_replay_budget(
+                replay_budget.config.replay_policy,
+                effective_limits,
+                DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
             );
+            if effective_limits.state.is_paused() {
+                return Ok(());
+            }
+            match replay_chain_event_to_derive(chain_store, derive_store, envelope, replay_budget)
+                .await?
+            {
+                DeriveReplayProgress::Advanced(next_cursor) => cursor = Some(next_cursor),
+                DeriveReplayProgress::Yielded => return Ok(()),
+            }
         }
     }
+}
+
+enum DeriveReplayProgress {
+    Advanced(StreamCursorTokenV1),
+    Yielded,
 }
 
 async fn replay_chain_event_to_derive(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
-    derive_config: IngestDeriveConfig,
-) -> Result<StreamCursorTokenV1, IngestError> {
+    replay_budget: &mut DeriveReplayBudget,
+) -> Result<DeriveReplayProgress, IngestError> {
     if matches!(envelope.event, ChainEvent::ChainReorged { .. }) {
-        return replay_reorg_event_to_derive(chain_store, derive_store, envelope, derive_config)
+        return replay_reorg_event_to_derive(chain_store, derive_store, envelope, replay_budget)
             .await;
     }
 
     let committed_range = committed_block_range_for_chain_event(&envelope)?;
     let block_count = block_height_range_len(committed_range);
     if block_count == 0 {
-        return replay_empty_committed_event(chain_store, derive_store, envelope, committed_range);
+        return replay_empty_committed_event(chain_store, derive_store, envelope, committed_range)
+            .map(DeriveReplayProgress::Advanced);
     }
 
     replay_committed_event_to_derive_in_batches(
@@ -283,7 +435,7 @@ async fn replay_chain_event_to_derive(
         derive_store,
         envelope,
         committed_range,
-        derive_config,
+        replay_budget,
     )
     .await
 }
@@ -315,9 +467,7 @@ fn replay_empty_committed_event(
     }
 
     record_derive_replay_event(0, None);
-    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
-        record_derive_replay_progress(committed_range.end, tip_height);
-    }
+    record_committed_replay_progress(chain_store, committed_range.end)?;
     Ok(envelope.cursor)
 }
 
@@ -326,18 +476,23 @@ async fn replay_committed_event_to_derive_in_batches(
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
     committed_range: BlockHeightRange,
-    derive_config: IngestDeriveConfig,
-) -> Result<StreamCursorTokenV1, IngestError> {
+    replay_budget: &mut DeriveReplayBudget,
+) -> Result<DeriveReplayProgress, IngestError> {
     let block_count = block_height_range_len(committed_range);
     let mut next_height = committed_range.start;
     while next_height <= committed_range.end {
+        let effective_limits = evaluate_and_record_replay_budget(replay_budget);
+        if effective_limits.state.is_paused() {
+            return Ok(DeriveReplayProgress::Yielded);
+        }
+
         let hydrate_started_at = Instant::now();
         let replay_blocks_outcome = hydrate_committed_block_replay_batch(
             chain_store,
             &envelope,
             next_height,
             committed_range.end,
-            derive_config,
+            effective_limits,
         );
         record_derive_replay_stage(
             DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS,
@@ -360,7 +515,6 @@ async fn replay_committed_event_to_derive_in_batches(
             chain_store,
             envelope.chain_epoch.id,
             replay_batch.blocks,
-            derive_config.replay_concurrency,
         )
         .await;
         record_derive_replay_stage(
@@ -401,20 +555,49 @@ async fn replay_committed_event_to_derive_in_batches(
     }
 
     record_derive_replay_event(block_count, None);
+    record_committed_replay_progress(chain_store, committed_range.end)?;
+    Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+}
+
+fn evaluate_and_record_replay_budget(
+    replay_budget: &mut DeriveReplayBudget,
+) -> EffectiveDeriveReplayLimits {
+    let effective_limits = replay_budget.evaluate_current();
+    record_derive_replay_budget(
+        replay_budget.config.replay_policy,
+        effective_limits,
+        DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+    );
+    effective_limits
+}
+
+fn record_committed_replay_progress(
+    chain_store: &PrimaryChainStore,
+    replayed_height: BlockHeight,
+) -> Result<(), IngestError> {
     if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
-        record_derive_replay_progress(committed_range.end, tip_height);
+        record_derive_replay_progress(replayed_height, tip_height);
     }
-    Ok(envelope.cursor)
+    Ok(())
 }
 
 async fn replay_reorg_event_to_derive(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
-    derive_config: IngestDeriveConfig,
-) -> Result<StreamCursorTokenV1, IngestError> {
+    replay_budget: &mut DeriveReplayBudget,
+) -> Result<DeriveReplayProgress, IngestError> {
     let committed_range = committed_block_range_for_chain_event(&envelope)?;
     let block_count = block_height_range_len(committed_range);
+    let effective_limits = replay_budget.evaluate_current();
+    record_derive_replay_budget(
+        replay_budget.config.replay_policy,
+        effective_limits,
+        DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+    );
+    if effective_limits.state.is_paused() {
+        return Ok(DeriveReplayProgress::Yielded);
+    }
 
     let hydrate_started_at = Instant::now();
     let replay_blocks_outcome =
@@ -437,7 +620,6 @@ async fn replay_reorg_event_to_derive(
         chain_store,
         envelope.chain_epoch.id,
         replay_blocks,
-        derive_config.replay_concurrency,
     )
     .await;
     record_derive_replay_stage(
@@ -476,7 +658,7 @@ async fn replay_reorg_event_to_derive(
     if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
         record_derive_replay_progress(committed_range.end, tip_height);
     }
-    Ok(envelope.cursor)
+    Ok(DeriveReplayProgress::Advanced(envelope.cursor))
 }
 
 fn persisted_chain_event_cursor(
@@ -518,10 +700,15 @@ fn hydrate_committed_block_replay_batch(
     envelope: &ChainEventEnvelope,
     start_height: BlockHeight,
     end_height: BlockHeight,
-    derive_config: IngestDeriveConfig,
+    effective_limits: EffectiveDeriveReplayLimits,
 ) -> Result<CanonicalReplayBatch, IngestError> {
     let reader = chain_store.chain_epoch_reader_at(envelope.chain_epoch.id)?;
-    let max_blocks = nonzero_u32_to_usize(derive_config.replay_batch_blocks);
+    let max_blocks = usize::try_from(effective_limits.batch_blocks).unwrap_or(usize::MAX);
+    if max_blocks == 0 {
+        return Err(IngestError::DeriveDispatch(
+            "derive replay batch cannot hydrate while paused".to_owned(),
+        ));
+    }
     let remaining_blocks = usize::try_from(
         end_height
             .value()
@@ -752,7 +939,6 @@ async fn build_block_contexts_from_committed_event(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: Vec<CanonicalReplayBlock>,
-    _derive_replay_concurrency: NonZeroU32,
 ) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
     let transparent_spends = read_transparent_spend_facts_for_committed_blocks(
         chain_store,
@@ -916,7 +1102,7 @@ fn record_current_derive_replay_tip(
 
 fn record_derive_replay_budget(
     replay_policy: DeriveReplayPolicy,
-    pause_reason: Option<DeriveReplayPauseReason>,
+    effective_limits: EffectiveDeriveReplayLimits,
     poll_interval: Duration,
 ) {
     metrics::gauge!(
@@ -924,27 +1110,59 @@ fn record_derive_replay_budget(
         "policy" => replay_policy.as_kebab_case()
     )
     .set(1.0);
-    metrics::gauge!("zinder_ingest_derive_replay_paused").set(if pause_reason.is_some() {
-        1.0
-    } else {
-        0.0
-    });
     metrics::gauge!(
-        "zinder_ingest_derive_replay_pause_reason",
-        "reason" => DeriveReplayPauseReason::MemoryPressure.as_label()
+        "zinder_ingest_derive_replay_budget_state",
+        "state" => DeriveReplayBudgetState::Normal.as_label()
     )
     .set(
-        if pause_reason == Some(DeriveReplayPauseReason::MemoryPressure) {
+        if effective_limits.state == DeriveReplayBudgetState::Normal {
             1.0
         } else {
             0.0
         },
     );
-    metrics::gauge!("zinder_ingest_derive_replay_budget_seconds").set(if pause_reason.is_some() {
-        0.0
-    } else {
-        poll_interval.as_secs_f64()
-    });
+    metrics::gauge!(
+        "zinder_ingest_derive_replay_budget_state",
+        "state" => DeriveReplayBudgetState::Degraded.as_label()
+    )
+    .set(
+        if effective_limits.state == DeriveReplayBudgetState::Degraded {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!(
+        "zinder_ingest_derive_replay_budget_state",
+        "state" => DeriveReplayBudgetState::Paused.as_label()
+    )
+    .set(
+        if effective_limits.state == DeriveReplayBudgetState::Paused {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!("zinder_ingest_derive_replay_effective_batch_blocks")
+        .set(f64::from(effective_limits.batch_blocks));
+    if let Some(memory_budget_bytes) = effective_limits.memory_budget_bytes {
+        metrics::gauge!("zinder_ingest_derive_replay_memory_budget_bytes")
+            .set(u64_to_f64(memory_budget_bytes));
+    }
+    metrics::gauge!("zinder_ingest_derive_replay_paused").set(
+        if effective_limits.state.is_paused() {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!("zinder_ingest_derive_replay_budget_seconds").set(
+        if effective_limits.state.is_paused() {
+            0.0
+        } else {
+            poll_interval.as_secs_f64()
+        },
+    );
 }
 
 fn record_derive_tailer_tick(started_at: Instant, outcome: &Result<(), IngestError>) {
@@ -974,10 +1192,6 @@ fn block_height_range_len(block_range: BlockHeightRange) -> usize {
     usize::try_from(length).map_or(usize::MAX, |converted| converted)
 }
 
-fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
-    usize::try_from(amount.get()).unwrap_or(usize::MAX)
-}
-
 fn usize_to_u64_saturating(amount: usize) -> u64 {
     u64::try_from(amount).unwrap_or(u64::MAX)
 }
@@ -988,4 +1202,82 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
 
 fn encode_block_hash(hash: BlockHash) -> Vec<u8> {
     hash.as_bytes().to_vec()
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 samples; memory byte counts are diagnostic magnitudes"
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use super::*;
+
+    fn replay_config() -> IngestDeriveConfig {
+        IngestDeriveConfig {
+            replay_batch_blocks: NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
+            replay_policy: DeriveReplayPolicy::CanonicalFirst,
+            memory_budget_bytes: NonZeroU64::new(1_000),
+            memory_degrade_ratio: 0.85,
+            memory_pause_ratio: 0.95,
+            memory_resume_ratio: 0.75,
+            min_replay_batch_blocks: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+        }
+    }
+
+    fn memory_snapshot(current_bytes: u64) -> RuntimeMemorySnapshot {
+        RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(current_bytes),
+            cgroup_max_bytes: Some(1_000),
+            ..RuntimeMemorySnapshot::default()
+        }
+    }
+
+    #[test]
+    fn replay_budget_degrades_batch_before_pause() {
+        let mut budget = DeriveReplayBudget::new(replay_config());
+
+        let normal = budget.evaluate(memory_snapshot(800));
+        assert_eq!(normal.state, DeriveReplayBudgetState::Normal);
+        assert_eq!(normal.batch_blocks, 100);
+
+        let degraded = budget.evaluate(memory_snapshot(875));
+        assert_eq!(degraded.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(degraded.batch_blocks, 50);
+
+        let minimum = budget.evaluate(memory_snapshot(925));
+        assert_eq!(minimum.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(minimum.batch_blocks, 10);
+
+        let paused = budget.evaluate(memory_snapshot(950));
+        assert_eq!(paused.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(paused.batch_blocks, 0);
+    }
+
+    #[test]
+    fn replay_budget_resumes_paused_replay_as_degraded_work() {
+        let mut budget = DeriveReplayBudget::new(replay_config());
+
+        assert_eq!(
+            budget.evaluate(memory_snapshot(960)).state,
+            DeriveReplayBudgetState::Paused
+        );
+        assert_eq!(
+            budget.evaluate(memory_snapshot(900)).state,
+            DeriveReplayBudgetState::Degraded
+        );
+        assert_eq!(
+            budget.evaluate(memory_snapshot(800)).state,
+            DeriveReplayBudgetState::Degraded
+        );
+        assert_eq!(
+            budget.evaluate(memory_snapshot(700)).state,
+            DeriveReplayBudgetState::Normal
+        );
+    }
 }

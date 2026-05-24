@@ -97,6 +97,10 @@ pub(crate) fn live_backfill_config(
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         fact_build_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
         allow_near_tip_finalize,

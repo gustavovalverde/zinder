@@ -497,6 +497,13 @@ async fn run_ingest(
         source_segment_target_response_bytes = command_config.loop_config.bulk_catchup.source_segment_target_response_bytes.get(),
         source_fetch_max_in_flight_requests = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_requests.get(),
         source_fetch_max_in_flight_bytes = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_bytes.get(),
+        fact_build_max_in_flight_artifact_bytes = command_config.loop_config.bulk_catchup.fact_build_max_in_flight_artifact_bytes.get(),
+        commit_reassembly_max_queued_artifact_bytes = command_config.loop_config.bulk_catchup.commit_reassembly_max_queued_artifact_bytes.get(),
+        derive_replay_batch_blocks = command_config.loop_config.derive.replay_batch_blocks.get(),
+        derive_memory_degrade_ratio = command_config.loop_config.derive.memory_degrade_ratio,
+        derive_memory_pause_ratio = command_config.loop_config.derive.memory_pause_ratio,
+        derive_memory_resume_ratio = command_config.loop_config.derive.memory_resume_ratio,
+        derive_min_replay_batch_blocks = command_config.loop_config.derive.min_replay_batch_blocks.get(),
         poll_interval_ms = u64::try_from(
             command_config.loop_config.tip_follow.poll_interval.as_millis()
         )

@@ -188,9 +188,13 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             catchup_threshold_blocks: 100,
         },
         derive: IngestDeriveConfig {
-            replay_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
             replay_batch_blocks: NonZeroU32::new(100).ok_or_else(|| eyre!("nonzero"))?,
             replay_policy: DeriveReplayPolicy::DEFAULT,
+            memory_budget_bytes: None,
+            memory_degrade_ratio: 0.85,
+            memory_pause_ratio: 0.95,
+            memory_resume_ratio: 0.75,
+            min_replay_batch_blocks: NonZeroU32::new(10).ok_or_else(|| eyre!("nonzero"))?,
         },
         bulk_catchup: BulkCatchupConfig {
             canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
@@ -204,6 +208,10 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
             fact_build_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+            fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .ok_or_else(|| eyre!("nonzero"))?,
+            commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .ok_or_else(|| eyre!("nonzero"))?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("nonzero"))?,
         },
         tip_follow: TipFollowPhaseConfig {

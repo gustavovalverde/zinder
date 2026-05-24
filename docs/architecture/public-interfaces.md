@@ -413,18 +413,23 @@ reorg_window_blocks = 100
 catchup_threshold_blocks = 100
 
 [ingest.derive]
-replay_concurrency = 16
-replay_batch_blocks = 100
+replay_batch_blocks = 500
 replay_policy = "canonical-first"
+memory_degrade_ratio = 0.85
+memory_pause_ratio = 0.95
+memory_resume_ratio = 0.75
+min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 12
-source_fetch_max_in_flight_bytes = 402653184
+source_fetch_max_in_flight_requests = 20
+source_fetch_max_in_flight_bytes = 671088640
 fact_build_concurrency = 16
+fact_build_max_in_flight_artifact_bytes = 536870912
+commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
 poll_interval_ms = 1000
@@ -519,9 +524,15 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_requests` | Maximum concurrent source segment requests. Defaults to 12. |
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Maximum reserved source response bytes across in-flight fetches. Defaults to 402653184. |
 | `ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fact_build_concurrency` | Parallel canonical fact-build slots. Defaults to `min(available_parallelism(), 16)`. |
-| `ZINDER_INGEST__DERIVE__REPLAY_CONCURRENCY` | zinder-ingest | Optional | `ingest.derive.replay_concurrency` | Parallel block hydration slots used by derive replay. Defaults to `min(available_parallelism(), 16)`. |
+| `ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes` | Maximum reserved derived artifact bytes across active and completed fact-build work. Defaults to 536870912. |
+| `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum finalized artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
 | `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available. Defaults to `canonical-first`. |
+| `ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES` | zinder-ingest | Optional | `ingest.derive.memory_budget_bytes` | Explicit derive replay memory budget in bytes. When unset, derive replay uses the runtime cgroup `memory.high` or `memory.max` value when present. |
+| `ZINDER_INGEST__DERIVE__MEMORY_DEGRADE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_degrade_ratio` | Memory pressure ratio at which derive replay shrinks the effective replay batch size. Defaults to 0.85. |
+| `ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_pause_ratio` | Memory pressure ratio at which canonical-first derive replay pauses. Defaults to 0.95. |
+| `ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_resume_ratio` | Memory pressure ratio below which degraded derive replay returns to the normal replay batch size. Paused replay resumes as degraded work once pressure falls below memory_pause_ratio. Defaults to 0.75. |
+| `ZINDER_INGEST__DERIVE__MIN_REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.min_replay_batch_blocks` | Smallest effective derive replay batch size under memory degradation. Must be greater than zero and no larger than replay_batch_blocks. Defaults to 10. |
 | `ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS` | zinder-ingest | Optional | `ingest.bulk_catchup.flush_interval_epochs` | Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater than zero. Defaults to 5. |
 | `ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.tip_follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
 | `ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.tip_follow.lag_threshold_blocks` | Block lag at which tip-follow reports `cause=syncing`. Defaults to 1. |
@@ -540,7 +551,6 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
 | `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Canonical store path used to locate the writer-owned derive store at its `derive` subdirectory. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. Empty/unset disables the `explorer.transparent_address.balance_v1` capability. |
-
 <!-- env-var-table:public-interfaces:end -->
 
 ### `--print-config`

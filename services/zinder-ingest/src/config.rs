@@ -47,8 +47,14 @@ const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 16;
 const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 33_554_432;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184;
+const DEFAULT_FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912;
+const DEFAULT_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912;
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
 const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
+const DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
+const DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.85;
+const DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.95;
+const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.75;
 const FACT_BUILD_CONCURRENCY_CEILING: u32 = 16;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
@@ -231,8 +237,12 @@ pub(crate) fn load_ingest_config(
             default_fact_build_concurrency(),
         )?
         .with_default(
-            "ingest.derive.replay_concurrency",
-            default_fact_build_concurrency(),
+            "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
+            DEFAULT_FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+            DEFAULT_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES,
         )?
         .with_default(
             "ingest.derive.replay_batch_blocks",
@@ -241,6 +251,22 @@ pub(crate) fn load_ingest_config(
         .with_default(
             "ingest.derive.replay_policy",
             DeriveReplayPolicy::DEFAULT.as_kebab_case(),
+        )?
+        .with_default(
+            "ingest.derive.memory_degrade_ratio",
+            DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO,
+        )?
+        .with_default(
+            "ingest.derive.memory_pause_ratio",
+            DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO,
+        )?
+        .with_default(
+            "ingest.derive.memory_resume_ratio",
+            DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO,
+        )?
+        .with_default(
+            "ingest.derive.min_replay_batch_blocks",
+            DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS,
         )?
         .with_default(
             "ingest.bulk_catchup.flush_interval_epochs",
@@ -449,12 +475,15 @@ struct IngestPhasesSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestDeriveSection {
-    #[serde(rename = "replay_concurrency")]
-    worker_count: Option<u32>,
     #[serde(rename = "replay_batch_blocks")]
     batch_blocks: Option<u32>,
     #[serde(rename = "replay_policy")]
     policy: Option<String>,
+    memory_budget_bytes: Option<u64>,
+    memory_degrade_ratio: Option<f64>,
+    memory_pause_ratio: Option<f64>,
+    memory_resume_ratio: Option<f64>,
+    min_replay_batch_blocks: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -467,6 +496,8 @@ struct IngestBulkCatchupSection {
     source_fetch_max_in_flight_requests: Option<u32>,
     source_fetch_max_in_flight_bytes: Option<u64>,
     fact_build_concurrency: Option<u32>,
+    fact_build_max_in_flight_artifact_bytes: Option<u64>,
+    commit_reassembly_max_queued_artifact_bytes: Option<u64>,
     flush_interval_epochs: Option<u32>,
 }
 
@@ -518,6 +549,28 @@ fn nonzero_u64_config(amount: Option<u64>, path: &'static str) -> Result<NonZero
     let amount = require_field(amount, path)?;
     NonZeroU64::new(amount)
         .ok_or_else(|| ConfigError::invalid(format!("{path} must be greater than zero")))
+}
+
+fn optional_nonzero_u64_config(
+    amount: Option<u64>,
+    path: &'static str,
+) -> Result<Option<NonZeroU64>, ConfigError> {
+    amount
+        .map(|amount| {
+            NonZeroU64::new(amount)
+                .ok_or_else(|| ConfigError::invalid(format!("{path} must be greater than zero")))
+        })
+        .transpose()
+}
+
+fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigError> {
+    let amount = require_field(amount, path)?;
+    if amount > 0.0 && amount <= 1.0 {
+        return Ok(amount);
+    }
+    Err(ConfigError::invalid(format!(
+        "{path} must be greater than zero and less than or equal to one"
+    )))
 }
 
 #[allow(
@@ -586,6 +639,20 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let fact_build_concurrency = NonZeroU32::new(fact_build_concurrency_raw).ok_or_else(|| {
         ConfigError::invalid("ingest.bulk_catchup.fact_build_concurrency must be greater than zero")
     })?;
+    let fact_build_max_in_flight_artifact_bytes = nonzero_u64_config(
+        config
+            .ingest
+            .bulk_catchup
+            .fact_build_max_in_flight_artifact_bytes,
+        "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
+    )?;
+    let commit_reassembly_max_queued_artifact_bytes = nonzero_u64_config(
+        config
+            .ingest
+            .bulk_catchup
+            .commit_reassembly_max_queued_artifact_bytes,
+        "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+    )?;
 
     let source_segment_target_response_bytes = nonzero_u64_config(
         config
@@ -606,10 +673,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
     )?;
 
-    let replay_concurrency = nonzero_u32_config(
-        config.ingest.derive.worker_count,
-        "ingest.derive.replay_concurrency",
-    )?;
     let replay_batch_blocks_raw = require_field(
         config.ingest.derive.batch_blocks,
         "ingest.derive.replay_batch_blocks",
@@ -620,6 +683,38 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let replay_policy_raw =
         require_field(config.ingest.derive.policy, "ingest.derive.replay_policy")?;
     let replay_policy = parse_derive_replay_policy(&replay_policy_raw)?;
+    let memory_budget_bytes = optional_nonzero_u64_config(
+        config.ingest.derive.memory_budget_bytes,
+        "ingest.derive.memory_budget_bytes",
+    )?;
+    let memory_degrade_ratio = ratio_config(
+        config.ingest.derive.memory_degrade_ratio,
+        "ingest.derive.memory_degrade_ratio",
+    )?;
+    let memory_pause_ratio = ratio_config(
+        config.ingest.derive.memory_pause_ratio,
+        "ingest.derive.memory_pause_ratio",
+    )?;
+    let memory_resume_ratio = ratio_config(
+        config.ingest.derive.memory_resume_ratio,
+        "ingest.derive.memory_resume_ratio",
+    )?;
+    if !(memory_resume_ratio < memory_degrade_ratio && memory_degrade_ratio < memory_pause_ratio) {
+        return Err(ConfigError::invalid(
+            "ingest.derive memory ratios must satisfy memory_resume_ratio < memory_degrade_ratio < memory_pause_ratio",
+        )
+        .into());
+    }
+    let min_replay_batch_blocks = nonzero_u32_config(
+        config.ingest.derive.min_replay_batch_blocks,
+        "ingest.derive.min_replay_batch_blocks",
+    )?;
+    if min_replay_batch_blocks > replay_batch_blocks {
+        return Err(ConfigError::invalid(
+            "ingest.derive.min_replay_batch_blocks must be less than or equal to ingest.derive.replay_batch_blocks",
+        )
+        .into());
+    }
 
     let flush_interval_epochs_raw = require_field(
         config.ingest.bulk_catchup.flush_interval_epochs,
@@ -700,9 +795,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             catchup_threshold_blocks,
         },
         derive: IngestDeriveConfig {
-            replay_concurrency,
             replay_batch_blocks,
             replay_policy,
+            memory_budget_bytes,
+            memory_degrade_ratio,
+            memory_pause_ratio,
+            memory_resume_ratio,
+            min_replay_batch_blocks,
         },
         bulk_catchup: BulkCatchupConfig {
             canonical_batch_max_blocks,
@@ -712,6 +811,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             source_fetch_max_in_flight_requests,
             source_fetch_max_in_flight_bytes,
             fact_build_concurrency,
+            fact_build_max_in_flight_artifact_bytes,
+            commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
         tip_follow: TipFollowPhaseConfig {
@@ -770,6 +871,10 @@ struct RedactedBackupConfigToml {
 }
 
 impl RedactedIngestConfigToml {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "redacted print-config mirrors the resolved ingest TOML shape field by field"
+    )]
     fn from_ingest_config(config: &IngestCommandConfig) -> Self {
         let loop_config = &config.loop_config;
         Self {
@@ -788,9 +893,16 @@ impl RedactedIngestConfigToml {
                     catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
                 },
                 derive: IngestDeriveToml {
-                    worker_count: loop_config.derive.replay_concurrency.get(),
                     batch_blocks: loop_config.derive.replay_batch_blocks.get(),
                     policy: loop_config.derive.replay_policy.as_kebab_case(),
+                    memory_budget_bytes: loop_config
+                        .derive
+                        .memory_budget_bytes
+                        .map(NonZeroU64::get),
+                    memory_degrade_ratio: loop_config.derive.memory_degrade_ratio,
+                    memory_pause_ratio: loop_config.derive.memory_pause_ratio,
+                    memory_resume_ratio: loop_config.derive.memory_resume_ratio,
+                    min_replay_batch_blocks: loop_config.derive.min_replay_batch_blocks.get(),
                 },
                 bulk_catchup: IngestBulkCatchupToml {
                     canonical_batch_max_blocks: loop_config
@@ -818,6 +930,14 @@ impl RedactedIngestConfigToml {
                         .source_fetch_max_in_flight_bytes
                         .get(),
                     fact_build_concurrency: loop_config.bulk_catchup.fact_build_concurrency.get(),
+                    fact_build_max_in_flight_artifact_bytes: loop_config
+                        .bulk_catchup
+                        .fact_build_max_in_flight_artifact_bytes
+                        .get(),
+                    commit_reassembly_max_queued_artifact_bytes: loop_config
+                        .bulk_catchup
+                        .commit_reassembly_max_queued_artifact_bytes
+                        .get(),
                     flush_interval_epochs: loop_config.bulk_catchup.flush_interval_epochs.get(),
                 },
                 tip_follow: IngestTipFollowToml {
@@ -883,12 +1003,16 @@ struct IngestPhasesToml {
 
 #[derive(Serialize)]
 struct IngestDeriveToml {
-    #[serde(rename = "replay_concurrency")]
-    worker_count: u32,
     #[serde(rename = "replay_batch_blocks")]
     batch_blocks: u32,
     #[serde(rename = "replay_policy")]
     policy: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_budget_bytes: Option<u64>,
+    memory_degrade_ratio: f64,
+    memory_pause_ratio: f64,
+    memory_resume_ratio: f64,
+    min_replay_batch_blocks: u32,
 }
 
 #[derive(Serialize)]
@@ -900,6 +1024,8 @@ struct IngestBulkCatchupToml {
     source_fetch_max_in_flight_requests: u32,
     source_fetch_max_in_flight_bytes: u64,
     fact_build_concurrency: u32,
+    fact_build_max_in_flight_artifact_bytes: u64,
+    commit_reassembly_max_queued_artifact_bytes: u64,
     flush_interval_epochs: u32,
 }
 
