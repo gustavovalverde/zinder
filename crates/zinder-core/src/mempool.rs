@@ -6,8 +6,8 @@
 //! epoch visible at first observation.
 
 use crate::{
-    AuthDigest, ChainEpoch, RawTransactionBytes, TransactionId, TransparentOutPoint,
-    UnixTimestampMillis, transparent_utxo::TransparentAddressScriptHash,
+    AuthDigest, ChainEpoch, RawTransactionBytes, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint, UnixTimestampMillis,
 };
 
 /// Hydrated record describing a mempool transaction observed by the indexer.
@@ -95,7 +95,7 @@ pub struct TransparentMempoolSpend {
 
 /// Bounded request for transparent mempool outputs tied to one address.
 ///
-/// Mirrors the mined `TransparentAddressUtxosRequest` shape so the call
+/// Mirrors the mined `AddressOutputIndexRequest` shape so the call
 /// surface for transparent address queries stays uniform between mined and
 /// mempool reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

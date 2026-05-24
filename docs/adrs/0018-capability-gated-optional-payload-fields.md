@@ -12,7 +12,7 @@ upstream state the operator may or may not have wired:
 
 - `TransactionDetailResponse.paid_fee_zat` requires the wallet plane's
   transparent prevout resolution (capability
-  `wallet.read.transparent_prevouts_v1`) to be online.
+  `wallet.read.transparent_outputs_by_outpoint_v1`) to be online.
 - `MempoolActivityEntry.paid_fee_zat` requires the same upstream
   capability plus a per-mempool-tx lookup path.
 - `BlockSummary.paid_fees_collected_zat` requires the
@@ -63,7 +63,7 @@ convention. Specifically:
    startup based on:
 
    - probing the upstream's `ServerInfo`
-     (`wallet.read.transparent_prevouts_v1` flips on when the wallet
+     (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
      advertises it);
    - local opt-in (the `payment_disclosure_verifier_online` flag);
    - whether the derive store has been wired

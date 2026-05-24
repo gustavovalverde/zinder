@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
@@ -490,7 +490,7 @@ struct DerivedBlockRow {
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     synthetic_epoch_with_finalized(chain_epoch_id, height, height, block_hash(height))
 }
 
@@ -499,7 +499,7 @@ fn synthetic_epoch_with_finalized(
     height: u32,
     finalized_height: u32,
     source_hash: BlockHash,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
 
@@ -511,15 +511,15 @@ fn synthetic_epoch_with_finalized(
             tip_hash: source_hash,
             finalized_height: BlockHeight::new(finalized_height),
             finalized_hash: block_hash(finalized_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").into_bytes(),
+            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,

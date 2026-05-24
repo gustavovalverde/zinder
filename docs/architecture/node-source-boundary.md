@@ -41,7 +41,17 @@ The trait is async, sized for the unified ingest loop's pipelined bulk-catchup a
 pub trait NodeSource: Send + Sync + 'static {
     fn capabilities(&self) -> NodeCapabilities;
 
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError>;
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError>;
 
     async fn tip_id(&self) -> Result<BlockId, SourceError>;
 
@@ -54,7 +64,9 @@ pub trait NodeSource: Send + Sync + 'static {
 }
 ```
 
-The bulk-catchup phase of the unified ingest loop ([ADR-0015](../adrs/0015-unified-phase-driven-ingest.md)) keeps `ingest.bulk_catchup.fetch_concurrency` (default 32) `fetch_block_at` calls in flight via `futures_util::stream::iter(...).buffered(N)`. Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports (Zebra Indexer `GetBlockRange` once it lands, in-process `ReadStateService` reader) will add their own trait method in a future ADR, alongside the backend that drives it; see [ADR-0016](../adrs/0016-source-streaming-pipeline.md) for the Phase 1 `getblockhash` drop and the reasoning for deferring the streaming surface.
+The bulk-catchup phase of the unified ingest loop ([ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md)) drives `fetch_chain_segment` with `SourceChainSegmentLimits`. The limits express both the requested block ceiling and the response-byte target/hard cap. JSON-RPC segments fetch raw block bytes only; checkpoint tree state is fetched separately through `fetch_tree_state_for_block` for the committed batch tip.
+
+Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports can satisfy the same `SourceChainUpdate` values behind `fetch_chain_segment` without changing canonical ingest.
 
 `tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
 
@@ -105,7 +117,7 @@ New capability names are added to `NodeCapability` when a real consumer reads th
 
 Capability discovery happens at startup in the `connect_node` phase. The probe is implementation-specific per backend:
 
-- **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. Optional methods such as `getblockchaininfo` for `chain_value_pools` are advertised when present but are not required for canonical ingestion.
+- **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Canonical ingest requires `getblock`, `getbestblockhash`, `getblockheader`, and `z_getsubtreesbyindex`; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. `z_gettreestate` enables checkpoint tree-state wallet capabilities but is not required for canonical catchup. The block-fetch and checkpoint paths use height-keyed `getblock`; `getblockhash` is not part of the source contract. Optional methods such as `sendrawtransaction` for broadcast and `getblockchaininfo` for `chain_value_pools` are advertised when present but are not required for canonical ingestion.
 - **Zebra indexer gRPC**: the mempool adapter detects feature presence by opening the configured gRPC stream. A block-streaming source and spending-transaction lookup capability are future extensions; they must add real `NodeCapability` variants and runtime wiring in the same change.
 - **zcashd JSON-RPC**: future. Capability probe via `getnetworkinfo` and method probing.
 
@@ -202,7 +214,7 @@ upstream-node response
   -> source parser owned by Zebra-compatible primitives
   -> SourceBlock and source metadata
   -> zinder-ingest artifact builders
-  -> BlockArtifact, CompactBlockArtifact, TreeStateArtifact
+  -> BlockHeaderArtifact, BlockTransactionIndexArtifact, TransactionFactsArtifact, CompactBlockArtifact, TreeStateArtifact
 ```
 
 This keeps consensus interpretation in the crates that own consensus semantics and keeps Zinder artifacts focused on indexing.

@@ -492,7 +492,8 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
     use crate::common::{
-        live_tip_follow_config, regtest_generate_blocks, zebra_source_from_tip_follow,
+        fetch_live_network_upgrade_activations, live_tip_follow_config, regtest_generate_blocks,
+        zebra_source_from_tip_follow,
     };
 
     let _guard = init();
@@ -505,12 +506,16 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     // tip-follow once with a short cancellation to seed the store.
     let tempdir = tempfile::tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
-    let tip_follow_config =
-        live_tip_follow_config(&env, &storage_path, 100, Duration::from_millis(200));
+    let tip_follow_config = live_tip_follow_config(
+        &env,
+        &storage_path,
+        100,
+        Duration::from_millis(200),
+        fetch_live_network_upgrade_activations(&env).await?,
+    );
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let derive_store = test_derive_store(&storage_path)?;
     let readiness = Readiness::default();
 
     let cancel = CancellationToken::new();
@@ -519,13 +524,11 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
         let readiness = readiness.clone();
         let cancel = cancel.clone();
         let tip_follow_config = tip_follow_config.clone();
-        let derive_store = derive_store.clone();
         tokio::spawn(async move {
             tip_follow_with_primary_store(
                 &tip_follow_config,
                 &source,
                 store,
-                derive_store,
                 &readiness,
                 None,
                 None,

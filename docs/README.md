@@ -17,6 +17,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [Wallet data plane](architecture/wallet-data-plane.md)
 - [Derive plane](architecture/derive-plane.md)
 - [Explorer plane](architecture/explorer-plane.md)
+- [Fact-first indexer](architecture/fact-first-indexer.md)
 - [Service operations](architecture/service-operations.md)
 - [Public interfaces](architecture/public-interfaces.md)
 - [Extending artifacts](architecture/extending-artifacts.md)
@@ -44,9 +45,8 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0018: Capability-gated optional payload fields](adrs/0018-capability-gated-optional-payload-fields.md)
 - [ADR-0019: Transport policy ownership and self-healing](adrs/0019-transport-policy-ownership.md)
 - [ADR-0020: Bounded RocksDB resource budget](adrs/0020-bounded-rocksdb-resource-budget.md)
-- [ADR-0021: Parallel block derivation in `BulkCatchup`](adrs/0021-parallel-block-derivation.md)
-- [ADR-0022: Transparent prevout rows remove commit-time transaction re-reads](adrs/0022-transparent-prevout-index.md)
-- [ADR-0023: Derive plane hosted by ingest](adrs/0023-derive-plane-hosted-by-ingest.md)
+- [ADR-0021: Parallel canonical fact build in bulk catchup](adrs/0021-parallel-block-derivation.md)
+- [ADR-0022: Resource-budgeted bulk catchup and checkpoint tree state](adrs/0022-resource-budgeted-bulk-catchup.md)
 
 ## Reference
 
@@ -74,7 +74,7 @@ Operational procedures for running Zinder against the workspace and external sys
 
 ## Current Contracts
 
-- **Transparent-address artifact surface**: [Wallet data plane §Transparent Address UTXOs](architecture/wallet-data-plane.md#transparent-address-utxos) and [§Transparent Address Tx History](architecture/wallet-data-plane.md#transparent-address-tx-history) carry the wire shapes and capability strings; [Extending artifacts](architecture/extending-artifacts.md) holds the canonical worked example for adding a new artifact family.
+- **Transparent-address artifact surface**: [Wallet data plane §Transparent Address Outputs](architecture/wallet-data-plane.md#transparent-address-outputs) and [§Transparent Address Tx History](architecture/wallet-data-plane.md#transparent-address-tx-history) carry the wire shapes and capability strings; [Extending artifacts](architecture/extending-artifacts.md) holds the canonical worked example for adding a new artifact family.
 - **Transparent-address balance + derive-plane instantiation**: [Wallet data plane §Transparent Address Balance](architecture/wallet-data-plane.md#transparent-address-balance) defines the wallet and derive capabilities, and [Derive plane](architecture/derive-plane.md) defines the federation primitive.
 - **Prevout resolution**: [Wallet data plane §Transparent Prevout Resolution](architecture/wallet-data-plane.md#transparent-prevout-resolution) defines the compute-at-read-time read path.
 - **Mempool topology**: [ADR-0007](adrs/0007-mempool-topology-and-retention.md) records the durable mempool topology; [Wallet data plane §Mempool Snapshot and Subscription](architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) owns the public surface.

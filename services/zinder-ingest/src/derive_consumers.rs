@@ -1,10 +1,10 @@
-//! In-process derive consumer dispatch driven by the canonical commit
-//! pipeline.
+//! In-process derive consumer dispatch driven by canonical chain events.
 //!
-//! `zinder-ingest` opens the derive store as a primary, parses each block
-//! committed in the current batch, and hands parsed block contexts to
-//! [`zinder_derive::DeriveStore::write_chain_event`]. Consumer writes and
-//! cursor advances land in one derive-store write batch per chain epoch.
+//! `zinder-ingest` opens the derive store as a primary, tails durable
+//! canonical chain events, hydrates each event's committed block contexts,
+//! and hands those contexts to [`zinder_derive::DeriveStore::write_chain_event`].
+//! Consumer writes and cursor advances land in one derive-store write batch
+//! per chain epoch.
 //!
 //! Reader processes (`zinder-explorer`) open the same derive store path in
 //! secondary mode (per [`zinder_derive::DeriveStore::open_secondary`]) and
@@ -15,43 +15,55 @@ use std::{
     num::NonZeroU32,
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use futures_util::stream::StreamExt as _;
-use zebra_chain::block::Block as ZebraBlock;
-use zebra_chain::serialization::ZcashDeserializeInto as _;
-use zebra_chain::transparent;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, TransactionId,
-    TransparentOutPoint, TransparentPrevoutArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, TransactionFactsArtifact,
+    TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_derive::{
     BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer, ChainEventDispatchInputs,
     DeriveStore, DeriveStoreOptions, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    MempoolEventCountsConsumer, PrevoutResolver, RecentTransactionsConsumer,
-    TransactionFeesConsumer, TransparentAddressActivityConsumer,
+    MempoolEventCountsConsumer, RecentTransactionsConsumer, TransactionFeesConsumer,
+    TransparentAddressActivityConsumer, TransparentAddressTransactionHistoryConsumer,
+    TransparentSpendFacts,
 };
 use zinder_store::{
-    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent,
-    MempoolEventEnvelope, PrimaryChainStore, StorageTuning, StreamCursorTokenV1,
+    ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
+    PrimaryChainStore, StorageTuning, StreamCursorTokenV1,
 };
 
 use crate::{
-    IngestError,
+    DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     chain_ingest::{ingest_error_class, outcome_status},
-    transparent_prevout_lookup::{
-        TransparentPrevoutLookupMode, TransparentPrevoutLookupStage,
-        read_chunked_transparent_prevouts_by_outpoints,
-    },
+    memory_pressure::RuntimeMemorySnapshot,
 };
 
 const DERIVE_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
-const DERIVE_REPLAY_STAGE_RESOLVE_PREVOUTS: &str = "resolve_prevouts";
+const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
-const DERIVE_CONTEXT_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
-const DERIVE_CONTEXT_STAGE_RESOLVE_PREVOUTS: &str = "resolve_prevouts";
+const CANONICAL_FIRST_MEMORY_PRESSURE_HIGH_RATIO: f64 = 0.95;
+
+/// Default poll cadence for the derive tailer when the canonical store is
+/// ingesting faster than chain-event notifications arrive.
+pub const DEFAULT_DERIVE_TAILER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeriveReplayPauseReason {
+    MemoryPressure,
+}
+
+impl DeriveReplayPauseReason {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::MemoryPressure => "memory_pressure",
+        }
+    }
+}
 
 /// Opens the ingest-owned derive store primary for a canonical store path.
 pub fn open_primary_derive_store_for_canonical(
@@ -68,6 +80,142 @@ pub fn open_primary_derive_store_for_canonical(
     )
 }
 
+/// Spawns the ingest-owned chain-event tailer for derive consumers.
+///
+/// The task is intentionally best-effort from the canonical ingest point of
+/// view: canonical commits have already succeeded before the tailer sees an
+/// event, so a derive failure is exposed through lag/error metrics and logs
+/// without blocking new chain facts from being indexed.
+#[must_use = "drop the handle to detach the derive tailer or await it for symmetric shutdown"]
+pub fn spawn_derive_tailer_task(
+    chain_store: PrimaryChainStore,
+    derive_store: DeriveStore,
+    derive_config: IngestDeriveConfig,
+    poll_interval: Duration,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if !derive_store.has_consumer_column_families() {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "derive_tailer_disabled",
+                "derive tailer disabled because the derive store has no chain-event consumers"
+            );
+            return;
+        }
+
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "derive_tailer_started",
+            poll_interval_ms = u64::try_from(poll_interval.as_millis()).unwrap_or(u64::MAX),
+            derive_replay_concurrency = derive_config.replay_concurrency.get(),
+            replay_batch_blocks = derive_config.replay_batch_blocks.get(),
+            replay_policy = derive_config.replay_policy.as_kebab_case(),
+            "derive chain-event tailer started"
+        );
+
+        loop {
+            let (memory_snapshot, pause_reason) = current_derive_replay_pause_reason(derive_config);
+            record_derive_replay_budget(derive_config.replay_policy, pause_reason, poll_interval);
+            if let Some(reason) = pause_reason {
+                tracing::debug!(
+                    target: "zinder::ingest",
+                    event = "derive_tailer_replay_paused",
+                    replay_policy = derive_config.replay_policy.as_kebab_case(),
+                    pause_reason = reason.as_label(),
+                    memory_pressure_ratio = ?memory_snapshot.pressure_ratio(),
+                    "derive replay paused so canonical ingest keeps the memory budget"
+                );
+
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        tracing::info!(
+                            target: "zinder::ingest",
+                            event = "derive_tailer_cancelled",
+                            "derive chain-event tailer cancelled"
+                        );
+                        return;
+                    }
+                    () = tokio::time::sleep(poll_interval) => {}
+                }
+                continue;
+            }
+
+            let started_at = Instant::now();
+            let outcome =
+                catch_up_derive_store_to_canonical(&chain_store, &derive_store, derive_config)
+                    .await;
+            record_derive_tailer_tick(started_at, &outcome);
+            if let Err(error) = outcome {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "derive_tailer_replay_failed",
+                    error = %error,
+                    "derive tailer failed to replay canonical chain events; retrying"
+                );
+            }
+
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "zinder::ingest",
+                        event = "derive_tailer_cancelled",
+                        "derive chain-event tailer cancelled"
+                    );
+                    return;
+                }
+                () = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+    })
+}
+
+/// Spawns the derive replay budget metric sampler.
+///
+/// The derive tailer can spend multiple seconds replaying retained events. This
+/// task keeps replay budget gauges tied to current memory pressure instead of
+/// to the tailer's next scheduling boundary.
+#[must_use = "drop the handle to detach the derive replay budget sampler or await it for symmetric shutdown"]
+pub fn spawn_derive_replay_budget_metrics_task(
+    derive_config: IngestDeriveConfig,
+    poll_interval: Duration,
+    sample_interval: Duration,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (_memory_snapshot, pause_reason) =
+                current_derive_replay_pause_reason(derive_config);
+            record_derive_replay_budget(derive_config.replay_policy, pause_reason, poll_interval);
+
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(sample_interval) => {}
+            }
+        }
+    })
+}
+
+fn current_derive_replay_pause_reason(
+    derive_config: IngestDeriveConfig,
+) -> (RuntimeMemorySnapshot, Option<DeriveReplayPauseReason>) {
+    let memory_snapshot = RuntimeMemorySnapshot::sample();
+    let pause_reason = derive_replay_pause_reason(derive_config.replay_policy, memory_snapshot);
+    (memory_snapshot, pause_reason)
+}
+
+fn derive_replay_pause_reason(
+    replay_policy: DeriveReplayPolicy,
+    memory_snapshot: RuntimeMemorySnapshot,
+) -> Option<DeriveReplayPauseReason> {
+    if replay_policy == DeriveReplayPolicy::Continuous {
+        return None;
+    }
+    let pressure_ratio = memory_snapshot.pressure_ratio()?;
+    (pressure_ratio >= CANONICAL_FIRST_MEMORY_PRESSURE_HIGH_RATIO)
+        .then_some(DeriveReplayPauseReason::MemoryPressure)
+}
+
 /// Replays retained canonical chain events that have not reached the
 /// ingest-owned derive store.
 ///
@@ -78,19 +226,13 @@ pub fn open_primary_derive_store_for_canonical(
 pub async fn catch_up_derive_store_to_canonical(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
-    derive_concurrency: NonZeroU32,
+    derive_config: IngestDeriveConfig,
 ) -> Result<(), IngestError> {
     if !derive_store.has_consumer_column_families() {
         return Ok(());
     }
 
-    let canonical_tip_height = chain_store
-        .current_chain_epoch()?
-        .map(|epoch| epoch.tip_height);
-    if let Some(tip_height) = canonical_tip_height {
-        metrics::gauge!("zinder_ingest_derive_replay_tip_height")
-            .set(f64::from(tip_height.value()));
-    }
+    record_current_derive_replay_tip(chain_store)?;
 
     let mut cursor = persisted_chain_event_cursor(derive_store)?;
     loop {
@@ -112,14 +254,8 @@ pub async fn catch_up_derive_store_to_canonical(
 
         for envelope in page {
             cursor = Some(
-                replay_chain_event_to_derive(
-                    chain_store,
-                    derive_store,
-                    envelope,
-                    canonical_tip_height,
-                    derive_concurrency,
-                )
-                .await?,
+                replay_chain_event_to_derive(chain_store, derive_store, envelope, derive_config)
+                    .await?,
             );
         }
     }
@@ -129,20 +265,160 @@ async fn replay_chain_event_to_derive(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
-    canonical_tip_height: Option<BlockHeight>,
-    derive_concurrency: NonZeroU32,
+    derive_config: IngestDeriveConfig,
+) -> Result<StreamCursorTokenV1, IngestError> {
+    if matches!(envelope.event, ChainEvent::ChainReorged { .. }) {
+        return replay_reorg_event_to_derive(chain_store, derive_store, envelope, derive_config)
+            .await;
+    }
+
+    let committed_range = committed_block_range_for_chain_event(&envelope)?;
+    let block_count = block_height_range_len(committed_range);
+    if block_count == 0 {
+        return replay_empty_committed_event(chain_store, derive_store, envelope, committed_range);
+    }
+
+    replay_committed_event_to_derive_in_batches(
+        chain_store,
+        derive_store,
+        envelope,
+        committed_range,
+        derive_config,
+    )
+    .await
+}
+
+fn replay_empty_committed_event(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    envelope: ChainEventEnvelope,
+    committed_range: BlockHeightRange,
+) -> Result<StreamCursorTokenV1, IngestError> {
+    let contexts = HashMap::new();
+    let inputs = ChainEventDispatchInputs {
+        chain_epoch: envelope.chain_epoch,
+        chain_event: &envelope.event,
+        chain_cursor: envelope.cursor.as_bytes(),
+        event_sequence: envelope.event_sequence,
+        finalized_height: envelope.finalized_height,
+    };
+    let dispatch_started_at = Instant::now();
+    let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, true);
+    record_derive_replay_stage(
+        DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
+        dispatch_started_at,
+        &dispatch_outcome,
+    );
+    if let Err(error) = dispatch_outcome {
+        record_derive_replay_event(0, Some(&error));
+        return Err(error);
+    }
+
+    record_derive_replay_event(0, None);
+    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
+        record_derive_replay_progress(committed_range.end, tip_height);
+    }
+    Ok(envelope.cursor)
+}
+
+async fn replay_committed_event_to_derive_in_batches(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    envelope: ChainEventEnvelope,
+    committed_range: BlockHeightRange,
+    derive_config: IngestDeriveConfig,
+) -> Result<StreamCursorTokenV1, IngestError> {
+    let block_count = block_height_range_len(committed_range);
+    let mut next_height = committed_range.start;
+    while next_height <= committed_range.end {
+        let hydrate_started_at = Instant::now();
+        let replay_blocks_outcome = hydrate_committed_block_replay_batch(
+            chain_store,
+            &envelope,
+            next_height,
+            committed_range.end,
+            derive_config,
+        );
+        record_derive_replay_stage(
+            DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS,
+            hydrate_started_at,
+            &replay_blocks_outcome,
+        );
+        let replay_batch = match replay_blocks_outcome {
+            Ok(replay_batch) => replay_batch,
+            Err(error) => {
+                record_derive_replay_event(block_count, Some(&error));
+                return Err(error);
+            }
+        };
+
+        let replay_range = replay_batch.block_range;
+        let final_chunk = replay_range.end >= committed_range.end;
+        let chunk_event = committed_chain_event_chunk(&envelope.event, replay_range);
+        let resolve_started_at = Instant::now();
+        let contexts_outcome = build_block_contexts_from_committed_event(
+            chain_store,
+            envelope.chain_epoch.id,
+            replay_batch.blocks,
+            derive_config.replay_concurrency,
+        )
+        .await;
+        record_derive_replay_stage(
+            DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
+            resolve_started_at,
+            &contexts_outcome,
+        );
+        let contexts = match contexts_outcome {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                record_derive_replay_event(block_count, Some(&error));
+                return Err(error);
+            }
+        };
+
+        let inputs = ChainEventDispatchInputs {
+            chain_epoch: envelope.chain_epoch,
+            chain_event: &chunk_event,
+            chain_cursor: envelope.cursor.as_bytes(),
+            event_sequence: envelope.event_sequence,
+            finalized_height: envelope.finalized_height,
+        };
+        let dispatch_started_at = Instant::now();
+        let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, final_chunk);
+        record_derive_replay_stage(
+            DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
+            dispatch_started_at,
+            &dispatch_outcome,
+        );
+        if let Err(error) = dispatch_outcome {
+            record_derive_replay_event(block_count, Some(&error));
+            return Err(error);
+        }
+
+        next_height = replay_range.end.next().ok_or_else(|| {
+            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
+        })?;
+    }
+
+    record_derive_replay_event(block_count, None);
+    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
+        record_derive_replay_progress(committed_range.end, tip_height);
+    }
+    Ok(envelope.cursor)
+}
+
+async fn replay_reorg_event_to_derive(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    envelope: ChainEventEnvelope,
+    derive_config: IngestDeriveConfig,
 ) -> Result<StreamCursorTokenV1, IngestError> {
     let committed_range = committed_block_range_for_chain_event(&envelope)?;
     let block_count = block_height_range_len(committed_range);
 
     let hydrate_started_at = Instant::now();
-    let replay_blocks_outcome = hydrate_committed_blocks_for_chain_event(
-        chain_store,
-        &envelope,
-        committed_range,
-        derive_concurrency,
-    )
-    .await;
+    let replay_blocks_outcome =
+        hydrate_committed_blocks_for_reorg_event(chain_store, &envelope, committed_range);
     record_derive_replay_stage(
         DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS,
         hydrate_started_at,
@@ -161,9 +437,11 @@ async fn replay_chain_event_to_derive(
         chain_store,
         envelope.chain_epoch.id,
         replay_blocks,
-    );
+        derive_config.replay_concurrency,
+    )
+    .await;
     record_derive_replay_stage(
-        DERIVE_REPLAY_STAGE_RESOLVE_PREVOUTS,
+        DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
         resolve_started_at,
         &contexts_outcome,
     );
@@ -183,7 +461,7 @@ async fn replay_chain_event_to_derive(
         finalized_height: envelope.finalized_height,
     };
     let dispatch_started_at = Instant::now();
-    let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts);
+    let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, true);
     record_derive_replay_stage(
         DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
         dispatch_started_at,
@@ -195,7 +473,7 @@ async fn replay_chain_event_to_derive(
     }
 
     record_derive_replay_event(block_count, None);
-    if let Some(tip_height) = canonical_tip_height {
+    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
         record_derive_replay_progress(committed_range.end, tip_height);
     }
     Ok(envelope.cursor)
@@ -235,53 +513,136 @@ fn committed_block_range_for_chain_event(
     Ok(committed.block_range)
 }
 
-async fn hydrate_committed_blocks_for_chain_event(
+fn hydrate_committed_block_replay_batch(
     chain_store: &PrimaryChainStore,
     envelope: &ChainEventEnvelope,
-    committed_range: BlockHeightRange,
-    derive_concurrency: NonZeroU32,
-) -> Result<Vec<ParsedReplayBlock>, IngestError> {
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    derive_config: IngestDeriveConfig,
+) -> Result<CanonicalReplayBatch, IngestError> {
     let reader = chain_store.chain_epoch_reader_at(envelope.chain_epoch.id)?;
-    let block_artifacts = reader.blocks_in_range(committed_range)?;
-    let mut finalized_blocks = Vec::with_capacity(block_artifacts.len());
-    for (height, block) in committed_range.into_iter().zip(block_artifacts) {
-        let Some(block) = block else {
+    let max_blocks = nonzero_u32_to_usize(derive_config.replay_batch_blocks);
+    let remaining_blocks = usize::try_from(
+        end_height
+            .value()
+            .saturating_sub(start_height.value())
+            .saturating_add(1),
+    )
+    .unwrap_or(usize::MAX);
+    let mut replay_blocks = Vec::with_capacity(max_blocks.min(remaining_blocks));
+    let mut next_height = start_height;
+
+    while next_height <= end_height && replay_blocks.len() < max_blocks {
+        let height = next_height;
+        let Some(header) = reader.block_header_at(height)? else {
             return Err(IngestError::DeriveDispatch(format!(
-                "committed chain event {} references unavailable block {}",
+                "committed chain event {} references unavailable block-header facts {}",
                 envelope.event_sequence,
                 height.value()
             )));
         };
-        finalized_blocks.push(block);
+        let transaction_ids = reader.transaction_ids_at_height(height)?;
+        let mut facts_by_id = reader.transaction_facts_by_ids(&transaction_ids)?;
+        let mut transactions = Vec::with_capacity(transaction_ids.len());
+        for transaction_id in transaction_ids {
+            let Some(transaction) = facts_by_id.remove(&transaction_id).flatten() else {
+                return Err(IngestError::DeriveDispatch(format!(
+                    "committed chain event {} references unavailable transaction facts {}",
+                    envelope.event_sequence,
+                    hex::encode(transaction_id.as_bytes())
+                )));
+            };
+            transactions.push(transaction);
+        }
+        let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
+        replay_blocks.push(CanonicalReplayBlock {
+            height,
+            block_hash: header.block_hash,
+            previous_block_hash: header.parent_hash,
+            block_time_unix_seconds: header.block_time,
+            block_size_bytes: header.block_size_bytes,
+            transactions,
+            transparent_spends,
+        });
+        next_height = height.next().ok_or_else(|| {
+            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
+        })?;
     }
-    parse_replay_blocks(finalized_blocks, derive_concurrency).await
-}
 
-/// Builds per-block derive contexts from the batch before the canonical
-/// artifacts are moved into the store commit.
-pub(crate) fn build_block_contexts_from_batch(
-    chain_store: &PrimaryChainStore,
-    finalized_blocks: &[BlockArtifact],
-    parsed_blocks: &[Option<Arc<ZebraBlock>>],
-    transparent_prevouts: &[TransparentPrevoutArtifact],
-) -> Result<BatchBlockContexts, IngestError> {
-    let current_chain_reader = if chain_store.current_chain_epoch()?.is_some() {
-        Some(chain_store.current_chain_epoch_reader()?)
-    } else {
-        None
+    let Some(first) = replay_blocks.first() else {
+        return Err(IngestError::DeriveDispatch(
+            "derive replay batch did not hydrate any blocks".to_owned(),
+        ));
     };
-    build_block_contexts(
-        finalized_blocks,
-        parsed_blocks,
-        current_chain_reader.as_ref(),
-        transparent_prevouts,
-        TransparentPrevoutLookupMode::WriterCommit,
-    )
+    let last = replay_blocks
+        .last()
+        .ok_or_else(|| IngestError::DeriveDispatch("derive replay batch empty".to_owned()))?;
+    Ok(CanonicalReplayBatch {
+        block_range: BlockHeightRange::inclusive(first.height, last.height),
+        blocks: replay_blocks,
+    })
 }
 
-pub(crate) struct BatchBlockContexts {
-    pub(crate) blocks: HashMap<BlockHeight, Arc<BlockCommitContext>>,
-    pub(crate) prevouts_by_outpoint: Arc<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>>,
+fn hydrate_committed_blocks_for_reorg_event(
+    chain_store: &PrimaryChainStore,
+    envelope: &ChainEventEnvelope,
+    committed_range: BlockHeightRange,
+) -> Result<Vec<CanonicalReplayBlock>, IngestError> {
+    let reader = chain_store.chain_epoch_reader_at(envelope.chain_epoch.id)?;
+    let mut replay_blocks = Vec::with_capacity(committed_range.into_iter().len());
+    for height in committed_range {
+        replay_blocks.push(hydrate_committed_block(&reader, envelope, height)?);
+    }
+    Ok(replay_blocks)
+}
+
+fn hydrate_committed_block(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    envelope: &ChainEventEnvelope,
+    height: BlockHeight,
+) -> Result<CanonicalReplayBlock, IngestError> {
+    let Some(header) = reader.block_header_at(height)? else {
+        return Err(IngestError::DeriveDispatch(format!(
+            "committed chain event {} references unavailable block-header facts {}",
+            envelope.event_sequence,
+            height.value()
+        )));
+    };
+    let transaction_ids = reader.transaction_ids_at_height(height)?;
+    let mut facts_by_id = reader.transaction_facts_by_ids(&transaction_ids)?;
+    let mut transactions = Vec::with_capacity(transaction_ids.len());
+    for transaction_id in transaction_ids {
+        let Some(transaction) = facts_by_id.remove(&transaction_id).flatten() else {
+            return Err(IngestError::DeriveDispatch(format!(
+                "committed chain event {} references unavailable transaction facts {}",
+                envelope.event_sequence,
+                hex::encode(transaction_id.as_bytes())
+            )));
+        };
+        transactions.push(transaction);
+    }
+    let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
+    Ok(CanonicalReplayBlock {
+        height,
+        block_hash: header.block_hash,
+        previous_block_hash: header.parent_hash,
+        block_time_unix_seconds: header.block_time,
+        block_size_bytes: header.block_size_bytes,
+        transactions,
+        transparent_spends,
+    })
+}
+
+fn committed_chain_event_chunk(event: &ChainEvent, replay_range: BlockHeightRange) -> ChainEvent {
+    match event {
+        ChainEvent::ChainCommitted { committed } => ChainEvent::ChainCommitted {
+            committed: zinder_store::ChainEpochCommitted {
+                chain_epoch: committed.chain_epoch,
+                block_range: replay_range,
+            },
+        },
+        ChainEvent::ChainReorged { .. } | _ => event.clone(),
+    }
 }
 
 /// Dispatches the configured chain-event consumers against parsed block
@@ -290,19 +651,22 @@ pub(crate) fn dispatch_chain_event(
     derive_store: &DeriveStore,
     inputs: ChainEventDispatchInputs<'_>,
     blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+    advance_cursor: bool,
 ) -> Result<(), IngestError> {
     let mut block_summary = BlockSummaryConsumer::new();
     let mut transaction_fees = TransactionFeesConsumer::new();
     let mut recent_transactions = RecentTransactionsConsumer::new();
     let mut transparent_activity = TransparentAddressActivityConsumer::new();
-    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 4] = [
+    let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
+    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 5] = [
         &mut block_summary,
         &mut transaction_fees,
         &mut recent_transactions,
         &mut transparent_activity,
+        &mut transparent_transaction_history,
     ];
     derive_store
-        .write_chain_event(&mut consumers, inputs, blocks)
+        .write_chain_event_chunk(&mut consumers, inputs, blocks, advance_cursor)
         .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
     Ok(())
 }
@@ -384,262 +748,101 @@ fn apply_mempool_event(
     Ok(())
 }
 
-fn build_block_contexts_from_committed_event(
+async fn build_block_contexts_from_committed_event(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
-    replay_blocks: Vec<ParsedReplayBlock>,
+    replay_blocks: Vec<CanonicalReplayBlock>,
+    _derive_replay_concurrency: NonZeroU32,
 ) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
-    let reader = chain_store.chain_epoch_reader_at(chain_epoch_id)?;
-    build_block_contexts_from_parsed_blocks(
-        replay_blocks,
-        Some(&reader),
-        &[],
-        TransparentPrevoutLookupMode::ReaderEpoch,
+    let transparent_spends = read_transparent_spend_facts_for_committed_blocks(
+        chain_store,
+        chain_epoch_id,
+        &replay_blocks,
     )
-    .map(|contexts| contexts.blocks)
-}
-
-fn build_block_contexts(
-    finalized_blocks: &[BlockArtifact],
-    cached_blocks: &[Option<Arc<ZebraBlock>>],
-    chain_reader: Option<&ChainEpochReader<'_>>,
-    transparent_prevouts: &[TransparentPrevoutArtifact],
-    stored_prevout_lookup: TransparentPrevoutLookupMode,
-) -> Result<BatchBlockContexts, IngestError> {
-    let hydrate_started_at = Instant::now();
-    let parsed_blocks_outcome = parsed_blocks_for_commit(finalized_blocks, cached_blocks);
-    record_derive_context_stage(
-        DERIVE_CONTEXT_STAGE_HYDRATE_BLOCKS,
-        hydrate_started_at,
-        &parsed_blocks_outcome,
-    );
-    let parsed_blocks = parsed_blocks_outcome?;
-    build_block_contexts_from_parsed_blocks(
-        parsed_blocks,
-        chain_reader,
-        transparent_prevouts,
-        stored_prevout_lookup,
-    )
-}
-
-fn build_block_contexts_from_parsed_blocks(
-    parsed_blocks: Vec<ParsedReplayBlock>,
-    chain_reader: Option<&ChainEpochReader<'_>>,
-    transparent_prevouts: &[TransparentPrevoutArtifact],
-    stored_prevout_lookup: TransparentPrevoutLookupMode,
-) -> Result<BatchBlockContexts, IngestError> {
-    let resolve_started_at = Instant::now();
-    let prevouts_outcome = resolve_prevouts_for_blocks(
-        chain_reader,
-        transparent_prevouts,
-        &parsed_blocks,
-        stored_prevout_lookup,
-    );
-    record_derive_context_stage(
-        DERIVE_CONTEXT_STAGE_RESOLVE_PREVOUTS,
-        resolve_started_at,
-        &prevouts_outcome,
-    );
-    let prevout_artifacts = prevouts_outcome?;
-    let prevouts = Arc::new(
-        prevout_artifacts
-            .iter()
-            .map(|(outpoint, artifact)| (*outpoint, artifact.clone().into_prevout()))
-            .collect::<HashMap<_, _>>(),
-    );
-    let mut out = HashMap::with_capacity(parsed_blocks.len());
-    for parsed in parsed_blocks {
+    .await?;
+    let mut out = HashMap::with_capacity(replay_blocks.len());
+    for block in replay_blocks {
         let context = BlockCommitContext::new(
             BlockCommitPayload {
-                height: parsed.height,
-                block_hash: encode_block_hash(parsed.block_hash),
-                previous_block_hash: encode_block_hash(parsed.previous_block_hash),
-                raw_block_size_bytes: parsed.raw_block_size_bytes,
-                block: parsed.block,
+                height: block.height,
+                block_hash: encode_block_hash(block.block_hash),
+                previous_block_hash: encode_block_hash(block.previous_block_hash),
+                block_time_unix_seconds: block.block_time_unix_seconds,
+                block_size_bytes: block.block_size_bytes,
+                transactions: block.transactions,
             },
-            PrevoutResolver::from_map(Arc::clone(&prevouts)),
+            TransparentSpendFacts::from_map(Arc::clone(&transparent_spends)),
         );
-        out.insert(parsed.height, Arc::new(context));
-    }
-    Ok(BatchBlockContexts {
-        blocks: out,
-        prevouts_by_outpoint: prevout_artifacts,
-    })
-}
-
-async fn parse_replay_blocks(
-    finalized_blocks: Vec<BlockArtifact>,
-    derive_concurrency: NonZeroU32,
-) -> Result<Vec<ParsedReplayBlock>, IngestError> {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
-    )]
-    let parse_concurrency = derive_concurrency.get() as usize;
-    let block_count = finalized_blocks.len();
-    let mut parse_stream = futures_util::stream::iter(finalized_blocks)
-        .map(|finalized_block| {
-            tokio::task::spawn_blocking(move || parse_block_artifact(&finalized_block))
-        })
-        .buffered(parse_concurrency);
-    let mut out = Vec::with_capacity(block_count);
-
-    while let Some(parse_outcome) = parse_stream.next().await {
-        let parsed_block =
-            parse_outcome.map_err(|join_error| IngestError::BlockingTaskFailed {
-                reason: join_error.to_string(),
-            })??;
-        out.push(parsed_block);
+        out.insert(block.height, Arc::new(context));
     }
     Ok(out)
 }
 
-struct ParsedReplayBlock {
+struct CanonicalReplayBlock {
     height: BlockHeight,
     block_hash: BlockHash,
     previous_block_hash: BlockHash,
-    raw_block_size_bytes: usize,
-    block: Arc<ZebraBlock>,
-    transparent_outpoints: HashSet<TransparentOutPoint>,
+    block_time_unix_seconds: i64,
+    block_size_bytes: u64,
+    transactions: Vec<TransactionFactsArtifact>,
+    transparent_spends: Vec<TransparentOutPoint>,
 }
 
-fn parsed_blocks_for_commit(
-    finalized_blocks: &[BlockArtifact],
-    cached_blocks: &[Option<Arc<ZebraBlock>>],
-) -> Result<Vec<ParsedReplayBlock>, IngestError> {
-    if finalized_blocks.len() == cached_blocks.len() && cached_blocks.iter().all(Option::is_some) {
-        return finalized_blocks
-            .iter()
-            .zip(cached_blocks)
-            .map(|(finalized, cached)| {
-                let block = Arc::clone(cached.as_ref().ok_or_else(|| {
-                    IngestError::DeriveDispatch("cached parsed block is unavailable".to_owned())
-                })?);
-                Ok(parsed_block_from_cached(finalized, block))
-            })
-            .collect();
-    }
-
-    finalized_blocks
-        .iter()
-        .map(parse_block_artifact)
-        .collect::<Result<Vec<_>, _>>()
+struct CanonicalReplayBatch {
+    block_range: BlockHeightRange,
+    blocks: Vec<CanonicalReplayBlock>,
 }
 
-fn parsed_block_from_cached(
-    finalized: &BlockArtifact,
-    block: Arc<ZebraBlock>,
-) -> ParsedReplayBlock {
-    let transparent_outpoints = transparent_outpoints_for_block(&block);
-    ParsedReplayBlock {
-        height: finalized.height,
-        block_hash: finalized.block_hash,
-        previous_block_hash: finalized.parent_hash,
-        raw_block_size_bytes: finalized.payload_bytes.len(),
-        block,
-        transparent_outpoints,
-    }
-}
-
-fn parse_block_artifact(finalized: &BlockArtifact) -> Result<ParsedReplayBlock, IngestError> {
-    let block: ZebraBlock = finalized
-        .payload_bytes
-        .as_slice()
-        .zcash_deserialize_into()
-        .map_err(|error| IngestError::DeriveDispatch(format!("block parse: {error}")))?;
-    Ok(parsed_block_from_cached(finalized, Arc::new(block)))
-}
-
-fn transparent_outpoints_for_block(block: &ZebraBlock) -> HashSet<TransparentOutPoint> {
-    let mut outpoints = HashSet::new();
-    for (position, transaction) in block.transactions.iter().enumerate() {
-        if position == 0 {
-            continue;
-        }
-        for input in transaction.inputs() {
-            if let transparent::Input::PrevOut { outpoint, .. } = input {
-                let outpoint = TransparentOutPoint::new(
-                    TransactionId::from_bytes(outpoint.hash.0),
-                    outpoint.index,
-                );
-                if !outpoint.is_coinbase_sentinel() {
-                    outpoints.insert(outpoint);
-                }
+fn transparent_spent_outpoints_for_transactions(
+    transactions: &[TransactionFactsArtifact],
+) -> Vec<TransparentOutPoint> {
+    let mut spends = Vec::new();
+    for transaction in transactions {
+        for input in &transaction.transparent_inputs {
+            if !input.spent_outpoint.is_coinbase_sentinel() {
+                spends.push(input.spent_outpoint);
             }
         }
     }
-    outpoints
+    spends
 }
 
-fn resolve_prevouts_for_blocks(
-    chain_reader: Option<&ChainEpochReader<'_>>,
-    transparent_prevouts: &[TransparentPrevoutArtifact],
-    parsed_blocks: &[ParsedReplayBlock],
-    stored_prevout_lookup: TransparentPrevoutLookupMode,
-) -> Result<Arc<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>>, IngestError> {
+async fn read_transparent_spend_facts_for_committed_blocks(
+    chain_store: &PrimaryChainStore,
+    chain_epoch_id: ChainEpochId,
+    replay_blocks: &[CanonicalReplayBlock],
+) -> Result<Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>, IngestError> {
     let mut requested_outpoints = HashSet::<TransparentOutPoint>::new();
-    for block in parsed_blocks {
-        for outpoint in &block.transparent_outpoints {
-            requested_outpoints.insert(*outpoint);
-        }
+    for block in replay_blocks {
+        requested_outpoints.extend(block.transparent_spends.iter().copied());
     }
 
-    let unique_prevout_count = requested_outpoints.len();
-    record_prevout_resolution_requested_outpoints(unique_prevout_count);
-    let in_batch_prevouts = transparent_prevouts
-        .iter()
-        .map(|prevout| (prevout.outpoint, prevout))
-        .collect::<HashMap<_, _>>();
-    let mut resolved = HashMap::with_capacity(unique_prevout_count);
-    let mut unresolved_store_outpoints = Vec::new();
-    for outpoint in requested_outpoints {
-        if let Some(prevout) = in_batch_prevouts.get(&outpoint) {
-            resolved.insert(outpoint, (*prevout).clone());
-        } else {
-            unresolved_store_outpoints.push(outpoint);
-        }
-    }
-    record_prevout_resolution_count("in_batch", resolved.len());
-
-    let Some(reader) = chain_reader else {
-        record_prevout_resolution_count(
-            "unresolved",
-            unique_prevout_count.saturating_sub(resolved.len()),
-        );
-        return Ok(Arc::new(resolved));
-    };
-
-    let indexed_count = resolve_indexed_prevouts(
-        reader,
-        stored_prevout_lookup,
-        &unresolved_store_outpoints,
-        &mut resolved,
-    )?;
-    record_prevout_resolution_count("indexed_prevout", indexed_count);
-
-    record_prevout_resolution_count(
-        "unresolved",
-        unique_prevout_count.saturating_sub(resolved.len()),
+    let unique_spent_outpoint_count = requested_outpoints.len();
+    record_transparent_spend_fact_requested_outpoints(unique_spent_outpoint_count);
+    let outpoints = requested_outpoints.into_iter().collect::<Vec<_>>();
+    let store = chain_store.clone();
+    let read_started_at = Instant::now();
+    let read_outcome = tokio::task::spawn_blocking(move || {
+        let reader = store.chain_epoch_reader_at(chain_epoch_id)?;
+        reader.transparent_spend_facts_by_outpoints(&outpoints)
+    })
+    .await
+    .map_err(|join_error| IngestError::BlockingTaskFailed {
+        reason: join_error.to_string(),
+    })?
+    .map_err(IngestError::from);
+    record_derive_replay_stage(
+        DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
+        read_started_at,
+        &read_outcome,
     );
-
+    let resolved = read_outcome?;
+    record_transparent_spend_fact_count("resolved", resolved.len());
+    record_transparent_spend_fact_count(
+        "unresolved",
+        unique_spent_outpoint_count.saturating_sub(resolved.len()),
+    );
     Ok(Arc::new(resolved))
-}
-
-fn resolve_indexed_prevouts(
-    reader: &ChainEpochReader<'_>,
-    stored_prevout_lookup: TransparentPrevoutLookupMode,
-    outpoints: &[TransparentOutPoint],
-    resolved: &mut HashMap<TransparentOutPoint, TransparentPrevoutArtifact>,
-) -> Result<usize, IngestError> {
-    let resolved_before_index = resolved.len();
-    let prevouts_by_outpoint = read_chunked_transparent_prevouts_by_outpoints(
-        reader,
-        stored_prevout_lookup,
-        TransparentPrevoutLookupStage::DeriveContext,
-        outpoints,
-    )?;
-    resolved.extend(prevouts_by_outpoint);
-    Ok(resolved.len().saturating_sub(resolved_before_index))
 }
 
 fn record_derive_replay_stage<T>(
@@ -656,33 +859,19 @@ fn record_derive_replay_stage<T>(
     .record(started_at.elapsed());
 }
 
-fn record_derive_context_stage<T>(
-    stage: &'static str,
-    started_at: Instant,
-    outcome: &Result<T, IngestError>,
-) {
-    metrics::histogram!(
-        "zinder_ingest_derive_context_stage_duration_seconds",
-        "stage" => stage,
-        "status" => outcome_status(outcome),
-        "error_class" => ingest_error_class(outcome.as_ref().err())
-    )
-    .record(started_at.elapsed());
-}
-
-fn record_prevout_resolution_count(source: &'static str, count: usize) {
+fn record_transparent_spend_fact_count(status: &'static str, count: usize) {
     if count == 0 {
         return;
     }
     metrics::counter!(
-        "zinder_ingest_prevout_resolution_total",
-        "source" => source
+        "zinder_ingest_transparent_spend_fact_read_total",
+        "status" => status
     )
     .increment(usize_to_u64_saturating(count));
 }
 
-fn record_prevout_resolution_requested_outpoints(count: usize) {
-    metrics::histogram!("zinder_ingest_prevout_resolution_requested_outpoint_count")
+fn record_transparent_spend_fact_requested_outpoints(count: usize) {
+    metrics::histogram!("zinder_ingest_transparent_spend_fact_requested_outpoint_count")
         .record(usize_to_u32_saturating(count));
 }
 
@@ -712,6 +901,67 @@ fn record_derive_replay_progress(progress_height: BlockHeight, canonical_tip_hei
     ));
 }
 
+fn record_current_derive_replay_tip(
+    chain_store: &PrimaryChainStore,
+) -> Result<Option<BlockHeight>, IngestError> {
+    let canonical_tip_height = chain_store
+        .current_chain_epoch()?
+        .map(|epoch| epoch.tip_height);
+    if let Some(tip_height) = canonical_tip_height {
+        metrics::gauge!("zinder_ingest_derive_replay_tip_height")
+            .set(f64::from(tip_height.value()));
+    }
+    Ok(canonical_tip_height)
+}
+
+fn record_derive_replay_budget(
+    replay_policy: DeriveReplayPolicy,
+    pause_reason: Option<DeriveReplayPauseReason>,
+    poll_interval: Duration,
+) {
+    metrics::gauge!(
+        "zinder_ingest_derive_replay_policy",
+        "policy" => replay_policy.as_kebab_case()
+    )
+    .set(1.0);
+    metrics::gauge!("zinder_ingest_derive_replay_paused").set(if pause_reason.is_some() {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!(
+        "zinder_ingest_derive_replay_pause_reason",
+        "reason" => DeriveReplayPauseReason::MemoryPressure.as_label()
+    )
+    .set(
+        if pause_reason == Some(DeriveReplayPauseReason::MemoryPressure) {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!("zinder_ingest_derive_replay_budget_seconds").set(if pause_reason.is_some() {
+        0.0
+    } else {
+        poll_interval.as_secs_f64()
+    });
+}
+
+fn record_derive_tailer_tick(started_at: Instant, outcome: &Result<(), IngestError>) {
+    metrics::histogram!(
+        "zinder_ingest_derive_tailer_tick_duration_seconds",
+        "status" => outcome_status(outcome),
+        "error_class" => ingest_error_class(outcome.as_ref().err())
+    )
+    .record(started_at.elapsed());
+    metrics::counter!(
+        "zinder_ingest_derive_tailer_ticks_total",
+        "status" => outcome_status(outcome),
+        "error_class" => ingest_error_class(outcome.as_ref().err())
+    )
+    .increment(1);
+}
+
 fn block_height_range_len(block_range: BlockHeightRange) -> usize {
     if block_range.start > block_range.end {
         return 0;
@@ -722,6 +972,10 @@ fn block_height_range_len(block_range: BlockHeightRange) -> usize {
         .saturating_sub(block_range.start.value())
         .saturating_add(1);
     usize::try_from(length).map_or(usize::MAX, |converted| converted)
+}
+
+fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
+    usize::try_from(amount.get()).unwrap_or(usize::MAX)
 }
 
 fn usize_to_u64_saturating(amount: usize) -> u64 {

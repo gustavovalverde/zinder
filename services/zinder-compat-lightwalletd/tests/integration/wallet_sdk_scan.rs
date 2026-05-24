@@ -43,15 +43,15 @@ use zebra_chain::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
     BlockHash, BlockHeight, ChainEpochId, ChainTipMetadata, Network, SUBTREE_LEAF_COUNT,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionArtifact,
-    TransactionId,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionId,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::WalletQuery;
 use zinder_testkit::{
-    ChainFixture, FixtureBlock, StoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, FixtureBlock, FixtureTransactionRows, StoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 const SDK_SCAN_BLOCK_COUNT: u32 = 10;
@@ -180,15 +180,16 @@ fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
             .ok_or_else(|| eyre!("fixture block missing at height"))?
             .clone();
         let payload_bytes = sdk_scan_compact_block_payload(&block)?;
-        let transaction_artifact = TransactionArtifact::new(
+        let transaction_rows = FixtureTransactionRows::from_raw_transaction(
             TransactionId::from_bytes(sdk_scan_txid_bytes(height_value)),
             block.height,
             block.hash,
+            0,
             sdk_scan_transaction_payload(height_value),
         );
         chain_fixture = chain_fixture
             .with_compact_block_payload_at(height, payload_bytes)
-            .with_transaction_artifact(transaction_artifact);
+            .with_transaction_rows(transaction_rows);
     }
 
     let completing_block = chain_fixture

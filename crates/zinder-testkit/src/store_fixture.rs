@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(chain_epoch.tip_height, BlockHeight::new(3));
 
         for height_value in 1..=3_u32 {
-            let block = reader.block_at(BlockHeight::new(height_value))?;
+            let block = reader.block_header_at(BlockHeight::new(height_value))?;
             assert!(
                 block.is_some(),
                 "block at height {height_value} should be readable after commit"

@@ -27,13 +27,12 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
 use zinder_core::{
-    BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations,
-    TransactionArtifact, TxStatus,
+    BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations, TxStatus,
 };
 use zinder_ingest::backfill;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
@@ -41,8 +40,8 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_tip_height, live_backfill_config, regtest_generate_blocks,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    regtest_generate_blocks, zebra_source_from_backfill,
 };
 
 /// Hard cap on the boundary-window backfill size on testnet/mainnet.
@@ -76,17 +75,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     }
     let tip_height = fetch_live_tip_height(&env).await?;
 
-    let source = zebra_source_from_backfill(&live_backfill_config(
-        &env,
-        std::path::Path::new("."),
-        BlockHeight::new(1),
-        tip_height,
-        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid scratch batch size"))?,
-        false,
-    ))?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-ingest-tests")
-        .await?;
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
 
     let Some(activation_height) = latest_reachable_activation_height(&activations, tip_height)
     else {
@@ -119,7 +108,9 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
         window_end,
         NonZeroU32::new(100).ok_or_else(|| eyre!("invalid backfill batch size"))?,
         false,
+        Arc::clone(&activations),
     );
+    let source = zebra_source_from_backfill(&backfill_config)?;
     if let Some(checkpoint_height) = checkpoint_height {
         backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
@@ -220,11 +211,7 @@ async fn read_coinbase_consensus_branch_id<QueryApi: WalletQueryApi>(
         .transaction(coinbase_transaction_id, None)
         .await?;
     let TransactionStatus {
-        status:
-            TxStatus::Mined(MinedTransaction {
-                artifact: TransactionArtifact { .. },
-                details,
-            }),
+        status: TxStatus::Mined(MinedTransaction { details, .. }),
         ..
     } = status
     else {

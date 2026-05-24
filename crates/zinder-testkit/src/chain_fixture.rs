@@ -14,11 +14,14 @@
 
 use prost::Message;
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
-    SubtreeRootIndex, TransactionArtifact, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentPrevoutArtifact, TransparentUtxoSpendArtifact,
-    TreeStateArtifact, UnixTimestampMillis, wire::encode_internal_block_hash,
+    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, LockTime, Network, PrivacyShape, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionComponentCounts,
+    TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
+    TransactionVersion, TransparentAddressTxIndexArtifact, TransparentOutputArtifact,
+    TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
+    wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
@@ -48,18 +51,35 @@ pub struct FixtureBlock {
     pub block_time_seconds: u32,
     /// Placeholder raw block bytes. Not parseable by `zebra_chain`.
     pub raw_block_bytes: Vec<u8>,
-    /// Tree-state JSON payload bytes attached to this block.
-    pub tree_state_payload_bytes: Vec<u8>,
+    /// Tree-state checkpoint JSON payload bytes for this block.
+    pub tree_state_checkpoint_payload_bytes: Vec<u8>,
     /// Optional override for the compact-block payload; used by tests that
     /// need a fully-populated lightwalletd `CompactBlock` shape.
     pub compact_block_payload_override: Option<Vec<u8>>,
 }
 
 impl FixtureBlock {
-    /// Returns the durable [`BlockArtifact`] for this fixture block.
+    /// Returns canonical block-header facts for this fixture block.
     #[must_use]
-    pub fn block_artifact(&self) -> BlockArtifact {
-        BlockArtifact::new(
+    pub fn block_header_artifact(&self) -> BlockHeaderArtifact {
+        BlockHeaderArtifact::new(
+            self.height,
+            self.hash,
+            self.parent_hash,
+            [0; 32],
+            [0; 32],
+            i64::from(self.block_time_seconds),
+            0,
+            [0; 32],
+            0,
+            u64::try_from(self.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Returns the raw block blob for this fixture block.
+    #[must_use]
+    pub fn block_blob_artifact(&self) -> BlockBlobArtifact {
+        BlockBlobArtifact::new(
             self.height,
             self.hash,
             self.parent_hash,
@@ -112,17 +132,105 @@ impl FixtureBlock {
             },
             self.raw_block_bytes.clone(),
         )
-        .with_tree_state_payload_bytes(self.tree_state_payload_bytes.clone())
     }
 
-    /// Returns the tree-state artifact for this fixture block.
+    /// Returns the tree-state checkpoint artifact for this fixture block.
     #[must_use]
-    pub fn tree_state_artifact(&self) -> TreeStateArtifact {
+    pub fn tree_state_checkpoint_artifact(&self) -> TreeStateArtifact {
         TreeStateArtifact::new(
             self.height,
             self.hash,
-            self.tree_state_payload_bytes.clone(),
+            self.tree_state_checkpoint_payload_bytes.clone(),
         )
+    }
+}
+
+/// Canonical transaction rows attached to a [`ChainFixture`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixtureTransactionRows {
+    /// Block-local transaction id row.
+    pub block_transaction_index: BlockTransactionIndexArtifact,
+    /// Canonical mined transaction location.
+    pub location: TransactionLocation,
+    /// Parsed public transaction facts.
+    pub facts: TransactionFactsArtifact,
+    /// Optional raw transaction blob row.
+    pub blob: Option<TransactionBlobArtifact>,
+}
+
+impl FixtureTransactionRows {
+    /// Builds canonical rows for a synthetic raw transaction.
+    #[must_use]
+    pub fn from_raw_transaction(
+        transaction_id: TransactionId,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        tx_index_in_block: u32,
+        raw_transaction_bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        let raw_transaction_bytes = raw_transaction_bytes.into();
+        let location =
+            TransactionLocation::new(transaction_id, block_height, block_hash, tx_index_in_block);
+        let public_facts =
+            synthetic_transaction_public_facts(transaction_id, raw_transaction_bytes.len());
+        Self {
+            block_transaction_index: BlockTransactionIndexArtifact::new(
+                block_height,
+                tx_index_in_block,
+                transaction_id,
+                block_hash,
+            ),
+            location,
+            facts: TransactionFactsArtifact::new(location, public_facts),
+            blob: Some(TransactionBlobArtifact::new(
+                location,
+                raw_transaction_bytes,
+            )),
+        }
+    }
+
+    /// Builds canonical rows for a transaction whose raw bytes are unavailable.
+    #[must_use]
+    pub fn from_public_facts(
+        location: TransactionLocation,
+        public_facts: TransactionPublicFacts,
+    ) -> Self {
+        Self {
+            block_transaction_index: BlockTransactionIndexArtifact::new(
+                location.block_height,
+                location.tx_index_in_block,
+                location.transaction_id,
+                location.block_hash,
+            ),
+            location,
+            facts: TransactionFactsArtifact::new(location, public_facts),
+            blob: None,
+        }
+    }
+}
+
+/// Builds public facts for synthetic transaction bytes used by fixture tests.
+#[must_use]
+pub fn synthetic_transaction_public_facts(
+    transaction_id: TransactionId,
+    raw_transaction_size_bytes: usize,
+) -> TransactionPublicFacts {
+    TransactionPublicFacts {
+        transaction_id,
+        auth_digest: None,
+        wtxid: None,
+        version: TransactionVersion::Unsupported {
+            effective_version: 0,
+            version_group_id: None,
+        },
+        consensus_branch_id: None,
+        lock_time: LockTime::Unlocked,
+        expiry_height: None,
+        size_bytes: u32::try_from(raw_transaction_size_bytes).unwrap_or(u32::MAX),
+        counts: TransactionComponentCounts::EMPTY,
+        privacy_shape: PrivacyShape::Unclassified,
+        is_coinbase: false,
+        unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
     }
 }
 
@@ -139,10 +247,10 @@ pub struct ChainFixture {
     blocks: Vec<FixtureBlock>,
     tip_metadata_override: Option<ChainTipMetadata>,
     sapling_subtree_roots: Vec<SubtreeRootArtifact>,
-    transaction_artifacts: Vec<TransactionArtifact>,
-    transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    transparent_prevouts: Vec<TransparentPrevoutArtifact>,
-    transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    transaction_rows: Vec<FixtureTransactionRows>,
+    address_output_index: Vec<AddressOutputIndexArtifact>,
+    transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
+    transparent_spend_facts: Vec<TransparentSpendFact>,
     transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
 }
 
@@ -156,10 +264,10 @@ impl ChainFixture {
             blocks: Vec::new(),
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
-            transaction_artifacts: Vec::new(),
-            transparent_address_utxos: Vec::new(),
-            transparent_prevouts: Vec::new(),
-            transparent_utxo_spends: Vec::new(),
+            transaction_rows: Vec::new(),
+            address_output_index: Vec::new(),
+            transparent_outputs_by_outpoint: Vec::new(),
+            transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
         }
     }
@@ -190,7 +298,7 @@ impl ChainFixture {
                 parent_hash,
                 block_time_seconds,
                 raw_block_bytes,
-                tree_state_payload_bytes: FIXTURE_TREE_STATE_PAYLOAD.to_vec(),
+                tree_state_checkpoint_payload_bytes: FIXTURE_TREE_STATE_PAYLOAD.to_vec(),
                 compact_block_payload_override: None,
             });
         }
@@ -237,10 +345,10 @@ impl ChainFixture {
             blocks: prefix_blocks,
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
-            transaction_artifacts: Vec::new(),
-            transparent_address_utxos: Vec::new(),
-            transparent_prevouts: Vec::new(),
-            transparent_utxo_spends: Vec::new(),
+            transaction_rows: Vec::new(),
+            address_output_index: Vec::new(),
+            transparent_outputs_by_outpoint: Vec::new(),
+            transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
         })
     }
@@ -256,11 +364,11 @@ impl ChainFixture {
         self
     }
 
-    /// Replaces the tree-state payload bytes attached to the block at `height`.
+    /// Replaces the tree-state checkpoint payload bytes attached to the block at `height`.
     ///
     /// Returns the fixture unchanged if no block exists at `height`.
     #[must_use]
-    pub fn with_tree_state_payload_at(
+    pub fn with_tree_state_checkpoint_payload_at(
         mut self,
         height: BlockHeight,
         payload_bytes: impl Into<Vec<u8>>,
@@ -268,7 +376,7 @@ impl ChainFixture {
         let payload_bytes = payload_bytes.into();
         for block in &mut self.blocks {
             if block.height == height {
-                block.tree_state_payload_bytes = payload_bytes;
+                block.tree_state_checkpoint_payload_bytes = payload_bytes;
                 break;
             }
         }
@@ -309,48 +417,41 @@ impl ChainFixture {
         self
     }
 
-    /// Attaches a [`TransactionArtifact`] to this fixture's commit set.
-    ///
-    /// Transactions added via this builder are included in
-    /// [`ChainFixture::chain_epoch_artifacts`] so the resulting
-    /// [`ChainEpochArtifacts`] can be committed in one batch.
+    /// Attaches canonical transaction rows to this fixture's commit set.
     #[must_use]
-    pub fn with_transaction_artifact(mut self, transaction: TransactionArtifact) -> Self {
-        self.transaction_artifacts.push(transaction);
+    pub fn with_transaction_rows(mut self, transaction_rows: FixtureTransactionRows) -> Self {
+        self.transaction_rows.push(transaction_rows);
         self
     }
 
-    /// Attaches a [`TransparentAddressUtxoArtifact`] to this fixture's
-    /// commit set and mirrors it into the canonical transparent-prevout index
-    /// so prevout reads and spend-side history lookups resolve.
-    ///
-    /// [ADR-0022]: ../../../docs/adrs/0022-transparent-prevout-index.md
+    /// Attaches a [`AddressOutputIndexArtifact`] to this fixture's
+    /// commit set and mirrors it into the canonical transparent-output index
+    /// so previous-output reads and spend-side history lookups resolve.
     #[must_use]
-    pub fn with_transparent_address_utxo(
+    pub fn with_address_output_index(
         mut self,
-        transparent_address_utxo: TransparentAddressUtxoArtifact,
+        address_output_index: AddressOutputIndexArtifact,
     ) -> Self {
-        self.transparent_prevouts
-            .push(TransparentPrevoutArtifact::new(
-                transparent_address_utxo.outpoint,
-                transparent_address_utxo.value_zat,
-                transparent_address_utxo.script_pub_key.clone(),
-                transparent_address_utxo.address_script_hash,
-                transparent_address_utxo.block_height,
-                transparent_address_utxo.block_hash,
+        self.transparent_outputs_by_outpoint
+            .push(TransparentOutputArtifact::new(
+                address_output_index.outpoint,
+                address_output_index.value_zat,
+                address_output_index.script_pub_key.clone(),
+                address_output_index.address_script_hash,
+                address_output_index.block_height,
+                address_output_index.block_hash,
             ));
-        self.transparent_address_utxos
-            .push(transparent_address_utxo);
+        self.address_output_index.push(address_output_index);
         self
     }
 
-    /// Attaches a [`TransparentUtxoSpendArtifact`] to this fixture's commit set.
+    /// Attaches a [`TransparentSpendFact`] to this fixture's commit set.
     #[must_use]
-    pub fn with_transparent_utxo_spend(
+    pub fn with_transparent_spend_fact(
         mut self,
-        transparent_utxo_spend: TransparentUtxoSpendArtifact,
+        transparent_spend_fact: TransparentSpendFact,
     ) -> Self {
-        self.transparent_utxo_spends.push(transparent_utxo_spend);
+        self.transparent_spend_facts.push(transparent_spend_fact);
         self
     }
 
@@ -412,12 +513,21 @@ impl ChainFixture {
             .map(|fixture_block| fixture_block.source_block(self.network))
     }
 
-    /// Returns every block as a [`BlockArtifact`] in ascending height order.
+    /// Returns every block as a [`BlockHeaderArtifact`] in ascending height order.
     #[must_use]
-    pub fn block_artifacts(&self) -> Vec<BlockArtifact> {
+    pub fn block_header_artifacts(&self) -> Vec<BlockHeaderArtifact> {
         self.blocks
             .iter()
-            .map(FixtureBlock::block_artifact)
+            .map(FixtureBlock::block_header_artifact)
+            .collect()
+    }
+
+    /// Returns every block as a [`BlockBlobArtifact`] in ascending height order.
+    #[must_use]
+    pub fn block_blob_artifacts(&self) -> Vec<BlockBlobArtifact> {
+        self.blocks
+            .iter()
+            .map(FixtureBlock::block_blob_artifact)
             .collect()
     }
 
@@ -430,12 +540,13 @@ impl ChainFixture {
             .collect()
     }
 
-    /// Returns every block as a [`TreeStateArtifact`] in ascending height order.
+    /// Returns the fixture tip as a tree-state checkpoint artifact.
     #[must_use]
-    pub fn tree_state_artifacts(&self) -> Vec<TreeStateArtifact> {
+    pub fn tree_state_checkpoint_artifacts(&self) -> Vec<TreeStateArtifact> {
         self.blocks
-            .iter()
-            .map(FixtureBlock::tree_state_artifact)
+            .last()
+            .map(FixtureBlock::tree_state_checkpoint_artifact)
+            .into_iter()
             .collect()
     }
 
@@ -484,9 +595,10 @@ impl ChainFixture {
     #[must_use]
     pub fn chain_epoch_artifacts(&self, epoch_id: ChainEpochId) -> Option<ChainEpochArtifacts> {
         let chain_epoch = self.chain_epoch(epoch_id)?;
-        let block_artifacts = self.block_artifacts();
+        let block_artifacts = self.block_header_artifacts();
+        let block_blob_artifacts = self.block_blob_artifacts();
         let compact_block_artifacts = self.compact_block_artifacts();
-        let tree_state_artifacts = self.tree_state_artifacts();
+        let tree_state_checkpoint_artifacts = self.tree_state_checkpoint_artifacts();
         let subtree_root_artifacts = self.subtree_root_artifacts();
 
         let block_range =
@@ -494,24 +606,41 @@ impl ChainFixture {
 
         let mut chain_epoch_artifacts =
             ChainEpochArtifacts::new(chain_epoch, block_artifacts, compact_block_artifacts)
-                .with_tree_states(tree_state_artifacts)
+                .with_block_blobs(block_blob_artifacts)
+                .with_tree_states(tree_state_checkpoint_artifacts)
                 .with_subtree_roots(subtree_root_artifacts)
                 .with_reorg_window_change(ReorgWindowChange::Extend { block_range });
-        if !self.transaction_artifacts.is_empty() {
+        if !self.address_output_index.is_empty() {
             chain_epoch_artifacts =
-                chain_epoch_artifacts.with_transactions(self.transaction_artifacts.clone());
+                chain_epoch_artifacts.with_address_output_index(self.address_output_index.clone());
         }
-        if !self.transparent_address_utxos.is_empty() {
-            chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transparent_address_utxos(self.transparent_address_utxos.clone());
-        }
-        if !self.transparent_prevouts.is_empty() {
+        if !self.transaction_rows.is_empty() {
+            let mut block_transaction_index = Vec::with_capacity(self.transaction_rows.len());
+            let mut transaction_locations = Vec::with_capacity(self.transaction_rows.len());
+            let mut transaction_facts = Vec::with_capacity(self.transaction_rows.len());
+            let mut transaction_blobs = Vec::new();
+            for transaction_rows in &self.transaction_rows {
+                block_transaction_index.push(transaction_rows.block_transaction_index);
+                transaction_locations.push(transaction_rows.location);
+                transaction_facts.push(transaction_rows.facts.clone());
+                if let Some(blob) = &transaction_rows.blob {
+                    transaction_blobs.push(blob.clone());
+                }
+            }
             chain_epoch_artifacts =
-                chain_epoch_artifacts.with_transparent_prevouts(self.transparent_prevouts.clone());
+                chain_epoch_artifacts.with_block_transaction_index(block_transaction_index);
+            chain_epoch_artifacts =
+                chain_epoch_artifacts.with_transaction_locations(transaction_locations);
+            chain_epoch_artifacts = chain_epoch_artifacts.with_transaction_facts(transaction_facts);
+            chain_epoch_artifacts = chain_epoch_artifacts.with_transaction_blobs(transaction_blobs);
         }
-        if !self.transparent_utxo_spends.is_empty() {
+        if !self.transparent_outputs_by_outpoint.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transparent_utxo_spends(self.transparent_utxo_spends.clone());
+                .with_transparent_outputs_by_outpoint(self.transparent_outputs_by_outpoint.clone());
+        }
+        if !self.transparent_spend_facts.is_empty() {
+            chain_epoch_artifacts = chain_epoch_artifacts
+                .with_transparent_spend_facts(self.transparent_spend_facts.clone());
         }
         if !self.transparent_address_tx_index.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
@@ -661,7 +790,7 @@ mod tests {
             .chain_epoch_artifacts(ChainEpochId::new(7))
             .ok_or("chain epoch artifacts should be available for a 4-block fixture")?;
 
-        assert_eq!(chain_epoch_artifacts.finalized_blocks.len(), 4);
+        assert_eq!(chain_epoch_artifacts.block_headers.len(), 4);
         assert_eq!(chain_epoch_artifacts.compact_blocks.len(), 4);
         assert_eq!(chain_epoch_artifacts.tree_states.len(), 4);
         assert_eq!(chain_epoch_artifacts.chain_epoch.tip_height.value(), 4);

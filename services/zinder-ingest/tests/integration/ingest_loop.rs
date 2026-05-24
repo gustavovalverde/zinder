@@ -14,7 +14,7 @@
 )]
 
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -28,9 +28,9 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex};
 use zinder_ingest::{
-    BulkCatchupConfig, IngestDeriveConfig, IngestLoopConfig, IngestModifiers, NodeSourceKind,
-    PhasesConfig, TipFollowPhaseConfig, TipFollowSubsystems, TipFollowSubsystemsLauncher,
-    run_ingest_loop,
+    BulkCatchupConfig, DeriveReplayPolicy, IngestDeriveConfig, IngestLoopConfig, IngestModifiers,
+    NodeSourceKind, PhasesConfig, TipFollowPhaseConfig, TipFollowSubsystems,
+    TipFollowSubsystemsLauncher, run_ingest_loop,
 };
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{
@@ -47,7 +47,6 @@ async fn ingest_loop_awaits_upstream_when_upstream_tip_is_zero() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let derive_store = test_derive_store(&storage_path)?;
     let source = ControllableTipSource::new(ChainFixture::new(Network::ZcashRegtest));
     source.set_tip_height(BlockHeight::new(0));
 
@@ -59,15 +58,14 @@ async fn ingest_loop_awaits_upstream_when_upstream_tip_is_zero() -> Result<()> {
     let loop_handle = {
         let readiness = readiness.clone();
         let store = store.clone();
-        let derive_store = derive_store.clone();
         let source = source.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
             run_ingest_loop(
                 &config,
+                Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
                 Arc::new(source),
                 store,
-                derive_store,
                 &readiness,
                 cancel,
                 Some(launcher),
@@ -91,7 +89,6 @@ async fn ingest_loop_stamps_following_tip_on_readiness_when_gap_is_small() -> Re
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let derive_store = test_derive_store(&storage_path)?;
     let source = ControllableTipSource::new(ChainFixture::new(Network::ZcashRegtest));
     source.set_tip_height(BlockHeight::new(1));
 
@@ -104,16 +101,15 @@ async fn ingest_loop_stamps_following_tip_on_readiness_when_gap_is_small() -> Re
     let loop_handle = {
         let readiness = readiness.clone();
         let store = store.clone();
-        let derive_store = derive_store.clone();
         let source = source.clone();
         let cancel = cancel.clone();
         let launcher = launcher.into_launcher();
         tokio::spawn(async move {
             run_ingest_loop(
                 &config,
+                Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
                 Arc::new(source),
                 store,
-                derive_store,
                 &readiness,
                 cancel,
                 Some(launcher),
@@ -139,7 +135,6 @@ async fn ingest_loop_exits_when_target_height_already_covered() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    let derive_store = test_derive_store(&storage_path)?;
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let artifacts = chain
         .chain_epoch_artifacts(zinder_core::ChainEpochId::new(1))
@@ -160,9 +155,9 @@ async fn ingest_loop_exits_when_target_height_already_covered() -> Result<()> {
         Duration::from_secs(5),
         run_ingest_loop(
             &config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             Arc::new(source),
             store,
-            derive_store,
             &readiness,
             cancel,
             Some(launcher),
@@ -187,18 +182,28 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: storage_path.to_path_buf(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         reorg_window_blocks: 100,
         phases: PhasesConfig {
             catchup_threshold_blocks: 100,
         },
         derive: IngestDeriveConfig {
-            concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+            replay_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+            replay_batch_blocks: NonZeroU32::new(100).ok_or_else(|| eyre!("nonzero"))?,
+            replay_policy: DeriveReplayPolicy::DEFAULT,
         },
         bulk_catchup: BulkCatchupConfig {
-            commit_batch_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
-            max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
+            canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
+            canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
-            fetch_concurrency: NonZeroU32::new(32).ok_or_else(|| eyre!("nonzero"))?,
+            source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
+            source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                .ok_or_else(|| eyre!("nonzero"))?,
+            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                .ok_or_else(|| eyre!("nonzero"))?,
+            source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                .ok_or_else(|| eyre!("nonzero"))?,
+            fact_build_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("nonzero"))?,
         },
         tip_follow: TipFollowPhaseConfig {
@@ -207,17 +212,6 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
         },
         modifiers: IngestModifiers::default(),
     })
-}
-
-fn test_derive_store(storage_path: &std::path::Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
-            sync_writes: false,
-            consumer_column_families: &[],
-            tuning: zinder_store::StorageTuning::for_local_tests(),
-        },
-    )?)
 }
 
 async fn wait_until_phase(readiness: &Readiness, target: IngestPhase) -> Result<()> {

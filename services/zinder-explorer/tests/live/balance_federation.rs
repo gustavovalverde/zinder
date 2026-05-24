@@ -11,7 +11,7 @@
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the
 //! ingest pipeline uses, and asserts that:
 //!
-//! - `WalletQueryApi::transparent_address_utxos` and
+//! - `WalletQueryApi::address_output_index` and
 //!   `ExplorerQuery::TransparentAddressBalance` agree on `confirmed_zat` for
 //!   the same address; the federated balance is the sum of the visible UTXO
 //!   values.
@@ -69,8 +69,8 @@ use zinder_testkit::{
 };
 
 use crate::common::{
-    fetch_live_tip_height, live_backfill_config, regtest_generate_blocks,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    regtest_generate_blocks, zebra_source_from_backfill,
 };
 
 /// Number of blocks below the tip to backfill.
@@ -150,8 +150,8 @@ impl FederatedBalanceFixture {
             Arc::new(sample_regtest_upgrade_activations()),
         );
         let utxos = wallet_query
-            .transparent_address_utxos(
-                zinder_query::TransparentAddressUtxosRequest {
+            .address_output_index(
+                zinder_query::AddressOutputIndexRequest {
                     address_script_hash: sample.address_script_hash,
                     start_height: sample.backfill_from_height,
                     max_entries: NonZeroU32::new(1024)
@@ -162,7 +162,7 @@ impl FederatedBalanceFixture {
             )
             .await?;
         let expected_confirmed_zat = utxos
-            .utxos
+            .outputs
             .iter()
             .map(|utxo| utxo.value_zat)
             .fold(0_u64, u64::saturating_add);
@@ -278,6 +278,7 @@ async fn backfill_and_sample_tip_coinbase(
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -285,6 +286,7 @@ async fn backfill_and_sample_tip_coinbase(
         tip_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        activations,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
@@ -349,16 +351,7 @@ async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
-    let probe_config = live_backfill_config(
-        &env,
-        std::path::Path::new("/tmp/zinder-mempool-overlay-schedule-probe"),
-        BlockHeight::new(1),
-        BlockHeight::new(1),
-        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid probe batch size"))?,
-        false,
-    );
-    let schedule = zebra_source_from_backfill(&probe_config)?
-        .fetch_network_upgrade_activations()
+    let schedule = fetch_live_network_upgrade_activations(&env)
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
@@ -691,6 +684,7 @@ async fn backfill_from_coinbase(
     let from_height = BlockHeight::new(checkpoint_height.value() + 1);
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -698,6 +692,7 @@ async fn backfill_from_coinbase(
         tip_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        activations,
     );
     backfill_config.node.request_timeout = std::cmp::max(
         backfill_config.node.request_timeout,

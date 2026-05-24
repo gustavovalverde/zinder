@@ -14,7 +14,7 @@
 
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
@@ -34,7 +34,7 @@ pub fn block_hash_from_seed(seed: u32) -> BlockHash {
 pub fn synthetic_chain_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let source_hash = block_hash_from_seed(height);
     let parent_hash = block_hash_from_seed(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
@@ -47,15 +47,21 @@ pub fn synthetic_chain_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        BlockHeaderArtifact::new(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").into_bytes(),
+            [0; 32],
+            [0; 32],
+            0,
+            0,
+            [0; 32],
+            0,
+            u64::try_from(format!("raw-block-{chain_epoch_id}-{height}").len()).unwrap_or(u64::MAX),
         ),
         CompactBlockArtifact::new(
             block_height,

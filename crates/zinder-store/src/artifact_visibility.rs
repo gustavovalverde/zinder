@@ -38,14 +38,18 @@ const fn artifact_family_label(family: ArtifactFamily) -> &'static str {
     match family {
         ArtifactFamily::ChainEpoch => "chain_epoch",
         ArtifactFamily::ChainEvent => "chain_event",
-        ArtifactFamily::FinalizedBlock => "finalized_block",
+        ArtifactFamily::BlockHeader => "block_header",
+        ArtifactFamily::BlockBlob => "block_blob",
         ArtifactFamily::CompactBlock => "compact_block",
-        ArtifactFamily::Transaction => "transaction",
+        ArtifactFamily::BlockTransactionIndex => "block_transaction_index",
+        ArtifactFamily::TransactionLocation => "transaction_location",
+        ArtifactFamily::TransactionFacts => "transaction_facts",
+        ArtifactFamily::TransactionBlob => "transaction_blob",
         ArtifactFamily::TreeState => "tree_state",
         ArtifactFamily::SubtreeRoot => "subtree_root",
-        ArtifactFamily::TransparentAddressUtxo => "transparent_address_utxo",
-        ArtifactFamily::TransparentPrevout => "transparent_prevout",
-        ArtifactFamily::TransparentUtxoSpend => "transparent_utxo_spend",
+        ArtifactFamily::AddressOutputIndex => "address_output_index",
+        ArtifactFamily::TransparentOutput => "transparent_output",
+        ArtifactFamily::TransparentSpendFact => "transparent_spend_fact",
         ArtifactFamily::TransparentAddressTxIndex => "transparent_address_tx_index",
         ArtifactFamily::BlockHashIndex => "block_hash_index",
         ArtifactFamily::MempoolEvent => "mempool_event",
@@ -80,7 +84,6 @@ pub(crate) fn decode_visible_source_epoch(
 pub(crate) enum HeightVisibilityIndex {
     FinalizedBlock,
     CompactBlock,
-    TreeState,
 }
 
 impl HeightVisibilityIndex {
@@ -88,7 +91,6 @@ impl HeightVisibilityIndex {
         match self {
             Self::FinalizedBlock => StoreKey::visible_block_epoch_prefix(network, height),
             Self::CompactBlock => StoreKey::visible_compact_block_epoch_prefix(network, height),
-            Self::TreeState => StoreKey::visible_tree_state_epoch_prefix(network, height),
         }
     }
 
@@ -103,7 +105,6 @@ impl HeightVisibilityIndex {
             Self::CompactBlock => {
                 StoreKey::visible_compact_block_epoch(network, height, chain_epoch)
             }
-            Self::TreeState => StoreKey::visible_tree_state_epoch(network, height, chain_epoch),
         }
     }
 }

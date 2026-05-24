@@ -3,6 +3,7 @@
 //! `zinder-store` exposes domain-shaped commit and read APIs while keeping
 //! `RocksDB` handles, column families, and write batches private to the adapter.
 
+mod address_output_index;
 mod artifact_visibility;
 mod block_artifact;
 mod block_hash_index;
@@ -22,11 +23,14 @@ mod store_error;
 mod subtree_root;
 mod transaction_artifact;
 mod transparent_address_tx_index;
-mod transparent_prevout;
-mod transparent_utxo;
+mod transparent_output;
+mod transparent_spend_fact;
 mod tree_state;
 
-pub use block_artifact::{CompactBlockStore, FinalizedBlockStore};
+pub use address_output_index::AddressOutputIndexStore;
+pub use block_artifact::{
+    BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
+};
 pub use block_hash_index::BlockHashLookup;
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
@@ -36,17 +40,17 @@ pub use chain_event::{
 };
 pub use chain_event_stream::run_chain_event_stream;
 pub use chain_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochReadApi, ChainEventHistoryRequest,
-    ChainEventRetentionReport, ChainStoreOptions, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
-    MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, SecondaryCatchupOutcome,
-    SecondaryChainStore, TransparentAddressTxIndexPage, TransparentAddressTxIndexPageRequest,
-    TransparentAddressUtxosPage, TransparentAddressUtxosPageRequest,
+    AddressOutputIndexPage, AddressOutputIndexPageRequest, CURRENT_ARTIFACT_SCHEMA_VERSION,
+    ChainEpochReadApi, ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
+    PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, TransparentAddressTxIndexPage,
+    TransparentAddressTxIndexPageRequest,
 };
 pub use format::{
-    ChainEventStreamFamily, MempoolEventCursorPayload, MempoolEventStreamFamily,
-    STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
-    TransparentHistoryCursorAnchor, TransparentHistoryCursorPayload,
-    TransparentHistoryStreamFamily, TransparentUtxoCursorPayload, TransparentUtxoStreamFamily,
+    AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
+    MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
+    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
+    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
 };
 pub use grpc_status::status_from_store_error;
 pub use kv::{
@@ -65,13 +69,14 @@ pub use proto_codec::{
     mempool_event_envelope_message, outpoint_from_message, outpoint_message,
     stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
     transparent_mempool_output_message, transparent_mempool_spend_from_message,
-    transparent_mempool_spend_message, transparent_prevout_entry_message,
-    transparent_prevout_message,
+    transparent_mempool_spend_message, transparent_output_entry_message,
+    transparent_output_message,
 };
 pub use storage_tuning::StorageTuning;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
-pub use transaction_artifact::TransactionArtifactStore;
+pub use transaction_artifact::{
+    TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
+};
 pub use transparent_address_tx_index::TransparentAddressTxIndexStore;
-pub use transparent_utxo::TransparentUtxoStore;
 pub use tree_state::TreeStateStore;

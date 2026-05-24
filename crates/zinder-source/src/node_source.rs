@@ -9,7 +9,9 @@ use zinder_core::{
 };
 
 use crate::{
-    NodeCapabilities, SourceBlock, SourceError, SourceSubtreeRoots, UpstreamHealthSnapshot,
+    NodeCapabilities, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceChainUpdate,
+    SourceError, SourceSubtreeRoots, SourceTreeState, UpstreamHealthSnapshot,
+    source_chain_update::SourceChainCursorPosition,
 };
 
 /// Configured upstream node source for ingestion.
@@ -20,6 +22,86 @@ pub trait NodeSource: Send + Sync + 'static {
 
     /// Fetches one block by height from the configured node.
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
+
+    /// Fetches a bounded ordered segment after `cursor`.
+    ///
+    /// Sources that can batch or stream upstream observations override this
+    /// method. The default implementation preserves the final
+    /// [`SourceChainUpdate`] boundary by fetching connected blocks one at a
+    /// time with [`Self::fetch_block_at`].
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        let observed_tip_id = self.tip_id().await?;
+        let (start_height, expected_parent_hash) = match limits.cursor.position() {
+            SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+            SourceChainCursorPosition::AtBlock(block_id) => {
+                if observed_tip_id.height < block_id.height
+                    || (observed_tip_id.height == block_id.height
+                        && observed_tip_id.hash != block_id.hash)
+                {
+                    return Ok(SourceChainSegment::new([
+                        SourceChainUpdate::reverted_block(block_id),
+                    ]));
+                }
+                if observed_tip_id.height == block_id.height {
+                    return Ok(SourceChainSegment::default());
+                }
+                let Some(next_height) = block_id.height.next() else {
+                    return Ok(SourceChainSegment::default());
+                };
+                (next_height, Some(block_id.hash))
+            }
+        };
+        if observed_tip_id.height < start_height {
+            return Ok(SourceChainSegment::default());
+        }
+
+        let end_height = bounded_segment_end_height(
+            start_height,
+            observed_tip_id.height,
+            limits.max_connected_blocks,
+        );
+        let mut blocks = Vec::with_capacity(block_height_span_len(start_height, end_height));
+        let mut next_height = Some(start_height);
+        while let Some(height) = next_height {
+            if height > end_height {
+                break;
+            }
+            let block = self.fetch_block_at(height).await?;
+            if let Some(expected_parent_hash) = expected_parent_hash
+                && blocks.is_empty()
+                && block.parent_hash != expected_parent_hash
+            {
+                let block_id = BlockId::new(
+                    start_height
+                        .value()
+                        .checked_sub(1)
+                        .map_or(start_height, BlockHeight::new),
+                    expected_parent_hash,
+                );
+                return Ok(SourceChainSegment::new([
+                    SourceChainUpdate::reverted_block(block_id),
+                ]));
+            }
+            blocks.push(block);
+            next_height = height.next();
+        }
+
+        Ok(SourceChainSegment::connected_blocks(blocks))
+    }
+
+    /// Fetches a tree-state payload for one already-identified block.
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError> {
+        let _ = block_id;
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::TreeState,
+        })
+    }
 
     /// Returns the node's current best tip identity (height and hash).
     ///
@@ -104,6 +186,28 @@ where
             None => Err(SourceError::TransactionBroadcastDisabled),
         }
     }
+}
+
+fn bounded_segment_end_height(
+    start_height: BlockHeight,
+    tip_height: BlockHeight,
+    max_connected_blocks: NonZeroU32,
+) -> BlockHeight {
+    let last_requested_height = start_height
+        .value()
+        .saturating_add(max_connected_blocks.get().saturating_sub(1));
+    BlockHeight::new(last_requested_height.min(tip_height.value()))
+}
+
+fn block_height_span_len(start_height: BlockHeight, end_height: BlockHeight) -> usize {
+    if end_height < start_height {
+        return 0;
+    }
+    let len = end_height
+        .value()
+        .saturating_sub(start_height.value())
+        .saturating_add(1);
+    usize::try_from(len).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

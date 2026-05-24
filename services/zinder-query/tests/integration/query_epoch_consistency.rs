@@ -12,8 +12,8 @@ use zinder_core::{
     SubtreeRootRange, TreeStateArtifact,
 };
 use zinder_query::{
-    WalletQuery, WalletQueryApi, latest_block_response, latest_tree_state_response,
-    subtree_roots_response, tree_state_response,
+    WalletQuery, WalletQueryApi, latest_block_response, latest_tree_state_checkpoint_response,
+    subtree_roots_response, tree_state_checkpoint_response,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochReadApi, ChainEpochReader, ChainEventEnvelope,
@@ -105,7 +105,7 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
 }
 
 #[tokio::test]
-async fn tree_state_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
+async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -133,7 +133,8 @@ async fn tree_state_response_stays_bound_to_reader_epoch_if_current_epoch_advanc
     let wallet_query =
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
-    let response = tree_state_response(&wallet_query, first_tree_state.height, None).await?;
+    let response =
+        tree_state_checkpoint_response(&wallet_query, first_tree_state.height, None).await?;
     let response_chain_epoch = response
         .chain_epoch
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
@@ -147,7 +148,7 @@ async fn tree_state_response_stays_bound_to_reader_epoch_if_current_epoch_advanc
 }
 
 #[tokio::test]
-async fn latest_tree_state_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
+async fn latest_tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -175,7 +176,7 @@ async fn latest_tree_state_response_stays_bound_to_reader_epoch_if_current_epoch
     let wallet_query =
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
-    let response = latest_tree_state_response(&wallet_query, None).await?;
+    let response = latest_tree_state_checkpoint_response(&wallet_query, None).await?;
     let response_chain_epoch = response
         .chain_epoch
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
@@ -277,11 +278,11 @@ impl ChainEpochReadApi for CommitAfterReaderReadApi {
         self.store.chain_event_history(request)
     }
 
-    fn transparent_address_utxos_page(
+    fn address_output_index_page(
         &self,
-        request: zinder_store::TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<zinder_store::TransparentAddressUtxosPage, StoreError> {
-        self.store.transparent_address_utxos_page(request)
+        request: zinder_store::AddressOutputIndexPageRequest<'_>,
+    ) -> Result<zinder_store::AddressOutputIndexPage, StoreError> {
+        self.store.address_output_index_page(request)
     }
 
     fn transparent_address_tx_index_page(

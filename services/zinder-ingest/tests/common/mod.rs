@@ -10,7 +10,13 @@
     reason = "Each live test file consumes only a subset of the common helpers."
 )]
 
-use std::{num::NonZeroU32, path::Path, process::Command, sync::Arc, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use eyre::{Result, eyre};
 use prost::Message;
@@ -37,7 +43,7 @@ use zinder_proto::{
 };
 use zinder_query::{
     ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter, latest_block_response,
-    latest_tree_state_response, subtree_roots_response, tree_state_response,
+    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_checkpoint_response,
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
@@ -67,21 +73,30 @@ pub(crate) fn live_backfill_config(
     storage_path: &Path,
     from_height: BlockHeight,
     to_height: BlockHeight,
-    commit_batch_blocks: NonZeroU32,
+    canonical_batch_max_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> BackfillConfig {
-    const FETCH_CONCURRENCY: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
+    const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
     BackfillConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations,
         from_height,
         to_height,
-        commit_batch_blocks,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::MIN.saturating_add(249_999),
-        fetch_concurrency: FETCH_CONCURRENCY,
-        derive_concurrency: FETCH_CONCURRENCY,
+        canonical_batch_max_blocks,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        fact_build_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
         allow_near_tip_finalize,
@@ -95,11 +110,14 @@ pub(crate) fn live_tip_follow_config(
     storage_path: &Path,
     reorg_window_blocks: u32,
     poll_interval: Duration,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> TipFollowConfig {
     TipFollowConfig {
         node: env.target.clone(),
         storage_path: storage_path.to_owned(),
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations,
         reorg_window_blocks,
         poll_interval,
         lag_threshold_blocks: DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
@@ -308,8 +326,8 @@ pub(crate) async fn assert_native_wallet_read_responses(
     assert_native_compact_block_range_chunks(&wallet_query, network, start_height, end_height)
         .await?;
     assert_native_latest_block_response(&wallet_query, network, end_height).await?;
-    assert_native_tree_state_response(&wallet_query, network, end_height).await?;
-    assert_native_latest_tree_state_response(&wallet_query, network, end_height).await?;
+    assert_native_tree_state_checkpoint_response(&wallet_query, network, end_height).await?;
+    assert_native_latest_tree_state_checkpoint_response(&wallet_query, network, end_height).await?;
     assert_native_subtree_roots_response(&wallet_query, network).await?;
     assert_native_wallet_grpc_responses(store, network, start_height, end_height, &activations)
         .await?;
@@ -401,7 +419,7 @@ async fn assert_lightwalletd_trait_responses(
     .await?
     .into_inner();
     let compact_blocks = collect_lightwalletd_stream(block_range).await?;
-    let latest_tree_state = LightwalletdCompactTxStreamer::get_latest_tree_state(
+    let latest_tree_state_checkpoint = LightwalletdCompactTxStreamer::get_latest_tree_state(
         grpc_adapter,
         Request::new(lightwalletd::Empty {}),
     )
@@ -426,8 +444,11 @@ async fn assert_lightwalletd_trait_responses(
             .height,
         u64::from(start_height)
     );
-    assert_eq!(latest_tree_state.network, encode_bip70_chain_name(network));
-    assert_eq!(latest_tree_state.height, u64::from(end_height));
+    assert_eq!(
+        latest_tree_state_checkpoint.network,
+        encode_bip70_chain_name(network)
+    );
+    assert_eq!(latest_tree_state_checkpoint.height, u64::from(end_height));
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, encode_bip70_chain_name(network));
     assert_eq!(lightd_info.block_height, u64::from(end_height));
@@ -500,7 +521,7 @@ async fn assert_generated_lightwalletd_client_responses(
         })
         .await?
         .into_inner();
-    let latest_tree_state = client
+    let latest_tree_state_checkpoint = client
         .get_latest_tree_state(lightwalletd::Empty {})
         .await?
         .into_inner();
@@ -515,9 +536,12 @@ async fn assert_generated_lightwalletd_client_responses(
         compact_blocks.len(),
         usize::try_from(end_height - start_height + 1)?
     );
-    assert_eq!(latest_tree_state.network, encode_bip70_chain_name(network));
-    assert_eq!(latest_tree_state.height, u64::from(end_height));
-    assert!(!latest_tree_state.hash.is_empty());
+    assert_eq!(
+        latest_tree_state_checkpoint.network,
+        encode_bip70_chain_name(network)
+    );
+    assert_eq!(latest_tree_state_checkpoint.height, u64::from(end_height));
+    assert!(!latest_tree_state_checkpoint.hash.is_empty());
 
     for (offset, compact_block) in compact_blocks.iter().enumerate() {
         let offset = u64::try_from(offset)?;
@@ -564,18 +588,18 @@ async fn assert_native_wallet_grpc_responses(
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
         compact_block_range.push(compact_block_chunk?);
     }
-    let tree_state = WalletQueryService::tree_state(
+    let tree_state = WalletQueryService::tree_state_checkpoint(
         &grpc_adapter,
-        Request::new(wallet::TreeStateRequest {
-            height: end_height,
+        Request::new(wallet::TreeStateCheckpointRequest {
+            max_height: end_height,
             at_epoch: None,
         }),
     )
     .await?
     .into_inner();
-    let latest_tree_state = WalletQueryService::latest_tree_state(
+    let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         &grpc_adapter,
-        Request::new(wallet::LatestTreeStateRequest { at_epoch: None }),
+        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch: None }),
     )
     .await?
     .into_inner();
@@ -585,7 +609,7 @@ async fn assert_native_wallet_grpc_responses(
         assert_native_grpc_response_epoch(compact_block_chunk, network, end_height)?;
     }
     assert_native_grpc_response_epoch(&tree_state, network, end_height)?;
-    assert_native_grpc_response_epoch(&latest_tree_state, network, end_height)?;
+    assert_native_grpc_response_epoch(&latest_tree_state_checkpoint, network, end_height)?;
 
     assert_eq!(
         latest_block
@@ -610,8 +634,8 @@ async fn assert_native_wallet_grpc_responses(
     }
     assert_eq!(tree_state.height, end_height);
     assert!(!tree_state.payload_bytes.is_empty());
-    assert_eq!(latest_tree_state.height, end_height);
-    assert!(!latest_tree_state.payload_bytes.is_empty());
+    assert_eq!(latest_tree_state_checkpoint.height, end_height);
+    assert!(!latest_tree_state_checkpoint.payload_bytes.is_empty());
 
     for protocol in [
         wallet::ShieldedProtocol::Sapling,
@@ -827,12 +851,13 @@ async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
     Ok(())
 }
 
-async fn assert_native_tree_state_response<QueryApi: WalletQueryApi>(
+async fn assert_native_tree_state_checkpoint_response<QueryApi: WalletQueryApi>(
     wallet_query: &QueryApi,
     network: Network,
     end_height: u32,
 ) -> Result<()> {
-    let response = tree_state_response(wallet_query, BlockHeight::new(end_height), None).await?;
+    let response =
+        tree_state_checkpoint_response(wallet_query, BlockHeight::new(end_height), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
@@ -850,12 +875,12 @@ async fn assert_native_tree_state_response<QueryApi: WalletQueryApi>(
     Ok(())
 }
 
-async fn assert_native_latest_tree_state_response<QueryApi: WalletQueryApi>(
+async fn assert_native_latest_tree_state_checkpoint_response<QueryApi: WalletQueryApi>(
     wallet_query: &QueryApi,
     network: Network,
     end_height: u32,
 ) -> Result<()> {
-    let response = latest_tree_state_response(wallet_query, None).await?;
+    let response = latest_tree_state_checkpoint_response(wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
@@ -965,7 +990,7 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.bulk_catchup]
-commit_batch_blocks = 1000
+canonical_batch_max_blocks = 1000
 
 [ingest.modifiers]
 target_height = {}
@@ -1013,7 +1038,7 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.bulk_catchup]
-commit_batch_blocks = 50
+canonical_batch_max_blocks = 50
 
 [ingest.modifiers]
 coverage = "wallet-serving"

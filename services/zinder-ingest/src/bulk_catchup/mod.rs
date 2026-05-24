@@ -1,17 +1,27 @@
 use std::{
+    collections::VecDeque,
     future::Future,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use futures_util::stream::StreamExt;
+use futures_util::{
+    FutureExt,
+    future::BoxFuture,
+    stream::{self, FuturesOrdered, Stream, StreamExt},
+};
+use parking_lot::Mutex;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
+    BlockHeight, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata, ConsensusBranchId, Network,
+    NetworkUpgradeActivations, TreeStateArtifact,
 };
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
 use zinder_source::{
-    NodeSource, NodeTarget, SourceBlock, SourceChainCheckpoint, SourceFailureClass,
+    NodeSource, NodeTarget, SourceBlock, SourceChainCheckpoint, SourceChainCursor,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
+    SourceError, SourceFailureClass,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
@@ -19,14 +29,16 @@ use zinder_store::{
 };
 
 use crate::artifact_builder::{
-    CommitmentTreeSizes, DerivedBlockArtifacts, derive_block, finalize_derived_block,
+    CommitmentTreeSizes, DerivedBlockArtifacts, RawBlobPolicy, derive_block_with_raw_blob_policy,
+    finalize_derived_block,
 };
 use crate::chain_ingest::{
-    IngestBatch, IngestBatchBudget, IngestBatchCommitTrigger, IngestBatchWorkCost, IngestError,
-    IngestRetryState, IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch,
-    current_unix_millis, fetch_block_with_retry, ingest_error_class, next_chain_epoch_id,
-    next_chain_epoch_id_after, populate_subtree_root_artifacts, record_ingest_batch_commit_trigger,
-    record_ingest_batch_work_cost, record_ingest_derive_outcome,
+    CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
+    IngestError, IngestRetryState, IngestSubtreeRootIndexes, NodeSourceKind, commit_ingest_batch,
+    current_unix_millis, fetch_chain_segment_with_retry, fetch_tree_state_for_block_with_retry,
+    ingest_error_class, next_chain_epoch_id, next_chain_epoch_id_after,
+    populate_subtree_root_artifacts, record_ingest_batch_commit_trigger,
+    record_ingest_batch_work_cost, record_ingest_fact_build_outcome,
 };
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
@@ -34,7 +46,12 @@ use crate::source_recovery::{
     detail_for_ongoing_outage,
 };
 
-const BACKFILL_STAGE_AWAIT_DERIVED_BLOCK: &str = "await_derived_block";
+const SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT: usize = 64;
+const SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT: u32 = 8;
+const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
+const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
+
+const BACKFILL_STAGE_AWAIT_FACT_BUILD: &str = "await_fact_build";
 const BACKFILL_STAGE_POPULATE_SUBTREE_ROOTS: &str = "populate_subtree_roots";
 const BACKFILL_STAGE_FLUSH_STORE: &str = "flush_store";
 
@@ -55,27 +72,39 @@ pub struct BackfillConfig {
     /// Last block height to backfill.
     pub to_height: BlockHeight,
     /// Maximum number of blocks committed in one chain epoch.
-    pub commit_batch_blocks: NonZeroU32,
-    /// Maximum unique transparent prevouts read from the store per chain epoch.
-    pub max_transparent_prevout_store_lookups_per_batch: NonZeroU32,
-    /// Number of historical block fetches kept in flight against the
-    /// upstream node. Zebra's JSON-RPC serves one fetch per request and
-    /// each block costs three concurrent calls (`getblockheader`,
-    /// `getblock`, `z_gettreestate`); buffering hides the round-trip
-    /// latency until the node's connection pool or CPU saturates.
-    /// Operator-tunable via `ingest.bulk_catchup.fetch_concurrency`.
-    pub fetch_concurrency: NonZeroU32,
+    pub canonical_batch_max_blocks: NonZeroU32,
+    /// Maximum in-memory canonical artifact bytes accumulated before commit.
+    pub canonical_batch_max_artifact_bytes: NonZeroU64,
+    /// Maximum connected blocks requested from the source adapter in one
+    /// bounded bulk-catchup segment.
+    ///
+    /// Zebra JSON-RPC batches the segment into one JSON-RPC request containing
+    /// raw `getblock` calls. Checkpoint tree state is fetched separately for
+    /// committed epoch tips. Future streaming sources can satisfy the same
+    /// boundary without changing canonical ingest.
+    /// Operator-tunable via `ingest.bulk_catchup.source_segment_max_blocks`.
+    pub source_segment_max_blocks: NonZeroU32,
+    /// Target JSON-RPC response body size for adaptive source segments.
+    pub source_segment_target_response_bytes: NonZeroU64,
+    /// Maximum concurrent source segment requests.
+    pub source_fetch_max_in_flight_requests: NonZeroU32,
+    /// Maximum reserved response bytes across source segment requests.
+    pub source_fetch_max_in_flight_bytes: NonZeroU64,
     /// Number of parallel `derive_block` invocations kept in flight on the
     /// Tokio blocking pool. Per-block derivation is CPU-bound (block
     /// deserialization, per-tx canonical re-serialization, compact-block
     /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
     /// scales nearly linearly with cores up to the commit-batch boundary.
-    /// Operator-tunable via `ingest.derive.concurrency`.
-    /// See [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub derive_concurrency: NonZeroU32,
+    /// Operator-tunable via `ingest.bulk_catchup.fact_build_concurrency`.
+    /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
+    pub fact_build_concurrency: NonZeroU32,
     /// Force a `RocksDB` flush after committing this many epochs. See
     /// [`crate::BulkCatchupConfig::flush_interval_epochs`].
     pub flush_interval_epochs: NonZeroU32,
+    /// Optional raw-byte blob write policy.
+    pub raw_blob_policy: RawBlobPolicy,
+    /// Node-discovered consensus upgrade activations used for transaction facts.
+    pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     /// Pre-observed upstream tip height. When set, `backfill_with_store`
     /// uses this in place of an internal `tip_id()` round-trip for its
     /// finality-bound validation. The unified ingest loop reuses the tip
@@ -94,15 +123,16 @@ pub struct BackfillConfig {
     pub checkpoint: Option<SourceChainCheckpoint>,
 }
 
-/// Mutable flush cadence carried across bulk-catchup backfill batches.
+/// Mutable bulk-catchup state carried across backfill batches.
 ///
 /// The unified ingest loop invokes `backfill_until_complete` once per
 /// bulk-catchup batch so it can re-classify the phase after each commit.
-/// This state keeps the WAL flush cadence tied to committed epochs rather
-/// than to that one-batch call boundary.
-#[derive(Debug, Default)]
+/// This state keeps the WAL flush cadence and source-density sizing tied to
+/// the continuous bulk range rather than to that one-batch call boundary.
+#[derive(Default)]
 pub(crate) struct BackfillFlushState {
     epochs_since_last_flush: u32,
+    source_segment_sizer: Option<Arc<Mutex<SourceSegmentSizer>>>,
 }
 
 impl BackfillFlushState {
@@ -120,6 +150,21 @@ impl BackfillFlushState {
 
     fn has_pending_epochs(&self) -> bool {
         self.epochs_since_last_flush > 0
+    }
+
+    fn source_segment_sizer(
+        &mut self,
+        config: &BackfillConfig,
+        from_height: BlockHeight,
+    ) -> Arc<Mutex<SourceSegmentSizer>> {
+        Arc::clone(self.source_segment_sizer.get_or_insert_with(|| {
+            Arc::new(Mutex::new(SourceSegmentSizer::new(
+                config.source_segment_max_blocks,
+                config.source_segment_target_response_bytes,
+                Arc::clone(&config.network_upgrade_activations),
+                from_height,
+            )))
+        }))
     }
 
     #[cfg(test)]
@@ -149,7 +194,6 @@ pub(crate) struct BackfillRunContext<'a, Source> {
     config: &'a BackfillConfig,
     source: &'a Source,
     store: &'a PrimaryChainStore,
-    derive_store: &'a zinder_derive::DeriveStore,
 }
 
 impl<'a, Source> BackfillRunContext<'a, Source> {
@@ -157,13 +201,11 @@ impl<'a, Source> BackfillRunContext<'a, Source> {
         config: &'a BackfillConfig,
         source: &'a Source,
         store: &'a PrimaryChainStore,
-        derive_store: &'a zinder_derive::DeriveStore,
     ) -> Self {
         Self {
             config,
             source,
             store,
-            derive_store,
         }
     }
 }
@@ -189,11 +231,7 @@ where
         ..ChainStoreOptions::for_network(config.node.network)
     };
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    let derive_store = crate::derive_consumers::open_primary_derive_store_for_canonical(
-        &config.storage_path,
-        config.storage_tuning,
-    )?;
-    backfill_with_store(config, source, &store, &derive_store).await
+    backfill_with_store(config, source, &store).await
 }
 
 /// Runs a historical backfill against a caller-owned [`PrimaryChainStore`].
@@ -217,13 +255,12 @@ pub async fn backfill_with_store<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
     let mut flush_state = BackfillFlushState::default();
-    let run = BackfillRunContext::new(config, source, store, derive_store);
+    let run = BackfillRunContext::new(config, source, store);
     backfill_with_store_inner(
         &run,
         &mut flush_state,
@@ -289,14 +326,13 @@ pub async fn backfill_until_complete<Source>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     readiness: &Readiness,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
     Source: NodeSource,
 {
     let mut flush_state = BackfillFlushState::default();
-    let run = BackfillRunContext::new(config, source, store, derive_store);
+    let run = BackfillRunContext::new(config, source, store);
     backfill_until_complete_inner(
         &run,
         readiness,
@@ -443,39 +479,45 @@ where
 {
     let config = run.config;
     let request_timeout = config.node.request_timeout;
+    let raw_blob_policy = config.raw_blob_policy;
+    let network_upgrade_activations = Arc::clone(&config.network_upgrade_activations);
     #[allow(
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let fetch_concurrency = config.fetch_concurrency.get() as usize;
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
-    )]
-    let derive_concurrency = config.derive_concurrency.get() as usize;
-    let derive_stream = build_derive_stream(
+    let fact_build_concurrency = config.fact_build_concurrency.get() as usize;
+    let fact_build_stream = build_fact_build_stream(
         run.source,
-        BackfillDeriveStreamConfig {
+        BackfillFactBuildStreamConfig {
             request_timeout,
             from_height: backfill_start.from_height,
             to_height: config.to_height,
-            fetch_concurrency,
-            derive_concurrency,
+            max_response_bytes: config.node.max_response_bytes,
+            target_response_payload_bytes: config.source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            source_segment_sizer: flush_state
+                .source_segment_sizer(config, backfill_start.from_height),
+            fact_build_concurrency,
         },
-        |source_block| async move {
-            tokio::task::spawn_blocking(move || {
-                derive_block(&source_block).map_err(IngestError::from)
-            })
-            .await
-            .map_err(|join_error| IngestError::BlockingTaskFailed {
-                reason: join_error.to_string(),
-            })?
+        move |source_block| {
+            let activations = Arc::clone(&network_upgrade_activations);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    derive_block_with_raw_blob_policy(&source_block, &activations, raw_blob_policy)
+                        .map_err(IngestError::from)
+                })
+                .await
+                .map_err(|join_error| IngestError::BlockingTaskFailed {
+                    reason: join_error.to_string(),
+                })?
+            }
         },
     );
 
     run_backfill_commit_loop(
         run,
-        derive_stream,
+        fact_build_stream,
         backfill_start,
         flush_state,
         completion_flush,
@@ -483,56 +525,613 @@ where
     .await
 }
 
-#[derive(Clone, Copy)]
-struct BackfillDeriveStreamConfig {
+struct BackfillFactBuildStreamConfig {
     request_timeout: Duration,
     from_height: BlockHeight,
     to_height: BlockHeight,
-    fetch_concurrency: usize,
-    derive_concurrency: usize,
+    max_response_bytes: NonZeroU64,
+    target_response_payload_bytes: NonZeroU64,
+    source_fetch_max_in_flight_requests: NonZeroU32,
+    source_fetch_max_in_flight_bytes: NonZeroU64,
+    source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+    fact_build_concurrency: usize,
 }
 
-fn build_derive_stream<'a, Source, F, Fut>(
+fn build_fact_build_stream<'a, Source, F, Fut>(
     source: &'a Source,
-    config: BackfillDeriveStreamConfig,
+    config: BackfillFactBuildStreamConfig,
     derive_fn: F,
-) -> impl futures_util::Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Unpin + 'a
+) -> impl Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a
 where
     Source: NodeSource + 'a,
-    F: Fn(SourceBlock) -> Fut + Copy + 'a,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + 'a,
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
 {
-    // Pipeline per-block fetches and derives with bounded concurrency.
-    // The commit path stays strictly ordered because both `buffered`
-    // slot pools yield completed futures in submission order.
-    futures_util::stream::iter(BlockHeightRange::inclusive(
-        config.from_height,
-        config.to_height,
-    ))
-    .map(move |height| {
-        let mut fetch_retry_state = IngestRetryState::default();
-        async move {
-            fetch_block_with_retry(
-                config.request_timeout,
-                source,
-                height,
-                &mut fetch_retry_state,
-            )
-            .await
-        }
+    let fact_build_concurrency = config.fact_build_concurrency;
+    build_source_block_stream(source, config)
+        .map(move |source_block_result| {
+            let derive_fn = derive_fn.clone();
+            async move {
+                let source_block = source_block_result?;
+                let fact_build_started_at = Instant::now();
+                let fact_build_outcome = derive_fn(source_block).await;
+                record_ingest_fact_build_outcome(fact_build_started_at, &fact_build_outcome);
+                fact_build_outcome
+            }
+        })
+        .buffered(fact_build_concurrency.max(1))
+}
+
+struct SourceBlockStreamState<'a, Source> {
+    source: &'a Source,
+    request_timeout: Duration,
+    to_height: BlockHeight,
+    source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+    max_response_bytes: NonZeroU64,
+    target_response_payload_bytes: NonZeroU64,
+    source_fetch_max_in_flight_requests: NonZeroU32,
+    source_fetch_max_in_flight_bytes: NonZeroU64,
+    in_flight_source_bytes: u64,
+    next_fetch_height: Option<BlockHeight>,
+    in_flight_segments: FuturesOrdered<BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>>,
+    pending_blocks: VecDeque<SourceBlock>,
+    last_connected_block_id: Option<BlockId>,
+}
+
+fn build_source_block_stream<'a, Source>(
+    source: &'a Source,
+    config: BackfillFactBuildStreamConfig,
+) -> impl Stream<Item = Result<SourceBlock, IngestError>> + Send + 'a
+where
+    Source: NodeSource + 'a,
+{
+    let state = SourceBlockStreamState {
+        source,
+        request_timeout: config.request_timeout,
+        to_height: config.to_height,
+        source_segment_sizer: config.source_segment_sizer,
+        max_response_bytes: config.max_response_bytes,
+        target_response_payload_bytes: config.target_response_payload_bytes,
+        source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+        in_flight_source_bytes: 0,
+        next_fetch_height: Some(config.from_height),
+        in_flight_segments: FuturesOrdered::new(),
+        pending_blocks: VecDeque::new(),
+        last_connected_block_id: None,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        let next_block = next_source_block_from_segment(&mut state).await;
+        next_block.map(|block_result| (block_result, state))
     })
-    .buffered(config.fetch_concurrency)
-    .map(move |fetch_result| {
-        let derive_fn = derive_fn;
-        async move {
-            let source_block = fetch_result?;
-            let derive_started_at = Instant::now();
-            let derive_outcome = derive_fn(source_block).await;
-            record_ingest_derive_outcome(derive_started_at, &derive_outcome);
-            derive_outcome
+}
+
+async fn next_source_block_from_segment<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+) -> Option<Result<SourceBlock, IngestError>>
+where
+    Source: NodeSource,
+{
+    loop {
+        if let Some(block) = state.pending_blocks.pop_front() {
+            return Some(Ok(block));
         }
-    })
-    .buffered(config.derive_concurrency)
+
+        fill_source_segment_prefetch_queue(state);
+        let prefetched_segment = match state.in_flight_segments.next().await {
+            Some(Ok(prefetched_segment)) => prefetched_segment,
+            Some(Err(error)) => {
+                return Some(Err(error));
+            }
+            None => return None,
+        };
+        state.in_flight_source_bytes = state
+            .in_flight_source_bytes
+            .saturating_sub(prefetched_segment.reserved_response_bytes);
+        record_source_fetch_queue_state(state);
+        let segment = prefetched_segment.segment;
+        if segment.is_empty() {
+            return None;
+        }
+
+        state
+            .source_segment_sizer
+            .lock()
+            .record_segment(segment.stats());
+        if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
+            return Some(Err(error));
+        }
+    }
+}
+
+fn fill_source_segment_prefetch_queue<'a, Source>(state: &mut SourceBlockStreamState<'a, Source>)
+where
+    Source: NodeSource + 'a,
+{
+    while state.in_flight_segments.len()
+        < nonzero_u32_to_usize(state.source_fetch_max_in_flight_requests)
+    {
+        let Some(next_height) = state.next_fetch_height else {
+            break;
+        };
+        let Some(source_segment_max_blocks) = state
+            .source_segment_sizer
+            .lock()
+            .blocks_for_remaining_range(next_height, state.to_height)
+        else {
+            state.next_fetch_height = None;
+            break;
+        };
+
+        let cursor = SourceChainCursor::before_height(next_height);
+        let reserved_response_bytes = state
+            .target_response_payload_bytes
+            .get()
+            .min(state.max_response_bytes.get());
+        if !try_reserve_source_fetch_bytes(state, reserved_response_bytes) {
+            break;
+        }
+        state
+            .in_flight_segments
+            .push_back(fetch_prefetched_chain_segment(&SourceFetchRequest {
+                request_timeout: state.request_timeout,
+                source: state.source,
+                cursor,
+                max_connected_blocks: source_segment_max_blocks,
+                target_response_bytes: state.target_response_payload_bytes,
+                max_response_bytes: state.max_response_bytes,
+                reserved_response_bytes,
+            }));
+        record_source_fetch_queue_state(state);
+        state.next_fetch_height = next_height_after_segment(next_height, source_segment_max_blocks)
+            .filter(|height| *height <= state.to_height);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceFetchRequest<'a, Source> {
+    request_timeout: Duration,
+    source: &'a Source,
+    cursor: SourceChainCursor,
+    max_connected_blocks: NonZeroU32,
+    target_response_bytes: NonZeroU64,
+    max_response_bytes: NonZeroU64,
+    reserved_response_bytes: u64,
+}
+
+struct PrefetchedSourceSegment {
+    segment: SourceChainSegment,
+    reserved_response_bytes: u64,
+}
+
+fn fetch_prefetched_chain_segment<'a, Source>(
+    request: &SourceFetchRequest<'a, Source>,
+) -> BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>
+where
+    Source: NodeSource + 'a,
+{
+    let request_timeout = request.request_timeout;
+    let source = request.source;
+    let cursor = request.cursor;
+    let max_connected_blocks = request.max_connected_blocks;
+    let target_response_bytes = request.target_response_bytes;
+    let max_response_bytes = request.max_response_bytes;
+    let reserved_response_bytes = request.reserved_response_bytes;
+
+    async move {
+        let mut retry_state = IngestRetryState::default();
+        let limits = SourceChainSegmentLimits::new(
+            cursor,
+            max_connected_blocks,
+            target_response_bytes.get(),
+            max_response_bytes.get(),
+        );
+        let segment =
+            fetch_chain_segment_with_retry(request_timeout, source, limits, &mut retry_state)
+                .await?;
+        Ok(PrefetchedSourceSegment {
+            segment,
+            reserved_response_bytes,
+        })
+    }
+    .boxed()
+}
+
+fn try_reserve_source_fetch_bytes<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+    reserved_response_bytes: u64,
+) -> bool {
+    let max_in_flight_bytes = state.source_fetch_max_in_flight_bytes.get();
+    if state.in_flight_source_bytes == 0 && reserved_response_bytes > max_in_flight_bytes {
+        state.in_flight_source_bytes = reserved_response_bytes;
+        return true;
+    }
+    let Some(next_in_flight_bytes) = state
+        .in_flight_source_bytes
+        .checked_add(reserved_response_bytes)
+    else {
+        return false;
+    };
+    if next_in_flight_bytes > max_in_flight_bytes {
+        return false;
+    }
+    state.in_flight_source_bytes = next_in_flight_bytes;
+    true
+}
+
+fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
+    metrics::gauge!("zinder_ingest_source_fetch_queue_requests").set(f64::from(
+        usize_to_u32_saturating(state.in_flight_segments.len()),
+    ));
+    metrics::gauge!("zinder_ingest_source_fetch_queue_bytes")
+        .set(u64_to_f64(state.in_flight_source_bytes));
+}
+
+fn enqueue_source_segment_max_blocks<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+    segment: SourceChainSegment,
+) -> Result<(), IngestError>
+where
+    Source: NodeSource,
+{
+    let mut connected_blocks = 0_u32;
+    for update in segment.into_updates() {
+        match update {
+            SourceChainUpdate::ConnectedBlock { block, .. } => {
+                validate_prefetched_block_link(state.last_connected_block_id, &block)?;
+                state.last_connected_block_id = Some(BlockId::new(block.height, block.hash));
+                if block.height <= state.to_height {
+                    connected_blocks = connected_blocks.saturating_add(1);
+                    state.pending_blocks.push_back(block);
+                }
+            }
+            SourceChainUpdate::RevertedBlock { block_id, .. } => {
+                return Err(IngestError::from(SourceError::BlockReorgDuringFetch {
+                    height: block_id.height,
+                    reason: "source chain segment reverted during bulk catchup",
+                }));
+            }
+            SourceChainUpdate::FinalizedTip { .. } => {}
+        }
+    }
+
+    if connected_blocks == 0 {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "source chain segment did not contain connected blocks during bulk catchup",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_prefetched_block_link(
+    previous_block_id: Option<BlockId>,
+    block: &SourceBlock,
+) -> Result<(), IngestError> {
+    let Some(previous_block_id) = previous_block_id else {
+        return Ok(());
+    };
+    let Some(expected_height) = previous_block_id.height.next() else {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "source chain segment continued after maximum block height",
+        }));
+    };
+    if block.height != expected_height {
+        return Err(IngestError::from(SourceError::SourceProtocolMismatch {
+            reason: "source chain segment skipped a height during bulk catchup",
+        }));
+    }
+    if block.parent_hash != previous_block_id.hash {
+        return Err(IngestError::from(SourceError::BlockReorgDuringFetch {
+            height: block.height,
+            reason: "prefetched source chain segment did not connect to the previous segment",
+        }));
+    }
+    Ok(())
+}
+
+fn next_height_after_segment(
+    start_height: BlockHeight,
+    source_segment_max_blocks: NonZeroU32,
+) -> Option<BlockHeight> {
+    start_height
+        .value()
+        .checked_add(source_segment_max_blocks.get())
+        .map(BlockHeight::new)
+}
+
+#[derive(Clone, Copy)]
+struct SourceSegmentDensitySample {
+    response_payload_bytes: u64,
+    connected_blocks: u32,
+}
+
+struct SourceSegmentSizer {
+    max_blocks: NonZeroU32,
+    target_response_payload_bytes: NonZeroU64,
+    current_blocks: NonZeroU32,
+    success_count: u32,
+    overshoot_clear_success_count: u32,
+    overshoot_bytes_per_block: Option<u64>,
+    active_branch_id: ConsensusBranchId,
+    activations: Arc<NetworkUpgradeActivations>,
+    density_samples: VecDeque<SourceSegmentDensitySample>,
+}
+
+impl SourceSegmentSizer {
+    fn new(
+        max_blocks: NonZeroU32,
+        target_response_payload_bytes: NonZeroU64,
+        activations: Arc<NetworkUpgradeActivations>,
+        from_height: BlockHeight,
+    ) -> Self {
+        let current_blocks = max_blocks;
+        let active_branch_id = activations.consensus_branch_id_at(from_height);
+        record_source_segment_sizer_state(
+            current_blocks,
+            max_blocks,
+            target_response_payload_bytes,
+        );
+        Self {
+            max_blocks,
+            target_response_payload_bytes,
+            current_blocks,
+            success_count: 0,
+            overshoot_clear_success_count: 0,
+            overshoot_bytes_per_block: None,
+            active_branch_id,
+            activations,
+            density_samples: VecDeque::new(),
+        }
+    }
+
+    fn blocks_for_remaining_range(
+        &mut self,
+        next_height: BlockHeight,
+        to_height: BlockHeight,
+    ) -> Option<NonZeroU32> {
+        if next_height > to_height {
+            return None;
+        }
+        self.reset_after_network_upgrade_if_needed(next_height);
+        let remaining_blocks = to_height
+            .value()
+            .saturating_sub(next_height.value())
+            .saturating_add(1);
+        NonZeroU32::new(remaining_blocks.min(self.current_blocks.get()))
+    }
+
+    fn record_segment(&mut self, stats: SourceChainSegmentStats) {
+        self.record_density_sample(stats);
+        self.record_overshoot_memory(stats);
+        let previous_blocks = self.current_blocks;
+        let next_blocks = if stats.split_count() > 0 {
+            self.shrunk_blocks_after_overshoot()
+        } else {
+            self.blocks_after_success()
+        };
+        self.current_blocks = next_blocks;
+        record_source_segment_sizer_state(
+            self.current_blocks,
+            self.max_blocks,
+            self.target_response_payload_bytes,
+        );
+        if previous_blocks != self.current_blocks {
+            let reason = if stats.split_count() > 0 {
+                "response_too_large"
+            } else if self.current_blocks < previous_blocks {
+                "density"
+            } else {
+                "success"
+            };
+            record_source_segment_sizer_adjustment(reason, previous_blocks, self.current_blocks);
+        }
+    }
+
+    fn record_density_sample(&mut self, stats: SourceChainSegmentStats) {
+        if stats.connected_blocks() == 0 || stats.response_payload_bytes() == 0 {
+            return;
+        }
+        self.density_samples.push_back(SourceSegmentDensitySample {
+            response_payload_bytes: stats.response_payload_bytes(),
+            connected_blocks: stats.connected_blocks(),
+        });
+        while self.density_samples.len() > SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT {
+            self.density_samples.pop_front();
+        }
+    }
+
+    fn shrunk_blocks_after_overshoot(&mut self) -> NonZeroU32 {
+        self.success_count = 0;
+        self.overshoot_clear_success_count = 0;
+        let halved = self.current_blocks.get().saturating_div(2).max(1);
+        nonzero_u32(
+            self.blocks_allowed_by_density()
+                .map_or(halved, |blocks| halved.min(blocks.get()))
+                .max(1),
+        )
+    }
+
+    fn blocks_after_success(&mut self) -> NonZeroU32 {
+        let density_blocks = self.blocks_allowed_by_density();
+        if let Some(density_blocks) = density_blocks
+            && density_blocks < self.current_blocks
+        {
+            self.success_count = 0;
+            return density_blocks;
+        }
+
+        self.success_count = self.success_count.saturating_add(1);
+        if self.success_count < SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT {
+            return self.current_blocks;
+        }
+
+        self.success_count = 0;
+        let grown = self
+            .current_blocks
+            .get()
+            .saturating_mul(SOURCE_SEGMENT_GROW_NUMERATOR)
+            .saturating_div(SOURCE_SEGMENT_GROW_DENOMINATOR)
+            .max(self.current_blocks.get().saturating_add(1));
+        let capped = grown.min(self.max_blocks.get());
+        nonzero_u32(density_blocks.map_or(capped, |blocks| capped.min(blocks.get())))
+    }
+
+    fn blocks_allowed_by_density(&self) -> Option<NonZeroU32> {
+        let bytes_per_block = self.estimated_response_payload_bytes_per_block()?;
+        let target_blocks = self
+            .target_response_payload_bytes
+            .get()
+            .saturating_div(bytes_per_block)
+            .max(1)
+            .min(u64::from(self.max_blocks.get()));
+        Some(nonzero_u32(
+            u32::try_from(target_blocks).unwrap_or(u32::MAX),
+        ))
+    }
+
+    fn estimated_response_payload_bytes_per_block(&self) -> Option<u64> {
+        let p95 = self.p95_response_payload_bytes_per_block();
+        match (p95, self.overshoot_bytes_per_block) {
+            (Some(p95), Some(overshoot)) => Some(p95.max(overshoot)),
+            (Some(p95), None) => Some(p95),
+            (None, Some(overshoot)) => Some(overshoot),
+            (None, None) => None,
+        }
+    }
+
+    fn p95_response_payload_bytes_per_block(&self) -> Option<u64> {
+        let mut samples = self
+            .density_samples
+            .iter()
+            .map(|sample| {
+                let blocks = u64::from(sample.connected_blocks);
+                sample
+                    .response_payload_bytes
+                    .saturating_add(blocks.saturating_sub(1))
+                    / blocks
+            })
+            .collect::<Vec<_>>();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        let percentile_index = samples
+            .len()
+            .saturating_mul(95)
+            .saturating_add(99)
+            .saturating_div(100)
+            .saturating_sub(1);
+        samples.get(percentile_index).copied()
+    }
+
+    fn record_overshoot_memory(&mut self, stats: SourceChainSegmentStats) {
+        if stats.split_count() > 0 {
+            let Some(bytes_per_block) = response_payload_bytes_per_block(stats) else {
+                return;
+            };
+            self.overshoot_bytes_per_block = Some(
+                self.overshoot_bytes_per_block
+                    .map_or(bytes_per_block, |current| current.max(bytes_per_block)),
+            );
+            self.overshoot_clear_success_count = 0;
+            return;
+        }
+
+        if stats.response_payload_bytes() > self.target_response_payload_bytes.get() {
+            self.overshoot_clear_success_count = 0;
+            return;
+        }
+        self.overshoot_clear_success_count = self.overshoot_clear_success_count.saturating_add(1);
+        if self.overshoot_clear_success_count >= SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT {
+            self.overshoot_bytes_per_block = None;
+            self.overshoot_clear_success_count = 0;
+        }
+    }
+
+    fn reset_after_network_upgrade_if_needed(&mut self, next_height: BlockHeight) {
+        let active_branch_id = self.activations.consensus_branch_id_at(next_height);
+        if active_branch_id == self.active_branch_id {
+            return;
+        }
+        let previous_blocks = self.current_blocks;
+        self.active_branch_id = active_branch_id;
+        self.current_blocks = self.max_blocks;
+        self.success_count = 0;
+        self.overshoot_clear_success_count = 0;
+        self.overshoot_bytes_per_block = None;
+        self.density_samples.clear();
+        record_source_segment_sizer_state(
+            self.current_blocks,
+            self.max_blocks,
+            self.target_response_payload_bytes,
+        );
+        record_source_segment_sizer_adjustment(
+            "network_upgrade",
+            previous_blocks,
+            self.current_blocks,
+        );
+    }
+}
+
+fn response_payload_bytes_per_block(stats: SourceChainSegmentStats) -> Option<u64> {
+    if stats.connected_blocks() == 0 || stats.response_payload_bytes() == 0 {
+        return None;
+    }
+    let blocks = u64::from(stats.connected_blocks());
+    Some(
+        stats
+            .response_payload_bytes()
+            .saturating_add(blocks.saturating_sub(1))
+            / blocks,
+    )
+}
+
+fn nonzero_u32(amount: u32) -> NonZeroU32 {
+    NonZeroU32::new(amount.max(1)).unwrap_or(NonZeroU32::MIN)
+}
+
+fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
+    usize::try_from(amount.get()).unwrap_or(usize::MAX)
+}
+
+fn usize_to_u32_saturating(amount: usize) -> u32 {
+    u32::try_from(amount).unwrap_or(u32::MAX)
+}
+
+fn record_source_segment_sizer_state(
+    current_blocks: NonZeroU32,
+    max_blocks: NonZeroU32,
+    target_response_payload_bytes: NonZeroU64,
+) {
+    metrics::gauge!("zinder_ingest_source_segment_next_blocks")
+        .set(f64::from(current_blocks.get()));
+    metrics::gauge!("zinder_ingest_source_segment_max_blocks").set(f64::from(max_blocks.get()));
+    metrics::gauge!("zinder_ingest_source_segment_target_response_payload_bytes")
+        .set(u64_to_f64(target_response_payload_bytes.get()));
+}
+
+fn record_source_segment_sizer_adjustment(
+    reason: &'static str,
+    previous_blocks: NonZeroU32,
+    current_blocks: NonZeroU32,
+) {
+    if previous_blocks == current_blocks && reason != "network_upgrade" {
+        return;
+    }
+    metrics::counter!(
+        "zinder_ingest_source_segment_sizing_adjustment_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges and histograms use f64 samples; byte counts are diagnostic magnitudes"
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
 }
 
 #[cfg(test)]
@@ -544,7 +1143,9 @@ async fn backfill_from_source_with_mock_derive<Source, F>(
 where
     Source: NodeSource,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
-        + Copy,
+        + Copy
+        + Send
+        + Sync,
 {
     let store_options = ChainStoreOptions {
         tuning: config.storage_tuning,
@@ -557,19 +1158,10 @@ where
     )?;
 
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    let derive_store = zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(&config.storage_path),
-        zinder_derive::DeriveStoreOptions {
-            sync_writes: false,
-            consumer_column_families: &[],
-            tuning: zinder_store::StorageTuning::for_local_tests(),
-        },
-    )?;
     backfill_from_source_with_store_using_derive_fn(
         config,
         source,
         &store,
-        &derive_store,
         derive_fn,
         BackfillStart {
             from_height: config.from_height,
@@ -588,43 +1180,44 @@ async fn backfill_from_source_with_store_using_derive_fn<Source, F>(
     config: &BackfillConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     derive_fn: F,
     backfill_start: BackfillStart,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
-        + Copy,
+        + Copy
+        + Send
+        + Sync,
 {
     let request_timeout = config.node.request_timeout;
     #[allow(
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let fetch_concurrency = config.fetch_concurrency.get() as usize;
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
-    )]
-    let derive_concurrency = config.derive_concurrency.get() as usize;
-    let derive_stream = build_derive_stream(
+    let fact_build_concurrency = config.fact_build_concurrency.get() as usize;
+    let mut flush_state = BackfillFlushState::default();
+    let fact_build_stream = build_fact_build_stream(
         source,
-        BackfillDeriveStreamConfig {
+        BackfillFactBuildStreamConfig {
             request_timeout,
             from_height: backfill_start.from_height,
             to_height: config.to_height,
-            fetch_concurrency,
-            derive_concurrency,
+            max_response_bytes: config.node.max_response_bytes,
+            target_response_payload_bytes: config.source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            source_segment_sizer: flush_state
+                .source_segment_sizer(config, backfill_start.from_height),
+            fact_build_concurrency,
         },
         move |source_block| async move { derive_fn(&source_block).map_err(IngestError::from) },
     );
 
-    let mut flush_state = BackfillFlushState::default();
-    let run = BackfillRunContext::new(config, source, store, derive_store);
+    let run = BackfillRunContext::new(config, source, store);
     run_backfill_commit_loop(
         &run,
-        derive_stream,
+        fact_build_stream,
         backfill_start,
         &mut flush_state,
         BackfillCompletionFlush::FlushPending,
@@ -634,7 +1227,7 @@ where
 
 async fn run_backfill_commit_loop<Source>(
     run: &BackfillRunContext<'_, Source>,
-    derive_stream: impl futures_util::Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Unpin,
+    fact_build_stream: impl Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Send,
     backfill_start: BackfillStart,
     flush_state: &mut BackfillFlushState,
     completion_flush: BackfillCompletionFlush,
@@ -643,30 +1236,30 @@ where
     Source: NodeSource,
 {
     let mut chain_epoch_id = next_chain_epoch_id(run.store)?;
-    let mut batch = IngestBatch::default();
+    let mut batch = CanonicalBatch::default();
     let mut next_subtree_root_indexes =
         IngestSubtreeRootIndexes::from_tip_metadata(backfill_start.initial_tip_metadata);
     let mut last_commit_outcome = None;
     let mut retry_state = IngestRetryState::default();
     let mut running_tree_sizes =
         CommitmentTreeSizes::from_tip_metadata(backfill_start.initial_tip_metadata);
-    let batch_budget = IngestBatchBudget::new(
-        run.config.commit_batch_blocks,
-        run.config.max_transparent_prevout_store_lookups_per_batch,
+    let batch_budget = CanonicalBatchBudget::new(
+        run.config.canonical_batch_max_blocks,
+        run.config.canonical_batch_max_artifact_bytes,
     );
-    let mut derive_stream = derive_stream;
+    futures_util::pin_mut!(fact_build_stream);
 
     loop {
-        let await_derived_block_started_at = Instant::now();
-        let Some(derive_result) = derive_stream.next().await else {
+        let await_fact_build_started_at = Instant::now();
+        let Some(fact_build_result) = fact_build_stream.next().await else {
             break;
         };
         record_backfill_stage_duration(
-            BACKFILL_STAGE_AWAIT_DERIVED_BLOCK,
-            await_derived_block_started_at,
-            derive_result.as_ref().err(),
+            BACKFILL_STAGE_AWAIT_FACT_BUILD,
+            await_fact_build_started_at,
+            fact_build_result.as_ref().err(),
         );
-        let built_outcome = derive_result.and_then(|derived| {
+        let built_outcome = fact_build_result.and_then(|derived| {
             finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
         });
         let built = built_outcome?;
@@ -684,9 +1277,9 @@ where
                 &mut retry_state,
             )
             .await?;
+            populate_backfill_tree_state_checkpoint(run, &mut batch, &mut retry_state).await?;
             let (commit_outcome, returned_batch) = commit_finalized_backfill_batch(
                 run.store,
-                run.derive_store,
                 run.config.node.network,
                 chain_epoch_id,
                 batch,
@@ -709,9 +1302,9 @@ where
             &mut retry_state,
         )
         .await?;
+        populate_backfill_tree_state_checkpoint(run, &mut batch, &mut retry_state).await?;
         let (commit_outcome, _drained_batch) = commit_finalized_backfill_batch(
             run.store,
-            run.derive_store,
             run.config.node.network,
             chain_epoch_id,
             batch,
@@ -743,7 +1336,7 @@ where
 
 async fn populate_backfill_subtree_roots<Source>(
     run: &BackfillRunContext<'_, Source>,
-    batch: &mut IngestBatch,
+    batch: &mut CanonicalBatch,
     next_subtree_root_indexes: IngestSubtreeRootIndexes,
     retry_state: &mut IngestRetryState,
 ) -> Result<IngestSubtreeRootIndexes, IngestError>
@@ -765,6 +1358,55 @@ where
         outcome.as_ref().err(),
     );
     outcome
+}
+
+async fn populate_backfill_tree_state_checkpoint<Source>(
+    run: &BackfillRunContext<'_, Source>,
+    batch: &mut CanonicalBatch,
+    retry_state: &mut IngestRetryState,
+) -> Result<(), IngestError>
+where
+    Source: NodeSource,
+{
+    if !batch.tree_states.is_empty() {
+        return Ok(());
+    }
+    let Some(tip_block) = batch.block_headers.last() else {
+        return Ok(());
+    };
+    if !run
+        .source
+        .capabilities()
+        .supports(zinder_source::NodeCapability::TreeState)
+    {
+        return Ok(());
+    }
+
+    let block_id = BlockId::new(tip_block.height, tip_block.block_hash);
+    let started_at = Instant::now();
+    let outcome = fetch_tree_state_for_block_with_retry(
+        run.config.node.request_timeout,
+        run.source,
+        block_id,
+        retry_state,
+    )
+    .await;
+    record_backfill_stage_duration(
+        "fetch_tree_state_checkpoint",
+        started_at,
+        outcome.as_ref().err(),
+    );
+    let source_tree_state = match outcome {
+        Ok(source_tree_state) => source_tree_state,
+        Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+        source_tree_state.block_id.height,
+        source_tree_state.block_id.hash,
+        source_tree_state.payload_bytes,
+    ));
+    Ok(())
 }
 
 /// Wraps the synchronous `PrimaryChainStore::flush` in a `spawn_blocking`
@@ -804,21 +1446,19 @@ fn record_backfill_stage_duration(
 
 fn record_backfill_batch_commit_trigger(
     config: &BackfillConfig,
-    batch_cost: IngestBatchWorkCost,
-    commit_trigger: IngestBatchCommitTrigger,
+    batch_cost: CanonicalBatchCost,
+    commit_trigger: CanonicalBatchCloseTrigger,
 ) {
     record_ingest_batch_commit_trigger(commit_trigger);
     tracing::info!(
         target: "zinder::ingest",
         event = "bulk_catchup_batch_budget_reached",
         trigger = commit_trigger.metric_label(),
-        block_count = batch_cost.block_count,
-        transparent_prevout_store_lookup_count =
-            batch_cost.transparent_prevout_store_lookup_count,
-        max_blocks = config.commit_batch_blocks.get(),
-        max_transparent_prevout_store_lookups = config
-            .max_transparent_prevout_store_lookups_per_batch
-            .get(),
+        block_count = batch_cost.blocks,
+        transaction_count = batch_cost.transactions,
+        transparent_output_count = batch_cost.transparent_outputs,
+        transparent_spend_reference_count = batch_cost.transparent_spend_references,
+        max_blocks = config.canonical_batch_max_blocks.get(),
         "bulk-catchup batch budget reached; committing accumulated artifacts"
     );
 }
@@ -826,37 +1466,29 @@ fn record_backfill_batch_commit_trigger(
 /// Commits a finalized backfill batch and returns the drained batch buffer.
 async fn commit_finalized_backfill_batch(
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     network: Network,
     chain_epoch_id: ChainEpochId,
-    batch: IngestBatch,
-) -> Result<(ChainEpochCommitOutcome, IngestBatch), IngestError> {
+    batch: CanonicalBatch,
+) -> Result<(ChainEpochCommitOutcome, CanonicalBatch), IngestError> {
     let mut batch = batch;
-    let outcome = commit_finalized_backfill_batch_inner(
-        store,
-        derive_store,
-        network,
-        chain_epoch_id,
-        &mut batch,
-    )
-    .await?;
+    let outcome =
+        commit_finalized_backfill_batch_inner(store, network, chain_epoch_id, &mut batch).await?;
     Ok((outcome, batch))
 }
 
 async fn commit_finalized_backfill_batch_inner(
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     network: Network,
     chain_epoch_id: ChainEpochId,
-    batch: &mut IngestBatch,
+    batch: &mut CanonicalBatch,
 ) -> Result<ChainEpochCommitOutcome, IngestError> {
     let tip_block = batch
-        .finalized_blocks
+        .block_headers
         .last()
-        .ok_or(IngestError::EmptyIngestBatch)?;
+        .ok_or(IngestError::EmptyCanonicalBatch)?;
     let tip_height = tip_block.height;
     let tip_hash = tip_block.block_hash;
-    let tip_metadata = batch.tip_metadata.ok_or(IngestError::EmptyIngestBatch)?;
+    let tip_metadata = batch.tip_metadata.ok_or(IngestError::EmptyCanonicalBatch)?;
     let chain_epoch = ChainEpoch {
         id: chain_epoch_id,
         network,
@@ -870,7 +1502,6 @@ async fn commit_finalized_backfill_batch_inner(
     };
     commit_ingest_batch(
         store,
-        derive_store,
         chain_epoch,
         batch,
         ReorgWindowChange::FinalizeThrough { height: tip_height },
@@ -925,10 +1556,14 @@ fn bootstrap_from_checkpoint_if_needed(
         created_at: current_unix_millis()?,
     };
     let outcome = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(bootstrap_chain_epoch, Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
-                height: checkpoint.height,
-            }),
+        ChainEpochArtifacts::new(
+            bootstrap_chain_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+            height: checkpoint.height,
+        }),
     )?;
     Ok(Some(outcome.chain_epoch))
 }
@@ -1035,21 +1670,26 @@ const fn checkpoint_within_reorg_window(
 mod tests {
     use std::{
         error::Error,
-        num::NonZeroU32,
+        num::{NonZeroU32, NonZeroU64},
         path::Path,
-        sync::atomic::{AtomicU32, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
     };
 
+    use futures_util::StreamExt as _;
+    use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockArtifact, BlockHash, BlockId, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
-        SubtreeRootIndex, TransactionId, TransparentOutPoint, TransparentUtxoSpendArtifact,
-        UnixTimestampMillis, wire::encode_internal_block_hash,
+        BlockHash, BlockId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT, ShieldedProtocol,
+        SubtreeRootHash, SubtreeRootIndex, UnixTimestampMillis, wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
-        NodeCapabilities, SourceBlock, SourceBlockHeader, SourceError, SourceSubtreeRoot,
-        SourceSubtreeRoots, ZebraJsonRpcSource,
+        NodeCapabilities, SourceBlock, SourceBlockHeader, SourceChainSegment,
+        SourceChainSegmentLimits, SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
+        ZebraJsonRpcSource,
     };
     use zinder_store::ChainEventHistoryRequest;
 
@@ -1077,6 +1717,86 @@ mod tests {
         flush_state.mark_flushed();
         assert_eq!(flush_state.pending_epoch_count(), 0);
         assert!(!flush_state.should_flush(flush_interval));
+        Ok(())
+    }
+
+    #[test]
+    fn source_segment_sizer_shrinks_after_response_split() -> Result<(), Box<dyn Error>> {
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+
+        sizer.record_segment(
+            SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
+                .with_connected_blocks(32)
+                .with_added_splits(1),
+        );
+
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(33), BlockHeight::new(100)),
+            NonZeroU32::new(16)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_segment_sizer_resets_density_at_network_upgrade() -> Result<(), Box<dyn Error>> {
+        let activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(5),
+                name: "Sapling".to_owned(),
+            }],
+        )?;
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
+            Arc::new(activations),
+            BlockHeight::new(1),
+        );
+        sizer.record_segment(
+            SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
+                .with_connected_blocks(32)
+                .with_added_splits(1),
+        );
+
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(4), BlockHeight::new(100)),
+            NonZeroU32::new(16)
+        );
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(5), BlockHeight::new(100)),
+            NonZeroU32::new(32)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_segment_sizer_uses_heaviest_density_sample() -> Result<(), Box<dyn Error>> {
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+
+        sizer.record_segment(
+            SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024)
+                .with_connected_blocks(12),
+        );
+        sizer.record_segment(
+            SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024)
+                .with_connected_blocks(4),
+        );
+
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(17), BlockHeight::new(100)),
+            NonZeroU32::new(4)
+        );
         Ok(())
     }
 
@@ -1187,44 +1907,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_commits_when_prevout_store_lookup_budget_is_reached()
+    async fn fact_build_stream_fetches_source_segments_and_yields_ordered_blocks()
     -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("prevout-budget-store");
-        let source = TestNodeSource {
-            tip_height: BlockHeight::new(200),
+        let requested_segments = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingSegmentSource {
+            requested_segments: Arc::clone(&requested_segments),
             network: Network::ZcashRegtest,
         };
-        let mut config = test_backfill_config(&storage_path, 1, 3, 10, true)?;
-        config.max_transparent_prevout_store_lookups_per_batch =
-            NonZeroU32::new(2).ok_or("invalid prevout budget")?;
-
-        let commit_outcome = backfill_from_source_with_mock_derive(&config, &source, |sb| {
-            let mut derived = test_derived_block(sb, 0, 0);
-            let mut transaction_id_bytes = [0; 32];
-            transaction_id_bytes[..4].copy_from_slice(&sb.height.value().to_be_bytes());
-            derived
-                .transparent_utxo_spends
-                .push(TransparentUtxoSpendArtifact::new(
-                    TransparentOutPoint::new(TransactionId::from_bytes(transaction_id_bytes), 0),
-                    sb.height,
-                    sb.hash,
-                ));
-            Ok(derived)
-        })
-        .await?;
-
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(3));
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
-        assert_eq!(
-            store
-                .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
-                .len(),
-            2
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let fact_build_stream = build_fact_build_stream(
+            &source,
+            BackfillFactBuildStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(6),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                fact_build_concurrency: 2,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
+        futures_util::pin_mut!(fact_build_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(next_block) = fact_build_stream.next().await {
+            observed_heights.push(next_block?.block_header.height.value());
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(*requested_segments.lock(), vec![(1, 2), (3, 2), (5, 2)]);
 
         Ok(())
     }
@@ -1256,7 +1978,7 @@ mod tests {
     }
 
     // `BlockUnavailable` retry-then-success is intentionally NOT covered as a
-    // per-call test: per [ADR-0013](../../../docs/adrs/0013-source-failure-recovery-topology.md)
+    // per-call test: per [ADR-0013](../../../../docs/adrs/0013-source-failure-recovery-topology.md)
     // the per-call retry window only covers transient transport failures
     // (`NodeUnreachable`, `StreamDisconnected`). `UpstreamViewChanged` (which
     // `BlockUnavailable` maps to) is recoverable at the loop layer because
@@ -1486,7 +2208,7 @@ mod tests {
         let event_history =
             store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
         // 1 bootstrap commit + 2 single-block backfill commits (heights 11
-        // and 12 with commit_batch_blocks = 1).
+        // and 12 with canonical_batch_max_blocks = 1).
         assert_eq!(
             event_history.len(),
             3,
@@ -1617,7 +2339,10 @@ mod tests {
     ) -> Result<ChainEpochCommitOutcome, IngestError>
     where
         Source: NodeSource,
-        F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> + Copy,
+        F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError>
+            + Copy
+            + Send
+            + Sync,
     {
         let store_options = ChainStoreOptions::for_network(config.node.network);
         validate_backfill_finality_bound(
@@ -1636,19 +2361,10 @@ mod tests {
             .map_or_else(ChainTipMetadata::empty, |chain_epoch| {
                 chain_epoch.tip_metadata
             });
-        let derive_store = zinder_derive::DeriveStore::open(
-            zinder_derive::DeriveStore::path_for_canonical(&config.storage_path),
-            zinder_derive::DeriveStoreOptions {
-                sync_writes: false,
-                consumer_column_families: &[],
-                tuning: zinder_store::StorageTuning::for_local_tests(),
-            },
-        )?;
         backfill_from_source_with_store_using_derive_fn(
             config,
             source,
             &store,
-            &derive_store,
             derive_fn,
             BackfillStart {
                 from_height: config.from_height,
@@ -1662,7 +2378,7 @@ mod tests {
         storage_path: &Path,
         from_height: u32,
         to_height: u32,
-        commit_batch_blocks: u32,
+        canonical_batch_max_blocks: u32,
         allow_near_tip_finalize: bool,
     ) -> Result<BackfillConfig, Box<dyn Error>> {
         Ok(BackfillConfig {
@@ -1676,14 +2392,25 @@ mod tests {
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
             storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::All,
+            network_upgrade_activations: Arc::new(
+                zinder_testkit::sample_regtest_upgrade_activations(),
+            ),
             from_height: BlockHeight::new(from_height),
             to_height: BlockHeight::new(to_height),
-            commit_batch_blocks: NonZeroU32::new(commit_batch_blocks)
+            canonical_batch_max_blocks: NonZeroU32::new(canonical_batch_max_blocks)
                 .ok_or("invalid test batch size")?,
-            max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-                .ok_or("invalid test prevout budget")?,
-            fetch_concurrency: NonZeroU32::new(4).ok_or("invalid test fetch concurrency")?,
-            derive_concurrency: NonZeroU32::new(4).ok_or("invalid test derive concurrency")?,
+            canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+                .ok_or("invalid test batch artifact bytes")?,
+            source_segment_max_blocks: NonZeroU32::new(4)
+                .ok_or("invalid test source segment blocks")?,
+            source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                .ok_or("invalid test source segment target bytes")?,
+            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                .ok_or("invalid test source fetch requests")?,
+            source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                .ok_or("invalid test source fetch bytes")?,
+            fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid test derive concurrency")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
             upstream_tip_hint: None,
             allow_near_tip_finalize,
@@ -1693,6 +2420,11 @@ mod tests {
 
     struct TestNodeSource {
         tip_height: BlockHeight,
+        network: Network,
+    }
+
+    struct RecordingSegmentSource {
+        requested_segments: Arc<Mutex<Vec<(u32, u32)>>>,
         network: Network,
     }
 
@@ -1723,13 +2455,102 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl NodeSource for RecordingSegmentSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            ZebraJsonRpcSource::baseline_capabilities()
+        }
+
+        async fn fetch_chain_segment(
+            &self,
+            limits: SourceChainSegmentLimits,
+        ) -> Result<SourceChainSegment, SourceError> {
+            let Some(start_height) = limits.cursor.next_connected_height() else {
+                return Ok(SourceChainSegment::default());
+            };
+            if start_height > BlockHeight::new(6) {
+                return Ok(SourceChainSegment::default());
+            }
+
+            self.requested_segments
+                .lock()
+                .push((start_height.value(), limits.max_connected_blocks.get()));
+            let end_height = BlockHeight::new(
+                start_height
+                    .value()
+                    .saturating_add(limits.max_connected_blocks.get())
+                    .saturating_sub(1)
+                    .min(6),
+            );
+            let mut blocks = Vec::new();
+            let mut next_height = Some(start_height);
+            while let Some(height) = next_height {
+                if height > end_height {
+                    break;
+                }
+                blocks.push(test_source_block(self.network, height));
+                next_height = height.next();
+            }
+
+            Ok(SourceChainSegment::connected_blocks(blocks))
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            let _ = height;
+            Err(SourceError::SourceProtocolMismatch {
+                reason: "single-block fetch should not be used by segment backfill",
+            })
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(BlockHeight::new(6), block_hash(6)))
+        }
+    }
+
+    #[async_trait::async_trait]
     impl NodeSource for FlakyNodeSource {
         fn capabilities(&self) -> NodeCapabilities {
             self.delegate.capabilities()
         }
 
-        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        async fn fetch_chain_segment(
+            &self,
+            limits: SourceChainSegmentLimits,
+        ) -> Result<SourceChainSegment, SourceError> {
             self.fetch_attempts.fetch_add(1, Ordering::SeqCst);
+            let start_height = limits.cursor.next_connected_height().ok_or(
+                SourceError::SourceProtocolMismatch {
+                    reason: "test segment cursor cannot connect a block",
+                },
+            )?;
+            if self
+                .retryable_failures_before_success
+                .load(Ordering::SeqCst)
+                > 0
+            {
+                self.retryable_failures_before_success
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(self.failure.source_error(start_height));
+            }
+
+            let end_height = BlockHeight::new(
+                start_height
+                    .value()
+                    .saturating_add(limits.max_connected_blocks.get())
+                    .saturating_sub(1),
+            );
+            let mut blocks = Vec::new();
+            let mut next_height = Some(start_height);
+            while let Some(height) = next_height {
+                if height > end_height {
+                    break;
+                }
+                blocks.push(self.delegate.fetch_block_at(height).await?);
+                next_height = height.next();
+            }
+            Ok(SourceChainSegment::connected_blocks(blocks))
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             if self
                 .retryable_failures_before_success
                 .load(Ordering::SeqCst)
@@ -1766,22 +2587,7 @@ mod tests {
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-            let source_hash = block_hash(height.value());
-            let parent_hash = block_hash(height.value().saturating_sub(1));
-            let header = SourceBlockHeader {
-                network: self.network,
-                height,
-                hash: source_hash,
-                parent_hash,
-                block_time_seconds: 1_774_668_400,
-            };
-
-            Ok(
-                SourceBlock::new(header, format!("raw-block-{}", height.value()).into_bytes())
-                    .with_tree_state_payload_bytes(
-                        format!("tree-state-{}", height.value()).into_bytes(),
-                    ),
-            )
+            Ok(test_source_block(self.network, height))
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
@@ -1824,6 +2630,20 @@ mod tests {
         }
     }
 
+    fn test_source_block(network: Network, height: BlockHeight) -> SourceBlock {
+        let source_hash = block_hash(height.value());
+        let parent_hash = block_hash(height.value().saturating_sub(1));
+        let header = SourceBlockHeader {
+            network,
+            height,
+            hash: source_hash,
+            parent_hash,
+            block_time_seconds: 1_774_668_400,
+        };
+
+        SourceBlock::new(header, format!("raw-block-{}", height.value()).into_bytes())
+    }
+
     fn block_hash(seed: u32) -> BlockHash {
         let mut bytes = [0; 32];
         for chunk in bytes.chunks_exact_mut(4) {
@@ -1859,13 +2679,24 @@ mod tests {
         orchard_tree_size_addition: u32,
     ) -> DerivedBlockArtifacts {
         DerivedBlockArtifacts {
-            block: BlockArtifact::new(
+            block_header: zinder_core::BlockHeaderArtifact::new(
+                source_block.height,
+                source_block.hash,
+                source_block.parent_hash,
+                [0; 32],
+                [0; 32],
+                i64::from(source_block.block_time_seconds),
+                0,
+                [0; 32],
+                0,
+                u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+            ),
+            block_blob: Some(zinder_core::BlockBlobArtifact::new(
                 source_block.height,
                 source_block.hash,
                 source_block.parent_hash,
                 source_block.raw_block_bytes.clone(),
-            ),
-            parsed_block: None,
+            )),
             partial_compact_block: LightwalletdCompactBlock {
                 proto_version: 1,
                 height: u64::from(source_block.height.value()),
@@ -1880,14 +2711,12 @@ mod tests {
                 sapling: sapling_tree_size_addition,
                 orchard: orchard_tree_size_addition,
             },
-            observed_tree_sizes: None,
-            tree_state: None,
-            transactions: Vec::new(),
-            transparent_address_utxos: Vec::new(),
-            transparent_prevouts: Vec::new(),
-            transparent_utxo_spends: Vec::new(),
-            transparent_address_tx_index: Vec::new(),
-            transparent_address_tx_index_spend_candidates: Vec::new(),
+            block_transaction_index: Vec::new(),
+            transaction_locations: Vec::new(),
+            transaction_facts: Vec::new(),
+            transaction_blobs: Vec::new(),
+            address_output_index: Vec::new(),
+            transparent_outputs_by_outpoint: Vec::new(),
         }
     }
 }

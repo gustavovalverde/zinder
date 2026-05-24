@@ -4,6 +4,7 @@ use thiserror::Error;
 use tonic::Code;
 use tonic_types::StatusExt;
 use zinder_core::{Network, artifact_family};
+use zinder_derive::DeriveStoreError;
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_store::{ArtifactFamily, StoreError};
 
@@ -192,6 +193,30 @@ impl IndexerError {
 
     #[allow(
         clippy::needless_pass_by_value,
+        clippy::wildcard_enum_match_arm,
+        reason = "DeriveStoreError is consumed through map_err adapters at storage boundaries; unknown future variants stay storage-unavailable for clients."
+    )]
+    pub(crate) fn from_derive_store_error(error: DeriveStoreError) -> Self {
+        match &error {
+            DeriveStoreError::Decode { reason, .. } if reason.contains("cursor") => {
+                Self::InvalidRequest {
+                    reason: reason.clone(),
+                }
+            }
+            DeriveStoreError::Decode { reason, .. } => Self::DataLoss {
+                reason: reason.clone(),
+            },
+            DeriveStoreError::InvalidOptions { reason } => Self::InvalidRequest {
+                reason: (*reason).to_owned(),
+            },
+            _ => Self::StorageUnavailable {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
         reason = "tonic::Status is consumed through map_err adapters at gRPC boundaries"
     )]
     pub(crate) fn from_status(status: tonic::Status) -> Self {
@@ -315,13 +340,18 @@ fn artifact_family_label(family: ArtifactFamily) -> &'static str {
     match family {
         ArtifactFamily::ChainEpoch => artifact_family::CHAIN_EPOCH,
         ArtifactFamily::ChainEvent => artifact_family::CHAIN_EVENT,
-        ArtifactFamily::FinalizedBlock => artifact_family::FINALIZED_BLOCK,
+        ArtifactFamily::BlockHeader => artifact_family::BLOCK_HEADER_ARTIFACT,
+        ArtifactFamily::BlockBlob => artifact_family::BLOCK_BLOB,
         ArtifactFamily::CompactBlock => artifact_family::COMPACT_BLOCK,
-        ArtifactFamily::Transaction => artifact_family::MINED_TRANSACTION,
+        ArtifactFamily::BlockTransactionIndex => artifact_family::BLOCK_TRANSACTION_INDEX,
+        ArtifactFamily::TransactionLocation => artifact_family::TRANSACTION_LOCATION,
+        ArtifactFamily::TransactionFacts => artifact_family::TRANSACTION_FACTS,
+        ArtifactFamily::TransactionBlob => artifact_family::TRANSACTION_BLOB,
         ArtifactFamily::TreeState => artifact_family::TREE_STATE,
         ArtifactFamily::SubtreeRoot => artifact_family::SUBTREE_ROOT,
-        ArtifactFamily::TransparentAddressUtxo => artifact_family::TRANSPARENT_ADDRESS_UTXO,
-        ArtifactFamily::TransparentUtxoSpend => artifact_family::TRANSPARENT_UTXO_SPEND,
+        ArtifactFamily::TransparentOutput => artifact_family::TRANSPARENT_OUTPUT,
+        ArtifactFamily::AddressOutputIndex => artifact_family::ADDRESS_OUTPUT_INDEX,
+        ArtifactFamily::TransparentSpendFact => artifact_family::TRANSPARENT_SPEND_FACT,
         ArtifactFamily::TransparentAddressTxIndex => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
         ArtifactFamily::BlockHashIndex => artifact_family::BLOCK_HASH_INDEX,
         ArtifactFamily::MempoolEvent => artifact_family::MEMPOOL_EVENT,
@@ -339,13 +369,18 @@ fn artifact_family_for_label(resource_type: &str) -> &'static str {
     match resource_type {
         "ChainEpoch" => artifact_family::CHAIN_EPOCH,
         "ChainEvent" => artifact_family::CHAIN_EVENT,
-        "FinalizedBlock" => artifact_family::FINALIZED_BLOCK,
+        "BlockHeader" => artifact_family::BLOCK_HEADER_ARTIFACT,
+        "BlockBlob" => artifact_family::BLOCK_BLOB,
         "CompactBlock" => artifact_family::COMPACT_BLOCK,
-        "Transaction" => artifact_family::MINED_TRANSACTION,
+        "BlockTransactionIndex" => artifact_family::BLOCK_TRANSACTION_INDEX,
+        "TransactionLocation" => artifact_family::TRANSACTION_LOCATION,
+        "TransactionFacts" => artifact_family::TRANSACTION_FACTS,
+        "TransactionBlob" => artifact_family::TRANSACTION_BLOB,
         "TreeState" => artifact_family::TREE_STATE,
         "SubtreeRoot" => artifact_family::SUBTREE_ROOT,
-        "TransparentAddressUtxo" => artifact_family::TRANSPARENT_ADDRESS_UTXO,
-        "TransparentUtxoSpend" => artifact_family::TRANSPARENT_UTXO_SPEND,
+        "TransparentOutput" => artifact_family::TRANSPARENT_OUTPUT,
+        "AddressOutputIndex" => artifact_family::ADDRESS_OUTPUT_INDEX,
+        "TransparentSpendFact" => artifact_family::TRANSPARENT_SPEND_FACT,
         "TransparentAddressTxIndex" => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
         "BlockHashIndex" => artifact_family::BLOCK_HASH_INDEX,
         "MempoolEvent" => artifact_family::MEMPOOL_EVENT,

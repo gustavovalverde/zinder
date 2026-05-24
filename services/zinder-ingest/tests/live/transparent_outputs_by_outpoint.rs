@@ -9,7 +9,7 @@
 //! network the operator points at (regtest, testnet, or mainnet), samples the
 //! tip block's first transparent coinbase output, and asserts that:
 //!
-//! - `WalletQueryApi::transparent_prevouts` resolves the sampled outpoint to a
+//! - `WalletQueryApi::transparent_outputs_by_outpoint` resolves the sampled outpoint to a
 //!   prevout whose `value_zat` and `script_pub_key` match the source-observed
 //!   transaction's `vout[0]`;
 //! - an unknown outpoint (random transaction id) resolves to `None`;
@@ -17,7 +17,7 @@
 //!
 //! The sampled "coinbase output" is just a stable, easy-to-find transparent
 //! output on every network. The prevout surface resolves any
-//! [`TransparentOutPoint`] to its referenced [`TransparentPrevout`]
+//! [`TransparentOutPoint`] to its referenced [`TransparentOutput`]
 //! regardless of whether the `OutPoint` has been spent; what consumers do
 //! with the result (label it "prevout", "txout", or "utxo") is their concern.
 //!
@@ -33,15 +33,19 @@ use tempfile::tempdir;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::encode_zinder_native_chain_name;
-use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
+use zinder_core::{
+    BlockHash, BlockHeight, Network, NetworkUpgradeActivations, TransactionId, TransparentOutPoint,
+};
 use zinder_ingest::backfill;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
+use crate::common::{
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
+};
 
 /// Number of blocks below the tip to backfill.
 ///
@@ -52,7 +56,8 @@ const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn sampled_coinbase_outpoint_resolves_through_transparent_prevouts() -> Result<()> {
+async fn sampled_coinbase_outpoint_resolves_through_transparent_outputs_by_outpoint() -> Result<()>
+{
     let _guard = init();
     let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
@@ -63,9 +68,10 @@ async fn sampled_coinbase_outpoint_resolves_through_transparent_prevouts() -> Re
         return Ok(());
     };
     let network = env.network();
-    let (storage_path_owner, store, sample) = backfill_and_sample_tip_coinbase(&env).await?;
+    let (storage_path_owner, store, sample, activations) =
+        backfill_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), activations);
 
     assert_known_outpoint_resolves(&wallet_query, &sample).await?;
     assert_unknown_outpoint_returns_none(&wallet_query).await?;
@@ -73,10 +79,10 @@ async fn sampled_coinbase_outpoint_resolves_through_transparent_prevouts() -> Re
 
     tracing::info!(
         target: "zinder::live",
-        event = "transparent_prevouts_validated",
+        event = "transparent_outputs_by_outpoint_validated",
         network = %encode_zinder_native_chain_name(network),
         height = sample.block_height.value(),
-        "transparent prevout-resolution surface validated against live node"
+        "transparent-output resolution surface validated against live node"
     );
     Ok(())
 }
@@ -92,7 +98,12 @@ struct SampledOutput {
 
 async fn backfill_and_sample_tip_coinbase(
     env: &LiveTestEnv,
-) -> Result<(tempfile::TempDir, PrimaryChainStore, SampledOutput)> {
+) -> Result<(
+    tempfile::TempDir,
+    PrimaryChainStore,
+    SampledOutput,
+    Arc<NetworkUpgradeActivations>,
+)> {
     let tip_height = fetch_live_tip_height(env).await?;
     if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
         return Err(eyre!(
@@ -107,6 +118,7 @@ async fn backfill_and_sample_tip_coinbase(
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -114,6 +126,7 @@ async fn backfill_and_sample_tip_coinbase(
         tip_height,
         NonZeroU32::new(100).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
@@ -126,7 +139,7 @@ async fn backfill_and_sample_tip_coinbase(
     let sample = sample_first_coinbase_output(&block_at_tip)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    Ok((tempdir, store, sample))
+    Ok((tempdir, store, sample, activations))
 }
 
 fn sample_first_coinbase_output(block: &SourceBlock) -> Result<SampledOutput> {
@@ -160,7 +173,7 @@ async fn assert_known_outpoint_resolves(
     sample: &SampledOutput,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_prevouts(vec![sample.outpoint], None)
+        .transparent_outputs_by_outpoint(vec![sample.outpoint], None)
         .await?;
     assert_eq!(
         response.entries.len(),
@@ -169,7 +182,7 @@ async fn assert_known_outpoint_resolves(
     );
     let entry = &response.entries[0];
     assert_eq!(entry.outpoint, sample.outpoint);
-    let prevout = entry.prevout.as_ref().ok_or_else(|| {
+    let prevout = entry.output.as_ref().ok_or_else(|| {
         eyre!(
             "sampled coinbase outpoint did not resolve; height={}, hash={:?}",
             sample.block_height.value(),
@@ -185,7 +198,7 @@ async fn assert_unknown_outpoint_returns_none(
     wallet_query: &WalletQuery<PrimaryChainStore>,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_prevouts(
+        .transparent_outputs_by_outpoint(
             vec![TransparentOutPoint::new(
                 TransactionId::from_bytes(unknown_transaction_id_bytes()),
                 0,
@@ -195,7 +208,7 @@ async fn assert_unknown_outpoint_returns_none(
         .await?;
     assert_eq!(response.entries.len(), 1);
     assert!(
-        response.entries[0].prevout.is_none(),
+        response.entries[0].output.is_none(),
         "unknown txid must resolve to None against the live store",
     );
     Ok(())
@@ -209,15 +222,15 @@ async fn assert_duplicate_outpoints_preserve_order(
         TransparentOutPoint::new(TransactionId::from_bytes(unknown_transaction_id_bytes()), 0);
     let outpoints = vec![sample.outpoint, unknown, sample.outpoint];
     let response = wallet_query
-        .transparent_prevouts(outpoints.clone(), None)
+        .transparent_outputs_by_outpoint(outpoints.clone(), None)
         .await?;
     assert_eq!(response.entries.len(), 3);
     for (entry, requested) in response.entries.iter().zip(outpoints.iter()) {
         assert_eq!(entry.outpoint, *requested);
     }
-    assert!(response.entries[0].prevout.is_some());
-    assert!(response.entries[1].prevout.is_none());
-    assert_eq!(response.entries[0].prevout, response.entries[2].prevout);
+    assert!(response.entries[0].output.is_some());
+    assert!(response.entries[1].output.is_none());
+    assert_eq!(response.entries[0].output, response.entries[2].output);
     Ok(())
 }
 
@@ -228,6 +241,6 @@ async fn assert_duplicate_outpoints_preserve_order(
 /// digest by hand.
 fn unknown_transaction_id_bytes() -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"zinder::live::transparent_prevouts::unknown_outpoint");
+    hasher.update(b"zinder::live::transparent_outputs_by_outpoint::unknown_outpoint");
     hasher.finalize().into()
 }

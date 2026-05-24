@@ -38,11 +38,11 @@ The services must not share:
 
 ## Storage Ownership
 
-`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections, dispatching derive consumers in the same ingest pipeline after canonical commits. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
+`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections and runs the derive tailer over retained canonical events. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
-`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; only the product-facing binary, config namespace, capability prefix, and Prometheus prefix rebrand. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md) and [ADR-0023](../adrs/0023-derive-plane-hosted-by-ingest.md).
+`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ## Development Profile
 

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use tonic::{Code, Status};
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation, StatusExt};
+use zinder_core::BlockHeight;
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_store::status_from_store_error;
@@ -22,13 +23,14 @@ pub(crate) const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
     MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings, UpstreamNodeCapabilities,
-    address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_utxos_stream_chunk,
-    build_wallet_server_info, chain_events_response, compact_block_response, latest_block_response,
-    latest_tree_state_response, subtree_roots_response, transaction_response,
-    transparent_address_confirmed_balance_response, transparent_address_tx_ids_response,
-    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
+    address_lookup_to_script_hash, address_output_index_response,
+    block_header_by_selector_response, block_id_by_selector_response,
+    broadcast_transaction_response, build_address_output_index_stream_chunk,
+    build_transparent_address_tx_ids_chunk, build_wallet_server_info, chain_events_response,
+    compact_block_response, latest_block_response, latest_tree_state_checkpoint_response,
+    subtree_roots_response, transaction_response, transparent_address_confirmed_balance_response,
+    transparent_address_tx_ids_response, transparent_outputs_by_outpoint_response,
+    tree_state_checkpoint_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -47,13 +49,15 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
         QueryError::InvalidBlockRange { .. }
         | QueryError::CompactBlockRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
-        | QueryError::TransparentUtxoCursorInvalid { .. }
+        | QueryError::AddressOutputCursorInvalid { .. }
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
         | QueryError::UnsupportedShieldedProtocol { .. } => {
             (Code::InvalidArgument, bad_request_details(error))
         }
         QueryError::TransactionBroadcastDisabled
+        | QueryError::DeriveUnavailable { .. }
+        | QueryError::DeriveLag { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnsupported
         | QueryError::ChainEpochPinUnavailable { .. }
@@ -78,7 +82,8 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
         | QueryError::UnsupportedBlockSelector { .. }
         | QueryError::UnsupportedTransactionStatus { .. }
         | QueryError::BlockingTaskFailed { .. }
-        | QueryError::Node(_) => (Code::Unavailable, ErrorDetails::new()),
+        | QueryError::Node(_)
+        | QueryError::DeriveStore(_) => (Code::Unavailable, ErrorDetails::new()),
         QueryError::Store(error) => return status_from_store_error(error),
     };
 
@@ -98,15 +103,16 @@ fn error_reason_for_query_error(error: &QueryError) -> ErrorReason {
         QueryError::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
         QueryError::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
         QueryError::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
-        QueryError::TransparentUtxoCursorInvalid { .. } => {
-            ErrorReason::TransparentUtxoCursorInvalid
-        }
+        QueryError::AddressOutputCursorInvalid { .. } => ErrorReason::AddressOutputCursorInvalid,
         QueryError::TransparentHistoryCursorInvalid { .. } => {
             ErrorReason::TransparentHistoryCursorInvalid
         }
         QueryError::InvalidAddress { .. } => ErrorReason::InvalidAddress,
         QueryError::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
         QueryError::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
+        QueryError::DeriveUnavailable { .. } | QueryError::DeriveLag { .. } => {
+            ErrorReason::Unspecified
+        }
         QueryError::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
         QueryError::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
         QueryError::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
@@ -124,7 +130,7 @@ fn error_reason_for_query_error(error: &QueryError) -> ErrorReason {
         }
         QueryError::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
         QueryError::Node(_) => ErrorReason::NodeUnavailable,
-        QueryError::Store(_) => ErrorReason::Unspecified,
+        QueryError::Store(_) | QueryError::DeriveStore(_) => ErrorReason::Unspecified,
     }
 }
 
@@ -162,7 +168,7 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
             )
         }
         QueryError::ChainEventCursorInvalid { reason }
-        | QueryError::TransparentUtxoCursorInvalid { reason }
+        | QueryError::AddressOutputCursorInvalid { reason }
         | QueryError::TransparentHistoryCursorInvalid { reason } => {
             ErrorDetails::with_bad_request_violation("from_cursor", *reason)
         }
@@ -192,6 +198,26 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "transaction broadcast is not configured for this deployment",
             )
         }
+        QueryError::DeriveUnavailable { capability } => {
+            ErrorDetails::with_precondition_failure_violation(
+                "DERIVE_PROJECTION_UNAVAILABLE",
+                *capability,
+                "derive projection is not configured for this deployment",
+            )
+        }
+        QueryError::DeriveLag {
+            capability,
+            chain_tip_height,
+            derive_height,
+        } => ErrorDetails::with_precondition_failure_violation(
+            "DERIVE_PROJECTION_LAGGING",
+            *capability,
+            format!(
+                "canonical height {} is ahead of derive height {:?}",
+                chain_tip_height.value(),
+                derive_height.map(BlockHeight::value)
+            ),
+        ),
         QueryError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence,

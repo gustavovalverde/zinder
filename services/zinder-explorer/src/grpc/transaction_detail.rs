@@ -1,8 +1,7 @@
 //! `ExplorerQuery.TransactionDetail` handler.
 //!
-//! Reads one transaction through `WalletQuery.Transaction`, parses the
-//! returned `payload_bytes` once via `zinder_source::parse_transaction_public_facts`,
-//! and surfaces the result as a typed [`TransactionDetailResponse`] alongside
+//! Reads one transaction through `WalletQuery.Transaction` and surfaces the
+//! status location alongside
 //! the cross-cutting [`ExplorerFreshness`] envelope. The handler owns the
 //! conversion between the `zinder_core::TransactionPublicFacts` shape and
 //! its proto mirror; the source-side parser is the single source of truth
@@ -29,10 +28,12 @@ use zinder_proto::v1::{
     wallet::{self, transaction_status_response, wallet_query_client::WalletQueryClient},
 };
 use zinder_runtime::AuthenticatedChannel;
+use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
 
 /// Executes one `ExplorerQuery.TransactionDetail` request.
 pub(crate) async fn handle_transaction_detail(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    chain_store: Option<&SecondaryChainStore>,
     derive_store: Option<&DeriveStore>,
     network: zinder_core::Network,
     request: Request<TransactionDetailRequest>,
@@ -55,23 +56,28 @@ pub(crate) async fn handle_transaction_detail(
         .status
         .ok_or_else(|| Status::internal("WalletQuery.Transaction response missing status"))?;
 
-    let (raw_bytes, location, mined_height, wallet_branch_id) = match status {
-        transaction_status_response::Status::Mined(mined) => extract_mined(mined)?,
-        transaction_status_response::Status::InMempool(mempool) => extract_mempool(mempool),
+    let (core_facts, location) = match status {
+        transaction_status_response::Status::Mined(mined) => {
+            let (location, branch_id) = extract_mined(mined)?;
+            let mut facts =
+                read_mined_public_facts(chain_store, chain_epoch.clone(), transaction_id)?;
+            facts.consensus_branch_id = Some(branch_id);
+            (facts, location)
+        }
+        transaction_status_response::Status::InMempool(mempool) => {
+            let (raw_bytes, location) = extract_mempool(mempool);
+            let activations = NetworkUpgradeActivations::empty(network);
+            let facts =
+                zinder_source::parse_transaction_public_facts(&raw_bytes, None, &activations)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+            (facts, location)
+        }
         transaction_status_response::Status::Conflicting(_) => {
             return Err(Status::failed_precondition(
                 "transaction is conflicting-chain; ExplorerQuery.TransactionDetail returns mined or mempool only",
             ));
         }
     };
-
-    let activations = NetworkUpgradeActivations::empty(network);
-    let mut core_facts =
-        zinder_source::parse_transaction_public_facts(&raw_bytes, mined_height, &activations)
-            .map_err(|error| Status::internal(error.to_string()))?;
-    if let Some(branch_id) = wallet_branch_id {
-        core_facts.consensus_branch_id = Some(branch_id);
-    }
 
     let freshness = ExplorerFreshness {
         chain_epoch: Some(chain_epoch),
@@ -97,48 +103,65 @@ pub(crate) async fn handle_transaction_detail(
         freshness: Some(freshness),
         facts: Some(encode_public_facts(&core_facts)),
         location: Some(location),
-        raw_transaction_bytes: raw_bytes,
         paid_fee_zat,
         prevout_resolution_status,
         transparent_inputs,
     }))
 }
 
-/// Tuple returned by both extractors so the caller has one consistent
-/// destructure target regardless of where the bytes came from. Mempool
-/// extractions populate the trailing `Option`s with `None`.
-type ExtractedTransaction = (
-    Vec<u8>,
-    WireTransactionLocation,
-    Option<BlockHeight>,
-    Option<ConsensusBranchId>,
-);
+fn read_mined_public_facts(
+    chain_store: Option<&SecondaryChainStore>,
+    chain_epoch: wallet::ChainEpoch,
+    transaction_id: zinder_core::TransactionId,
+) -> Result<CoreFacts, Status> {
+    let store = chain_store.ok_or_else(|| {
+        Status::unavailable(
+            "TransactionDetail requires the canonical fact store; configure --storage-path",
+        )
+    })?;
+    store
+        .try_catch_up()
+        .map_err(|error| status_from_store_error(&error))?;
+    let core_epoch = chain_epoch_from_message(chain_epoch)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let reader = store
+        .chain_epoch_reader_at(core_epoch.id)
+        .map_err(|error| status_from_store_error(&error))?;
+    let artifact = reader
+        .transaction_facts_by_id(transaction_id)
+        .map_err(|error| status_from_store_error(&error))?
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "transaction facts are not available for {transaction_id:?}"
+            ))
+        })?;
+    Ok(artifact.public_facts)
+}
 
-fn extract_mined(mined: wallet::MinedTransaction) -> Result<ExtractedTransaction, Status> {
-    let transaction = mined
-        .transaction
-        .ok_or_else(|| Status::internal("MinedTransaction missing transaction artifact"))?;
+fn extract_mined(
+    mined: wallet::MinedTransaction,
+) -> Result<(WireTransactionLocation, ConsensusBranchId), Status> {
+    let location = mined
+        .location
+        .ok_or_else(|| Status::internal("MinedTransaction missing transaction location"))?;
     let details = mined
         .details
         .ok_or_else(|| Status::internal("MinedTransaction missing details"))?;
-    let mined_height = BlockHeight::new(transaction.block_height);
-    let location = WireTransactionLocation {
+    let wire_location = WireTransactionLocation {
         kind: Some(wire_location::Kind::Mined(MinedLocation {
-            block_height: transaction.block_height,
-            block_hash: transaction.block_hash,
+            block_height: location.block_height,
+            block_hash: location.block_hash,
             block_time_unix_seconds: details.block_time,
             confirmations: details.confirmations,
         })),
     };
     Ok((
-        transaction.payload_bytes,
-        location,
-        Some(mined_height),
-        Some(ConsensusBranchId::new(details.consensus_branch_id)),
+        wire_location,
+        ConsensusBranchId::new(details.consensus_branch_id),
     ))
 }
 
-fn extract_mempool(mempool: wallet::MempoolTransaction) -> ExtractedTransaction {
+fn extract_mempool(mempool: wallet::MempoolTransaction) -> (Vec<u8>, WireTransactionLocation) {
     let first_seen_unix_millis = u64::try_from(mempool.first_seen_unix_seconds)
         .map_or(0, |seconds| seconds.saturating_mul(1_000));
     let location = WireTransactionLocation {
@@ -147,7 +170,7 @@ fn extract_mempool(mempool: wallet::MempoolTransaction) -> ExtractedTransaction 
             first_seen_chain_epoch: None,
         })),
     };
-    (mempool.payload_bytes, location, None, None)
+    (mempool.payload_bytes, location)
 }
 
 fn encode_public_facts(facts: &CoreFacts) -> WireFacts {

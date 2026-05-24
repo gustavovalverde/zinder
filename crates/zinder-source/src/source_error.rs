@@ -144,6 +144,22 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// A JSON-RPC response exceeded the configured adapter response limit.
+    ///
+    /// Batched source adapters should split bounded segments before surfacing
+    /// this to callers. If a single source item still exceeds the limit, the
+    /// operator must raise `node.max_response_bytes` or switch to a source feed
+    /// that does not require large JSON payloads.
+    #[error(
+        "source response exceeded node.max_response_bytes during {operation}: limit={max_response_bytes}"
+    )]
+    SourceResponseTooLarge {
+        /// Source operation that exceeded the configured response limit.
+        operation: &'static str,
+        /// Configured response limit in bytes.
+        max_response_bytes: u64,
+    },
+
     /// The configured upstream node does not support a required capability.
     #[error("node capability is missing: {capability}")]
     NodeCapabilityMissing {
@@ -185,20 +201,20 @@ pub enum SourceError {
 
     /// Concurrent observations of the same height disagreed.
     ///
-    /// Produced when the JSON-RPC adapter's three height-keyed parallel
-    /// calls (`getblockheader`, `getblock`, `z_gettreestate`) observe
-    /// different blocks because the upstream chain reorged between the
-    /// requests. Distinct from [`Self::SourceProtocolMismatch`] (a wire-
-    /// contract violation: a broken node) and [`Self::BlockUnavailable`]
-    /// (a height that left the best chain before any fetch landed). The
-    /// loop treats this as a re-observation signal under the
+    /// Produced when the JSON-RPC adapter's height-keyed `getblock` and
+    /// `z_gettreestate` calls observe different blocks because the upstream
+    /// chain reorged between the requests. Distinct from
+    /// [`Self::SourceProtocolMismatch`] (a wire-contract violation: a broken
+    /// node) and [`Self::BlockUnavailable`] (a height that left the best chain
+    /// before any fetch landed). The loop treats this as a re-observation
+    /// signal under the
     /// [`SourceFailureClass::UpstreamViewChanged`] class.
     #[error("upstream chain reorged during concurrent fetch at height {height:?}: {reason}")]
     BlockReorgDuringFetch {
         /// Requested block height.
         height: BlockHeight,
-        /// Names which cross-call invariant failed (e.g. header-vs-block
-        /// hash disagreement, tree-state-vs-block hash disagreement).
+        /// Names which cross-call invariant failed (for example,
+        /// tree-state-vs-block hash disagreement).
         reason: &'static str,
     },
 
@@ -360,6 +376,7 @@ impl SourceError {
     pub const fn upstream_classification(&self) -> SourceFailureClass {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
+            Self::SourceResponseTooLarge { .. } => SourceFailureClass::Configuration,
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }

@@ -8,11 +8,10 @@
 //! caught up: [`EXPLORER_BLOCK_SUMMARY_V1`] and [`EXPLORER_BLOCK_DETAIL_V1`].
 
 use prost::Message as _;
-use zebra_chain::block::Block as ZebraBlock;
-use zinder_core::BlockHeight;
 use zinder_core::wire::{
     HEIGHT_KEY_LEN, encode_height_key_ascending, encode_internal_transaction_id,
 };
+use zinder_core::{BlockHeight, TransactionFactsArtifact};
 use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
@@ -91,19 +90,15 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
 }
 
 fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord {
-    let block_time_unix_seconds = block.block.header.time.timestamp();
-    let transaction_count = u32::try_from(block.block.transactions.len()).unwrap_or(u32::MAX);
-    let total_size_bytes = u64::try_from(block.raw_block_size_bytes).unwrap_or(u64::MAX);
-    let aggregates = aggregate_block_facts(&block.block);
+    let block_time_unix_seconds = block.block_time_unix_seconds;
+    let transaction_count = u32::try_from(block.transactions.len()).unwrap_or(u32::MAX);
+    let total_size_bytes = block.block_size_bytes;
+    let aggregates = aggregate_block_facts(&block.transactions);
     let transaction_ids = block
-        .block
         .transactions
         .iter()
         .map(|transaction| {
-            encode_internal_transaction_id(zinder_core::TransactionId::from_bytes(
-                transaction.hash().0,
-            ))
-            .to_vec()
+            encode_internal_transaction_id(transaction.location.transaction_id).to_vec()
         })
         .collect();
     let summary = BlockSummary {
@@ -124,6 +119,9 @@ fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord 
     BlockSummaryRecord {
         summary: Some(summary),
         transaction_ids,
+        fee_transaction_count: aggregates.fee_transaction_count,
+        min_zip317_conventional_fee_zat: aggregates.min_zip317_conventional_fee_zat.unwrap_or(0),
+        max_zip317_conventional_fee_zat: aggregates.max_zip317_conventional_fee_zat.unwrap_or(0),
     }
 }
 
@@ -133,37 +131,56 @@ struct BlockFactsAggregate {
     sapling_output_count: u32,
     orchard_action_count: u32,
     zip317_conventional_fees_collected_zat: u64,
+    fee_transaction_count: u32,
+    min_zip317_conventional_fee_zat: Option<u64>,
+    max_zip317_conventional_fee_zat: Option<u64>,
 }
 
-fn aggregate_block_facts(block: &ZebraBlock) -> BlockFactsAggregate {
+fn aggregate_block_facts(transactions: &[TransactionFactsArtifact]) -> BlockFactsAggregate {
     let mut aggregate = BlockFactsAggregate::default();
-    for (position, transaction) in block.transactions.iter().enumerate() {
-        let is_coinbase = position == 0;
-        let counts = zinder_source::transaction_component_counts(transaction);
+    for transaction in transactions {
+        let facts = &transaction.public_facts;
+        let counts = facts.counts;
         aggregate.sapling_output_count = aggregate
             .sapling_output_count
             .saturating_add(counts.sapling_output_count);
         aggregate.orchard_action_count = aggregate
             .orchard_action_count
             .saturating_add(counts.orchard_action_count);
-        if is_coinbase {
-            for output in transaction.outputs() {
-                let amount = i64::from(output.value);
-                let zat = u64::try_from(amount).unwrap_or(0);
-                aggregate.coinbase_reward_zat = aggregate.coinbase_reward_zat.saturating_add(zat);
+        if facts.is_coinbase {
+            for output in &transaction.transparent_outputs {
+                aggregate.coinbase_reward_zat = aggregate
+                    .coinbase_reward_zat
+                    .saturating_add(output.value_zat);
             }
             continue;
         }
+        aggregate.fee_transaction_count = aggregate.fee_transaction_count.saturating_add(1);
+        let conventional_fee_zat = counts.zip317_conventional_fee_zat();
+        aggregate.min_zip317_conventional_fee_zat = Some(
+            aggregate
+                .min_zip317_conventional_fee_zat
+                .map_or(conventional_fee_zat, |prior| {
+                    prior.min(conventional_fee_zat)
+                }),
+        );
+        aggregate.max_zip317_conventional_fee_zat = Some(
+            aggregate
+                .max_zip317_conventional_fee_zat
+                .map_or(conventional_fee_zat, |prior| {
+                    prior.max(conventional_fee_zat)
+                }),
+        );
         aggregate.zip317_conventional_fees_collected_zat = aggregate
             .zip317_conventional_fees_collected_zat
-            .saturating_add(counts.zip317_conventional_fee_zat());
+            .saturating_add(conventional_fee_zat);
     }
     aggregate
 }
 
 /// Consumer-specific failure modes [`BlockSummaryConsumer`] can surface.
 ///
-/// Infrastructure failures (store I/O, `WalletQuery.FullBlock` errors) reach
+/// Infrastructure failures (store I/O, derive-store writes) reach
 /// the SDK through the boxed [`DeriveConsumerError`] without going through
 /// this enum; the variants here are reserved for the shape-specific things
 /// the consumer itself can fail at.

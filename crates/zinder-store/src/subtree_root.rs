@@ -5,7 +5,7 @@ use zinder_core::{ChainEpoch, SubtreeRootArtifact, SubtreeRootRange};
 use crate::{
     ArtifactFamily, StoreError,
     artifact_visibility::visible_subtree_root_source_epoch,
-    block_artifact::read_block_artifact,
+    block_artifact::read_block_header_artifact,
     format::{StoreKey, decode_subtree_root_artifact},
     kv::{RocksChainStoreRead, StorageTable},
 };
@@ -62,7 +62,7 @@ pub(crate) fn read_subtree_root_artifacts(
         }
 
         let Some(block) =
-            read_block_artifact(inner, chain_epoch, subtree_root.completing_block_height)?
+            read_block_header_artifact(inner, chain_epoch, subtree_root.completing_block_height)?
         else {
             subtree_roots.push(None);
             continue;

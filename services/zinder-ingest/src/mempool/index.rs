@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use zinder_core::{
     MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevout, TransparentPrevoutEntry,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
     UnixTimestampMillis,
 };
 
@@ -179,10 +179,10 @@ impl MempoolIndex {
     /// a transaction currently in the mempool and the output index is in
     /// bounds; otherwise the entry's `prevout` is `None`.
     #[must_use]
-    pub fn transparent_prevouts_by_outpoints(
+    pub fn transparent_outputs_by_outpoints(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Vec<TransparentPrevoutEntry> {
+    ) -> Vec<TransparentOutputEntry> {
         let state = self.state.read();
         outpoints
             .iter()
@@ -190,13 +190,13 @@ impl MempoolIndex {
                 let prevout = state
                     .output_by_outpoint
                     .get(outpoint)
-                    .map(|mempool_output| TransparentPrevout {
+                    .map(|mempool_output| TransparentOutput {
                         value_zat: mempool_output.value_zat,
                         script_pub_key: mempool_output.script_pub_key.clone(),
                     });
-                TransparentPrevoutEntry {
+                TransparentOutputEntry {
                     outpoint: *outpoint,
-                    prevout,
+                    output: prevout,
                 }
             })
             .collect()

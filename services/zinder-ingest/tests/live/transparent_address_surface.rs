@@ -12,7 +12,7 @@
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the ingest
 //! pipeline uses, and asserts that:
 //!
-//! - `WalletQueryApi::transparent_address_utxos` returns a UTXO whose outpoint,
+//! - `WalletQueryApi::address_output_index` returns a UTXO whose outpoint,
 //!   `script_pub_key`, value, and block fields match the sampled output;
 //! - `WalletQueryApi::transparent_address_tx_ids_in_range` returns the same
 //!   transaction id in ascending order, and the descending response returns the
@@ -32,20 +32,21 @@ use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    BlockHash, BlockHeight, Network, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact,
+    AddressOutputIndexArtifact, BlockHash, BlockHeight, Network, NetworkUpgradeActivations,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
 };
 use zinder_ingest::backfill;
 use zinder_query::{
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxosRequest, WalletQuery,
-    WalletQueryApi,
+    AddressOutputIndexRequest, TransparentAddressTxIdsInRangeRequest, WalletQuery, WalletQueryApi,
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
+use crate::common::{
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
+};
 
 /// Number of blocks below the tip to backfill.
 ///
@@ -67,9 +68,10 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
         return Ok(());
     };
     let network = env.network();
-    let (storage_path_owner, store, sample) = backfill_and_sample_tip_coinbase(&env).await?;
+    let (storage_path_owner, store, sample, activations) =
+        backfill_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), activations);
 
     assert_utxo_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_round_trip(&wallet_query, &sample).await?;
@@ -101,7 +103,12 @@ struct SampledCoinbase {
 
 async fn backfill_and_sample_tip_coinbase(
     env: &LiveTestEnv,
-) -> Result<(tempfile::TempDir, PrimaryChainStore, SampledCoinbase)> {
+) -> Result<(
+    tempfile::TempDir,
+    PrimaryChainStore,
+    SampledCoinbase,
+    Arc<NetworkUpgradeActivations>,
+)> {
     let tip_height = fetch_live_tip_height(env).await?;
     if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
         return Err(eyre!(
@@ -116,6 +123,7 @@ async fn backfill_and_sample_tip_coinbase(
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -123,6 +131,7 @@ async fn backfill_and_sample_tip_coinbase(
         tip_height,
         NonZeroU32::new(100).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
@@ -135,7 +144,7 @@ async fn backfill_and_sample_tip_coinbase(
     let sample = sample_first_coinbase_output(&block_at_tip, from_height, tip_height)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    Ok((tempdir, store, sample))
+    Ok((tempdir, store, sample, activations))
 }
 
 fn sample_first_coinbase_output(
@@ -180,8 +189,8 @@ async fn assert_utxo_round_trip(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_address_utxos(
-            TransparentAddressUtxosRequest {
+        .address_output_index(
+            AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
                 start_height: sample.backfill_from_height,
                 max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
@@ -191,7 +200,7 @@ async fn assert_utxo_round_trip(
         )
         .await?;
     let matched = response
-        .utxos
+        .outputs
         .iter()
         .find(|utxo| {
             utxo.outpoint.transaction_id == sample.transaction_id
@@ -201,7 +210,7 @@ async fn assert_utxo_round_trip(
             eyre!(
                 "sampled coinbase output is absent from the UTXO response; \
                  returned_count={} sample_height={}",
-                response.utxos.len(),
+                response.outputs.len(),
                 sample.block_height.value(),
             )
         })?;
@@ -210,7 +219,7 @@ async fn assert_utxo_round_trip(
     assert_eq!(matched.value_zat, sample.value_zat);
     assert_eq!(matched.block_height, sample.block_height);
     assert_eq!(matched.block_hash, sample.block_hash);
-    assert_response_addresses_are_uniform(&response.utxos, sample.address_script_hash)?;
+    assert_response_addresses_are_uniform(&response.outputs, sample.address_script_hash)?;
     Ok(())
 }
 
@@ -219,17 +228,14 @@ async fn assert_tx_history_round_trip(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let response = wallet_query
-        .transparent_address_tx_ids_in_range(
-            TransparentAddressTxIdsInRangeRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
-                end_height: sample.tip_height,
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                descending: false,
-                from_cursor: None,
-            },
-            None,
-        )
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
+            address_script_hash: sample.address_script_hash,
+            start_height: sample.backfill_from_height,
+            end_height: sample.tip_height,
+            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+            descending: false,
+            from_cursor: None,
+        })
         .await?;
     assert!(
         response
@@ -248,30 +254,24 @@ async fn assert_tx_history_descending_matches_ascending(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let ascending = wallet_query
-        .transparent_address_tx_ids_in_range(
-            TransparentAddressTxIdsInRangeRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
-                end_height: sample.tip_height,
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                descending: false,
-                from_cursor: None,
-            },
-            None,
-        )
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
+            address_script_hash: sample.address_script_hash,
+            start_height: sample.backfill_from_height,
+            end_height: sample.tip_height,
+            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+            descending: false,
+            from_cursor: None,
+        })
         .await?;
     let descending = wallet_query
-        .transparent_address_tx_ids_in_range(
-            TransparentAddressTxIdsInRangeRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
-                end_height: sample.tip_height,
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                descending: true,
-                from_cursor: None,
-            },
-            None,
-        )
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
+            address_script_hash: sample.address_script_hash,
+            start_height: sample.backfill_from_height,
+            end_height: sample.tip_height,
+            max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
+            descending: true,
+            from_cursor: None,
+        })
         .await?;
     assert_eq!(
         ascending.artifacts.len(),
@@ -295,8 +295,8 @@ async fn assert_utxo_cursor_resumes(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let baseline = wallet_query
-        .transparent_address_utxos(
-            TransparentAddressUtxosRequest {
+        .address_output_index(
+            AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
                 start_height: sample.backfill_from_height,
                 max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
@@ -305,14 +305,14 @@ async fn assert_utxo_cursor_resumes(
             None,
         )
         .await?;
-    if baseline.utxos.len() < 2 {
+    if baseline.outputs.len() < 2 {
         // Address only paid once in the backfill window: cursor pagination is
         // covered by the integration tests, no signal to validate here.
         return Ok(());
     }
     let first_page = wallet_query
-        .transparent_address_utxos(
-            TransparentAddressUtxosRequest {
+        .address_output_index(
+            AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
                 start_height: sample.backfill_from_height,
                 max_entries: NonZeroU32::MIN,
@@ -321,13 +321,13 @@ async fn assert_utxo_cursor_resumes(
             None,
         )
         .await?;
-    assert_eq!(first_page.utxos.len(), 1);
+    assert_eq!(first_page.outputs.len(), 1);
     let cursor = first_page
         .next_cursor
         .ok_or_else(|| eyre!("first page must return a resume cursor when more UTXOs exist"))?;
     let second_page = wallet_query
-        .transparent_address_utxos(
-            TransparentAddressUtxosRequest {
+        .address_output_index(
+            AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
                 start_height: BlockHeight::new(0),
                 max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
@@ -337,19 +337,19 @@ async fn assert_utxo_cursor_resumes(
         )
         .await?;
     let resumed: Vec<_> = first_page
-        .utxos
+        .outputs
         .iter()
-        .chain(second_page.utxos.iter())
+        .chain(second_page.outputs.iter())
         .collect();
-    assert_eq!(resumed.len(), baseline.utxos.len());
-    for (joined, expected) in resumed.iter().zip(baseline.utxos.iter()) {
+    assert_eq!(resumed.len(), baseline.outputs.len());
+    for (joined, expected) in resumed.iter().zip(baseline.outputs.iter()) {
         assert_eq!(joined.outpoint, expected.outpoint);
     }
     Ok(())
 }
 
 fn assert_response_addresses_are_uniform(
-    utxos: &[TransparentAddressUtxoArtifact],
+    utxos: &[AddressOutputIndexArtifact],
     expected: TransparentAddressScriptHash,
 ) -> Result<()> {
     for utxo in utxos {

@@ -4,58 +4,64 @@ use zinder_core::{BlockHeight, ChainEpoch, TreeStateArtifact};
 
 use crate::{
     ArtifactFamily, StoreError,
-    artifact_visibility::{HeightVisibilityIndex, visible_height_source_epoch},
-    block_artifact::read_block_artifact,
+    block_artifact::read_block_header_artifact,
     format::{StoreKey, decode_tree_state_artifact},
-    kv::{RocksChainStoreRead, StorageTable},
+    kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
 
 /// Read boundary for commitment tree-state artifacts.
 pub trait TreeStateStore {
-    /// Reads the tree-state artifact at `height` for the reader's chain epoch.
-    fn tree_state_at(&self, height: BlockHeight) -> Result<Option<TreeStateArtifact>, StoreError>;
+    /// Reads the latest checkpoint tree state not above `max_height`.
+    fn tree_state_checkpoint_at_or_before(
+        &self,
+        max_height: BlockHeight,
+    ) -> Result<Option<TreeStateArtifact>, StoreError>;
 }
 
-pub(crate) fn read_tree_state_artifact(
+pub(crate) fn read_tree_state_checkpoint_at_or_before(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
-    height: BlockHeight,
+    max_height: BlockHeight,
 ) -> Result<Option<TreeStateArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
-        return Ok(None);
+    if max_height > chain_epoch.tip_height {
+        return read_tree_state_checkpoint_at_or_before(inner, chain_epoch, chain_epoch.tip_height);
     }
 
-    let source_epoch = visible_height_source_epoch(
-        inner,
-        chain_epoch,
-        height,
-        ArtifactFamily::TreeState,
-        HeightVisibilityIndex::TreeState,
+    let prefix = StoreKey::tree_state_network_prefix(chain_epoch.network);
+    let mut checkpoint = None::<TreeStateArtifact>;
+    inner.scan_prefix_reverse(
+        StorageTable::TreeState,
+        &prefix,
+        &mut |key_bytes, envelope_bytes| {
+            let key = StoreKey::from_raw_bytes(key_bytes);
+            let Some((source_epoch, height)) = StoreKey::tree_state_key_parts(key_bytes) else {
+                return Err(StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::TreeState,
+                    key: key.into(),
+                    reason: "tree-state key does not match checkpoint scan prefix",
+                });
+            };
+            if source_epoch > chain_epoch.id || height > max_height {
+                return Ok(PrefixScanControl::Continue);
+            }
+
+            let tree_state = decode_tree_state_artifact(&key, envelope_bytes)?;
+            let Some(block) = read_block_header_artifact(inner, chain_epoch, tree_state.height)?
+            else {
+                return Ok(PrefixScanControl::Continue);
+            };
+            if block.block_hash != tree_state.block_hash {
+                return Ok(PrefixScanControl::Continue);
+            }
+
+            let replaces_current = checkpoint
+                .as_ref()
+                .is_none_or(|current| tree_state.height > current.height);
+            if replaces_current {
+                checkpoint = Some(tree_state);
+            }
+            Ok(PrefixScanControl::Continue)
+        },
     )?;
-    let key = StoreKey::tree_state(chain_epoch.network, source_epoch, height);
-    let Some(envelope_bytes) = inner.get(StorageTable::TreeState, &key)? else {
-        return Err(StoreError::ArtifactMissing {
-            family: ArtifactFamily::TreeState,
-            key: key.into(),
-        });
-    };
-
-    let tree_state = decode_tree_state_artifact(&key, &envelope_bytes)?;
-    let Some(block) = read_block_artifact(inner, chain_epoch, tree_state.height)? else {
-        return Err(StoreError::ArtifactMissing {
-            family: ArtifactFamily::TreeState,
-            key: key.into(),
-        });
-    };
-
-    if block.block_hash == tree_state.block_hash {
-        return Ok(Some(tree_state));
-    }
-
-    // Tree-state reads are height-addressed consistency checks, so a reverted
-    // branch at that height is treated as a missing required artifact.
-    Err(StoreError::ArtifactMissing {
-        family: ArtifactFamily::TreeState,
-        key: StoreKey::tree_state(chain_epoch.network, chain_epoch.id, height).into(),
-    })
+    Ok(checkpoint)
 }

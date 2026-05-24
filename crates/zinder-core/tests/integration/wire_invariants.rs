@@ -35,7 +35,7 @@ const TXID_BLOCK_HASH_AS_BYTES_ALLOWLIST: &[&str] = &[
     "crates/zinder-store/src/format/artifact_codec.rs",
     "crates/zinder-store/src/format/store_key.rs",
     "crates/zinder-store/src/format/stream_cursor.rs",
-    "crates/zinder-store/src/transparent_utxo.rs",
+    "crates/zinder-store/src/address_output.rs",
 ];
 
 /// Identifier substrings that name a Zcash 32-byte little-endian hash field at a wire boundary.

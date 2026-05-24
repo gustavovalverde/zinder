@@ -1,3 +1,4 @@
+mod address_output_index;
 mod cli;
 mod compact_block_range;
 mod native_grpc;
@@ -8,5 +9,4 @@ mod single_artifact_lookup;
 mod stream_cancellation;
 mod transaction_broadcast;
 mod transparent_address_tx_history;
-mod transparent_address_utxos;
-mod transparent_prevouts;
+mod transparent_outputs_by_outpoint;

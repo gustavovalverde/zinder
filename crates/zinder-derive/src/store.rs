@@ -41,6 +41,12 @@ use crate::{
         TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
         TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
     },
+    consumer::transparent_address_transaction_history::{
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+    },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
         CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveMempoolConsumer,
@@ -64,7 +70,7 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 /// metadata payload format changes in a backwards-incompatible way. The
 /// version is persisted in the `consumer_metadata` column family on first
 /// open and validated on subsequent opens.
-pub const DERIVE_SCHEMA_VERSION: u16 = 2;
+pub const DERIVE_SCHEMA_VERSION: u16 = 4;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
@@ -75,12 +81,16 @@ const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
     TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
 ];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     BLOCK_SUMMARY_CONSUMER_NAME,
     TRANSACTION_FEES_CONSUMER_NAME,
     RECENT_TRANSACTIONS_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
 ];
 
 /// Per-column-family options the derive plane tunes at open time.
@@ -215,6 +225,7 @@ pub struct DeriveStore {
     sync_writes: bool,
     storage_path: PathBuf,
     consumer_column_families: &'static [&'static str],
+    is_secondary: bool,
 }
 
 impl DeriveStore {
@@ -285,6 +296,7 @@ impl DeriveStore {
             sync_writes: options.sync_writes,
             storage_path: path.to_path_buf(),
             consumer_column_families: options.consumer_column_families,
+            is_secondary: false,
         };
         store.validate_or_initialize_schema_version()?;
         Ok(store)
@@ -341,6 +353,7 @@ impl DeriveStore {
             sync_writes: options.sync_writes,
             storage_path: primary_path.to_path_buf(),
             consumer_column_families: options.consumer_column_families,
+            is_secondary: true,
         };
         store.schema_version()?;
         Ok(store)
@@ -352,6 +365,9 @@ impl DeriveStore {
     /// No-op on a primary instance: `RocksDB` returns immediately because
     /// there is no upstream MANIFEST to tail.
     pub fn try_catch_up(&self) -> Result<(), DeriveStoreError> {
+        if !self.is_secondary {
+            return Ok(());
+        }
         self.db
             .try_catch_up_with_primary()
             .map_err(|source| DeriveStoreError::Operation {
@@ -395,6 +411,28 @@ impl DeriveStore {
     where
         S: BuildHasher,
     {
+        self.write_chain_event_chunk(consumers, inputs, blocks, true)
+    }
+
+    /// Dispatches one replay chunk and optionally advances chain-event
+    /// cursors.
+    ///
+    /// Replay callers use this when a retained canonical event is too large
+    /// to hydrate as one in-memory unit. Intermediate chunks persist
+    /// deterministic consumer rows without advancing the cursor; the final
+    /// chunk advances all consumer cursors in the same write batch as its
+    /// rows. If the process exits between chunks, replay restarts from the
+    /// canonical event and overwrites the already-materialized rows.
+    pub fn write_chain_event_chunk<S>(
+        &self,
+        consumers: &mut [&mut dyn BlockKeyedConsumer],
+        inputs: ChainEventDispatchInputs<'_>,
+        blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+        advance_cursor: bool,
+    ) -> Result<(), DeriveError>
+    where
+        S: BuildHasher,
+    {
         let mut batch = WriteBatch::default();
         let mut ctx = DeriveConsumerCtx {
             store: self,
@@ -405,7 +443,9 @@ impl DeriveStore {
             dispatch_chain_event_to_block_consumer(&mut **consumer, inputs, &mut ctx, blocks)?;
         }
 
-        self.stage_chain_event_cursor_advances(&mut batch, consumers, inputs.chain_cursor)?;
+        if advance_cursor {
+            self.stage_chain_event_cursor_advances(&mut batch, consumers, inputs.chain_cursor)?;
+        }
         self.write_batch(&batch)?;
         Ok(())
     }

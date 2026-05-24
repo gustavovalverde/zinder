@@ -905,14 +905,14 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
     Ok(())
 }
 
-/// `IngestControl.TransparentMempoolPrevouts` resolves the outputs of
+/// `IngestControl.TransparentMempoolOutputsByOutpoint` resolves the outputs of
 /// mempool transactions into per-entry prevouts in input order.
 ///
 /// Outpoints that reference unknown transactions or out-of-bounds output
 /// indices return `None`.
 #[tokio::test(flavor = "multi_thread")]
-async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
-    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolPrevoutsRequest};
+async fn ingest_control_serves_transparent_mempool_outputs_by_outpoint() -> Result<()> {
+    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolOutputsByOutpointRequest};
 
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let chain_epoch = *store_fixture
@@ -942,7 +942,7 @@ async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
     };
 
     let response = client
-        .transparent_mempool_prevouts(TransparentMempoolPrevoutsRequest {
+        .transparent_mempool_outputs_by_outpoint(TransparentMempoolOutputsByOutpointRequest {
             outpoints: vec![
                 known_outpoint.clone(),
                 unknown_outpoint.clone(),
@@ -955,17 +955,17 @@ async fn ingest_control_serves_transparent_mempool_prevouts() -> Result<()> {
     assert!(response.chain_epoch.is_some());
     assert_eq!(response.entries.len(), 3);
     let known_prevout = response.entries[0]
-        .prevout
+        .output
         .as_ref()
         .ok_or_else(|| eyre::eyre!("known mempool outpoint must resolve to a prevout"))?;
     assert_eq!(known_prevout.value_zat, 1_000);
     assert_eq!(known_prevout.script_pub_key, vec![0xAA; 25]);
     assert!(
-        response.entries[1].prevout.is_none(),
+        response.entries[1].output.is_none(),
         "unknown txid must resolve to None",
     );
     assert!(
-        response.entries[2].prevout.is_none(),
+        response.entries[2].output.is_none(),
         "out-of-bounds output_index must resolve to None",
     );
     Ok(())

@@ -44,11 +44,14 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{NodeSource as _, SourceBlock};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::{ChainStoreOptions, PrimaryChainStore, SecondaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
+use crate::common::{
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
+};
 
 /// Number of blocks below the tip to backfill.
 ///
@@ -131,10 +134,7 @@ fn assert_response_invariants(
         BlockHeight::new(mined_location.block_height),
         fixture.sample_block_height,
     );
-    assert_eq!(
-        u32::try_from(response.raw_transaction_bytes.len()).unwrap_or(u32::MAX),
-        facts.size_bytes,
-    );
+    assert!(facts.size_bytes > 0);
     tracing::info!(
         target: "zinder::live",
         event = "transaction_detail_validated",
@@ -183,8 +183,15 @@ impl TransactionDetailFixture {
             serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
+        let canonical_secondary = SecondaryChainStore::open(
+            tempdir.path().join("zinder-store"),
+            tempdir.path().join("zinder-store-secondary-explorer"),
+            ChainStoreOptions::for_network(network),
+        )?;
+        canonical_secondary.try_catch_up()?;
         let explorer_adapter =
             ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
+                .with_canonical_store(canonical_secondary)
                 .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
 
         Ok(Self {
@@ -297,6 +304,7 @@ async fn backfill_and_sample_tip_coinbase(
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -304,6 +312,7 @@ async fn backfill_and_sample_tip_coinbase(
         tip_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        activations,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;

@@ -38,17 +38,19 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `ChainEvent` | Post-commit canonical transition emitted by `zinder-ingest` |
 | `ChainEventEnvelope` | Cursor-bound chain-event message carried over the ingest subscription plane and exposed natively on `WalletQuery.ChainEvents` |
 | `ChainTipMetadata` | Chain-derived counters at the visible tip (Sapling and Orchard tree sizes) |
-| `BlockArtifact` | Durable artifact derived from a block |
+| `BlockHeaderArtifact` | Durable typed block-header fact row |
+| `BlockBlobArtifact` | Optional raw block blob available only when raw blob policy stores blocks |
 | `CompactBlockArtifact` | Wallet-oriented compact block artifact |
 | `BlockId` | Stable block identity (`{ height: BlockHeight, hash: BlockHash }`); lives in `zinder-core` and is the canonical (height, hash) pair across the source boundary, the wallet protocol, and the reader API |
-| `FinalizedBlockStore` | Storage boundary for finalized chain data |
+| `TransactionLocation` | Durable transaction id to block-location fact |
+| `TransactionFactsArtifact` | Durable typed public transaction facts parsed once by ingest |
 | `ReorgWindow` | Non-finalized range where reorgs are expected and supported |
 | `MempoolEntry` | One transaction currently observed in the mempool |
 | `MempoolEvent` | Typed mempool transition (`Added`, `Invalidated`, `Mined`) carried in the event log |
 | `MempoolEventEnvelope` | Cursor-bound mempool-event message exposed natively on `WalletQuery.MempoolEvents` |
 | `MempoolSnapshotView` | Bounded, pageable point-in-time projection of the live mempool with `snapshot_age_millis` |
 | `TransparentOutPoint` | Canonical transparent output identifier: transaction id plus output index |
-| `TransparentPrevoutArtifact` | Durable mined transparent-output row carrying value, `script_pub_key`, address script hash, and producing block identity; stored in the current `transparent_prevout` projection and `transparent_prevout_history`, with its outpoint referenced by the block-local repair index |
+| `TransparentOutputArtifact` | Durable mined transparent-output row carrying value, `script_pub_key`, address script hash, and producing block identity; stored in `transparent_output`, with its outpoint referenced by the block-local repair index |
 | `TransparentMempoolOutputsRequest` | Bounded transparent-address request for outputs currently visible in the mempool index |
 | `TransparentMempoolOutput` | Transparent output currently visible in the mempool index |
 | `TransparentMempoolSpend` | Transparent outpoint-spend relationship currently visible in the mempool index |
@@ -157,7 +159,8 @@ Method names on public traits, types, and gRPC services follow a small set of ru
 
 Methods that look up exactly one artifact by exactly one key:
 
-- For a `BlockHeight` key, use `{artifact}_at(height)`. Example: `block_at(height)`, `compact_block_at(height)`, `tree_state_at(height)`.
+- For an exact `BlockHeight` key, use `{artifact}_at(height)`. Example: `block_at(height)`, `compact_block_at(height)`.
+- For checkpoint floor reads, use `{artifact}_checkpoint_at_or_before(max_height)`. Example: `tree_state_checkpoint_at_or_before(max_height)`.
 - For any other unique key, use `{artifact}_by_{key_noun}(key)`. Example: `transaction_by_id(txid)`, `block_by_hash(hash)`.
 
 The `_at` suffix is reserved for height; using `_at` for any non-height key is a convention violation.
@@ -173,7 +176,7 @@ Methods that read a contiguous range of artifacts, returning a stream or vector:
 
 Methods that return the artifact at the visible tip with no caller-supplied key:
 
-- `latest_{artifact}()`. Example: `latest_block()`, `latest_tree_state()`.
+- `latest_{artifact}()`. Example: `latest_block()`, `latest_tree_state_checkpoint()`.
 
 ### Rule 4 — Stream subscriptions
 
@@ -264,8 +267,8 @@ pub enum ArtifactFamily {
     Transaction,
     TreeState,
     SubtreeRoot,
-    TransparentAddressUtxo,
-    TransparentUtxoSpend,
+    AddressOutputIndex,
+    TransparentSpendFact,
 }
 
 #[non_exhaustive]
@@ -354,7 +357,7 @@ listen_addr = "127.0.0.1:9106"
 [node]
 json_rpc_addr = "127.0.0.1:8232"
 request_timeout_ms = 30000
-max_response_bytes = 16777216
+max_response_bytes = 67108864
 
 [node.auth]
 method = "basic"
@@ -410,12 +413,18 @@ reorg_window_blocks = 100
 catchup_threshold_blocks = 100
 
 [ingest.derive]
-concurrency = 32
+replay_concurrency = 16
+replay_batch_blocks = 100
+replay_policy = "canonical-first"
 
 [ingest.bulk_catchup]
-commit_batch_blocks = 1000
-max_transparent_prevout_store_lookups_per_batch = 250000
-fetch_concurrency = 32
+canonical_batch_max_blocks = 1000
+canonical_batch_max_artifact_bytes = 536870912
+source_segment_max_blocks = 128
+source_segment_target_response_bytes = 50331648
+source_fetch_max_in_flight_requests = 8
+source_fetch_max_in_flight_bytes = 268435456
+fact_build_concurrency = 16
 
 [ingest.tip_follow]
 poll_interval_ms = 1000
@@ -453,7 +462,7 @@ Every duration field uses the `_ms` suffix. Sub-second granularity is supported 
 |------|--------|---------|
 | Milliseconds | `_ms` | `request_timeout_ms`, `poll_interval_ms` |
 | Bytes | `_bytes` | `max_response_bytes`, `max_size_bytes` |
-| Block count | `_blocks` | `reorg_window_blocks`, `commit_batch_blocks` |
+| Block count | `_blocks` | `reorg_window_blocks`, `canonical_batch_max_blocks` |
 | Hour count | `_hours` | `chain_event_retention_hours` |
 | Minute count | `_minutes` | `mempool_mined_retention_minutes` |
 | Bare counts (events, items) | `_events`, `_entries`, `_chunks` | `max_event_history_entries` |
@@ -490,7 +499,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__AUTH__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.path` | Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`. |
 | `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
-| `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
+| `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
@@ -500,12 +509,19 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST_CONTROL__ADDR` | zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
 | `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to `none` so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phases.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
-| `ZINDER_INGEST__BULK_CATCHUP__COMMIT_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_batch_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
-| `ZINDER_INGEST__BULK_CATCHUP__MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH` | zinder-ingest | Optional | `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch` | Maximum unique transparent prevouts read from the store per bulk-catchup commit batch. Defaults to 250000. |
-| `ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fetch_concurrency` | Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32. |
-| `ZINDER_INGEST__DERIVE__CONCURRENCY` | zinder-ingest | Optional | `ingest.derive.concurrency` | Parallel CPU-bound derive and replay block hydration tasks on the blocking pool. Defaults to `clamp(available_parallelism() - 1, 4, 32)`. |
+| `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_blocks` | Maximum block count per bulk-catchup commit batch. Dense batches can commit earlier when canonical work-cost budgets are reached. Defaults to 1000. |
+| `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_artifact_bytes` | Maximum canonical artifact bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Maximum connected blocks requested from the source in one bulk-catchup segment. The writer adapts below this ceiling from observed response bytes, carries learned density across bulk commit batches, and resets density at network-upgrade boundaries. Defaults to 128. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Target response bytes for adaptive source segment sizing. Defaults to 50331648. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_requests` | Maximum concurrent source segment fetch requests. Defaults to 8. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Maximum reserved source response bytes across in-flight fetches. Defaults to 268435456. |
+| `ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fact_build_concurrency` | Parallel canonical fact-build slots. Defaults to `min(available_parallelism(), 16)`. |
+| `ZINDER_INGEST__DERIVE__REPLAY_CONCURRENCY` | zinder-ingest | Optional | `ingest.derive.replay_concurrency` | Parallel block hydration slots used by derive replay. Defaults to `min(available_parallelism(), 16)`. |
+| `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
+| `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available. Defaults to `canonical-first`. |
 | `ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS` | zinder-ingest | Optional | `ingest.bulk_catchup.flush_interval_epochs` | Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater than zero. Defaults to 5. |
 | `ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.tip_follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
 | `ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.tip_follow.lag_threshold_blocks` | Block lag at which tip-follow reports `cause=syncing`. Defaults to 1. |
@@ -581,8 +597,8 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.read.block_header_by_selector_v1`
 - `wallet.read.compact_block_at_v1`
 - `wallet.read.compact_block_range_v1`
-- `wallet.read.tree_state_at_v1`
-- `wallet.read.latest_tree_state_v1`
+- `wallet.read.tree_state_checkpoint_v1`
+- `wallet.read.latest_tree_state_checkpoint_v1`
 - `wallet.read.subtree_roots_in_range_v1`
 - `wallet.read.transaction_by_id_v1`
 - `wallet.read.server_info_v1`
@@ -592,10 +608,10 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.events.mempool_v1`
 - `wallet.mempool.transparent_outputs_by_address_v1`
 - `wallet.mempool.transparent_spend_by_outpoint_v1`
-- `wallet.mempool.transparent_prevouts_v1`
-- `wallet.read.transparent_prevouts_v1`
+- `wallet.mempool.transparent_outputs_by_outpoint_v1`
+- `wallet.read.transparent_outputs_by_outpoint_v1`
 - `wallet.read.chain_value_pools_at_tip_v1`
-- `wallet.address.transparent_utxos_v1`
+- `wallet.address.output_index_v1`
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
 - `explorer.server_info_v1`
@@ -603,7 +619,6 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `explorer.transaction.detail_v1`
 - `explorer.block.summary_v1`
 - `explorer.block.detail_v1`
-- `wallet.read.full_block_at_v1`
 - `explorer.search_v1`
 - `explorer.mempool.summary_v1`
 - `explorer.mempool.activity_v1`
@@ -617,7 +632,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent UTXO column family, no mempool overlay). `explorer.transparent_address.balance_v1` coexists with it when `zinder-explorer` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the explorer capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed. The dual-capability federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent output column family, no mempool overlay). `explorer.transparent_address.balance_v1` coexists with it when `zinder-explorer` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the explorer capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed. The dual-capability federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are
@@ -789,7 +804,7 @@ Add a crate only when it has a stable domain boundary and enough behavior to jus
 Public shapes describe behavior that production code can actually reach.
 
 - Public event variants, error variants, API transitions, cursor fields, and proto surfaces must be produced, consumed, or explicitly reserved by the owning architecture document.
-- Delete unreachable public variants while Zinder has no compatibility burden. Do not keep fallback variants only because they might be useful later.
+- Delete unreachable public variants. Do not keep fallback variants only because they might be useful later.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
 - Backfill ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.

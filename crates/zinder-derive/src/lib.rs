@@ -46,12 +46,22 @@ pub use consumer::transparent_address_activity::{
     TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressActivityConsumer,
     TransparentAddressActivityConsumerError,
 };
+pub use consumer::transparent_address_transaction_history::{
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+    TransparentAddressTransactionHistoryConsumer,
+    TransparentAddressTransactionHistoryConsumerError, TransparentAddressTransactionHistoryPage,
+    TransparentAddressTransactionHistoryPageRequest,
+};
 pub use consumer::{
     BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockKeyedConsumer,
     ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
     DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent,
-    MempoolConsumerEventVariant, PrevoutResolver, RevertedRange, apply_chain_committed_in_memory,
-    apply_chain_reorged_in_memory,
+    MempoolConsumerEventVariant, RevertedRange, TransparentSpendFacts,
+    apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use store::{

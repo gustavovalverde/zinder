@@ -125,8 +125,6 @@ pub struct SourceBlock {
     pub block_time_seconds: u32,
     /// Raw serialized block bytes returned by the node.
     pub raw_block_bytes: Vec<u8>,
-    /// Optional tree-state payload bytes observed with this block.
-    pub tree_state_payload_bytes: Option<Vec<u8>>,
 }
 
 impl SourceBlock {
@@ -151,18 +149,7 @@ impl SourceBlock {
             parent_hash: header.parent_hash,
             block_time_seconds: header.block_time_seconds,
             raw_block_bytes: raw_block_bytes.into(),
-            tree_state_payload_bytes: None,
         }
-    }
-
-    /// Adds tree-state payload bytes observed with this block.
-    #[must_use]
-    pub fn with_tree_state_payload_bytes(
-        mut self,
-        tree_state_payload_bytes: impl Into<Vec<u8>>,
-    ) -> Self {
-        self.tree_state_payload_bytes = Some(tree_state_payload_bytes.into());
-        self
     }
 }
 

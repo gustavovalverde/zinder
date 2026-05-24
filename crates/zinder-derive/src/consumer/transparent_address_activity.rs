@@ -9,7 +9,7 @@
 //! ## Field-presence rules (ADR-0018)
 //!
 //! `net_value_zat` is set only when the consumer resolved every
-//! transparent prevout the transaction reads from this address. If any
+//! previous transparent output the transaction reads from this address. If any
 //! prevout is unresolved (or the prevout-resolution capability is off
 //! entirely), `net_value_zat` is `None` and `prevout_resolution_status`
 //! disambiguates which case applies. The handler renders a chip rather
@@ -29,14 +29,12 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
-use zebra_chain::transparent;
 use zinder_core::wire::{
     encode_address_script_hash, encode_height_key_ascending, encode_height_key_descending,
     encode_in_block_position, encode_internal_transaction_id,
 };
 use zinder_core::{
-    BlockHeight, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentPrevout,
+    BlockHeight, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
@@ -115,8 +113,8 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let prevouts = block.prevouts()?;
-        let rows = aggregate_address_rows(block, prevouts.as_deref())?;
+        let transparent_spends = block.transparent_spends()?;
+        let rows = aggregate_address_rows(block, transparent_spends.as_deref());
         let primary_cf = ctx
             .store
             .consumer_column_family(TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY)?;
@@ -239,75 +237,62 @@ impl RowAccumulator {
 
 fn aggregate_address_rows(
     block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
-) -> Result<
-    HashMap<(TransparentAddressScriptHash, u32), TransparentAddressActivityRecord>,
-    TransparentAddressActivityConsumerError,
-> {
+    transparent_spends: Option<&HashMap<TransparentOutPoint, TransparentSpendFact>>,
+) -> HashMap<(TransparentAddressScriptHash, u32), TransparentAddressActivityRecord> {
     let mut accumulators: HashMap<(TransparentAddressScriptHash, u32), RowAccumulator> =
         HashMap::new();
-    let block_time_unix_seconds = block.block.header.time.timestamp();
+    let block_time_unix_seconds = block.block_time_unix_seconds;
 
-    for (position, transaction) in block.block.transactions.iter().enumerate() {
-        let in_block_position = u32::try_from(position)
-            .map_err(|_| TransparentAddressActivityConsumerError::PositionOverflow)?;
-        let is_coinbase = position == 0;
+    for transaction in &block.transactions {
+        let in_block_position = transaction.location.tx_index_in_block;
+        let is_coinbase = transaction.public_facts.is_coinbase;
         let transaction_id_bytes =
-            encode_internal_transaction_id(TransactionId::from_bytes(transaction.hash().0));
+            encode_internal_transaction_id(transaction.location.transaction_id);
 
         // Output side: every transaction (including coinbase) contributes.
-        for output in transaction.outputs() {
-            let script_bytes = output.lock_script.as_raw_bytes();
-            let address = TransparentAddressScriptHash::of_script_pub_key(script_bytes);
+        for output in &transaction.transparent_outputs {
+            let address = output.address_script_hash;
             let entry = accumulators
                 .entry((address, in_block_position))
                 .or_insert_with(|| RowAccumulator::new(transaction_id_bytes.to_vec()));
             entry.output_count = entry.output_count.saturating_add(1);
             entry.output_value_zat = entry
                 .output_value_zat
-                .saturating_add(i128::from(i64::from(output.value)));
+                .saturating_add(i128::from(output.value_zat));
         }
 
         if is_coinbase {
             continue;
         }
 
-        // Input side: only when prevouts are available. Coinbase has no
-        // resolvable prevouts and is already skipped above.
-        if let Some(prevouts_map) = prevouts {
-            for input in transaction.inputs() {
-                let transparent::Input::PrevOut { outpoint, .. } = input else {
-                    continue;
-                };
-                let canonical_outpoint = TransparentOutPoint::new(
-                    TransactionId::from_bytes(outpoint.hash.0),
-                    outpoint.index,
-                );
-                let Some(prevout) = prevouts_map.get(&canonical_outpoint) else {
-                    // We don't know which address this input belonged to without the prevout, so we
-                    // cannot attribute it. The row(s) for this transaction stay with
+        // Input side: only when hydrated spends are available. Coinbase has no
+        // resolvable inputs and is already skipped above.
+        if let Some(spends_by_outpoint) = transparent_spends {
+            for input in &transaction.transparent_inputs {
+                let Some(spend) = spends_by_outpoint.get(&input.spent_outpoint) else {
+                    // We don't know which address this input belonged to without the hydrated spend,
+                    // so we cannot attribute it. The row(s) for this transaction stay with
                     // `every_input_resolved = false` on the address(es) it DOES touch via outputs,
                     // and `prevout_resolution_status` rolls up as Partial when any row is incomplete.
                     continue;
                 };
-                let address =
-                    TransparentAddressScriptHash::of_script_pub_key(&prevout.script_pub_key);
+                let address = spend.spent_address_script_hash;
                 let entry = accumulators
                     .entry((address, in_block_position))
                     .or_insert_with(|| RowAccumulator::new(transaction_id_bytes.to_vec()));
                 entry.input_count = entry.input_count.saturating_add(1);
                 entry.input_value_zat = entry
                     .input_value_zat
-                    .saturating_add(i128::from(prevout.value_zat));
+                    .saturating_add(i128::from(spend.spent_value_zat));
             }
         }
     }
 
     // Determine per-transaction resolution status and downgrade affected rows.
-    let resolution_status = determine_resolution_status(block, prevouts);
-    flag_partial_rows(&mut accumulators, block, prevouts);
+    let resolution_status = determine_resolution_status(transparent_spends);
+    flag_partial_rows(&mut accumulators, block, transparent_spends);
 
-    let records = accumulators
+    accumulators
         .into_iter()
         .map(|(key, accumulator)| {
             let row_status = if accumulator.every_input_resolved {
@@ -318,17 +303,15 @@ fn aggregate_address_rows(
             let record = accumulator.into_record(block_time_unix_seconds, row_status);
             (key, record)
         })
-        .collect();
-    Ok(records)
+        .collect()
 }
 
 /// Top-level status for the block: Resolved when prevout resolution was
 /// online for the consumer, Unavailable when offline.
 fn determine_resolution_status(
-    _block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
+    transparent_spends: Option<&HashMap<TransparentOutPoint, TransparentSpendFact>>,
 ) -> PrevoutResolutionStatus {
-    if prevouts.is_some() {
+    if transparent_spends.is_some() {
         PrevoutResolutionStatus::Resolved
     } else {
         PrevoutResolutionStatus::Unavailable
@@ -344,31 +327,22 @@ fn determine_resolution_status(
 fn flag_partial_rows(
     accumulators: &mut HashMap<(TransparentAddressScriptHash, u32), RowAccumulator>,
     block: &BlockCommitContext,
-    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
+    transparent_spends: Option<&HashMap<TransparentOutPoint, TransparentSpendFact>>,
 ) {
-    let Some(prevouts_map) = prevouts else {
+    let Some(spends_by_outpoint) = transparent_spends else {
         for entry in accumulators.values_mut() {
             entry.every_input_resolved = false;
         }
         return;
     };
-    for (position, transaction) in block.block.transactions.iter().enumerate() {
-        if position == 0 {
+    for transaction in &block.transactions {
+        if transaction.public_facts.is_coinbase {
             continue;
         }
-        let Ok(in_block_position) = u32::try_from(position) else {
-            continue;
-        };
+        let in_block_position = transaction.location.tx_index_in_block;
         let mut transaction_complete = true;
-        for input in transaction.inputs() {
-            let transparent::Input::PrevOut { outpoint, .. } = input else {
-                continue;
-            };
-            let canonical_outpoint = TransparentOutPoint::new(
-                TransactionId::from_bytes(outpoint.hash.0),
-                outpoint.index,
-            );
-            if !prevouts_map.contains_key(&canonical_outpoint) {
+        for input in &transaction.transparent_inputs {
+            if !spends_by_outpoint.contains_key(&input.spent_outpoint) {
                 transaction_complete = false;
                 break;
             }
@@ -391,9 +365,6 @@ pub enum TransparentAddressActivityConsumerError {
     /// Storage encoding of the materialized record failed.
     #[error("TransparentAddressActivityRecord prost encode failed: {0}")]
     Encode(String),
-    /// Block carried more than `u32::MAX` transactions.
-    #[error("transaction position overflowed u32")]
-    PositionOverflow,
     /// Per-height index entry was not a clean multiple of 36 bytes.
     #[error(
         "transparent_address_activity_index entry for height {height} has {bytes} bytes, not a multiple of {INDEX_ENTRY_LEN}"

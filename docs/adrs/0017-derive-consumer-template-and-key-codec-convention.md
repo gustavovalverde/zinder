@@ -1,45 +1,49 @@
 # ADR-0017: Derive-consumer template, shared block context, and key codec convention
 
-Status: Accepted; hosting updated by [ADR-0023](0023-derive-plane-hosted-by-ingest.md)
+Status: Accepted
 Date: 2026-05-19
 Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
 [ADR-0011](0011-explorer-freshness-envelope.md),
-[ADR-0023](0023-derive-plane-hosted-by-ingest.md)
+[Derive plane](../architecture/derive-plane.md),
+[Fact-first indexer](../architecture/fact-first-indexer.md)
 
-ADR-0023 places bundled derive writes inside `zinder-ingest`. The durable
-contract in this ADR is the shared per-block context, `BlockKeyedConsumer`
-range dispatch convention, key codecs in `zinder-core::wire`, and atomic
-derive cursor persistence. Current implementations live in
-`crates/zinder-derive`, and `zinder-ingest` hosts bundled derive writes.
+Bundled derive writes run inside `zinder-ingest`'s derive tailer. The durable
+contract in this ADR is the shared per-block fact context,
+`BlockKeyedConsumer` range dispatch convention, key codecs in
+`zinder-core::wire`, and atomic derive cursor persistence. Current
+implementations live in `crates/zinder-derive`, and `zinder-ingest` hosts the
+bundled tailer.
 
 ## Context
 
 The explorer plane materializes column-family projections through reusable
 derive consumers: `BlockSummaryConsumer`, `TransactionFeesConsumer`,
 `TransparentAddressActivityConsumer`, and `RecentTransactionsConsumer`.
-Each consumer needs (a) the parsed block at the height being applied,
-(b) optionally a resolved prevout map, and (c) a small per-height key
+Each consumer needs (a) typed block-header and transaction facts at the height
+being applied, (b) transparent spend facts for the block's transparent inputs
+when the view computes fees or address deltas, and (c) a small per-height key
 encoding for whichever column-family layout the consumer chose.
 
-Letting each consumer roll its own block fetch, its own prevout resolver,
-its own key bytes, and its own range-loop scaffolding would multiply
-boilerplate by N and let drift between consumers compound.
+Letting each consumer roll its own block-context hydration, transparent-spend
+hydration, key bytes, and range-loop scaffolding would multiply boilerplate by
+N and let drift between consumers compound.
 
 ## Decision
 
 ### Per-block context shared across consumers
 
-`zinder-ingest` constructs one `BlockCommitContext` per committed block and
-passes shared references to every chain-events consumer observing that height.
-The context carries the parsed `zebra-chain` block, block identity, raw block
-size, and a precomputed prevout map when the commit path resolved prevouts.
-Consumers do not fetch `WalletQuery.FullBlock`, hold `WalletQueryClient`
-handles, or resolve prevouts over gRPC.
+`zinder-ingest`'s derive tailer hydrates one `BlockCommitContext` per committed
+block and passes shared references to every chain-event consumer observing that
+height. The context carries block identity, block time, raw block size, ordered
+`TransactionFactsArtifact` rows, and hydrated `TransparentSpendFact` rows when
+the view needs transparent input values. Consumers do not fetch
+`WalletQuery.FullBlock`, hold `WalletQueryClient` handles, parse raw block
+bytes, or resolve transparent outputs over gRPC.
 
 ### Consumer trait split
 
-`DeriveConsumer` is the SDK-facing trait the chain-events dispatcher calls;
-it has `apply_chain_committed` and `apply_chain_reorged`.
+`DeriveConsumer` is the SDK-facing trait the derive tailer calls; it has
+`apply_chain_committed` and `apply_chain_reorged`.
 
 `BlockKeyedConsumer` is the convention every production consumer implements:
 
@@ -50,7 +54,7 @@ it has `apply_chain_committed` and `apply_chain_reorged`.
 A blanket `impl<C: BlockKeyedConsumer> DeriveConsumer for C` provides
 the range loop on top: `apply_chain_committed` walks
 `start_height..=end_height`, pulls each `BlockCommitContext` from the
-writer-provided in-memory map, and calls `apply_block`;
+tailer-provided in-memory map, and calls `apply_block`;
 `apply_chain_reorged` walks the reverted range calling `revert_block` then
 walks the replacement range calling `apply_block`.
 
@@ -148,9 +152,9 @@ materialized at apply time.
 - `wire_invariants.rs` extends with bans for inline
   `.to_be_bytes()` on derive-store key fields when the temptation
   arises.
-- Shared `BlockCommitContext` values bound intra-commit cost to one parse
-  and one prevout-resolution pass per height, even as the consumer count
-  grows.
+- Shared `BlockCommitContext` values bound derive replay cost to one canonical
+  fact hydration pass and one transparent-spend hydration pass per height, even
+  as the consumer count grows.
 - Composite-key consumers that don't have a height prefix accept the
   index-CF overhead (a few dozen bytes per row at apply time) in
   exchange for correct, single-batch rewinds.

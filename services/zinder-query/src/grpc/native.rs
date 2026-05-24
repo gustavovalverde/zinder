@@ -10,12 +10,12 @@ use std::num::NonZeroU32;
 
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
-    BlockArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionArtifact, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevoutsResponse, TxStatus,
+    AddressOutputIndexArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
+    CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TxStatus,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
@@ -28,15 +28,14 @@ use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, FullBlock,
-    LatestBlock, QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos, TransparentAddressUtxosRequest,
-    TreeState, WalletQueryApi,
+    AddressOutputIndex, AddressOutputIndexRequest, BlockHeaderResponseValue, BlockIdResponseValue,
+    ChainEvents, CompactBlock, LatestBlock, QueryError, SubtreeRoots, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TreeState, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
-    chain_event_envelope_message, outpoint_message, transparent_prevout_entry_message,
+    chain_event_envelope_message, outpoint_message, transparent_output_entry_message,
 };
 
 /// Operator-configured snapshot used to build the `WalletServerInfo` descriptor.
@@ -199,19 +198,6 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
         .map(build_compact_block_response)
 }
 
-/// Reads the full canonical block at `height` and encodes the native wallet
-/// response.
-pub(super) async fn full_block_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    height: BlockHeight,
-    at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::FullBlockResponse, QueryError> {
-    query_api
-        .full_block_at(height, at_epoch)
-        .await
-        .map(build_full_block_response)
-}
-
 /// Resolves a typed block selector and encodes the native wallet response.
 pub async fn block_id_by_selector_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
@@ -256,26 +242,26 @@ pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
 }
 
 /// Reads the tree-state at `height` and encodes the native wallet response.
-pub async fn tree_state_response<Q: WalletQueryApi + ?Sized>(
+pub async fn tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     height: BlockHeight,
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .tree_state_at(height, at_epoch)
+        .tree_state_checkpoint_at_or_before(height, at_epoch)
         .await
-        .map(build_tree_state_response)
+        .map(build_tree_state_checkpoint_response)
 }
 
 /// Reads the latest tree-state and encodes the native wallet response.
-pub async fn latest_tree_state_response<Q: WalletQueryApi + ?Sized>(
+pub async fn latest_tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .latest_tree_state(at_epoch)
+        .latest_tree_state_checkpoint(at_epoch)
         .await
-        .map(build_tree_state_response)
+        .map(build_tree_state_checkpoint_response)
 }
 
 /// Reads subtree roots in `subtree_root_range` and encodes the native wallet response.
@@ -316,49 +302,49 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
 /// Resolves a batch of canonical-chain transparent outpoints to their
 /// referenced outputs and encodes the native wallet response.
 ///
-pub async fn transparent_prevouts_response<Q: WalletQueryApi + ?Sized>(
+pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     outpoints: Vec<TransparentOutPoint>,
     at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::TransparentPrevoutsResponse, QueryError> {
+) -> Result<wallet::TransparentOutputsByOutpointResponse, QueryError> {
     query_api
-        .transparent_prevouts(outpoints, at_epoch)
+        .transparent_outputs_by_outpoint(outpoints, at_epoch)
         .await
-        .map(build_transparent_prevouts_response)
+        .map(build_transparent_outputs_by_outpoint_response)
 }
 
-/// Reads transparent address UTXOs for `request` and encodes the native
+/// Reads transparent address outputs for `request` and encodes the native
 /// wallet response. The unary RPC and the streaming RPC share this helper.
-pub async fn transparent_address_utxos_response<Q: WalletQueryApi + ?Sized>(
+pub async fn address_output_index_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    request: TransparentAddressUtxosRequest,
+    request: AddressOutputIndexRequest,
     at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::TransparentAddressUtxosResponse, QueryError> {
+) -> Result<wallet::AddressOutputIndexResponse, QueryError> {
     query_api
-        .transparent_address_utxos(request, at_epoch)
+        .address_output_index(request, at_epoch)
         .await
-        .map(build_transparent_address_utxos_response)
+        .map(build_address_output_index_response)
 }
 
 /// Per-request address cap for [`transparent_address_confirmed_balance_response`].
 ///
 /// Mirrors the cap the federated explorer plane enforces in
 /// `services/zinder-explorer/src/grpc/adapter.rs`. Each address fans out into a
-/// paginated UTXO scan; without a cap one request could fan out into thousands
+/// paginated output scan; without a cap one request could fan out into thousands
 /// of column-family seeks.
 pub const MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST: u32 = 256;
 
-/// Per-address page size used when draining UTXOs for balance computation.
+/// Per-address page size used when draining outputs for balance computation.
 ///
-/// The native UTXO RPC pages with cursors. The balance helper drains the
-/// stream for each address; this constant bounds how many UTXOs the helper
+/// The native output RPC pages with cursors. The balance helper drains the
+/// stream for each address; this constant bounds how many outputs the helper
 /// asks for per round-trip. A large page reduces round-trips for whale
-/// addresses; the value mirrors `DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS` in
+/// addresses; the value mirrors `DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS` in
 /// `crates/zinder-query/src/grpc/adapter.rs`.
-const TRANSPARENT_BALANCE_UTXO_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+const TRANSPARENT_BALANCE_OUTPUT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
 /// Aggregates confirmed transparent balance across the requested addresses by
-/// draining canonical UTXOs at one chain epoch and summing `value_zat`.
+/// draining canonical outputs at one chain epoch and summing `value_zat`.
 ///
 /// Pins the read to `at_epoch` when supplied so the response is reproducible
 /// across pages; otherwise the first page binds the epoch and the loop
@@ -375,7 +361,7 @@ const TRANSPARENT_BALANCE_UTXO_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturatin
 /// Returns [`QueryError::InvalidAddress`] when the input contains no
 /// addresses, exceeds [`MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST`], or
 /// fails address-network validation. Propagates the underlying
-/// [`QueryError`] from each UTXO page lookup.
+/// [`QueryError`] from each output page lookup.
 pub async fn transparent_address_confirmed_balance_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     addresses: Vec<wallet::AddressLookup>,
@@ -401,14 +387,14 @@ pub async fn transparent_address_confirmed_balance_response<Q: WalletQueryApi + 
         let address_script_hash = address_lookup_to_script_hash(Some(address), network)?;
         let mut from_cursor: Option<StreamCursorTokenV1> = None;
         loop {
-            let request = TransparentAddressUtxosRequest {
+            let request = AddressOutputIndexRequest {
                 address_script_hash,
                 start_height: BlockHeight::new(0),
-                max_entries: TRANSPARENT_BALANCE_UTXO_PAGE_SIZE,
+                max_entries: TRANSPARENT_BALANCE_OUTPUT_PAGE_SIZE,
                 from_cursor: from_cursor.clone(),
             };
             let page = query_api
-                .transparent_address_utxos(request, pinned_epoch)
+                .address_output_index(request, pinned_epoch)
                 .await?;
             // Pin every subsequent page (and every later address) to the
             // first observed epoch so the response is reproducible.
@@ -416,8 +402,8 @@ pub async fn transparent_address_confirmed_balance_response<Q: WalletQueryApi + 
                 pinned_epoch = Some(page.chain_epoch);
             }
             chain_epoch = Some(page.chain_epoch);
-            for utxo in &page.utxos {
-                confirmed_zat = confirmed_zat.saturating_add(utxo.value_zat);
+            for output in &page.outputs {
+                confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
             }
             let Some(next_cursor) = page.next_cursor else {
                 break;
@@ -494,11 +480,8 @@ pub fn address_lookup_to_script_hash(
 pub async fn transparent_address_tx_ids_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     request: TransparentAddressTxIdsInRangeRequest,
-    at_epoch: Option<ChainEpoch>,
 ) -> Result<TransparentAddressTxIds, QueryError> {
-    query_api
-        .transparent_address_tx_ids_in_range(request, at_epoch)
-        .await
+    query_api.transparent_address_tx_ids_in_range(request).await
 }
 
 /// Builds one streamed tx-history chunk message.
@@ -518,43 +501,43 @@ pub fn build_transparent_address_tx_ids_chunk(
     }
 }
 
-/// Builds one stream chunk message from a UTXO and the chain epoch.
+/// Builds one stream chunk message from a output and the chain epoch.
 #[must_use]
-pub fn build_transparent_address_utxos_stream_chunk(
+pub fn build_address_output_index_stream_chunk(
     chain_epoch: ChainEpoch,
-    utxo: &TransparentAddressUtxoArtifact,
+    output: &AddressOutputIndexArtifact,
     cursor: Vec<u8>,
-) -> wallet::TransparentAddressUtxosStreamChunk {
-    wallet::TransparentAddressUtxosStreamChunk {
+) -> wallet::AddressOutputIndexStreamChunk {
+    wallet::AddressOutputIndexStreamChunk {
         chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
-        utxo: Some(build_transparent_address_utxo_message(utxo)),
+        output: Some(build_address_output_index_message(output)),
         cursor,
     }
 }
 
-fn build_transparent_prevouts_response(
-    response: TransparentPrevoutsResponse,
-) -> wallet::TransparentPrevoutsResponse {
-    wallet::TransparentPrevoutsResponse {
+fn build_transparent_outputs_by_outpoint_response(
+    response: TransparentOutputsByOutpointResponse,
+) -> wallet::TransparentOutputsByOutpointResponse {
+    wallet::TransparentOutputsByOutpointResponse {
         chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
         entries: response
             .entries
             .into_iter()
-            .map(transparent_prevout_entry_message)
+            .map(transparent_output_entry_message)
             .collect(),
     }
 }
 
-fn build_transparent_address_utxos_response(
-    response: TransparentAddressUtxos,
-) -> wallet::TransparentAddressUtxosResponse {
+fn build_address_output_index_response(
+    response: AddressOutputIndex,
+) -> wallet::AddressOutputIndexResponse {
     let chain_epoch = build_chain_epoch_message(response.chain_epoch);
-    wallet::TransparentAddressUtxosResponse {
+    wallet::AddressOutputIndexResponse {
         chain_epoch: Some(chain_epoch),
-        utxos: response
-            .utxos
+        outputs: response
+            .outputs
             .iter()
-            .map(build_transparent_address_utxo_message)
+            .map(build_address_output_index_message)
             .collect(),
         next_cursor: response
             .next_cursor
@@ -563,16 +546,16 @@ fn build_transparent_address_utxos_response(
     }
 }
 
-fn build_transparent_address_utxo_message(
-    utxo: &TransparentAddressUtxoArtifact,
-) -> wallet::TransparentAddressUtxo {
-    wallet::TransparentAddressUtxo {
-        address_script_hash: utxo.address_script_hash.as_bytes().to_vec(),
-        script_pub_key: utxo.script_pub_key.clone(),
-        outpoint: Some(outpoint_message(&utxo.outpoint)),
-        value_zat: utxo.value_zat,
-        block_height: utxo.block_height.value(),
-        block_hash: encode_internal_block_hash(utxo.block_hash).to_vec(),
+fn build_address_output_index_message(
+    output: &AddressOutputIndexArtifact,
+) -> wallet::AddressOutputIndex {
+    wallet::AddressOutputIndex {
+        address_script_hash: output.address_script_hash.as_bytes().to_vec(),
+        script_pub_key: output.script_pub_key.clone(),
+        outpoint: Some(outpoint_message(&output.outpoint)),
+        value_zat: output.value_zat,
+        block_height: output.block_height.value(),
+        block_hash: encode_internal_block_hash(output.block_hash).to_vec(),
     }
 }
 
@@ -623,22 +606,6 @@ fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactB
     }
 }
 
-fn build_full_block_response(full_block: FullBlock) -> wallet::FullBlockResponse {
-    wallet::FullBlockResponse {
-        chain_epoch: Some(build_chain_epoch_message(full_block.chain_epoch)),
-        block: Some(build_full_block_message(full_block.block)),
-    }
-}
-
-fn build_full_block_message(block: BlockArtifact) -> wallet::FullBlock {
-    wallet::FullBlock {
-        block_height: block.height.value(),
-        block_hash: encode_internal_block_hash(block.block_hash).into(),
-        parent_block_hash: encode_internal_block_hash(block.parent_hash).into(),
-        raw_block_bytes: block.payload_bytes,
-    }
-}
-
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "TxStatus is #[non_exhaustive]; new arms must be wired into the proto oneof in a deliberate change, not folded into a default branch."
@@ -650,7 +617,7 @@ fn build_transaction_status_response(
     let oneof = match status.status {
         TxStatus::Mined(mined) => {
             wallet::transaction_status_response::Status::Mined(wallet::MinedTransaction {
-                transaction: Some(build_transaction_message(mined.artifact)),
+                location: Some(build_transaction_location_message(mined.location)),
                 details: Some(build_mined_details_message(mined.details)),
             })
         }
@@ -685,16 +652,18 @@ fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
     }
 }
 
-fn build_transaction_message(transaction: TransactionArtifact) -> wallet::Transaction {
-    wallet::Transaction {
+fn build_transaction_location_message(
+    transaction: TransactionLocation,
+) -> wallet::TransactionLocation {
+    wallet::TransactionLocation {
         transaction_id: encode_internal_transaction_id(transaction.transaction_id).into(),
         block_height: transaction.block_height.value(),
         block_hash: encode_internal_block_hash(transaction.block_hash).into(),
-        payload_bytes: transaction.payload_bytes,
+        tx_index_in_block: transaction.tx_index_in_block,
     }
 }
 
-fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse {
+fn build_tree_state_checkpoint_response(tree_state: TreeState) -> wallet::TreeStateResponse {
     wallet::TreeStateResponse {
         chain_epoch: Some(build_chain_epoch_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),

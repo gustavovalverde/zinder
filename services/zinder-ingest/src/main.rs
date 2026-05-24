@@ -12,15 +12,17 @@ use clap::{Parser, Subcommand};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use zinder_core::BlockHeight;
 use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
+    DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
     MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, catch_up_derive_store_to_canonical, classify_phase,
-    current_chain_height, mempool_ready_channel, open_primary_derive_store_for_canonical,
-    run_ingest_loop, run_mempool_orchestrator, spawn_chain_event_retention_task,
-    spawn_mempool_event_retention_task, spawn_upstream_health_probe_task,
+    TipFollowSubsystemsLauncher, classify_phase, current_chain_height, mempool_ready_channel,
+    open_primary_derive_store_for_canonical, run_ingest_loop, run_mempool_orchestrator,
+    spawn_chain_event_retention_task, spawn_derive_replay_budget_metrics_task,
+    spawn_derive_tailer_task, spawn_mempool_event_retention_task,
+    spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
@@ -46,7 +48,6 @@ const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
     NodeCapability::BestChainBlocks,
     NodeCapability::TipId,
-    NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
 ];
 
@@ -97,20 +98,26 @@ struct Cli {
     #[arg(long = "catchup-threshold-blocks", global = true)]
     catchup_threshold_blocks: Option<u32>,
     /// Maximum number of blocks committed in one bulk-catchup batch.
-    #[arg(long = "commit-batch-blocks", global = true)]
-    commit_batch_blocks: Option<u32>,
-    /// Maximum unique transparent prevouts read from the store in one bulk-catchup batch.
-    #[arg(
-        long = "max-transparent-prevout-store-lookups-per-batch",
-        global = true
-    )]
-    max_transparent_prevout_store_lookups_per_batch: Option<u32>,
-    /// Number of concurrent block fetches in the pipelined bulk-catchup fetcher.
-    #[arg(long = "fetch-concurrency", global = true)]
-    fetch_concurrency: Option<u32>,
+    #[arg(long = "canonical-batch-max-blocks", global = true)]
+    canonical_batch_max_blocks: Option<u32>,
+    /// Maximum canonical artifact bytes accumulated before closing a batch.
+    #[arg(long = "canonical-batch-max-artifact-bytes", global = true)]
+    canonical_batch_max_artifact_bytes: Option<u64>,
+    /// Maximum connected blocks requested from the source in one bulk-catchup segment.
+    #[arg(long = "source-segment-max-blocks", global = true)]
+    source_segment_max_blocks: Option<u32>,
+    /// Target response bytes for adaptive source segment sizing.
+    #[arg(long = "source-segment-target-response-bytes", global = true)]
+    source_segment_target_response_bytes: Option<u64>,
+    /// Maximum concurrent source segment fetch requests.
+    #[arg(long = "source-fetch-max-in-flight-requests", global = true)]
+    source_fetch_max_in_flight_requests: Option<u32>,
+    /// Maximum reserved response bytes across source segment fetches.
+    #[arg(long = "source-fetch-max-in-flight-bytes", global = true)]
+    source_fetch_max_in_flight_bytes: Option<u64>,
     /// Number of parallel `derive_block` invocations on the blocking pool.
-    #[arg(long = "derive-concurrency", global = true)]
-    derive_concurrency: Option<u32>,
+    #[arg(long = "fact-build-concurrency", global = true)]
+    fact_build_concurrency: Option<u32>,
     /// Delay between upstream node tip polls, in milliseconds.
     #[arg(long = "poll-interval-ms", global = true)]
     poll_interval_ms: Option<u64>,
@@ -245,11 +252,13 @@ fn ingest_overrides_with_ops(
         max_response_bytes: cli.max_response_bytes,
         reorg_window_blocks: cli.reorg_window_blocks,
         catchup_threshold_blocks: cli.catchup_threshold_blocks,
-        commit_batch_blocks: cli.commit_batch_blocks,
-        max_transparent_prevout_store_lookups_per_batch: cli
-            .max_transparent_prevout_store_lookups_per_batch,
-        fetch_concurrency: cli.fetch_concurrency,
-        derive_concurrency: cli.derive_concurrency,
+        canonical_batch_max_blocks: cli.canonical_batch_max_blocks,
+        canonical_batch_max_artifact_bytes: cli.canonical_batch_max_artifact_bytes,
+        source_segment_max_blocks: cli.source_segment_max_blocks,
+        source_segment_target_response_bytes: cli.source_segment_target_response_bytes,
+        source_fetch_max_in_flight_requests: cli.source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: cli.source_fetch_max_in_flight_bytes,
+        fact_build_concurrency: cli.fact_build_concurrency,
         poll_interval_ms: cli.poll_interval_ms,
         lag_threshold_blocks: cli.lag_threshold_blocks,
         target_height: cli.target_height,
@@ -354,16 +363,31 @@ async fn run_ingest(
 
     let check_schema_phase = StartupPhase::CheckSchema.start();
     match ensure_node_capabilities(&source, &readiness).await {
-        Ok(_capabilities) => check_schema_phase.complete(),
+        Ok(_capabilities) => {}
         Err(error) => {
             check_schema_phase.fail(&error);
             start_api_phase.fail(&error);
             return Err(error);
         }
     }
+    let network_upgrade_activations = match source
+        .discover_network_upgrade_activations("zinder-ingest")
+        .await
+    {
+        Ok(activations) => activations,
+        Err(error) => {
+            let wrapped: IngestConfigError = IngestError::from(error).into();
+            check_schema_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
+    check_schema_phase.complete();
 
     let recover_state_phase = StartupPhase::RecoverState.start();
-    if let Err(error) = resolve_wallet_serving_modifiers(&mut command_config, &source).await {
+    if let Err(error) =
+        resolve_wallet_serving_modifiers(&mut command_config, &network_upgrade_activations)
+    {
         recover_state_phase.fail(&error);
         start_api_phase.fail(&error);
         return Err(error);
@@ -420,18 +444,21 @@ async fn run_ingest(
             return Err(wrapped);
         }
     };
-    if let Err(error) = catch_up_derive_store_to_canonical(
-        &store,
-        &derive_store,
-        command_config.loop_config.derive.concurrency,
-    )
-    .await
-    {
-        let wrapped: IngestConfigError = error.into();
-        open_storage_phase.fail(&wrapped);
-        start_api_phase.fail(&wrapped);
-        return Err(wrapped);
-    }
+    let derive_tailer_handle = spawn_derive_tailer_task(
+        store.clone(),
+        derive_store.clone(),
+        command_config.loop_config.derive,
+        DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+        cancel.clone(),
+    );
+    let memory_metrics_handle =
+        spawn_runtime_memory_metrics_task(DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, cancel.clone());
+    let derive_replay_budget_metrics_handle = spawn_derive_replay_budget_metrics_task(
+        command_config.loop_config.derive,
+        DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+        DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
+        cancel.clone(),
+    );
     open_storage_phase.complete();
 
     let mempool_index = MempoolIndex::new();
@@ -463,14 +490,13 @@ async fn run_ingest(
         json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
         reorg_window_blocks = command_config.loop_config.reorg_window_blocks,
         catchup_threshold_blocks = command_config.loop_config.phases.catchup_threshold_blocks,
-        derive_concurrency = command_config.loop_config.derive.concurrency.get(),
-        commit_batch_blocks = command_config.loop_config.bulk_catchup.commit_batch_blocks.get(),
-        max_transparent_prevout_store_lookups_per_batch = command_config
-            .loop_config
-            .bulk_catchup
-            .max_transparent_prevout_store_lookups_per_batch
-            .get(),
-        fetch_concurrency = command_config.loop_config.bulk_catchup.fetch_concurrency.get(),
+        fact_build_concurrency = command_config.loop_config.bulk_catchup.fact_build_concurrency.get(),
+        canonical_batch_max_blocks = command_config.loop_config.bulk_catchup.canonical_batch_max_blocks.get(),
+        canonical_batch_max_artifact_bytes = command_config.loop_config.bulk_catchup.canonical_batch_max_artifact_bytes.get(),
+        source_segment_max_blocks = command_config.loop_config.bulk_catchup.source_segment_max_blocks.get(),
+        source_segment_target_response_bytes = command_config.loop_config.bulk_catchup.source_segment_target_response_bytes.get(),
+        source_fetch_max_in_flight_requests = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_requests.get(),
+        source_fetch_max_in_flight_bytes = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_bytes.get(),
         poll_interval_ms = u64::try_from(
             command_config.loop_config.tip_follow.poll_interval.as_millis()
         )
@@ -494,9 +520,9 @@ async fn run_ingest(
 
     let loop_outcome = run_ingest_loop(
         &command_config.loop_config,
+        network_upgrade_activations,
         Arc::new(source),
         store.clone(),
-        derive_store,
         &readiness,
         cancel.clone(),
         Some(launcher),
@@ -504,6 +530,31 @@ async fn run_ingest(
     .await;
 
     let final_result = handle_loop_outcome(loop_outcome, &readiness, &cancel).await;
+    cancel.cancel();
+    if let Err(join_error) = derive_tailer_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "derive_tailer_join_failed",
+            error = %join_error,
+            "derive tailer task failed during shutdown"
+        );
+    }
+    if let Err(join_error) = memory_metrics_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "runtime_memory_metrics_join_failed",
+            error = %join_error,
+            "runtime memory metrics task failed during shutdown"
+        );
+    }
+    if let Err(join_error) = derive_replay_budget_metrics_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "derive_replay_budget_metrics_join_failed",
+            error = %join_error,
+            "derive replay budget metrics task failed during shutdown"
+        );
+    }
 
     tracing::info!(
         target: "zinder::ingest",
@@ -600,18 +651,14 @@ fn build_tip_follow_subsystems_launcher(
     })
 }
 
-async fn resolve_wallet_serving_modifiers(
+fn resolve_wallet_serving_modifiers(
     command_config: &mut IngestCommandConfig,
-    source: &ZebraJsonRpcSource,
+    activations: &NetworkUpgradeActivations,
 ) -> Result<(), IngestConfigError> {
     if !matches!(command_config.coverage, IngestCoverage::WalletServing) {
         return Ok(());
     }
 
-    let activations = source
-        .fetch_network_upgrade_activations()
-        .await
-        .map_err(IngestError::from)?;
     let Some(earliest) = activations.earliest_wallet_servable_activation() else {
         return Err(
             IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
@@ -1133,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_capability_validation_rejects_missing_tree_state()
+    fn ingest_capability_validation_accepts_missing_tree_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let capabilities = NodeCapabilities::new([
             NodeCapability::JsonRpc,
@@ -1142,18 +1189,7 @@ mod tests {
             NodeCapability::SubtreeRoots,
         ])?;
 
-        let Err(error) = require_ingest_node_capabilities(capabilities) else {
-            return Err(Box::new(std::io::Error::other(
-                "missing tree-state support passed startup validation",
-            )));
-        };
-
-        assert!(matches!(
-            error,
-            zinder_source::SourceError::NodeCapabilityMissing {
-                capability: NodeCapability::TreeState,
-            }
-        ));
+        require_ingest_node_capabilities(capabilities)?;
 
         Ok(())
     }

@@ -9,7 +9,7 @@ use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, MempoolEntry, MempoolEvictionReason, RawTransactionBytes, TransactionId,
     TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentPrevout, TransparentPrevoutEntry, UnixTimestampMillis,
+    TransparentOutPoint, TransparentOutput, TransparentOutputEntry, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
 
@@ -171,27 +171,27 @@ pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
     }
 }
 
-/// Encodes a [`TransparentPrevout`] into the wallet protocol message.
+/// Encodes a [`TransparentOutput`] into the wallet protocol message.
 #[must_use]
-pub fn transparent_prevout_message(prevout: TransparentPrevout) -> wallet::TransparentPrevout {
-    wallet::TransparentPrevout {
-        value_zat: prevout.value_zat,
-        script_pub_key: prevout.script_pub_key,
+pub fn transparent_output_message(output: TransparentOutput) -> wallet::TransparentOutput {
+    wallet::TransparentOutput {
+        value_zat: output.value_zat,
+        script_pub_key: output.script_pub_key,
     }
 }
 
-/// Encodes a [`TransparentPrevoutEntry`] into the wallet protocol message.
+/// Encodes a [`TransparentOutputEntry`] into the wallet protocol message.
 ///
-/// Used by both the canonical `WalletQuery.TransparentPrevouts` surface and
-/// the live-mempool `WalletQuery.TransparentMempoolPrevouts` surface, so the
+/// Used by both the canonical `WalletQuery.TransparentOutputsByOutpoint` surface and
+/// the live-mempool `WalletQuery.TransparentMempoolOutputsByOutpoint` surface, so the
 /// two sides share one wire shape and one encoder.
 #[must_use]
-pub fn transparent_prevout_entry_message(
-    entry: TransparentPrevoutEntry,
-) -> wallet::TransparentPrevoutEntry {
-    wallet::TransparentPrevoutEntry {
+pub fn transparent_output_entry_message(
+    entry: TransparentOutputEntry,
+) -> wallet::TransparentOutputEntry {
+    wallet::TransparentOutputEntry {
         outpoint: Some(outpoint_message(&entry.outpoint)),
-        prevout: entry.prevout.map(transparent_prevout_message),
+        output: entry.output.map(transparent_output_message),
     }
 }
 

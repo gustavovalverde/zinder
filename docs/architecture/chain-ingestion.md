@@ -27,10 +27,10 @@ Zinder should treat artifacts as durable products of ingestion, not incidental c
 
 Required artifact families:
 
-- `BlockArtifact`: canonical block metadata, transaction references, and block links.
+- `BlockHeaderArtifact`: canonical block-header facts and block links.
 - `CompactBlockArtifact`: wallet-oriented compact block representation.
 - `TreeStateArtifact`: tree state data required by wallet sync APIs.
-- `TransactionArtifact`: transaction lookup material needed by APIs.
+- `BlockTransactionIndexArtifact`, `TransactionLocation`, and `TransactionFactsArtifact`: transaction ordering, location, and typed public facts needed by APIs.
 - `MempoolIndex` / `MempoolEventLog`: non-canonical mempool view and event stream, implemented outside `commit_ingest_batch`. The live index is in-memory; the event log persists through the `mempool_event` column family per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md). Both are owned by `zinder-ingest` and spawn the first time the unified ingest loop enters the `TipFollow` phase (see §Phase transitions below). The mempool orchestrator (`run_mempool_orchestrator`) is a sibling of the ingest loop in the writer process: it consumes a `MempoolSource` stream, hydrates each observation through `build_mempool_entry`, and writes typed `Added`/`Invalidated`/`Mined` envelopes to `MempoolEventLog`. A separate retention worker (`spawn_mempool_event_retention_task`) prunes per-variant windows and emits `MempoolCursorAtRisk` readiness when the oldest retained sequence approaches the configured floor; this is the mempool-side equivalent of [`spawn_chain_event_retention_task`](chain-events.md#retention-and-backpressure).
 
 Each artifact must include:
@@ -130,7 +130,7 @@ Source capability detection happens before processing starts. If the selected so
 
 The classifier reads two inputs each iteration: the store's `current_chain_epoch.tip_height` (cached, cheap) and the upstream tip (one `NodeSource::tip_id` call). The decision rule:
 
-- `gap_blocks > ingest.phases.catchup_threshold_blocks` (defaults to `reorg_window_blocks`): `BulkCatchup`. Pipelined fetches at `ingest.bulk_catchup.fetch_concurrency` width, batches bounded by both `ingest.bulk_catchup.commit_batch_blocks` and `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch`, commit transition `FinalizeThrough { tip_height: target }` against `min(upstream_tip - reorg_window, store_tip + commit_batch_blocks)`.
+- `gap_blocks > ingest.phases.catchup_threshold_blocks` (defaults to `reorg_window_blocks`): `BulkCatchup`. The source adapter returns bounded `SourceChainSegment`s with up to `ingest.bulk_catchup.source_segment_max_blocks` connected raw blocks, while the writer adapts the requested count from observed source response bytes and consensus-branch changes. Batches are bounded by block count, artifact bytes, and canonical work cost, and the commit transition is `FinalizeThrough { tip_height: target }` against `min(upstream_tip - reorg_window, store_tip + canonical_batch_max_blocks)`.
 - `gap_blocks <= ingest.phases.catchup_threshold_blocks` and upstream tip above the catch-up floor: `TipFollow`. Serial fetches, one block per commit, transition `Extend` or `Replace`. `finalize_tip_if_ready` advances the finalized boundary once a tip is older than `reorg_window_blocks`.
 - Upstream tip below catch-up floor (regtest near genesis, freshly initialized node): `AwaitingUpstream`. The loop polls on the upstream-health interval and emits `cause=upstream_not_ready` until enough chain exists to commit.
 
@@ -138,11 +138,13 @@ Transitions are bidirectional. A long downtime or upstream burst that re-opens t
 
 ### Bulk-catch-up throughput shape
 
-Bulk catch-up reaches single-digit-hours mainnet sync through three structural choices. RocksDB writes stay strictly ordered (atomic per chain epoch, per ADR-0001 and ADR-0020); artifact assembly upstream of the writer runs on a worker pool (per [ADR-0021](../adrs/0021-parallel-block-derivation.md)).
+Bulk catch-up reaches single-digit-hours mainnet sync through bounded source fetch, parallel canonical fact build, resource-bounded canonical batches, and bounded derive replay. RocksDB writes stay strictly ordered (atomic per chain epoch, per ADR-0001 and ADR-0020); artifact assembly upstream of the writer runs on a worker pool (per [ADR-0021](../adrs/0021-parallel-block-derivation.md)).
 
-1. **Concurrent per-block RPCs.** `ZebraJsonRpcSource::fetch_block_at` keys `getblockheader`, `getblock`, and `z_gettreestate` directly on the requested height (Zebra accepts a height string on all three) and drives them concurrently via `tokio::join!`. Per-block round-trip count is exactly one parallel triple; the serial `getblockhash` round trip was removed per [ADR-0016](../adrs/0016-source-streaming-pipeline.md). Mid-flight reorgs surface through cross-hash agreement checks as `SourceError::BlockReorgDuringFetch` (mapped to `SourceFailureClass::UpstreamViewChanged`), distinguishing the race from a broken upstream.
-2. **Pipelined block fetches.** The bulk-catch-up phase keeps up to `ingest.bulk_catchup.fetch_concurrency` (default 32) block fetches in flight via `futures_util::stream::iter(...).buffered(N)`. The stream preserves submission order so the downstream stages see blocks in height order.
-3. **Parallel block derivation.** Each fetched block is handed to `tokio::task::spawn_blocking(move || derive_block(...))`. Up to `ingest.derive.concurrency` (default `clamp(available_parallelism() - 1, 4, 32)`) derives run concurrently; `try_buffered` preserves submission order. The CPU-bound work (block deserialization, per-transaction canonical re-serialization, lightwalletd compact-block proto encoding, per-output `SHA256(script_pub_key)`) now spreads across cores while the commit stage stays serial and atomic. Startup derive replay uses the same concurrency cap when hydrating retained canonical events.
+1. **Bytes-adaptive source segments.** `NodeSource::fetch_chain_segment` accepts `SourceChainSegmentLimits` and fetches raw block bytes only. Returned `SourceChainSegment` values carry advisory density stats: connected block count, response payload bytes, and split count. Bulk catchup targets `ingest.bulk_catchup.source_segment_target_response_bytes`, sizes from p95 bytes per block plus overshoot memory, grows after sustained success, and clears density samples when the consensus branch changes. The JSON-RPC adapter splits oversized ranges and retries smaller ordered ranges; a single-block oversize is a configuration error.
+2. **Byte-watermarked source prefetch.** Bulk catchup keeps an ordered queue of source segments in flight. Prefetching overlaps Zebra JSON-RPC latency with fact build while preserving source order before commit. The queue is bounded by `source_fetch_max_in_flight_requests` and `source_fetch_max_in_flight_bytes`, so dense ranges apply back-pressure by shrinking segment size or pausing scheduling instead of expanding process memory without limit.
+3. **Resource-bounded canonical batches.** `canonical_batch_max_blocks` is an upper bound, not the only trigger. The in-flight canonical batch also commits when it reaches `canonical_batch_max_artifact_bytes`, transaction count, transparent-output count, or transparent-spend-reference count. Dense ranges write smaller chain epochs before RocksDB write-batch construction can consume the cgroup memory budget.
+4. **Parallel canonical fact build.** Each connected block from the segment is handed to `tokio::task::spawn_blocking(move || derive_block(...))`. Up to `ingest.bulk_catchup.fact_build_concurrency` fact builds run concurrently while the stream yields finalized block artifacts in source order. The CPU-bound work spreads across cores while finalization and commit stay ordered.
+5. **Bounded derive replay.** Startup derive replay uses `ingest.derive.replay_concurrency`, `ingest.derive.replay_batch_blocks`, and `ingest.derive.replay_policy`, so retained chain events are replayed in bounded writes and can pause under memory pressure while canonical ingest catches up.
 
 Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom. The same `derive_block` and `finalize_derived_block` functions feed the tip-follow loop, just sequentially.
 
@@ -150,7 +152,7 @@ The loop treats every upstream-source failure as a readiness transition rather t
 
 ### Tip-follow wakeups
 
-Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate iteration against the JSON-RPC source for block bytes and tree state. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `ingest.tip_follow.poll_interval_ms`. The subscription lifecycle runs beside polling and keeps re-subscribing after stream errors. Block fetching does not move to gRPC because `z_gettreestate` is JSON-RPC-only.
+Tip-follow's default wake-up signal is a polling interval, but when the operator sets `ZINDER_NODE__INDEXER_GRPC_ADDR=http://<zebra>:8155` the loop also subscribes to Zebra's `Indexer.ChainTipChange` gRPC stream. Each push notification wakes the loop and triggers an immediate iteration against the JSON-RPC source for block bytes plus one checkpoint tree-state fetch for the committed tip. The polling interval stays in the `tokio::select!` as a safety net: a transient stream failure, missed reconnect, or failed re-subscription cannot stall ingest beyond `ingest.tip_follow.poll_interval_ms`.
 
 Every upstream-source failure is a readiness event, not a process lifecycle event. If Zebra is restarting, warming up, reorging near the tip, or unreachable mid-iteration, `zinder-ingest` reports `node_unavailable` with a `failure_class` payload, keeps `/healthz` alive, returns not-ready on `/readyz`, and continues retrying. Storage errors and reorg-window violations still fail closed; protocol mismatches and missing capabilities stay alive in a typed operator-action readiness state for inspection. See [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
 
@@ -172,10 +174,10 @@ root to the block artifact that completed it before committing
 `SubtreeRootArtifact` values. Query and compatibility code must not repair
 missing subtree roots by calling the upstream node.
 
-Checkpoint bootstrap must initialize the running shielded tree-size observer
-from the upstream-node-supplied checkpoint tree state before validating the first
-post-checkpoint block. Assuming zero after Sapling or Orchard activation makes
-deep wallet-serving catch-up fail even when the checkpoint metadata is correct.
+Checkpoint bootstrap initializes the running shielded tree-size observer from
+the checkpoint `ChainTipMetadata`. Canonical ingest stores tree-state payloads
+only at committed epoch tips and the latest tip; query and compatibility code
+must not repair missing checkpoint tree state by calling the upstream node.
 This page owns the durable ingestion requirement.
 
 ### Wallet-serving coverage
@@ -216,7 +218,7 @@ fatal because retrying would hide a contract violation.
 
 ### Commit shape per phase
 
-The bulk-catch-up phase finalizes each committed batch through its tip because it only operates outside the live reorg window. The commit uses the same finality transition the live store understands, for example `FinalizeThrough { height: tip_height }`. It must not encode a finalized-height change as `Unchanged`. The loop clamps every bulk-phase fetch target to `min(upstream_tip - reorg_window, store_tip + commit_batch_blocks)`, and the commit stage may close the batch earlier when `max_transparent_prevout_store_lookups_per_batch` is reached. The explicit `ingest.modifiers.allow_near_tip_finalize` override is intended for local regtest or disposable stores where the operator accepts that future reorgs may require recreating the store.
+The bulk-catch-up phase finalizes each committed batch through its tip because it only operates outside the live reorg window. The commit uses the same finality transition the live store understands, for example `FinalizeThrough { height: tip_height }`. It must not encode a finalized-height change as `Unchanged`. The loop clamps every bulk-phase fetch target to `min(upstream_tip - reorg_window, store_tip + canonical_batch_max_blocks)`, then may commit earlier when the accumulated canonical work cost reaches its transaction, transparent-output, or transparent-spend-reference budget. The explicit `ingest.modifiers.allow_near_tip_finalize` override is intended for local regtest or disposable stores where the operator accepts that future reorgs may require recreating the store.
 
 Tip following performs parent-hash continuity checks before commit. If the
 observed tip does not extend the visible tip, ingestion walks back to the

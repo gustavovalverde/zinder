@@ -24,6 +24,7 @@ name = "zcash-testnet"
 json_rpc_addr = "http://zebra:18232"
 indexer_grpc_addr = "http://zebra:18230"
 request_timeout_secs = 30
+max_response_bytes = 67108864
 
 [node.auth]
 # Reads the cookie from the Z3 shared cookie volume mounted at /var/run/auth.
@@ -38,14 +39,20 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.derive]
-concurrency = 8
+replay_concurrency = 8
+replay_batch_blocks = 100
+replay_policy = "canonical-first"
 
 # Bulk-catchup runs on cold stores and after long downtime; the unified
 # loop bounces back when the gap closes through the threshold.
 [ingest.bulk_catchup]
-commit_batch_blocks = 1000
-max_transparent_prevout_store_lookups_per_batch = 250000
-fetch_concurrency = 32
+canonical_batch_max_blocks = 1000
+canonical_batch_max_artifact_bytes = 536870912
+source_segment_max_blocks = 128
+source_segment_target_response_bytes = 50331648
+source_fetch_max_in_flight_requests = 8
+source_fetch_max_in_flight_bytes = 268435456
+fact_build_concurrency = 16
 
 [ingest.tip_follow]
 poll_interval_ms = 2000

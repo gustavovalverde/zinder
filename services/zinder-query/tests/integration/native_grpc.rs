@@ -75,7 +75,7 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
         stored_artifacts.tree_state.payload_bytes
     );
     assert_eq!(
-        grpc_responses.latest_tree_state.payload_bytes,
+        grpc_responses.latest_tree_state_checkpoint.payload_bytes,
         stored_artifacts.tree_state.payload_bytes
     );
     assert_eq!(
@@ -142,10 +142,10 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let tree_state_status = match WalletQueryService::tree_state(
+    let tree_state_status = match WalletQueryService::tree_state_checkpoint(
         &grpc_adapter,
-        Request::new(wallet::TreeStateRequest {
-            height: 1,
+        Request::new(wallet::TreeStateCheckpointRequest {
+            max_height: 1,
             at_epoch: None,
         }),
     )
@@ -572,7 +572,7 @@ struct WalletGrpcResponses {
     latest_block: wallet::LatestBlockResponse,
     compact_block_range: Vec<wallet::CompactBlockRangeChunk>,
     explicit_tree_state: wallet::TreeStateResponse,
-    latest_tree_state: wallet::TreeStateResponse,
+    latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
 }
 
@@ -627,18 +627,18 @@ async fn read_wallet_grpc_responses(
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
         compact_block_range.push(compact_block_chunk?);
     }
-    let explicit_tree_state = WalletQueryService::tree_state(
+    let explicit_tree_state = WalletQueryService::tree_state_checkpoint(
         grpc_adapter,
-        Request::new(wallet::TreeStateRequest {
-            height: 1,
+        Request::new(wallet::TreeStateCheckpointRequest {
+            max_height: 1,
             at_epoch: None,
         }),
     )
     .await?
     .into_inner();
-    let latest_tree_state = WalletQueryService::latest_tree_state(
+    let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         grpc_adapter,
-        Request::new(wallet::LatestTreeStateRequest { at_epoch: None }),
+        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch: None }),
     )
     .await?
     .into_inner();
@@ -658,7 +658,7 @@ async fn read_wallet_grpc_responses(
         latest_block,
         compact_block_range,
         explicit_tree_state,
-        latest_tree_state,
+        latest_tree_state_checkpoint,
         subtree_roots,
     })
 }
@@ -676,7 +676,7 @@ fn assert_wallet_grpc_response_epochs(responses: &WalletGrpcResponses, chain_epo
         chain_epoch_id
     );
     assert_eq!(
-        response_chain_epoch_id(&responses.latest_tree_state),
+        response_chain_epoch_id(&responses.latest_tree_state_checkpoint),
         chain_epoch_id
     );
     assert_eq!(
@@ -843,12 +843,12 @@ impl IngestControl for StaticIngestControl {
         ))
     }
 
-    async fn transparent_mempool_prevouts(
+    async fn transparent_mempool_outputs_by_outpoint(
         &self,
-        _request: Request<wallet::TransparentMempoolPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
+        _request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
         Err(Status::unimplemented(
-            "test scaffold does not stub TransparentMempoolPrevouts",
+            "test scaffold does not stub TransparentMempoolOutputsByOutpoint",
         ))
     }
 

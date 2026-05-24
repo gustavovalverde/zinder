@@ -23,8 +23,7 @@
 //! caller is expected to wrap the response in
 //! [`SEARCH_QUERY_MAX_BYTES`]-bounded transport limits as well.
 
-use crate::Network;
-use crate::transparent_utxo::TransparentAddressScriptHash;
+use crate::{Network, TransparentAddressScriptHash};
 use zcash_address::unified::{Container as _, Receiver as UnifiedReceiver};
 use zcash_address::{
     ConversionError, ParseError as ZcashAddressParseError, ToAddress, TryFromAddress, ZcashAddress,

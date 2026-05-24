@@ -14,7 +14,7 @@ use zinder_core::{
 
 use crate::{
     ArtifactFamily, StoreError,
-    block_artifact::read_block_artifact,
+    block_artifact::read_block_header_artifact,
     format::{StoreKey, decode_transparent_address_tx_index_artifact},
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
@@ -190,7 +190,7 @@ fn block_is_visible(
     height: BlockHeight,
     expected_hash: BlockHash,
 ) -> Result<bool, StoreError> {
-    let Some(block) = read_block_artifact(inner, chain_epoch, height)? else {
+    let Some(block) = read_block_header_artifact(inner, chain_epoch, height)? else {
         return Ok(false);
     };
 

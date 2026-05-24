@@ -130,7 +130,7 @@ async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()>
         TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
     );
     assert_eq!(store.current_chain_epoch()?, Some(chain_epoch));
-    assert!(reader.transaction_by_id(transaction_id)?.is_none());
+    assert!(reader.transaction_facts_by_id(transaction_id)?.is_none());
 
     Ok(())
 }

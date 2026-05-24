@@ -8,7 +8,7 @@ use tonic::{Request, Response, Status};
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_internal_transaction_id};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
 use zinder_proto::capabilities::{
@@ -30,26 +30,25 @@ use zinder_store::{
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
-use crate::{
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxosRequest, WalletQueryApi,
-};
+use crate::{AddressOutputIndexRequest, TransparentAddressTxIdsInRangeRequest, WalletQueryApi};
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
-    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
-    build_compact_block_message, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_utxos_stream_chunk, build_wallet_server_info, compact_block_response,
-    full_block_response, latest_block_response, latest_tree_state_response, subtree_roots_response,
-    transaction_response, transparent_address_confirmed_balance_response,
-    transparent_address_utxos_response, transparent_prevouts_response, tree_state_response,
+    ServerInfoSettings, address_lookup_to_script_hash, address_output_index_response,
+    block_header_by_selector_response, block_id_by_selector_response,
+    broadcast_transaction_response, build_address_output_index_stream_chunk,
+    build_chain_epoch_message, build_compact_block_message, build_transparent_address_tx_ids_chunk,
+    build_wallet_server_info, compact_block_response, latest_block_response,
+    latest_tree_state_checkpoint_response, subtree_roots_response, transaction_response,
+    transparent_address_confirmed_balance_response, transparent_outputs_by_outpoint_response,
+    tree_state_checkpoint_response,
 };
 use super::status_from_query_error;
 
 type WalletGrpcStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = WalletGrpcStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
-type TransparentAddressUtxosStream = WalletGrpcStream<wallet::TransparentAddressUtxosStreamChunk>;
+type AddressOutputIndexStream = WalletGrpcStream<wallet::AddressOutputIndexStreamChunk>;
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
@@ -163,7 +162,7 @@ where
     type CompactBlockRangeStream = WalletGrpcStream<wallet::CompactBlockRangeChunk>;
     type ChainEventsStream = ChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
-    type TransparentAddressUtxosStreamStream = TransparentAddressUtxosStream;
+    type AddressOutputIndexStreamStream = AddressOutputIndexStream;
     type TransparentAddressTxIdsInRangeStream = TransparentAddressTxIdsStream;
 
     async fn latest_block(
@@ -187,21 +186,6 @@ where
         compact_block_response(
             &self.query_api,
             BlockHeight::new(request.height),
-            chain_epoch_from_request(request.at_epoch)?,
-        )
-        .await
-        .map(Response::new)
-        .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn full_block(
-        &self,
-        request: Request<wallet::FullBlockRequest>,
-    ) -> Result<Response<wallet::FullBlockResponse>, Status> {
-        let request = request.into_inner();
-        full_block_response(
-            &self.query_api,
-            BlockHeight::new(request.block_height),
             chain_epoch_from_request(request.at_epoch)?,
         )
         .await
@@ -286,14 +270,14 @@ where
         Ok(Response::new(Box::pin(stream::iter(compact_block_chunks))))
     }
 
-    async fn tree_state(
+    async fn tree_state_checkpoint(
         &self,
-        request: Request<wallet::TreeStateRequest>,
+        request: Request<wallet::TreeStateCheckpointRequest>,
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
         let request = request.into_inner();
-        tree_state_response(
+        tree_state_checkpoint_response(
             &self.query_api,
-            BlockHeight::new(request.height),
+            BlockHeight::new(request.max_height),
             chain_epoch_from_request(request.at_epoch)?,
         )
         .await
@@ -301,11 +285,11 @@ where
         .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn latest_tree_state(
+    async fn latest_tree_state_checkpoint(
         &self,
-        request: Request<wallet::LatestTreeStateRequest>,
+        request: Request<wallet::LatestTreeStateCheckpointRequest>,
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
-        latest_tree_state_response(
+        latest_tree_state_checkpoint_response(
             &self.query_api,
             chain_epoch_from_request(request.into_inner().at_epoch)?,
         )
@@ -482,38 +466,44 @@ where
         outcome
     }
 
-    async fn transparent_prevouts(
+    async fn transparent_outputs_by_outpoint(
         &self,
-        request: Request<wallet::TransparentPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
+        request: Request<wallet::TransparentOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
         let request = request.into_inner();
         reject_coinbase_sentinels(&request.outpoints)?;
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
         let at_epoch = chain_epoch_from_request(request.at_epoch)?;
-        transparent_prevouts_response(&self.query_api, outpoints, at_epoch)
+        transparent_outputs_by_outpoint_response(&self.query_api, outpoints, at_epoch)
             .await
             .map(Response::new)
             .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn transparent_mempool_prevouts(
+    async fn transparent_mempool_outputs_by_outpoint(
         &self,
-        request: Request<wallet::TransparentMempoolPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
+        request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
         let started_at = Instant::now();
         let outcome = async {
             let request_inner = request.get_ref();
             reject_coinbase_sentinels(&request_inner.outpoints)?;
             let mut client = self
                 .ingest_control_client(
-                    "TransparentMempoolPrevouts requires the ingest-control proxy; \
+                    "TransparentMempoolOutputsByOutpoint requires the ingest-control proxy; \
                      configure the writer endpoint",
                 )
                 .await?;
-            client.transparent_mempool_prevouts(request).await
+            client
+                .transparent_mempool_outputs_by_outpoint(request)
+                .await
         }
         .await;
-        record_proxy_outcome("transparent_mempool_prevouts", started_at, &outcome);
+        record_proxy_outcome(
+            "transparent_mempool_outputs_by_outpoint",
+            started_at,
+            &outcome,
+        );
         outcome
     }
 
@@ -536,32 +526,32 @@ where
         outcome
     }
 
-    async fn transparent_address_utxos(
+    async fn address_output_index(
         &self,
-        request: Request<wallet::TransparentAddressUtxosRequest>,
-    ) -> Result<Response<wallet::TransparentAddressUtxosResponse>, Status> {
+        request: Request<wallet::AddressOutputIndexRequest>,
+    ) -> Result<Response<wallet::AddressOutputIndexResponse>, Status> {
         let request = request.into_inner();
         let at_epoch = chain_epoch_from_request(request.at_epoch.clone())?;
         let typed_request =
-            transparent_address_utxos_request_from_message(request, self.server_info_network()?)?;
+            address_output_index_request_from_message(request, self.server_info_network()?)?;
 
-        transparent_address_utxos_response(&self.query_api, typed_request, at_epoch)
+        address_output_index_response(&self.query_api, typed_request, at_epoch)
             .await
             .map(Response::new)
             .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn transparent_address_utxos_stream(
+    async fn address_output_index_stream(
         &self,
-        request: Request<wallet::TransparentAddressUtxosRequest>,
-    ) -> Result<Response<Self::TransparentAddressUtxosStreamStream>, Status> {
+        request: Request<wallet::AddressOutputIndexRequest>,
+    ) -> Result<Response<Self::AddressOutputIndexStreamStream>, Status> {
         let request = request.into_inner();
         let at_epoch = chain_epoch_from_request(request.at_epoch.clone())?;
         let typed_request =
-            transparent_address_utxos_request_from_message(request, self.server_info_network()?)?;
+            address_output_index_request_from_message(request, self.server_info_network()?)?;
         let response = self
             .query_api
-            .transparent_address_utxos(typed_request, at_epoch)
+            .address_output_index(typed_request, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = response.chain_epoch;
@@ -569,20 +559,20 @@ where
             .next_cursor
             .map(|cursor| cursor.as_bytes().to_vec())
             .unwrap_or_default();
-        let last_index = response.utxos.len().saturating_sub(1);
+        let last_index = response.outputs.len().saturating_sub(1);
         let chunk_iter = response
-            .utxos
+            .outputs
             .into_iter()
             .enumerate()
-            .map(move |(index, utxo)| {
+            .map(move |(index, output)| {
                 let cursor_bytes = if index == last_index {
                     next_cursor_bytes.clone()
                 } else {
                     Vec::new()
                 };
-                Ok(build_transparent_address_utxos_stream_chunk(
+                Ok(build_address_output_index_stream_chunk(
                     chain_epoch,
-                    &utxo,
+                    &output,
                     cursor_bytes,
                 ))
             });
@@ -595,14 +585,13 @@ where
         request: Request<wallet::TransparentAddressTxIdsInRangeRequest>,
     ) -> Result<Response<Self::TransparentAddressTxIdsInRangeStream>, Status> {
         let request = request.into_inner();
-        let at_epoch = chain_epoch_from_request(request.at_epoch.clone())?;
         let typed_request = transparent_address_tx_ids_in_range_request_from_message(
             request,
             self.server_info_network()?,
         )?;
         let response = self
             .query_api
-            .transparent_address_tx_ids_in_range(typed_request, at_epoch)
+            .transparent_address_tx_ids_in_range(typed_request)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = response.chain_epoch;
@@ -756,21 +745,21 @@ fn transparent_address_tx_ids_in_range_request_from_message(
 
 const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
-fn transparent_address_utxos_request_from_message(
-    request: wallet::TransparentAddressUtxosRequest,
+fn address_output_index_request_from_message(
+    request: wallet::AddressOutputIndexRequest,
     network: Network,
-) -> Result<TransparentAddressUtxosRequest, Status> {
+) -> Result<AddressOutputIndexRequest, Status> {
     let address_script_hash = address_lookup_to_script_hash(request.address, network)
         .map_err(|error| status_from_query_error(&error))?;
     let max_entries =
-        optional_max_entries_from_u32(request.max_entries, DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS);
+        optional_max_entries_from_u32(request.max_entries, DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS);
     let from_cursor = if request.from_cursor.is_empty() {
         None
     } else {
         Some(StreamCursorTokenV1::from_bytes(request.from_cursor))
     };
 
-    Ok(TransparentAddressUtxosRequest {
+    Ok(AddressOutputIndexRequest {
         address_script_hash,
         start_height: BlockHeight::new(request.start_height),
         max_entries,
@@ -778,7 +767,7 @@ fn transparent_address_utxos_request_from_message(
     })
 }
 
-const DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+const DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
 fn optional_max_entries_from_u32(requested: Option<u32>, cap: NonZeroU32) -> NonZeroU32 {
     requested.map_or(cap, |max_entries| max_entries_from_u32(max_entries, cap))
@@ -888,11 +877,11 @@ fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Statu
 }
 
 /// Translates a wire outpoint list into typed `TransparentOutPoint`s,
-/// silently truncating to [`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST`].
+/// silently truncating to [`MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
 fn transparent_outpoints_from_request(
     mut outpoints: Vec<wallet::OutPoint>,
 ) -> Result<Vec<TransparentOutPoint>, Status> {
-    outpoints.truncate(MAX_TRANSPARENT_PREVOUTS_PER_REQUEST);
+    outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
     outpoints
         .into_iter()
         .map(|outpoint| {

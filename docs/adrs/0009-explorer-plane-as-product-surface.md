@@ -5,55 +5,52 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Service topology, explorer wire surface, capability namespace, federation contract |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0005](0005-consumer-neutral-wallet-data-plane.md), [ADR-0006](0006-ingest-control-transport-security.md), [ADR-0007](0007-mempool-topology-and-retention.md), [ADR-0023](0023-derive-plane-hosted-by-ingest.md), [Explorer plane](../architecture/explorer-plane.md), [Derive plane](../architecture/derive-plane.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md) |
-
-ADR-0023 supersedes this ADR's original writer topology: bundled derive writes now run inside `zinder-ingest`, and `zinder-explorer` is a secondary-reader gateway. The product namespace decision in this ADR remains current.
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0005](0005-consumer-neutral-wallet-data-plane.md), [ADR-0006](0006-ingest-control-transport-security.md), [ADR-0007](0007-mempool-topology-and-retention.md), [Explorer plane](../architecture/explorer-plane.md), [Derive plane](../architecture/derive-plane.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md) |
 
 ## Context
 
-The original derive plane shipped as `zinder-derive`: a fourth deployable that opened its own RocksDB, served `ExplorerQuery` over tonic, and federated one capability (`derive.explorer.transparent_balance_v1`) back into `WalletQuery`. The shape works, but it leaks an implementation detail (the word "derive") into every operator-facing surface: process name, config namespace, capability strings, Prometheus prefix.
+Explorer support is a product surface, not an implementation pattern. The
+product answer is `zinder-explorer`: operators reading `ps aux`, contributors
+reading `services/`, and integrators reading the capability list should all see
+the same word.
 
-Explorer support is a product surface, not an implementation pattern. The product question is "what does the block explorer call?" The answer should be `zinder-explorer`, not "the derive consumer named explorer running inside `zinder-derive`." Operators reading `ps aux`, contributors reading `services/`, and integrators reading the capability list should all see the same word.
-
-At the same time, the SDK that powers the explorer is reusable. `DeriveConsumer`, `DeriveStore`, `DeriveProxy`, and the `DeriveStore::write_*` dispatch entry points describe a pattern (chain and mempool events flowing into stateful consumers with atomic cursor persistence), not the explorer product specifically. A second consumer some day (analytics, search index sink, anything else) would link the same SDK and ship its own service binary.
+At the same time, the SDK that powers the explorer is reusable. `DeriveConsumer`, `DeriveStore`, `DeriveProxy`, and the `DeriveStore::write_*` dispatch entry points describe a pattern (chain and mempool events flowing into stateful consumers with atomic cursor persistence), not the explorer product specifically. Additional consumers link the same SDK and ship their own service binaries.
 
 The decisions to record here are:
 
-1. The service binary, config namespace, capability namespace, and Prometheus prefix all rebrand to `explorer`.
+1. The service binary, config namespace, capability namespace, and Prometheus prefix use `explorer`.
 2. The SDK names (`DeriveConsumer`, `DeriveStore`, etc.) stay because they describe the pattern, not the product.
 3. The dual-capability federation rule from ADR-0007's mempool work generalizes: a federated explorer method on `WalletQuery` advertises one always-on `wallet.*` capability plus one optional richer `explorer.*` capability.
 4. The explorer plane must not call upstream node RPCs directly. Source-boundary extensions land first; the explorer consumes canonical artifacts and chain/mempool events.
 
 ## Decision
 
-### The service rebrands to `zinder-explorer`
+### The service is `zinder-explorer`
 
-Production processes, config keys, capability strings, and Prometheus metrics rename in one wave:
+Production processes, config keys, capability strings, and Prometheus metrics use one namespace:
 
-| Surface | Before | After |
-| ------- | ------ | ----- |
-| Service crate | `services/zinder-derive/` | `services/zinder-explorer/` |
-| Cargo package | `zinder-derive` | `zinder-explorer` |
-| Binary | `zinder-derive` | `zinder-explorer` |
-| Config TOML namespace | `[derive.explorer]` | `[explorer]` |
-| Environment-variable prefix | `ZINDER_DERIVE__*` | `ZINDER_EXPLORER__*` |
-| Capability prefix | `derive.explorer.*` | `explorer.*` |
-| Prometheus metric prefix | `zinder_derive_*` | `zinder_explorer_*` |
-| CLI flag namespace | `--derive-explorer-*` | `--explorer-*` |
+| Surface | Value |
+| ------- | ----- |
+| Service crate | `services/zinder-explorer/` |
+| Cargo package | `zinder-explorer` |
+| Binary | `zinder-explorer` |
+| Config TOML namespace | `[explorer]` |
+| Environment-variable prefix | `ZINDER_EXPLORER__*` |
+| Capability prefix | `explorer.*` |
+| Prometheus metric prefix | `zinder_explorer_*` |
+| CLI flag namespace | `--explorer-*` |
 
-Two existing capability strings rename in lockstep:
+The explorer plane exposes these baseline capability strings:
 
-| Before | After |
+| Capability | Meaning |
 | ------ | ----- |
-| `derive.explorer.server_info_v1` | `explorer.server_info_v1` |
-| `derive.explorer.transparent_balance_v1` | `explorer.transparent_address.balance_v1` |
+| `explorer.server_info_v1` | Explorer server-info descriptor |
+| `explorer.transparent_address.balance_v1` | Transparent-address balance with explorer enrichment |
 
-The federated capability rename also reshapes the noun (`transparent_balance` → `transparent_address.balance`) to align with the wallet-plane convention `wallet.address.transparent_balance_v1`. After the rename, the dual-capability pair is symmetric:
+The dual-capability pair is symmetric:
 
 - `wallet.address.transparent_balance_v1` — always-on canonical-confirmed path.
 - `explorer.transparent_address.balance_v1` — same RPC carries the live-mempool overlay when the explorer proxy is ready.
-
-There is no `_v2` deprecation window for the two renamed strings: Zinder has no public compatibility burden, and the rename ships before any external consumer has wired against the old names.
 
 ### SDK names stay derive-shaped
 
@@ -66,7 +63,7 @@ The reusable SDK abstractions keep their `Derive*` names because they describe t
 - `DeriveReadinessGauge`, `spawn_derive_readiness_probe`
 - `DeriveStore::write_chain_event`, `DeriveStore::write_mempool_event`
 
-The boundary is "Zinder process or library entity belonging to the running explorer service" → renames; "reusable SDK abstraction representing the derive pattern" → keeps its name. A future second consumer (`zinder-analytics`, hypothetical) would link the same SDK without confusion.
+The boundary is "Zinder process or library entity belonging to the running explorer service" -> `explorer` namespace; "reusable SDK abstraction representing the derive pattern" -> `Derive*` name.
 
 ### Dual-capability federation rule generalizes
 
@@ -77,7 +74,7 @@ Every federated method on `WalletQuery` that piggybacks on the explorer plane ad
 
 Clients that only need the canonical answer gate on the wallet capability. Clients that need the enrichment gate on the explorer capability. The wire response shape is identical between the two paths; only the semantic content (overlay present vs absent) differs.
 
-This rule applies retroactively to `TransparentAddressBalance` and forward to every future federated method.
+This rule applies to `TransparentAddressBalance` and every federated method.
 
 ### Capability namespace structure
 
@@ -108,42 +105,46 @@ This rule is structural: it keeps canonical artifacts as the single source of tr
 
 ### Operational
 
-- Operators running the prior `zinder-derive` migrate config: `[derive.explorer]` → `[explorer]`, `ZINDER_DERIVE__*` env vars → `ZINDER_EXPLORER__*`. The rename is a single coordinated change; there is no compatibility shim.
-- Prometheus scrapes pick up the new `zinder_explorer_*` metric prefix; dashboards and alerts that grep for `zinder_derive_*` need an in-place edit.
-- `WalletQuery.ServerInfo` capability lists shift from `derive.explorer.*` to `explorer.*`. Clients that probe `WalletQuery.ServerInfo` and gate on the old strings see the capability as absent until they update.
+- Operators configure the explorer through `[explorer]` and `ZINDER_EXPLORER__*`.
+- Prometheus scrapes use the `zinder_explorer_*` metric prefix.
+- `WalletQuery.ServerInfo` advertises `explorer.*` capabilities only when the explorer proxy is configured and ready.
 - A deployment that does not run `zinder-explorer` continues to advertise only the `wallet.*` capabilities. The wallet plane's federated method (`TransparentAddressBalance`) continues to answer from canonical UTXOs.
 
 ### Implementation
 
-- The `services/zinder-derive/` directory moves to `services/zinder-explorer/`. The `Cargo.toml` package name, binary name, and `pkg-name` derivations all change in lockstep.
-- `crates/zinder-proto/src/capabilities.rs` renames the two `DERIVE_EXPLORER_*` constants to `EXPLORER_*`; `ZINDER_CAPABILITIES` advertises the new strings.
-- `services/zinder-query/src/grpc/adapter.rs` updates the federation gating: probe target capability becomes `explorer.transparent_address.balance_v1`; advertised capability matches.
-- The `derive-plane.md` architecture doc stays as the SDK documentation. A new `explorer-plane.md` documents the product surface. Both reference each other.
-- Doc edits land in the same change as the rename so the docs/code drift never exists. The `capability_docs.rs` test in `zinder-proto` already enforces that `ZINDER_CAPABILITIES` matches the public-interfaces capability list; that test fails until the docs and constants are aligned.
+- `services/zinder-explorer/` owns the explorer binary and gRPC service.
+- `crates/zinder-proto/src/capabilities.rs` exposes the `EXPLORER_*` constants.
+- `services/zinder-query/src/grpc/adapter.rs` gates federation on `explorer.transparent_address.balance_v1`.
+- `derive-plane.md` documents the SDK boundary. `explorer-plane.md` documents the product surface. Both reference each other.
+- The capability docs tests enforce that `ZINDER_CAPABILITIES` matches the public-interfaces capability list.
 
 ### Testing
 
-- The validation gate passes after the rename. The `capability_coverage.rs` test in `zinder-client` references the new capability strings; the env-var docs mirror test in `zinder-runtime` references the new env-var names.
+- The validation gate covers capability strings and env-var docs. The `capability_coverage.rs` test in `zinder-client` references the explorer capability strings; the env-var docs mirror test in `zinder-runtime` references the explorer env-var names.
 - One additional integration test in `services/zinder-explorer/tests/integration/` asserts that `ExplorerServerInfo.common.capabilities` contains both `explorer.server_info_v1` and (when the wallet endpoint is configured) `explorer.transparent_address.balance_v1`.
 - Live tests under `services/zinder-explorer/tests/live/` retain their previous coverage and adjust env-var names.
 
 ## Alternatives Considered
 
-### Keep the umbrella and add per-consumer namespaces over time
+### Use an implementation-pattern service name
 
-Rejected. The PRD framing is unambiguous: "Make explorer support a first-class Zinder product surface." Calling the deployable `zinder-derive` muddles that. The umbrella naming would also imply a multi-consumer future that does not exist today (YAGNI applies). When a second consumer materializes, it gets its own service binary (`zinder-analytics` or similar) and the SDK abstractions are already in place to support it.
+Rejected. Explorer is a first-class product surface. The deployable name should
+match what operators run and what integrators discover in capability strings.
+Reusable SDK abstractions already carry the implementation-pattern name.
 
 ### Rename `DeriveConsumer`/`DeriveStore`/etc. to `ExplorerConsumer`/`ExplorerStore`/etc.
 
-Rejected. The SDK describes a pattern, not a product. Naming the trait `ExplorerConsumer` forces the second consumer to either rename the trait again (breaking change) or live with a confusing name. The boundary is "service binary entity" → product-renamed; "reusable SDK abstraction" → pattern-named. The `Derive*` prefix on the SDK is correct and stays.
+Rejected. The SDK describes a pattern, not a product. Naming the trait
+`ExplorerConsumer` would force every non-explorer consumer through a product
+name it does not own. The boundary is service product name -> `explorer`;
+reusable SDK abstraction -> `Derive*`.
 
-### Keep `derive.explorer.*` as the capability namespace but rename only the binary
+### Use a capability namespace that differs from the binary
 
-Rejected. The capability namespace is the durable contract; if the binary is `zinder-explorer`, the capabilities are `explorer.*`. A capability prefix that does not match the service name is harder to grep and pushes operators to context-switch between two vocabularies for the same thing.
-
-### Ship a backwards-compatible alias for the old capability strings
-
-Rejected. Zinder has no external compatibility burden ([ADR-0005](0005-consumer-neutral-wallet-data-plane.md)); aliasing keeps the old strings alive for no benefit and creates a permanent mental hop ("which is the canonical name?"). The clean cut is cheaper than the alias.
+Rejected. The capability namespace is the durable contract; if the binary is
+`zinder-explorer`, the capabilities are `explorer.*`. A capability prefix that
+does not match the service name is harder to grep and pushes operators to
+context-switch between two vocabularies for the same thing.
 
 ## Out of Scope
 

@@ -42,6 +42,7 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
+zinder-derive.workspace = true
 zinder-ingest.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

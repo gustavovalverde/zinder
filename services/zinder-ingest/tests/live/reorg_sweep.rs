@@ -19,8 +19,11 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::num::NonZeroU32;
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroU32,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use eyre::{Result, eyre};
 use tokio::net::TcpListener;
@@ -41,9 +44,10 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_tip_height, live_backfill_config, live_tip_follow_config, regtest_generate_blocks,
-    rpc_block_hash_at_height, rpc_invalidate_block, rpc_reconsider_block, test_derive_store,
-    zebra_source_from_backfill, zebra_source_from_tip_follow,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    live_tip_follow_config, regtest_generate_blocks, rpc_block_hash_at_height,
+    rpc_invalidate_block, rpc_reconsider_block, zebra_source_from_backfill,
+    zebra_source_from_tip_follow,
 };
 
 /// Tip-follow poll interval. Sized so the writer notices the
@@ -101,6 +105,7 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     // regtest blocks. Backfill is built for this and finishes in
     // seconds.
     let zebra_tip_before_mining = fetch_live_tip_height(&env).await?;
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let backfill_config = live_backfill_config(
         &env,
         &storage_path,
@@ -108,6 +113,7 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         zebra_tip_before_mining,
         NonZeroU32::new(BACKFILL_BATCH_BLOCKS).ok_or_else(|| eyre!("invalid backfill batch"))?,
         true,
+        Arc::clone(&activations),
     );
     let backfill_source = zebra_source_from_backfill(&backfill_config)?;
     backfill(&backfill_config, &backfill_source)
@@ -119,12 +125,12 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     // freshly-mined reorg blocks, which is fast.
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let derive_store = test_derive_store(&storage_path)?;
     let tip_follow_config = live_tip_follow_config(
         &env,
         &storage_path,
         TIP_FOLLOW_REORG_WINDOW_BLOCKS,
         TIP_FOLLOW_POLL_INTERVAL,
+        Arc::clone(&activations),
     );
     let tip_follow_source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let readiness = Readiness::default();
@@ -135,13 +141,11 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
         let readiness = readiness.clone();
         let cancel = cancel.clone();
         let tip_follow_config = tip_follow_config.clone();
-        let derive_store = derive_store.clone();
         tokio::spawn(async move {
             tip_follow_with_primary_store(
                 &tip_follow_config,
                 &tip_follow_source,
                 store,
-                derive_store,
                 &readiness,
                 None,
                 None,

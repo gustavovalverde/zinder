@@ -19,7 +19,7 @@
 //!   [`IngestError::SourceRetryDeadlineExceeded`]) are recoverable; the
 //!   loop resets and re-observes the upstream view.
 //! - **Storage failures**, **reorg-window violations**, and **internal
-//!   logic errors** (`EmptyIngestBatch`, etc.) are fatal: data integrity
+//!   logic errors** (`EmptyCanonicalBatch`, etc.) are fatal: data integrity
 //!   is at stake, or the failure indicates a Zinder bug. The loop exits
 //!   so the orchestrator can decide whether to restart, replay, or
 //!   require manual reset.
@@ -181,9 +181,9 @@ pub(crate) fn decide_recovery(
         | IngestError::UnknownNodeSource { .. }
         | IngestError::SubtreeRootsUnavailable { .. }
         | IngestError::SubtreeRootCompletingBlockMissing { .. }
-        | IngestError::TransparentPrevoutOutputMissing { .. }
+        | IngestError::TransparentOutputOutputMissing { .. }
         | IngestError::UnsupportedShieldedProtocol { .. }
-        | IngestError::EmptyIngestBatch
+        | IngestError::EmptyCanonicalBatch
         | IngestError::BackfillProducedNoCommit
         | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
         | IngestError::BackfillRequiresContiguousTipMetadata { .. }

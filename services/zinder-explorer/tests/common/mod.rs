@@ -12,10 +12,14 @@
     reason = "Each test file consumes only a subset of the common helpers."
 )]
 
-use std::{num::NonZeroU32, path::Path};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+    sync::Arc,
+};
 
 use eyre::Result;
-use zinder_core::BlockHeight;
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{BackfillConfig, NodeSourceKind};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::LiveTestEnv;
@@ -31,21 +35,30 @@ pub(crate) fn live_backfill_config(
     storage_path: &Path,
     from_height: BlockHeight,
     to_height: BlockHeight,
-    commit_batch_blocks: NonZeroU32,
+    canonical_batch_max_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> BackfillConfig {
-    const FETCH_CONCURRENCY: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
+    const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
     BackfillConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations,
         from_height,
         to_height,
-        commit_batch_blocks,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::MIN.saturating_add(24_999),
-        fetch_concurrency: FETCH_CONCURRENCY,
-        derive_concurrency: FETCH_CONCURRENCY,
+        canonical_batch_max_blocks,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        fact_build_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
         allow_near_tip_finalize,
@@ -82,6 +95,24 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
         },
     )?;
     Ok(NodeSource::tip_id(&probe_source).await?.height)
+}
+
+/// Fetches the node-advertised upgrade table for live backfill derivation.
+pub(crate) async fn fetch_live_network_upgrade_activations(
+    env: &LiveTestEnv,
+) -> Result<Arc<NetworkUpgradeActivations>> {
+    let probe_source = ZebraJsonRpcSource::with_options(
+        env.target.network,
+        &env.target.json_rpc_addr,
+        env.target.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: env.target.request_timeout,
+            max_response_bytes: env.target.max_response_bytes,
+        },
+    )?;
+    Ok(Arc::new(
+        probe_source.fetch_network_upgrade_activations().await?,
+    ))
 }
 
 /// Calls Zebra's regtest-only `generate` JSON-RPC to mine `block_count` empty

@@ -27,22 +27,30 @@ pub enum ArtifactFamily {
     ChainEpoch,
     /// Chain event envelope.
     ChainEvent,
-    /// Finalized block artifact.
-    FinalizedBlock,
+    /// Canonical block-header facts.
+    BlockHeader,
+    /// Optional raw block blob.
+    BlockBlob,
     /// Compact block artifact.
     CompactBlock,
-    /// Transaction artifact.
-    Transaction,
+    /// Block-local transaction index row.
+    BlockTransactionIndex,
+    /// Mined transaction location.
+    TransactionLocation,
+    /// Canonical transaction facts.
+    TransactionFacts,
+    /// Optional raw transaction blob.
+    TransactionBlob,
     /// Commitment tree-state artifact.
     TreeState,
     /// Commitment subtree-root artifact.
     SubtreeRoot,
-    /// Transparent address UTXO artifact.
-    TransparentAddressUtxo,
-    /// Transparent prevout artifact keyed by outpoint.
-    TransparentPrevout,
-    /// Transparent UTXO spend artifact.
-    TransparentUtxoSpend,
+    /// Transparent address output artifact.
+    AddressOutputIndex,
+    /// Transparent-output artifact keyed by outpoint.
+    TransparentOutput,
+    /// Resolved transparent spend fact.
+    TransparentSpendFact,
     /// Transparent address tx-history index artifact.
     TransparentAddressTxIndex,
     /// Best-chain block-hash to height index entry.
@@ -160,9 +168,7 @@ pub enum StoreError {
 
     /// Persisted artifact schema is older than this binary requires.
     ///
-    /// The project is pre-release; breaking schema changes do not ship
-    /// compatibility shims. Wipe the store and resync. See
-    /// [ADR-0022](../../docs/adrs/0022-transparent-prevout-index.md).
+    /// Wipe the store and resync with the schema required by this binary.
     #[error(
         "store artifact schema is too old: persisted {persisted_version}, required {required_version}; wipe the store and resync"
     )]
@@ -229,9 +235,9 @@ pub enum StoreError {
         reason: &'static str,
     },
 
-    /// Transparent UTXO cursor failed validation.
-    #[error("transparent UTXO cursor is invalid: {reason}")]
-    TransparentUtxoCursorInvalid {
+    /// Transparent output cursor failed validation.
+    #[error("transparent output cursor is invalid: {reason}")]
+    AddressOutputCursorInvalid {
         /// Cursor validation failure reason.
         reason: &'static str,
     },

@@ -25,24 +25,20 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
 /// Capability advertised for `WalletQuery.CompactBlockRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
-/// Capability advertised for `WalletQuery.FullBlock`.
-///
-/// Returns the full canonical block bytes for consumers that need the
-/// transaction list including transparent-only and coinbase transactions
-/// the compact-block format omits.
-pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
-/// Capability advertised for `WalletQuery.TreeState`.
-pub const WALLET_READ_TREE_STATE_AT_V1: &str = "wallet.read.tree_state_at_v1";
-/// Capability advertised for `WalletQuery.LatestTreeState`.
-pub const WALLET_READ_LATEST_TREE_STATE_V1: &str = "wallet.read.latest_tree_state_v1";
+/// Capability advertised for `WalletQuery.TreeStateCheckpoint`.
+pub const WALLET_READ_TREE_STATE_CHECKPOINT_V1: &str = "wallet.read.tree_state_checkpoint_v1";
+/// Capability advertised for `WalletQuery.LatestTreeStateCheckpoint`.
+pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
+    "wallet.read.latest_tree_state_checkpoint_v1";
 /// Capability advertised for `WalletQuery.SubtreeRoots`.
 pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
 /// Capability advertised for `WalletQuery.Transaction`.
 pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_id_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
 pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
-/// Capability advertised for `WalletQuery.TransparentPrevouts`.
-pub const WALLET_READ_TRANSPARENT_PREVOUTS_V1: &str = "wallet.read.transparent_prevouts_v1";
+/// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
+pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
+    "wallet.read.transparent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
@@ -59,10 +55,11 @@ pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1: &str =
 /// Capability advertised for `WalletQuery.TransparentMempoolSpendByOutpoint`.
 pub const WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1: &str =
     "wallet.mempool.transparent_spend_by_outpoint_v1";
-/// Capability advertised for `WalletQuery.TransparentMempoolPrevouts`.
-pub const WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1: &str = "wallet.mempool.transparent_prevouts_v1";
-/// Capability advertised for `WalletQuery.TransparentAddressUtxos[Stream]`.
-pub const WALLET_ADDRESS_TRANSPARENT_UTXOS_V1: &str = "wallet.address.transparent_utxos_v1";
+/// Capability advertised for `WalletQuery.TransparentMempoolOutputsByOutpoint`.
+pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1: &str =
+    "wallet.mempool.transparent_outputs_by_outpoint_v1";
+/// Capability advertised for `WalletQuery.AddressOutputIndex[Stream]`.
+pub const WALLET_ADDRESS_OUTPUT_INDEX_V1: &str = "wallet.address.output_index_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
 /// Always-on canonical-confirmed-balance path for `WalletQuery.TransparentAddressBalance`.
@@ -134,9 +131,8 @@ pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
 /// Signals that the explorer plane aggregates per-transaction
 /// ZIP-317 conventional fee floors over a block range at request time.
 /// The fee fields are ZIP-317 conventional fees, not miner-collected
-/// fees: computing actual fees requires prevout resolution and is out
-/// of scope for `v1`. Composed from `WalletQuery.FullBlock` per height;
-/// no derive consumer required.
+/// fees: computing actual fees requires transparent-output resolution and is
+/// materialized by the derive plane.
 pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 /// Capability advertised for `ExplorerQuery.ValuePoolSummary`.
 ///
@@ -147,12 +143,12 @@ pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
 /// Capability advertised for the per-transaction paid-fee surface.
 ///
-/// Signals that the explorer plane has the transparent prevout index
-/// online and the `TransactionFeesConsumer` has materialized per-tx fee
-/// rows. When advertised, `TransactionDetail` responses populate
-/// `paid_fee_zat` and `transparent_inputs[].value_zat`; absent, those
-/// fields stay default and consumers fall back to
-/// `zip317_conventional_fee_zat` with a `prevout_resolution_status` chip.
+/// Signals that the explorer plane has transparent-output facts online and
+/// the `TransactionFeesConsumer` has materialized per-transaction fee rows.
+/// When advertised, `TransactionDetail` responses populate `paid_fee_zat` and
+/// `transparent_inputs[].value_zat`; absent, those fields stay default and
+/// consumers fall back to `zip317_conventional_fee_zat` with a
+/// `prevout_resolution_status` chip.
 pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
 /// Capability advertised for `ExplorerQuery.RecentTransactions`.
 ///
@@ -199,9 +195,9 @@ pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1: &str =
 /// Capability advertised for `IngestControl.TransparentMempoolSpendByOutpoint`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1: &str =
     "ingest.control.transparent_mempool_spend_by_outpoint_v1";
-/// Capability advertised for `IngestControl.TransparentMempoolPrevouts`.
+/// Capability advertised for `IngestControl.TransparentMempoolOutputsByOutpoint`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
-    "ingest.control.transparent_mempool_prevouts_v1";
+    "ingest.control.transparent_mempool_outputs_by_outpoint_v1";
 /// Capability advertised for `IngestControl.ChainValuePoolsAtTip`.
 pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
     "ingest.control.chain_value_pools_at_tip_v1";
@@ -267,9 +263,8 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
     WALLET_READ_COMPACT_BLOCK_AT_V1,
     WALLET_READ_COMPACT_BLOCK_RANGE_V1,
-    WALLET_READ_FULL_BLOCK_AT_V1,
-    WALLET_READ_TREE_STATE_AT_V1,
-    WALLET_READ_LATEST_TREE_STATE_V1,
+    WALLET_READ_TREE_STATE_CHECKPOINT_V1,
+    WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
     WALLET_READ_TRANSACTION_BY_ID_V1,
     WALLET_READ_SERVER_INFO_V1,
@@ -279,10 +274,10 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_EVENTS_MEMPOOL_V1,
     WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
     WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
-    WALLET_MEMPOOL_TRANSPARENT_PREVOUTS_V1,
-    WALLET_READ_TRANSPARENT_PREVOUTS_V1,
+    WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
+    WALLET_READ_TRANSPARENT_OUTPUTS_V1,
     WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-    WALLET_ADDRESS_TRANSPARENT_UTXOS_V1,
+    WALLET_ADDRESS_OUTPUT_INDEX_V1,
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
     WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
     EXPLORER_SERVER_INFO_V1,

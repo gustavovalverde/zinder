@@ -17,7 +17,10 @@ use zinder_client::{
 };
 use zinder_core::TransparentAddressTxIndexArtifact;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, StoreFixture, open_test_derive_store_for_canonical,
+    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
+};
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xEF; 32];
 
@@ -35,14 +38,14 @@ async fn local_and_remote_ascending_drain_returns_identical_tx_history() -> eyre
     let local_chunks = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(drain_query.clone(), None)
+            .transparent_address_tx_ids_in_range(drain_query.clone())
             .await?,
     )
     .await?;
     let remote_chunks = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(drain_query, None)
+            .transparent_address_tx_ids_in_range(drain_query)
             .await?,
     )
     .await?;
@@ -71,14 +74,14 @@ async fn local_and_remote_descending_drain_returns_identical_tx_history() -> eyr
     let local_chunks = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(descending_query.clone(), None)
+            .transparent_address_tx_ids_in_range(descending_query.clone())
             .await?,
     )
     .await?;
     let remote_chunks = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(descending_query, None)
+            .transparent_address_tx_ids_in_range(descending_query)
             .await?,
     )
     .await?;
@@ -106,14 +109,14 @@ async fn local_and_remote_paged_resume_returns_identical_tx_history() -> eyre::R
     let local_first = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(first_page_query.clone(), None)
+            .transparent_address_tx_ids_in_range(first_page_query.clone())
             .await?,
     )
     .await?;
     let remote_first = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(first_page_query, None)
+            .transparent_address_tx_ids_in_range(first_page_query)
             .await?,
     )
     .await?;
@@ -140,14 +143,14 @@ async fn local_and_remote_paged_resume_returns_identical_tx_history() -> eyre::R
     let local_resume = drain_stream(
         fixtures
             .local
-            .transparent_address_tx_ids_in_range(resume_query.clone(), None)
+            .transparent_address_tx_ids_in_range(resume_query.clone())
             .await?,
     )
     .await?;
     let remote_resume = drain_stream(
         fixtures
             .remote
-            .transparent_address_tx_ids_in_range(resume_query, None)
+            .transparent_address_tx_ids_in_range(resume_query)
             .await?,
     )
     .await?;
@@ -168,36 +171,40 @@ struct ChainIndexFixtures {
     // lifetime; dropping it removes the data files the secondary store
     // and the in-process query are reading from.
     _store_fixture: StoreFixture,
+    _derive_store: zinder_derive::DeriveStore,
 }
 
 async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> {
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (block_height, block_hash) = {
         let block = chain_fixture
             .block_at(BlockHeight::new(1))
             .ok_or_else(|| eyre!("fixture must contain block 1"))?;
         (block.height, block.hash)
     };
-    for tx_index in 0..tx_count {
-        let mut transaction_id_bytes = [0; 32];
-        transaction_id_bytes[..4].copy_from_slice(&tx_index.to_be_bytes());
-        chain_fixture = chain_fixture.with_transparent_address_tx_index(
+    let artifacts = (0..tx_count)
+        .map(|tx_index| {
+            let mut transaction_id_bytes = [0; 32];
+            transaction_id_bytes[..4].copy_from_slice(&tx_index.to_be_bytes());
             TransparentAddressTxIndexArtifact::new(
                 address_script_hash,
                 block_height,
                 tx_index,
                 TransactionId::from_bytes(transaction_id_bytes),
                 block_hash,
-            ),
-        );
-    }
+            )
+        })
+        .collect::<Vec<_>>();
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    seed_transparent_address_transaction_history(&derive_store, &artifacts)?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
         (),
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    )
+    .with_derive_store(derive_store.clone());
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
     let remote = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -219,6 +226,7 @@ async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> 
         remote,
         address_script_hash,
         _store_fixture: store_fixture,
+        _derive_store: derive_store,
     })
 }
 

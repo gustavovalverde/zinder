@@ -1,0 +1,331 @@
+//! Transparent output facts and address indexes.
+
+use sha2::{Digest, Sha256};
+
+use crate::{BlockHash, BlockHeight, ChainEpoch, TransactionId};
+
+/// Hard cap on the number of transparent outpoints one output-resolution
+/// request may resolve.
+pub const MAX_TRANSPARENT_OUTPUTS_PER_REQUEST: usize = 1024;
+
+/// Hash of a transparent address `scriptPubKey`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TransparentAddressScriptHash([u8; 32]);
+
+impl TransparentAddressScriptHash {
+    /// Creates a script hash from fixed 32-byte material.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the script hash bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Hashes a transparent `scriptPubKey` into its canonical script hash.
+    #[must_use]
+    pub fn of_script_pub_key(script_pub_key: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(script_pub_key);
+        Self::from_bytes(hasher.finalize().into())
+    }
+}
+
+/// Transparent transaction output identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TransparentOutPoint {
+    /// Transaction that created the transparent output.
+    pub transaction_id: TransactionId,
+    /// Output index within the transaction.
+    pub output_index: u32,
+}
+
+impl TransparentOutPoint {
+    /// Sentinel outpoint used by Zcash transaction inputs to mark coinbase.
+    pub const COINBASE_SENTINEL: Self = Self::new(TransactionId::from_bytes([0u8; 32]), u32::MAX);
+
+    /// Creates a transparent outpoint.
+    #[must_use]
+    pub const fn new(transaction_id: TransactionId, output_index: u32) -> Self {
+        Self {
+            transaction_id,
+            output_index,
+        }
+    }
+
+    /// Returns true when this outpoint is the Zcash coinbase input sentinel.
+    #[must_use]
+    pub fn is_coinbase_sentinel(self) -> bool {
+        self == Self::COINBASE_SENTINEL
+    }
+}
+
+/// Resolved transparent output referenced by an outpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutput {
+    /// Output value in zatoshis.
+    pub value_zat: u64,
+    /// Raw scriptPubKey bytes.
+    pub script_pub_key: Vec<u8>,
+}
+
+/// Transparent input fact local to a mined transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransparentInputFact {
+    /// Transparent input index within the transaction.
+    pub input_index: u32,
+    /// Output consumed by this transparent input.
+    pub spent_outpoint: TransparentOutPoint,
+}
+
+impl TransparentInputFact {
+    /// Creates an ordered transparent input fact.
+    #[must_use]
+    pub const fn new(input_index: u32, spent_outpoint: TransparentOutPoint) -> Self {
+        Self {
+            input_index,
+            spent_outpoint,
+        }
+    }
+}
+
+/// Transparent output fact local to a mined transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutputFact {
+    /// Transparent output index within the transaction.
+    pub output_index: u32,
+    /// Output value in zatoshis.
+    pub value_zat: u64,
+    /// Raw scriptPubKey bytes.
+    pub script_pub_key: Vec<u8>,
+    /// Hash of the transparent output script.
+    pub address_script_hash: TransparentAddressScriptHash,
+}
+
+impl TransparentOutputFact {
+    /// Creates an ordered transparent output fact.
+    #[must_use]
+    pub fn new(
+        output_index: u32,
+        value_zat: u64,
+        script_pub_key: impl Into<Vec<u8>>,
+        address_script_hash: TransparentAddressScriptHash,
+    ) -> Self {
+        Self {
+            output_index,
+            value_zat,
+            script_pub_key: script_pub_key.into(),
+            address_script_hash,
+        }
+    }
+}
+
+/// Canonical transparent output fact keyed by outpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutputArtifact {
+    /// Output identity.
+    pub outpoint: TransparentOutPoint,
+    /// Output value in zatoshis.
+    pub value_zat: u64,
+    /// Raw scriptPubKey bytes.
+    pub script_pub_key: Vec<u8>,
+    /// Hash of the transparent output script.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Height of the block that mined the output.
+    pub block_height: BlockHeight,
+    /// Hash of the block that mined the output.
+    pub block_hash: BlockHash,
+}
+
+impl TransparentOutputArtifact {
+    /// Creates a transparent output artifact.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "transparent output artifacts are immutable persisted facts"
+    )]
+    pub fn new(
+        outpoint: TransparentOutPoint,
+        value_zat: u64,
+        script_pub_key: impl Into<Vec<u8>>,
+        address_script_hash: TransparentAddressScriptHash,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Self {
+        Self {
+            outpoint,
+            value_zat,
+            script_pub_key: script_pub_key.into(),
+            address_script_hash,
+            block_height,
+            block_hash,
+        }
+    }
+
+    /// Converts the persisted artifact into the public output payload.
+    #[must_use]
+    pub fn into_output(self) -> TransparentOutput {
+        TransparentOutput {
+            value_zat: self.value_zat,
+            script_pub_key: self.script_pub_key,
+        }
+    }
+}
+
+/// Address-index row for a mined transparent output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressOutputIndexArtifact {
+    /// Hash of the transparent output script.
+    pub address_script_hash: TransparentAddressScriptHash,
+    /// Raw `scriptPubKey` bytes for the output.
+    pub script_pub_key: Vec<u8>,
+    /// Output identity.
+    pub outpoint: TransparentOutPoint,
+    /// Output value in zatoshis.
+    pub value_zat: u64,
+    /// Height of the block that mined the output.
+    pub block_height: BlockHeight,
+    /// Hash of the block that mined the output.
+    pub block_hash: BlockHash,
+}
+
+impl AddressOutputIndexArtifact {
+    /// Creates an address-output index row.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "address-output index rows are immutable persisted facts"
+    )]
+    pub fn new(
+        address_script_hash: TransparentAddressScriptHash,
+        script_pub_key: impl Into<Vec<u8>>,
+        outpoint: TransparentOutPoint,
+        value_zat: u64,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Self {
+        Self {
+            address_script_hash,
+            script_pub_key: script_pub_key.into(),
+            outpoint,
+            value_zat,
+            block_height,
+            block_hash,
+        }
+    }
+}
+
+/// Canonical transparent spend fact resolved from a spend-index row and the
+/// transparent output it consumes.
+///
+/// The ingest writer persists this fact once with the chain epoch that mined
+/// the spending transaction. Derive consumers read it directly instead of
+/// rehydrating spend context from transparent-output rows during replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentSpendFact {
+    /// Output consumed by this transparent input.
+    pub spent_outpoint: TransparentOutPoint,
+    /// Transparent input index within the spending transaction.
+    pub input_index: u32,
+    /// Spending transaction identifier.
+    pub spending_transaction_id: TransactionId,
+    /// Spending transaction's block-local index.
+    pub tx_index_in_block: u32,
+    /// Height of the block that mined the spending transaction.
+    pub block_height: BlockHeight,
+    /// Hash of the block that mined the spending transaction.
+    pub block_hash: BlockHash,
+    /// Value of the spent output in zatoshis.
+    pub spent_value_zat: u64,
+    /// Hash of the spent output script.
+    pub spent_address_script_hash: TransparentAddressScriptHash,
+    /// Height of the block that mined the spent output.
+    pub spent_block_height: BlockHeight,
+    /// Hash of the block that mined the spent output.
+    pub spent_block_hash: BlockHash,
+}
+
+impl TransparentSpendFact {
+    /// Creates a resolved transparent spend fact.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "transparent spend facts are immutable persisted facts"
+    )]
+    pub fn new(
+        spent_outpoint: TransparentOutPoint,
+        input_index: u32,
+        spending_transaction_id: TransactionId,
+        tx_index_in_block: u32,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        spent_value_zat: u64,
+        spent_address_script_hash: TransparentAddressScriptHash,
+        spent_block_height: BlockHeight,
+        spent_block_hash: BlockHash,
+    ) -> Self {
+        Self {
+            spent_outpoint,
+            input_index,
+            spending_transaction_id,
+            tx_index_in_block,
+            block_height,
+            block_hash,
+            spent_value_zat,
+            spent_address_script_hash,
+            spent_block_height,
+            spent_block_hash,
+        }
+    }
+
+    /// Builds a resolved spend fact from a transparent input and its consumed
+    /// canonical output.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the spending input identity and consumed output identity are both persisted"
+    )]
+    pub fn from_input_and_output(
+        spent_outpoint: TransparentOutPoint,
+        input_index: u32,
+        spending_transaction_id: TransactionId,
+        tx_index_in_block: u32,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        output: &TransparentOutputArtifact,
+    ) -> Self {
+        Self::new(
+            spent_outpoint,
+            input_index,
+            spending_transaction_id,
+            tx_index_in_block,
+            block_height,
+            block_hash,
+            output.value_zat,
+            output.address_script_hash,
+            output.block_height,
+            output.block_hash,
+        )
+    }
+}
+
+/// One entry in a transparent-output resolution response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutputEntry {
+    /// Outpoint requested by the caller.
+    pub outpoint: TransparentOutPoint,
+    /// Resolved output, when found.
+    pub output: Option<TransparentOutput>,
+}
+
+/// Transparent-output resolution response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutputsByOutpointResponse {
+    /// Chain epoch the response binds to.
+    pub chain_epoch: ChainEpoch,
+    /// Per-outpoint resolution result, in input order.
+    pub entries: Vec<TransparentOutputEntry>,
+}

@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
-    SubtreeRootArtifact, TransactionArtifact, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevoutArtifact, TransparentUtxoSpendArtifact, TreeStateArtifact,
+    AddressOutputIndexArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact, TransactionFactsArtifact,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
 };
 
 use crate::{
-    ChainEpochArtifacts, ReorgWindowChange, StoreError, block_artifact::read_block_artifact,
+    ChainEpochArtifacts, ReorgWindowChange, StoreError, block_artifact::read_block_header_artifact,
     kv::RocksChainStore,
 };
 
@@ -40,7 +40,7 @@ pub(super) fn validate_chain_epoch_artifacts(
 
     let tip_height = artifacts.chain_epoch.tip_height;
     validate_finalized_height(artifacts.chain_epoch)?;
-    let block_hash_by_height = block_hash_by_height(&artifacts.finalized_blocks)?;
+    let block_hash_by_height = block_hash_by_height(&artifacts.block_headers)?;
     validate_committed_boundary_hash_if_present(
         artifacts.chain_epoch.tip_height,
         artifacts.chain_epoch.tip_hash,
@@ -53,24 +53,28 @@ pub(super) fn validate_chain_epoch_artifacts(
         &block_hash_by_height,
         "finalized hash must match the committed block at finalized height",
     )?;
-    validate_block_artifacts(&artifacts.finalized_blocks, tip_height)?;
+    validate_block_header_artifacts(&artifacts.block_headers, tip_height)?;
     validate_compact_block_artifacts(&artifacts.compact_blocks, tip_height, &block_hash_by_height)?;
-    validate_transaction_artifacts(&artifacts.transactions, tip_height, &block_hash_by_height)?;
+    validate_transaction_facts_artifacts(
+        &artifacts.transaction_facts,
+        tip_height,
+        &block_hash_by_height,
+    )?;
     validate_tree_state_artifacts(&artifacts.tree_states, tip_height, &block_hash_by_height)?;
     validate_subtree_root_artifacts(&artifacts.subtree_roots, tip_height, &block_hash_by_height)?;
-    validate_transparent_address_utxo_artifacts(
-        &artifacts.transparent_address_utxos,
+    validate_address_output_index_artifacts(
+        &artifacts.address_output_index,
         tip_height,
         &block_hash_by_height,
     )?;
-    validate_transparent_prevout_artifacts(
-        &artifacts.transparent_prevouts,
-        &artifacts.transparent_address_utxos,
+    validate_transparent_output_artifacts(
+        &artifacts.transparent_outputs_by_outpoint,
+        &artifacts.address_output_index,
         tip_height,
         &block_hash_by_height,
     )?;
-    validate_transparent_utxo_spend_artifacts(
-        &artifacts.transparent_utxo_spends,
+    validate_transparent_spend_facts(
+        &artifacts.transparent_spend_facts,
         tip_height,
         &block_hash_by_height,
     )
@@ -92,7 +96,7 @@ pub(super) fn committed_block_range(
 
     block_height_range(
         artifacts
-            .finalized_blocks
+            .block_headers
             .iter()
             .map(|artifact| artifact.height),
     )
@@ -103,7 +107,7 @@ fn validate_artifact_presence(artifacts: &ChainEpochArtifacts) -> Result<(), Sto
         return Ok(());
     }
 
-    if artifacts.finalized_blocks.is_empty() {
+    if artifacts.block_headers.is_empty() {
         return Err(StoreError::InvalidChainEpochArtifacts {
             reason: "at least one finalized block artifact is required",
         });
@@ -122,14 +126,14 @@ fn finalized_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> b
     matches!(
         artifacts.reorg_window_change,
         ReorgWindowChange::FinalizeThrough { .. }
-    ) && artifacts.finalized_blocks.is_empty()
+    ) && artifacts.block_headers.is_empty()
         && artifacts.compact_blocks.is_empty()
-        && artifacts.transactions.is_empty()
+        && artifacts.transaction_facts.is_empty()
         && artifacts.tree_states.is_empty()
         && artifacts.subtree_roots.is_empty()
-        && artifacts.transparent_address_utxos.is_empty()
-        && artifacts.transparent_prevouts.is_empty()
-        && artifacts.transparent_utxo_spends.is_empty()
+        && artifacts.address_output_index.is_empty()
+        && artifacts.transparent_outputs_by_outpoint.is_empty()
+        && artifacts.transparent_spend_facts.is_empty()
 }
 
 pub(super) fn validate_reorg_window_change(
@@ -274,7 +278,7 @@ fn validate_committed_block_heights_are_publishable(
     changed_block_range: Option<BlockHeightRange>,
 ) -> Result<(), StoreError> {
     let Some(changed_block_range) = changed_block_range else {
-        if artifacts.finalized_blocks.is_empty() && artifacts.compact_blocks.is_empty() {
+        if artifacts.block_headers.is_empty() && artifacts.compact_blocks.is_empty() {
             return Ok(());
         }
 
@@ -283,7 +287,7 @@ fn validate_committed_block_heights_are_publishable(
         });
     };
 
-    for block in &artifacts.finalized_blocks {
+    for block in &artifacts.block_headers {
         if block.height < changed_block_range.start || block.height > changed_block_range.end {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "block artifacts can only publish newly appended or replaced heights",
@@ -304,7 +308,7 @@ fn validate_committed_block_parent_links(
         return Ok(());
     };
 
-    let block_artifacts_by_height = block_artifact_by_height(&artifacts.finalized_blocks)?;
+    let block_headers_by_height = block_header_by_height(&artifacts.block_headers)?;
     let mut expected_parent_hash = match current_chain_epoch {
         None => None,
         Some(current_chain_epoch)
@@ -325,7 +329,7 @@ fn validate_committed_block_parent_links(
     };
 
     for height in changed_block_range {
-        let block = block_artifacts_by_height.get(&height).ok_or({
+        let block = block_headers_by_height.get(&height).ok_or({
             StoreError::InvalidChainEpochArtifacts {
                 reason: "committed block range must contain every linked block height",
             }
@@ -362,7 +366,7 @@ fn validate_finalized_hash_against_visible_chain(
         return Ok(());
     }
 
-    let committed_hash_by_height = block_hash_by_height(&artifacts.finalized_blocks)?;
+    let committed_hash_by_height = block_hash_by_height(&artifacts.block_headers)?;
     if let Some(committed_hash) = committed_hash_by_height.get(&finalized_height) {
         if *committed_hash != artifacts.chain_epoch.finalized_hash {
             return Err(StoreError::InvalidChainEpochArtifacts {
@@ -397,7 +401,7 @@ fn visible_block_hash_at(
         current_chain_epoch.ok_or(StoreError::InvalidChainEpochArtifacts {
             reason: "visible block validation requires an existing chain epoch",
         })?;
-    let Some(block) = read_block_artifact(inner, current_chain_epoch, height)? else {
+    let Some(block) = read_block_header_artifact(inner, current_chain_epoch, height)? else {
         return Err(StoreError::InvalidChainEpochArtifacts {
             reason: "visible block validation height is not present in the current chain",
         });
@@ -548,7 +552,7 @@ fn validate_required_block_coverage(
     reason: &'static str,
 ) -> Result<(), StoreError> {
     let block_heights: HashSet<BlockHeight> = artifacts
-        .finalized_blocks
+        .block_headers
         .iter()
         .map(|block| block.height)
         .collect();
@@ -578,10 +582,10 @@ fn validate_finalized_height(chain_epoch: ChainEpoch) -> Result<(), StoreError> 
 }
 
 fn block_hash_by_height(
-    finalized_blocks: &[BlockArtifact],
+    block_headers: &[BlockHeaderArtifact],
 ) -> Result<HashMap<BlockHeight, BlockHash>, StoreError> {
     let mut block_hash_by_height = HashMap::new();
-    for block in finalized_blocks {
+    for block in block_headers {
         if let Some(existing_hash) = block_hash_by_height.insert(block.height, block.block_hash)
             && existing_hash != block.block_hash
         {
@@ -594,12 +598,12 @@ fn block_hash_by_height(
     Ok(block_hash_by_height)
 }
 
-fn block_artifact_by_height(
-    finalized_blocks: &[BlockArtifact],
-) -> Result<HashMap<BlockHeight, &BlockArtifact>, StoreError> {
-    let mut block_artifact_by_height = HashMap::new();
-    for block in finalized_blocks {
-        if let Some(existing_block) = block_artifact_by_height.insert(block.height, block)
+fn block_header_by_height(
+    block_headers: &[BlockHeaderArtifact],
+) -> Result<HashMap<BlockHeight, &BlockHeaderArtifact>, StoreError> {
+    let mut block_header_by_height = HashMap::new();
+    for block in block_headers {
+        if let Some(existing_block) = block_header_by_height.insert(block.height, block)
             && (existing_block.block_hash != block.block_hash
                 || existing_block.parent_hash != block.parent_hash)
         {
@@ -609,14 +613,14 @@ fn block_artifact_by_height(
         }
     }
 
-    Ok(block_artifact_by_height)
+    Ok(block_header_by_height)
 }
 
-fn validate_block_artifacts(
-    finalized_blocks: &[BlockArtifact],
+fn validate_block_header_artifacts(
+    block_headers: &[BlockHeaderArtifact],
     tip_height: BlockHeight,
 ) -> Result<(), StoreError> {
-    for block in finalized_blocks {
+    for block in block_headers {
         if block.height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "block artifact height cannot exceed tip height",
@@ -649,19 +653,21 @@ fn validate_compact_block_artifacts(
     Ok(())
 }
 
-fn validate_transaction_artifacts(
-    transactions: &[TransactionArtifact],
+fn validate_transaction_facts_artifacts(
+    transaction_facts: &[TransactionFactsArtifact],
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
-    for transaction in transactions {
-        if transaction.block_height > tip_height {
+    for transaction in transaction_facts {
+        if transaction.location.block_height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "transaction artifact height cannot exceed tip height",
             });
         }
 
-        if block_hash_by_height.get(&transaction.block_height) != Some(&transaction.block_hash) {
+        if block_hash_by_height.get(&transaction.location.block_height)
+            != Some(&transaction.location.block_hash)
+        {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "transaction artifact must match a block artifact at the same height",
             });
@@ -724,28 +730,30 @@ fn validate_subtree_root_artifacts(
     Ok(())
 }
 
-fn validate_transparent_address_utxo_artifacts(
-    transparent_address_utxos: &[TransparentAddressUtxoArtifact],
+fn validate_address_output_index_artifacts(
+    address_output_index: &[AddressOutputIndexArtifact],
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
     let mut outpoints = HashSet::<TransparentOutPoint>::new();
-    for utxo in transparent_address_utxos {
-        if utxo.block_height > tip_height {
+    for address_output in address_output_index {
+        if address_output.block_height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address UTXO height cannot exceed tip height",
+                reason: "transparent address output height cannot exceed tip height",
             });
         }
 
-        if block_hash_by_height.get(&utxo.block_height) != Some(&utxo.block_hash) {
+        if block_hash_by_height.get(&address_output.block_height)
+            != Some(&address_output.block_hash)
+        {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address UTXO artifact must match a block artifact at the same height",
+                reason: "transparent address output artifact must match a block artifact at the same height",
             });
         }
 
-        if !outpoints.insert(utxo.outpoint) {
+        if !outpoints.insert(address_output.outpoint) {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address UTXO artifacts cannot repeat an outpoint",
+                reason: "transparent address output artifacts cannot repeat an outpoint",
             });
         }
     }
@@ -753,24 +761,24 @@ fn validate_transparent_address_utxo_artifacts(
     Ok(())
 }
 
-fn validate_transparent_prevout_artifacts(
-    transparent_prevouts: &[TransparentPrevoutArtifact],
-    transparent_address_utxos: &[TransparentAddressUtxoArtifact],
+fn validate_transparent_output_artifacts(
+    transparent_outputs_by_outpoint: &[TransparentOutputArtifact],
+    address_output_index: &[AddressOutputIndexArtifact],
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
     let mut prevouts_by_outpoint =
-        HashMap::<TransparentOutPoint, &TransparentPrevoutArtifact>::new();
-    for prevout in transparent_prevouts {
+        HashMap::<TransparentOutPoint, &TransparentOutputArtifact>::new();
+    for prevout in transparent_outputs_by_outpoint {
         if prevout.block_height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent prevout height cannot exceed tip height",
+                reason: "transparent output height cannot exceed tip height",
             });
         }
 
         if block_hash_by_height.get(&prevout.block_height) != Some(&prevout.block_hash) {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent prevout artifact must match a block artifact at the same height",
+                reason: "transparent output artifact must match a block artifact at the same height",
             });
         }
 
@@ -779,60 +787,75 @@ fn validate_transparent_prevout_artifacts(
             .is_some()
         {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent prevout artifacts cannot repeat an outpoint",
+                reason: "transparent output artifacts cannot repeat an outpoint",
             });
         }
     }
 
-    for utxo in transparent_address_utxos {
-        let Some(prevout) = prevouts_by_outpoint.get(&utxo.outpoint) else {
+    for address_output in address_output_index {
+        let Some(prevout) = prevouts_by_outpoint.get(&address_output.outpoint) else {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address UTXO artifacts require matching transparent prevout artifacts",
+                reason: "transparent address output artifacts require matching transparent output artifacts",
             });
         };
-        if prevout.value_zat != utxo.value_zat
-            || prevout.script_pub_key != utxo.script_pub_key
-            || prevout.address_script_hash != utxo.address_script_hash
-            || prevout.block_height != utxo.block_height
-            || prevout.block_hash != utxo.block_hash
+        if prevout.value_zat != address_output.value_zat
+            || prevout.script_pub_key != address_output.script_pub_key
+            || prevout.address_script_hash != address_output.address_script_hash
+            || prevout.block_height != address_output.block_height
+            || prevout.block_hash != address_output.block_hash
         {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent prevout artifact must match its transparent address UTXO artifact",
+                reason: "transparent output artifact must match its transparent address output artifact",
             });
         }
     }
 
-    if prevouts_by_outpoint.len() != transparent_address_utxos.len() {
+    if prevouts_by_outpoint.len() != address_output_index.len() {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "transparent prevout artifacts require matching transparent address UTXO artifacts",
+            reason: "transparent output artifacts require matching transparent address output artifacts",
         });
     }
 
     Ok(())
 }
 
-fn validate_transparent_utxo_spend_artifacts(
-    transparent_utxo_spends: &[TransparentUtxoSpendArtifact],
+fn validate_transparent_spend_facts(
+    transparent_spend_facts: &[TransparentSpendFact],
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
     let mut spent_outpoints = HashSet::<TransparentOutPoint>::new();
-    for spend in transparent_utxo_spends {
+    for spend in transparent_spend_facts {
         if spend.block_height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent UTXO spend height cannot exceed tip height",
+                reason: "transparent spend fact height cannot exceed tip height",
             });
         }
 
         if block_hash_by_height.get(&spend.block_height) != Some(&spend.block_hash) {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent UTXO spend artifact must match a block artifact at the same height",
+                reason: "transparent spend fact must match a block artifact at the same height",
+            });
+        }
+
+        if spend.spent_block_height > spend.block_height {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent spend fact cannot spend an output mined after the spending block",
+            });
+        }
+
+        if let Some(committed_spent_block_hash) =
+            block_hash_by_height.get(&spend.spent_block_height)
+            && committed_spent_block_hash != &spend.spent_block_hash
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent spend fact spent-output block hash must match the committed block at the same height",
             });
         }
 
         if !spent_outpoints.insert(spend.spent_outpoint) {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent UTXO spend artifacts cannot repeat a spent outpoint",
+                reason: "transparent spend facts cannot repeat a spent outpoint",
             });
         }
     }
@@ -842,7 +865,7 @@ fn validate_transparent_utxo_spend_artifacts(
 
 fn first_committed_block_height(artifacts: &ChainEpochArtifacts) -> BlockHeight {
     artifacts
-        .finalized_blocks
+        .block_headers
         .iter()
         .map(|block| block.height)
         .min()

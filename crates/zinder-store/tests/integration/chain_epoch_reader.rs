@@ -13,10 +13,10 @@ use std::{
 use eyre::eyre;
 use tempfile::{TempDir, tempdir};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, BlockId,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevoutArtifact, UnixTimestampMillis,
+    AddressOutputIndexArtifact, ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, UnixTimestampMillis,
 };
 use zinder_store::{
     BlockHashLookup, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -50,22 +50,28 @@ fn chain_epoch_reader_stays_pinned_after_a_new_epoch_is_committed() -> eyre::Res
 
     assert_eq!(reader_1.chain_epoch(), epoch_1);
     assert_eq!(
-        reader_1.block_at(BlockHeight::new(1))?,
+        reader_1.block_header_at(BlockHeight::new(1))?,
         Some(block_1.clone())
     );
     assert_eq!(reader_1.compact_block_at(BlockHeight::new(2))?, None);
 
     assert_eq!(reader_2.chain_epoch(), epoch_2);
-    assert_eq!(reader_2.block_at(BlockHeight::new(1))?, Some(block_1));
-    assert_eq!(reader_2.block_at(BlockHeight::new(2))?, Some(block_2));
     assert_eq!(
-        reader_2.blocks_in_range(BlockHeightRange::inclusive(
+        reader_2.block_header_at(BlockHeight::new(1))?,
+        Some(block_1)
+    );
+    assert_eq!(
+        reader_2.block_header_at(BlockHeight::new(2))?,
+        Some(block_2)
+    );
+    assert_eq!(
+        reader_2.block_headers_in_range(BlockHeightRange::inclusive(
             BlockHeight::new(1),
             BlockHeight::new(2)
         ))?,
         vec![
-            reader_2.block_at(BlockHeight::new(1))?,
-            reader_2.block_at(BlockHeight::new(2))?
+            reader_2.block_header_at(BlockHeight::new(1))?,
+            reader_2.block_header_at(BlockHeight::new(2))?
         ]
     );
 
@@ -96,7 +102,7 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -105,11 +111,11 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         replacement_hash,
         b"replacement-compact-block-2".to_vec(),
     );
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
 
     store.commit_chain_epoch(
@@ -164,15 +170,15 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -197,15 +203,15 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: reintroduced_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
-    let reintroduced_block = BlockArtifact::new(
+    let reintroduced_block = super::synthetic_block_header(
         replacement_height,
         reintroduced_hash,
         finalized_block.block_hash,
-        b"reintroduced-block-2".to_vec(),
+        b"reintroduced-block-2",
     );
     let reintroduced_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -239,7 +245,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
 }
 
 #[test]
-fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> eyre::Result<()> {
+fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (finalized_epoch, finalized_block, finalized_compact_block) = synthetic_epoch(1, 1);
@@ -256,15 +262,15 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -274,7 +280,7 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
 
     let address_script_hash = TransparentAddressScriptHash::from_bytes([17; 32]);
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([23; 32]), 0);
-    let stale_utxo = TransparentAddressUtxoArtifact::new(
+    let stale_utxo = AddressOutputIndexArtifact::new(
         address_script_hash,
         b"stale-script".to_vec(),
         outpoint,
@@ -282,7 +288,7 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
         replacement_height,
         initial_block.block_hash,
     );
-    let visible_utxo = TransparentAddressUtxoArtifact::new(
+    let visible_utxo = AddressOutputIndexArtifact::new(
         address_script_hash,
         b"visible-script".to_vec(),
         outpoint,
@@ -297,8 +303,8 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
             vec![finalized_block, initial_block],
             vec![finalized_compact_block, initial_compact_block],
         )
-        .with_transparent_address_utxos(vec![stale_utxo.clone()])
-        .with_transparent_prevouts(vec![transparent_prevout_from_utxo(&stale_utxo)]),
+        .with_address_output_index(vec![stale_utxo.clone()])
+        .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&stale_utxo)]),
     )?;
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
@@ -306,15 +312,15 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
             vec![replacement_block],
             vec![replacement_compact_block],
         )
-        .with_transparent_address_utxos(vec![visible_utxo.clone()])
-        .with_transparent_prevouts(vec![transparent_prevout_from_utxo(&visible_utxo)])
+        .with_address_output_index(vec![visible_utxo.clone()])
+        .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&visible_utxo)])
         .with_reorg_window_change(ReorgWindowChange::Replace {
             from_height: replacement_height,
         }),
     )?;
 
     let reader = store.current_chain_epoch_reader()?;
-    let utxos = reader.transparent_address_utxos(
+    let utxos = reader.address_output_index(
         address_script_hash,
         BlockHeight::new(1),
         NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max entries"))?,
@@ -326,7 +332,7 @@ fn transparent_address_utxos_return_visible_remined_outpoint_after_reorg() -> ey
 }
 
 #[test]
-fn transparent_prevouts_return_latest_visible_row_after_reorg() -> eyre::Result<()> {
+fn transparent_outputs_by_outpoint_return_latest_visible_row_after_reorg() -> eyre::Result<()> {
     let fixture = reorged_outpoint_fixture()?;
     let reader = fixture.store.current_chain_epoch_reader()?;
     let stale_epoch_reader = fixture.store.chain_epoch_reader_at(ChainEpochId::new(2))?;
@@ -334,49 +340,226 @@ fn transparent_prevouts_return_latest_visible_row_after_reorg() -> eyre::Result<
 
     assert_eq!(
         reader
-            .transparent_prevouts_by_outpoints(&[rows.outpoint])?
+            .transparent_outputs_by_outpoints(&[rows.outpoint])?
             .get(&rows.outpoint),
         Some(&rows.visible_prevout)
     );
     assert_eq!(
         reader
-            .transparent_prevouts_by_outpoints_for_writer_commit(&[rows.outpoint])?
+            .transparent_outputs_by_outpoints_for_writer_commit(&[rows.outpoint])?
             .get(&rows.outpoint),
         Some(&rows.visible_prevout)
     );
     assert_eq!(
         stale_epoch_reader
-            .transparent_prevouts_by_outpoints(&[rows.outpoint])?
+            .transparent_outputs_by_outpoints(&[rows.outpoint])?
             .get(&rows.outpoint),
-        Some(&rows.stale_prevout)
+        Some(&rows.visible_prevout)
+    );
+    assert!(
+        stale_epoch_reader
+            .transparent_outputs_by_outpoints(&[rows.stale_prevout.outpoint])?
+            .is_empty()
     );
 
     Ok(())
 }
 
 #[test]
-fn transparent_prevouts_remove_reorged_row_without_visible_history() -> eyre::Result<()> {
+fn transparent_outputs_by_outpoint_remove_reorged_row_without_visible_history() -> eyre::Result<()>
+{
     let fixture = reorged_only_outpoint_fixture()?;
     let current_reader = fixture.store.current_chain_epoch_reader()?;
     let stale_epoch_reader = fixture.store.chain_epoch_reader_at(ChainEpochId::new(2))?;
 
     assert_eq!(
         current_reader
-            .transparent_prevouts_by_outpoints(&[fixture.outpoint])?
+            .transparent_outputs_by_outpoints(&[fixture.outpoint])?
             .get(&fixture.outpoint),
         None
     );
     assert_eq!(
         current_reader
-            .transparent_prevouts_by_outpoints_for_writer_commit(&[fixture.outpoint])?
+            .transparent_outputs_by_outpoints_for_writer_commit(&[fixture.outpoint])?
             .get(&fixture.outpoint),
         None
     );
     assert_eq!(
         stale_epoch_reader
-            .transparent_prevouts_by_outpoints(&[fixture.outpoint])?
+            .transparent_outputs_by_outpoints(&[fixture.outpoint])?
             .get(&fixture.outpoint),
-        Some(&fixture.stale_prevout)
+        None
+    );
+
+    Ok(())
+}
+
+#[test]
+fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
+    let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
+    let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([31; 32]), 0);
+    let output = AddressOutputIndexArtifact::new(
+        TransparentAddressScriptHash::from_bytes([32; 32]),
+        b"spendable-script".to_vec(),
+        spent_outpoint,
+        77,
+        block_1.height,
+        block_1.block_hash,
+    );
+    let spend = TransparentSpendFact::new(
+        spent_outpoint,
+        0,
+        TransactionId::from_bytes([33; 32]),
+        0,
+        block_2.height,
+        block_2.block_hash,
+        output.value_zat,
+        output.address_script_hash,
+        output.block_height,
+        output.block_hash,
+    );
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+            .with_address_output_index(vec![output.clone()])
+            .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
+    )?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_block_2])
+            .with_transparent_spend_facts(vec![spend.clone()]),
+    )?;
+
+    let current_reader = store.current_chain_epoch_reader()?;
+    let epoch_1_reader = store.chain_epoch_reader_at(ChainEpochId::new(1))?;
+    assert_eq!(
+        current_reader
+            .transparent_spend_facts_by_outpoints(&[spent_outpoint])?
+            .get(&spent_outpoint),
+        Some(&spend)
+    );
+    assert!(
+        epoch_1_reader
+            .transparent_spend_facts_by_outpoints(&[spent_outpoint])?
+            .is_empty()
+    );
+    assert!(
+        current_reader
+            .address_output_index(
+                output.address_script_hash,
+                BlockHeight::new(1),
+                NonZeroU32::MIN
+            )?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reorg fixture keeps the committed epochs visible inside the assertion"
+)]
+fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
+    let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(2, 2);
+    initial_epoch.finalized_height = epoch_1.tip_height;
+    initial_epoch.finalized_hash = epoch_1.tip_hash;
+    let replacement_height = BlockHeight::new(2);
+    let replacement_hash = BlockHash::from_bytes([45; 32]);
+    let replacement_epoch = ChainEpoch {
+        id: ChainEpochId::new(3),
+        network: Network::ZcashRegtest,
+        tip_height: replacement_height,
+        tip_hash: replacement_hash,
+        finalized_height: epoch_1.tip_height,
+        finalized_hash: epoch_1.tip_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_030),
+    };
+    let replacement_block = super::synthetic_block_header(
+        replacement_height,
+        replacement_hash,
+        block_1.block_hash,
+        b"replacement-spend-block",
+    );
+    let replacement_compact_block = CompactBlockArtifact::new(
+        replacement_height,
+        replacement_hash,
+        b"replacement".to_vec(),
+    );
+    let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([41; 32]), 0);
+    let output = AddressOutputIndexArtifact::new(
+        TransparentAddressScriptHash::from_bytes([42; 32]),
+        b"reorg-script".to_vec(),
+        spent_outpoint,
+        99,
+        block_1.height,
+        block_1.block_hash,
+    );
+    let reorged_spend = TransparentSpendFact::new(
+        spent_outpoint,
+        0,
+        TransactionId::from_bytes([43; 32]),
+        0,
+        initial_block.height,
+        initial_block.block_hash,
+        output.value_zat,
+        output.address_script_hash,
+        output.block_height,
+        output.block_hash,
+    );
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+            .with_address_output_index(vec![output.clone()])
+            .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
+    )?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            initial_epoch,
+            vec![initial_block],
+            vec![initial_compact_block],
+        )
+        .with_transparent_spend_facts(vec![reorged_spend]),
+    )?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            replacement_epoch,
+            vec![replacement_block],
+            vec![replacement_compact_block],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: replacement_height,
+        }),
+    )?;
+
+    let current_reader = store.current_chain_epoch_reader()?;
+    let stale_reader = store.chain_epoch_reader_at(ChainEpochId::new(2))?;
+    assert!(
+        current_reader
+            .transparent_spend_facts_by_outpoints(&[spent_outpoint])?
+            .is_empty()
+    );
+    assert_eq!(
+        stale_reader
+            .transparent_spend_facts_by_outpoints(&[spent_outpoint])?
+            .get(&spent_outpoint),
+        None
+    );
+    assert_eq!(
+        current_reader.address_output_index(
+            output.address_script_hash,
+            BlockHeight::new(1),
+            NonZeroU32::MIN,
+        )?,
+        vec![output]
     );
 
     Ok(())
@@ -386,7 +569,6 @@ struct ReorgedOnlyOutpointFixture {
     store: PrimaryChainStore,
     _tempdir: TempDir,
     outpoint: TransparentOutPoint,
-    stale_prevout: TransparentPrevoutArtifact,
 }
 
 fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
@@ -406,15 +588,15 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -422,7 +604,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         b"replacement-compact-block-2".to_vec(),
     );
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([25; 32]), 0);
-    let stale_utxo = TransparentAddressUtxoArtifact::new(
+    let stale_utxo = AddressOutputIndexArtifact::new(
         TransparentAddressScriptHash::from_bytes([19; 32]),
         b"stale-script".to_vec(),
         outpoint,
@@ -430,7 +612,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         replacement_height,
         initial_block.block_hash,
     );
-    let stale_prevout = transparent_prevout_from_utxo(&stale_utxo);
+    let stale_prevout = transparent_output_from_utxo(&stale_utxo);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         finalized_epoch,
@@ -443,8 +625,8 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
             vec![initial_block],
             vec![initial_compact_block],
         )
-        .with_transparent_address_utxos(vec![stale_utxo])
-        .with_transparent_prevouts(vec![stale_prevout.clone()]),
+        .with_address_output_index(vec![stale_utxo])
+        .with_transparent_outputs_by_outpoint(vec![stale_prevout]),
     )?;
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
@@ -461,7 +643,6 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         store,
         _tempdir: tempdir,
         outpoint,
-        stale_prevout,
     })
 }
 
@@ -473,10 +654,10 @@ struct ReorgedOutpointFixture {
 
 struct ReorgedOutpointRows {
     outpoint: TransparentOutPoint,
-    visible_prevout: TransparentPrevoutArtifact,
-    stale_prevout: TransparentPrevoutArtifact,
-    visible_utxo: TransparentAddressUtxoArtifact,
-    stale_utxo: TransparentAddressUtxoArtifact,
+    visible_prevout: TransparentOutputArtifact,
+    stale_prevout: TransparentOutputArtifact,
+    visible_utxo: AddressOutputIndexArtifact,
+    stale_utxo: AddressOutputIndexArtifact,
 }
 
 fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
@@ -496,15 +677,15 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -519,8 +700,8 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
             vec![finalized_block],
             vec![finalized_compact_block],
         )
-        .with_transparent_address_utxos(vec![rows.visible_utxo.clone()])
-        .with_transparent_prevouts(vec![rows.visible_prevout.clone()]),
+        .with_address_output_index(vec![rows.visible_utxo.clone()])
+        .with_transparent_outputs_by_outpoint(vec![rows.visible_prevout.clone()]),
     )?;
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
@@ -528,8 +709,8 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
             vec![initial_block],
             vec![initial_compact_block],
         )
-        .with_transparent_address_utxos(vec![rows.stale_utxo.clone()])
-        .with_transparent_prevouts(vec![rows.stale_prevout.clone()]),
+        .with_address_output_index(vec![rows.stale_utxo.clone()])
+        .with_transparent_outputs_by_outpoint(vec![rows.stale_prevout.clone()]),
     )?;
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
@@ -551,13 +732,14 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
 
 fn reorged_outpoint_rows(
     finalized_epoch: ChainEpoch,
-    initial_block: &BlockArtifact,
+    initial_block: &BlockHeaderArtifact,
     replacement_height: BlockHeight,
 ) -> ReorgedOutpointRows {
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([24; 32]), 0);
+    let stale_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([25; 32]), 0);
     let base_address = TransparentAddressScriptHash::from_bytes([18; 32]);
     let stale_address = TransparentAddressScriptHash::from_bytes([19; 32]);
-    let visible_utxo = TransparentAddressUtxoArtifact::new(
+    let visible_utxo = AddressOutputIndexArtifact::new(
         base_address,
         b"visible-script".to_vec(),
         outpoint,
@@ -565,16 +747,16 @@ fn reorged_outpoint_rows(
         finalized_epoch.tip_height,
         finalized_epoch.tip_hash,
     );
-    let stale_utxo = TransparentAddressUtxoArtifact::new(
+    let stale_utxo = AddressOutputIndexArtifact::new(
         stale_address,
         b"stale-script".to_vec(),
-        outpoint,
+        stale_outpoint,
         50_000,
         replacement_height,
         initial_block.block_hash,
     );
-    let visible_prevout = transparent_prevout_from_utxo(&visible_utxo);
-    let stale_prevout = transparent_prevout_from_utxo(&stale_utxo);
+    let visible_prevout = transparent_output_from_utxo(&visible_utxo);
+    let stale_prevout = transparent_output_from_utxo(&stale_utxo);
 
     ReorgedOutpointRows {
         outpoint,
@@ -585,10 +767,8 @@ fn reorged_outpoint_rows(
     }
 }
 
-fn transparent_prevout_from_utxo(
-    utxo: &TransparentAddressUtxoArtifact,
-) -> TransparentPrevoutArtifact {
-    TransparentPrevoutArtifact::new(
+fn transparent_output_from_utxo(utxo: &AddressOutputIndexArtifact) -> TransparentOutputArtifact {
+    TransparentOutputArtifact::new(
         utxo.outpoint,
         utxo.value_zat,
         utxo.script_pub_key.clone(),
@@ -635,7 +815,10 @@ fn process_crash_after_append_commit_recovers_complete_epoch() -> eyre::Result<(
     let (expected_epoch, expected_block, expected_compact_block) = synthetic_epoch(2, 2);
 
     assert_eq!(reader.chain_epoch(), expected_epoch);
-    assert_eq!(reader.block_at(BlockHeight::new(2))?, Some(expected_block));
+    assert_eq!(
+        reader.block_header_at(BlockHeight::new(2))?,
+        Some(expected_block)
+    );
     assert_eq!(
         reader.compact_block_at(BlockHeight::new(2))?,
         Some(expected_compact_block)
@@ -657,7 +840,7 @@ fn process_crash_after_reorg_commit_recovers_complete_epoch() -> eyre::Result<()
     assert_eq!(reader.chain_epoch().id, ChainEpochId::new(2));
     assert_eq!(
         reader
-            .block_at(BlockHeight::new(2))?
+            .block_header_at(BlockHeight::new(2))?
             .map(|block| block.block_hash),
         Some(replacement_hash)
     );
@@ -679,7 +862,10 @@ fn process_crash_with_sync_writes_recovers_complete_epoch() -> eyre::Result<()> 
     let (expected_epoch, expected_block, expected_compact_block) = synthetic_epoch(2, 2);
 
     assert_eq!(reader.chain_epoch(), expected_epoch);
-    assert_eq!(reader.block_at(BlockHeight::new(2))?, Some(expected_block));
+    assert_eq!(
+        reader.block_header_at(BlockHeight::new(2))?,
+        Some(expected_block)
+    );
     assert_eq!(
         reader.compact_block_at(BlockHeight::new(2))?,
         Some(expected_compact_block)
@@ -700,7 +886,7 @@ fn initial_commit_uses_artifact_set_as_lower_bound() -> eyre::Result<()> {
         vec![compact_block.clone()],
     ))?;
     let reader = store.current_chain_epoch_reader()?;
-    let below_lower_bound = match reader.block_at(BlockHeight::new(1)) {
+    let below_lower_bound = match reader.block_header_at(BlockHeight::new(1)) {
         Ok(block) => {
             return Err(eyre!(
                 "expected missing block below lower bound, got {block:?}"
@@ -714,7 +900,7 @@ fn initial_commit_uses_artifact_set_as_lower_bound() -> eyre::Result<()> {
         below_lower_bound,
         zinder_store::StoreError::ArtifactMissing { .. }
     ));
-    assert_eq!(reader.block_at(BlockHeight::new(2))?, Some(block));
+    assert_eq!(reader.block_header_at(BlockHeight::new(2))?, Some(block));
     assert_eq!(
         reader.compact_block_at(BlockHeight::new(2))?,
         Some(compact_block)
@@ -744,7 +930,7 @@ fn many_epoch_reads_do_not_depend_on_dense_artifact_rewrites() -> eyre::Result<(
 
     let reader = store.current_chain_epoch_reader()?;
     assert_eq!(reader.chain_epoch().id, ChainEpochId::new(200));
-    assert_eq!(reader.block_at(BlockHeight::new(1))?, first_block);
+    assert_eq!(reader.block_header_at(BlockHeight::new(1))?, first_block);
 
     Ok(())
 }
@@ -789,7 +975,7 @@ fn crash_recovery_child_process() -> eyre::Result<()> {
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
@@ -802,15 +988,15 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{height}").into_bytes(),
+            format!("raw-block-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,
@@ -884,15 +1070,15 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         tip_hash: replacement_hash,
         finalized_height: first_epoch.tip_height,
         finalized_hash: first_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         first_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        b"replacement-block-2",
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,

@@ -6,6 +6,7 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
+use zinder_derive::{DeriveStore, DeriveStoreOptions};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1;
 use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
@@ -159,10 +160,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             ..zinder_store::ChainStoreOptions::for_network(query_config.network)
         },
     ) {
-        Ok(store) => {
-            open_storage_phase.complete();
-            store
-        }
+        Ok(store) => store,
         Err(error) => {
             let error = QueryConfigError::Store(error);
             open_storage_phase.fail(&error);
@@ -170,6 +168,32 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error);
         }
     };
+    let derive_store = match DeriveStore::open_secondary(
+        DeriveStore::path_for_canonical(&query_config.storage.path),
+        query_config.storage.secondary_path.join("derive"),
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            tuning: query_config.storage.tuning,
+        },
+    ) {
+        Ok(derive_store) => {
+            if let Err(error) = derive_store.try_catch_up() {
+                let error = QueryConfigError::DeriveStore(error);
+                open_storage_phase.fail(&error);
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+            derive_store
+        }
+        Err(error) => {
+            let error = QueryConfigError::DeriveStore(error);
+            open_storage_phase.fail(&error);
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
+    open_storage_phase.complete();
     let visible_height = store
         .current_chain_epoch()
         .map_err(QueryConfigError::Store)?
@@ -213,7 +237,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         }
     };
     let wallet_query =
-        zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations);
+        zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations)
+            .with_derive_store(derive_store);
     let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),

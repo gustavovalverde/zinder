@@ -21,9 +21,9 @@ If any of these are false, you may not be adding an artifact family. Common alte
 |-----------|-------------|-------------|
 | Adding a precomputed totals table for explorer dashboards | `zinder-explorer` materialized view consumed via `ChainEvents` | Canonical artifact family |
 | Adding fee-rate ordering to mempool transactions | `zinder-explorer` view over `MempoolEvents` | Canonical mempool artifact |
-| Adding a new field to per-block metadata | Extend `BlockArtifact`'s payload with the new field, bump artifact schema version | New artifact family |
-| Adding transparent address transaction history | New canonical artifact family with `ArtifactKey::TransparentAddress` | Compat-shim-only feature, derive view, ad-hoc index |
-| Adding transparent address UTXO lookup for lightwalletd compatibility | New canonical transparent UTXO artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
+| Adding a new field to per-block metadata | Extend `BlockHeaderArtifact` with the new typed field, bump artifact schema version | New artifact family |
+| Adding transparent address transaction history | Derive-owned projection over transaction, transparent output, and transparent spend facts | Canonical ingest index, compat-shim-only feature, ad-hoc index |
+| Adding transparent address output lookup for lightwalletd compatibility | New canonical transparent output artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
 
 When in doubt, the [Wallet data plane](wallet-data-plane.md) and [derive plane](derive-plane.md) docs distinguish the two boundaries.
 
@@ -47,8 +47,8 @@ Current examples:
 - `consensus_branch_id` is derived from the network upgrade active at the mined
   block height. It is not a transaction payload field.
 - `block_time` can be read from the retained block or compact-block header. If
-  repeated header parsing becomes too expensive, promote a typed block-header
-  read model or artifact; do not widen `TransactionArtifact` to cache a copy.
+  repeated header reads become too expensive, improve the typed block-header
+  read model or artifact; do not widen `TransactionFactsArtifact` to cache a duplicate copy.
 - `MempoolMinedEvent.block_hash` is event enrichment from the mined block
   identity. It belongs on the event payload so consumers do not issue a racy
   follow-up read after receiving `Mined`.
@@ -79,7 +79,7 @@ A new file in `crates/zinder-core/src/`, named after the artifact family in snak
 
 - `block_artifact.rs` (existing)
 - `compact_block_artifact.rs` (existing)
-- `transparent_address_tx_index_artifact.rs` (hypothetical)
+- `address_output_index.rs` (existing)
 
 The file exports one `*Artifact` struct or one `*Artifact` enum. The struct is named `{Family}Artifact`. Its fields are:
 
@@ -92,8 +92,8 @@ The file also exports any newtypes specific to the family. Examples: `SubtreeRoo
 Re-export the type from `crates/zinder-core/src/lib.rs`:
 
 ```rust
-mod transparent_address_tx_index_artifact;
-pub use transparent_address_tx_index_artifact::TransparentAddressTxIndexArtifact;
+mod transparent_output;
+pub use transparent_output::AddressOutputIndexArtifact;
 ```
 
 Naming check:
@@ -114,20 +114,20 @@ A new file in `crates/zinder-store/src/` with the matching name. Inside, three t
 ```rust
 enum ColumnFamilyName {
     // existing variants
-    TransparentAddressTxIndex,
+    AddressOutputIndex,
 }
 ```
 
-The enum's `as_str()` method returns the literal column-family name written to RocksDB (`"transparent_address_tx_index"`). Renaming this string later is a migration; pick carefully.
+The enum's `as_str()` method returns the literal column-family name written to RocksDB (`"address_output_index"`). Renaming this string later is a migration; pick carefully.
 
 3. A schema fingerprint is added. The `SchemaFingerprint` table in `crates/zinder-store/src/storage_control.rs` gains a new entry:
 
 ```rust
 SchemaFingerprintEntry {
-    artifact_family: ArtifactFamily::TransparentAddressTxIndex,
+    artifact_family: ArtifactFamily::AddressOutputIndex,
     schema_version: 1,
     payload_format: PayloadFormat::Protobuf,
-    description: "Transparent address tx history index",
+    description: "Transparent address output index",
 }
 ```
 
@@ -146,11 +146,11 @@ There are two reorg-handling patterns. The right one is determined by the family
 
 1. **Per-block families** (compact blocks, transactions, tree states, subtree roots): use **eager-delete**. The key contains a single `BlockHeight` (no per-address dimension), so a reorged height has exactly one row to revert. The `ReorgWindow` table tracks the family's entries within the non-finalized window. Reorg deletes must include the new family's keys for the reverted range. Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch for the new family wherever one appears.
 
-2. **Address-keyed families** (transparent address UTXOs, transparent address tx history, future address-shaped artifacts): use **dynamic-filter visibility**. The key fans out across many addresses per height, which makes per-height eager-delete an O(addresses-touched-by-block) write amplification on every reorg. Instead, rows are written and never physically deleted. `build_reorg_window_deletes` returns empty for the family. The key carries a trailing `chain_epoch_id` (8 BE bytes) recording the source epoch. Read paths enforce visibility at scan time:
+2. **Address-keyed canonical families** (transparent address outputs and future address-shaped canonical artifacts): use **dynamic-filter visibility**. The key fans out across many addresses per height, which makes per-height eager-delete an O(addresses-touched-by-block) write amplification on every reorg. Instead, rows are written and never physically deleted. `build_reorg_window_deletes` returns empty for the family. The key carries a trailing `chain_epoch_id` (8 BE bytes) recording the source epoch. Read paths enforce visibility at scan time:
    - Reject rows whose `source_epoch > chain_epoch.id` (visibility filter).
-   - Call `block_is_visible(height, expected_hash)`, which reads the `BlockArtifact` at the row's height and rejects rows whose stored `block_hash` does not match the visible chain at that height.
+   - Call `block_is_visible(height, expected_hash)`, which reads the `BlockHeaderArtifact` at the row's height and rejects rows whose stored `block_hash` does not match the visible chain at that height.
 
-   Reorg-revert is logical, not physical; reorged-out rows are silently skipped on every read. The canonical example is `crates/zinder-store/src/transparent_utxo.rs::read_transparent_address_utxos` together with the `kind=6/7` key layouts in `format/store_key.rs`.
+   Reorg-revert is logical, not physical; reorged-out rows are silently skipped on every read. The canonical example is `crates/zinder-store/src/address_output_index.rs::read_address_output_index_rows_paged` together with the key layouts in `format/store_key.rs`.
 
 Mixing the patterns within one family is a design error. Pick eager-delete for `(network, height, ...)` families and dynamic-filter for `(network, address_script_hash, ...)` families. The trailing `chain_epoch_id` byte and the `block_is_visible` check are non-optional for dynamic-filter families.
 
@@ -224,8 +224,8 @@ Add the request and response messages. The request mirrors the typed signature: 
 
 Naming check:
 
-- RPC name uses PascalCase: `TransparentAddressTxIndexByAddress`.
-- Request and response messages use the RPC name as a prefix: `TransparentAddressTxIndexByAddressRequest`, `TransparentAddressTxIndexByAddressResponse`.
+- RPC name uses PascalCase: `AddressOutputIndexByAddress`.
+- Request and response messages use the RPC name as a prefix: `AddressOutputIndexByAddressRequest`, `AddressOutputIndexByAddressResponse`.
 - Field names use snake_case in proto, matching the typed Rust signature. The lookup key field is named after the key noun: `address`, `transaction_id`, `subtree_root_index`.
 - Optional epoch pin: `optional ChainEpoch at_epoch = N;` (proto field name `at_epoch`, not `at`, because `at` is reserved-looking in some languages; the typed Rust API converts).
 
@@ -241,7 +241,7 @@ message AddressLookup {
   }
 }
 
-message TransparentAddressTxIndexByAddressRequest {
+message AddressOutputIndexByAddressRequest {
   AddressLookup address = 1;
   // ... other fields
 }
@@ -263,12 +263,12 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
 
 The CI `capability-coverage` job will reject the proto change if the capability constant is not updated.
 
-For the lightwalletd compatibility slice, the transparent UTXO family uses the
-reserved `wallet.address.transparent_utxos_v1` capability for the native proto
+For the lightwalletd compatibility slice, the transparent output family uses the
+reserved `wallet.address.output_index_v1` capability for the native proto
 surface. The lightwalletd `GetAddressUtxos[Stream]` adapter already reads from
-stored transparent UTXO artifacts and can therefore set
+stored transparent output artifacts and can therefore set
 `GetLightdInfo.taddrSupport=true`. Do not advertise
-`wallet.address.transparent_utxos_v1` until the native `WalletQuery` proto and
+`wallet.address.output_index_v1` until the native `WalletQuery` proto and
 `zinder-client::ChainIndex` expose the same artifact-backed method.
 
 ### Step 6 — Adapter wiring
@@ -304,24 +304,24 @@ If the artifact requires a new source capability (e.g. nullifier-to-spending-tx 
 
 If the artifact changes the on-disk shape of an existing artifact, [ADR-0002](../adrs/0002-boundary-specific-serialization.md) and [Storage backend](storage-backend.md) §Schema Versioning are amended.
 
-## A worked example: transparent address tx index
+## A worked example: transparent address transaction history
 
-To make the cookbook concrete, here is the path for `TransparentAddressTxIndex`, the artifact family that backs paginated `GetTaddressTxids`.
+To make the cookbook concrete, here is the path for transparent-address transaction history, the derive-owned projection that backs paginated `GetTaddressTxids`.
 
-The transparent UTXO artifact follows the same seven-step path,
+The transparent output artifact follows the same seven-step path,
 but its priority and capability are different: it is release-gated by
-`wallet.address.transparent_utxos_v1`, while this transaction-history example
+`wallet.address.output_index_v1`, while this transaction-history example
 uses `wallet.address.transparent_history_v1`.
 
 1. **Domain type**: `crates/zinder-core/src/transparent_address_tx_index.rs` exporting `TransparentAddressTxIndexArtifact { address_script_hash, block_height, tx_index_in_block, transaction_id, block_hash }`. One row per `(address, transaction)` pair, regardless of how many transparent inputs or outputs the transaction has for that address.
 
-2. **Storage**: a new column family `transparent_address_tx_index` whose key is `(network_id, address_script_hash, block_height_be, tx_index_be)` plus the trailing `chain_epoch_id` (8 BE bytes), totaling 41 bytes plus the trailing 8. The payload is `(transaction_id, block_hash)` encoded with `prost::Message` per [ADR-0002](../adrs/0002-boundary-specific-serialization.md). Schema fingerprint version 1, `PayloadFormat::ZinderTransparentAddressTxIndexArtifactV1`.
+2. **Storage**: derive consumer column families `transparent_address_transaction_history`, `transparent_address_transaction_history_descending`, and `transparent_address_transaction_history_index`. Primary keys are `(address_script_hash, block_height_be, tx_index_be)` in ascending or descending height order. The value is the transaction id and block hash. The per-height index stores both primary keys so reorg rollback deletes exact rows.
 
-   Per-row keying lets pagination cursors point at exact `(height, tx_index)` boundaries without re-decoding a vec payload to skip already-returned txids; this is the canonical shape for tx-history-keyed families. Reorg semantics follow the address-keyed dynamic-filter pattern from Step 2: `build_reorg_window_deletes` returns empty, and read paths enforce visibility through the `source_epoch <= chain_epoch.id` filter and a `block_is_visible` check.
+   Per-row keying lets pagination cursors point at exact `(height, tx_index)` boundaries without re-decoding a vec payload to skip already-returned txids; this is the canonical shape for tx-history-keyed projections.
 
-3. **Ingest**: `IngestArtifactBuilder::build_transparent_address_tx_index_artifacts(&self, block: &SourceBlock)` walks each transaction's transparent inputs and outputs, deduplicates by `(address_script_hash, tx_index_in_block)`, and emits one artifact per matching pair. Invoked from `build_block_artifacts`.
+3. **Derive**: `TransparentAddressTransactionHistoryConsumer` walks canonical transaction facts, transparent outputs, and hydrated transparent spends, deduplicates by `(address_script_hash, tx_index_in_block)`, and emits one row per matching pair. Canonical ingest does not write this projection.
 
-4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(request: TransparentAddressTxIdsInRangeRequest) -> impl Stream<Item = Result<TransparentAddressTxIdsChunk, QueryError>>`, plus the `_at_epoch` companion. The request carries the typed `address_script_hash: TransparentAddressScriptHash`, an inclusive height range, `max_entries` bounded by `WalletQueryOptions::max_transparent_history_entries`, an opaque `from_cursor` for resume, and a `descending: bool` flag for newest-first iteration.
+4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(request: TransparentAddressTxIdsInRangeRequest) -> impl Stream<Item = Result<TransparentAddressTxIdsChunk, QueryError>>`. The request carries the typed `address_script_hash: TransparentAddressScriptHash`, an inclusive height range, `max_entries` bounded by `WalletQueryOptions::max_transparent_history_entries`, an opaque `from_cursor` for resume, and a `descending: bool` flag for newest-first iteration. The derive projection is current-only; each response chunk carries the `chain_epoch` used to answer the read instead of accepting an `at_epoch` pin.
 
 5. **Wire**:
 
@@ -335,8 +335,7 @@ uses `wallet.address.transparent_history_v1`.
      uint32 end_height = 3;
      uint32 max_entries = 4;
      bytes from_cursor = 5;
-     optional ChainEpoch at_epoch = 6;
-     bool descending = 7;
+     bool descending = 6;
    }
 
    message TransparentAddressTxIdsChunk {

@@ -15,7 +15,6 @@ use zinder_ingest::backfill;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     assert_lightwalletd_send_transaction_classifies_invalid, assert_native_wallet_read_responses,
@@ -38,6 +37,7 @@ async fn backfills_initial_range() -> Result<()> {
         Network::ZcashTestnet | Network::ZcashMainnet => BlockHeight::new(2),
         other => return Err(eyre!("unsupported network for backfill test: {other:?}")),
     };
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let backfill_config = live_backfill_config(
         &env,
         &storage_path,
@@ -45,6 +45,7 @@ async fn backfills_initial_range() -> Result<()> {
         to_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let commit_outcome = backfill(&backfill_config, &source)
@@ -58,20 +59,19 @@ async fn backfills_initial_range() -> Result<()> {
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     let reader = store.current_chain_epoch_reader()?;
     let block = reader
-        .block_at(to_height)?
+        .block_header_at(to_height)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip block artifact"))?;
     let compact_block = reader
         .compact_block_at(to_height)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip compact block artifact"))?;
     let tree_state = reader
-        .tree_state_at(to_height)?
+        .tree_state_checkpoint_at_or_before(to_height)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip tree-state artifact"))?;
 
     assert_eq!(block.height, to_height);
     assert_eq!(compact_block.height, to_height);
     assert_eq!(tree_state.height, to_height);
     assert!(!tree_state.payload_bytes.is_empty());
-    let activations = fetch_live_network_upgrade_activations(&env).await?;
     assert_native_wallet_read_responses(
         &store,
         env.network(),
@@ -110,6 +110,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let mut backfill_config = live_backfill_config(
         &env,
         &storage_path,
@@ -117,6 +118,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
         tip_height,
         NonZeroU32::new(25).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
@@ -138,7 +140,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
     // reads at and below the checkpoint surface ArtifactMissing instead of
     // succeeding with stale data or returning Ok(None).
     assert!(matches!(
-        reader.block_at(checkpoint_height),
+        reader.block_header_at(checkpoint_height),
         Err(StoreError::ArtifactMissing { .. })
     ));
     assert!(matches!(
@@ -147,16 +149,16 @@ async fn backfills_from_checkpoint() -> Result<()> {
     ));
     let below_checkpoint = BlockHeight::new(checkpoint_height.value() - 1);
     assert!(matches!(
-        reader.block_at(below_checkpoint),
+        reader.block_header_at(below_checkpoint),
         Err(StoreError::ArtifactMissing { .. })
     ));
 
     let first_filled = reader
-        .block_at(from_height)?
+        .block_header_at(from_height)?
         .ok_or_else(|| eyre!("missing first backfilled block at {}", from_height.value()))?;
     assert_eq!(first_filled.height, from_height);
     let tip_block = reader
-        .block_at(tip_height)?
+        .block_header_at(tip_height)?
         .ok_or_else(|| eyre!("missing tip block at {}", tip_height.value()))?;
     assert_eq!(tip_block.height, tip_height);
 
@@ -165,7 +167,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
         env.network(),
         from_height.value(),
         tip_height.value(),
-        Arc::new(sample_regtest_upgrade_activations()),
+        Arc::clone(&activations),
     )
     .await?;
     Ok(())
@@ -197,6 +199,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let mut backfill_config = live_backfill_config(
         &env,
         &storage_path,
@@ -204,6 +207,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
         tip_height,
         NonZeroU32::new(100).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
@@ -225,12 +229,12 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     {
         let reader = store.current_chain_epoch_reader()?;
         assert!(matches!(
-            reader.block_at(checkpoint_height),
+            reader.block_header_at(checkpoint_height),
             Err(StoreError::ArtifactMissing { .. })
         ));
     }
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
     let _latest = wallet_query.latest_block(None).await?;
@@ -277,8 +281,10 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     assert_eq!(full_blocks.compact_blocks.len(), 1000);
 
     let measurement_start = std::time::Instant::now();
-    let _tree_state = wallet_query.tree_state_at(tip_height, None).await?;
-    let tree_state_at_micros = measurement_start.elapsed().as_micros();
+    let _tree_state = wallet_query
+        .tree_state_checkpoint_at_or_before(tip_height, None)
+        .await?;
+    let tree_state_checkpoint_at_or_before_micros = measurement_start.elapsed().as_micros();
 
     // A checkpoint-bootstrapped store only carries subtree roots completed
     // after the checkpoint. Wallets bootstrapping against the same checkpoint
@@ -305,7 +311,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
              backfill_seconds={} latest_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_1={}us \
              compact_block_range_10={}us compact_block_range_50={}us \
-             compact_block_range_1000={}us tree_state_at={}us subtree_roots_8={}us",
+             compact_block_range_1000={}us tree_state_checkpoint_at_or_before={}us subtree_roots_8={}us",
             tip_height.value(),
             checkpoint_height.value(),
             checkpoint_sapling_size,
@@ -318,7 +324,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
             compact_block_range_10_micros,
             compact_block_range_50_micros,
             compact_block_range_1000_micros,
-            tree_state_at_micros,
+            tree_state_checkpoint_at_or_before_micros,
             subtree_roots_micros,
         );
     }

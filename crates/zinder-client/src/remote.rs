@@ -12,15 +12,14 @@ use zinder_core::wire::{
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector,
-    ChainEpoch, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
-    MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
-    TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentPrevoutsResponse, TreeStateArtifact,
-    TxStatus, UnixTimestampMillis,
+    AddressOutputIndexArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange,
+    BlockSelector, ChainEpoch, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
+    ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentOutputsByOutpointResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
@@ -33,13 +32,13 @@ use zinder_store::{
 };
 
 use crate::{
-    BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
-    ChainEventStream, ChainIndex, ChainRangeReverted, IndexStream, IndexerError, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
-    TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
-    TransparentHistoryCursor, TransparentUtxoCursor,
+    AddressOutputCursor, AddressOutputIndexQuery, AddressOutputIndexStream,
+    AddressOutputIndexStreamItem, AddressOutputIndexView, BlockId, ChainEpochCommitted, ChainEvent,
+    ChainEventCursor, ChainEventEnvelope, ChainEventStream, ChainIndex, ChainRangeReverted,
+    IndexStream, IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope,
+    MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    TransparentHistoryCursor,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -233,27 +232,6 @@ impl ChainIndex for RemoteChainIndex {
         )
     }
 
-    async fn full_block_at(
-        &self,
-        height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<BlockArtifact, IndexerError> {
-        let response = self
-            .client()
-            .full_block(Request::new(wallet::FullBlockRequest {
-                block_height: height.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
-            }))
-            .await
-            .map_err(IndexerError::from_status)?
-            .into_inner();
-        full_block_from_message(
-            response
-                .block
-                .ok_or_else(|| IndexerError::malformed("full_block", "field is missing"))?,
-        )
-    }
-
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -280,15 +258,15 @@ impl ChainIndex for RemoteChainIndex {
         Ok(Box::pin(stream))
     }
 
-    async fn tree_state_at(
+    async fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
             .client()
-            .tree_state(Request::new(wallet::TreeStateRequest {
-                height: height.value(),
+            .tree_state_checkpoint(Request::new(wallet::TreeStateCheckpointRequest {
+                max_height: height.value(),
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
@@ -297,13 +275,13 @@ impl ChainIndex for RemoteChainIndex {
         tree_state_from_response(response)
     }
 
-    async fn latest_tree_state(
+    async fn latest_tree_state_checkpoint(
         &self,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
             .client()
-            .latest_tree_state(Request::new(wallet::LatestTreeStateRequest {
+            .latest_tree_state_checkpoint(Request::new(wallet::LatestTreeStateCheckpointRequest {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
@@ -468,15 +446,15 @@ impl ChainIndex for RemoteChainIndex {
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
 
-    async fn transparent_address_utxos(
+    async fn address_output_index(
         &self,
-        query: TransparentAddressUtxosQuery,
+        query: AddressOutputIndexQuery,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
-        let request = transparent_address_utxos_request_message(&query, at_epoch);
+    ) -> Result<AddressOutputIndexView, IndexerError> {
+        let request = address_output_index_request_message(&query, at_epoch);
         let response = self
             .client()
-            .transparent_address_utxos(Request::new(request))
+            .address_output_index(Request::new(request))
             .await
             .map_err(IndexerError::from_status)?
             .into_inner();
@@ -486,19 +464,19 @@ impl ChainIndex for RemoteChainIndex {
                 .chain_epoch
                 .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
         )?;
-        let utxos = response
-            .utxos
+        let outputs = response
+            .outputs
             .into_iter()
-            .map(transparent_address_utxo_from_message)
+            .map(address_output_index_from_message)
             .collect::<Result<Vec<_>, IndexerError>>()?;
         let next_cursor = if response.next_cursor.is_empty() {
             None
         } else {
-            Some(TransparentUtxoCursor::from_bytes(response.next_cursor))
+            Some(AddressOutputCursor::from_bytes(response.next_cursor))
         };
-        Ok(TransparentAddressUtxosView {
+        Ok(AddressOutputIndexView {
             chain_epoch,
-            utxos,
+            outputs,
             next_cursor,
         })
     }
@@ -506,7 +484,6 @@ impl ChainIndex for RemoteChainIndex {
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
-        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
         let address_script_hash = query.address_script_hash;
         let request = wallet::TransparentAddressTxIdsInRangeRequest {
@@ -523,7 +500,6 @@ impl ChainIndex for RemoteChainIndex {
                 .as_ref()
                 .map(|cursor| cursor.as_bytes().to_vec())
                 .unwrap_or_default(),
-            at_epoch: at_epoch.map(chain_epoch_to_message),
             descending: query.descending,
         };
         let response = self
@@ -543,21 +519,21 @@ impl ChainIndex for RemoteChainIndex {
         Ok(Box::pin(stream))
     }
 
-    async fn transparent_address_utxos_stream(
+    async fn address_output_index_stream(
         &self,
-        query: TransparentAddressUtxosQuery,
+        query: AddressOutputIndexQuery,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxoStream, IndexerError> {
-        let request = transparent_address_utxos_request_message(&query, at_epoch);
+    ) -> Result<AddressOutputIndexStream, IndexerError> {
+        let request = address_output_index_request_message(&query, at_epoch);
         let response = self
             .client()
-            .transparent_address_utxos_stream(Request::new(request))
+            .address_output_index_stream(Request::new(request))
             .await
             .map_err(IndexerError::from_status)?;
         let expected_network = self.network;
         let stream = response.into_inner().map(move |chunk_result| {
             let chunk = chunk_result.map_err(IndexerError::from_status)?;
-            transparent_address_utxos_stream_item_from_message(expected_network, chunk)
+            address_output_index_stream_item_from_message(expected_network, chunk)
         });
         Ok(Box::pin(stream))
     }
@@ -632,47 +608,47 @@ impl ChainIndex for RemoteChainIndex {
         transparent_address_balance_from_message(self.network, response)
     }
 
-    async fn transparent_prevouts(
+    async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentPrevoutsResponse, IndexerError> {
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
         let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentPrevoutsRequest {
+        let request = wallet::TransparentOutputsByOutpointRequest {
             outpoints: wire_outpoints,
             at_epoch: at_epoch.map(chain_epoch_to_message),
         };
         let response = self
             .client()
-            .transparent_prevouts(Request::new(request))
+            .transparent_outputs_by_outpoint(Request::new(request))
             .await
             .map_err(IndexerError::from_status)?
             .into_inner();
-        transparent_prevouts_response_from_message(self.network, response)
+        transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
 
-    async fn transparent_mempool_prevouts(
+    async fn transparent_mempool_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentPrevoutsResponse, IndexerError> {
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
         let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentMempoolPrevoutsRequest {
+        let request = wallet::TransparentMempoolOutputsByOutpointRequest {
             outpoints: wire_outpoints,
         };
         let response = self
             .client()
-            .transparent_mempool_prevouts(Request::new(request))
+            .transparent_mempool_outputs_by_outpoint(Request::new(request))
             .await
             .map_err(IndexerError::from_status)?
             .into_inner();
-        transparent_prevouts_response_from_message(self.network, response)
+        transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
 }
 
-fn transparent_prevouts_response_from_message(
+fn transparent_outputs_by_outpoint_response_from_message(
     expected_network: Network,
-    message: wallet::TransparentPrevoutsResponse,
-) -> Result<TransparentPrevoutsResponse, IndexerError> {
+    message: wallet::TransparentOutputsByOutpointResponse,
+) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
     let chain_epoch = chain_epoch_from_message_with_network(
         expected_network,
         message
@@ -682,9 +658,9 @@ fn transparent_prevouts_response_from_message(
     let entries = message
         .entries
         .into_iter()
-        .map(transparent_prevout_entry_from_message)
+        .map(transparent_output_entry_from_message)
         .collect::<Result<Vec<_>, IndexerError>>()?;
-    Ok(TransparentPrevoutsResponse {
+    Ok(TransparentOutputsByOutpointResponse {
         chain_epoch,
         entries,
     })
@@ -712,24 +688,27 @@ fn chain_value_pools_at_tip_from_message(
     })
 }
 
-fn transparent_prevout_entry_from_message(
-    message: wallet::TransparentPrevoutEntry,
-) -> Result<zinder_core::TransparentPrevoutEntry, IndexerError> {
+fn transparent_output_entry_from_message(
+    message: wallet::TransparentOutputEntry,
+) -> Result<zinder_core::TransparentOutputEntry, IndexerError> {
     let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed("transparent_prevout_entry.outpoint", "field is missing")
+        IndexerError::malformed("transparent_output_entry.outpoint", "field is missing")
     })?;
     let transaction_id = TransactionId::from_bytes(fixed_32_bytes(
-        "transparent_prevout_entry.outpoint.transaction_id",
+        "transparent_output_entry.outpoint.transaction_id",
         outpoint_message.transaction_id,
     )?);
     let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
     let prevout = message
-        .prevout
-        .map(|prevout_message| zinder_core::TransparentPrevout {
+        .output
+        .map(|prevout_message| zinder_core::TransparentOutput {
             value_zat: prevout_message.value_zat,
             script_pub_key: prevout_message.script_pub_key,
         });
-    Ok(zinder_core::TransparentPrevoutEntry { outpoint, prevout })
+    Ok(zinder_core::TransparentOutputEntry {
+        outpoint,
+        output: prevout,
+    })
 }
 
 fn transparent_address_balance_from_message(
@@ -877,15 +856,6 @@ fn compact_block_from_message(
     ))
 }
 
-fn full_block_from_message(message: wallet::FullBlock) -> Result<BlockArtifact, IndexerError> {
-    Ok(BlockArtifact::new(
-        BlockHeight::new(message.block_height),
-        block_hash_from_bytes("full_block.block_hash", message.block_hash)?,
-        block_hash_from_bytes("full_block.parent_block_hash", message.parent_block_hash)?,
-        message.raw_block_bytes,
-    ))
-}
-
 fn tree_state_from_response(
     response: wallet::TreeStateResponse,
 ) -> Result<TreeStateArtifact, IndexerError> {
@@ -912,11 +882,11 @@ fn subtree_root_from_message(
     ))
 }
 
-fn transparent_address_utxos_request_message(
-    query: &TransparentAddressUtxosQuery,
+fn address_output_index_request_message(
+    query: &AddressOutputIndexQuery,
     at_epoch: Option<ChainEpoch>,
-) -> wallet::TransparentAddressUtxosRequest {
-    wallet::TransparentAddressUtxosRequest {
+) -> wallet::AddressOutputIndexRequest {
+    wallet::AddressOutputIndexRequest {
         address: Some(wallet::AddressLookup {
             selector: Some(wallet::address_lookup::Selector::ScriptHash(
                 query.address_script_hash.as_bytes().to_vec(),
@@ -965,23 +935,22 @@ fn transparent_address_tx_ids_chunk_from_message(
     })
 }
 
-fn transparent_address_utxo_from_message(
-    message: wallet::TransparentAddressUtxo,
-) -> Result<TransparentAddressUtxoArtifact, IndexerError> {
+fn address_output_index_from_message(
+    message: wallet::AddressOutputIndex,
+) -> Result<AddressOutputIndexArtifact, IndexerError> {
     let address_script_hash_bytes = fixed_32_bytes(
-        "transparent_address_utxo.address_script_hash",
+        "address_output_index.address_script_hash",
         message.address_script_hash,
     )?;
     let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed("transparent_address_utxo.outpoint", "field is missing")
+        IndexerError::malformed("address_output_index.outpoint", "field is missing")
     })?;
     let transaction_id_bytes = fixed_32_bytes(
-        "transparent_address_utxo.outpoint.transaction_id",
+        "address_output_index.outpoint.transaction_id",
         outpoint_message.transaction_id,
     )?;
-    let block_hash =
-        block_hash_from_bytes("transparent_address_utxo.block_hash", message.block_hash)?;
-    Ok(TransparentAddressUtxoArtifact::new(
+    let block_hash = block_hash_from_bytes("address_output_index.block_hash", message.block_hash)?;
+    Ok(AddressOutputIndexArtifact::new(
         TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
         message.script_pub_key,
         TransparentOutPoint::new(
@@ -994,41 +963,44 @@ fn transparent_address_utxo_from_message(
     ))
 }
 
-fn transparent_address_utxos_stream_item_from_message(
+fn address_output_index_stream_item_from_message(
     expected_network: Network,
-    message: wallet::TransparentAddressUtxosStreamChunk,
-) -> Result<TransparentAddressUtxoStreamItem, IndexerError> {
+    message: wallet::AddressOutputIndexStreamChunk,
+) -> Result<AddressOutputIndexStreamItem, IndexerError> {
     let chain_epoch = chain_epoch_from_message_with_network(
         expected_network,
         message
             .chain_epoch
             .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
     )?;
-    let utxo = transparent_address_utxo_from_message(
+    let output = address_output_index_from_message(
         message
-            .utxo
-            .ok_or_else(|| IndexerError::malformed("utxo", "field is missing"))?,
+            .output
+            .ok_or_else(|| IndexerError::malformed("output", "field is missing"))?,
     )?;
     let cursor = if message.cursor.is_empty() {
         None
     } else {
-        Some(TransparentUtxoCursor::from_bytes(message.cursor))
+        Some(AddressOutputCursor::from_bytes(message.cursor))
     };
-    Ok(TransparentAddressUtxoStreamItem {
+    Ok(AddressOutputIndexStreamItem {
         chain_epoch,
-        utxo,
+        output,
         cursor,
     })
 }
 
-fn transaction_from_message(
-    message: wallet::Transaction,
-) -> Result<TransactionArtifact, IndexerError> {
-    Ok(TransactionArtifact::new(
-        transaction_id_from_bytes("transaction.transaction_id", message.transaction_id)?,
+fn transaction_location_from_message(
+    message: wallet::TransactionLocation,
+) -> Result<TransactionLocation, IndexerError> {
+    Ok(TransactionLocation::new(
+        transaction_id_from_bytes(
+            "transaction_location.transaction_id",
+            message.transaction_id,
+        )?,
         BlockHeight::new(message.block_height),
-        block_hash_from_bytes("transaction.block_hash", message.block_hash)?,
-        message.payload_bytes,
+        block_hash_from_bytes("transaction_location.block_hash", message.block_hash)?,
+        message.tx_index_in_block,
     ))
 }
 
@@ -1245,9 +1217,10 @@ fn tx_status_from_message(
         .ok_or_else(|| IndexerError::malformed("status", "field is missing"))?;
     match status {
         wallet::transaction_status_response::Status::Mined(mined) => {
-            let artifact = transaction_from_message(mined.transaction.ok_or_else(|| {
-                IndexerError::malformed("mined.transaction", "field is missing")
-            })?)?;
+            let location =
+                transaction_location_from_message(mined.location.ok_or_else(|| {
+                    IndexerError::malformed("mined.location", "field is missing")
+                })?)?;
             let details_message = mined
                 .details
                 .ok_or_else(|| IndexerError::malformed("mined.details", "field is missing"))?;
@@ -1256,7 +1229,7 @@ fn tx_status_from_message(
                 block_time: details_message.block_time,
                 confirmations: details_message.confirmations,
             };
-            Ok(TxStatus::Mined(MinedTransaction::new(artifact, details)))
+            Ok(TxStatus::Mined(MinedTransaction::new(location, details)))
         }
         wallet::transaction_status_response::Status::InMempool(in_mempool) => {
             let chain_epoch = chain_epoch_from_message(chain_epoch_message.clone())

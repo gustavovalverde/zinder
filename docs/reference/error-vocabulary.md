@@ -45,7 +45,7 @@ The request shape failed validation. Retry policy: **ClientError**. Carries `Bad
 | `INVALID_BLOCK_RANGE` | `start_height` exceeds `end_height` | `field_violations[start_height, end_height]` |
 | `COMPACT_BLOCK_RANGE_TOO_LARGE` | Requested range exceeds the per-deployment cap | `field_violations[end_height]` |
 | `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, or are for a different network / store / stream family | `field_violations[from_cursor]` |
-| `TRANSPARENT_UTXO_CURSOR_INVALID` | Same as above for transparent-UTXO streams | `field_violations[from_cursor]` |
+| `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
 | `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |
 | `INVALID_ADDRESS` | Address selector is empty, malformed, or targets a different network | `field_violations[address]` |
 | `UNSUPPORTED_SHIELDED_PROTOCOL` | Shielded protocol value is not supported by the wallet protocol | `field_violations[shielded_protocol]` |

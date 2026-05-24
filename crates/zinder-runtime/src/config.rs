@@ -589,11 +589,11 @@ mod tests {
 
     #[test]
     fn require_field_returns_missing_field_for_none() {
-        let outcome: Result<u32, _> = require_field(None, "ingest.commit_batch_blocks");
+        let outcome: Result<u32, _> = require_field(None, "ingest.canonical_batch_max_blocks");
         assert!(matches!(
             outcome,
             Err(ConfigError::MissingField {
-                field: "ingest.commit_batch_blocks"
+                field: "ingest.canonical_batch_max_blocks"
             })
         ));
     }

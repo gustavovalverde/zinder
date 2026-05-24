@@ -6,14 +6,14 @@
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
-    TransactionId, TreeStateArtifact, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
-    ArtifactFamily, ChainEpochArtifacts, ChainEvent, ChainStoreOptions, PrimaryChainStore,
-    ReorgWindowChange, StoreError,
+    ChainEpochArtifacts, ChainEvent, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    StoreError,
 };
 
 #[test]
@@ -55,7 +55,7 @@ fn replacing_non_finalized_state_emits_chain_reorged() -> eyre::Result<()> {
 
     let reader = store.current_chain_epoch_reader()?;
     assert_eq!(
-        reader.block_at(BlockHeight::new(2))?,
+        reader.block_header_at(BlockHeight::new(2))?,
         Some(replacement_block)
     );
 
@@ -170,7 +170,7 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
     store.commit_chain_epoch(artifacts_from_height_one_to_tip(initial_epoch))?;
     let initial_reader = store.current_chain_epoch_reader()?;
     let visible_tip_block = initial_reader
-        .block_at(BlockHeight::new(2))?
+        .block_header_at(BlockHeight::new(2))?
         .ok_or_else(|| eyre!("expected visible tip block"))?;
 
     let finalized_epoch = ChainEpoch {
@@ -181,11 +181,14 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(finalized_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
-            ReorgWindowChange::FinalizeThrough {
-                height: BlockHeight::new(2),
-            },
-        ),
+        ChainEpochArtifacts::new(
+            finalized_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+            height: BlockHeight::new(2),
+        }),
     )?;
 
     assert_eq!(committed.chain_epoch, finalized_epoch);
@@ -202,7 +205,7 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
     assert_eq!(store.current_chain_epoch()?, Some(finalized_epoch));
     let finalized_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
-        finalized_reader.block_at(BlockHeight::new(2))?,
+        finalized_reader.block_header_at(BlockHeight::new(2))?,
         Some(visible_tip_block)
     );
 
@@ -224,8 +227,12 @@ fn unchanged_commit_without_visible_transition_is_rejected() -> eyre::Result<()>
         ..initial_epoch
     };
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(attempted_epoch, Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::Unchanged),
+        ChainEpochArtifacts::new(
+            attempted_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::Unchanged),
     ) {
         Ok(event) => return Err(eyre!("expected no-op commit error, got {event:?}")),
         Err(error) => error,
@@ -295,11 +302,14 @@ fn finalize_through_height_can_be_below_epoch_finalized_height() -> eyre::Result
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(finalized_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
-            ReorgWindowChange::FinalizeThrough {
-                height: BlockHeight::new(2),
-            },
-        ),
+        ChainEpochArtifacts::new(
+            finalized_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+            height: BlockHeight::new(2),
+        }),
     )?;
 
     assert_eq!(committed.chain_epoch, finalized_epoch);
@@ -514,11 +524,11 @@ fn append_commit_cannot_publish_block_for_existing_visible_height() -> eyre::Res
 
     let (attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(2));
-    let rewritten_block = BlockArtifact::new(
+    let rewritten_block = super::synthetic_block_header(
         BlockHeight::new(2),
         block_hash(20),
         block_hash(1),
-        b"rewritten-block-2".to_vec(),
+        b"rewritten-block-2",
     );
     let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
         attempted_epoch,
@@ -604,23 +614,28 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
 
     let transaction_id = TransactionId::from_bytes([9; 32]);
     let old_hash = block_hash(2);
-    let old_transaction = TransactionArtifact::new(
-        transaction_id,
-        BlockHeight::new(2),
-        old_hash,
-        b"old-transaction".to_vec(),
-    );
+    let (transaction_index, transaction_location, old_transaction_facts, transaction_blob) =
+        super::synthetic_transaction_rows(
+            transaction_id,
+            BlockHeight::new(2),
+            old_hash,
+            0,
+            b"old-transaction",
+        );
     let (initial_epoch, _initial_block, _initial_compact_block) =
         synthetic_epoch(1, 2, 1, old_hash, block_hash(1));
     store.commit_chain_epoch(
         artifacts_from_height_one_to_tip(initial_epoch)
-            .with_transactions(vec![old_transaction.clone()]),
+            .with_block_transaction_index(vec![transaction_index])
+            .with_transaction_locations(vec![transaction_location])
+            .with_transaction_facts(vec![old_transaction_facts.clone()])
+            .with_transaction_blobs(vec![transaction_blob]),
     )?;
 
     let initial_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
-        initial_reader.transaction_by_id(transaction_id)?,
-        Some(old_transaction.clone())
+        initial_reader.transaction_facts_by_id(transaction_id)?,
+        Some(old_transaction_facts.clone())
     );
 
     let replacement_hash = block_hash(20);
@@ -638,12 +653,15 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
     )?;
 
     assert_eq!(
-        initial_reader.transaction_by_id(transaction_id)?,
-        Some(old_transaction)
+        initial_reader.transaction_facts_by_id(transaction_id)?,
+        Some(old_transaction_facts)
     );
 
     let replacement_reader = store.current_chain_epoch_reader()?;
-    assert_eq!(replacement_reader.transaction_by_id(transaction_id)?, None);
+    assert_eq!(
+        replacement_reader.transaction_facts_by_id(transaction_id)?,
+        None
+    );
 
     Ok(())
 }
@@ -721,7 +739,7 @@ fn tree_state_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
 
     let initial_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
-        initial_reader.tree_state_at(BlockHeight::new(2))?,
+        initial_reader.tree_state_checkpoint_at_or_before(BlockHeight::new(2))?,
         Some(old_tree_state.clone())
     );
 
@@ -740,27 +758,15 @@ fn tree_state_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
     )?;
 
     assert_eq!(
-        initial_reader.tree_state_at(BlockHeight::new(2))?,
+        initial_reader.tree_state_checkpoint_at_or_before(BlockHeight::new(2))?,
         Some(old_tree_state)
     );
 
     let replacement_reader = store.current_chain_epoch_reader()?;
-    let error = match replacement_reader.tree_state_at(BlockHeight::new(2)) {
-        Ok(tree_state) => {
-            return Err(eyre!(
-                "expected missing tree-state error, got {tree_state:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        StoreError::ArtifactMissing {
-            family: ArtifactFamily::TreeState,
-            ..
-        }
-    ));
+    assert_eq!(
+        replacement_reader.tree_state_checkpoint_at_or_before(BlockHeight::new(2))?,
+        None
+    );
 
     Ok(())
 }
@@ -771,7 +777,7 @@ fn synthetic_epoch(
     finalized_height: u32,
     hash: BlockHash,
     parent_hash: BlockHash,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let block_height = BlockHeight::new(height);
 
     (
@@ -782,15 +788,15 @@ fn synthetic_epoch(
             tip_hash: hash,
             finalized_height: BlockHeight::new(finalized_height),
             finalized_hash: block_hash(finalized_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             hash,
             parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").into_bytes(),
+            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,
@@ -813,11 +819,11 @@ fn artifacts_from_height_one_to_tip(chain_epoch: ChainEpoch) -> ChainEpochArtifa
         };
         let parent_hash = self::block_hash(height.saturating_sub(1));
 
-        blocks.push(BlockArtifact::new(
+        blocks.push(super::synthetic_block_header(
             block_height,
             block_hash,
             parent_hash,
-            format!("raw-block-{}-{height}", chain_epoch.id.value()).into_bytes(),
+            format!("raw-block-{}-{height}", chain_epoch.id.value()).as_bytes(),
         ));
         compact_blocks.push(CompactBlockArtifact::new(
             block_height,

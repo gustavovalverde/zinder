@@ -5,7 +5,7 @@
 //! keyed by the canonical transaction id. The handler-side
 //! `TransactionDetail` reads the record at request time to populate
 //! `paid_fee_zat`, `prevout_resolution_status`, and the per-input
-//! `value_zat` list when the wallet plane's transparent prevout
+//! `value_zat` list when the wallet plane's transparent-output
 //! resolution capability is online.
 //!
 //! When prevout resolution is offline the consumer still writes a row
@@ -28,10 +28,10 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
-use zebra_chain::transaction::Transaction as ZebraTransaction;
-use zebra_chain::transparent;
 use zinder_core::wire::{encode_height_key_ascending, encode_internal_transaction_id};
-use zinder_core::{BlockHeight, TransactionId, TransparentOutPoint, TransparentPrevout};
+use zinder_core::{
+    BlockHeight, TransactionFactsArtifact, TransactionId, TransparentOutPoint, TransparentSpendFact,
+};
 use zinder_proto::v1::explorer::{
     PrevoutResolutionStatus, TransactionFeesRecord, TransparentInputDetail,
 };
@@ -128,7 +128,7 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let prevouts = block.prevouts()?;
+        let transparent_spends = block.transparent_spends()?;
         let fees_cf = ctx
             .store
             .consumer_column_family(TRANSACTION_FEES_COLUMN_FAMILY)?;
@@ -136,13 +136,20 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
             .store
             .consumer_column_family(TRANSACTION_FEES_INDEX_COLUMN_FAMILY)?;
 
-        let non_coinbase = block.block.transactions.iter().skip(1);
-        let non_coinbase_count = block.block.transactions.len().saturating_sub(1);
+        let non_coinbase = block
+            .transactions
+            .iter()
+            .filter(|transaction| !transaction.public_facts.is_coinbase);
+        let non_coinbase_count = block
+            .transactions
+            .iter()
+            .filter(|transaction| !transaction.public_facts.is_coinbase)
+            .count();
         let mut index_payload: Vec<u8> = Vec::with_capacity(non_coinbase_count * TXID_LEN);
 
         for transaction in non_coinbase {
-            let transaction_id_bytes = transaction.hash().0;
-            let record = build_fee_record(transaction, prevouts.as_deref());
+            let transaction_id_bytes = transaction.location.transaction_id.as_bytes();
+            let record = build_fee_record(transaction, transparent_spends.as_deref());
             let mut payload = Vec::with_capacity(record.encoded_len());
             record
                 .encode(&mut payload)
@@ -194,13 +201,13 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
 }
 
 fn build_fee_record(
-    transaction: &ZebraTransaction,
-    prevouts: Option<&HashMap<TransparentOutPoint, TransparentPrevout>>,
+    transaction: &TransactionFactsArtifact,
+    transparent_spends: Option<&HashMap<TransparentOutPoint, TransparentSpendFact>>,
 ) -> TransactionFeesRecord {
-    let counts = zinder_source::transaction_component_counts(transaction);
+    let counts = transaction.public_facts.counts;
     let logical_actions = counts.logical_actions();
 
-    let Some(prevouts_map) = prevouts else {
+    let Some(spends_by_outpoint) = transparent_spends else {
         return TransactionFeesRecord {
             paid_fee_zat: None,
             prevout_resolution_status: PrevoutResolutionStatus::Unavailable as i32,
@@ -213,36 +220,26 @@ fn build_fee_record(
     let mut total_transparent_input_zat: i128 = 0;
     let mut total_transparent_output_zat: i128 = 0;
     let mut has_unresolved = false;
-    for (index, input) in transaction.inputs().iter().enumerate() {
-        let input_index = u32::try_from(index).unwrap_or(u32::MAX);
-        match input {
-            transparent::Input::PrevOut { outpoint, .. } => {
-                let outpoint = TransparentOutPoint::new(
-                    TransactionId::from_bytes(outpoint.hash.0),
-                    outpoint.index,
-                );
-                let value_zat = prevouts_map.get(&outpoint).map(|out| out.value_zat);
-                if let Some(zat) = value_zat {
-                    total_transparent_input_zat =
-                        total_transparent_input_zat.saturating_add(i128::from(zat));
-                } else {
-                    has_unresolved = true;
-                }
-                transparent_inputs.push(TransparentInputDetail {
-                    input_index,
-                    value_zat,
-                });
-            }
-            transparent::Input::Coinbase { .. } => {}
+    for input in &transaction.transparent_inputs {
+        let value_zat = spends_by_outpoint
+            .get(&input.spent_outpoint)
+            .map(|spend| spend.spent_value_zat);
+        if let Some(zat) = value_zat {
+            total_transparent_input_zat =
+                total_transparent_input_zat.saturating_add(i128::from(zat));
+        } else {
+            has_unresolved = true;
         }
+        transparent_inputs.push(TransparentInputDetail {
+            input_index: input.input_index,
+            value_zat,
+        });
     }
-    for output in transaction.outputs() {
+    for output in &transaction.transparent_outputs {
         total_transparent_output_zat =
-            total_transparent_output_zat.saturating_add(i128::from(i64::from(output.value)));
+            total_transparent_output_zat.saturating_add(i128::from(output.value_zat));
     }
-    let has_shielded_input = counts.sapling_spend_count > 0
-        || counts.orchard_action_count > 0
-        || counts.sprout_joinsplit_count > 0;
+    let has_shielded_input = counts.has_shielded_input();
     let status = if has_unresolved {
         PrevoutResolutionStatus::Partial
     } else {

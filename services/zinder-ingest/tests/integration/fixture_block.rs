@@ -13,11 +13,11 @@ use zebra_chain::{
 };
 use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    Network, UnixTimestampMillis,
+    Network, TransactionFactsArtifact, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    ArtifactDeriveError, BlockMismatchField, BuiltArtifacts, CommitmentTreeSizes, derive_block,
-    finalize_derived_block,
+    ArtifactDeriveError, BlockMismatchField, BuiltArtifacts, CommitmentTreeSizes, RawBlobPolicy,
+    derive_block_with_raw_blob_policy, finalize_derived_block,
 };
 
 /// Runs the production two-stage pipeline against an empty offset.
@@ -27,14 +27,16 @@ use zinder_ingest::{
 /// finalized `BuiltArtifacts`. Use this when a test wants the full
 /// artifact set from one fixture block.
 fn derive_for_test(source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError> {
-    let derived = derive_block(source_block)?;
+    let activations = sample_regtest_upgrade_activations();
+    let derived =
+        derive_block_with_raw_blob_policy(source_block, &activations, RawBlobPolicy::All)?;
     let mut counters = CommitmentTreeSizes::default();
     finalize_derived_block(derived, &mut counters)
 }
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{SourceBlock, decode_display_block_hash};
 use zinder_store::ChainEpochArtifacts;
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 #[test]
 #[allow(
@@ -44,13 +46,23 @@ use zinder_testkit::StoreFixture;
 fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
     let built = derive_for_test(&source_block)?;
-    let block_artifact = built.block;
+    let block_header_artifact = built.block_header;
+    let block_blob_artifact = built
+        .block_blob
+        .ok_or("fixture derivation must include a raw block blob")?;
     let compact_block_artifact = built.compact_block;
 
-    assert_eq!(block_artifact.height, BlockHeight::new(1));
-    assert_eq!(block_artifact.block_hash, source_block.hash);
-    assert_eq!(block_artifact.parent_hash, source_block.parent_hash);
-    assert_eq!(block_artifact.payload_bytes, source_block.raw_block_bytes);
+    assert_eq!(block_header_artifact.height, BlockHeight::new(1));
+    assert_eq!(block_header_artifact.block_hash, source_block.hash);
+    assert_eq!(block_header_artifact.parent_hash, source_block.parent_hash);
+    assert_eq!(block_header_artifact.block_time, 1_296_694_002);
+    assert_eq!(block_blob_artifact.height, BlockHeight::new(1));
+    assert_eq!(block_blob_artifact.block_hash, source_block.hash);
+    assert_eq!(block_blob_artifact.parent_hash, source_block.parent_hash);
+    assert_eq!(
+        block_blob_artifact.raw_block_bytes,
+        source_block.raw_block_bytes
+    );
 
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     assert_eq!(compact_block.proto_version, 1);
@@ -112,19 +124,29 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         tip_hash: source_block.hash,
         finalized_height: source_block.height,
         finalized_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block_artifact.clone()],
-        vec![compact_block_artifact.clone()],
-    ))?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block_header_artifact.clone()],
+            vec![compact_block_artifact.clone()],
+        )
+        .with_block_blobs(vec![block_blob_artifact.clone()]),
+    )?;
 
     let reader = store.current_chain_epoch_reader()?;
-    assert_eq!(reader.block_at(source_block.height)?, Some(block_artifact));
+    assert_eq!(
+        reader.block_header_at(source_block.height)?,
+        Some(block_header_artifact)
+    );
+    assert_eq!(
+        reader.block_blob_at(source_block.height)?,
+        Some(block_blob_artifact)
+    );
     assert_eq!(
         reader.compact_block_at(source_block.height)?,
         Some(compact_block_artifact)
@@ -137,23 +159,36 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
 fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
     let built = derive_for_test(&source_block)?;
-    let block_artifact = built.block;
+    let block_header_artifact = built.block_header;
+    let block_blob_artifact = built
+        .block_blob
+        .ok_or("fixture derivation must include a raw block blob")?;
     let compact_block_artifact = built.compact_block;
-    let transactions = built.transactions;
+    let block_transaction_index = built.block_transaction_index;
+    let transaction_locations = built.transaction_locations;
+    let transaction_facts = built.transaction_facts;
+    let transaction_blobs = built.transaction_blobs;
     assert_eq!(
-        transactions.len(),
+        transaction_locations.len(),
         1,
         "regtest fixture block 1 has a single coinbase transaction"
     );
-    let coinbase = transactions
+    let coinbase_location = transaction_locations
         .first()
-        .ok_or("transaction artifacts vector is empty")?;
-    assert_eq!(coinbase.block_height, source_block.height);
-    assert_eq!(coinbase.block_hash, source_block.hash);
+        .copied()
+        .ok_or("transaction location vector is empty")?;
+    assert_eq!(coinbase_location.block_height, source_block.height);
+    assert_eq!(coinbase_location.block_hash, source_block.hash);
+    assert_eq!(coinbase_location.tx_index_in_block, 0);
+    let coinbase_blob = transaction_blobs
+        .first()
+        .cloned()
+        .ok_or("transaction blob vector is empty")?;
     assert!(
-        !coinbase.payload_bytes.is_empty(),
+        !coinbase_blob.raw_transaction_bytes.is_empty(),
         "coinbase serialized payload bytes must be present"
     );
+    assert_coinbase_branch_id_uses_activation_table(&transaction_facts, &source_block)?;
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let chain_epoch = ChainEpoch {
@@ -163,7 +198,7 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         tip_hash: source_block.hash,
         finalized_height: source_block.height,
         finalized_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -171,18 +206,50 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             chain_epoch,
-            vec![block_artifact],
+            vec![block_header_artifact],
             vec![compact_block_artifact],
         )
-        .with_transactions(transactions.clone()),
+        .with_block_blobs(vec![block_blob_artifact])
+        .with_block_transaction_index(block_transaction_index)
+        .with_transaction_locations(transaction_locations)
+        .with_transaction_facts(transaction_facts.clone())
+        .with_transaction_blobs(transaction_blobs),
     )?;
 
     let reader = store.current_chain_epoch_reader()?;
     let stored = reader
-        .transaction_by_id(coinbase.transaction_id)?
+        .transaction_facts_by_id(coinbase_location.transaction_id)?
         .ok_or("coinbase transaction should be readable after commit")?;
-    assert_eq!(&stored, coinbase);
+    assert_eq!(
+        &stored,
+        transaction_facts
+            .first()
+            .ok_or("transaction facts vector is empty")?
+    );
+    assert_eq!(
+        reader.transaction_id_at_block_index(source_block.height, 0)?,
+        Some(coinbase_location.transaction_id)
+    );
+    assert_eq!(
+        reader.transaction_blob_by_id(coinbase_location.transaction_id)?,
+        Some(coinbase_blob)
+    );
 
+    Ok(())
+}
+
+fn assert_coinbase_branch_id_uses_activation_table(
+    transaction_facts: &[TransactionFactsArtifact],
+    source_block: &SourceBlock,
+) -> Result<(), Box<dyn Error>> {
+    let coinbase_facts = transaction_facts
+        .first()
+        .ok_or("transaction facts vector is empty")?;
+    assert_eq!(
+        coinbase_facts.public_facts.consensus_branch_id,
+        Some(sample_regtest_upgrade_activations().consensus_branch_id_at(source_block.height)),
+        "mined transaction facts must use the network-upgrade activation table"
+    );
     Ok(())
 }
 
@@ -253,138 +320,6 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
         assert_eq!(action.ephemeral_key.len(), 32);
         assert_eq!(action.ciphertext.len(), 52);
     }
-
-    Ok(())
-}
-
-#[test]
-fn compact_block_builder_rejects_observed_tree_size_mismatch() -> Result<(), Box<dyn Error>> {
-    let source_block = fixture_source_block()?.with_tree_state_payload_bytes(
-        br#"{"sapling":{"commitments":{"size":1}},"orchard":{"commitments":{"size":0}}}"#.to_vec(),
-    );
-
-    let error = match derive_for_test(&source_block) {
-        Ok(built) => {
-            return Err(format!("expected tree-size mismatch, got {built:?}").into());
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        ArtifactDeriveError::ObservedTreeSizeMismatch { .. }
-    ));
-
-    Ok(())
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "Inline NodeSource stub plus end-to-end backfill assertion read more clearly together."
-)]
-#[tokio::test]
-async fn backfill_rejects_wrong_checkpoint_tree_metadata() -> Result<(), Box<dyn Error>> {
-    use std::{num::NonZeroU32, sync::Arc};
-
-    use async_trait::async_trait;
-    use tempfile::tempdir;
-    use zinder_core::{BlockId, ChainTipMetadata, ShieldedProtocol, SubtreeRootIndex};
-    use zinder_ingest::{BackfillConfig, IngestError, NodeSourceKind, backfill};
-    use zinder_source::{
-        DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeSource, NodeTarget,
-        SourceChainCheckpoint, SourceError, SourceSubtreeRoots,
-    };
-
-    // The tree-size defense fires when the node's z_gettreestate payload
-    // exposes an explicit `commitments.size`. Use the regtest coinbase-only
-    // fixture (where the real Sapling tree size after height 1 is 0) and lie
-    // to the bootstrap by claiming the checkpoint already had 99 Sapling
-    // commitments. The first backfilled block (height 1) builds against the
-    // wrong initial metadata, observes `size = 0`, and surfaces
-    // `ArtifactDeriveError::ObservedTreeSizeMismatch`.
-    struct StubFixtureSource {
-        block: SourceBlock,
-        tip_height: BlockHeight,
-    }
-
-    #[async_trait]
-    impl NodeSource for StubFixtureSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            NodeCapabilities::default()
-        }
-
-        async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
-            Ok(self.block.clone())
-        }
-
-        async fn tip_id(&self) -> Result<BlockId, SourceError> {
-            Ok(BlockId::new(self.tip_height, self.block.hash))
-        }
-
-        async fn fetch_subtree_roots(
-            &self,
-            protocol: ShieldedProtocol,
-            start_index: SubtreeRootIndex,
-            _max_entries: NonZeroU32,
-        ) -> Result<SourceSubtreeRoots, SourceError> {
-            Ok(SourceSubtreeRoots::new(protocol, start_index, Vec::new()))
-        }
-    }
-
-    let fixture_block = fixture_source_block()?.with_tree_state_payload_bytes(
-        br#"{"sapling":{"commitments":{"size":0}},"orchard":{"commitments":{"size":0}}}"#.to_vec(),
-    );
-    let stub_source = Arc::new(StubFixtureSource {
-        block: fixture_block,
-        tip_height: BlockHeight::new(200),
-    });
-
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wrong-checkpoint-store");
-    let bogus_checkpoint_height = BlockHeight::new(0);
-    let backfill_config = BackfillConfig {
-        node: NodeTarget::new(
-            Network::ZcashRegtest,
-            "http://127.0.0.1:39232".to_owned(),
-            NodeAuth::None,
-            std::time::Duration::from_secs(30),
-            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
-        ),
-        node_source: NodeSourceKind::ZebraJsonRpc,
-        storage_path,
-        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
-        from_height: BlockHeight::new(1),
-        to_height: BlockHeight::new(1),
-        commit_batch_blocks: NonZeroU32::new(1).ok_or("invalid batch size")?,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-            .ok_or("invalid prevout budget")?,
-        fetch_concurrency: NonZeroU32::new(4).ok_or("invalid fetch concurrency")?,
-        derive_concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
-        flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
-        upstream_tip_hint: None,
-        allow_near_tip_finalize: true,
-        checkpoint: Some(SourceChainCheckpoint::new(
-            bogus_checkpoint_height,
-            BlockHash::from_bytes([0; 32]),
-            ChainTipMetadata::new(99, 0),
-        )),
-    };
-
-    let error = match backfill(&backfill_config, stub_source.as_ref()).await {
-        Ok(outcome) => return Err(format!("expected tree-size mismatch, got {outcome:?}").into()),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(
-            error,
-            IngestError::ArtifactDerive(ArtifactDeriveError::ObservedTreeSizeMismatch {
-                expected_sapling: 99,
-                observed_sapling: 0,
-                ..
-            })
-        ),
-        "expected ObservedTreeSizeMismatch with seeded sapling=99 vs observed=0; got {error:?}"
-    );
 
     Ok(())
 }

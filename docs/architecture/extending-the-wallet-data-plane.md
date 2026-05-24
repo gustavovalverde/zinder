@@ -241,7 +241,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 |---|---|---|
 | `wallet.read.*` | Canonical block / transaction / tree-state reads | `wallet.read.transaction_by_id_v1` |
 | `wallet.mempool.*` | Live mempool point lookups | `wallet.mempool.transparent_outputs_by_address_v1` |
-| `wallet.address.*` | Transparent-address reads | `wallet.address.transparent_utxos_v1` |
+| `wallet.address.*` | Transparent-address reads | `wallet.address.output_index_v1` |
 | `wallet.events.*` | Streaming event families | `wallet.events.chain_v1` |
 | `wallet.snapshot.*` | Bounded snapshot reads | `wallet.snapshot.mempool_v1` |
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
@@ -279,9 +279,9 @@ explain why the case is different from the documented refusal.
 A non-federated typed read with a new core type.
 
 - Step 1: `wallet.proto` adds `BlockHeaderBySelectorRequest` (selector + chain_epoch_id) and `BlockHeaderResponse` (chain_epoch + BlockHeaderInfo).
-- Step 2: `crates/zinder-core/src/block_header_info.rs` adds the `BlockHeaderInfo` read-model struct parsed from `BlockArtifact`.
+- Step 2: `crates/zinder-core/src/block_artifact.rs` adds or extends the `BlockHeaderInfo` read-model struct backed by `BlockHeaderArtifact`.
 - Step 3: `ChainIndex::block_header_by_selector(selector, at_epoch)` on the trait.
-- Steps 4-5: `LocalChainIndex` resolves selector to height via `block_hash_index` column family then reads the `BlockArtifact`; `RemoteChainIndex` calls the gRPC method.
+- Steps 4-5: `LocalChainIndex` resolves selector to height via the `block_hash_index` column family then reads `BlockHeaderArtifact`; `RemoteChainIndex` calls the gRPC method.
 - Steps 6-8: `WalletQueryApi::block_header_by_selector`, native encoder, adapter handler.
 - Step 9: capability `wallet.read.block_header_by_selector_v1`.
 - Steps 10-11: capability_coverage row + capability-docs mirrors.
@@ -302,20 +302,20 @@ A federated derive-plane method. Adds the 14 baseline steps plus the 7 federatio
 - F6: capabilities `explorer.server_info_v1` (probe target) and `explorer.transparent_address.balance_v1` (federated method).
 - F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
 
-The compute shape is compute at read time: canonical confirmed totals are summed from transparent UTXOs, and the derive plane adds the live mempool overlay. An accumulator-backed read optimization may land later without changing the public wire shape or capability strings.
+The compute shape is compute at read time: canonical confirmed totals are summed from transparent outputs, and the derive plane adds the live mempool overlay. An accumulator-backed read optimization may land later without changing the public wire shape or capability strings.
 
-### Example 4 — `TransparentPrevouts` and `TransparentMempoolPrevouts`
+### Example 4 — `TransparentOutputsByOutpoint` and `TransparentMempoolOutputsByOutpoint`
 
-A pair of canonical wallet-plane reads that resolve outpoints to their referenced outputs. Both share the new wire-level `OutPoint` message, the `TransparentPrevout` payload, and a `repeated TransparentPrevoutEntry` response shape with `optional TransparentPrevout prevout` per entry.
+A pair of canonical wallet-plane reads that resolve outpoints to their referenced outputs. Both share the new wire-level `OutPoint` message, the `TransparentOutput` payload, and a `repeated TransparentOutputEntry` response shape with `optional TransparentOutput prevout` per entry.
 
-- The canonical method reads first-class `transparent_prevout` rows from `zinder-store`. Shape B canonical row lookup; latest reads use the exact current projection, while explicit historical reads use `transparent_prevout_history` with the row's block identity for visibility checks.
-- The mempool method reads `MempoolEntry.transparent_outputs` through `MempoolIndex::transparent_prevouts_by_outpoints`. Proxied through `IngestControl` because secondary readers cannot observe live writer state.
-- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_PREVOUTS_PER_REQUEST = 1024`) and reject the coinbase sentinel outpoint at the wallet adapter.
-- Capability strings: `wallet.read.transparent_prevouts_v1` (canonical) and `wallet.mempool.transparent_prevouts_v1` (mempool).
-- `ChainIndex` exposes three methods: `transparent_prevouts`, `transparent_prevouts_at_epoch`, `transparent_mempool_prevouts`.
+- The canonical method reads first-class `transparent_output` rows from `zinder-store`. Shape B canonical row lookup; pinned reads verify the row's producing-block identity against the requested epoch.
+- The mempool method reads `MempoolEntry.transparent_outputs` through `MempoolIndex::transparent_outputs_by_outpoints`. Proxied through `IngestControl` because secondary readers cannot observe live writer state.
+- Both surfaces share the same per-request cap (`MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`) and reject the coinbase sentinel outpoint at the wallet adapter.
+- Capability strings: `wallet.read.transparent_outputs_by_outpoint_v1` (canonical) and `wallet.mempool.transparent_outputs_by_outpoint_v1` (mempool).
+- `ChainIndex` exposes three methods: `transparent_outputs_by_outpoint`, `transparent_outputs_by_outpoint_at_epoch`, `transparent_mempool_outputs_by_outpoint`.
 - No compat-shim counterpart: `CompactTxStreamer` has no prevout endpoint, and the cookbook forbids inventing one.
 
-The public wire shape and capability string do not expose the storage layout. Dedicated current `transparent_prevout` rows plus `transparent_prevout_history` rows are the canonical storage shape for mined outputs; the store also maintains a block-local index for bounded reorg repair. The response remains a list of per-request entries so consumers can decode canonical and mempool prevout resolution through the same path.
+The public wire shape and capability string do not expose the storage layout. Dedicated `transparent_output` rows are the canonical storage shape for mined outputs; the store also maintains a block-local index for bounded reorg repair. The response remains a list of per-request entries so consumers can decode canonical and mempool prevout resolution through the same path.
 
 ## Common mistakes
 

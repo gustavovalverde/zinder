@@ -19,7 +19,7 @@ pub use zinder_derive::{
     DeriveStoreColumnFamily, DeriveStoreError, DeriveStoreOptions, DeriveStoreTable,
     MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
     MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    MempoolEventCountsConsumer, PrevoutResolver, RECENT_TRANSACTIONS_COLUMN_FAMILY,
+    MempoolEventCountsConsumer, RECENT_TRANSACTIONS_COLUMN_FAMILY,
     RECENT_TRANSACTIONS_CONSUMER_NAME, RecentTransactionsConsumer, RecentTransactionsConsumerError,
     RevertedRange, TRANSACTION_FEES_COLUMN_FAMILIES, TRANSACTION_FEES_COLUMN_FAMILY,
     TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
@@ -27,5 +27,5 @@ pub use zinder_derive::{
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransactionFeesConsumer, TransactionFeesConsumerError,
     TransparentAddressActivityConsumer, TransparentAddressActivityConsumerError,
-    decode_stored_record,
+    TransparentSpendFacts, decode_stored_record,
 };

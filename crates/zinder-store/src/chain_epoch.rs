@@ -1,9 +1,10 @@
 //! Chain epoch commit values.
 
 use zinder_core::{
-    BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
-    SubtreeRootArtifact, TransactionArtifact, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentPrevoutArtifact, TransparentUtxoSpendArtifact,
+    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, CompactBlockArtifact,
+    SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact, TransactionLocation,
+    TransparentAddressTxIndexArtifact, TransparentOutputArtifact, TransparentSpendFact,
     TreeStateArtifact,
 };
 
@@ -12,22 +13,30 @@ use zinder_core::{
 pub struct ChainEpochArtifacts {
     /// Chain epoch made visible by this commit.
     pub chain_epoch: ChainEpoch,
-    /// Finalized block artifacts included in this commit.
-    pub finalized_blocks: Vec<BlockArtifact>,
+    /// Block-header facts included in this commit.
+    pub block_headers: Vec<BlockHeaderArtifact>,
+    /// Optional raw block blobs included in this commit.
+    pub block_blobs: Vec<BlockBlobArtifact>,
     /// Compact block artifacts included in this commit.
     pub compact_blocks: Vec<CompactBlockArtifact>,
-    /// Transaction artifacts included in this commit.
-    pub transactions: Vec<TransactionArtifact>,
+    /// Block-local transaction id index rows included in this commit.
+    pub block_transaction_index: Vec<BlockTransactionIndexArtifact>,
+    /// Transaction-location rows included in this commit.
+    pub transaction_locations: Vec<TransactionLocation>,
+    /// Transaction fact rows included in this commit.
+    pub transaction_facts: Vec<TransactionFactsArtifact>,
+    /// Optional raw transaction blobs included in this commit.
+    pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Tree-state artifacts included in this commit.
     pub tree_states: Vec<TreeStateArtifact>,
     /// Subtree-root artifacts included in this commit.
     pub subtree_roots: Vec<SubtreeRootArtifact>,
-    /// Transparent address UTXO artifacts included in this commit.
-    pub transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    /// Transparent prevout artifacts included in this commit.
-    pub transparent_prevouts: Vec<TransparentPrevoutArtifact>,
-    /// Transparent spend artifacts included in this commit.
-    pub transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    /// Transparent address output artifacts included in this commit.
+    pub address_output_index: Vec<AddressOutputIndexArtifact>,
+    /// Transparent output artifacts included in this commit.
+    pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
+    /// Resolved transparent spend facts included in this commit.
+    pub transparent_spend_facts: Vec<TransparentSpendFact>,
     /// Transparent address tx-history index artifacts included in this commit.
     pub transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
     /// Reorg-window transition included in this commit.
@@ -39,28 +48,72 @@ impl ChainEpochArtifacts {
     #[must_use]
     pub fn new(
         chain_epoch: ChainEpoch,
-        finalized_blocks: Vec<BlockArtifact>,
+        block_headers: Vec<BlockHeaderArtifact>,
         compact_blocks: Vec<CompactBlockArtifact>,
     ) -> Self {
         Self {
             chain_epoch,
-            finalized_blocks,
+            block_headers,
+            block_blobs: Vec::new(),
             compact_blocks,
-            transactions: Vec::new(),
+            block_transaction_index: Vec::new(),
+            transaction_locations: Vec::new(),
+            transaction_facts: Vec::new(),
+            transaction_blobs: Vec::new(),
             tree_states: Vec::new(),
             subtree_roots: Vec::new(),
-            transparent_address_utxos: Vec::new(),
-            transparent_prevouts: Vec::new(),
-            transparent_utxo_spends: Vec::new(),
+            address_output_index: Vec::new(),
+            transparent_outputs_by_outpoint: Vec::new(),
+            transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
             reorg_window_change: ReorgWindowChange::Unchanged,
         }
     }
 
-    /// Adds transaction artifacts to this commit value.
+    /// Adds optional raw block blobs to this commit value.
     #[must_use]
-    pub fn with_transactions(mut self, transactions: Vec<TransactionArtifact>) -> Self {
-        self.transactions = transactions;
+    pub fn with_block_blobs(mut self, block_blobs: Vec<BlockBlobArtifact>) -> Self {
+        self.block_blobs = block_blobs;
+        self
+    }
+
+    /// Adds block-local transaction id index rows to this commit value.
+    #[must_use]
+    pub fn with_block_transaction_index(
+        mut self,
+        block_transaction_index: Vec<BlockTransactionIndexArtifact>,
+    ) -> Self {
+        self.block_transaction_index = block_transaction_index;
+        self
+    }
+
+    /// Adds transaction locations to this commit value.
+    #[must_use]
+    pub fn with_transaction_locations(
+        mut self,
+        transaction_locations: Vec<TransactionLocation>,
+    ) -> Self {
+        self.transaction_locations = transaction_locations;
+        self
+    }
+
+    /// Adds transaction facts to this commit value.
+    #[must_use]
+    pub fn with_transaction_facts(
+        mut self,
+        transaction_facts: Vec<TransactionFactsArtifact>,
+    ) -> Self {
+        self.transaction_facts = transaction_facts;
+        self
+    }
+
+    /// Adds optional raw transaction blobs to this commit value.
+    #[must_use]
+    pub fn with_transaction_blobs(
+        mut self,
+        transaction_blobs: Vec<TransactionBlobArtifact>,
+    ) -> Self {
+        self.transaction_blobs = transaction_blobs;
         self
     }
 
@@ -78,33 +131,33 @@ impl ChainEpochArtifacts {
         self
     }
 
-    /// Adds transparent address UTXO artifacts to this commit value.
+    /// Adds transparent address output artifacts to this commit value.
     #[must_use]
-    pub fn with_transparent_address_utxos(
+    pub fn with_address_output_index(
         mut self,
-        transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+        address_output_index: Vec<AddressOutputIndexArtifact>,
     ) -> Self {
-        self.transparent_address_utxos = transparent_address_utxos;
+        self.address_output_index = address_output_index;
         self
     }
 
-    /// Adds transparent prevout artifacts to this commit value.
+    /// Adds transparent output artifacts to this commit value.
     #[must_use]
-    pub fn with_transparent_prevouts(
+    pub fn with_transparent_outputs_by_outpoint(
         mut self,
-        transparent_prevouts: Vec<TransparentPrevoutArtifact>,
+        transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     ) -> Self {
-        self.transparent_prevouts = transparent_prevouts;
+        self.transparent_outputs_by_outpoint = transparent_outputs_by_outpoint;
         self
     }
 
-    /// Adds transparent spend artifacts to this commit value.
+    /// Adds resolved transparent spend facts to this commit value.
     #[must_use]
-    pub fn with_transparent_utxo_spends(
+    pub fn with_transparent_spend_facts(
         mut self,
-        transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+        transparent_spend_facts: Vec<TransparentSpendFact>,
     ) -> Self {
-        self.transparent_utxo_spends = transparent_utxo_spends;
+        self.transparent_spend_facts = transparent_spend_facts;
         self
     }
 

@@ -54,6 +54,7 @@ services:
   # longer a separate Compose service.
   zinder-ingest:
     image: zinder-ingest:latest
+    mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -96,6 +97,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-query
     image: zinder-query:latest
+    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-2g}
     restart: on-failure
     depends_on:
       zinder-ingest:
@@ -134,6 +136,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-explorer
     image: zinder-explorer:latest
+    mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-2g}
     restart: on-failure
     depends_on:
       zinder-ingest:
@@ -162,6 +165,7 @@ services:
   # Survives every restart. ADR: docs/architecture/upstream-platform-binding.md.
   zinder-prometheus:
     image: prom/prometheus:v3.2.0
+    mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: unless-stopped
     networks: [observability]
     volumes:
@@ -187,6 +191,7 @@ services:
   # collected by zinder-prometheus"; Grafana is the visualization bonus.
   zinder-grafana:
     image: grafana/grafana:11.5.1
+    mem_limit: ${ZINDER_GRAFANA_MEMORY_LIMIT:-512m}
     restart: unless-stopped
     profiles: [observability]
     networks: [observability]

@@ -12,6 +12,7 @@ name = "zcash-mainnet"
 json_rpc_addr = "http://zebra:8232"
 indexer_grpc_addr = "http://zebra:8230"
 request_timeout_secs = 30
+max_response_bytes = 67108864
 
 [node.auth]
 method = "cookie"
@@ -33,17 +34,25 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.derive]
-# Number of parallel CPU-bound derive and startup replay hydration tasks
-# on the Tokio blocking pool. Default is
-# `clamp(available_parallelism() - 1, 4, 32)`; uncomment to override. See
-# docs/adrs/0021-parallel-block-derivation.md.
-# concurrency = 8
+# Derive replay is memory-bounded independently from canonical commit size.
+replay_concurrency = 8
+# Derive replay is memory-bounded independently from canonical commit size:
+# each replay write hydrates at most this many block contexts before committing
+# consumer rows.
+replay_batch_blocks = 100
+# Keep canonical fact writes ahead of rebuildable derive projections when the
+# process is at its cgroup memory budget.
+replay_policy = "canonical-first"
 
 [ingest.bulk_catchup]
-commit_batch_blocks = 1000
-max_transparent_prevout_store_lookups_per_batch = 250000
-fetch_concurrency = 32
-# Force a RocksDB flush every N committed epochs (≈ N × commit_batch_blocks
+canonical_batch_max_blocks = 1000
+canonical_batch_max_artifact_bytes = 536870912
+source_segment_max_blocks = 128
+source_segment_target_response_bytes = 50331648
+source_fetch_max_in_flight_requests = 8
+source_fetch_max_in_flight_bytes = 268435456
+fact_build_concurrency = 16
+# Force a RocksDB flush every N committed epochs (≈ N × canonical_batch_max_blocks
 # blocks). Caps the live WAL by writer cadence and bounds crash-recovery
 # RAM. Default is 5; uncomment to override. See
 # docs/runbooks/bulk-catchup-oom-recovery.md.

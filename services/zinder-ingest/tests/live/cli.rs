@@ -14,7 +14,6 @@ use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::NodeSource;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     BoundedIngestConfigToml, WalletServingIngestConfigToml, assert_native_wallet_read_responses,
@@ -110,6 +109,7 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let probe_config = live_backfill_config(
         &env,
         &storage_path,
@@ -117,9 +117,9 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
         BlockHeight::new(1),
         NonZeroU32::new(1).ok_or_else(|| eyre!("invalid probe batch size"))?,
         true,
+        Arc::clone(&activations),
     );
     let source = zebra_source_from_backfill(&probe_config)?;
-    let activations = source.fetch_network_upgrade_activations().await?;
     let wallet_serving_floor = activations
         .earliest_wallet_servable_activation()
         .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?
@@ -197,13 +197,13 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
             .compact_block_at(wallet_serving_floor)?
             .ok_or_else(|| eyre!("missing first wallet-serving compact block"))?;
         let tip_tree_state = reader
-            .tree_state_at(to_height)?
+            .tree_state_checkpoint_at_or_before(to_height)?
             .ok_or_else(|| eyre!("missing bounded wallet-serving tip tree state"))?;
         assert_eq!(first_compact_block.height, wallet_serving_floor);
         assert_eq!(tip_tree_state.height, to_height);
     }
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
     let latest_block = wallet_query.latest_block(None).await?;
     assert_eq!(latest_block.height, to_height);
     let compact_blocks = wallet_query
@@ -216,6 +216,8 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
         compact_blocks.compact_blocks.len(),
         usize::try_from(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS)?
     );
-    let _tree_state = wallet_query.tree_state_at(to_height, None).await?;
+    let _tree_state = wallet_query
+        .tree_state_checkpoint_at_or_before(to_height, None)
+        .await?;
     Ok(())
 }

@@ -291,7 +291,7 @@ fn synthetic_chain_epoch(chain_epoch_id: u64) -> ChainEpoch {
         tip_hash: BlockHash::from_bytes([0x42; 32]),
         finalized_height: BlockHeight::new(1),
         finalized_hash: BlockHash::from_bytes([0x42; 32]),
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_700_000_000_000),
     }

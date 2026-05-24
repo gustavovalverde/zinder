@@ -34,7 +34,10 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
+use crate::common::{
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
+};
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 const REGTEST_TRANSPARENT_ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
@@ -379,6 +382,7 @@ async fn backfill_and_sample_tip(
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -386,6 +390,7 @@ async fn backfill_and_sample_tip(
         tip_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        activations,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;

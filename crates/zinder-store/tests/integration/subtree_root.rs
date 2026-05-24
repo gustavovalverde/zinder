@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
@@ -47,7 +47,7 @@ fn subtree_roots_read_from_one_visible_chain_epoch() -> eyre::Result<()> {
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
@@ -60,15 +60,15 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_600_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").into_bytes(),
+            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,

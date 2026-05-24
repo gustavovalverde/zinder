@@ -10,10 +10,9 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use zinder_client::{
-    BlockHeight, ChainEpochId, ChainIndex, LocalChainIndex, LocalOpenOptions, Network,
-    RemoteChainIndex, RemoteOpenOptions, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact, TransparentAddressUtxosQuery, TransparentOutPoint,
-    TransparentUtxoCursor,
+    AddressOutputCursor, AddressOutputIndexArtifact, AddressOutputIndexQuery, BlockHeight,
+    ChainEpochId, ChainIndex, LocalChainIndex, LocalOpenOptions, Network, RemoteChainIndex,
+    RemoteOpenOptions, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
@@ -27,7 +26,7 @@ const SCRIPT_PUB_KEY: &[u8] = &[
 #[tokio::test]
 async fn local_and_remote_drained_scan_returns_identical_utxos() -> eyre::Result<()> {
     let fixtures = setup_chain_indexes(3).await?;
-    let drain_query = TransparentAddressUtxosQuery {
+    let drain_query = AddressOutputIndexQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(0),
         max_entries: None,
@@ -35,25 +34,25 @@ async fn local_and_remote_drained_scan_returns_identical_utxos() -> eyre::Result
     };
     let local_view = fixtures
         .local
-        .transparent_address_utxos(drain_query.clone(), None)
+        .address_output_index(drain_query.clone(), None)
         .await?;
     let remote_view = fixtures
         .remote
-        .transparent_address_utxos(drain_query, None)
+        .address_output_index(drain_query, None)
         .await?;
 
-    assert_eq!(local_view.utxos.len(), 3);
-    assert_eq!(local_view.utxos, remote_view.utxos);
+    assert_eq!(local_view.outputs.len(), 3);
+    assert_eq!(local_view.outputs, remote_view.outputs);
     assert_eq!(local_view.chain_epoch, remote_view.chain_epoch);
     assert_eq!(
         local_view
             .next_cursor
             .as_ref()
-            .map(TransparentUtxoCursor::as_bytes),
+            .map(AddressOutputCursor::as_bytes),
         remote_view
             .next_cursor
             .as_ref()
-            .map(TransparentUtxoCursor::as_bytes),
+            .map(AddressOutputCursor::as_bytes),
         "drained scan must surface identical cursor bytes across local and remote",
     );
     Ok(())
@@ -62,7 +61,7 @@ async fn local_and_remote_drained_scan_returns_identical_utxos() -> eyre::Result
 #[tokio::test]
 async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result<()> {
     let fixtures = setup_chain_indexes(3).await?;
-    let first_page_query = TransparentAddressUtxosQuery {
+    let first_page_query = AddressOutputIndexQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(0),
         max_entries: NonZeroU32::new(2),
@@ -70,24 +69,24 @@ async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result
     };
     let local_first = fixtures
         .local
-        .transparent_address_utxos(first_page_query.clone(), None)
+        .address_output_index(first_page_query.clone(), None)
         .await?;
     let remote_first = fixtures
         .remote
-        .transparent_address_utxos(first_page_query, None)
+        .address_output_index(first_page_query, None)
         .await?;
 
-    assert_eq!(local_first.utxos.len(), 2);
-    assert_eq!(local_first.utxos, remote_first.utxos);
+    assert_eq!(local_first.outputs.len(), 2);
+    assert_eq!(local_first.outputs, remote_first.outputs);
     assert_eq!(
         local_first
             .next_cursor
             .as_ref()
-            .map(TransparentUtxoCursor::as_bytes),
+            .map(AddressOutputCursor::as_bytes),
         remote_first
             .next_cursor
             .as_ref()
-            .map(TransparentUtxoCursor::as_bytes),
+            .map(AddressOutputCursor::as_bytes),
         "paged cursor bytes must match between local and remote so resume is interoperable",
     );
 
@@ -95,7 +94,7 @@ async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result
         .next_cursor
         .clone()
         .ok_or_else(|| eyre!("local first page must yield a resume cursor"))?;
-    let resume_query = TransparentAddressUtxosQuery {
+    let resume_query = AddressOutputIndexQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(0),
         max_entries: NonZeroU32::new(10),
@@ -103,16 +102,16 @@ async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result
     };
     let local_resume = fixtures
         .local
-        .transparent_address_utxos(resume_query.clone(), None)
+        .address_output_index(resume_query.clone(), None)
         .await?;
     let remote_resume = fixtures
         .remote
-        .transparent_address_utxos(resume_query, None)
+        .address_output_index(resume_query, None)
         .await?;
 
-    assert_eq!(local_resume.utxos, remote_resume.utxos);
+    assert_eq!(local_resume.outputs, remote_resume.outputs);
     assert_eq!(
-        local_first.utxos.len() + local_resume.utxos.len(),
+        local_first.outputs.len() + local_resume.outputs.len(),
         3,
         "first page plus resume must equal the full drained set",
     );
@@ -141,18 +140,17 @@ async fn setup_chain_indexes(utxo_count: u32) -> eyre::Result<ChainIndexFixtures
     for output_index in 0..utxo_count {
         let mut transaction_id_bytes = [0; 32];
         transaction_id_bytes[..4].copy_from_slice(&output_index.to_be_bytes());
-        chain_fixture =
-            chain_fixture.with_transparent_address_utxo(TransparentAddressUtxoArtifact::new(
-                address_script_hash,
-                SCRIPT_PUB_KEY.to_vec(),
-                TransparentOutPoint::new(
-                    TransactionId::from_bytes(transaction_id_bytes),
-                    output_index,
-                ),
-                1_000_000_u64 + u64::from(output_index),
-                block_height,
-                block_hash,
-            ));
+        chain_fixture = chain_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+            address_script_hash,
+            SCRIPT_PUB_KEY.to_vec(),
+            TransparentOutPoint::new(
+                TransactionId::from_bytes(transaction_id_bytes),
+                output_index,
+            ),
+            1_000_000_u64 + u64::from(output_index),
+            block_height,
+            block_hash,
+        ));
     }
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
     let wallet_query = WalletQuery::new(

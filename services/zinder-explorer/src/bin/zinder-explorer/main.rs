@@ -13,6 +13,7 @@ use zinder_runtime::{
     Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
     install_tracing_subscriber, spawn_ops_endpoint_for,
 };
+use zinder_store::{ChainStoreOptions, SecondaryChainStore};
 
 mod config;
 
@@ -111,6 +112,14 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
 
+    let canonical_store = match open_canonical_store(&explorer_config) {
+        Ok(store) => store,
+        Err(error) => {
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
+
     let store = match open_derive_store(&explorer_config) {
         Ok(store) => store,
         Err(error) => {
@@ -123,8 +132,10 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
     let catchup_handle = spawn_derive_catchup_task(store.clone(), cancel.clone());
+    let canonical_catchup_handle =
+        spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
 
-    let grpc_adapter = build_grpc_adapter(&explorer_config, store);
+    let grpc_adapter = build_grpc_adapter(&explorer_config, canonical_store, store);
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
 
     let ops_handle = spawn_ops_endpoint_for(
@@ -164,9 +175,38 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
+    let _ = canonical_catchup_handle.await;
     let _ = catchup_handle.await;
 
     server_result.map_err(ExplorerConfigError::Transport)
+}
+
+fn open_canonical_store(
+    explorer_config: &ExplorerConfig,
+) -> Result<SecondaryChainStore, ExplorerConfigError> {
+    let secondary_path = explorer_config
+        .storage_path
+        .join("secondary-explorer-canonical");
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    match SecondaryChainStore::open(
+        &explorer_config.storage_path,
+        secondary_path,
+        ChainStoreOptions {
+            tuning: explorer_config.storage_tuning,
+            ..ChainStoreOptions::for_network(explorer_config.network)
+        },
+    ) {
+        Ok(handle) => {
+            handle.try_catch_up()?;
+            open_storage_phase.complete();
+            Ok(handle)
+        }
+        Err(error) => {
+            let wrapped = ExplorerConfigError::CanonicalStore(error);
+            open_storage_phase.fail(&wrapped);
+            Err(wrapped)
+        }
+    }
 }
 
 fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, ExplorerConfigError> {
@@ -192,6 +232,30 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
             Err(wrapped)
         }
     }
+}
+
+fn spawn_canonical_catchup_task(
+    store: SecondaryChainStore,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DERIVE_CATCHUP_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = store.try_catch_up() {
+                        tracing::warn!(
+                            target: "zinder::explorer",
+                            event = "canonical_secondary_catchup_failed",
+                            error = %error,
+                            "canonical store secondary catchup failed"
+                        );
+                    }
+                }
+                () = cancel.cancelled() => break,
+            }
+        }
+    })
 }
 
 fn spawn_derive_catchup_task(
@@ -220,12 +284,14 @@ fn spawn_derive_catchup_task(
 
 fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
+    canonical_store: SecondaryChainStore,
     store: DeriveStore,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
+        .with_canonical_store(canonical_store)
         .with_derive_store(store)
         .with_prevout_resolution_online(true);
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {

@@ -86,7 +86,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         ErrorReason::InvalidBlockRange,
         ErrorReason::CompactBlockRangeTooLarge,
         ErrorReason::ChainEventCursorInvalid,
-        ErrorReason::TransparentUtxoCursorInvalid,
+        ErrorReason::AddressOutputCursorInvalid,
         ErrorReason::TransparentHistoryCursorInvalid,
         ErrorReason::InvalidAddress,
         ErrorReason::UnsupportedShieldedProtocol,

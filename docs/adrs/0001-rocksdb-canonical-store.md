@@ -21,7 +21,12 @@ The candidates evaluated were RocksDB through `rust-rocksdb`, `fjall`, `redb`, a
 
 Zinder uses **RocksDB through `rust-rocksdb`** as the canonical KV store for `zinder-store`.
 
-The storage boundary hides RocksDB behind Zinder-owned domain contracts. Public APIs expose `ChainEpoch`, `BlockArtifact`, `CompactBlockArtifact`, `FinalizedBlockStore`, and `ReorgWindow`, never RocksDB types. RocksDB is owned by `zinder-ingest`; other services read through `ChainEpochReadApi` or an explicit query-owned store.
+The storage boundary hides RocksDB behind Zinder-owned domain contracts. Public
+APIs expose `ChainEpoch`, `BlockHeaderArtifact`, `BlockBlobArtifact`,
+`CompactBlockArtifact`, transaction fact/location artifacts, transparent-output
+artifacts, and `ReorgWindow`, never RocksDB types. RocksDB is owned by
+`zinder-ingest`; other services read through epoch-pinned store readers or an
+explicit query-owned store.
 
 ## Rationale
 

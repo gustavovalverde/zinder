@@ -36,9 +36,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, IndexerError, Network,
-    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
-    TransparentAddressUtxosQuery,
+    AddressOutputIndexQuery, BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex,
+    IndexerError, Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
+    TransparentAddressScriptHash,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -141,8 +141,8 @@ async fn snapshot_utxos(
     let mut utxo_count: u32 = 0;
     loop {
         let view = chain_index
-            .transparent_address_utxos(
-                TransparentAddressUtxosQuery {
+            .address_output_index(
+                AddressOutputIndexQuery {
                     address_script_hash: script_hash,
                     start_height: BlockHeight::new(0),
                     max_entries: None,
@@ -151,7 +151,7 @@ async fn snapshot_utxos(
                 None,
             )
             .await?;
-        for utxo in &view.utxos {
+        for utxo in &view.outputs {
             utxo_count += 1;
             total_zat = total_zat.saturating_add(utxo.value_zat);
             println!(

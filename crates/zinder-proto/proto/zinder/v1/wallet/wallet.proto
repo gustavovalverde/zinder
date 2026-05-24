@@ -180,45 +180,6 @@ message CompactBlockResponse {
   CompactBlock compact_block = 2;
 }
 
-// Full canonical block in consensus wire-serialized form.
-//
-// Use when the lightwalletd-compatible `CompactBlock` payload omits the
-// transactions a consumer needs (e.g. transparent-only and coinbase
-// transactions). Consumers decode `raw_block_bytes` with `zebra-chain`'s
-// `Block::zcash_deserialize` to recover the full transaction list.
-message FullBlock {
-  // Height of the source block.
-  uint32 block_height = 1;
-
-  // Canonical block hash in internal byte order (32 bytes).
-  bytes block_hash = 2;
-
-  // Parent block hash in internal byte order (32 bytes).
-  bytes parent_block_hash = 3;
-
-  // Serialized consensus block payload bytes.
-  bytes raw_block_bytes = 4;
-}
-
-// Single full block request.
-message FullBlockRequest {
-  // Requested block height.
-  uint32 block_height = 1;
-
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 2;
-}
-
-// Single full block response bound to one chain epoch.
-message FullBlockResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
-
-  // Full block at the requested height.
-  FullBlock block = 2;
-}
-
 // Single transaction request.
 message TransactionRequest {
   // Transaction identifier in canonical 32-byte order.
@@ -229,8 +190,8 @@ message TransactionRequest {
   optional ChainEpoch at_epoch = 2;
 }
 
-// Indexed transaction artifact.
-message Transaction {
+// Indexed transaction location.
+message TransactionLocation {
   // Transaction identifier.
   bytes transaction_id = 1;
 
@@ -240,8 +201,8 @@ message Transaction {
   // Hash of the containing block.
   bytes block_hash = 3;
 
-  // Serialized transaction payload bytes.
-  bytes payload_bytes = 4;
+  // Block-local transaction index.
+  uint32 tx_index_in_block = 4;
 }
 
 // Mined-transaction enrichment bound to a response's chain epoch.
@@ -263,11 +224,11 @@ message MinedDetails {
   uint32 confirmations = 3;
 }
 
-// Mined-transaction response carrier: the durable `Transaction` artifact
+// Mined-transaction response carrier: the durable `TransactionLocation`
 // plus epoch-bound enrichment.
 message MinedTransaction {
-  // Mined-transaction artifact.
-  Transaction transaction = 1;
+  // Mined-transaction location.
+  TransactionLocation location = 1;
 
   // Epoch-bound enrichment fields.
   MinedDetails details = 2;
@@ -319,24 +280,24 @@ message CompactBlockRangeChunk {
   CompactBlock compact_block = 2;
 }
 
-// Tree-state request by block height.
-message TreeStateRequest {
-  // Requested block height.
-  uint32 height = 1;
+// Checkpoint tree-state request bounded by block height.
+message TreeStateCheckpointRequest {
+  // Highest checkpoint height the server may return.
+  uint32 max_height = 1;
 
   // Optional chain epoch that must be used to answer the request. When absent,
   // the server uses the visible epoch at request time.
   optional ChainEpoch at_epoch = 2;
 }
 
-// Latest tree-state request.
-message LatestTreeStateRequest {
+// Latest checkpoint tree-state request.
+message LatestTreeStateCheckpointRequest {
   // Optional chain epoch that must be used to answer the request. When absent,
   // the server uses the visible epoch at request time.
   optional ChainEpoch at_epoch = 1;
 }
 
-// Tree-state response bound to one chain epoch.
+// Checkpoint tree-state response bound to one chain epoch.
 message TreeStateResponse {
   // Chain epoch used to answer this response.
   ChainEpoch chain_epoch = 1;
@@ -753,8 +714,8 @@ message TransparentMempoolSpendByOutpointResponse {
 //
 // Carries the intrinsic fields a consumer needs to compute input value and
 // derive the owning address; identifying fields like `transaction_id` stay on
-// the owning [`TransparentPrevoutEntry.outpoint`].
-message TransparentPrevout {
+// the owning [`TransparentOutputEntry.outpoint`].
+message TransparentOutput {
   // Output value in zatoshis.
   uint64 value_zat = 1;
 
@@ -762,20 +723,20 @@ message TransparentPrevout {
   bytes script_pub_key = 2;
 }
 
-// One entry in a [`TransparentPrevouts`] response, in input-order.
-message TransparentPrevoutEntry {
+// One entry in a [`TransparentOutputsByOutpoint`] response, in input-order.
+message TransparentOutputEntry {
   // Outpoint requested by the caller.
   OutPoint outpoint = 1;
 
-  // Resolved prevout, when the outpoint was found at the response's
-  // [`TransparentPrevoutsResponse.chain_epoch`]. Absent means the
+  // Resolved output, when the outpoint was found at the response's
+  // [`TransparentOutputsByOutpointResponse.chain_epoch`]. Absent means the
   // canonical chain at that epoch did not have the referenced output
   // (transaction unknown, output index out of bounds, or reorged out).
-  optional TransparentPrevout prevout = 2;
+  optional TransparentOutput output = 2;
 }
 
 // Batched request for canonical-chain transparent prevout resolution.
-message TransparentPrevoutsRequest {
+message TransparentOutputsByOutpointRequest {
   // Outpoints to resolve. Bounded server-side to a hard cap; requests
   // above the cap are silently truncated to the first N entries. The
   // coinbase sentinel `(transaction_id = [0u8; 32], output_index =
@@ -788,24 +749,24 @@ message TransparentPrevoutsRequest {
   optional ChainEpoch at_epoch = 2;
 }
 
-// Response for [`TransparentPrevouts`] bound to one chain epoch.
-message TransparentPrevoutsResponse {
+// Response for [`TransparentOutputsByOutpoint`] bound to one chain epoch.
+message TransparentOutputsByOutpointResponse {
   // Chain epoch the response binds to. Every entry's `prevout` (when
   // present) is visible at this epoch.
   ChainEpoch chain_epoch = 1;
 
   // Per-outpoint resolution result, in input order. Length matches the
   // request's `outpoints` length after server-side truncation.
-  repeated TransparentPrevoutEntry entries = 2;
+  repeated TransparentOutputEntry entries = 2;
 }
 
 // Batched request for live mempool transparent prevout resolution.
 //
 // Mempool reads are not chain-epoch-pinnable; the request omits
 // `at_epoch` and the response binds to the chain epoch visible at
-// lookup time. The reply uses the same [`TransparentPrevoutsResponse`]
+// lookup time. The reply uses the same [`TransparentOutputsByOutpointResponse`]
 // shape as the canonical surface so consumers share one decoder.
-message TransparentMempoolPrevoutsRequest {
+message TransparentMempoolOutputsByOutpointRequest {
   // Outpoints to resolve against the live mempool index. Bounded
   // server-side to a hard cap; requests above the cap are silently
   // truncated to the first N entries. The coinbase sentinel is
@@ -915,13 +876,13 @@ message AddressLookup {
   }
 }
 
-// Transparent-address UTXO request consumed by both the unary and streaming
+// Transparent-address output request consumed by both the unary and streaming
 // RPCs. Pagination across both forms uses the same opaque cursor envelope.
-message TransparentAddressUtxosRequest {
+message AddressOutputIndexRequest {
   // Selector for the transparent address being queried.
   AddressLookup address = 1;
 
-  // Maximum number of UTXOs returned. Absent means use the server default;
+  // Maximum number of outputs returned. Absent means use the server default;
   // values larger than the server's configured cap are silently clamped.
   optional uint32 max_entries = 2;
 
@@ -939,7 +900,7 @@ message TransparentAddressUtxosRequest {
 }
 
 // One unspent transparent output.
-message TransparentAddressUtxo {
+message AddressOutputIndex {
   // SHA-256 of the transparent address scriptPubKey.
   bytes address_script_hash = 1;
 
@@ -959,35 +920,35 @@ message TransparentAddressUtxo {
   bytes block_hash = 6;
 }
 
-// Bounded transparent UTXO response bound to one chain epoch.
-message TransparentAddressUtxosResponse {
+// Bounded transparent output response bound to one chain epoch.
+message AddressOutputIndexResponse {
   // Chain epoch used to answer this response.
   ChainEpoch chain_epoch = 1;
 
   // Unspent outputs in ascending mined-height order.
-  repeated TransparentAddressUtxo utxos = 2;
+  repeated AddressOutputIndex outputs = 2;
 
   // Empty when the bounded scan was fully drained. Non-empty carries an
   // opaque StreamCursorTokenV1 for resuming the next page.
   bytes next_cursor = 3;
 }
 
-// Streamed transparent UTXO chunk emitted one per UTXO. Streaming is the
+// Streamed transparent output chunk emitted one per output. Streaming is the
 // preferred form for mining and exchange addresses.
-message TransparentAddressUtxosStreamChunk {
-  // Chain epoch used for this UTXO.
+message AddressOutputIndexStreamChunk {
+  // Chain epoch used for this output.
   ChainEpoch chain_epoch = 1;
 
   // Single unspent output.
-  TransparentAddressUtxo utxo = 2;
+  AddressOutputIndex output = 2;
 
-  // Cursor for resuming strictly after this UTXO.
+  // Cursor for resuming strictly after this output.
   bytes cursor = 3;
 }
 
 // Bounded transparent-address balance request federated to `zinder-explorer`.
 //
-// The balance read is computed from canonical transparent UTXOs at the
+// The balance read is computed from canonical transparent outputs at the
 // requested addresses plus the live mempool overlay. Mempool live state is
 // not chain-epoch-pinnable, so the response binds to the visible chain epoch
 // at lookup time; callers may pin canonical reads through `at_epoch`. An
@@ -1077,13 +1038,9 @@ message TransparentAddressTxIdsInRangeRequest {
   // encoded direction is authoritative.
   bytes from_cursor = 5;
 
-  // Optional chain epoch that must be used to answer the request. When
-  // absent, the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 6;
-
   // Iterate newest-first when true. The cursor body encodes the direction
   // so resume continues in the same order.
-  bool descending = 7;
+  bool descending = 6;
 }
 
 // One streamed transparent-address tx-history chunk.
@@ -1125,21 +1082,16 @@ service WalletQuery {
   // Stream compact blocks for an inclusive height range.
   rpc CompactBlockRange(CompactBlockRangeRequest) returns (stream CompactBlockRangeChunk);
 
-  // Return one full canonical block at a given height. Capability:
-  // `wallet.read.full_block_at_v1`. Returns NOT_FOUND when the height is
-  // beyond the visible tip or the canonical artifact is missing.
-  rpc FullBlock(FullBlockRequest) returns (FullBlockResponse);
-
   // Return the typed status of one transaction by transaction id. NotFound
   // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states
   // are typed in the response oneof.
   rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
-  // Return tree state at one block height.
-  rpc TreeState(TreeStateRequest) returns (TreeStateResponse);
+  // Return the latest checkpoint tree state at or before a block height.
+  rpc TreeStateCheckpoint(TreeStateCheckpointRequest) returns (TreeStateResponse);
 
-  // Return tree state for the latest visible block.
-  rpc LatestTreeState(LatestTreeStateRequest) returns (TreeStateResponse);
+  // Return the latest checkpoint tree state visible to the selected epoch.
+  rpc LatestTreeStateCheckpoint(LatestTreeStateCheckpointRequest) returns (TreeStateResponse);
 
   // Return shielded subtree roots.
   rpc SubtreeRoots(SubtreeRootsRequest) returns (SubtreeRootsResponse);
@@ -1170,24 +1122,24 @@ service WalletQuery {
   // Resolve a batch of canonical-chain transparent outpoints to their
   // referenced outputs. Closes the prevout-resolution gap that forced
   // consumers to fetch one full transaction per input.
-  rpc TransparentPrevouts(TransparentPrevoutsRequest)
-      returns (TransparentPrevoutsResponse);
+  rpc TransparentOutputsByOutpoint(TransparentOutputsByOutpointRequest)
+      returns (TransparentOutputsByOutpointResponse);
 
   // Resolve a batch of live-mempool transparent outpoints to their
   // referenced outputs. Used by chained-mempool-tx flows where the
   // creating transaction has not yet confirmed.
-  rpc TransparentMempoolPrevouts(TransparentMempoolPrevoutsRequest)
-      returns (TransparentPrevoutsResponse);
+  rpc TransparentMempoolOutputsByOutpoint(TransparentMempoolOutputsByOutpointRequest)
+      returns (TransparentOutputsByOutpointResponse);
 
   // Return unspent transparent outputs for one transparent address.
-  rpc TransparentAddressUtxos(TransparentAddressUtxosRequest)
-      returns (TransparentAddressUtxosResponse);
+  rpc AddressOutputIndex(AddressOutputIndexRequest)
+      returns (AddressOutputIndexResponse);
 
   // Stream unspent transparent outputs for one transparent address. Used by
   // mining and exchange addresses where a single message would exceed the
   // gRPC size cap.
-  rpc TransparentAddressUtxosStream(TransparentAddressUtxosRequest)
-      returns (stream TransparentAddressUtxosStreamChunk);
+  rpc AddressOutputIndexStream(AddressOutputIndexRequest)
+      returns (stream AddressOutputIndexStreamChunk);
 
   // Stream the transparent-address tx-history index for an inclusive
   // height range, in ascending or descending mined order.

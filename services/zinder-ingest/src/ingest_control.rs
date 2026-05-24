@@ -8,7 +8,7 @@ use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    ChainEpoch, ChainValuePools, MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, TransactionId,
+    ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_proto::capabilities::{
@@ -31,7 +31,7 @@ use zinder_store::{
     chain_event_stream_family_from_message, mempool_entry_message, mempool_event_envelope_message,
     run_chain_event_stream, status_from_store_error, stream_cursor_from_message_bytes,
     transparent_mempool_output_message, transparent_mempool_spend_message,
-    transparent_prevout_entry_message,
+    transparent_output_entry_message,
 };
 
 use crate::mempool::MempoolIndex;
@@ -341,17 +341,17 @@ impl IngestControl for IngestControlGrpcAdapter {
         ))
     }
 
-    async fn transparent_mempool_prevouts(
+    async fn transparent_mempool_outputs_by_outpoint(
         &self,
-        request: Request<wallet::TransparentMempoolPrevoutsRequest>,
-    ) -> Result<Response<wallet::TransparentPrevoutsResponse>, Status> {
+        request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
         let mempool_index = self
             .mempool_index
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
         let request = request.into_inner();
         let mut request_outpoints = request.outpoints;
-        request_outpoints.truncate(MAX_TRANSPARENT_PREVOUTS_PER_REQUEST);
+        request_outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
         let outpoints = request_outpoints
             .into_iter()
             .map(|message| outpoint_from_request_message(Some(message)))
@@ -362,14 +362,16 @@ impl IngestControl for IngestControlGrpcAdapter {
             .map_err(|error| status_from_store_error(&error))?
             .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
         let entries = mempool_index
-            .transparent_prevouts_by_outpoints(&outpoints)
+            .transparent_outputs_by_outpoints(&outpoints)
             .into_iter()
-            .map(transparent_prevout_entry_message)
+            .map(transparent_output_entry_message)
             .collect();
-        Ok(Response::new(wallet::TransparentPrevoutsResponse {
-            chain_epoch: Some(chain_epoch_message(chain_epoch)),
-            entries,
-        }))
+        Ok(Response::new(
+            wallet::TransparentOutputsByOutpointResponse {
+                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                entries,
+            },
+        ))
     }
 
     async fn chain_value_pools_at_tip(

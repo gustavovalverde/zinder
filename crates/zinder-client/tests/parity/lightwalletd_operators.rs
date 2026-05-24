@@ -13,14 +13,13 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionArtifact, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentOutPoint,
+    AddressOutputIndexArtifact, ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations};
 
 use super::{committed_store_fixture, parity_chain_fixture};
 
@@ -108,7 +107,7 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
         txid_response.data,
         fixture.transaction_id.as_bytes().to_vec()
     );
-    assert_eq!(transaction_response.data, fixture.transaction.payload_bytes);
+    assert_eq!(transaction_response.data, fixture.raw_transaction_bytes);
     assert_eq!(transaction_response.height, 1);
     assert!(txids.next().await.is_none());
     assert!(transactions.next().await.is_none());
@@ -121,7 +120,7 @@ struct PublicOperatorFixture {
     address: String,
     script_pub_key: Vec<u8>,
     transaction_id: TransactionId,
-    transaction: TransactionArtifact,
+    raw_transaction_bytes: Vec<u8>,
 }
 
 fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
@@ -137,15 +136,17 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
         .ok_or_else(|| eyre::eyre!("fixture must contain block 1"))?;
     let block_height = block.height;
     let block_hash = block.hash;
-    let transaction = TransactionArtifact::new(
+    let raw_transaction_bytes = b"operator-transaction-payload".to_vec();
+    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
         transaction_id,
         block_height,
         block_hash,
-        b"operator-transaction-payload".to_vec(),
+        0,
+        raw_transaction_bytes.clone(),
     );
     let chain_fixture = base_fixture
-        .with_transaction_artifact(transaction.clone())
-        .with_transparent_address_utxo(TransparentAddressUtxoArtifact::new(
+        .with_transaction_rows(transaction_rows)
+        .with_address_output_index(AddressOutputIndexArtifact::new(
             address_script_hash,
             script_pub_key.clone(),
             TransparentOutPoint::new(transaction_id, 0),
@@ -166,7 +167,7 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
         address,
         script_pub_key,
         transaction_id,
-        transaction,
+        raw_transaction_bytes,
     })
 }
 

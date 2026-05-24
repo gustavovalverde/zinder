@@ -11,9 +11,11 @@ mod node_capabilities;
 mod node_source;
 mod node_target;
 mod source_block;
+mod source_chain_update;
 mod source_error;
 mod source_subtree_root;
 mod source_transaction;
+mod source_tree_state;
 mod transparent_address;
 mod transport;
 mod upstream_health;
@@ -42,9 +44,14 @@ pub use source_block::{
     SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes,
     decode_display_block_hash, encode_display_block_hash,
 };
+pub use source_chain_update::{
+    SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats,
+    SourceChainUpdate,
+};
 pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::{parse_transaction_public_facts, transaction_component_counts};
+pub use source_tree_state::SourceTreeState;
 pub use transparent_address::transparent_address_matches_network;
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,

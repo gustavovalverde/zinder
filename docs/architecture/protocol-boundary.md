@@ -71,8 +71,8 @@ The current native wallet read-sync surface is:
 - `zinder_proto::v1::wallet::TransactionRequest`
 - `zinder_proto::v1::wallet::Transaction`
 - `zinder_proto::v1::wallet::TransactionResponse`
-- `zinder_proto::v1::wallet::TreeStateRequest`
-- `zinder_proto::v1::wallet::LatestTreeStateRequest`
+- `zinder_proto::v1::wallet::TreeStateCheckpointRequest`
+- `zinder_proto::v1::wallet::LatestTreeStateCheckpointRequest`
 - `zinder_proto::v1::wallet::TreeStateResponse`
 - `zinder_proto::v1::wallet::ShieldedProtocol`
 - `zinder_proto::v1::wallet::SubtreeRootsRequest`
@@ -107,7 +107,7 @@ stay behind `WalletQueryApi`, `ChainEpochReadApi`, and ingestion.
 The current native network service exposes Zinder concepts:
 
 - `LatestBlock`, `CompactBlock`, `CompactBlockRange`, `Transaction`
-- `TreeState`, `LatestTreeState`, `SubtreeRoots`
+- `TreeStateCheckpoint`, `LatestTreeStateCheckpoint`, `SubtreeRoots`
 - `ServerInfo`
 
 The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
@@ -135,7 +135,7 @@ surface is:
 
 Future native slices may add:
 
-- Transparent address artifacts (paginated `TransparentAddressTxIdsInRange`, `TransparentAddressUtxosAt`, `TransparentAddressBalanceAt`)
+- Transparent address artifacts (paginated `TransparentAddressTxIdsInRange`, `AddressOutputIndexAt`, `TransparentAddressBalanceAt`)
 - Internal `ChainEpochReadApi` over gRPC for multi-process query mode
 
 Every chain-dependent response either binds to one `ChainEpoch` or explicitly says why a field is independent of the epoch. Range and list APIs must have cursors or explicit maximum sizes.
@@ -148,8 +148,8 @@ It should provide:
 
 - `resolve_chain_epoch`
 - `read_compact_block_range`
-- `read_tree_state`
-- `read_latest_tree_state`
+- `read_tree_state_checkpoint_at_or_before`
+- `read_latest_tree_state_checkpoint`
 - `read_subtree_roots`
 - `read_transaction`
 - `chain_event_history` (library/internal helper for the subscription plane, not a second public stream)
@@ -207,7 +207,7 @@ The minimum lightwalletd-compatible read-sync surface is:
 Android/Zashi compatibility claims are governed by
 [Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims).
 `GetLightdInfo.taddrSupport` may be true only when `GetAddressUtxos[Stream]`
-reads from stored transparent UTXO artifacts. The compatibility service must
+reads from stored transparent output artifacts. The compatibility service must
 not claim broader Zashi compatibility until the full external-wallet contract
 is satisfied.
 

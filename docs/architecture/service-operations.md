@@ -107,32 +107,32 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
-| `zinder_ingest_derive_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
-| `zinder_ingest_derive_total` | counter | `zinder-ingest` | Per-block bulk-catchup derive count by status and error class. |
-| `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Startup derive replay stage latency by stage, status, and error class. |
-| `zinder_ingest_derive_replay_events_total` | counter | `zinder-ingest` | Startup derive replay event count by status and error class. |
-| `zinder_ingest_derive_replay_blocks_total` | counter | `zinder-ingest` | Startup derive replay block count by status and error class. |
-| `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before startup derive replay. |
-| `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store during startup. |
-| `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Startup derive replay lag between replay progress and canonical tip. |
-| `zinder_ingest_derive_context_stage_duration_seconds` | histogram | `zinder-ingest` | Commit-time derive-context hydration latency by stage, status, and error class; stages include `hydrate_blocks` and `resolve_prevouts`. |
-| `zinder_ingest_prevout_resolution_total` | counter | `zinder-ingest` | Transparent prevouts resolved while building derive contexts by source: `in_batch`, `indexed_prevout`, or `unresolved`. |
-| `zinder_ingest_prevout_resolution_requested_outpoint_count` | histogram | `zinder-ingest` | Unique transparent prevouts requested while building one derive context batch. |
-| `zinder_ingest_prevout_store_lookup_active` | gauge | `zinder-ingest` | Whether a commit-time transparent-prevout store lookup is active by stage (`derive_context`, `spend_address_index`). |
-| `zinder_ingest_prevout_store_lookup_requested_outpoints` | gauge | `zinder-ingest` | Transparent prevout store lookups requested by the active batch by stage. |
-| `zinder_ingest_prevout_store_lookup_completed_outpoints` | gauge | `zinder-ingest` | Transparent prevout store lookups completed in the active batch by stage. |
-| `zinder_ingest_prevout_store_lookup_chunks` | gauge | `zinder-ingest` | Bounded lookup chunks planned for the active transparent-prevout store read by stage. |
-| `zinder_ingest_prevout_store_lookup_completed_chunks` | gauge | `zinder-ingest` | Bounded lookup chunks completed for the active transparent-prevout store read by stage. |
-| `zinder_ingest_prevout_store_lookup_chunk_duration_seconds` | histogram | `zinder-ingest` | Transparent prevout store lookup latency per bounded chunk by stage, status, and error class. |
-| `zinder_ingest_prevout_store_lookup_chunk_outpoint_count` | histogram | `zinder-ingest` | Transparent prevout outpoints requested per bounded lookup chunk by stage and status. |
-| `zinder_ingest_prevout_store_lookup_chunks_total` | counter | `zinder-ingest` | Transparent prevout lookup chunks by stage, status, and error class. |
-| `zinder_ingest_backfill_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup/backfill stage latency by stage, status, and error class; stages include `await_derived_block`, `populate_subtree_roots`, and `flush_store`. |
+| `zinder_ingest_fact_build_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
+| `zinder_ingest_fact_build_total` | counter | `zinder-ingest` | Per-block bulk-catchup derive count by status and error class. |
+| `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
+| `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
+| `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. |
+| `zinder_ingest_derive_replay_events_total` | counter | `zinder-ingest` | Derive tailer replay event count by status and error class. |
+| `zinder_ingest_derive_replay_blocks_total` | counter | `zinder-ingest` | Derive tailer replay block count by status and error class. |
+| `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before a derive tailer catch-up pass. |
+| `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store by the tailer. |
+| `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between replay progress and canonical tip. |
+| `zinder_ingest_transparent_spend_fact_resolution_total` | counter | `zinder-ingest` | Transparent spend facts resolved during canonical ingest by status: `resolved` or `unresolved`. |
+| `zinder_ingest_transparent_spend_fact_read_total` | counter | `zinder-ingest` | Transparent spend facts read while building derive contexts by status: `resolved` or `unresolved`. |
+| `zinder_ingest_transparent_spend_fact_requested_outpoint_count` | histogram | `zinder-ingest` | Unique transparent outpoints requested while building one derive context batch. |
+| `zinder_ingest_raw_blob_disabled_total` | counter | `zinder-ingest` | Raw block or transaction blob rows intentionally skipped by `storage.raw_blob_policy`, labeled by table. |
+| `zinder_ingest_backfill_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup/backfill stage latency by stage, status, and error class; stages include `await_fact_build`, `populate_subtree_roots`, and `flush_store`. |
 | `zinder_ingest_commit_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit latency by status and error class. |
 | `zinder_ingest_commit_stage_duration_seconds` | histogram | `zinder-ingest` | Chain-epoch commit substage latency by stage, status, and error class. |
 | `zinder_ingest_commit_batch_block_count` | histogram | `zinder-ingest` | Blocks per ingest commit batch by status. |
-| `zinder_ingest_commit_batch_transparent_prevout_store_lookup_count` | histogram | `zinder-ingest` | Unique transparent prevouts read from the store per ingest commit batch by status. |
-| `zinder_ingest_batch_transparent_prevout_store_lookup_outpoints` | gauge | `zinder-ingest` | Current in-flight batch's unique transparent prevouts that must be read from the store. |
-| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count` or `transparent_prevout_store_lookup_count`. |
+| `zinder_ingest_commit_batch_transaction_count` | histogram | `zinder-ingest` | Transactions per ingest commit batch by status. |
+| `zinder_ingest_commit_batch_transparent_output_count` | histogram | `zinder-ingest` | Transparent outputs per ingest commit batch by status. |
+| `zinder_ingest_commit_batch_transparent_spend_reference_count` | histogram | `zinder-ingest` | Transparent spend references per ingest commit batch by status. |
+| `zinder_ingest_batch_accumulator_blocks` | gauge | `zinder-ingest` | Blocks currently accumulated in the in-flight ingest batch. |
+| `zinder_ingest_batch_accumulator_transactions` | gauge | `zinder-ingest` | Transactions currently accumulated in the in-flight ingest batch. |
+| `zinder_ingest_batch_accumulator_transparent_outputs` | gauge | `zinder-ingest` | Transparent outputs currently accumulated in the in-flight ingest batch. |
+| `zinder_ingest_batch_accumulator_transparent_spend_references` | gauge | `zinder-ingest` | Transparent spend references currently accumulated in the in-flight ingest batch. |
+| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count`, `transactions`, `transparent_outputs`, or `transparent_spend_references`. |
 | `zinder_ingest_writer_has_chain_epoch` | gauge | `zinder-ingest` | Whether the ingest writer currently has a visible chain epoch. |
 | `zinder_ingest_writer_chain_epoch_id` | gauge | `zinder-ingest` | Latest visible chain-epoch id published by the ingest writer. |
 | `zinder_ingest_writer_tip_height` | gauge | `zinder-ingest` | Latest visible tip height published by the ingest writer. |
@@ -274,6 +274,29 @@ observability documented in
 dashboards are agnostic to whether the metrics come from
 local-binary smoke or compose-attached deploy.
 
+### Resource Guardrails
+
+`deploy/docker-compose.yml` sets per-service memory ceilings through
+`mem_limit`, with network-specific defaults in `deploy/.env.<network>`.
+These limits are cgroup guardrails, not throughput controls. The
+application still owns bounded work units through canonical commit size,
+derive replay batch size, RocksDB WAL/cache budgets, and explicit
+backpressure. A memory limit should catch a regression that escapes those
+bounds; it should not be the mechanism that makes normal bulk catchup fit.
+
+Mainnet ingest gets the largest default ceiling because historical replay
+and transparent-output hydration are the only local stack paths expected to
+reach multi-GiB RSS during catchup. Readers and observability services stay
+under smaller limits so one runaway sidecar cannot starve the writer or the
+upstream Zebra process.
+
+`zinder-ingest` samples its cgroup and process RSS on a dedicated periodic
+task. The exported memory gauges are runtime health signals, not derive-replay
+progress signals, so they remain fresh while canonical catchup or derive replay
+spends a long time inside a single work pass. The derive replay budget gauges
+use the same current memory cadence, so `canonical-first` pressure state is
+observable even when the tailer is still finishing a retained-event pass.
+
 ### Federation patterns
 
 When operators want a single Grafana for everything, they have
@@ -407,12 +430,18 @@ reorg_window_blocks = 100        # chain-truth invariant
 catchup_threshold_blocks = 100   # defaults to ingest.reorg_window_blocks
 
 [ingest.derive]
-concurrency = 32                 # CPU-bound derive and replay hydration width
+replay_concurrency = 16          # derive replay context width
+replay_batch_blocks = 100        # bounded derive replay write chunk
+replay_policy = "canonical-first"
 
 [ingest.bulk_catchup]
-commit_batch_blocks = 1000
-max_transparent_prevout_store_lookups_per_batch = 250000
-fetch_concurrency = 32
+canonical_batch_max_blocks = 1000
+canonical_batch_max_artifact_bytes = 536870912
+source_segment_max_blocks = 128
+source_segment_target_response_bytes = 50331648
+source_fetch_max_in_flight_requests = 8
+source_fetch_max_in_flight_bytes = 268435456
+fact_build_concurrency = 16
 
 [ingest.tip_follow]
 poll_interval_ms = 1000
@@ -433,6 +462,19 @@ lag_threshold_blocks = 1
 [ingest_control]
 listen_addr = "127.0.0.1:9100"
 ```
+
+`source_segment_max_blocks` is a hard ceiling, not the steady-state request size.
+Bulk catch-up targets 75% of `node.max_response_bytes`, records source-segment
+payload bytes, shrinks the next request after oversized responses or dense
+payload samples, grows back after sustained success, carries learned density
+across bulk commit batches, and resets density when the node-advertised
+consensus branch changes. The source stage keeps a bounded ordered prefetch
+queue so several source segments can be awaiting Zebra at once without changing
+the serial commit contract. The Zebra JSON-RPC adapter still splits an oversized
+in-flight segment and emits
+`zinder_node_source_segment_split_total{reason="response_too_large"}`; repeated
+splits should drive `zinder_ingest_source_segment_next_blocks` down without an
+operator retune.
 
 `ingest.tip_follow.poll_interval_ms` and `node.health.poll_interval_ms`
 must be non-zero. Shutdown is driven by a `CancellationToken`; the

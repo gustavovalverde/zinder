@@ -307,9 +307,9 @@ fn smoke_ingest_toml(network: Network, json_rpc_url: &str) -> String {
 name = "{chain_name}"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "{json_rpc_url}"
 request_timeout_secs = 15
+max_response_bytes = 67108864
 
 [node.auth]
 method = "basic"
@@ -320,13 +320,22 @@ password = "REPLACE_VIA_ENV"
 path = "/var/lib/zinder/store"
 
 [ingest]
+source = "zebra-json-rpc"
 reorg_window_blocks = 100
-commit_batch_blocks = 100
+
+[ingest.bulk_catchup]
+canonical_batch_max_blocks = 100
+canonical_batch_max_artifact_bytes = 536870912
+source_segment_max_blocks = 128
+source_segment_target_response_bytes = 50331648
+source_fetch_max_in_flight_requests = 8
+source_fetch_max_in_flight_bytes = 268435456
+fact_build_concurrency = 16
 
 [ingest_control]
 listen_addr = "127.0.0.1:9100"
 
-[tip_follow]
+[ingest.tip_follow]
 poll_interval_ms = 2000
 "#
     )

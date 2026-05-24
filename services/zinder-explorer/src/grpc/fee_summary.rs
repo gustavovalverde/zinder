@@ -1,13 +1,8 @@
 //! `ExplorerQuery.FeeSummary` handler.
 //!
 //! Aggregates per-transaction ZIP-317 conventional fee floors over an
-//! inclusive block range. The handler reads each block via
-//! `WalletQuery.FullBlock`, parses the block bytes with `zebra-chain`,
-//! re-serializes each transaction so the canonical
-//! `zinder_source::parse_transaction_public_facts` produces the
-//! component counts, and sums the
-//! `TransactionComponentCounts::zip317_conventional_fee_zat` across
-//! every non-coinbase transaction. Coinbase transactions are excluded
+//! inclusive block range from the typed `BlockSummaryRecord` rows
+//! materialized by the derive plane. Coinbase transactions are excluded
 //! because they have no fee.
 //!
 //! The fee fields are ZIP-317 conventional fee floors, not
@@ -16,45 +11,40 @@
 //! is the minimum a wallet should attach to a transaction with the
 //! given shape.
 
+use prost::Message as _;
 use tonic::{Request, Response, Status};
-use zebra_chain::block::Block as ZebraBlock;
-use zebra_chain::serialization::{ZcashDeserializeInto as _, ZcashSerialize as _};
-use zinder_core::{Network, NetworkUpgradeActivations};
+use zinder_core::BlockHeight;
+use zinder_core::wire::encode_height_key_ascending;
+use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
-use zinder_proto::v1::explorer::{ExplorerFreshness, FeeSummaryRequest, FeeSummaryResponse};
-use zinder_proto::v1::wallet::{
-    self, FullBlockRequest, LatestBlockRequest, wallet_query_client::WalletQueryClient,
+use zinder_proto::v1::explorer::{
+    BlockSummaryRecord, ExplorerFreshness, FeeSummaryRequest, FeeSummaryResponse,
 };
+use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 /// Hard cap on the blocks one `FeeSummary` request aggregates.
 ///
-/// Each block triggers a `WalletQuery.FullBlock` RPC plus a per-block
-/// `zebra-chain` parse and per-transaction
-/// `parse_transaction_public_facts` decode. The cap keeps total parse
-/// cost bounded on mainnet blocks (median ~ a few dozen txs) without
-/// requiring a derive consumer.
+/// The wire response is a single aggregate over a contiguous window; the cap
+/// bounds one request's derive-store scan.
 const MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST: u32 = 256;
 
 /// Executes one `ExplorerQuery.FeeSummary` request.
 pub(crate) async fn handle_fee_summary(
+    derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    network: Network,
     request: Request<FeeSummaryRequest>,
 ) -> Result<Response<FeeSummaryResponse>, Status> {
     let inner = request.into_inner();
     validate_range(inner.start_height, inner.end_height)?;
-    let activations = NetworkUpgradeActivations::empty(network);
-    let mut aggregate = FeeAggregate::default();
-    for height in inner.start_height..=inner.end_height {
-        if let Some(full_block) =
-            fetch_full_block(wallet_client, height, inner.at_epoch.as_ref()).await?
-        {
-            aggregate_block(&mut aggregate, height, &full_block, &activations)?;
-        }
-    }
-    let chain_epoch = fetch_latest_chain_epoch(wallet_client).await?;
-    Ok(Response::new(build_response(aggregate, chain_epoch)))
+    let aggregate = aggregate_block_summaries(derive_store, inner.start_height, inner.end_height)?;
+    let (chain_epoch, canonical_tip) = fetch_latest_chain_epoch(wallet_client).await?;
+    Ok(Response::new(build_response(
+        derive_store,
+        aggregate,
+        chain_epoch,
+        canonical_tip,
+    )?))
 }
 
 fn validate_range(start_height: u32, end_height: u32) -> Result<(), Status> {
@@ -82,99 +72,102 @@ struct FeeAggregate {
     max_fee_zat: Option<u64>,
 }
 
-async fn fetch_full_block(
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    height: u32,
-    at_epoch: Option<&wallet::ChainEpoch>,
-) -> Result<Option<wallet::FullBlock>, Status> {
-    let outcome = wallet_client
-        .full_block(Request::new(FullBlockRequest {
-            block_height: height,
-            at_epoch: at_epoch.cloned(),
-        }))
-        .await;
-    match outcome {
-        Ok(envelope) => Ok(envelope.into_inner().block),
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
-        Err(status) => Err(status),
-    }
-}
-
-fn aggregate_block(
-    aggregate: &mut FeeAggregate,
-    height: u32,
-    full_block: &wallet::FullBlock,
-    activations: &NetworkUpgradeActivations,
-) -> Result<(), Status> {
-    let parsed: ZebraBlock = full_block
-        .raw_block_bytes
-        .as_slice()
-        .zcash_deserialize_into()
-        .map_err(|error| {
-            Status::internal(format!(
-                "raw_block_bytes for {height} did not parse: {error}",
-            ))
-        })?;
-    aggregate.block_count = aggregate.block_count.saturating_add(1);
-    for transaction in &parsed.transactions {
-        if transaction.is_coinbase() {
-            continue;
-        }
-        let raw_tx_bytes = transaction.zcash_serialize_to_vec().map_err(|error| {
-            Status::internal(format!(
-                "could not re-serialize transaction in block {height}: {error}",
-            ))
-        })?;
-        let facts = zinder_source::parse_transaction_public_facts(
-            &raw_tx_bytes,
-            Some(zinder_core::BlockHeight::new(height)),
-            activations,
+fn aggregate_block_summaries(
+    derive_store: &DeriveStore,
+    start_height: u32,
+    end_height: u32,
+) -> Result<FeeAggregate, Status> {
+    let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
+    let end_key = encode_height_key_ascending(BlockHeight::new(end_height));
+    let entries = derive_store
+        .range_iterate_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &start_key,
+            &end_key,
+            MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST as usize,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
-        let fee_zat = facts.counts.zip317_conventional_fee_zat();
-        aggregate.transaction_count = aggregate.transaction_count.saturating_add(1);
-        aggregate.total_fee_zat = aggregate.total_fee_zat.saturating_add(fee_zat);
-        aggregate.min_fee_zat = Some(
-            aggregate
-                .min_fee_zat
-                .map_or(fee_zat, |prior| prior.min(fee_zat)),
-        );
-        aggregate.max_fee_zat = Some(
-            aggregate
-                .max_fee_zat
-                .map_or(fee_zat, |prior| prior.max(fee_zat)),
-        );
+
+    let mut aggregate = FeeAggregate::default();
+    for (_, payload) in entries {
+        let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+            Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
+        })?;
+        let summary = record
+            .summary
+            .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+        aggregate.block_count = aggregate.block_count.saturating_add(1);
+        aggregate.transaction_count = aggregate
+            .transaction_count
+            .saturating_add(record.fee_transaction_count);
+        aggregate.total_fee_zat = aggregate
+            .total_fee_zat
+            .saturating_add(summary.fees_collected_zat);
+        if record.fee_transaction_count > 0 {
+            aggregate.min_fee_zat = Some(
+                aggregate
+                    .min_fee_zat
+                    .map_or(record.min_zip317_conventional_fee_zat, |prior| {
+                        prior.min(record.min_zip317_conventional_fee_zat)
+                    }),
+            );
+            aggregate.max_fee_zat = Some(
+                aggregate
+                    .max_fee_zat
+                    .map_or(record.max_zip317_conventional_fee_zat, |prior| {
+                        prior.max(record.max_zip317_conventional_fee_zat)
+                    }),
+            );
+        }
     }
-    Ok(())
+    Ok(aggregate)
 }
 
-fn build_response(aggregate: FeeAggregate, chain_epoch: wallet::ChainEpoch) -> FeeSummaryResponse {
+fn build_response(
+    derive_store: &DeriveStore,
+    aggregate: FeeAggregate,
+    chain_epoch: wallet::ChainEpoch,
+    canonical_tip: u32,
+) -> Result<FeeSummaryResponse, Status> {
+    let derive_tip = derive_store
+        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map(BlockHeight::value);
+    let derive_cursor_lag_blocks = derive_tip.map_or_else(
+        || u64::from(canonical_tip),
+        |materialized| u64::from(canonical_tip.saturating_sub(materialized)),
+    );
     let freshness = ExplorerFreshness {
         chain_epoch: Some(chain_epoch),
         snapshot_age_millis: 0,
-        derive_cursor_lag_blocks: 0,
+        derive_cursor_lag_blocks,
         derive_cursor_lag_millis: 0,
         capability_version: EXPLORER_FEE_SUMMARY_V1.to_owned(),
         unavailable: Vec::new(),
     };
-    FeeSummaryResponse {
+    Ok(FeeSummaryResponse {
         freshness: Some(freshness),
         block_count: aggregate.block_count,
         transaction_count: aggregate.transaction_count,
         total_zip317_conventional_fee_zat: aggregate.total_fee_zat,
         min_zip317_conventional_fee_zat: aggregate.min_fee_zat.unwrap_or(0),
         max_zip317_conventional_fee_zat: aggregate.max_fee_zat.unwrap_or(0),
-    }
+    })
 }
 
 async fn fetch_latest_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<wallet::ChainEpoch, Status> {
+) -> Result<(wallet::ChainEpoch, u32), Status> {
     let response = wallet_client
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
         .into_inner();
-    response
+    let chain_epoch = response
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))
+        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+    let canonical_tip = response
+        .latest_block
+        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
+        .height;
+    Ok((chain_epoch, canonical_tip))
 }

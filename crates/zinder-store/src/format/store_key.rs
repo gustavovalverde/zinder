@@ -12,20 +12,24 @@ use zinder_core::{
 pub(crate) struct StoreKey(Vec<u8>);
 
 const KEY_VERSION: u8 = 1;
-const FINALIZED_BLOCK_KEY_KIND: u8 = 1;
+const BLOCK_HEADER_KEY_KIND: u8 = 1;
 const COMPACT_BLOCK_KEY_KIND: u8 = 2;
-const TRANSACTION_KEY_KIND: u8 = 3;
+const TRANSACTION_FACTS_KEY_KIND: u8 = 3;
 const TREE_STATE_KEY_KIND: u8 = 4;
 const SUBTREE_ROOT_KEY_KIND: u8 = 5;
-const TRANSPARENT_ADDRESS_UTXO_KEY_KIND: u8 = 6;
-const TRANSPARENT_UTXO_SPEND_KEY_KIND: u8 = 7;
+const ADDRESS_OUTPUT_INDEX_KEY_KIND: u8 = 6;
+const TRANSPARENT_SPEND_FACT_KEY_KIND: u8 = 7;
 const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
 const TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND: u8 = 9;
 const BLOCK_HASH_INDEX_KEY_KIND: u8 = 10;
-const TRANSPARENT_PREVOUT_KEY_KIND: u8 = 11;
-const TRANSPARENT_PREVOUT_HISTORY_KEY_KIND: u8 = 12;
-const TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND: u8 = 13;
-// Key kinds 14..=32 are reserved for future artifact families; visibility keys start at 33.
+const TRANSPARENT_OUTPUT_KEY_KIND: u8 = 11;
+const TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND: u8 = 13;
+const BLOCK_BLOB_KEY_KIND: u8 = 14;
+const BLOCK_TRANSACTION_INDEX_KEY_KIND: u8 = 15;
+const TRANSACTION_LOCATION_KEY_KIND: u8 = 16;
+const TRANSACTION_BLOB_KEY_KIND: u8 = 17;
+const TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND: u8 = 19;
+// Key kinds 20..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -89,12 +93,22 @@ impl StoreKey {
         Self(key)
     }
 
-    pub(crate) fn finalized_block(
+    pub(crate) fn block_header(
         network: Network,
         chain_epoch: ChainEpochId,
         height: BlockHeight,
     ) -> Self {
-        let mut key = artifact_key_prefix(FINALIZED_BLOCK_KEY_KIND);
+        let mut key = artifact_key_prefix(BLOCK_HEADER_KEY_KIND);
+        push_network_epoch_height(&mut key, network, chain_epoch, height);
+        Self(key)
+    }
+
+    pub(crate) fn block_blob(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(BLOCK_BLOB_KEY_KIND);
         push_network_epoch_height(&mut key, network, chain_epoch, height);
         Self(key)
     }
@@ -109,12 +123,59 @@ impl StoreKey {
         Self(key)
     }
 
-    pub(crate) fn transaction(
+    pub(crate) fn block_transaction_index(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+        tx_index_in_block: u32,
+    ) -> Self {
+        let mut key = Self::block_transaction_index_prefix(network, chain_epoch, height).0;
+        key.extend_from_slice(&tx_index_in_block.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn block_transaction_index_prefix(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(BLOCK_TRANSACTION_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        key.extend_from_slice(&height.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transaction_location(
         network: Network,
         chain_epoch: ChainEpochId,
         transaction_id: TransactionId,
     ) -> Self {
-        let mut key = artifact_key_prefix(TRANSACTION_KEY_KIND);
+        let mut key = artifact_key_prefix(TRANSACTION_LOCATION_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        key.extend_from_slice(&transaction_id.as_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transaction_facts(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        transaction_id: TransactionId,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSACTION_FACTS_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        key.extend_from_slice(&transaction_id.as_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transaction_blob(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        transaction_id: TransactionId,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSACTION_BLOB_KEY_KIND);
         key.extend_from_slice(&network.id().to_be_bytes());
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
         key.extend_from_slice(&transaction_id.as_bytes());
@@ -131,6 +192,32 @@ impl StoreKey {
         Self(key)
     }
 
+    pub(crate) fn tree_state_network_prefix(network: Network) -> Self {
+        let mut key = artifact_key_prefix(TREE_STATE_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn tree_state_key_parts(key_bytes: &[u8]) -> Option<(ChainEpochId, BlockHeight)> {
+        let prefix_len = STORE_KEY_HEADER_LEN + NETWORK_ID_LEN;
+        let expected_len = prefix_len + CHAIN_EPOCH_ID_LEN + BLOCK_HEIGHT_LEN;
+        if key_bytes.len() != expected_len
+            || key_bytes.first().copied() != Some(KEY_VERSION)
+            || key_bytes.get(1).copied() != Some(TREE_STATE_KEY_KIND)
+        {
+            return None;
+        }
+        let epoch_start = prefix_len;
+        let height_start = epoch_start + CHAIN_EPOCH_ID_LEN;
+        let epoch_bytes =
+            <[u8; CHAIN_EPOCH_ID_LEN]>::try_from(&key_bytes[epoch_start..height_start]).ok()?;
+        let height_bytes = <[u8; BLOCK_HEIGHT_LEN]>::try_from(&key_bytes[height_start..]).ok()?;
+        Some((
+            ChainEpochId::new(u64::from_be_bytes(epoch_bytes)),
+            BlockHeight::new(u32::from_be_bytes(height_bytes)),
+        ))
+    }
+
     pub(crate) fn subtree_root(
         network: Network,
         chain_epoch: ChainEpochId,
@@ -145,24 +232,24 @@ impl StoreKey {
         Self(key)
     }
 
-    pub(crate) fn transparent_address_utxo_prefix(
+    pub(crate) fn address_output_index_prefix(
         network: Network,
         address_script_hash: TransparentAddressScriptHash,
     ) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_ADDRESS_UTXO_KEY_KIND);
+        let mut key = artifact_key_prefix(ADDRESS_OUTPUT_INDEX_KEY_KIND);
         key.extend_from_slice(&network.id().to_be_bytes());
         key.extend_from_slice(&address_script_hash.as_bytes());
         Self(key)
     }
 
-    pub(crate) fn transparent_address_utxo(
+    pub(crate) fn address_output_index(
         network: Network,
         address_script_hash: TransparentAddressScriptHash,
         height: BlockHeight,
         outpoint: TransparentOutPoint,
         chain_epoch: ChainEpochId,
     ) -> Self {
-        let mut key = Self::transparent_address_utxo_prefix(network, address_script_hash).0;
+        let mut key = Self::address_output_index_prefix(network, address_script_hash).0;
         key.extend_from_slice(&height.value().to_be_bytes());
         key.extend_from_slice(&outpoint.transaction_id.as_bytes());
         key.extend_from_slice(&outpoint.output_index.to_be_bytes());
@@ -170,77 +257,63 @@ impl StoreKey {
         Self(key)
     }
 
-    pub(crate) fn transparent_utxo_spend_prefix(
-        network: Network,
-        outpoint: TransparentOutPoint,
-    ) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_UTXO_SPEND_KEY_KIND);
+    pub(crate) fn transparent_output_network_prefix(network: Network) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_OUTPUT_KEY_KIND);
         key.extend_from_slice(&network.id().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_output(network: Network, outpoint: TransparentOutPoint) -> Self {
+        let mut key = Self::transparent_output_network_prefix(network).0;
         key.extend_from_slice(&outpoint.transaction_id.as_bytes());
         key.extend_from_slice(&outpoint.output_index.to_be_bytes());
         Self(key)
     }
 
-    pub(crate) fn transparent_prevout_network_prefix(network: Network) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_KEY_KIND);
-        key.extend_from_slice(&network.id().to_be_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_prevout(network: Network, outpoint: TransparentOutPoint) -> Self {
-        let mut key = Self::transparent_prevout_network_prefix(network).0;
-        key.extend_from_slice(&outpoint.transaction_id.as_bytes());
-        key.extend_from_slice(&outpoint.output_index.to_be_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_prevout_history_prefix(
-        network: Network,
-        outpoint: TransparentOutPoint,
-    ) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_HISTORY_KEY_KIND);
-        key.extend_from_slice(&network.id().to_be_bytes());
-        key.extend_from_slice(&outpoint.transaction_id.as_bytes());
-        key.extend_from_slice(&outpoint.output_index.to_be_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_prevout_history(
-        network: Network,
-        outpoint: TransparentOutPoint,
-        chain_epoch: ChainEpochId,
-    ) -> Self {
-        let mut key = Self::transparent_prevout_history_prefix(network, outpoint).0;
-        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_prevout_block_index_prefix(
+    pub(crate) fn transparent_output_block_index_prefix(
         network: Network,
         height: BlockHeight,
     ) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND);
+        let mut key = artifact_key_prefix(TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND);
         key.extend_from_slice(&network.id().to_be_bytes());
         key.extend_from_slice(&height.value().to_be_bytes());
         Self(key)
     }
 
-    pub(crate) fn transparent_prevout_block_index(
+    pub(crate) fn transparent_output_block_index(
         network: Network,
         height: BlockHeight,
         chain_epoch: ChainEpochId,
     ) -> Self {
-        let mut key = Self::transparent_prevout_block_index_prefix(network, height).0;
+        let mut key = Self::transparent_output_block_index_prefix(network, height).0;
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
         Self(key)
     }
 
-    pub(crate) fn transparent_utxo_spend(
+    pub(crate) fn transparent_spend_fact(network: Network, outpoint: TransparentOutPoint) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_SPEND_FACT_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&outpoint.transaction_id.as_bytes());
+        key.extend_from_slice(&outpoint.output_index.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_spend_fact_block_index_prefix(
         network: Network,
-        outpoint: TransparentOutPoint,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&height.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn transparent_spend_fact_block_index(
+        network: Network,
+        height: BlockHeight,
         chain_epoch: ChainEpochId,
     ) -> Self {
-        let mut key = Self::transparent_utxo_spend_prefix(network, outpoint).0;
+        let mut key = Self::transparent_spend_fact_block_index_prefix(network, height).0;
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
         Self(key)
     }
@@ -347,6 +420,7 @@ impl StoreKey {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_tree_state_epoch_prefix(network: Network, height: BlockHeight) -> Self {
         visible_height_epoch_prefix(VISIBLE_TREE_STATE_EPOCH_KEY_KIND, network, height)
     }
@@ -442,10 +516,9 @@ impl StoreKey {
         }
         if !matches!(
             key_bytes[1],
-            TRANSPARENT_ADDRESS_UTXO_KEY_KIND
-                | TRANSPARENT_UTXO_SPEND_KEY_KIND
-                | TRANSPARENT_PREVOUT_HISTORY_KEY_KIND
-                | TRANSPARENT_PREVOUT_BLOCK_INDEX_KEY_KIND
+            ADDRESS_OUTPUT_INDEX_KEY_KIND
+                | TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND
+                | TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND
                 | TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND
         ) {
             return None;
@@ -511,9 +584,9 @@ mod tests {
         let transaction_id = TransactionId::from_bytes([0x11; 32]);
         let subtree_index = SubtreeRootIndex::new(3);
         let artifact_prefixes = [
-            StoreKey::finalized_block(network, chain_epoch, height),
+            StoreKey::block_header(network, chain_epoch, height),
             StoreKey::compact_block(network, chain_epoch, height),
-            StoreKey::transaction(network, chain_epoch, transaction_id),
+            StoreKey::transaction_facts(network, chain_epoch, transaction_id),
             StoreKey::tree_state(network, chain_epoch, height),
             StoreKey::subtree_root(
                 network,
@@ -521,28 +594,23 @@ mod tests {
                 ShieldedProtocol::Sapling,
                 subtree_index,
             ),
-            StoreKey::transparent_address_utxo(
+            StoreKey::address_output_index(
                 network,
                 zinder_core::TransparentAddressScriptHash::from_bytes([0x44; 32]),
                 height,
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
                 chain_epoch,
             ),
-            StoreKey::transparent_utxo_spend(
-                network,
-                zinder_core::TransparentOutPoint::new(transaction_id, 0),
-                chain_epoch,
-            ),
-            StoreKey::transparent_prevout(
+            StoreKey::transparent_spend_fact(
                 network,
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
             ),
-            StoreKey::transparent_prevout_history(
+            StoreKey::transparent_spend_fact_block_index(network, height, chain_epoch),
+            StoreKey::transparent_output(
                 network,
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
-                chain_epoch,
             ),
-            StoreKey::transparent_prevout_block_index(network, height, chain_epoch),
+            StoreKey::transparent_output_block_index(network, height, chain_epoch),
             StoreKey::transparent_address_tx_index(
                 network,
                 zinder_core::TransparentAddressScriptHash::from_bytes([0x55; 32]),

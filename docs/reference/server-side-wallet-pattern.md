@@ -10,7 +10,7 @@ This page is the canonical recipe for building a server-side Zcash wallet on top
 | Wallet state + key storage | [`zcash_client_sqlite`](https://crates.io/crates/zcash_client_sqlite) | SQLite-backed accounts, addresses, notes, transactions |
 | Transaction building | [`zcash_primitives`](https://crates.io/crates/zcash_primitives) | Constructing transactions, computing fees, signing |
 | Sapling/Orchard proving | [`zcash_proofs`](https://crates.io/crates/zcash_proofs) | Zero-knowledge proof generation |
-| Chain reads + broadcast | **Zinder** | Compact blocks, tree state, subtree roots, transparent UTXOs, mempool, broadcast |
+| Chain reads + broadcast | **Zinder** | Compact blocks, tree state, subtree roots, transparent outputs, mempool, broadcast |
 | Upstream node | Zebra | Block production / consensus / mempool source |
 
 Zinder tracks the workspace's pinned `librustzcash` release train. Server-side
@@ -38,7 +38,7 @@ flowchart LR
     end
 
     Backend -->|compact blocks<br/>tree state<br/>subtree roots| Zinder
-    Backend -->|transparent UTXOs<br/>tx history| Zinder
+    Backend -->|transparent outputs<br/>tx history| Zinder
     Builder -->|broadcast raw tx| Zinder
     Keys --> Backend
     Backend --> Sqlite
@@ -55,7 +55,7 @@ flowchart LR
 
 The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Chain events §Address Filters](../architecture/chain-events.md#address-filters)).
 
-1. **Snapshot phase**: paginate the current state for each tracked account using `WalletQuery.TransparentAddressUtxosStream` (transparent) plus `WalletQuery.CompactBlockRange` + `WalletQuery.TreeState` (shielded, fed to `zcash_client_backend::scan_cached_blocks`).
+1. **Snapshot phase**: paginate the current state for each tracked account using `WalletQuery.AddressOutputIndexStream` (transparent) plus `WalletQuery.CompactBlockRange` + `WalletQuery.TreeState` (shielded, fed to `zcash_client_backend::scan_cached_blocks`).
 2. **Subscribe phase**: open a `WalletQuery.ChainEvents` stream with the addresses you care about in `address_filter`. Each envelope tells you a chain epoch advanced (commit) or replaced (reorg); use the height range to re-derive the affected slice from `compact_block_at` and merge the result into `zcash_client_sqlite`.
 3. **Broadcast phase**: build the transaction with `zcash_primitives::transaction::builder::Builder`, prove it with `zcash_proofs`, and post the raw bytes via `WalletQuery.BroadcastTransaction`.
 4. **Cursor persistence**: store the bytes from the latest `ChainEventEnvelope.cursor` durably alongside your wallet state. On restart, replay strictly after that cursor.
@@ -83,17 +83,17 @@ async fn run_server_wallet(
     // 2. Persist the wallet state in zcash_client_sqlite. (Pseudocode.)
     let mut wallet = open_wallet_db("wallet.sqlite")?;
 
-    // 3. Snapshot: paginate transparent UTXOs for every watched address.
+    // 3. Snapshot: paginate transparent outputs for every watched address.
     for address in &watched_addresses {
         let mut cursor = None;
         loop {
             let page = zinder
-                .transparent_address_utxos(
+                .address_output_index(
                     transparent_address_query(address, cursor.clone()),
                     None,
                 )
                 .await?;
-            wallet.absorb_transparent_utxos(&page.utxos)?;
+            wallet.absorb_transparent_outputs(&page.outputs)?;
             match page.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,

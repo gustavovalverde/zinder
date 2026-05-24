@@ -17,7 +17,8 @@ use zinder_core::{
 use zinder_proto::v1::wallet;
 use zinder_query::{
     ArtifactKey, QueryError, WalletQuery, WalletQueryApi, WalletQueryOptions,
-    latest_block_response, latest_tree_state_response, subtree_roots_response, tree_state_response,
+    latest_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
+    tree_state_checkpoint_response,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
@@ -170,7 +171,7 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
 }
 
 #[tokio::test]
-async fn tree_state_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
+async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
@@ -186,7 +187,7 @@ async fn tree_state_response_uses_native_wallet_proto_shape() -> eyre::Result<()
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = tree_state_response(&wallet_query, BlockHeight::new(1), None).await?;
+    let response = tree_state_checkpoint_response(&wallet_query, BlockHeight::new(1), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
@@ -206,7 +207,7 @@ async fn tree_state_response_uses_native_wallet_proto_shape() -> eyre::Result<()
 }
 
 #[tokio::test]
-async fn latest_tree_state_response_uses_tip_tree_state() -> eyre::Result<()> {
+async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
@@ -222,7 +223,7 @@ async fn latest_tree_state_response_uses_tip_tree_state() -> eyre::Result<()> {
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = latest_tree_state_response(&wallet_query, None).await?;
+    let response = latest_tree_state_checkpoint_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
 
@@ -461,8 +462,8 @@ async fn compact_block_range_reports_unavailable_artifact_without_node_repair() 
 }
 
 #[tokio::test]
-async fn tree_state_response_reports_unavailable_artifact_without_node_repair() -> eyre::Result<()>
-{
+async fn tree_state_checkpoint_response_reports_unavailable_artifact_without_node_repair()
+-> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
@@ -474,10 +475,11 @@ async fn tree_state_response_reports_unavailable_artifact_without_node_repair() 
     ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match tree_state_response(&wallet_query, BlockHeight::new(1), None).await {
-        Ok(tree_state_response) => {
+    let error = match tree_state_checkpoint_response(&wallet_query, BlockHeight::new(1), None).await
+    {
+        Ok(tree_state_checkpoint_response) => {
             return Err(eyre!(
-                "expected unavailable artifact, got {tree_state_response:?}"
+                "expected unavailable artifact, got {tree_state_checkpoint_response:?}"
             ));
         }
         Err(error) => error,

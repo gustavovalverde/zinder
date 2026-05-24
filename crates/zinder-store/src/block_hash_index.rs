@@ -13,7 +13,7 @@ use zinder_core::{BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId, Net
 
 use crate::{
     ArtifactFamily, StoreError,
-    block_artifact::read_block_artifact,
+    block_artifact::read_block_header_artifact,
     format::StoreKey,
     kv::{RocksChainStoreRead, StoragePut, StorageTable},
 };
@@ -60,7 +60,7 @@ pub(crate) fn read_block_hash_lookup(
         return Ok(BlockHashLookup::NotInBestChain);
     }
 
-    match read_block_artifact(inner, chain_epoch, recorded_height) {
+    match read_block_header_artifact(inner, chain_epoch, recorded_height) {
         Ok(Some(block)) if block.block_hash == block_hash => Ok(BlockHashLookup::Resolved(
             BlockId::new(recorded_height, block_hash),
         )),

@@ -31,6 +31,7 @@ zcash_primitives = { version = "0.26.4", default-features = false, features = ["
 zcash_protocol = { version = "0.7.2", default-features = false, features = ["local-consensus", "std"] }
 zcash_transparent = { version = "0.6.4", default-features = false, features = ["transparent-inputs", "std"] }
 zinder-core.workspace = true
+zinder-derive.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true

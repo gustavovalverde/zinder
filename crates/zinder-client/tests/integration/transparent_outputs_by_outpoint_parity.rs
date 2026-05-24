@@ -10,22 +10,21 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use zinder_client::{
-    BlockHeight, ChainEpochId, ChainIndex, LocalChainIndex, LocalOpenOptions,
-    MAX_TRANSPARENT_PREVOUTS_PER_REQUEST, Network, RemoteChainIndex, RemoteOpenOptions,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressUtxoArtifact,
-    TransparentOutPoint,
+    AddressOutputIndexArtifact, BlockHeight, ChainEpochId, ChainIndex, LocalChainIndex,
+    LocalOpenOptions, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RemoteChainIndex,
+    RemoteOpenOptions, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
-struct TransparentPrevoutParityHarness {
+struct TransparentOutputParityHarness {
     _store_fixture: StoreFixture,
     local: LocalChainIndex,
     remote: RemoteChainIndex,
     indexed_transaction_id: TransactionId,
 }
 
-async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevoutParityHarness> {
+async fn transparent_output_parity_harness() -> eyre::Result<TransparentOutputParityHarness> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let block = chain_fixture
         .block_at(BlockHeight::new(1))
@@ -35,15 +34,14 @@ async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevout
     let transaction_id = TransactionId::from_bytes([0xCC; 32]);
     let script_pub_key = vec![0x76, 0xa9, 0x42, 0x88, 0xac];
     let outpoint = TransparentOutPoint::new(transaction_id, 0);
-    let chain_fixture =
-        chain_fixture.with_transparent_address_utxo(TransparentAddressUtxoArtifact::new(
-            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
-            script_pub_key,
-            outpoint,
-            10_000_000,
-            block_height,
-            block_hash,
-        ));
+    let chain_fixture = chain_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+        script_pub_key,
+        outpoint,
+        10_000_000,
+        block_height,
+        block_hash,
+    ));
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
@@ -67,7 +65,7 @@ async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevout
     })
     .await?;
 
-    Ok(TransparentPrevoutParityHarness {
+    Ok(TransparentOutputParityHarness {
         _store_fixture: store_fixture,
         local,
         remote,
@@ -76,52 +74,63 @@ async fn transparent_prevout_parity_harness() -> eyre::Result<TransparentPrevout
 }
 
 #[tokio::test]
-async fn local_and_remote_resolve_identical_transparent_prevouts() -> eyre::Result<()> {
-    let harness = transparent_prevout_parity_harness().await?;
+async fn local_and_remote_resolve_identical_transparent_outputs_by_outpoint() -> eyre::Result<()> {
+    let harness = transparent_output_parity_harness().await?;
     let outpoints = vec![
         TransparentOutPoint::new(harness.indexed_transaction_id, 0),
         TransparentOutPoint::new(TransactionId::from_bytes([0xEE; 32]), 0),
     ];
-    let local_response = harness.local.transparent_prevouts(&outpoints, None).await?;
+    let local_response = harness
+        .local
+        .transparent_outputs_by_outpoint(&outpoints, None)
+        .await?;
     let remote_response = harness
         .remote
-        .transparent_prevouts(&outpoints, None)
+        .transparent_outputs_by_outpoint(&outpoints, None)
         .await?;
 
     assert_eq!(local_response.chain_epoch, remote_response.chain_epoch);
     assert_eq!(local_response.entries, remote_response.entries);
     assert_eq!(local_response.entries.len(), 2);
-    assert!(local_response.entries[0].prevout.is_some());
-    assert!(local_response.entries[1].prevout.is_none());
+    assert!(local_response.entries[0].output.is_some());
+    assert!(local_response.entries[1].output.is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn local_and_remote_truncate_transparent_prevout_requests() -> eyre::Result<()> {
-    let harness = transparent_prevout_parity_harness().await?;
+async fn local_and_remote_truncate_transparent_output_requests() -> eyre::Result<()> {
+    let harness = transparent_output_parity_harness().await?;
     let outpoints = oversized_outpoints();
 
-    let local_response = harness.local.transparent_prevouts(&outpoints, None).await?;
+    let local_response = harness
+        .local
+        .transparent_outputs_by_outpoint(&outpoints, None)
+        .await?;
     let remote_response = harness
         .remote
-        .transparent_prevouts(&outpoints, None)
+        .transparent_outputs_by_outpoint(&outpoints, None)
         .await?;
 
     assert_eq!(local_response.chain_epoch, remote_response.chain_epoch);
     assert_eq!(local_response.entries, remote_response.entries);
     assert_eq!(
         local_response.entries.len(),
-        MAX_TRANSPARENT_PREVOUTS_PER_REQUEST
+        MAX_TRANSPARENT_OUTPUTS_PER_REQUEST
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn local_and_remote_reject_coinbase_sentinel_transparent_prevouts() -> eyre::Result<()> {
-    let harness = transparent_prevout_parity_harness().await?;
+async fn local_and_remote_reject_coinbase_sentinel_transparent_outputs_by_outpoint()
+-> eyre::Result<()> {
+    let harness = transparent_output_parity_harness().await?;
     let outpoints = [TransparentOutPoint::COINBASE_SENTINEL];
 
-    let local_error = match harness.local.transparent_prevouts(&outpoints, None).await {
+    let local_error = match harness
+        .local
+        .transparent_outputs_by_outpoint(&outpoints, None)
+        .await
+    {
         Ok(response) => {
             return Err(eyre!(
                 "expected local coinbase sentinel rejection, got {response:?}"
@@ -131,7 +140,11 @@ async fn local_and_remote_reject_coinbase_sentinel_transparent_prevouts() -> eyr
     };
     assert!(local_error.to_string().contains("coinbase sentinel"));
 
-    let remote_error = match harness.remote.transparent_prevouts(&outpoints, None).await {
+    let remote_error = match harness
+        .remote
+        .transparent_outputs_by_outpoint(&outpoints, None)
+        .await
+    {
         Ok(response) => {
             return Err(eyre!(
                 "expected remote coinbase sentinel rejection, got {response:?}"
@@ -144,7 +157,7 @@ async fn local_and_remote_reject_coinbase_sentinel_transparent_prevouts() -> eyr
 }
 
 fn oversized_outpoints() -> Vec<TransparentOutPoint> {
-    (0..=MAX_TRANSPARENT_PREVOUTS_PER_REQUEST)
+    (0..=MAX_TRANSPARENT_OUTPUTS_PER_REQUEST)
         .map(|request_index| {
             let mut transaction_id_bytes = [0x55; 32];
             let index_bytes = request_index.to_le_bytes();

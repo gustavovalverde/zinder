@@ -21,11 +21,13 @@ pub(crate) fn parse_node_source(node_source: &str) -> Result<NodeSourceKind, Ing
 }
 
 /// Parses the maximum commit batch size.
-pub(crate) fn parse_commit_batch_blocks(
-    commit_batch_blocks: u32,
+pub(crate) fn parse_canonical_batch_max_blocks(
+    canonical_batch_max_blocks: u32,
 ) -> Result<NonZeroU32, ConfigError> {
-    NonZeroU32::new(commit_batch_blocks).ok_or_else(|| {
-        ConfigError::invalid("ingest.bulk_catchup.commit_batch_blocks must be greater than zero")
+    NonZeroU32::new(canonical_batch_max_blocks).ok_or_else(|| {
+        ConfigError::invalid(
+            "ingest.bulk_catchup.canonical_batch_max_blocks must be greater than zero",
+        )
     })
 }
 

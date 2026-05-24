@@ -1,9 +1,9 @@
 //! Deterministic source-block artifact builders.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
 
 use prost::Message;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zebra_chain::{
     block::Block as ZebraBlock,
@@ -12,10 +12,11 @@ use zebra_chain::{
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
-    ShieldedProtocol, TransactionArtifact, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutArtifact,
-    TransparentUtxoSpendArtifact, TreeStateArtifact,
+    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact,
+    BlockTransactionIndexArtifact, ChainTipMetadata, CompactBlockArtifact,
+    NetworkUpgradeActivations, ShieldedProtocol, TransactionBlobArtifact, TransactionFactsArtifact,
+    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
     wire::{encode_display_block_hash_hex, encode_internal_block_hash},
 };
 
@@ -24,12 +25,44 @@ use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
 };
-use zinder_source::SourceBlock;
+use zinder_source::{
+    SourceBlock, block_header_info_from_raw_block_bytes, parse_transaction_public_facts,
+};
 
 const LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION: u32 = 1;
 const COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN: usize = 52;
-const SAPLING_TREE_POOL: &str = "sapling";
-const ORCHARD_TREE_POOL: &str = "orchard";
+
+/// Policy controlling optional raw-byte blob writes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawBlobPolicy {
+    /// Write no raw block or transaction blobs.
+    None,
+    /// Write raw transaction blobs only.
+    Transactions,
+    /// Write both raw block blobs and raw transaction blobs.
+    All,
+}
+
+impl RawBlobPolicy {
+    /// Returns the config spelling for this policy.
+    #[must_use]
+    pub const fn as_kebab_case(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Transactions => "transactions",
+            Self::All => "all",
+        }
+    }
+
+    const fn writes_block_blobs(self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    const fn writes_transaction_blobs(self) -> bool {
+        matches!(self, Self::Transactions | Self::All)
+    }
+}
 
 /// Error returned while deriving canonical artifacts from source blocks.
 #[derive(Debug, Error)]
@@ -77,57 +110,6 @@ pub enum ArtifactDeriveError {
         protocol: ShieldedProtocol,
     },
 
-    /// Built compact-block tree sizes do not match node-observed tree sizes.
-    #[error(
-        "compact block tree sizes sapling={expected_sapling} orchard={expected_orchard} do not match observed sapling={observed_sapling} orchard={observed_orchard}"
-    )]
-    ObservedTreeSizeMismatch {
-        /// Expected Sapling tree size after this block.
-        expected_sapling: u32,
-        /// Expected Orchard tree size after this block.
-        expected_orchard: u32,
-        /// Observed Sapling tree size from node-supplied tree state.
-        observed_sapling: u32,
-        /// Observed Orchard tree size from node-supplied tree state.
-        observed_orchard: u32,
-    },
-
-    /// Node-supplied tree-state payload is not valid JSON.
-    #[error("tree-state JSON parse failed: {source}")]
-    TreeStateParseFailed {
-        /// Underlying JSON error.
-        #[source]
-        source: serde_json::Error,
-    },
-
-    /// Tree-state pool size does not fit a u32.
-    #[error("tree-state {pool} size does not fit u32")]
-    TreeStateSizeOverflow {
-        /// Pool name from the node tree-state payload.
-        pool: &'static str,
-    },
-
-    /// Tree-state pool size string failed to parse as u32.
-    #[error("tree-state {pool} size string failed to parse as u32: {source}")]
-    TreeStateSizeStringInvalid {
-        /// Pool name from the node tree-state payload.
-        pool: &'static str,
-        /// Underlying integer parse error.
-        #[source]
-        source: std::num::ParseIntError,
-    },
-
-    /// Tree-state pool size is neither an integer nor an integer string.
-    #[error("tree-state {pool} size must be an integer or integer string")]
-    TreeStateSizeShape {
-        /// Pool name from the node tree-state payload.
-        pool: &'static str,
-    },
-
-    /// Node-supplied tree-state payload has no recognized pool sizes.
-    #[error("tree-state payload does not contain recognized Sapling or Orchard pool sizes")]
-    UnrecognizedTreeStateShape,
-
     /// A counted field cannot be encoded as u32.
     #[error("{field} does not fit u32")]
     CountOverflow {
@@ -147,8 +129,8 @@ pub enum ArtifactDeriveError {
     },
 
     /// Transparent input previous transaction id has the wrong length.
-    #[error("transparent prevout transaction id is {byte_count} bytes, expected 32")]
-    TransparentPrevoutTransactionIdMalformed {
+    #[error("transparent input prevout transaction id is {byte_count} bytes, expected 32")]
+    TransparentOutputTransactionIdMalformed {
         /// Observed byte count.
         byte_count: usize,
     },
@@ -156,6 +138,24 @@ pub enum ArtifactDeriveError {
     /// Transparent output index cannot be represented as `u32`.
     #[error("transparent output index does not fit u32")]
     TransparentOutputIndexOverflow,
+
+    /// Transaction index cannot be represented as `u32`.
+    #[error("transaction index does not fit u32")]
+    TransactionIndexOverflow,
+
+    /// Parsing typed block-header facts failed.
+    #[error("block header fact parse failed: {reason}")]
+    BlockHeaderParseFailed {
+        /// Parser failure reason.
+        reason: String,
+    },
+
+    /// Parsing typed transaction facts failed.
+    #[error("transaction fact parse failed: {reason}")]
+    TransactionFactsParseFailed {
+        /// Parser failure reason.
+        reason: String,
+    },
 
     /// Round-tripping a parsed transaction back to canonical bytes failed.
     #[error("transaction serialization failed: {source}")]
@@ -257,26 +257,6 @@ impl CommitmentTreeSizes {
     }
 }
 
-/// Source-supplied commitment-tree observation extracted from `z_gettreestate`.
-///
-/// Each pool is `Some` only when the node payload exposes a recognizable
-/// size shape. `finalize_derived_block` enforces equality against the
-/// post-fold running totals; absent observations skip the corresponding
-/// pool check.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ObservedCommitmentTreeSizes {
-    /// Sapling pool size if the source disclosed it.
-    pub sapling: Option<u32>,
-    /// Orchard pool size if the source disclosed it.
-    pub orchard: Option<u32>,
-}
-
-impl ObservedCommitmentTreeSizes {
-    const fn has_observation(self) -> bool {
-        self.sapling.is_some() || self.orchard.is_some()
-    }
-}
-
 /// Parallel-safe derivation output for one source block.
 ///
 /// `derive_block` populates every field that depends only on the block
@@ -286,59 +266,29 @@ impl ObservedCommitmentTreeSizes {
 /// `tree_size_additions` into the running commitment-tree position.
 #[derive(Debug)]
 pub struct DerivedBlockArtifacts {
-    /// Durable full-block artifact (canonical bytes plus identifiers).
-    pub block: BlockArtifact,
-    /// Parsed block produced during parallel derivation.
-    ///
-    /// Production derivation always fills this so the commit path does not
-    /// deserialize the same block bytes again when deriving explorer
-    /// contexts. Tests that use synthetic non-Zcash payloads leave it
-    /// absent; those tests also run with derive consumers disabled.
-    pub parsed_block: Option<Arc<ZebraBlock>>,
+    /// Canonical block-header facts.
+    pub block_header: BlockHeaderArtifact,
+    /// Optional raw block blob.
+    pub block_blob: Option<BlockBlobArtifact>,
     /// Lightwalletd compact block with `chain_metadata = None`; the
     /// serial folder stamps the final tree-size position before encoding.
     pub partial_compact_block: CompactBlock,
     /// Commitment-tree-size delta this block contributes.
     pub tree_size_additions: CommitmentTreeSizes,
-    /// Tree-size observation extracted from `z_gettreestate`, if the
-    /// source supplied one.
-    pub observed_tree_sizes: Option<ObservedCommitmentTreeSizes>,
-    /// Tree-state payload archived for canonical recovery, if any.
-    pub tree_state: Option<TreeStateArtifact>,
-    /// Per-transaction durable artifacts.
-    pub transactions: Vec<TransactionArtifact>,
+    /// Block-local transaction id index rows.
+    pub block_transaction_index: Vec<BlockTransactionIndexArtifact>,
+    /// Transaction location rows.
+    pub transaction_locations: Vec<TransactionLocation>,
+    /// Per-transaction public facts.
+    pub transaction_facts: Vec<TransactionFactsArtifact>,
+    /// Optional raw transaction blobs.
+    pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Transparent-output index entries for this block.
-    pub transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    /// Transparent prevout artifacts for this block. One per transparent
+    pub address_output_index: Vec<AddressOutputIndexArtifact>,
+    /// Transparent-output artifacts for this block. One per transparent
     /// output; writer, derive, and query paths resolve spent outputs from
     /// these rows without re-fetching the producing transaction.
-    pub transparent_prevouts: Vec<TransparentPrevoutArtifact>,
-    /// Transparent-input spend records for this block.
-    pub transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
-    /// Transparent-address transaction-index entries (output side).
-    pub transparent_address_tx_index: Vec<zinder_core::TransparentAddressTxIndexArtifact>,
-    /// Spend-input candidates awaiting prevout resolution at commit time.
-    pub transparent_address_tx_index_spend_candidates: Vec<TransparentAddressTxIndexSpendCandidate>,
-}
-
-/// Transparent-address tx-history row candidate derived from a transparent
-/// spend input.
-///
-/// The spending transaction does not carry the spent output script.
-/// Commit-time resolution binds this candidate to the canonical prevout
-/// transaction before writing the address-index row.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TransparentAddressTxIndexSpendCandidate {
-    /// The transparent outpoint being spent.
-    pub spent_outpoint: TransparentOutPoint,
-    /// Containing block height for the spending transaction.
-    pub block_height: BlockHeight,
-    /// Containing block hash for the spending transaction.
-    pub block_hash: BlockHash,
-    /// Spending transaction's position in the block.
-    pub tx_index_in_block: u32,
-    /// Spending transaction id.
-    pub transaction_id: TransactionId,
+    pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
 }
 
 /// Parallel-safe derivation: parse the source block and build every artifact
@@ -350,38 +300,53 @@ pub struct TransparentAddressTxIndexSpendCandidate {
 /// observation.
 pub fn derive_block(
     source_block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
+    derive_block_with_raw_blob_policy(source_block, activations, RawBlobPolicy::None)
+}
+
+/// Parallel-safe derivation with an explicit optional raw-blob policy.
+pub fn derive_block_with_raw_blob_policy(
+    source_block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+    raw_blob_policy: RawBlobPolicy,
 ) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
     validate_source_block_payload(source_block)?;
     let parsed_block = parse_source_block(source_block)?;
     validate_parsed_block_identity(&parsed_block, source_block)?;
-    let parsed_block = Arc::new(parsed_block);
-
     let (compact_transactions, tree_size_additions) = compact_transactions(&parsed_block)?;
     let TransparentBlockArtifacts {
-        address_utxos: transparent_address_utxos,
-        prevouts: transparent_prevouts,
-        utxo_spends: transparent_utxo_spends,
-    } = transparent_utxo_artifacts(source_block, &compact_transactions)?;
-    let transparent_address_tx_index =
-        transparent_address_tx_index_artifacts(source_block, &compact_transactions)?;
-    let transparent_address_tx_index_spend_candidates =
-        transparent_address_tx_index_spend_candidates(source_block, &compact_transactions)?;
-    let transactions = derive_transaction_artifacts_from_parsed(&parsed_block, source_block)?;
+        address_outputs: address_output_index,
+        prevouts: transparent_outputs_by_outpoint,
+    } = address_output_artifacts(source_block, &compact_transactions)?;
+    let transaction_artifacts = derive_transaction_artifacts_from_parsed(
+        &parsed_block,
+        source_block,
+        activations,
+        raw_blob_policy,
+    )?;
     let block_header_bytes = parsed_block
         .header
         .zcash_serialize_to_vec()
         .map_err(|source| ArtifactDeriveError::BlockHeaderSerializationFailed { source })?;
-    let observed_tree_sizes = observed_tree_sizes(source_block)?;
-    let tree_state = source_block
-        .tree_state_payload_bytes
-        .as_ref()
-        .map(|bytes| TreeStateArtifact::new(source_block.height, source_block.hash, bytes.clone()));
-    let block = BlockArtifact::new(
-        source_block.height,
-        source_block.hash,
-        source_block.parent_hash,
-        source_block.raw_block_bytes.clone(),
+    let block_header = BlockHeaderArtifact::from_header_info_with_block_size(
+        block_header_info_from_raw_block_bytes(source_block.height, &source_block.raw_block_bytes)
+            .map_err(|source| ArtifactDeriveError::BlockHeaderParseFailed {
+                reason: source.to_string(),
+            })?,
+        usize_to_u64_saturating(source_block.raw_block_bytes.len()),
     );
+    let block_blob = if raw_blob_policy.writes_block_blobs() {
+        Some(BlockBlobArtifact::new(
+            source_block.height,
+            source_block.hash,
+            source_block.parent_hash,
+            source_block.raw_block_bytes.clone(),
+        ))
+    } else {
+        record_raw_blob_disabled("block_blob", 1);
+        None
+    };
     let partial_compact_block = CompactBlock {
         proto_version: LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION,
         height: u64::from(source_block.height.value()),
@@ -394,26 +359,24 @@ pub fn derive_block(
     };
 
     Ok(DerivedBlockArtifacts {
-        block,
-        parsed_block: Some(parsed_block),
+        block_header,
+        block_blob,
         partial_compact_block,
         tree_size_additions,
-        observed_tree_sizes,
-        tree_state,
-        transactions,
-        transparent_address_utxos,
-        transparent_prevouts,
-        transparent_utxo_spends,
-        transparent_address_tx_index,
-        transparent_address_tx_index_spend_candidates,
+        block_transaction_index: transaction_artifacts.block_transaction_index,
+        transaction_locations: transaction_artifacts.transaction_locations,
+        transaction_facts: transaction_artifacts.transaction_facts,
+        transaction_blobs: transaction_artifacts.transaction_blobs,
+        address_output_index,
+        transparent_outputs_by_outpoint,
     })
 }
 
 /// Serial fold over a single block's derived artifacts.
 ///
 /// Applies `derived.tree_size_additions` to `running_tree_sizes`, stamps
-/// the final `chain_metadata` into the compact block, validates observed
-/// sizes if present, and returns the finalized [`BuiltArtifacts`].
+/// the final `chain_metadata` into the compact block, and returns the
+/// finalized [`BuiltArtifacts`].
 /// Mutates `running_tree_sizes` in place so a sequential loop can carry
 /// it forward across blocks.
 pub fn finalize_derived_block(
@@ -421,68 +384,149 @@ pub fn finalize_derived_block(
     running_tree_sizes: &mut CommitmentTreeSizes,
 ) -> Result<BuiltArtifacts, ArtifactDeriveError> {
     let DerivedBlockArtifacts {
-        block,
-        parsed_block,
+        block_header,
+        block_blob,
         mut partial_compact_block,
         tree_size_additions,
-        observed_tree_sizes,
-        tree_state,
-        transactions,
-        transparent_address_utxos,
-        transparent_prevouts,
-        transparent_utxo_spends,
-        transparent_address_tx_index,
-        transparent_address_tx_index_spend_candidates,
+        block_transaction_index,
+        transaction_locations,
+        transaction_facts,
+        transaction_blobs,
+        address_output_index,
+        transparent_outputs_by_outpoint,
     } = derived;
 
     let final_tree_sizes = running_tree_sizes.checked_add(tree_size_additions)?;
-    if let Some(observed) = observed_tree_sizes {
-        validate_observed_tree_sizes_against(observed, final_tree_sizes)?;
-    }
 
     partial_compact_block.chain_metadata = Some(final_tree_sizes.chain_metadata());
     let compact_block = CompactBlockArtifact::new(
-        block.height,
-        block.block_hash,
+        block_header.height,
+        block_header.block_hash,
         partial_compact_block.encode_to_vec(),
     );
 
     *running_tree_sizes = final_tree_sizes;
 
     Ok(BuiltArtifacts {
-        block,
-        parsed_block,
+        block_header,
+        block_blob,
         compact_block,
-        transactions,
-        transparent_address_utxos,
-        transparent_prevouts,
-        transparent_utxo_spends,
-        transparent_address_tx_index,
-        transparent_address_tx_index_spend_candidates,
+        block_transaction_index,
+        transaction_locations,
+        transaction_facts,
+        transaction_blobs,
+        address_output_index,
+        transparent_outputs_by_outpoint,
         tip_metadata: final_tree_sizes.tip_metadata(),
-        tree_state,
     })
+}
+
+struct DerivedTransactionArtifacts {
+    block_transaction_index: Vec<BlockTransactionIndexArtifact>,
+    transaction_locations: Vec<TransactionLocation>,
+    transaction_facts: Vec<TransactionFactsArtifact>,
+    transaction_blobs: Vec<TransactionBlobArtifact>,
 }
 
 fn derive_transaction_artifacts_from_parsed(
     parsed_block: &ZebraBlock,
     source_block: &SourceBlock,
-) -> Result<Vec<TransactionArtifact>, ArtifactDeriveError> {
-    parsed_block
-        .transactions
-        .iter()
-        .map(|transaction| {
-            let payload_bytes = transaction
-                .zcash_serialize_to_vec()
-                .map_err(|source| ArtifactDeriveError::TransactionSerializationFailed { source })?;
-            Ok(TransactionArtifact::new(
-                TransactionId::from_bytes(transaction.hash().0),
-                source_block.height,
-                source_block.hash,
-                payload_bytes,
-            ))
-        })
-        .collect()
+    activations: &NetworkUpgradeActivations,
+    raw_blob_policy: RawBlobPolicy,
+) -> Result<DerivedTransactionArtifacts, ArtifactDeriveError> {
+    let mut block_transaction_index = Vec::with_capacity(parsed_block.transactions.len());
+    let mut transaction_locations = Vec::with_capacity(parsed_block.transactions.len());
+    let mut transaction_facts = Vec::with_capacity(parsed_block.transactions.len());
+    let mut transaction_blobs = Vec::with_capacity(parsed_block.transactions.len());
+
+    for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
+        let tx_index_in_block = u32::try_from(tx_index_in_block)
+            .map_err(|_| ArtifactDeriveError::TransactionIndexOverflow)?;
+        let payload_bytes = transaction
+            .zcash_serialize_to_vec()
+            .map_err(|source| ArtifactDeriveError::TransactionSerializationFailed { source })?;
+        let transaction_id = TransactionId::from_bytes(transaction.hash().0);
+        let location = TransactionLocation::new(
+            transaction_id,
+            source_block.height,
+            source_block.hash,
+            tx_index_in_block,
+        );
+        let public_facts =
+            parse_transaction_public_facts(&payload_bytes, Some(source_block.height), activations)
+                .map_err(|source| ArtifactDeriveError::TransactionFactsParseFailed {
+                    reason: source.to_string(),
+                })?;
+        block_transaction_index.push(BlockTransactionIndexArtifact::new(
+            source_block.height,
+            tx_index_in_block,
+            transaction_id,
+            source_block.hash,
+        ));
+        let (transparent_inputs, transparent_outputs) = transaction_transparent_facts(transaction)?;
+        transaction_locations.push(location);
+        transaction_facts.push(
+            TransactionFactsArtifact::new(location, public_facts)
+                .with_transparent_facts(transparent_inputs, transparent_outputs),
+        );
+        if raw_blob_policy.writes_transaction_blobs() {
+            transaction_blobs.push(TransactionBlobArtifact::new(location, payload_bytes));
+        } else {
+            record_raw_blob_disabled("transaction_blob", 1);
+        }
+    }
+
+    Ok(DerivedTransactionArtifacts {
+        block_transaction_index,
+        transaction_locations,
+        transaction_facts,
+        transaction_blobs,
+    })
+}
+
+fn transaction_transparent_facts(
+    transaction: &ZebraTransaction,
+) -> Result<(Vec<TransparentInputFact>, Vec<TransparentOutputFact>), ArtifactDeriveError> {
+    let mut inputs = Vec::new();
+    for (input_index, input) in transaction.inputs().iter().enumerate() {
+        let input_index =
+            u32::try_from(input_index).map_err(|_| ArtifactDeriveError::CountOverflow {
+                field: "transparent input index",
+            })?;
+        let ZebraTransparentInput::PrevOut { outpoint, .. } = input else {
+            continue;
+        };
+        inputs.push(TransparentInputFact::new(
+            input_index,
+            TransparentOutPoint::new(TransactionId::from_bytes(outpoint.hash.0), outpoint.index),
+        ));
+    }
+
+    let mut outputs = Vec::new();
+    for (output_index, output) in transaction.outputs().iter().enumerate() {
+        let output_index =
+            u32::try_from(output_index).map_err(|_| ArtifactDeriveError::CountOverflow {
+                field: "transparent output index",
+            })?;
+        let script_pub_key = output.lock_script.as_raw_bytes().to_vec();
+        outputs.push(TransparentOutputFact::new(
+            output_index,
+            u64::from(output.value()),
+            script_pub_key.clone(),
+            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+        ));
+    }
+
+    Ok((inputs, outputs))
+}
+
+fn record_raw_blob_disabled(table: &'static str, row_count: u64) {
+    metrics::counter!("zinder_ingest_raw_blob_disabled_total", "table" => table)
+        .increment(row_count);
+}
+
+fn usize_to_u64_saturating(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
 }
 
 fn validate_source_block_payload(source_block: &SourceBlock) -> Result<(), ArtifactDeriveError> {
@@ -674,18 +718,16 @@ fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTxO
 
 /// Aggregated transparent artifacts derived from one block.
 struct TransparentBlockArtifacts {
-    address_utxos: Vec<TransparentAddressUtxoArtifact>,
-    prevouts: Vec<TransparentPrevoutArtifact>,
-    utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    address_outputs: Vec<AddressOutputIndexArtifact>,
+    prevouts: Vec<TransparentOutputArtifact>,
 }
 
-fn transparent_utxo_artifacts(
+fn address_output_artifacts(
     source_block: &SourceBlock,
     compact_transactions: &[CompactTx],
 ) -> Result<TransparentBlockArtifacts, ArtifactDeriveError> {
-    let mut transparent_address_utxos = Vec::new();
-    let mut transparent_prevouts = Vec::new();
-    let mut transparent_utxo_spends = Vec::new();
+    let mut address_output_index = Vec::new();
+    let mut transparent_outputs_by_outpoint = Vec::new();
 
     for transaction in compact_transactions {
         let transaction_id = transaction_id_from_compact_tx(transaction)?;
@@ -695,7 +737,7 @@ fn transparent_utxo_artifacts(
             let address_script_hash =
                 TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
             let outpoint = TransparentOutPoint::new(transaction_id, output_index);
-            transparent_address_utxos.push(TransparentAddressUtxoArtifact::new(
+            address_output_index.push(AddressOutputIndexArtifact::new(
                 address_script_hash,
                 output.script_pub_key.clone(),
                 outpoint,
@@ -703,20 +745,11 @@ fn transparent_utxo_artifacts(
                 source_block.height,
                 source_block.hash,
             ));
-            transparent_prevouts.push(TransparentPrevoutArtifact::new(
+            transparent_outputs_by_outpoint.push(TransparentOutputArtifact::new(
                 outpoint,
                 output.value,
                 output.script_pub_key.clone(),
                 address_script_hash,
-                source_block.height,
-                source_block.hash,
-            ));
-        }
-
-        for input in &transaction.vin {
-            let previous_transaction_id = previous_transaction_id_from_compact_input(input)?;
-            transparent_utxo_spends.push(TransparentUtxoSpendArtifact::new(
-                TransparentOutPoint::new(previous_transaction_id, input.prevout_index),
                 source_block.height,
                 source_block.hash,
             ));
@@ -724,72 +757,9 @@ fn transparent_utxo_artifacts(
     }
 
     Ok(TransparentBlockArtifacts {
-        address_utxos: transparent_address_utxos,
-        prevouts: transparent_prevouts,
-        utxo_spends: transparent_utxo_spends,
+        address_outputs: address_output_index,
+        prevouts: transparent_outputs_by_outpoint,
     })
-}
-
-pub(crate) fn transparent_address_tx_index_artifacts(
-    source_block: &SourceBlock,
-    compact_transactions: &[CompactTx],
-) -> Result<Vec<zinder_core::TransparentAddressTxIndexArtifact>, ArtifactDeriveError> {
-    use std::collections::HashSet;
-    let mut artifacts = Vec::new();
-    let mut emitted = HashSet::new();
-
-    for transaction in compact_transactions {
-        let transaction_id = transaction_id_from_compact_tx(transaction)?;
-        let tx_index_in_block =
-            u32::try_from(transaction.index).map_err(|_| ArtifactDeriveError::CountOverflow {
-                field: "transparent transaction index",
-            })?;
-        for output in &transaction.vout {
-            let address_script_hash =
-                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
-            if emitted.insert((address_script_hash, tx_index_in_block)) {
-                artifacts.push(zinder_core::TransparentAddressTxIndexArtifact::new(
-                    address_script_hash,
-                    source_block.height,
-                    tx_index_in_block,
-                    transaction_id,
-                    source_block.hash,
-                ));
-            }
-        }
-    }
-
-    Ok(artifacts)
-}
-
-pub(crate) fn transparent_address_tx_index_spend_candidates(
-    source_block: &SourceBlock,
-    compact_transactions: &[CompactTx],
-) -> Result<Vec<TransparentAddressTxIndexSpendCandidate>, ArtifactDeriveError> {
-    let mut spend_candidates = Vec::new();
-
-    for transaction in compact_transactions {
-        let transaction_id = transaction_id_from_compact_tx(transaction)?;
-        let tx_index_in_block =
-            u32::try_from(transaction.index).map_err(|_| ArtifactDeriveError::CountOverflow {
-                field: "transparent transaction index",
-            })?;
-        for input in &transaction.vin {
-            let previous_transaction_id = previous_transaction_id_from_compact_input(input)?;
-            spend_candidates.push(TransparentAddressTxIndexSpendCandidate {
-                spent_outpoint: TransparentOutPoint::new(
-                    previous_transaction_id,
-                    input.prevout_index,
-                ),
-                block_height: source_block.height,
-                block_hash: source_block.hash,
-                tx_index_in_block,
-                transaction_id,
-            });
-        }
-    }
-
-    Ok(spend_candidates)
 }
 
 fn transaction_id_from_compact_tx(
@@ -803,165 +773,12 @@ fn transaction_id_from_compact_tx(
     Ok(TransactionId::from_bytes(txid_bytes))
 }
 
-fn previous_transaction_id_from_compact_input(
-    input: &CompactTxIn,
-) -> Result<TransactionId, ArtifactDeriveError> {
-    let txid_bytes = <[u8; 32]>::try_from(input.prevout_txid.as_slice()).map_err(|_| {
-        ArtifactDeriveError::TransparentPrevoutTransactionIdMalformed {
-            byte_count: input.prevout_txid.len(),
-        }
-    })?;
-    Ok(TransactionId::from_bytes(txid_bytes))
-}
-
 fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
         || !transaction.actions.is_empty()
         || !transaction.vin.is_empty()
         || !transaction.vout.is_empty()
-}
-
-fn validate_observed_tree_sizes_against(
-    observed_tree_sizes: ObservedCommitmentTreeSizes,
-    expected_tree_sizes: CommitmentTreeSizes,
-) -> Result<(), ArtifactDeriveError> {
-    if let Some(observed_sapling) = observed_tree_sizes.sapling
-        && observed_sapling != expected_tree_sizes.sapling
-    {
-        return Err(ArtifactDeriveError::ObservedTreeSizeMismatch {
-            expected_sapling: expected_tree_sizes.sapling,
-            expected_orchard: expected_tree_sizes.orchard,
-            observed_sapling,
-            observed_orchard: observed_tree_sizes
-                .orchard
-                .unwrap_or(expected_tree_sizes.orchard),
-        });
-    }
-
-    if let Some(observed_orchard) = observed_tree_sizes.orchard
-        && observed_orchard != expected_tree_sizes.orchard
-    {
-        return Err(ArtifactDeriveError::ObservedTreeSizeMismatch {
-            expected_sapling: expected_tree_sizes.sapling,
-            expected_orchard: expected_tree_sizes.orchard,
-            observed_sapling: observed_tree_sizes
-                .sapling
-                .unwrap_or(expected_tree_sizes.sapling),
-            observed_orchard,
-        });
-    }
-
-    Ok(())
-}
-
-fn observed_tree_sizes(
-    source_block: &SourceBlock,
-) -> Result<Option<ObservedCommitmentTreeSizes>, ArtifactDeriveError> {
-    let Some(tree_state_payload_bytes) = source_block.tree_state_payload_bytes.as_deref() else {
-        return Ok(None);
-    };
-
-    let tree_state_payload: Value = serde_json::from_slice(tree_state_payload_bytes)
-        .map_err(|source| ArtifactDeriveError::TreeStateParseFailed { source })?;
-    let sapling = tree_size_observation(&tree_state_payload, SAPLING_TREE_POOL)?;
-    let orchard = tree_size_observation(&tree_state_payload, ORCHARD_TREE_POOL)?;
-    let observed_tree_sizes = ObservedCommitmentTreeSizes { sapling, orchard };
-
-    if observed_tree_sizes.has_observation() {
-        Ok(Some(observed_tree_sizes))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Returns the observed commitment-tree size for `pool`, or `None` when the
-/// node response lacks the size shape Zinder can interpret.
-///
-/// Recognized shapes:
-/// - `{pool}.commitments.size` (legacy explicit size, used in tests)
-/// - `{pool}.size` and `trees.{pool}.size` (alternate explicit shapes)
-/// - `{pool}.commitments` is `{}` (Zebra reports an empty pool)
-/// - `{pool}.commitments.finalState` is `"000000"` or empty (Zebra v6.0.2's
-///   serialized form for an empty Sapling/Orchard commitment tree)
-///
-/// Non-empty trees without an explicit `size` field return `None`. Validation
-/// in [`validate_observed_tree_sizes`] then skips for that pool; the
-/// builder's internal output count is the authoritative source.
-fn tree_size_observation(
-    tree_state_payload: &Value,
-    pool: &'static str,
-) -> Result<Option<u32>, ArtifactDeriveError> {
-    if let Some(size) = explicit_tree_size_field(tree_state_payload, pool)? {
-        return Ok(Some(size));
-    }
-
-    let Some(commitments) = tree_state_payload
-        .get(pool)
-        .and_then(|pool_value| pool_value.get("commitments"))
-    else {
-        return Ok(None);
-    };
-    let Some(commitments_object) = commitments.as_object() else {
-        return Ok(None);
-    };
-
-    if commitments_object.is_empty() {
-        return Ok(Some(0));
-    }
-    if let Some(final_state) = commitments_object.get("finalState").and_then(Value::as_str)
-        && is_empty_commitment_final_state(final_state)
-    {
-        return Ok(Some(0));
-    }
-
-    Ok(None)
-}
-
-fn is_empty_commitment_final_state(final_state: &str) -> bool {
-    final_state.is_empty() || final_state == "000000"
-}
-
-fn explicit_tree_size_field(
-    tree_state_payload: &Value,
-    pool: &'static str,
-) -> Result<Option<u32>, ArtifactDeriveError> {
-    if let Some(field) = [
-        tree_state_payload
-            .get(pool)
-            .and_then(|pool_value| pool_value.get("commitments"))
-            .and_then(|commitments| commitments.get("size")),
-        tree_state_payload
-            .get(pool)
-            .and_then(|pool_value| pool_value.get("size")),
-        tree_state_payload
-            .get("trees")
-            .and_then(|trees| trees.get(pool))
-            .and_then(|pool_value| pool_value.get("size")),
-    ]
-    .into_iter()
-    .flatten()
-    .next()
-    {
-        return parse_tree_size_field(field, pool).map(Some);
-    }
-
-    Ok(None)
-}
-
-fn parse_tree_size_field(field: &Value, pool: &'static str) -> Result<u32, ArtifactDeriveError> {
-    if let Some(size) = field.as_u64() {
-        return u32::try_from(size)
-            .map_err(|_| ArtifactDeriveError::TreeStateSizeOverflow { pool });
-    }
-
-    if let Some(size) = field.as_str() {
-        return size
-            .parse::<u32>()
-            .map_err(|source| ArtifactDeriveError::TreeStateSizeStringInvalid { pool, source });
-    }
-
-    Err(ArtifactDeriveError::TreeStateSizeShape { pool })
 }
 
 fn count_to_u32(count: usize, field: &'static str) -> Result<u32, ArtifactDeriveError> {
@@ -976,12 +793,8 @@ fn format_block_hash(bytes: [u8; 32]) -> String {
 mod tests {
     use std::error::Error;
 
-    use zinder_core::{BlockHash, BlockHeight, Network};
-    use zinder_source::SourceBlock;
-
     use super::{
-        ArtifactDeriveError, COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, ObservedCommitmentTreeSizes,
-        compact_note_ciphertext_prefix, observed_tree_sizes,
+        ArtifactDeriveError, COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, compact_note_ciphertext_prefix,
     };
 
     #[test]
@@ -1013,89 +826,5 @@ mod tests {
 
         assert_eq!(prefix, vec![1u8; COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN]);
         Ok(())
-    }
-
-    #[test]
-    fn observed_tree_sizes_returns_none_when_payload_lacks_pool_shape()
-    -> Result<(), ArtifactDeriveError> {
-        let observed = observed_tree_sizes(&source_block_with_tree_state_payload(
-            br#"{"hash":"block"}"#,
-        ))?;
-        assert!(observed.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn observed_tree_sizes_accepts_one_present_pool_size() -> Result<(), Box<dyn Error>> {
-        let observed_tree_sizes = observed_tree_sizes(&source_block_with_tree_state_payload(
-            br#"{"sapling":{"commitments":{"size":7}}}"#,
-        ))?
-        .ok_or("expected tree-size observation when sapling.commitments.size is present")?;
-
-        assert_eq!(
-            observed_tree_sizes,
-            ObservedCommitmentTreeSizes {
-                sapling: Some(7),
-                orchard: None,
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn observed_tree_sizes_treats_zebra_v6_empty_tree_state_as_size_zero()
-    -> Result<(), Box<dyn Error>> {
-        let observed = observed_tree_sizes(&source_block_with_tree_state_payload(
-            br#"{"sapling":{"commitments":{"finalState":"000000"}},"orchard":{"commitments":{}}}"#,
-        ))?
-        .ok_or("expected tree-size observation when Zebra reports empty pools")?;
-
-        assert_eq!(
-            observed,
-            ObservedCommitmentTreeSizes {
-                sapling: Some(0),
-                orchard: Some(0),
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn observed_tree_sizes_returns_none_for_non_empty_tree_state_without_explicit_size()
-    -> Result<(), ArtifactDeriveError> {
-        let observed = observed_tree_sizes(&source_block_with_tree_state_payload(
-            br#"{"sapling":{"commitments":{"finalRoot":"deadbeef","finalState":"abc1230102"}}}"#,
-        ))?;
-        assert!(observed.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn observed_tree_sizes_does_not_default_unknown_pool_to_zero() -> Result<(), Box<dyn Error>> {
-        let observed = observed_tree_sizes(&source_block_with_tree_state_payload(
-            br#"{"sapling":{"commitments":{"finalRoot":"deadbeef","finalState":"abc1230102"}},"orchard":{"commitments":{}}}"#,
-        ))?
-        .ok_or("expected partial tree-size observation when one pool is explicit empty")?;
-
-        assert_eq!(
-            observed,
-            ObservedCommitmentTreeSizes {
-                sapling: None,
-                orchard: Some(0),
-            }
-        );
-        Ok(())
-    }
-
-    fn source_block_with_tree_state_payload(tree_state_payload_bytes: &[u8]) -> SourceBlock {
-        SourceBlock {
-            network: Network::ZcashRegtest,
-            height: BlockHeight::new(1),
-            hash: BlockHash::from_bytes([1; 32]),
-            parent_hash: BlockHash::from_bytes([0; 32]),
-            block_time_seconds: 0,
-            raw_block_bytes: vec![1],
-            tree_state_payload_bytes: Some(tree_state_payload_bytes.to_vec()),
-        }
     }
 }

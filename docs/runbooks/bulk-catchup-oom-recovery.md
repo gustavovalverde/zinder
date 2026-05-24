@@ -26,7 +26,7 @@ docker events --since '30s' --filter container=zinder-mainnet-zinder-ingest-1
 # … start
 ```
 
-`exitCode=137` is `128 + SIGKILL`; the host kernel's OOM killer is reaping the process. `OOMKilled: false` only reports cgroup-level OOM, which never trips because the ingest container has no `mem_limit`. The `restart: on-failure` policy then restarts on the non-zero kernel exit.
+`exitCode=137` is `128 + SIGKILL`. On current Compose deployments, `OOMKilled: true` means the service crossed its configured cgroup memory ceiling. On older or custom deployments without a `mem_limit`, the host kernel can reap the process while Docker reports `OOMKilled: false`; in that case the Docker event stream is the authoritative signal. The `restart: on-failure` policy then restarts on the non-zero kernel exit.
 
 ## Root cause
 
@@ -135,13 +135,23 @@ Plus the bulk-catchup ingest knobs:
 concurrency = 8                # parallel derive and replay hydration tasks
 
 [ingest.bulk_catchup]
-fetch_concurrency = 32         # in-flight block fetches
+source_segment_max_blocks = 128     # hard ceiling; runtime size adapts by response bytes
 flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
 
-With `commit_batch_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+Do not use `source_segment_max_blocks` as the primary response-size tuning knob. The
+writer targets 75% of `node.max_response_bytes`, shrinks the next source segment
+after oversized or dense responses, carries learned density across bulk commit
+batches, and resets density when the consensus branch changes. If
+`zinder_node_source_segment_split_total{reason="response_too_large"}` keeps
+increasing while `zinder_ingest_source_segment_next_blocks` is already `1`,
+raise `node.max_response_bytes` or switch to a source feed that does not require
+large JSON payloads. If split bursts repeat immediately after every
+`chain_committed` event, the source-density state is being reset too often.
 
-`ingest.derive.concurrency` adds at most `N × (avg SourceBlock + avg DerivedBlockArtifacts)` of in-flight RAM (roughly 100 KB per slot on mainnet). At the default `clamp(available_parallelism() - 1, 4, 32)`, the in-flight derive contribution is at most a few MiB and is negligible alongside the batch accumulator and RocksDB write buffers. Startup derive replay uses the same cap while hydrating one retained canonical event at a time. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
+With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+
+`ingest.bulk_catchup.fact_build_concurrency` adds at most `N × (avg SourceBlock + avg DerivedBlockArtifacts)` of in-flight RAM (roughly 100 KB per slot on mainnet). At the default `min(available_parallelism(), 16)`, the in-flight fact-build contribution is at most a few MiB and is negligible alongside the batch accumulator, source-response reservations, and RocksDB write buffers. Startup derive replay is bounded separately by `ingest.derive.replay_batch_blocks`, so replay does not hydrate an entire retained chain event in one in-memory unit. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
 RAM-constrained hosts drop the cache to 128 MiB and the WAL ceiling to 64 MiB; high-throughput hosts can raise the cache to 1 GiB. The architectural invariants (WAL on, point-in-time recovery, atomic cross-CF flush, ordered writes) are not exposed to operator tuning because each one is a contract of the per-`ChainEpoch` commit guarantee.
 

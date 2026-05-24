@@ -5,33 +5,38 @@
 //! belong to `zinder-store`.
 
 mod artifact_builder;
-mod backfill;
+mod bulk_catchup;
 mod chain_ingest;
 mod derive_consumers;
 mod ingest_control;
 mod ingest_loop;
+mod memory_pressure;
 mod mempool;
 mod phase;
 mod retention;
 mod source_recovery;
 mod tip_follow;
-mod transparent_prevout_lookup;
 mod upstream_health_probe;
 
 pub use artifact_builder::{
     ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
-    ObservedCommitmentTreeSizes, TransparentAddressTxIndexSpendCandidate, derive_block,
-    finalize_derived_block,
+    RawBlobPolicy, derive_block, derive_block_with_raw_blob_policy, finalize_derived_block,
 };
-pub use backfill::{BackfillConfig, backfill, backfill_until_complete, backfill_with_store};
+pub use bulk_catchup::{BackfillConfig, backfill, backfill_until_complete, backfill_with_store};
 pub use chain_ingest::{BuiltArtifacts, IngestError, NodeSourceKind};
 pub use derive_consumers::{
-    catch_up_derive_store_to_canonical, open_primary_derive_store_for_canonical,
+    DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,
+    open_primary_derive_store_for_canonical, spawn_derive_replay_budget_metrics_task,
+    spawn_derive_tailer_task,
 };
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use ingest_loop::{
-    BulkCatchupConfig, IngestDeriveConfig, IngestLoopConfig, IngestModifiers, PhasesConfig,
-    TipFollowPhaseConfig, TipFollowSubsystems, TipFollowSubsystemsLauncher, run_ingest_loop,
+    BulkCatchupConfig, DeriveReplayPolicy, IngestDeriveConfig, IngestLoopConfig, IngestModifiers,
+    PhasesConfig, TipFollowPhaseConfig, TipFollowSubsystems, TipFollowSubsystemsLauncher,
+    run_ingest_loop,
+};
+pub use memory_pressure::{
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolOrchestratorError,

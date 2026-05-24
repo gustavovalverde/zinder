@@ -9,8 +9,8 @@ use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 use tonic_types::StatusExt;
 use zinder_core::{
-    ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentAddressUtxoArtifact,
-    TransparentOutPoint, TransparentPrevoutArtifact,
+    AddressOutputIndexArtifact, ChainEpochId, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
@@ -28,17 +28,17 @@ const SCRIPT_PUB_KEY: &[u8] = &[
 ];
 
 #[tokio::test]
-async fn transparent_address_utxos_round_trip_through_native_grpc() -> eyre::Result<()> {
+async fn address_output_index_round_trip_through_native_grpc() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 3)?;
+    let stored_utxos = commit_address_output_index(&store, ChainEpochId::new(1), 1, 3)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let response = WalletQueryService::transparent_address_utxos(
+    let response = WalletQueryService::address_output_index(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::ScriptHash(
                     ADDRESS_SCRIPT_HASH_BYTES.to_vec(),
@@ -53,11 +53,11 @@ async fn transparent_address_utxos_round_trip_through_native_grpc() -> eyre::Res
     .await?
     .into_inner();
 
-    assert_eq!(response.utxos.len(), stored_utxos.len());
+    assert_eq!(response.outputs.len(), stored_utxos.len());
     assert!(response.next_cursor.is_empty());
-    let mut stream = WalletQueryService::transparent_address_utxos_stream(
+    let mut stream = WalletQueryService::address_output_index_stream(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::ScriptHash(
                     ADDRESS_SCRIPT_HASH_BYTES.to_vec(),
@@ -82,17 +82,17 @@ async fn transparent_address_utxos_round_trip_through_native_grpc() -> eyre::Res
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_paginates_with_cursor() -> eyre::Result<()> {
+async fn address_output_index_paginates_with_cursor() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 4)?;
+    let stored_utxos = commit_address_output_index(&store, ChainEpochId::new(1), 1, 4)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let first_page = WalletQueryService::transparent_address_utxos(
+    let first_page = WalletQueryService::address_output_index(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::ScriptHash(
                     ADDRESS_SCRIPT_HASH_BYTES.to_vec(),
@@ -106,12 +106,12 @@ async fn transparent_address_utxos_paginates_with_cursor() -> eyre::Result<()> {
     )
     .await?
     .into_inner();
-    assert_eq!(first_page.utxos.len(), 2);
+    assert_eq!(first_page.outputs.len(), 2);
     assert!(!first_page.next_cursor.is_empty());
 
-    let second_page = WalletQueryService::transparent_address_utxos(
+    let second_page = WalletQueryService::address_output_index(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::ScriptHash(
                     ADDRESS_SCRIPT_HASH_BYTES.to_vec(),
@@ -127,7 +127,7 @@ async fn transparent_address_utxos_paginates_with_cursor() -> eyre::Result<()> {
     .into_inner();
 
     assert_eq!(
-        first_page.utxos.len() + second_page.utxos.len(),
+        first_page.outputs.len() + second_page.outputs.len(),
         stored_utxos.len()
     );
     assert!(second_page.next_cursor.is_empty());
@@ -136,17 +136,17 @@ async fn transparent_address_utxos_paginates_with_cursor() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_clamps_oversized_page_request() -> eyre::Result<()> {
+async fn address_output_index_clamps_oversized_page_request() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let _stored_utxos = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 1001)?;
+    let _stored_utxos = commit_address_output_index(&store, ChainEpochId::new(1), 1, 1001)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let response = WalletQueryService::transparent_address_utxos(
+    let response = WalletQueryService::address_output_index(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::ScriptHash(
                     ADDRESS_SCRIPT_HASH_BYTES.to_vec(),
@@ -161,7 +161,7 @@ async fn transparent_address_utxos_clamps_oversized_page_request() -> eyre::Resu
     .await?
     .into_inner();
 
-    assert_eq!(response.utxos.len(), 1000);
+    assert_eq!(response.outputs.len(), 1000);
     assert!(
         !response.next_cursor.is_empty(),
         "clamped page should expose a cursor when more rows remain"
@@ -171,17 +171,17 @@ async fn transparent_address_utxos_clamps_oversized_page_request() -> eyre::Resu
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_rejects_invalid_address_selector() -> eyre::Result<()> {
+async fn address_output_index_rejects_invalid_address_selector() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let _ = commit_transparent_address_utxos(&store, ChainEpochId::new(1), 1, 1)?;
+    let _ = commit_address_output_index(&store, ChainEpochId::new(1), 1, 1)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let status = match WalletQueryService::transparent_address_utxos(
+    let status = match WalletQueryService::address_output_index(
         &grpc_adapter,
-        Request::new(wallet::TransparentAddressUtxosRequest {
+        Request::new(wallet::AddressOutputIndexRequest {
             address: Some(AddressLookup {
                 selector: Some(address_lookup::Selector::Address(String::from(
                     "not-an-address",
@@ -211,19 +211,19 @@ async fn transparent_address_utxos_rejects_invalid_address_selector() -> eyre::R
     Ok(())
 }
 
-fn commit_transparent_address_utxos(
+fn commit_address_output_index(
     store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     height: u32,
     utxo_count: u32,
-) -> eyre::Result<Vec<TransparentAddressUtxoArtifact>> {
+) -> eyre::Result<Vec<AddressOutputIndexArtifact>> {
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(chain_epoch_id.value(), height);
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     let mut utxos = Vec::new();
     for output_index in 0..utxo_count {
         let mut transaction_id_bytes = [0; 32];
         transaction_id_bytes[..4].copy_from_slice(&output_index.to_be_bytes());
-        utxos.push(TransparentAddressUtxoArtifact::new(
+        utxos.push(AddressOutputIndexArtifact::new(
             address_script_hash,
             SCRIPT_PUB_KEY.to_vec(),
             TransparentOutPoint::new(
@@ -238,20 +238,18 @@ fn commit_transparent_address_utxos(
 
     let prevouts = utxos
         .iter()
-        .map(transparent_prevout_from_utxo)
+        .map(transparent_output_from_utxo)
         .collect::<Vec<_>>();
     let mut artifacts = ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block]);
-    artifacts = artifacts.with_transparent_address_utxos(utxos.clone());
-    artifacts = artifacts.with_transparent_prevouts(prevouts);
+    artifacts = artifacts.with_address_output_index(utxos.clone());
+    artifacts = artifacts.with_transparent_outputs_by_outpoint(prevouts);
     store.commit_chain_epoch(artifacts)?;
 
     Ok(utxos)
 }
 
-fn transparent_prevout_from_utxo(
-    utxo: &TransparentAddressUtxoArtifact,
-) -> TransparentPrevoutArtifact {
-    TransparentPrevoutArtifact::new(
+fn transparent_output_from_utxo(utxo: &AddressOutputIndexArtifact) -> TransparentOutputArtifact {
+    TransparentOutputArtifact::new(
         utxo.outpoint,
         utxo.value_zat,
         utxo.script_pub_key.clone(),

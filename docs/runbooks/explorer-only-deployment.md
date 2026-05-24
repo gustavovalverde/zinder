@@ -15,8 +15,7 @@ stay on a separate operational footprint (see
 
 - A reachable `zinder-query` endpoint (gRPC) advertising:
   - `wallet.read.latest_block_v1`
-  - `wallet.read.full_block_at_v1`
-  - `wallet.read.transparent_prevouts_v1` (optional; enables paid-fee
+  - `wallet.read.transparent_outputs_by_outpoint_v1` (optional; enables paid-fee
     fields on explorer reads when present)
   - `wallet.snapshot.mempool_v1`
   - `wallet.address.transparent_history_v1`

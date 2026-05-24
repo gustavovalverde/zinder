@@ -10,12 +10,21 @@ Explorer features and wallet sync have different ownership rules. If explorer ad
 
 Concretely, the derive plane:
 
-- **Consumes** canonical artifacts (`BlockArtifact`, `CompactBlockArtifact`, transaction artifacts) and event envelopes (`ChainEventEnvelope`, `MempoolEventEnvelope`) from the ingest writer.
+- **Consumes** canonical facts (`BlockHeaderArtifact`, `BlockTransactionIndexArtifact`, `TransactionFactsArtifact`, transparent-output facts) and event envelopes (`ChainEventEnvelope`, `MempoolEventEnvelope`) from the ingest writer.
 - **Produces** materialized views with their own storage, schemas, retention, and gRPC surfaces.
 - **Cannot affect** canonical state. A derive-plane crash does not stop ingest, does not block reads from `WalletQueryApi`, and does not corrupt canonical storage.
 - **Is rebuildable**. Any derived view can be discarded and rebuilt from canonical artifacts. This is the test for whether a view belongs in the derive plane: if rebuilding requires re-validating chain data, the view is in the wrong plane.
 
-A derive projection is optional in v1 and consumes canonical artifacts rather than upstream node RPCs directly. The bundled projection is hosted by `zinder-ingest`, which opens the derive store as primary and atomically writes consumer rows plus derive cursors after canonical commits. `zinder-explorer` is the stateless reader gateway: it opens the same derive store as a secondary and serves `ExplorerQuery`. Derived explorer or analytics indexes must be rebuildable from canonical artifacts and must not become a hidden dependency of wallet sync. The `Derive*` SDK abstractions (trait, store, federation primitive) describe the reusable pattern; see [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md) and [ADR-0023](../adrs/0023-derive-plane-hosted-by-ingest.md).
+A derive projection consumes canonical artifacts rather than upstream node RPCs
+directly. The bundled projection is hosted by `zinder-ingest`, which opens the
+derive store as primary and runs the derive tailer over retained canonical
+events. The tailer atomically writes consumer rows plus derive cursors.
+`zinder-explorer` is the stateless reader gateway: it opens the same derive
+store as a secondary and serves `ExplorerQuery`. Derived explorer or analytics
+indexes must be rebuildable from canonical artifacts and must not become a
+hidden dependency of wallet sync. The `Derive*` SDK abstractions (trait, store,
+federation primitive) describe the reusable pattern; see
+[ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ## When to use the derive plane
 
@@ -47,9 +56,13 @@ The DX/AX corollary: if you find yourself extending `zinder-store` to support an
 
 The bundled derive plane consumes Zinder data through three channels, in decreasing order of preference:
 
-### Channel A - ingest-hosted chain-event dispatch
+### Channel A - ingest-hosted chain-event tailing
 
-The primary input. After `zinder-ingest` commits a canonical chain epoch, it dispatches the committed `ChainEvent` plus parsed block contexts to bundled `BlockKeyedConsumer` implementations through `zinder_derive::DeriveStore::write_chain_event`. Each derive write stores consumer rows and the canonical chain-event cursor in one derive-store batch.
+The primary input. `zinder-ingest` tails retained canonical `ChainEvent`
+envelopes, hydrates typed block contexts from the canonical store, and dispatches
+them to bundled `BlockKeyedConsumer` implementations through
+`zinder_derive::DeriveStore::write_chain_event`. Each derive write stores
+consumer rows and the canonical chain-event cursor in one derive-store batch.
 
 This channel is sufficient for views that derive from chain transitions: block summaries, recent transactions, paid-fee summaries, address activity feeds, transaction count time-series, fee-rate distributions over time. The consumer's view is rebuilt by replaying retained canonical events from the lowest persisted derive cursor, or from `cursor = None` after dropping the derive store.
 
@@ -67,14 +80,18 @@ The same atomic-cursor contract applies: consumers stage writes into `DeriveCons
 
 For views that need full block bodies, full transaction data, or cross-block aggregations that the event stream does not carry. The ingest-hosted dispatcher reads canonical artifacts through `ChainEpochReadApi` when repairing startup gaps or resolving prevouts outside the current commit batch.
 
-This channel is used for one-time replay, full rebuild, startup catch-up, and occasional historical lookups. Steady-state operation should use Channel A or B. A derive consumer that repeatedly scans canonical history outside commit dispatch is a smell: the data should probably be carried in the chain event context, or the view is in the wrong plane.
+This channel is used for one-time replay, full rebuild, startup catch-up, and
+occasional historical lookups. Steady-state operation should use Channel A or B.
+A derive consumer that repeatedly scans canonical history outside the tailer is
+a smell: the data should probably be carried in the chain event context, or the
+view is in the wrong plane.
 
 A fresh derive consumer whose persisted cursor sits below the canonical event retention floor needs a cold-start path that rebuilds from canonical artifacts and then resumes ingest-hosted event dispatch without dropping or duplicating events. Stateful derive consumers own this path; the framework provides the atomic-cursor contract, and the writer provides the gap-fill loop.
 
 ### What the derive plane must not consume
 
 - **Upstream node RPCs directly.** A derive-pattern service does not import `zinder-source`. It does not call Zebra. The upstream node is upstream of `zinder-ingest`, not of any derive consumer. This rule is structural: the derive plane assumes Zinder canonical data is the source of truth.
-- **Live primary store handles in reader gateways.** A reader gateway that opens `PrimaryChainStore`, opens the derive store as primary, or bypasses immutable snapshots is breaking [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and [ADR-0023](../adrs/0023-derive-plane-hosted-by-ingest.md).
+- **Live primary store handles in reader gateways.** A reader gateway that opens `PrimaryChainStore`, opens the derive store as primary, or bypasses immutable snapshots breaks [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and the service-boundary contract.
 - **`zinder-ingest` internals from consumer logic.** Derive consumers receive typed block and event contexts. They do not reach into `IngestArtifactBuilder`, `chain_event_writer`, or canonical RocksDB write locks.
 
 ## Output contract
@@ -85,13 +102,17 @@ A derive-plane consumer produces one of three output shapes:
 
 The reader gateway ships its own gRPC service with its own proto schema, own listen address, own `ServerInfo` capability descriptor (per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery)), and own freshness policy. The shipping example today is `zinder-explorer` serving `ExplorerQuery` from a secondary derive store with methods like `TransactionDetail`, `BlockSummary`, `AddressActivityFeed`, `FeeHistogram` ([Explorer plane](explorer-plane.md) documents the surface).
 
-Capability strings use the consumer's product namespace: `<product>.<noun>.<capability>_v{N}`, distinct from `wallet.*` capabilities. Example: `explorer.transparent_address.activity_v1`. The PRD-era `derive.<consumer>.*` namespace was retired in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md); the product name is what operators grep for.
+Capability strings use the consumer's product namespace:
+`<product>.<noun>.<capability>_v{N}`, distinct from `wallet.*` capabilities.
+Example: `explorer.transparent_address.activity_v1`. Product names are the
+operator-facing namespace per
+[ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ### Shape 2 — Federated under `WalletQuery`
 
 For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in the consumer's service crate (`services/zinder-explorer/` today) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) lives in `services/zinder-query/src/derive_proxy.rs`; every federated method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
 
-The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-explorer/` when the explorer plane is configured and ready. When the explorer plane is unavailable, the native adapter falls back to the always-on canonical-confirmed compute path on the same RPC; `WalletQuery.ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `explorer.transparent_address.balance_v1` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `explorer.server_info_v1` ready inside the configured window. The explorer capability signals that the response additionally carries the live mempool overlay in `unconfirmed_delta_zat`; the wallet capability signals confirmed totals from canonical UTXOs.
+The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-explorer/` when the explorer plane is configured and ready. When the explorer plane is unavailable, the native adapter falls back to the always-on canonical-confirmed compute path on the same RPC; `WalletQuery.ServerInfo` advertises `wallet.address.transparent_balance_v1` unconditionally and `explorer.transparent_address.balance_v1` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `explorer.server_info_v1` ready inside the configured window. The explorer capability signals that the response additionally carries the live mempool overlay in `unconfirmed_delta_zat`; the wallet capability signals confirmed totals from canonical outputs.
 
 This shape is reserved for views that wallets and applications consume *as if* they were canonical. The consumer's product capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 
@@ -116,13 +137,16 @@ A derive service follows the same naming spine as canonical services ([Public In
 
 The derive plane fails independently. The boundary rules:
 
-- **A derive dispatch failure does not corrupt canonical state.** Canonical commits land before derive dispatch. Startup catch-up replays retained canonical events whose cursor has not reached the derive store.
+- **A derive tailer failure does not corrupt canonical state.** Canonical commits land before the derive tailer sees the event. Startup catch-up replays retained canonical events whose cursor has not reached the derive store.
 - **A reader gateway crash does not stop `zinder-ingest`.** The derive primary is owned by ingest; readers reopen as secondaries and catch up from the primary view.
 - **A reader gateway crash does not stop `zinder-query`.** `WalletQueryApi` reads from `ChainEpochReadApi`, not from any derive consumer.
 - **A derive view becoming inconsistent does not corrupt canonical state.** Canonical artifacts are written by `zinder-ingest` in atomic batches. A derive consumer that misinterprets an event produces a wrong derived view, not a wrong canonical view.
 - **Operators can drop and rebuild a derive view.** The derive store is independent. Dropping the derive subdirectory and restarting ingest produces a full rebuild from canonical artifacts and retained events.
 
-The metrics surface reflects this: ingest exposes derive-dispatch health for writer-owned projections, and `zinder-explorer` exposes secondary-reader freshness and query readiness. A derive view that is "not ready" does not propagate to wallet sync correctness.
+The metrics surface reflects this: ingest exposes derive-tailer health for
+writer-owned projections, and `zinder-explorer` exposes secondary-reader
+freshness and query readiness. A derive view that is "not ready" does not
+propagate to wallet sync correctness.
 
 ## Replayability
 

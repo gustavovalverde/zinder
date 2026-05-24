@@ -21,7 +21,7 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
     );
 
     let transaction_id = vec![0x42; 32];
-    let transparent_prevout_transaction_id = vec![0x43; 32];
+    let transparent_output_transaction_id = vec![0x43; 32];
     let compact_block = lightwalletd::CompactBlock {
         proto_version: 1,
         height: 42,
@@ -46,7 +46,7 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
                 ciphertext: vec![0x53; 52],
             }],
             vin: vec![lightwalletd::CompactTxIn {
-                prevout_txid: transparent_prevout_transaction_id.clone(),
+                prevout_txid: transparent_output_transaction_id.clone(),
                 prevout_index: 7,
             }],
             vout: vec![lightwalletd::TxOut {
@@ -81,7 +81,7 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
     assert_eq!(compact_transaction.txid, transaction_id);
     assert_eq!(
         transparent_input.prevout_txid,
-        transparent_prevout_transaction_id
+        transparent_output_transaction_id
     );
     assert_eq!(transparent_input.prevout_index, 7);
     assert_eq!(transparent_output.value, 5_000);

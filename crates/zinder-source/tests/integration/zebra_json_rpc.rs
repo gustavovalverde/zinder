@@ -8,12 +8,13 @@ use std::{collections::HashSet, num::NonZeroU64, time::Duration};
 use eyre::eyre;
 use serde_json::{Value, json};
 use zinder_core::{
-    BlockHeight, BroadcastAccepted, ChainTipMetadata, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ChainTipMetadata, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
+    TransactionId,
 };
 use zinder_source::{
-    NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceError, TransactionBroadcaster,
-    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
+    SourceError, TransactionBroadcaster, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
     decode_display_block_hash,
@@ -22,26 +23,13 @@ use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
 #[tokio::test]
 async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
-    // `fetch_block_at` keys the three parallel RPCs on the requested
-    // height directly; no separate `getblockhash` round trip. Pin the
-    // method set and parameter shape since operators read both through
-    // tracing.
+    // `fetch_block_at` keys the required RPCs on the requested height
+    // directly; no separate `getblockhash` or redundant `getblockheader`
+    // round trip. Pin the method set and parameter shape since operators
+    // read both through tracing.
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": fixture["height"],
-            "hash": fixture["hash"],
-            "sapling": {"commitments": {"size": 0}},
-            "orchard": {"commitments": {"size": 0}},
-        }))),
+        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"])))
     ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -59,26 +47,23 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
         decode_display_block_hash(string_field(&fixture, "hash")?)?
     );
     let methods_called: HashSet<String> = requests.iter().map(|r| r.method.clone()).collect();
-    let expected: HashSet<String> = ["getblockheader", "getblock", "z_gettreestate"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let expected: HashSet<String> = std::iter::once("getblock").map(str::to_owned).collect();
     assert_eq!(
         methods_called, expected,
-        "the three parallel RPCs key on the height directly; no `getblockhash` round trip",
+        "the block-fetch RPC keys on the height directly; tree state is fetched through its own checkpoint path",
     );
     assert!(
         server.requests_for("getblockhash")?.is_empty(),
         "`getblockhash` must not be called by the fetch path",
     );
-    assert_eq!(
-        server.requests_for("getblockheader")?[0].params,
-        json!(["1", true]),
+    assert!(
+        server.requests_for("getblockheader")?.is_empty(),
+        "`getblockheader` must not be called by the fetch path",
     );
     assert_eq!(server.requests_for("getblock")?[0].params, json!(["1", 0]),);
-    assert_eq!(
-        server.requests_for("z_gettreestate")?[0].params,
-        json!(["1"]),
+    assert!(
+        server.requests_for("z_gettreestate")?.is_empty(),
+        "`z_gettreestate` must not be called by the raw block fetch path",
     );
     assert!(
         requests
@@ -90,15 +75,127 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
 }
 
 #[tokio::test]
+async fn fetch_chain_update_after_start_emits_connected_block() -> eyre::Result<()> {
+    let fixture = fixture_block()?;
+    let server = JsonRpcTestServer::start([
+        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
+        method("getblockheader").reply(RpcReply::result(json!({
+            "hash": fixture["hash"],
+            "height": fixture["height"],
+            "previousblockhash": fixture["previousblockhash"],
+            "time": fixture["time"],
+        }))),
+        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let update = source
+        .fetch_chain_update_after(SourceChainCursor::before_first_block())
+        .await?
+        .ok_or_else(|| eyre!("expected connected block update"))?;
+
+    let SourceChainUpdate::ConnectedBlock { cursor, block } = update else {
+        return Err(eyre!("expected connected block update"));
+    };
+    let block_id = BlockId::new(
+        BlockHeight::new(1),
+        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+    );
+    assert_eq!(cursor, SourceChainCursor::at_block(block_id));
+    assert_eq!(block.height, BlockHeight::new(1));
+    assert!(
+        server.requests_for("getblockhash")?.is_empty(),
+        "the update adapter should stay on the existing height-keyed block fetch path",
+    );
+    assert!(
+        server.requests_for("z_gettreestate")?.is_empty(),
+        "tree state is fetched separately from connected block updates",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> {
+    let fixture = fixture_block()?;
+    let block_id = BlockId::new(
+        BlockHeight::new(1),
+        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+    );
+    let server = JsonRpcTestServer::start([
+        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
+        method("getblockheader").reply(RpcReply::result(json!({
+            "hash": fixture["hash"],
+            "height": fixture["height"],
+            "previousblockhash": fixture["previousblockhash"],
+            "time": fixture["time"],
+        }))),
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let update = source
+        .fetch_chain_update_after(SourceChainCursor::at_block(block_id))
+        .await?;
+
+    assert_eq!(update, None);
+    assert!(
+        server.requests_for("getblock")?.is_empty(),
+        "a cursor already at the observed tip should not fetch block payloads",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_update_after_diverged_tip_emits_reverted_block() -> eyre::Result<()> {
+    let fixture = fixture_block()?;
+    let old_block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([7; 32]));
+    let server = JsonRpcTestServer::start([
+        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
+        method("getblockheader").reply(RpcReply::result(json!({
+            "hash": fixture["hash"],
+            "height": fixture["height"],
+            "previousblockhash": fixture["previousblockhash"],
+            "time": fixture["time"],
+        }))),
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let update = source
+        .fetch_chain_update_after(SourceChainCursor::at_block(old_block_id))
+        .await?
+        .ok_or_else(|| eyre!("expected reverted block update"))?;
+
+    assert_eq!(update, SourceChainUpdate::reverted_block(old_block_id));
+    assert!(
+        server.requests_for("getblock")?.is_empty(),
+        "same-height cursor divergence should emit a revert before fetching replacement payloads",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> eyre::Result<()> {
     // Zebra's "height out of range" surfaces when the upstream's best
     // chain shifted between the parallel calls. The error rides on any
-    // of the three height-keyed calls; mocking `getblockheader` is
-    // enough because the joined Result short-circuits on the first
-    // failure. The adapter classifies it as UpstreamViewChanged so the
-    // loop treats it as a recoverable signal instead of a fatal exit.
+    // height-keyed block-fetch call. The adapter classifies it as
+    // UpstreamViewChanged so the loop treats it as a recoverable signal
+    // instead of a fatal exit.
     let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::error("height out of range"))
+        method("getblock").reply(RpcReply::error("height out of range"))
     ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -128,12 +225,10 @@ async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> e
 
 #[tokio::test]
 async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> eyre::Result<()> {
-    // Warming-up rides on any of the three parallel calls; mocking
-    // `getblockheader` is enough because the joined Result
-    // short-circuits on the first failure. Classifies as
-    // UpstreamViewChanged so the loop recovers.
+    // Warming-up on the block payload path classifies as UpstreamViewChanged
+    // so the loop recovers.
     let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::error_with_code(-28, "node warming up"))
+        method("getblock").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -163,7 +258,7 @@ async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> e
 
 #[tokio::test]
 async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([method("getblockheader").reply(RpcReply::empty())])?;
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::empty())])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -206,7 +301,17 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
         Err(error) => error,
     };
 
-    assert!(matches!(error, SourceError::NodeUnavailable { .. }));
+    assert!(matches!(
+        error,
+        SourceError::SourceResponseTooLarge {
+            operation: "getbestblockhash",
+            max_response_bytes: 1,
+        }
+    ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::Configuration,
+    );
 
     Ok(())
 }
@@ -312,119 +417,9 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
 }
 
 #[tokio::test]
-async fn header_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
-    let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": 2,
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": fixture["height"],
-            "hash": fixture["hash"],
-            "sapling": {"commitments": {"size": 0}},
-            "orchard": {"commitments": {"size": 0}},
-        }))),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
-        Ok(source_block) => {
-            return Err(eyre!("expected fetch error, got {source_block:?}"));
-        }
-        Err(error) => error,
-    };
-
-    // `header.height` disagreeing with the requested height is a
-    // wire-contract violation (Zebra returned the wrong block), not a
-    // reorg signature; stays SourceProtocolMismatch.
-    assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn header_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre::Result<()> {
-    // `getblockheader` and `getblock` can observe different blocks at
-    // the same height if a reorg lands between the parallel calls. The
-    // cross-hash agreement check is the de-facto reorg detector;
-    // BlockReorgDuringFetch lets the loop recover instead of treating
-    // the race as a broken node.
-    let fixture = fixture_block()?;
-    let mismatched_hash = "1111111111111111111111111111111111111111111111111111111111111111";
-    let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": mismatched_hash,
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": fixture["height"],
-            "hash": fixture["hash"],
-            "sapling": {"commitments": {"size": 0}},
-            "orchard": {"commitments": {"size": 0}},
-        }))),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
-        Ok(source_block) => {
-            return Err(eyre!("expected fetch error, got {source_block:?}"));
-        }
-        Err(error) => error,
-    };
-
-    assert!(
-        matches!(
-            error,
-            SourceError::BlockReorgDuringFetch { height, .. } if height == BlockHeight::new(1)
-        ),
-        "expected BlockReorgDuringFetch, got {error:?}",
-    );
-    assert_eq!(
-        error.upstream_classification(),
-        zinder_source::SourceFailureClass::UpstreamViewChanged,
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
-    let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!("not-hex"))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": fixture["height"],
-            "hash": fixture["hash"],
-            "sapling": {"commitments": {"size": 0}},
-            "orchard": {"commitments": {"size": 0}},
-        }))),
-    ])?;
+    let server =
+        JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!("not-hex")))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -450,30 +445,26 @@ async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre
     // with the parsed raw block hash is the second reorg-during-fetch
     // signature. Classified as UpstreamViewChanged so the loop recovers.
     let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({
             "network": "regtest",
             "height": fixture["height"],
             "hash": "1111111111111111111111111111111111111111111111111111111111111111",
-        }))),
-    ])?;
+        })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
         NodeAuth::None,
         Duration::from_secs(5),
     )?;
+    let requested_block = BlockId::new(
+        BlockHeight::new(1),
+        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+    );
 
-    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
-        Ok(source_block) => {
-            return Err(eyre!("expected fetch error, got {source_block:?}"));
+    let error = match source.fetch_tree_state_for_block(requested_block).await {
+        Ok(tree_state) => {
+            return Err(eyre!("expected fetch error, got {tree_state:?}"));
         }
         Err(error) => error,
     };
@@ -496,30 +487,26 @@ async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre
 #[tokio::test]
 async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
     let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-        method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
-        method("z_gettreestate").reply(RpcReply::result(json!({
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({
             "network": "regtest",
             "height": 2,
             "hash": fixture["hash"],
-        }))),
-    ])?;
+        })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
         NodeAuth::None,
         Duration::from_secs(5),
     )?;
+    let requested_block = BlockId::new(
+        BlockHeight::new(1),
+        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+    );
 
-    let error = match source.fetch_block_at(BlockHeight::new(1)).await {
-        Ok(source_block) => {
-            return Err(eyre!("expected fetch error, got {source_block:?}"));
+    let error = match source.fetch_tree_state_for_block(requested_block).await {
+        Ok(tree_state) => {
+            return Err(eyre!("expected fetch error, got {tree_state:?}"));
         }
         Err(error) => error,
     };
@@ -826,7 +813,6 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
             "methods": [
                 {"name": "getblock"},
                 {"name": "getbestblockhash"},
-                {"name": "getblockhash"},
                 {"name": "getblockheader"},
                 {"name": "z_gettreestate"},
                 {"name": "z_getsubtreesbyindex"},
@@ -947,17 +933,14 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
 #[tokio::test]
 async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()> {
     let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(block_hash_hex))),
-        method("getblock").reply(RpcReply::result(json!({
-            "height": 100,
-            "hash": block_hash_hex,
-            "trees": {
-                "sapling": {"size": 1234},
-                "orchard": {"size": 567},
-            },
-        }))),
-    ])?;
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+        "height": 100,
+        "hash": block_hash_hex,
+        "trees": {
+            "sapling": {"size": 1234},
+            "orchard": {"size": 567},
+        },
+    })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -970,20 +953,25 @@ async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()
     assert_eq!(checkpoint.height, BlockHeight::new(100));
     assert_eq!(checkpoint.hash, decode_display_block_hash(block_hash_hex)?);
     assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::new(1234, 567));
+    assert!(
+        server.requests_for("getblockhash")?.is_empty(),
+        "checkpoint fetch should use height-keyed getblock directly"
+    );
+    assert_eq!(
+        server.requests_for("getblock")?[0].params,
+        json!(["100", 1])
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn fetch_chain_checkpoint_defaults_missing_tree_pools_to_zero() -> eyre::Result<()> {
     let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(block_hash_hex))),
-        method("getblock").reply(RpcReply::result(json!({
-            "height": 100,
-            "hash": block_hash_hex,
-            "trees": {},
-        }))),
-    ])?;
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+        "height": 100,
+        "hash": block_hash_hex,
+        "trees": {},
+    })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -1002,13 +990,10 @@ async fn fetch_chain_checkpoint_defaults_missing_tree_pools_to_zero() -> eyre::R
 #[tokio::test]
 async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result<()> {
     let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([
-        method("getblockhash").reply(RpcReply::result(json!(block_hash_hex))),
-        method("getblock").reply(RpcReply::result(json!({
-            "height": 100,
-            "hash": block_hash_hex,
-        }))),
-    ])?;
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+        "height": 100,
+        "hash": block_hash_hex,
+    })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),

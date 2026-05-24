@@ -4,7 +4,7 @@
 //! [`EXPLORER_SERVER_INFO_V1`]) and
 //! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
 //! request time: confirmed totals are summed from canonical
-//! transparent UTXO artifacts (via `WalletQuery`) and the mempool overlay is
+//! transparent output facts (via `WalletQuery`) and the mempool overlay is
 //! composed from the live mempool point lookups (also via `WalletQuery`).
 //! The explorer plane owns no balance column family; the wire shape is the
 //! durable contract.
@@ -70,6 +70,7 @@ use super::transaction_detail::handle_transaction_detail;
 use super::transparent_address_activity::handle_transparent_address_activity;
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::DeriveStore;
+use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Copy, Debug)]
@@ -92,12 +93,13 @@ impl Default for ExplorerServerInfoSettings {
 /// [`ExplorerQueryGrpcAdapter::with_wallet_query_endpoint`] to enable the
 /// balance compute path. Without the endpoint the balance method returns
 /// `UNAVAILABLE` and `ServerInfo` omits the corresponding capability.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ExplorerQueryGrpcAdapter {
     settings: ExplorerServerInfoSettings,
     wallet_query_endpoint: Option<String>,
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
+    canonical_store: Option<SecondaryChainStore>,
     derive_store: Option<DeriveStore>,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
@@ -113,6 +115,7 @@ impl ExplorerQueryGrpcAdapter {
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
             bearer_token: None,
+            canonical_store: None,
             derive_store: None,
             wallet_channel: Arc::new(OnceCell::new()),
             prevout_resolution_online: false,
@@ -128,9 +131,18 @@ impl ExplorerQueryGrpcAdapter {
         self
     }
 
+    /// Wires the canonical secondary store so explorer handlers can read typed
+    /// block and transaction facts without requesting raw blobs from the
+    /// wallet plane.
+    #[must_use]
+    pub fn with_canonical_store(mut self, store: SecondaryChainStore) -> Self {
+        self.canonical_store = Some(store);
+        self
+    }
+
     /// Configures the `WalletQuery` endpoint the balance handler reads from.
     ///
-    /// The same endpoint serves canonical transparent UTXOs and the live
+    /// The same endpoint serves canonical transparent outputs and the live
     /// mempool point lookups composed into the balance response.
     #[must_use]
     pub fn with_wallet_query_endpoint(mut self, endpoint: String) -> Self {
@@ -156,7 +168,7 @@ impl ExplorerQueryGrpcAdapter {
         self
     }
 
-    /// Marks transparent prevout resolution as online so the adapter
+    /// Marks transparent-output resolution as online so the adapter
     /// advertises the per-tx paid-fee capability.
     ///
     /// The binary sets this flag once it opens a derive store with the bundled
@@ -205,28 +217,31 @@ impl ExplorerQueryGrpcAdapter {
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
         let wallet_query_online = self.wallet_query_endpoint.is_some();
         let derive_store_online = self.derive_store.is_some();
+        let canonical_store_online = self.canonical_store.is_some();
         let prevout_resolution_online = self.prevout_resolution_online && wallet_query_online;
         let payment_disclosure_verifier_online = self.payment_disclosure_verifier_online;
 
         let mut capabilities = vec![EXPLORER_SERVER_INFO_V1];
         if wallet_query_online {
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
-            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1);
             capabilities.push(EXPLORER_SEARCH_V1);
             capabilities.push(EXPLORER_MEMPOOL_SUMMARY_V1);
             capabilities.push(EXPLORER_MEMPOOL_ACTIVITY_V1);
-            capabilities.push(EXPLORER_FEE_SUMMARY_V1);
             capabilities.push(EXPLORER_VALUE_POOL_SUMMARY_V1);
+        }
+        if wallet_query_online && canonical_store_online {
+            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1);
         }
         if derive_store_online && wallet_query_online {
             capabilities.push(EXPLORER_BLOCK_SUMMARY_V1);
             capabilities.push(EXPLORER_BLOCK_DETAIL_V1);
+            capabilities.push(EXPLORER_FEE_SUMMARY_V1);
             capabilities.push(EXPLORER_MEMPOOL_EVENT_COUNTS_V1);
             capabilities.push(EXPLORER_TRANSACTION_RECENT_V1);
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1);
             // ADR-0018: TRANSACTION_FEES_V1 surfaces paid_fee_zat on
             // TransactionDetail / RecentTransactions / MempoolActivity,
-            // all of which need the transparent-prevouts upstream to be
+            // all of which need the transparent-output upstream to be
             // online. Advertise only when both gates are satisfied.
             if prevout_resolution_online {
                 capabilities.push(EXPLORER_TRANSACTION_FEES_V1);
@@ -312,6 +327,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let mut client = self.wallet_client(OP.method).await?;
             handle_transaction_detail(
                 &mut client,
+                self.canonical_store.as_ref(),
                 self.derive_store.as_ref(),
                 self.settings.network,
                 request,
@@ -458,8 +474,9 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_fee_summary(&mut client, self.settings.network, request).await
+            handle_fee_summary(derive_store, &mut client, request).await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -605,7 +622,7 @@ impl ExplorerQueryGrpcAdapter {
 
 /// Hard cap on the number of addresses one balance request may sum across.
 ///
-/// Shape C reads canonical UTXOs and the mempool overlay per address, so an
+/// Shape C reads canonical outputs and the mempool overlay per address, so an
 /// unbounded list would let one request fan out into thousands of
 /// `WalletQuery` round-trips. The cap mirrors the bounded-page rule used by
 /// the rest of the transparent-address surface. `u32` matches the
@@ -634,8 +651,8 @@ async fn compute_transparent_address_balance(
     let mut chain_epoch: Option<wallet::ChainEpoch> = None;
 
     for address_lookup in request.addresses {
-        let utxos_response = client
-            .transparent_address_utxos(Request::new(wallet::TransparentAddressUtxosRequest {
+        let outputs_response = client
+            .address_output_index(Request::new(wallet::AddressOutputIndexRequest {
                 address: Some(address_lookup.clone()),
                 max_entries: None,
                 from_cursor: Vec::new(),
@@ -645,7 +662,7 @@ async fn compute_transparent_address_balance(
             .await?
             .into_inner();
         if chain_epoch.is_none() {
-            chain_epoch.clone_from(&utxos_response.chain_epoch);
+            chain_epoch.clone_from(&outputs_response.chain_epoch);
         }
 
         let mempool_outputs = client
@@ -661,29 +678,29 @@ async fn compute_transparent_address_balance(
             chain_epoch.clone_from(&mempool_outputs.chain_epoch);
         }
 
-        for utxo in &utxos_response.utxos {
-            confirmed_zat = confirmed_zat.saturating_add(utxo.value_zat);
+        for output in &outputs_response.outputs {
+            confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
         }
         for output in &mempool_outputs.outputs {
             unconfirmed_delta_zat =
                 unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat)?);
         }
 
-        for utxo in &utxos_response.utxos {
-            let utxo_outpoint = utxo.outpoint.clone().ok_or_else(|| {
-                Status::data_loss("TransparentAddressUtxo.outpoint missing in WalletQuery response")
+        for output in &outputs_response.outputs {
+            let outpoint = output.outpoint.clone().ok_or_else(|| {
+                Status::data_loss("AddressOutputIndex.outpoint missing in WalletQuery response")
             })?;
             let spend_response = client
                 .transparent_mempool_spend_by_outpoint(Request::new(
                     wallet::TransparentMempoolSpendByOutpointRequest {
-                        outpoint: Some(utxo_outpoint),
+                        outpoint: Some(outpoint),
                     },
                 ))
                 .await?
                 .into_inner();
             if spend_response.spend.is_some() {
                 unconfirmed_delta_zat =
-                    unconfirmed_delta_zat.saturating_sub(value_zat_to_signed(utxo.value_zat)?);
+                    unconfirmed_delta_zat.saturating_sub(value_zat_to_signed(output.value_zat)?);
             }
         }
     }

@@ -266,6 +266,9 @@ fn seed_block_summary(derive_store: &DeriveStore, chain_fixture: &ChainFixture) 
             is_canonical: true,
         }),
         transaction_ids: Vec::new(),
+        fee_transaction_count: 0,
+        min_zip317_conventional_fee_zat: 0,
+        max_zip317_conventional_fee_zat: 0,
     };
     derive_store.put_consumer(
         BLOCK_SUMMARY_COLUMN_FAMILY,

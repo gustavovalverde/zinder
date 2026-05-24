@@ -8,41 +8,52 @@
 //! - [`BackupCommandConfig`] resolves the `backup` subcommand. Backup
 //!   keeps its own command config because it does not run the loop.
 
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
     BulkCatchupConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-    IngestDeriveConfig, IngestError, IngestLoopConfig, IngestModifiers,
-    MempoolEventRetentionWorkerConfig, NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
+    DeriveReplayPolicy, IngestDeriveConfig, IngestError, IngestLoopConfig, IngestModifiers,
+    MempoolEventRetentionWorkerConfig, NodeSourceKind, PhasesConfig, RawBlobPolicy,
+    TipFollowPhaseConfig,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
     IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageTuningToml,
-    duration_as_millis_u64, require_field, resolve_ingest_control_writer, resolve_ops_listen_addr,
-    resolve_primary_storage, resolve_retention,
+    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageTuningSection,
+    StorageTuningToml, duration_as_millis_u64, require_field, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::{MempoolEventRetentionConfig, StorageTuning};
 
 use crate::cli::parse::{
-    parse_commit_batch_blocks, parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks,
+    parse_canonical_batch_max_blocks, parse_node_source, parse_poll_interval_ms,
+    parse_reorg_window_blocks,
 };
 
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
-const DEFAULT_COMMIT_BATCH_BLOCKS: u32 = 1_000;
-const DEFAULT_MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH: u32 = 250_000;
-const DEFAULT_FETCH_CONCURRENCY: u32 = 32;
+const DEFAULT_CANONICAL_BATCH_MAX_BLOCKS: u32 = 1_000;
+const DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES: u64 = 536_870_912;
+const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 128;
+const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 50_331_648;
+const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 8;
+const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 268_435_456;
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
-const DERIVE_CONCURRENCY_FLOOR: u32 = 4;
-const DERIVE_CONCURRENCY_CEILING: u32 = 32;
+const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
+const FACT_BUILD_CONCURRENCY_CEILING: u32 = 16;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
+const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 
 /// Fully loaded command configuration for the unified `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
@@ -128,10 +139,13 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) max_response_bytes: Option<u64>,
     pub(crate) reorg_window_blocks: Option<u32>,
     pub(crate) catchup_threshold_blocks: Option<u32>,
-    pub(crate) commit_batch_blocks: Option<u32>,
-    pub(crate) max_transparent_prevout_store_lookups_per_batch: Option<u32>,
-    pub(crate) fetch_concurrency: Option<u32>,
-    pub(crate) derive_concurrency: Option<u32>,
+    pub(crate) canonical_batch_max_blocks: Option<u32>,
+    pub(crate) canonical_batch_max_artifact_bytes: Option<u64>,
+    pub(crate) source_segment_max_blocks: Option<u32>,
+    pub(crate) source_segment_target_response_bytes: Option<u64>,
+    pub(crate) source_fetch_max_in_flight_requests: Option<u32>,
+    pub(crate) source_fetch_max_in_flight_bytes: Option<u64>,
+    pub(crate) fact_build_concurrency: Option<u32>,
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) target_height: Option<u32>,
@@ -189,18 +203,45 @@ pub(crate) fn load_ingest_config(
     let raw_config: IngestConfig = ConfigLoader::new()
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
-            "ingest.bulk_catchup.commit_batch_blocks",
-            DEFAULT_COMMIT_BATCH_BLOCKS,
+            "ingest.bulk_catchup.canonical_batch_max_blocks",
+            DEFAULT_CANONICAL_BATCH_MAX_BLOCKS,
         )?
         .with_default(
-            "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
-            DEFAULT_MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH,
+            "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+            DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES,
         )?
         .with_default(
-            "ingest.bulk_catchup.fetch_concurrency",
-            DEFAULT_FETCH_CONCURRENCY,
+            "ingest.bulk_catchup.source_segment_max_blocks",
+            DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS,
         )?
-        .with_default("ingest.derive.concurrency", default_derive_concurrency())?
+        .with_default(
+            "ingest.bulk_catchup.source_segment_target_response_bytes",
+            DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+            DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+            DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.fact_build_concurrency",
+            default_fact_build_concurrency(),
+        )?
+        .with_default(
+            "ingest.derive.replay_concurrency",
+            default_fact_build_concurrency(),
+        )?
+        .with_default(
+            "ingest.derive.replay_batch_blocks",
+            DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.derive.replay_policy",
+            DeriveReplayPolicy::DEFAULT.as_kebab_case(),
+        )?
         .with_default(
             "ingest.bulk_catchup.flush_interval_epochs",
             DEFAULT_FLUSH_INTERVAL_EPOCHS,
@@ -221,6 +262,10 @@ pub(crate) fn load_ingest_config(
             "ingest.modifiers.coverage",
             DEFAULT_INGEST_COVERAGE.as_kebab_case(),
         )?
+        .with_default(
+            "storage.raw_blob_policy",
+            DEFAULT_RAW_BLOB_POLICY.as_kebab_case(),
+        )?
         .with_ops_section(ServiceIdentifier::Ingest)?
         .with_file(config_path)
         .with_zinder_env()?
@@ -239,18 +284,33 @@ pub(crate) fn load_ingest_config(
             overrides.catchup_threshold_blocks,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.commit_batch_blocks",
-            overrides.commit_batch_blocks,
+            "ingest.bulk_catchup.canonical_batch_max_blocks",
+            overrides.canonical_batch_max_blocks,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
-            overrides.max_transparent_prevout_store_lookups_per_batch,
+            "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+            overrides.canonical_batch_max_artifact_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.fetch_concurrency",
-            overrides.fetch_concurrency,
+            "ingest.bulk_catchup.source_segment_max_blocks",
+            overrides.source_segment_max_blocks,
         )?
-        .with_override_if("ingest.derive.concurrency", overrides.derive_concurrency)?
+        .with_override_if(
+            "ingest.bulk_catchup.source_segment_target_response_bytes",
+            overrides.source_segment_target_response_bytes,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+            overrides.source_fetch_max_in_flight_requests,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+            overrides.source_fetch_max_in_flight_bytes,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.fact_build_concurrency",
+            overrides.fact_build_concurrency,
+        )?
         .with_override_if(
             "ingest.tip_follow.poll_interval_ms",
             overrides.poll_interval_ms,
@@ -334,11 +394,28 @@ struct IngestConfig {
     network: NetworkSection,
     ops: OpsSection,
     node: NodeSection,
-    storage: PrimaryStorageSection,
+    storage: IngestPrimaryStorageSection,
     ingest: IngestSection,
     ingest_control: IngestControlSection,
     retention: RetentionSection,
     backup: BackupSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestPrimaryStorageSection {
+    path: Option<PathBuf>,
+    tuning: StorageTuningSection,
+    raw_blob_policy: Option<RawBlobPolicy>,
+}
+
+impl IngestPrimaryStorageSection {
+    fn into_primary_storage(self) -> PrimaryStorageSection {
+        PrimaryStorageSection {
+            path: self.path,
+            tuning: self.tuning,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -372,15 +449,24 @@ struct IngestPhasesSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestDeriveSection {
-    concurrency: Option<u32>,
+    #[serde(rename = "replay_concurrency")]
+    worker_count: Option<u32>,
+    #[serde(rename = "replay_batch_blocks")]
+    batch_blocks: Option<u32>,
+    #[serde(rename = "replay_policy")]
+    policy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestBulkCatchupSection {
-    commit_batch_blocks: Option<u32>,
-    max_transparent_prevout_store_lookups_per_batch: Option<u32>,
-    fetch_concurrency: Option<u32>,
+    canonical_batch_max_blocks: Option<u32>,
+    canonical_batch_max_artifact_bytes: Option<u64>,
+    source_segment_max_blocks: Option<u32>,
+    source_segment_target_response_bytes: Option<u64>,
+    source_fetch_max_in_flight_requests: Option<u32>,
+    source_fetch_max_in_flight_bytes: Option<u64>,
+    fact_build_concurrency: Option<u32>,
     flush_interval_epochs: Option<u32>,
 }
 
@@ -412,6 +498,28 @@ const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     }
 }
 
+fn parse_derive_replay_policy(policy_text: &str) -> Result<DeriveReplayPolicy, ConfigError> {
+    match policy_text {
+        "canonical-first" => Ok(DeriveReplayPolicy::CanonicalFirst),
+        "continuous" => Ok(DeriveReplayPolicy::Continuous),
+        _ => Err(ConfigError::invalid(
+            "ingest.derive.replay_policy must be one of: canonical-first, continuous",
+        )),
+    }
+}
+
+fn nonzero_u32_config(amount: Option<u32>, path: &'static str) -> Result<NonZeroU32, ConfigError> {
+    let amount = require_field(amount, path)?;
+    NonZeroU32::new(amount)
+        .ok_or_else(|| ConfigError::invalid(format!("{path} must be greater than zero")))
+}
+
+fn nonzero_u64_config(amount: Option<u64>, path: &'static str) -> Result<NonZeroU64, ConfigError> {
+    let amount = require_field(amount, path)?;
+    NonZeroU64::new(amount)
+        .ok_or_else(|| ConfigError::invalid(format!("{path} must be greater than zero")))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the unified ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
@@ -424,10 +532,14 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .clone()
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
+    let raw_blob_policy = config
+        .storage
+        .raw_blob_policy
+        .unwrap_or(DEFAULT_RAW_BLOB_POLICY);
     let ResolvedPrimaryStorage {
         path: storage_path,
         tuning: storage_tuning,
-    } = resolve_primary_storage(config.storage)?;
+    } = resolve_primary_storage(config.storage.into_primary_storage())?;
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -441,41 +553,73 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .catchup_threshold_blocks
         .unwrap_or(reorg_window_blocks);
 
-    let commit_batch_blocks_raw = require_field(
-        config.ingest.bulk_catchup.commit_batch_blocks,
-        "ingest.bulk_catchup.commit_batch_blocks",
+    let canonical_batch_max_blocks_raw = require_field(
+        config.ingest.bulk_catchup.canonical_batch_max_blocks,
+        "ingest.bulk_catchup.canonical_batch_max_blocks",
     )?;
-    let commit_batch_blocks = parse_commit_batch_blocks(commit_batch_blocks_raw)?;
+    let canonical_batch_max_blocks =
+        parse_canonical_batch_max_blocks(canonical_batch_max_blocks_raw)?;
 
-    let max_transparent_prevout_store_lookups_per_batch_raw = require_field(
+    let canonical_batch_max_artifact_bytes = nonzero_u64_config(
         config
             .ingest
             .bulk_catchup
-            .max_transparent_prevout_store_lookups_per_batch,
-        "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+            .canonical_batch_max_artifact_bytes,
+        "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
     )?;
-    let max_transparent_prevout_store_lookups_per_batch =
-        NonZeroU32::new(max_transparent_prevout_store_lookups_per_batch_raw).ok_or_else(|| {
+
+    let source_segment_max_blocks_raw = require_field(
+        config.ingest.bulk_catchup.source_segment_max_blocks,
+        "ingest.bulk_catchup.source_segment_max_blocks",
+    )?;
+    let source_segment_max_blocks =
+        NonZeroU32::new(source_segment_max_blocks_raw).ok_or_else(|| {
             ConfigError::invalid(
-                "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch must be greater than zero",
+                "ingest.bulk_catchup.source_segment_max_blocks must be greater than zero",
             )
         })?;
 
-    let fetch_concurrency_raw = require_field(
-        config.ingest.bulk_catchup.fetch_concurrency,
-        "ingest.bulk_catchup.fetch_concurrency",
+    let fact_build_concurrency_raw = require_field(
+        config.ingest.bulk_catchup.fact_build_concurrency,
+        "ingest.bulk_catchup.fact_build_concurrency",
     )?;
-    let fetch_concurrency = NonZeroU32::new(fetch_concurrency_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.bulk_catchup.fetch_concurrency must be greater than zero")
+    let fact_build_concurrency = NonZeroU32::new(fact_build_concurrency_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.bulk_catchup.fact_build_concurrency must be greater than zero")
     })?;
 
-    let derive_concurrency_raw = require_field(
-        config.ingest.derive.concurrency,
-        "ingest.derive.concurrency",
+    let source_segment_target_response_bytes = nonzero_u64_config(
+        config
+            .ingest
+            .bulk_catchup
+            .source_segment_target_response_bytes,
+        "ingest.bulk_catchup.source_segment_target_response_bytes",
     )?;
-    let derive_concurrency = NonZeroU32::new(derive_concurrency_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.derive.concurrency must be greater than zero")
+    let source_fetch_max_in_flight_requests = nonzero_u32_config(
+        config
+            .ingest
+            .bulk_catchup
+            .source_fetch_max_in_flight_requests,
+        "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+    )?;
+    let source_fetch_max_in_flight_bytes = nonzero_u64_config(
+        config.ingest.bulk_catchup.source_fetch_max_in_flight_bytes,
+        "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+    )?;
+
+    let replay_concurrency = nonzero_u32_config(
+        config.ingest.derive.worker_count,
+        "ingest.derive.replay_concurrency",
+    )?;
+    let replay_batch_blocks_raw = require_field(
+        config.ingest.derive.batch_blocks,
+        "ingest.derive.replay_batch_blocks",
+    )?;
+    let replay_batch_blocks = NonZeroU32::new(replay_batch_blocks_raw).ok_or_else(|| {
+        ConfigError::invalid("ingest.derive.replay_batch_blocks must be greater than zero")
     })?;
+    let replay_policy_raw =
+        require_field(config.ingest.derive.policy, "ingest.derive.replay_policy")?;
+    let replay_policy = parse_derive_replay_policy(&replay_policy_raw)?;
 
     let flush_interval_epochs_raw = require_field(
         config.ingest.bulk_catchup.flush_interval_epochs,
@@ -527,6 +671,12 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let retention = resolve_retention(config.retention)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
+    if source_segment_target_response_bytes > node_target.max_response_bytes {
+        return Err(ConfigError::invalid(
+            "ingest.bulk_catchup.source_segment_target_response_bytes must not exceed node.max_response_bytes",
+        )
+        .into());
+    }
 
     let modifiers = IngestModifiers {
         target_height: config.ingest.modifiers.target_height.map(BlockHeight::new),
@@ -544,17 +694,24 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         node_source,
         storage_path,
         storage_tuning,
+        raw_blob_policy,
         reorg_window_blocks,
         phases: PhasesConfig {
             catchup_threshold_blocks,
         },
         derive: IngestDeriveConfig {
-            concurrency: derive_concurrency,
+            replay_concurrency,
+            replay_batch_blocks,
+            replay_policy,
         },
         bulk_catchup: BulkCatchupConfig {
-            commit_batch_blocks,
-            max_transparent_prevout_store_lookups_per_batch,
-            fetch_concurrency,
+            canonical_batch_max_blocks,
+            canonical_batch_max_artifact_bytes,
+            source_segment_max_blocks,
+            source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes,
+            fact_build_concurrency,
             flush_interval_epochs,
         },
         tip_follow: TipFollowPhaseConfig {
@@ -580,7 +737,7 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
     let ResolvedPrimaryStorage {
         path: storage_path,
         tuning: storage_tuning,
-    } = resolve_primary_storage(config.storage)?;
+    } = resolve_primary_storage(config.storage.into_primary_storage())?;
     let to_path = config
         .backup
         .to_path
@@ -599,7 +756,7 @@ struct RedactedIngestConfigToml {
     network: NetworkToml,
     ops: OpsToml,
     node: NodeToml,
-    storage: PrimaryStorageToml,
+    storage: IngestPrimaryStorageToml,
     ingest: IngestToml,
     ingest_control: IngestControlWriterToml,
     retention: RetentionToml,
@@ -619,9 +776,10 @@ impl RedactedIngestConfigToml {
             network: NetworkToml::from_network(loop_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             node: NodeToml::from_node_target(&loop_config.node),
-            storage: PrimaryStorageToml {
+            storage: IngestPrimaryStorageToml {
                 path: loop_config.storage_path.display().to_string(),
                 tuning: StorageTuningToml::from_resolved(loop_config.storage_tuning),
+                raw_blob_policy: loop_config.raw_blob_policy,
             },
             ingest: IngestToml {
                 source: node_source_name(loop_config.node_source),
@@ -630,15 +788,36 @@ impl RedactedIngestConfigToml {
                     catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
                 },
                 derive: IngestDeriveToml {
-                    concurrency: loop_config.derive.concurrency.get(),
+                    worker_count: loop_config.derive.replay_concurrency.get(),
+                    batch_blocks: loop_config.derive.replay_batch_blocks.get(),
+                    policy: loop_config.derive.replay_policy.as_kebab_case(),
                 },
                 bulk_catchup: IngestBulkCatchupToml {
-                    commit_batch_blocks: loop_config.bulk_catchup.commit_batch_blocks.get(),
-                    max_transparent_prevout_store_lookups_per_batch: loop_config
+                    canonical_batch_max_blocks: loop_config
                         .bulk_catchup
-                        .max_transparent_prevout_store_lookups_per_batch
+                        .canonical_batch_max_blocks
                         .get(),
-                    fetch_concurrency: loop_config.bulk_catchup.fetch_concurrency.get(),
+                    canonical_batch_max_artifact_bytes: loop_config
+                        .bulk_catchup
+                        .canonical_batch_max_artifact_bytes
+                        .get(),
+                    source_segment_max_blocks: loop_config
+                        .bulk_catchup
+                        .source_segment_max_blocks
+                        .get(),
+                    source_segment_target_response_bytes: loop_config
+                        .bulk_catchup
+                        .source_segment_target_response_bytes
+                        .get(),
+                    source_fetch_max_in_flight_requests: loop_config
+                        .bulk_catchup
+                        .source_fetch_max_in_flight_requests
+                        .get(),
+                    source_fetch_max_in_flight_bytes: loop_config
+                        .bulk_catchup
+                        .source_fetch_max_in_flight_bytes
+                        .get(),
+                    fact_build_concurrency: loop_config.bulk_catchup.fact_build_concurrency.get(),
                     flush_interval_epochs: loop_config.bulk_catchup.flush_interval_epochs.get(),
                 },
                 tip_follow: IngestTipFollowToml {
@@ -691,37 +870,45 @@ struct IngestToml {
 }
 
 #[derive(Serialize)]
+struct IngestPrimaryStorageToml {
+    path: String,
+    tuning: StorageTuningToml,
+    raw_blob_policy: RawBlobPolicy,
+}
+
+#[derive(Serialize)]
 struct IngestPhasesToml {
     catchup_threshold_blocks: u32,
 }
 
 #[derive(Serialize)]
 struct IngestDeriveToml {
-    concurrency: u32,
+    #[serde(rename = "replay_concurrency")]
+    worker_count: u32,
+    #[serde(rename = "replay_batch_blocks")]
+    batch_blocks: u32,
+    #[serde(rename = "replay_policy")]
+    policy: &'static str,
 }
 
 #[derive(Serialize)]
 struct IngestBulkCatchupToml {
-    commit_batch_blocks: u32,
-    max_transparent_prevout_store_lookups_per_batch: u32,
-    fetch_concurrency: u32,
+    canonical_batch_max_blocks: u32,
+    canonical_batch_max_artifact_bytes: u64,
+    source_segment_max_blocks: u32,
+    source_segment_target_response_bytes: u64,
+    source_fetch_max_in_flight_requests: u32,
+    source_fetch_max_in_flight_bytes: u64,
+    fact_build_concurrency: u32,
     flush_interval_epochs: u32,
 }
 
-/// Computes the default `ingest.derive.concurrency` from available
-/// logical cores.
-///
-/// Subtracts one to leave a CPU for the Tokio reactor and other ingest
-/// work, then clamps into `[4, 32]`. The ceiling mirrors Zebra's
-/// `full_verify_concurrency_limit` precedent. See
-/// [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
-fn default_derive_concurrency() -> u32 {
+/// Computes the default fact-build concurrency from available logical cores.
+fn default_fact_build_concurrency() -> u32 {
     let logical_cores =
         u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
             .unwrap_or(8);
-    logical_cores
-        .saturating_sub(1)
-        .clamp(DERIVE_CONCURRENCY_FLOOR, DERIVE_CONCURRENCY_CEILING)
+    logical_cores.clamp(1, FACT_BUILD_CONCURRENCY_CEILING)
 }
 
 #[derive(Serialize)]

@@ -3,7 +3,12 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -15,31 +20,21 @@ use zinder_core::{
 };
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, decode_stored_record};
 use zinder_ingest::{
-    BackfillConfig, NodeSourceKind, backfill, backfill_until_complete,
-    catch_up_derive_store_to_canonical,
+    BackfillConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind, backfill,
+    backfill_until_complete, catch_up_derive_store_to_canonical,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
-    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeSource, NodeTarget,
-    SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots, decode_display_block_hash,
+    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
+    NodeTarget, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots,
+    SourceTreeState, decode_display_block_hash,
 };
 use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
     PrimaryChainStore,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
-
-fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
-            sync_writes: false,
-            consumer_column_families: &[],
-            tuning: zinder_store::StorageTuning::for_local_tests(),
-        },
-    )?)
-}
 
 fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
     Ok(zinder_derive::DeriveStore::open(
@@ -87,13 +82,23 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: storage_path.clone(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
         to_height: source_block.height,
-        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-            .ok_or_else(|| eyre!("invalid prevout budget"))?,
-        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        derive_concurrency: NonZeroU32::new(4)
+        canonical_batch_max_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid batch size"))?,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        source_segment_max_blocks: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
+        fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
@@ -149,6 +154,11 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         .await?;
     assert_eq!(compact_block.chain_epoch.tip_height, source_block.height);
     assert_eq!(compact_block.compact_block.height, source_block.height);
+    let tree_state = wallet_query
+        .tree_state_checkpoint_at_or_before(source_block.height, None)
+        .await?;
+    assert_eq!(tree_state.height, source_block.height);
+    assert_eq!(tree_state.block_hash, source_block.hash);
 
     Ok(())
 }
@@ -182,13 +192,23 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: storage_path.clone(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
         to_height: source_block.height,
-        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-            .ok_or_else(|| eyre!("invalid prevout budget"))?,
-        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        derive_concurrency: NonZeroU32::new(4)
+        canonical_batch_max_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid batch size"))?,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        source_segment_max_blocks: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
+        fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
@@ -199,25 +219,23 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashTestnet),
     )?;
-    let derive_store_without_consumers = test_derive_store(&storage_path)?;
     let readiness = Readiness::default();
 
-    backfill_until_complete(
-        &backfill_config,
-        &source,
-        &store,
-        &derive_store_without_consumers,
-        &readiness,
-    )
-    .await?
-    .ok_or_else(|| eyre!("expected backfill to commit"))?;
-    drop(derive_store_without_consumers);
+    backfill_until_complete(&backfill_config, &source, &store, &readiness)
+        .await?
+        .ok_or_else(|| eyre!("expected backfill to commit"))?;
 
     let derive_store = bundled_derive_store(&storage_path)?;
     catch_up_derive_store_to_canonical(
         &store,
         &derive_store,
-        NonZeroU32::new(2).ok_or_else(|| eyre!("invalid replay concurrency"))?,
+        IngestDeriveConfig {
+            replay_concurrency: NonZeroU32::new(2)
+                .ok_or_else(|| eyre!("invalid replay concurrency"))?,
+            replay_batch_blocks: NonZeroU32::new(1)
+                .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
+            replay_policy: DeriveReplayPolicy::DEFAULT,
+        },
     )
     .await?;
 
@@ -261,10 +279,7 @@ fn assert_block_summary_materialized(
 async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
     let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0);
     let expected_tip_metadata = ChainTipMetadata::new(107_796, 0);
-    let source_block = fixture_source_block()?.with_tree_state_payload_bytes(
-        br#"{"sapling":{"commitments":{"size":107796}},"orchard":{"commitments":{"size":0}}}"#
-            .to_vec(),
-    );
+    let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = SourceChainCheckpoint::new(
         checkpoint_height,
@@ -289,13 +304,23 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: tempdir.path().join("nonzero-checkpoint-backfill-store"),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
         to_height: source_block.height,
-        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-            .ok_or_else(|| eyre!("invalid prevout budget"))?,
-        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        derive_concurrency: NonZeroU32::new(4)
+        canonical_batch_max_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid batch size"))?,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        source_segment_max_blocks: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
+        fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
@@ -342,13 +367,23 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
         storage_path: storage_path.clone(),
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
         to_height: source_block.height,
-        commit_batch_blocks: NonZeroU32::new(1).ok_or_else(|| eyre!("invalid batch size"))?,
-        max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-            .ok_or_else(|| eyre!("invalid prevout budget"))?,
-        fetch_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("invalid fetch concurrency"))?,
-        derive_concurrency: NonZeroU32::new(4)
+        canonical_batch_max_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid batch size"))?,
+        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        source_segment_max_blocks: NonZeroU32::new(4)
+            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
+        fact_build_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
@@ -359,13 +394,11 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         &storage_path,
         ChainStoreOptions::for_network(Network::ZcashTestnet),
     )?;
-    let derive_store = test_derive_store(&storage_path)?;
     let readiness = Readiness::default();
 
-    let outcome =
-        backfill_until_complete(&backfill_config, &source, &store, &derive_store, &readiness)
-            .await?
-            .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
+    let outcome = backfill_until_complete(&backfill_config, &source, &store, &readiness)
+        .await?
+        .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
     assert_eq!(*pending_retryable_fetch_failures.lock(), 0);
@@ -398,7 +431,7 @@ fn assert_current_artifact_schema(chain_epoch: zinder_core::ChainEpoch) {
 #[async_trait]
 impl NodeSource for FixtureCheckpointSource {
     fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
+        NodeCapabilities::new([NodeCapability::TreeState]).unwrap_or_default()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -425,6 +458,25 @@ impl NodeSource for FixtureCheckpointSource {
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         Ok(BlockId::new(self.tip_height, self.block.hash))
+    }
+
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError> {
+        if block_id != BlockId::new(self.block.height, self.block.hash) {
+            return Err(SourceError::BlockUnavailable {
+                height: block_id.height,
+                reason: "fixture source only serves the configured block tree state".to_owned(),
+            });
+        }
+        let payload = format!(
+            r#"{{"hash":"{}","height":{},"time":{},"sapling":{{"commitments":{{"size":1,"finalState":"000000"}}}},"orchard":{{"commitments":{{"size":0,"finalState":"111111"}}}}}}"#,
+            hex::encode(block_id.hash.as_bytes()),
+            block_id.height.value(),
+            self.block.block_time_seconds
+        );
+        Ok(SourceTreeState::new(block_id, payload.into_bytes()))
     }
 
     async fn fetch_subtree_roots(

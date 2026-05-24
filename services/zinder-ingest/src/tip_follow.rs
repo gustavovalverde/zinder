@@ -10,25 +10,28 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    Network,
+    Network, NetworkUpgradeActivations, TreeStateArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState};
-use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceBlock};
+use zinder_source::{
+    ChainTipNotificationSource, NodeCapability, NodeSource, NodeTarget, SourceBlock, SourceError,
+};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
     ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
 };
 
 use crate::artifact_builder::{
-    CommitmentTreeSizes, DerivedBlockArtifacts, derive_block, finalize_derived_block,
+    CommitmentTreeSizes, DerivedBlockArtifacts, RawBlobPolicy, derive_block_with_raw_blob_policy,
+    finalize_derived_block,
 };
 use crate::chain_ingest::{
-    IngestBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
-    current_unix_millis, fetch_block_with_retry, next_chain_epoch_id_after,
-    next_chain_epoch_id_from, populate_subtree_root_artifacts, record_commit_outcome,
-    record_ingest_derive_outcome, select_best_chain,
+    CanonicalBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
+    current_unix_millis, fetch_block_with_retry, fetch_tree_state_for_block_with_retry,
+    next_chain_epoch_id_after, next_chain_epoch_id_from, populate_subtree_root_artifacts,
+    record_commit_outcome, record_ingest_fact_build_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
 use crate::phase::current_chain_height;
@@ -70,6 +73,10 @@ pub struct TipFollowConfig {
     /// service is ready as soon as the store is at most one block behind the
     /// observed node tip.
     pub lag_threshold_blocks: u64,
+    /// Optional raw-byte blob write policy.
+    pub raw_blob_policy: RawBlobPolicy,
+    /// Node-discovered consensus upgrade activations used for transaction facts.
+    pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
 /// Follows the upstream node tip until `cancel` is triggered, updating
@@ -84,21 +91,7 @@ where
     Source: NodeSource,
 {
     let store = open_tip_follow_store(config)?;
-    let derive_store = crate::derive_consumers::open_primary_derive_store_for_canonical(
-        &config.storage_path,
-        config.storage_tuning,
-    )?;
-    tip_follow_with_primary_store(
-        config,
-        source,
-        store,
-        derive_store,
-        readiness,
-        None,
-        None,
-        cancel,
-    )
-    .await
+    tip_follow_with_primary_store(config, source, store, readiness, None, None, cancel).await
 }
 
 /// Opens the primary store with the tip-follow reorg-window policy.
@@ -131,7 +124,6 @@ pub async fn tip_follow_with_primary_store<Source>(
     config: &TipFollowConfig,
     source: &Source,
     store: PrimaryChainStore,
-    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
     chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
@@ -140,16 +132,23 @@ pub async fn tip_follow_with_primary_store<Source>(
 where
     Source: NodeSource,
 {
+    let raw_blob_policy = config.raw_blob_policy;
+    let network_upgrade_activations = Arc::clone(&config.network_upgrade_activations);
     run_tip_follow_loop(
         config,
         source,
         store,
-        derive_store,
         readiness,
         mempool_ready_gate,
         chain_tip_source,
         cancel,
-        derive_block,
+        move |source_block| {
+            derive_block_with_raw_blob_policy(
+                source_block,
+                &network_upgrade_activations,
+                raw_blob_policy,
+            )
+        },
     )
     .await
 }
@@ -166,7 +165,6 @@ async fn run_tip_follow_loop<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: PrimaryChainStore,
-    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
     chain_tip_source: Option<Arc<dyn ChainTipNotificationSource>>,
@@ -176,7 +174,7 @@ async fn run_tip_follow_loop<Source, Derive>(
 where
     Source: NodeSource,
     Derive: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
-        + Copy
+        + Clone
         + Send
         + Sync,
 {
@@ -198,9 +196,8 @@ where
             config,
             source,
             &store,
-            &derive_store,
             &mut retry_state,
-            derive_fn,
+            derive_fn.clone(),
         )
         .await
         {
@@ -522,7 +519,6 @@ async fn tip_follow_once<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     retry_state: &mut IngestRetryState,
     derive_fn: Derive,
 ) -> Result<TipFollowIteration, IngestError>
@@ -553,7 +549,6 @@ where
         config,
         source,
         store,
-        derive_store,
         &derive_fn,
         plan,
         current_chain_epoch,
@@ -771,7 +766,7 @@ fn visible_block_hash(
     height: BlockHeight,
 ) -> Result<BlockHash, IngestError> {
     reader
-        .block_at(height)?
+        .block_header_at(height)?
         .map(|block| block.block_hash)
         .ok_or(IngestError::TipFollowCommonAncestorMissing {
             replacement_tip_height: height,
@@ -814,7 +809,6 @@ async fn commit_tip_follow_blocks<Source, Derive>(
     config: &TipFollowConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_store: &zinder_derive::DeriveStore,
     derive_fn: &Derive,
     plan: TipFollowPlan,
     current_chain_epoch: Option<ChainEpoch>,
@@ -825,7 +819,7 @@ where
     Derive:
         Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError> + Send + Sync,
 {
-    let mut batch = IngestBatch::default();
+    let mut batch = CanonicalBatch::default();
     let mut running_tree_sizes = CommitmentTreeSizes::from_tip_metadata(plan.parent_tip_metadata);
     for source_block in plan.source_blocks {
         if source_block.network != config.node.network {
@@ -836,13 +830,13 @@ where
             ));
         }
 
-        let derive_started_at = Instant::now();
+        let fact_build_started_at = Instant::now();
         let built_outcome = derive_fn(&source_block)
             .map_err(IngestError::from)
             .and_then(|derived| {
                 finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
             });
-        record_ingest_derive_outcome(derive_started_at, &built_outcome);
+        record_ingest_fact_build_outcome(fact_build_started_at, &built_outcome);
         let built = built_outcome?;
         batch.absorb(built);
     }
@@ -857,6 +851,7 @@ where
         retry_state,
     )
     .await?;
+    populate_tip_follow_tree_state_checkpoint(config, source, &mut batch, retry_state).await?;
     let chain_epoch_id = next_chain_epoch_id_from(current_chain_epoch.as_ref())?;
     let chain_epoch = chain_epoch_for_tip_commit(
         config.node.network,
@@ -865,26 +860,59 @@ where
         &batch,
     )?;
 
-    commit_ingest_batch(
-        store,
-        derive_store,
-        chain_epoch,
-        &mut batch,
-        plan.reorg_window_change,
+    commit_ingest_batch(store, chain_epoch, &mut batch, plan.reorg_window_change).await
+}
+
+async fn populate_tip_follow_tree_state_checkpoint<Source>(
+    config: &TipFollowConfig,
+    source: &Source,
+    batch: &mut CanonicalBatch,
+    retry_state: &mut IngestRetryState,
+) -> Result<(), IngestError>
+where
+    Source: NodeSource,
+{
+    if !batch.tree_states.is_empty() {
+        return Ok(());
+    }
+    let Some(tip_block) = batch.block_headers.last() else {
+        return Ok(());
+    };
+    if !source.capabilities().supports(NodeCapability::TreeState) {
+        return Ok(());
+    }
+
+    let block_id = BlockId::new(tip_block.height, tip_block.block_hash);
+    let source_tree_state = match fetch_tree_state_for_block_with_retry(
+        config.node.request_timeout,
+        source,
+        block_id,
+        retry_state,
     )
     .await
+    {
+        Ok(source_tree_state) => source_tree_state,
+        Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+        source_tree_state.block_id.height,
+        source_tree_state.block_id.hash,
+        source_tree_state.payload_bytes,
+    ));
+    Ok(())
 }
 
 fn chain_epoch_for_tip_commit(
     network: Network,
     chain_epoch_id: ChainEpochId,
     current_chain_epoch: Option<ChainEpoch>,
-    batch: &IngestBatch,
+    batch: &CanonicalBatch,
 ) -> Result<ChainEpoch, IngestError> {
     let tip_block = batch
-        .finalized_blocks
+        .block_headers
         .last()
-        .ok_or(IngestError::EmptyIngestBatch)?;
+        .ok_or(IngestError::EmptyCanonicalBatch)?;
     let parent_finalized = current_chain_epoch.map_or(
         (BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
         |chain_epoch| (chain_epoch.finalized_height, chain_epoch.finalized_hash),
@@ -898,7 +926,7 @@ fn chain_epoch_for_tip_commit(
         finalized_height: parent_finalized.0,
         finalized_hash: parent_finalized.1,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-        tip_metadata: batch.tip_metadata.ok_or(IngestError::EmptyIngestBatch)?,
+        tip_metadata: batch.tip_metadata.ok_or(IngestError::EmptyCanonicalBatch)?,
         created_at: current_unix_millis()?,
     })
 }
@@ -918,7 +946,7 @@ fn finalize_tip_if_ready(
     }
 
     let reader = store.chain_epoch_reader_at(chain_epoch.id)?;
-    let finalized_block = reader.block_at(finalized_height)?.ok_or(
+    let finalized_block = reader.block_header_at(finalized_height)?.ok_or(
         IngestError::TipFollowParentMetadataUnavailable {
             height: finalized_height,
         },
@@ -932,10 +960,14 @@ fn finalize_tip_if_ready(
     };
     let commit_outcome = store
         .commit_chain_epoch(
-            ChainEpochArtifacts::new(finalized_chain_epoch, Vec::new(), Vec::new())
-                .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
-                    height: finalized_height,
-                }),
+            ChainEpochArtifacts::new(
+                finalized_chain_epoch,
+                Vec::<zinder_core::BlockHeaderArtifact>::new(),
+                Vec::new(),
+            )
+            .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+                height: finalized_height,
+            }),
         )
         .map_err(IngestError::from)?;
     record_commit_outcome(&commit_outcome);
@@ -1050,7 +1082,7 @@ mod tests {
         let reader = store.current_chain_epoch_reader()?;
         assert_eq!(
             reader
-                .block_at(BlockHeight::new(2))?
+                .block_header_at(BlockHeight::new(2))?
                 .ok_or("missing block 2")?
                 .parent_hash,
             block_hash(1)
@@ -1083,7 +1115,7 @@ mod tests {
         let reader = store.current_chain_epoch_reader()?;
         assert_eq!(
             reader
-                .block_at(BlockHeight::new(2))?
+                .block_header_at(BlockHeight::new(2))?
                 .ok_or("missing replacement block")?
                 .block_hash,
             block_hash(20)
@@ -1157,7 +1189,6 @@ mod tests {
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
-        let derive_store = test_derive_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1168,7 +1199,6 @@ mod tests {
                     &config,
                     &source,
                     store,
-                    derive_store,
                     &readiness,
                     None,
                     None,
@@ -1202,7 +1232,6 @@ mod tests {
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
-        let derive_store = test_derive_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1213,7 +1242,6 @@ mod tests {
                     &config,
                     &source,
                     store,
-                    derive_store,
                     &readiness,
                     None,
                     None,
@@ -1360,6 +1388,10 @@ mod tests {
             ),
             storage_path: storage_path.to_owned(),
             storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::All,
+            network_upgrade_activations: Arc::new(
+                zinder_testkit::sample_regtest_upgrade_activations(),
+            ),
             reorg_window_blocks,
             poll_interval: Duration::from_millis(1),
             lag_threshold_blocks: super::DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
@@ -1372,28 +1404,9 @@ mod tests {
         store: &PrimaryChainStore,
         retry_state: &mut IngestRetryState,
     ) -> Result<Option<ChainEpochCommitOutcome>, IngestError> {
-        let derive_store = test_derive_store(&config.storage_path)?;
-        let iteration = tip_follow_once(
-            config,
-            source,
-            store,
-            &derive_store,
-            retry_state,
-            test_derive_block_fn,
-        )
-        .await?;
+        let iteration =
+            tip_follow_once(config, source, store, retry_state, test_derive_block_fn).await?;
         Ok(iteration.commit_outcome)
-    }
-
-    fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore, IngestError> {
-        Ok(zinder_derive::DeriveStore::open(
-            zinder_derive::DeriveStore::path_for_canonical(storage_path),
-            zinder_derive::DeriveStoreOptions {
-                sync_writes: false,
-                consumer_column_families: &[],
-                tuning: zinder_store::StorageTuning::for_local_tests(),
-            },
-        )?)
     }
 
     /// Test derive function for the tip-follow loop.
@@ -1411,13 +1424,24 @@ mod tests {
         source_block: &SourceBlock,
     ) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError> {
         Ok(DerivedBlockArtifacts {
-            block: zinder_core::BlockArtifact::new(
+            block_header: zinder_core::BlockHeaderArtifact::new(
+                source_block.height,
+                source_block.hash,
+                source_block.parent_hash,
+                [0; 32],
+                [0; 32],
+                i64::from(source_block.block_time_seconds),
+                0,
+                [0; 32],
+                0,
+                u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+            ),
+            block_blob: Some(zinder_core::BlockBlobArtifact::new(
                 source_block.height,
                 source_block.hash,
                 source_block.parent_hash,
                 source_block.raw_block_bytes.clone(),
-            ),
-            parsed_block: None,
+            )),
             partial_compact_block: LightwalletdCompactBlock {
                 proto_version: 1,
                 height: u64::from(source_block.height.value()),
@@ -1430,14 +1454,12 @@ mod tests {
                 chain_metadata: None,
             },
             tree_size_additions: CommitmentTreeSizes::default(),
-            observed_tree_sizes: None,
-            tree_state: None,
-            transactions: Vec::new(),
-            transparent_address_utxos: Vec::new(),
-            transparent_prevouts: Vec::new(),
-            transparent_utxo_spends: Vec::new(),
-            transparent_address_tx_index: Vec::new(),
-            transparent_address_tx_index_spend_candidates: Vec::new(),
+            block_transaction_index: Vec::new(),
+            transaction_locations: Vec::new(),
+            transaction_facts: Vec::new(),
+            transaction_blobs: Vec::new(),
+            address_output_index: Vec::new(),
+            transparent_outputs_by_outpoint: Vec::new(),
         })
     }
 
@@ -1535,10 +1557,10 @@ mod tests {
                 block_time_seconds: 1_774_668_400,
             };
 
-            Ok(
-                SourceBlock::new(header, format!("raw-block-{}", height.value()).into_bytes())
-                    .with_tree_state_payload_bytes(test_tree_state_payload()),
-            )
+            Ok(SourceBlock::new(
+                header,
+                format!("raw-block-{}", height.value()).into_bytes(),
+            ))
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
@@ -1642,10 +1664,6 @@ mod tests {
                 failure_count.checked_sub(1)
             })
             .is_ok()
-    }
-
-    fn test_tree_state_payload() -> Vec<u8> {
-        br#"{"sapling":{"commitments":{"size":0}},"orchard":{"commitments":{"size":0}}}"#.to_vec()
     }
 
     fn block_hash(seed: u32) -> BlockHash {

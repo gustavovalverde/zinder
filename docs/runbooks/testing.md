@@ -496,7 +496,7 @@ live_latency_baseline  network=zcash-regtest  tip=2361
   latest_block          = 160 µs
   compact_block_at      = 168 µs
   compact_block_range_50 = 1175 µs
-  tree_state_at         = 249 µs
+  tree_state_checkpoint_at_or_before         = 249 µs
 ```
 
 These numbers are not asserted by the test; treat the printed values as
@@ -705,7 +705,7 @@ What to validate by hand:
 
 - `GetLightdInfo.taddr_support` is `true` only on stores produced by the
   wallet-serving backfill profile (per
-  [wallet-data-plane §Transparent Address UTXOs](../architecture/wallet-data-plane.md#transparent-address-utxos)).
+  [wallet-data-plane §Transparent Address Outputs](../architecture/wallet-data-plane.md#transparent-address-outputs)).
 - `GetMempoolStream` closes cleanly on tip-change. Force a tip change with
   `docker exec z3_regtest_sidecar_zebra zebrad ... generate 1` and observe
   the stream end on the SDK side.
@@ -721,7 +721,7 @@ For production Zashi/Zodl claims, keep the evidence stricter:
   or above the wallet-serving store floor, or fail only with the documented
   strict `NOT_FOUND` unsupported-floor case. Unknown tree-state or subtree-root
   gaps are release blockers, not acceptable follow-up notes.
-- `GetAddressUtxosStream` is backed by stored transparent UTXO artifacts.
+- `GetAddressUtxosStream` is backed by stored transparent output artifacts.
   Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
   not satisfy the wallet-serving contract.
 - Pending-transaction UX requires both mempool surfaces: `GetMempoolTx` returns
@@ -795,8 +795,8 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v1
 wallet.read.compact_block_range_v1
-wallet.read.tree_state_at_v1
-wallet.read.latest_tree_state_v1
+wallet.read.tree_state_checkpoint_v1
+wallet.read.latest_tree_state_checkpoint_v1
 wallet.read.subtree_roots_in_range_v1
 wallet.read.transaction_by_id_v1
 wallet.read.server_info_v1
@@ -806,10 +806,10 @@ wallet.snapshot.mempool_v1
 wallet.events.mempool_v1
 wallet.mempool.transparent_outputs_by_address_v1
 wallet.mempool.transparent_spend_by_outpoint_v1
-wallet.mempool.transparent_prevouts_v1
-wallet.read.transparent_prevouts_v1
+wallet.mempool.transparent_outputs_by_outpoint_v1
+wallet.read.transparent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
-wallet.address.transparent_utxos_v1
+wallet.address.output_index_v1
 wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
 explorer.server_info_v1
@@ -817,7 +817,6 @@ explorer.transparent_address.balance_v1
 explorer.transaction.detail_v1
 explorer.block.summary_v1
 explorer.block.detail_v1
-wallet.read.full_block_at_v1
 explorer.search_v1
 explorer.mempool.summary_v1
 explorer.mempool.activity_v1
@@ -930,7 +929,7 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] Full wallet-serving bulk-catchup and tip-follow phase evidence exists for the target
       network, including store floor, tip height, `/readyz`, and reader secondary
       state.
-- [ ] Zashi/Zodl or Android SDK bootstrap, restore/resync, transparent UTXO, send,
+- [ ] Zashi/Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
       and mempool evidence is green when claiming lightwalletd-compatible wallet
       support.
 - [ ] Real Zallet binary gate is green when claiming Zallet support; the config

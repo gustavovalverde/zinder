@@ -39,6 +39,7 @@
 
 pub mod chain_fixture;
 pub mod deploy;
+pub mod derive_fixture;
 pub mod json_rpc_test_server;
 pub mod live;
 pub mod log_capture;
@@ -49,7 +50,13 @@ pub mod network_upgrade_fixtures;
 pub mod store_fixture;
 pub mod transparent_signer;
 
-pub use chain_fixture::{ChainFixture, FixtureBlock};
+pub use chain_fixture::{
+    ChainFixture, FixtureBlock, FixtureTransactionRows, synthetic_transaction_public_facts,
+};
+pub use derive_fixture::{
+    DeriveFixtureError, open_test_derive_store_for_canonical,
+    seed_transparent_address_transaction_history,
+};
 pub use json_rpc_test_server::{
     JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,
 };

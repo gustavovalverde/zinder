@@ -22,7 +22,10 @@ fn parity_chain_fixture(block_count: u32) -> ChainFixture {
     ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(block_count)
         .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0))
-        .with_tree_state_payload_at(BlockHeight::new(block_count), PARITY_TREE_STATE_PAYLOAD)
+        .with_tree_state_checkpoint_payload_at(
+            BlockHeight::new(block_count),
+            PARITY_TREE_STATE_PAYLOAD,
+        )
 }
 
 fn committed_store_fixture(chain_fixture: &ChainFixture) -> eyre::Result<StoreFixture> {

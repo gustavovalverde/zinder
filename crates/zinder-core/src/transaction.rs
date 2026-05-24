@@ -1,6 +1,9 @@
 //! Transaction identity, submission, and durable artifact values.
 
-use crate::{BlockHash, BlockHeight, ChainEpoch, ConsensusBranchId, MempoolEntry};
+use crate::{
+    BlockHash, BlockHeight, ChainEpoch, ConsensusBranchId, MempoolEntry, TransactionPublicFacts,
+    TransparentInputFact, TransparentOutputFact,
+};
 
 /// Zcash transaction identifier bytes.
 ///
@@ -126,23 +129,99 @@ pub struct BroadcastUnknown {
     pub message: String,
 }
 
-/// Durable artifact derived from a transaction in a block.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransactionArtifact {
+/// Canonical location of a mined transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionLocation {
     /// Transaction identifier.
     pub transaction_id: TransactionId,
     /// Height of the containing block.
     pub block_height: BlockHeight,
     /// Hash of the containing block.
     pub block_hash: BlockHash,
-    /// Serialized transaction payload or fixture bytes.
-    pub payload_bytes: Vec<u8>,
+    /// Block-local transaction index.
+    pub tx_index_in_block: u32,
+}
+
+impl TransactionLocation {
+    /// Creates a mined transaction location.
+    #[must_use]
+    pub const fn new(
+        transaction_id: TransactionId,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        tx_index_in_block: u32,
+    ) -> Self {
+        Self {
+            transaction_id,
+            block_height,
+            block_hash,
+            tx_index_in_block,
+        }
+    }
+}
+
+/// Canonical public transaction facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionFactsArtifact {
+    /// Location of the mined transaction.
+    pub location: TransactionLocation,
+    /// Public facts parsed from the transaction.
+    pub public_facts: TransactionPublicFacts,
+    /// Ordered transparent inputs observed in the transaction.
+    pub transparent_inputs: Vec<TransparentInputFact>,
+    /// Ordered transparent outputs observed in the transaction.
+    pub transparent_outputs: Vec<TransparentOutputFact>,
+}
+
+impl TransactionFactsArtifact {
+    /// Creates canonical transaction facts.
+    #[must_use]
+    pub const fn new(location: TransactionLocation, public_facts: TransactionPublicFacts) -> Self {
+        Self {
+            location,
+            public_facts,
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        }
+    }
+
+    /// Attaches the transaction-local transparent facts parsed by ingest.
+    #[must_use]
+    pub fn with_transparent_facts(
+        mut self,
+        transparent_inputs: Vec<TransparentInputFact>,
+        transparent_outputs: Vec<TransparentOutputFact>,
+    ) -> Self {
+        self.transparent_inputs = transparent_inputs;
+        self.transparent_outputs = transparent_outputs;
+        self
+    }
+}
+
+/// Optional cold-path raw transaction blob.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionBlobArtifact {
+    /// Location of the mined transaction.
+    pub location: TransactionLocation,
+    /// Serialized consensus transaction bytes.
+    pub raw_transaction_bytes: Vec<u8>,
+}
+
+impl TransactionBlobArtifact {
+    /// Creates a raw transaction blob.
+    #[must_use]
+    pub fn new(location: TransactionLocation, raw_transaction_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            location,
+            raw_transaction_bytes: raw_transaction_bytes.into(),
+        }
+    }
 }
 
 /// Mined-transaction enrichment fields bound to a response's [`ChainEpoch`].
 ///
 /// `MinedDetails` is a *response/read-model* value, not a persisted field on
-/// [`TransactionArtifact`]. The only public constructor takes the response
+/// [`TransactionLocation`]. The only public constructor takes the response
 /// epoch and the mined block's identity together, which prevents the racy
 /// `tip_height - block_height` confirmations computation by construction:
 /// the epoch is in scope when confirmations are computed, so callers cannot
@@ -189,8 +268,8 @@ impl MinedDetails {
 /// and the wire-side `MinedTransaction` message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinedTransaction {
-    /// Durable mined-transaction artifact.
-    pub artifact: TransactionArtifact,
+    /// Canonical mined transaction location.
+    pub location: TransactionLocation,
     /// Response-bound enrichment fields.
     pub details: MinedDetails,
 }
@@ -198,8 +277,8 @@ pub struct MinedTransaction {
 impl MinedTransaction {
     /// Creates a mined-transaction read-model record.
     #[must_use]
-    pub const fn new(artifact: TransactionArtifact, details: MinedDetails) -> Self {
-        Self { artifact, details }
+    pub const fn new(location: TransactionLocation, details: MinedDetails) -> Self {
+        Self { location, details }
     }
 }
 
@@ -219,7 +298,7 @@ impl MinedTransaction {
 pub enum TxStatus {
     /// Transaction is mined in the canonical chain.
     ///
-    /// Carries the durable [`TransactionArtifact`] together with
+    /// Carries the durable [`TransactionLocation`] together with
     /// epoch-bound [`MinedDetails`] enrichment.
     Mined(MinedTransaction),
     /// Transaction is not indexed in the visible canonical chain.
@@ -228,22 +307,4 @@ pub enum TxStatus {
     InMempool(MempoolEntry),
     /// Transaction conflicts with the visible canonical chain.
     ConflictingChain,
-}
-
-impl TransactionArtifact {
-    /// Creates a transaction artifact.
-    #[must_use]
-    pub fn new(
-        transaction_id: TransactionId,
-        block_height: BlockHeight,
-        block_hash: BlockHash,
-        payload_bytes: impl Into<Vec<u8>>,
-    ) -> Self {
-        Self {
-            transaction_id,
-            block_height,
-            block_hash,
-            payload_bytes: payload_bytes.into(),
-        }
-    }
 }

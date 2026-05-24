@@ -3,30 +3,39 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use zinder_core::{
-    BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionArtifact, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUtxoArtifact, TransparentOutPoint,
-    TransparentPrevoutArtifact, TreeStateArtifact,
+    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    TransparentSpendFact, TreeStateArtifact,
 };
 
 use crate::{
     StoreError,
+    address_output_index::{AddressOutputIndexStore, read_address_output_index},
     block_artifact::{
-        CompactBlockStore, FinalizedBlockStore, read_block_artifact, read_block_artifacts,
+        BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
+        read_block_blob_artifact, read_block_header_artifact, read_block_header_artifacts,
+        read_block_transaction_index_artifact, read_block_transaction_index_artifacts_at_height,
         read_compact_block_artifact, read_compact_block_artifacts,
     },
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
     kv::RocksChainStoreReadView,
     subtree_root::{SubtreeRootStore, read_subtree_root_artifacts},
     transaction_artifact::{
-        TransactionArtifactStore, read_transaction_artifact, read_transaction_artifacts_batch,
+        TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
+        read_transaction_blob_artifact, read_transaction_facts_artifact,
+        read_transaction_facts_artifacts_batch, read_transaction_location,
     },
-    transparent_prevout::{
-        read_current_transparent_prevouts_by_outpoints,
-        read_historical_transparent_prevouts_by_outpoints,
+    transparent_output::{
+        read_current_transparent_outputs_by_outpoints,
+        read_visible_transparent_outputs_by_outpoints,
     },
-    transparent_utxo::{TransparentUtxoStore, read_transparent_address_utxos},
-    tree_state::{TreeStateStore, read_tree_state_artifact},
+    transparent_spend_fact::{
+        read_current_transparent_spend_facts_by_outpoints,
+        read_visible_transparent_spend_facts_by_outpoints,
+    },
+    tree_state::{TreeStateStore, read_tree_state_checkpoint_at_or_before},
 };
 
 /// In-process read view pinned to one [`ChainEpoch`].
@@ -65,17 +74,57 @@ impl<'store> ChainEpochReader<'store> {
         self.chain_epoch
     }
 
-    /// Reads a finalized block artifact by height.
-    pub fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError> {
-        read_block_artifact(&self.read_view, self.chain_epoch, height)
+    /// Reads block-header facts by height.
+    pub fn block_header_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHeaderArtifact>, StoreError> {
+        read_block_header_artifact(&self.read_view, self.chain_epoch, height)
     }
 
-    /// Reads finalized block artifacts in one batched store read.
-    pub fn blocks_in_range(
+    /// Reads block-header facts in one batched store read.
+    pub fn block_headers_in_range(
         &self,
         block_range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
-        read_block_artifacts(&self.read_view, self.chain_epoch, block_range)
+    ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
+        read_block_header_artifacts(&self.read_view, self.chain_epoch, block_range)
+    }
+
+    /// Reads an optional raw block blob by height.
+    pub fn block_blob_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockBlobArtifact>, StoreError> {
+        read_block_blob_artifact(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads the transaction id at a block-local index.
+    pub fn transaction_id_at_block_index(
+        &self,
+        height: BlockHeight,
+        tx_index_in_block: u32,
+    ) -> Result<Option<TransactionId>, StoreError> {
+        Ok(read_block_transaction_index_artifact(
+            &self.read_view,
+            self.chain_epoch,
+            height,
+            tx_index_in_block,
+        )?
+        .map(|artifact| artifact.transaction_id))
+    }
+
+    /// Reads the ordered transaction ids for every transaction in a block.
+    pub fn transaction_ids_at_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Vec<TransactionId>, StoreError> {
+        read_block_transaction_index_artifacts_at_height(&self.read_view, self.chain_epoch, height)
+            .map(|artifacts| {
+                artifacts
+                    .into_iter()
+                    .map(|artifact| artifact.transaction_id)
+                    .collect()
+            })
     }
 
     /// Reads a compact block artifact by height.
@@ -94,33 +143,49 @@ impl<'store> ChainEpochReader<'store> {
         read_compact_block_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
-    /// Reads a transaction artifact by transaction id.
-    pub fn transaction_by_id(
+    /// Reads transaction facts by transaction id.
+    pub fn transaction_facts_by_id(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<TransactionArtifact>, StoreError> {
-        read_transaction_artifact(&self.read_view, self.chain_epoch, transaction_id)
+    ) -> Result<Option<TransactionFactsArtifact>, StoreError> {
+        read_transaction_facts_artifact(&self.read_view, self.chain_epoch, transaction_id)
     }
 
-    /// Reads transaction artifacts for many ids in one batched store read.
-    pub fn transactions_by_ids(
+    /// Reads transaction facts for many ids in one batched store read.
+    pub fn transaction_facts_by_ids(
         &self,
         transaction_ids: &[TransactionId],
-    ) -> Result<HashMap<TransactionId, Option<TransactionArtifact>>, StoreError> {
-        read_transaction_artifacts_batch(&self.read_view, self.chain_epoch, transaction_ids)
+    ) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
+        read_transaction_facts_artifacts_batch(&self.read_view, self.chain_epoch, transaction_ids)
     }
 
-    /// Reads a tree-state artifact by height.
-    pub fn tree_state_at(
+    /// Reads a transaction location by transaction id.
+    pub fn transaction_location_by_id(
         &self,
-        height: BlockHeight,
-    ) -> Result<Option<TreeStateArtifact>, StoreError> {
-        read_tree_state_artifact(&self.read_view, self.chain_epoch, height)
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionLocation>, StoreError> {
+        read_transaction_location(&self.read_view, self.chain_epoch, transaction_id)
     }
 
-    /// Reads the tree-state artifact at this reader's tip height.
-    pub fn latest_tree_state(&self) -> Result<Option<TreeStateArtifact>, StoreError> {
-        self.tree_state_at(self.chain_epoch.tip_height)
+    /// Reads an optional raw transaction blob by transaction id.
+    pub fn transaction_blob_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionBlobArtifact>, StoreError> {
+        read_transaction_blob_artifact(&self.read_view, self.chain_epoch, transaction_id)
+    }
+
+    /// Reads a checkpoint tree-state artifact at or before `max_height`.
+    pub fn tree_state_checkpoint_at_or_before(
+        &self,
+        max_height: BlockHeight,
+    ) -> Result<Option<TreeStateArtifact>, StoreError> {
+        read_tree_state_checkpoint_at_or_before(&self.read_view, self.chain_epoch, max_height)
+    }
+
+    /// Reads the latest checkpoint tree-state artifact visible to this reader.
+    pub fn latest_tree_state_checkpoint(&self) -> Result<Option<TreeStateArtifact>, StoreError> {
+        self.tree_state_checkpoint_at_or_before(self.chain_epoch.tip_height)
     }
 
     /// Reads subtree-root artifacts in ascending subtree-index order.
@@ -132,13 +197,13 @@ impl<'store> ChainEpochReader<'store> {
     }
 
     /// Reads unspent transparent outputs for an address script hash.
-    pub fn transparent_address_utxos(
+    pub fn address_output_index(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         max_entries: NonZeroU32,
-    ) -> Result<Vec<TransparentAddressUtxoArtifact>, StoreError> {
-        read_transparent_address_utxos(
+    ) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+        read_address_output_index(
             &self.read_view,
             self.chain_epoch,
             address_script_hash,
@@ -152,54 +217,95 @@ impl<'store> ChainEpochReader<'store> {
         read_block_hash_lookup(&self.read_view, self.chain_epoch, block_hash)
     }
 
-    /// Resolves transparent prevout artifacts by outpoint.
+    /// Resolves transparent output artifacts by outpoint.
     ///
     /// This does not filter out spent rows: prevout resolution needs the
     /// original value and script after the output has been spent. Current
     /// readers use the exact current projection; pinned historical readers
-    /// scan epoch-suffixed history and verify producing-block visibility.
-    pub fn transparent_prevouts_by_outpoints(
+    /// use the same canonical rows and verify producing-block visibility.
+    pub fn transparent_outputs_by_outpoints(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Result<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>, StoreError> {
+    ) -> Result<HashMap<TransparentOutPoint, TransparentOutputArtifact>, StoreError> {
         if self.is_current {
-            return read_current_transparent_prevouts_by_outpoints(
+            return read_current_transparent_outputs_by_outpoints(
                 &self.read_view,
                 self.chain_epoch,
                 outpoints,
             );
         }
-        read_historical_transparent_prevouts_by_outpoints(
-            &self.read_view,
-            self.chain_epoch,
-            outpoints,
-        )
+        read_visible_transparent_outputs_by_outpoints(&self.read_view, self.chain_epoch, outpoints)
     }
 
-    /// Resolves transparent prevout artifacts by outpoint on the primary writer's
+    /// Resolves transparent output artifacts by outpoint on the primary writer's
     /// commit path.
     ///
     /// This intentionally skips external-reader visibility and spend-state
     /// filtering. Use it only while the writer is deriving a node-validated
     /// batch against its own current epoch.
-    pub fn transparent_prevouts_by_outpoints_for_writer_commit(
+    pub fn transparent_outputs_by_outpoints_for_writer_commit(
         &self,
         outpoints: &[TransparentOutPoint],
-    ) -> Result<HashMap<TransparentOutPoint, TransparentPrevoutArtifact>, StoreError> {
-        read_current_transparent_prevouts_by_outpoints(&self.read_view, self.chain_epoch, outpoints)
+    ) -> Result<HashMap<TransparentOutPoint, TransparentOutputArtifact>, StoreError> {
+        read_current_transparent_outputs_by_outpoints(&self.read_view, self.chain_epoch, outpoints)
+    }
+
+    /// Resolves transparent spend facts by spent outpoint.
+    pub fn transparent_spend_facts_by_outpoints(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, StoreError> {
+        if self.is_current {
+            return read_current_transparent_spend_facts_by_outpoints(
+                &self.read_view,
+                self.chain_epoch,
+                outpoints,
+            );
+        }
+        read_visible_transparent_spend_facts_by_outpoints(
+            &self.read_view,
+            self.chain_epoch,
+            outpoints,
+        )
     }
 }
 
-impl FinalizedBlockStore for ChainEpochReader<'_> {
-    fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError> {
-        self.block_at(height)
+impl BlockHeaderStore for ChainEpochReader<'_> {
+    fn block_header_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHeaderArtifact>, StoreError> {
+        self.block_header_at(height)
     }
 
-    fn blocks_in_range(
+    fn block_headers_in_range(
         &self,
         block_range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
-        self.blocks_in_range(block_range)
+    ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
+        self.block_headers_in_range(block_range)
+    }
+}
+
+impl BlockBlobStore for ChainEpochReader<'_> {
+    fn block_blob_at(&self, height: BlockHeight) -> Result<Option<BlockBlobArtifact>, StoreError> {
+        self.block_blob_at(height)
+    }
+}
+
+impl BlockTransactionIndexStore for ChainEpochReader<'_> {
+    fn transaction_id_at_block_index(
+        &self,
+        height: BlockHeight,
+        tx_index_in_block: u32,
+    ) -> Result<Option<TransactionId>, StoreError> {
+        self.transaction_id_at_block_index(height, tx_index_in_block)
+    }
+
+    fn transaction_ids_at_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Vec<TransactionId>, StoreError> {
+        self.transaction_ids_at_height(height)
     }
 }
 
@@ -212,25 +318,46 @@ impl CompactBlockStore for ChainEpochReader<'_> {
     }
 }
 
-impl TransactionArtifactStore for ChainEpochReader<'_> {
-    fn transaction_by_id(
+impl TransactionFactsStore for ChainEpochReader<'_> {
+    fn transaction_facts_by_id(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<TransactionArtifact>, StoreError> {
-        self.transaction_by_id(transaction_id)
+    ) -> Result<Option<TransactionFactsArtifact>, StoreError> {
+        self.transaction_facts_by_id(transaction_id)
     }
 
-    fn transactions_by_ids(
+    fn transaction_facts_by_ids(
         &self,
         transaction_ids: &[TransactionId],
-    ) -> Result<HashMap<TransactionId, Option<TransactionArtifact>>, StoreError> {
-        self.transactions_by_ids(transaction_ids)
+    ) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
+        self.transaction_facts_by_ids(transaction_ids)
+    }
+}
+
+impl TransactionLocationStore for ChainEpochReader<'_> {
+    fn transaction_location_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionLocation>, StoreError> {
+        self.transaction_location_by_id(transaction_id)
+    }
+}
+
+impl TransactionBlobStore for ChainEpochReader<'_> {
+    fn transaction_blob_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionBlobArtifact>, StoreError> {
+        self.transaction_blob_by_id(transaction_id)
     }
 }
 
 impl TreeStateStore for ChainEpochReader<'_> {
-    fn tree_state_at(&self, height: BlockHeight) -> Result<Option<TreeStateArtifact>, StoreError> {
-        self.tree_state_at(height)
+    fn tree_state_checkpoint_at_or_before(
+        &self,
+        max_height: BlockHeight,
+    ) -> Result<Option<TreeStateArtifact>, StoreError> {
+        self.tree_state_checkpoint_at_or_before(max_height)
     }
 }
 
@@ -243,13 +370,13 @@ impl SubtreeRootStore for ChainEpochReader<'_> {
     }
 }
 
-impl TransparentUtxoStore for ChainEpochReader<'_> {
-    fn transparent_address_utxos(
+impl AddressOutputIndexStore for ChainEpochReader<'_> {
+    fn address_output_index(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         max_entries: NonZeroU32,
-    ) -> Result<Vec<TransparentAddressUtxoArtifact>, StoreError> {
-        self.transparent_address_utxos(address_script_hash, start_height, max_entries)
+    ) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+        self.address_output_index(address_script_hash, start_height, max_entries)
     }
 }

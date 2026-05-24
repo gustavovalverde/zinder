@@ -209,7 +209,7 @@ message TransactionPublicFacts {
 // has a known prevout value in the wallet plane's prevout index, `PARTIAL`
 // when at least one is missing, and `UNAVAILABLE` when the indexer is not
 // resolving prevouts at all (the upstream node does not advertise
-// `WALLET_READ_TRANSPARENT_PREVOUTS_V1`).
+// `WALLET_READ_TRANSPARENT_OUTPUTS_V1`).
 enum PrevoutResolutionStatus {
   PREVOUT_RESOLUTION_STATUS_UNSPECIFIED = 0;
   PREVOUT_RESOLUTION_STATUS_RESOLVED = 1;
@@ -282,7 +282,6 @@ message TransactionDetailResponse {
   ExplorerFreshness freshness = 1;
   TransactionPublicFacts facts = 2;
   TransactionLocation location = 3;
-  bytes raw_transaction_bytes = 4;
   optional uint64 paid_fee_zat = 5;
   PrevoutResolutionStatus prevout_resolution_status = 6;
   repeated TransparentInputDetail transparent_inputs = 7;
@@ -365,6 +364,14 @@ message BlockSummaryRecord {
   // Transaction ids in canonical block order (32 bytes each, internal byte
   // order). The leading entry is the coinbase.
   repeated bytes transaction_ids = 2;
+  // Number of non-coinbase transactions in this block.
+  uint32 fee_transaction_count = 3;
+  // Smallest ZIP-317 conventional fee floor among non-coinbase transactions,
+  // zero when the block has no non-coinbase transactions.
+  uint64 min_zip317_conventional_fee_zat = 4;
+  // Largest ZIP-317 conventional fee floor among non-coinbase transactions,
+  // zero when the block has no non-coinbase transactions.
+  uint64 max_zip317_conventional_fee_zat = 5;
 }
 
 // `ExplorerQuery.BlockSummariesInRange` request.
@@ -845,14 +852,11 @@ message TransparentAddressActivityResponse {
 // `ExplorerQuery.FeeSummary` request.
 //
 // Aggregates per-transaction ZIP-317 conventional fee floors over the
-// inclusive block range `[start_height, end_height]`. The handler parses
-// every block via `WalletQuery.FullBlock` and computes
-// `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat`
-// for each non-coinbase transaction.
+// inclusive block range `[start_height, end_height]` from the typed
+// `BlockSummaryRecord` facts materialized by the derive plane.
 message FeeSummaryRequest {
   uint32 start_height = 1;
   uint32 end_height = 2;
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
 }
 
 // `ExplorerQuery.FeeSummary` response.
@@ -1080,7 +1084,7 @@ message RecentTransactionsChunk {
 //   "coinbase reward path" with "paid no fee", and a `Some(0)` sentinel
 //   would force readers to special-case coinbase anyway.)
 // - `paid_fee_zat` is set only when the consumer resolved every
-//   transparent prevout via `WalletQuery.TransparentPrevouts` AND the
+//   transparent prevout via `WalletQuery.TransparentOutputsByOutpoint` AND the
 //   transaction has no shielded inputs.
 message RecentTransactionEntry {
   bytes transaction_id = 1;

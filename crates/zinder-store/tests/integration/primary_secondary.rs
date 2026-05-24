@@ -6,7 +6,7 @@
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
@@ -71,7 +71,10 @@ fn secondary_catches_up_after_primary_commits() -> eyre::Result<()> {
 
     let reader = secondary.current_chain_epoch_reader()?;
     assert_eq!(reader.chain_epoch(), second_epoch);
-    assert_eq!(reader.block_at(BlockHeight::new(2))?, Some(second_block));
+    assert_eq!(
+        reader.block_header_at(BlockHeight::new(2))?,
+        Some(second_block)
+    );
 
     Ok(())
 }
@@ -140,7 +143,7 @@ fn secondary_continues_serving_after_primary_drops() -> eyre::Result<()> {
     assert_eq!(secondary.current_chain_epoch()?, Some(final_epoch));
     let reader = secondary.current_chain_epoch_reader()?;
     assert_eq!(reader.chain_epoch(), final_epoch);
-    assert!(reader.block_at(BlockHeight::new(2))?.is_some());
+    assert!(reader.block_header_at(BlockHeight::new(2))?.is_some());
 
     // Phase 3: a new primary opened against the same path resumes from
     // the durable state. Validates that an operator restart after a
@@ -171,7 +174,7 @@ fn checkpoint_round_trip_preserves_visible_epoch() -> eyre::Result<()> {
         PrimaryChainStore::open(&checkpoint_path, ChainStoreOptions::for_local_tests())?;
     assert_eq!(checkpoint.current_chain_epoch()?, Some(chain_epoch));
     let reader = checkpoint.current_chain_epoch_reader()?;
-    assert_eq!(reader.block_at(BlockHeight::new(1))?, Some(block));
+    assert_eq!(reader.block_header_at(BlockHeight::new(1))?, Some(block));
 
     Ok(())
 }
@@ -179,7 +182,7 @@ fn checkpoint_round_trip_preserves_visible_epoch() -> eyre::Result<()> {
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
@@ -192,15 +195,15 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{height}").into_bytes(),
+            format!("raw-block-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,

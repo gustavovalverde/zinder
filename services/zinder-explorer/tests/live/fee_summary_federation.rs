@@ -1,8 +1,7 @@
 //! Live federation tests for [`ExplorerQuery::FeeSummary`].
 //!
-//! The handler reads each block via `WalletQuery.FullBlock`, parses
-//! with `zebra-chain`, and aggregates per-transaction ZIP-317
-//! conventional fee floors via
+//! The handler reads typed block-summary facts from the derive store and
+//! aggregates per-transaction ZIP-317 conventional fee floors via
 //! `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat`.
 //! The test exercises the full pipeline against a real upstream node:
 //! backfill a window, ask the explorer for a fee summary over the
@@ -23,7 +22,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{
+    DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
+};
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
@@ -35,7 +36,10 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_tip_height, live_backfill_config, zebra_source_from_backfill};
+use crate::common::{
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    zebra_source_from_backfill,
+};
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
@@ -131,9 +135,22 @@ impl FeeSummaryFixture {
         )
         .await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
+        let derive_store = DeriveStore::open_secondary(
+            DeriveStore::path_for_canonical(&store_tempdir.path().join("zinder-store")),
+            store_tempdir
+                .path()
+                .join("zinder-derive-secondary-explorer"),
+            DeriveStoreOptions {
+                sync_writes: false,
+                consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+                tuning: zinder_store::StorageTuning::for_local_tests(),
+            },
+        )?;
+        derive_store.try_catch_up()?;
 
         let explorer_adapter =
             ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
+                .with_derive_store(derive_store)
                 .with_wallet_query_endpoint(wallet_endpoint);
 
         Ok(Self {
@@ -156,7 +173,6 @@ impl FeeSummaryFixture {
             Request::new(FeeSummaryRequest {
                 start_height,
                 end_height,
-                at_epoch: None,
             }),
         )
         .await?;
@@ -235,6 +251,7 @@ async fn backfill_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore
     let from_height = BlockHeight::new(checkpoint_height.value() + 1);
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
     let mut backfill_config = live_backfill_config(
         env,
         &storage_path,
@@ -242,6 +259,7 @@ async fn backfill_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore
         tip_height,
         NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
         true,
+        activations,
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;

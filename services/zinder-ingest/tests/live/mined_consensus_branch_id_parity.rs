@@ -27,15 +27,15 @@ use std::num::NonZeroU32;
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
-use zinder_core::{BlockHeight, MinedTransaction, Network, TransactionArtifact, TxStatus};
+use zinder_core::{BlockHeight, MinedTransaction, Network, TxStatus};
 use zinder_ingest::backfill;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_tip_height, live_backfill_config, regtest_generate_blocks,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    regtest_generate_blocks, zebra_source_from_backfill,
 };
 
 /// Near-tip backfill depth on testnet/mainnet. Small enough to finish in
@@ -79,6 +79,7 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         (BlockHeight::new(1), None)
     };
 
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
     let mut backfill_config = live_backfill_config(
         &env,
         &storage_path,
@@ -86,11 +87,9 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         tip_height,
         NonZeroU32::new(100).ok_or_else(|| eyre!("invalid backfill batch size"))?,
         true,
+        activations.clone(),
     );
     let source = zebra_source_from_backfill(&backfill_config)?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-ingest-tests")
-        .await?;
     if let Some(checkpoint_height) = checkpoint_height {
         backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
@@ -112,11 +111,7 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         .transaction(coinbase_transaction_id, None)
         .await?;
     let TransactionStatus {
-        status:
-            TxStatus::Mined(MinedTransaction {
-                artifact: TransactionArtifact { block_height, .. },
-                details,
-            }),
+        status: TxStatus::Mined(MinedTransaction { location, details }),
         ..
     } = status
     else {
@@ -127,8 +122,8 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
     };
 
     assert_eq!(
-        block_height, coinbase_block_height,
-        "TxStatus::Mined artifact block_height must match the coinbase's block height"
+        location.block_height, coinbase_block_height,
+        "TxStatus::Mined location block_height must match the coinbase's block height"
     );
     let expected_branch_id = activations.consensus_branch_id_at(coinbase_block_height);
     assert_eq!(

@@ -96,10 +96,9 @@ The loop is driven by an explicit phase classifier with three phases:
   commits with `FinalizeThrough { tip_height: target }` against a
   per-batch target of
   `min(upstream_tip - ingest.reorg_window_blocks,
-       store_tip + ingest.bulk_catchup.commit_batch_blocks)`.
-  The commit stage may close the batch earlier when out-of-batch
-  transparent prevout store-lookups reach
-  `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch`.
+       store_tip + ingest.bulk_catchup.canonical_batch_max_blocks)`.
+  Transparent-output hydration for spend-derived views is outside the
+  canonical commit path and is handled by the derive tailer.
 - `IngestPhase::TipFollow` otherwise. Runs the serial fetch shape and
   commits with `Extend` or `Replace`, then advances the finalized
   boundary through the same `finalize_tip_if_ready` path that exists
@@ -144,9 +143,7 @@ splits the rest into four concern-named sub-sections:
 - `[ingest.derive]` carries shared CPU-bound derive execution knobs
   (`concurrency`).
 - `[ingest.bulk_catchup]` carries the pipelined-fetch and commit-work
-  knobs (`commit_batch_blocks`,
-  `max_transparent_prevout_store_lookups_per_batch`,
-  `fetch_concurrency`).
+  knobs (`canonical_batch_max_blocks`, `source_segment_max_blocks`).
 - `[ingest.tip_follow]` carries the serial-loop knobs
   (`poll_interval_ms`, `lag_threshold_blocks`).
 - `[ingest.modifiers]` carries the optional one-shot or
@@ -166,8 +163,11 @@ reads the same section without duplication.
 
 The deleted shapes: `[backfill]`, `[tip_follow]`, the
 `ZINDER_BACKFILL__*` and `ZINDER_TIP_FOLLOW__*` env namespaces, and
-the `BACKFILL_FETCH_CONCURRENCY` compile-time constant (promoted to
-`ingest.bulk_catchup.fetch_concurrency`). The shared
+the old compile-time bulk-fetch constant. Bulk catch-up now uses
+`ingest.bulk_catchup.source_segment_max_blocks` as a hard ceiling for
+connected blocks per source segment; the writer adapts below that ceiling
+from observed response bytes and resets density at consensus-branch
+changes. The shared
 `[ingest_control]` section keeps its current shape because the
 control endpoint always runs.
 
@@ -263,11 +263,9 @@ triplicated `current_chain_height` helper collapses to one private
 helper beside the phase classifier. `BackfillConfig` becomes
 `BulkCatchupConfig` and shrinks: `from_height` and `to_height` are
 both derived per iteration instead of carried as configuration. The
-`BACKFILL_FETCH_CONCURRENCY` constant becomes the
-`ingest.bulk_catchup.fetch_concurrency` config field, parameterized
-rather than hard-coded. The bulk-catchup transparent-prevout store-read
-budget is also a named config field instead of being hidden inside block
-count. The CLI surface tracks one front door, not two.
+bulk-catchup source bound is `ingest.bulk_catchup.source_segment_max_blocks`,
+parameterized as a hard ceiling rather than the steady-state request size.
+The CLI surface tracks one front door, not two.
 The duplicated `IngestNodeConfig` schema mirror in the ingest binary
 disappears in favor of consuming `NodeSection` directly through
 ADR-0014's `with_node_section` helper, so adding a field to the shared
@@ -327,7 +325,7 @@ advertise it.
 **Removed surface.** `zinder-ingest backfill`,
 `zinder-ingest tip-follow`, `BackfillOutcome`, `BackfillArgs`,
 `TipFollowArgs`, `TipFollowConfig` (deleted from the vocabulary
-spine), the `BACKFILL_FETCH_CONCURRENCY` constant, the `[backfill]`
+spine), the old compile-time bulk-fetch constant, the `[backfill]`
 and `[tip_follow]` TOML sections, the `ZINDER_BACKFILL__*` and
 `ZINDER_TIP_FOLLOW__*` env namespaces, the `IngestNodeConfig` schema
 mirror (replaced by direct `NodeSection` consumption per ADR-0014),
@@ -354,8 +352,8 @@ previously unused), the `zinder-ingest probe` diagnostic subcommand,
 the sub-sectioned writer-private `[ingest.phases]`,
 `[ingest.derive]`, `[ingest.bulk_catchup]`, `[ingest.tip_follow]`, `[ingest.modifiers]`
 TOML sections with their `catchup_threshold_blocks`,
-`concurrency`, `commit_batch_blocks`,
-`max_transparent_prevout_store_lookups_per_batch`, `fetch_concurrency`, `poll_interval_ms`,
+`concurrency`, `replay_batch_blocks`,
+`canonical_batch_max_blocks`, `source_segment_max_blocks`, `poll_interval_ms`,
 `lag_threshold_blocks`, `target_height`, `checkpoint_height`,
 `allow_near_tip_finalize`, and `coverage` fields, and the new
 `[node.health]` sub-section on the shared `[node]` schema with
@@ -393,7 +391,7 @@ ship at any time, independent of phases 1–5.
   helper. Adding a field to `[node]` then requires editing one struct,
   not two.
 - Collapse the three definitions of `current_chain_height` (at
-  `services/zinder-ingest/src/backfill.rs:242`,
+  `services/zinder-ingest/src/bulk_catchup/mod.rs`,
   `services/zinder-ingest/src/tip_follow.rs:347`, and
   `services/zinder-ingest/src/main.rs:990`) into one private helper.
   Place it where the phase classifier will land in phase 3 so the
@@ -496,7 +494,7 @@ Loop module:
   `BulkCatchup`, `FollowingTip`), and the spawn-once gates for the
   mempool orchestrator, retention worker, and chain-tip notification
   stream. The handlers reuse the existing fetch + commit primitives
-  from `backfill.rs` and `tip_follow.rs`; only the dispatch around
+  from `bulk_catchup/mod.rs` and `tip_follow.rs`; only the dispatch around
   them is new.
 - Plumb the upstream-health probe from phase 2: the loop reads the
   shared `Readiness` to observe the upstream-health cause and stamps
@@ -527,17 +525,15 @@ Config:
 - Restructure `[backfill]` and `[tip_follow]` into sub-sections of
   `[ingest]`: `[ingest.phases]` (classifier),
   `[ingest.derive]` (shared CPU-bound derive execution),
-  `[ingest.bulk_catchup]` (pipelined-fetch knobs), `[ingest.tip_follow]`
+  `[ingest.bulk_catchup]` (source-segment knobs), `[ingest.tip_follow]`
   (serial-loop knobs), `[ingest.modifiers]` (one-shot CLI modifiers).
   Keep `reorg_window_blocks` at the top of `[ingest]` as a chain-truth
   invariant.
 - Rename `to_height` to `target_height` and place it under
   `[ingest.modifiers]`.
-- Promote the `BACKFILL_FETCH_CONCURRENCY` constant to
-  `ingest.bulk_catchup.fetch_concurrency` (default 32).
-- Add `ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch`
-  so block count does not hide commit-time transparent-prevout store-read
-  cost.
+- Add `ingest.bulk_catchup.source_segment_max_blocks` (default 128) as the
+  maximum source-segment block count; runtime request size adapts from
+  source-response density.
 - Migrate `deploy/single-container/config.example.ingest.toml` and
   `deploy/config/ingest.toml` to the new shape.
 

@@ -10,22 +10,30 @@
 pub const CHAIN_EPOCH: &str = "chain_epoch";
 /// Chain-event envelope.
 pub const CHAIN_EVENT: &str = "chain_event";
-/// Finalized full-block artifact.
-pub const FINALIZED_BLOCK: &str = "finalized_block";
+/// Canonical block-header facts.
+pub const BLOCK_HEADER_ARTIFACT: &str = "block_header";
+/// Optional raw block blob.
+pub const BLOCK_BLOB: &str = "block_blob";
 /// Compact-block artifact.
 pub const COMPACT_BLOCK: &str = "compact_block";
-/// Mined transaction artifact.
-pub const MINED_TRANSACTION: &str = "mined_transaction";
+/// Block-local transaction id index.
+pub const BLOCK_TRANSACTION_INDEX: &str = "block_transaction_index";
+/// Mined transaction location.
+pub const TRANSACTION_LOCATION: &str = "transaction_location";
+/// Canonical transaction facts.
+pub const TRANSACTION_FACTS: &str = "transaction_facts";
+/// Optional raw transaction blob.
+pub const TRANSACTION_BLOB: &str = "transaction_blob";
 /// Commitment tree-state artifact.
 pub const TREE_STATE: &str = "tree_state";
 /// Commitment subtree-root artifact.
 pub const SUBTREE_ROOT: &str = "subtree_root";
-/// Transparent address UTXO artifact.
-pub const TRANSPARENT_ADDRESS_UTXO: &str = "transparent_address_utxo";
-/// Transparent UTXO spend artifact.
-pub const TRANSPARENT_UTXO_SPEND: &str = "transparent_utxo_spend";
-/// Transparent prevout (output referenced by an outpoint).
-pub const TRANSPARENT_PREVOUT: &str = "transparent_prevout";
+/// Transparent address output artifact.
+pub const ADDRESS_OUTPUT_INDEX: &str = "address_output_index";
+/// Resolved transparent spend fact.
+pub const TRANSPARENT_SPEND_FACT: &str = "transparent_spend_fact";
+/// Transparent output referenced by an outpoint.
+pub const TRANSPARENT_OUTPUT: &str = "transparent_output";
 /// Transparent address tx-history index artifact.
 pub const TRANSPARENT_ADDRESS_TX_INDEX: &str = "transparent_address_tx_index";
 /// Best-chain block-hash to height index entry.

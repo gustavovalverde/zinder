@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. The resource-budgeted catchup stage shape is owned by
+[ADR-0022](0022-resource-budgeted-bulk-catchup.md).
 
 ## Context
 
@@ -54,10 +55,11 @@ getblockhash       8.58 ms   (serial; blocks the parallel triple)
 = ~24 ms per block of upstream-side latency
 ```
 
-Dropping the serial call leaves just the parallel triple
-(`~15.36 ms` per block) and raises the theoretical ceiling at
-`ingest.bulk_catchup.fetch_concurrency = 32` from ~1,333 to ~2,083
-blocks/sec.
+Dropping the serial call leaves just the parallel source reads and raises the
+theoretical ceiling while the response-size regime is light. In dense eras,
+`ingest.bulk_catchup.source_segment_max_blocks = 128` is only a hard ceiling: bulk
+catch-up adapts the actual request size from observed source response bytes and
+resets its density estimate at consensus-branch changes.
 
 ## Decision
 

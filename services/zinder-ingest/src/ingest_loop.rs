@@ -21,22 +21,27 @@
 //! `FnOnce` closure; the unified loop calls it the first time the loop
 //! enters `FollowingTip`.
 
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::BlockHeight;
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceChainCheckpoint};
 use zinder_store::PrimaryChainStore;
 
-use crate::backfill::{
+use crate::bulk_catchup::{
     BackfillFlushState, BackfillRunContext, backfill_until_complete_with_flush_state,
     flush_pending_backfill_writes,
 };
 use crate::{
-    BackfillConfig, IngestError, MempoolReadyGate, NodeSourceKind, TipFollowConfig, classify_phase,
-    current_chain_height, tip_follow_with_primary_store,
+    BackfillConfig, IngestError, MempoolReadyGate, NodeSourceKind, RawBlobPolicy, TipFollowConfig,
+    classify_phase, current_chain_height, tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -71,6 +76,8 @@ pub struct IngestLoopConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget applied when opening the store.
     pub storage_tuning: zinder_store::StorageTuning,
+    /// Optional raw-byte blob write policy for canonical ingest.
+    pub raw_blob_policy: RawBlobPolicy,
     /// Reorg-window invariant. Bulk catch-up never finalizes blocks inside
     /// this window unless `modifiers.allow_near_tip_finalize` is true.
     pub reorg_window_blocks: u32,
@@ -108,23 +115,68 @@ pub struct IngestDeriveConfig {
     /// floor at 4 keeps small hosts pipelining I/O even when one CPU is
     /// reserved for the Tokio reactor. See
     /// [ADR-0021](../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub concurrency: NonZeroU32,
+    pub replay_concurrency: NonZeroU32,
+    /// Maximum block contexts hydrated and dispatched in one derive replay
+    /// write.
+    ///
+    /// This bound is independent of `ingest.bulk_catchup.canonical_batch_max_blocks`
+    /// because replay may resume from retained chain events after the writer
+    /// has already committed them. Keeping replay memory bounded here prevents
+    /// a large retained event from becoming one unbounded in-memory hydration.
+    pub replay_batch_blocks: NonZeroU32,
+    /// Replay pressure policy for the async derive tailer.
+    ///
+    /// `CanonicalFirst` keeps canonical ingest ahead of rebuildable derive
+    /// projections under memory pressure. `Continuous` always lets the tailer
+    /// replay retained chain events as soon as it observes them.
+    pub replay_policy: DeriveReplayPolicy,
+}
+
+/// Runtime policy for replaying retained chain events into derive consumers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeriveReplayPolicy {
+    /// Pause rebuildable derive replay when process or cgroup memory pressure
+    /// would compete with canonical ingest.
+    CanonicalFirst,
+    /// Continuously replay retained chain events regardless of memory pressure.
+    Continuous,
+}
+
+impl DeriveReplayPolicy {
+    /// Default derive replay policy for performance-first indexing.
+    pub const DEFAULT: Self = Self::CanonicalFirst;
+
+    /// Stable TOML/env rendering.
+    #[must_use]
+    pub const fn as_kebab_case(self) -> &'static str {
+        match self {
+            Self::CanonicalFirst => "canonical-first",
+            Self::Continuous => "continuous",
+        }
+    }
 }
 
 /// Resolved `[ingest.bulk_catchup]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkCatchupConfig {
     /// Maximum number of blocks committed in one bulk-catchup batch.
-    pub commit_batch_blocks: NonZeroU32,
-    /// Maximum unique transparent prevouts read from the store in one
-    /// bulk-catchup batch.
-    pub max_transparent_prevout_store_lookups_per_batch: NonZeroU32,
-    /// Number of concurrent block fetches in the pipelined fetcher.
-    pub fetch_concurrency: NonZeroU32,
+    pub canonical_batch_max_blocks: NonZeroU32,
+    /// Maximum canonical artifact bytes accumulated before closing a batch.
+    pub canonical_batch_max_artifact_bytes: NonZeroU64,
+    /// Maximum connected blocks requested from the source in one segment.
+    pub source_segment_max_blocks: NonZeroU32,
+    /// Target source response bytes for adaptive segment sizing.
+    pub source_segment_target_response_bytes: NonZeroU64,
+    /// Maximum concurrent source segment fetches.
+    pub source_fetch_max_in_flight_requests: NonZeroU32,
+    /// Maximum reserved response bytes across source fetches.
+    pub source_fetch_max_in_flight_bytes: NonZeroU64,
+    /// Parallel canonical fact-build slots.
+    pub fact_build_concurrency: NonZeroU32,
     /// Force a `RocksDB` flush every N committed epochs.
     ///
     /// Caps the live WAL by writer cadence rather than `RocksDB`'s WAL-size
-    /// safety trigger. With the default `commit_batch_blocks = 1000` and
+    /// safety trigger. With the default `canonical_batch_max_blocks = 1000` and
     /// `flush_interval_epochs = 5`, the writer truncates the WAL after
     /// every 5,000 committed blocks, bounding crash-recovery RAM
     /// proportionally. See
@@ -214,7 +266,7 @@ pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems +
 ///   [`TipFollowPhaseConfig::poll_interval`].
 /// - [`IngestPhase::BulkCatchup`] computes the per-batch target
 ///   `min(upstream_tip - reorg_window_blocks,
-///       store_tip + commit_batch_blocks)` and calls
+///       store_tip + canonical_batch_max_blocks)` and calls
 ///   `backfill_until_complete_with_flush_state` for one batch.
 /// - [`IngestPhase::FollowingTip`] calls
 ///   [`tip_follow_with_primary_store`] with a child cancel token; a
@@ -234,9 +286,9 @@ pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems +
 )]
 pub async fn run_ingest_loop<Source>(
     config: &IngestLoopConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     source: Arc<Source>,
     store: PrimaryChainStore,
-    derive_store: zinder_derive::DeriveStore,
     readiness: &Readiness,
     cancel: CancellationToken,
     mut tip_follow_subsystems: Option<TipFollowSubsystemsLauncher>,
@@ -318,7 +370,7 @@ where
                     upstream_tip,
                     store_tip,
                     config.reorg_window_blocks,
-                    config.bulk_catchup.commit_batch_blocks.get(),
+                    config.bulk_catchup.canonical_batch_max_blocks.get(),
                     config.modifiers.target_height.map(BlockHeight::value),
                 ) else {
                     // No height within the reorg window remains to be
@@ -336,12 +388,12 @@ where
 
                 let batch_config = build_bulk_catchup_batch_config(
                     config,
+                    Arc::clone(&network_upgrade_activations),
                     store_tip,
                     batch_target,
                     BlockHeight::new(upstream_tip),
                 );
-                let backfill_run =
-                    BackfillRunContext::new(&batch_config, source.as_ref(), &store, &derive_store);
+                let backfill_run = BackfillRunContext::new(&batch_config, source.as_ref(), &store);
                 backfill_until_complete_with_flush_state(
                     backfill_run,
                     readiness,
@@ -361,7 +413,8 @@ where
                     tip_subsystems = Some(launcher());
                 }
 
-                let tip_follow_config = build_tip_follow_config(config);
+                let tip_follow_config =
+                    build_tip_follow_config(config, Arc::clone(&network_upgrade_activations));
                 let phase_cancel = cancel.child_token();
                 let watcher_handle = spawn_phase_change_watcher(
                     Arc::clone(&source),
@@ -373,7 +426,6 @@ where
                     &tip_follow_config,
                     source.as_ref(),
                     store.clone(),
-                    derive_store.clone(),
                     readiness,
                     tip_subsystems
                         .as_ref()
@@ -457,11 +509,11 @@ fn compute_bulk_catchup_target(
     upstream_tip: u32,
     store_tip: u32,
     reorg_window_blocks: u32,
-    commit_batch_blocks: u32,
+    canonical_batch_max_blocks: u32,
     target_height_modifier: Option<u32>,
 ) -> Option<u32> {
     let outside_reorg_window = upstream_tip.checked_sub(reorg_window_blocks)?;
-    let batch_ceiling = store_tip.checked_add(commit_batch_blocks)?;
+    let batch_ceiling = store_tip.checked_add(canonical_batch_max_blocks)?;
     let mut target = outside_reorg_window.min(batch_ceiling);
     if let Some(modifier_ceiling) = target_height_modifier {
         target = target.min(modifier_ceiling);
@@ -475,6 +527,7 @@ fn compute_bulk_catchup_target(
 
 fn build_bulk_catchup_batch_config(
     config: &IngestLoopConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     store_tip: u32,
     batch_target: u32,
     upstream_tip: BlockHeight,
@@ -488,14 +541,21 @@ fn build_bulk_catchup_batch_config(
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
         storage_tuning: config.storage_tuning,
+        raw_blob_policy: config.raw_blob_policy,
+        network_upgrade_activations,
         from_height,
         to_height: BlockHeight::new(batch_target),
-        commit_batch_blocks: config.bulk_catchup.commit_batch_blocks,
-        max_transparent_prevout_store_lookups_per_batch: config
+        canonical_batch_max_blocks: config.bulk_catchup.canonical_batch_max_blocks,
+        canonical_batch_max_artifact_bytes: config.bulk_catchup.canonical_batch_max_artifact_bytes,
+        source_segment_max_blocks: config.bulk_catchup.source_segment_max_blocks,
+        source_segment_target_response_bytes: config
             .bulk_catchup
-            .max_transparent_prevout_store_lookups_per_batch,
-        fetch_concurrency: config.bulk_catchup.fetch_concurrency,
-        derive_concurrency: config.derive.concurrency,
+            .source_segment_target_response_bytes,
+        source_fetch_max_in_flight_requests: config
+            .bulk_catchup
+            .source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
+        fact_build_concurrency: config.bulk_catchup.fact_build_concurrency,
         flush_interval_epochs: config.bulk_catchup.flush_interval_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
@@ -503,11 +563,16 @@ fn build_bulk_catchup_batch_config(
     }
 }
 
-fn build_tip_follow_config(config: &IngestLoopConfig) -> TipFollowConfig {
+fn build_tip_follow_config(
+    config: &IngestLoopConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+) -> TipFollowConfig {
     TipFollowConfig {
         node: config.node.clone(),
         storage_path: config.storage_path.clone(),
         storage_tuning: config.storage_tuning,
+        raw_blob_policy: config.raw_blob_policy,
+        network_upgrade_activations,
         reorg_window_blocks: config.reorg_window_blocks,
         poll_interval: config.tip_follow.poll_interval,
         lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
@@ -565,18 +630,29 @@ mod tests {
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: PathBuf::from("/tmp/unit-test"),
             storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             reorg_window_blocks: 100,
             phases: PhasesConfig {
                 catchup_threshold_blocks: 100,
             },
             derive: IngestDeriveConfig {
-                concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
+                replay_concurrency: NonZeroU32::new(4).ok_or("invalid derive concurrency")?,
+                replay_batch_blocks: NonZeroU32::new(100).ok_or("invalid replay batch blocks")?,
+                replay_policy: DeriveReplayPolicy::DEFAULT,
             },
             bulk_catchup: BulkCatchupConfig {
-                commit_batch_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
-                max_transparent_prevout_store_lookups_per_batch: NonZeroU32::new(250_000)
-                    .ok_or("invalid prevout budget")?,
-                fetch_concurrency: NonZeroU32::new(32).ok_or("invalid fetch concurrency")?,
+                canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
+                canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
+                    .ok_or("invalid batch artifact bytes")?,
+                source_segment_max_blocks: NonZeroU32::new(128)
+                    .ok_or("invalid source segment blocks")?,
+                source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                    .ok_or("invalid source target bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid fact build slots")?,
                 flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
             },
             tip_follow: TipFollowPhaseConfig {
@@ -602,7 +678,13 @@ mod tests {
             checkpoint: Some(checkpoint),
             ..IngestModifiers::default()
         })?;
-        let batch = build_bulk_catchup_batch_config(&config, 0, 280_050, BlockHeight::new(280_200));
+        let batch = build_bulk_catchup_batch_config(
+            &config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            0,
+            280_050,
+            BlockHeight::new(280_200),
+        );
         assert_eq!(batch.from_height, BlockHeight::new(280_000));
         assert_eq!(batch.to_height, BlockHeight::new(280_050));
         assert_eq!(batch.upstream_tip_hint, Some(BlockHeight::new(280_200)));
@@ -621,8 +703,13 @@ mod tests {
             checkpoint: Some(checkpoint),
             ..IngestModifiers::default()
         })?;
-        let batch =
-            build_bulk_catchup_batch_config(&config, 280_500, 281_500, BlockHeight::new(281_700));
+        let batch = build_bulk_catchup_batch_config(
+            &config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            280_500,
+            281_500,
+            BlockHeight::new(281_700),
+        );
         assert_eq!(batch.from_height, BlockHeight::new(280_501));
         assert_eq!(batch.to_height, BlockHeight::new(281_500));
         Ok(())
@@ -631,7 +718,13 @@ mod tests {
     #[test]
     fn empty_store_without_checkpoint_starts_at_genesis() -> Result<(), &'static str> {
         let config = sample_loop_config(IngestModifiers::default())?;
-        let batch = build_bulk_catchup_batch_config(&config, 0, 1_000, BlockHeight::new(1_200));
+        let batch = build_bulk_catchup_batch_config(
+            &config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            0,
+            1_000,
+            BlockHeight::new(1_200),
+        );
         assert_eq!(batch.from_height, BlockHeight::new(1));
         assert_eq!(batch.to_height, BlockHeight::new(1_000));
         Ok(())

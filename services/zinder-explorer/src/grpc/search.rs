@@ -245,7 +245,7 @@ fn build_transaction_match(
 ) -> Option<TransactionMatch> {
     match status {
         transaction_status_response::Status::Mined(mined) => {
-            let transaction = mined.transaction?;
+            let transaction = mined.location?;
             Some(TransactionMatch {
                 transaction_id: hash.to_vec(),
                 in_mempool: false,

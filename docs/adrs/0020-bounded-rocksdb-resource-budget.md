@@ -56,7 +56,7 @@ A validation gate in `validate_chain_store_options` rejects values below the min
 
 ### Tier 3 — Phase-aware flush policy
 
-`BulkCatchup` forces an explicit `db.flush()` every `flush_interval_epochs` committed epochs (default 5). With the default `commit_batch_blocks = 1000`, this truncates the WAL after every 5,000 committed blocks. The flush is also performed once on `BulkCatchup` exit so the phase hands off a clean WAL state to `TipFollow`.
+`BulkCatchup` forces an explicit `db.flush()` every `flush_interval_epochs` committed epochs (default 5). With the default `canonical_batch_max_blocks = 1000`, this truncates the WAL after every 5,000 committed blocks. The flush is also performed once on `BulkCatchup` exit so the phase hands off a clean WAL state to `TipFollow`.
 
 `TipFollow` does not flush explicitly. Each commit is one block; the WAL stays under a few MiB; natural memtable rotation handles it.
 

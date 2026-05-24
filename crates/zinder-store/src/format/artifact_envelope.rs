@@ -12,42 +12,57 @@ const ARTIFACT_ENVELOPE_VERSION: u8 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum PayloadFormat {
-    /// Zinder protobuf payload for a block artifact.
-    ZinderBlockArtifactV1 = 1,
+    /// Zinder protobuf payload for block-header facts.
+    ZinderBlockHeaderArtifactV1 = 1,
     /// Zinder protobuf payload for a compact block artifact.
     ZinderCompactBlockArtifactV1 = 2,
-    /// Zinder protobuf payload for a transaction artifact.
-    ZinderTransactionArtifactV1 = 3,
+    /// Zinder protobuf payload for transaction facts.
+    ZinderTransactionFactsArtifactV1 = 3,
     /// Zinder protobuf payload for a tree-state artifact.
     ZinderTreeStateArtifactV1 = 4,
     /// Zinder protobuf payload for a subtree-root artifact.
     ZinderSubtreeRootArtifactV1 = 5,
-    /// Zinder protobuf payload for a transparent address UTXO artifact.
-    ZinderTransparentAddressUtxoArtifactV1 = 6,
-    /// Zinder protobuf payload for a transparent UTXO spend artifact.
-    ZinderTransparentUtxoSpendArtifactV1 = 7,
+    /// Zinder protobuf payload for a transparent address output artifact.
+    ZinderAddressOutputIndexArtifactV1 = 6,
+    /// Zinder protobuf payload for a resolved transparent spend fact.
+    ZinderTransparentSpendFactV2 = 16,
     /// Zinder protobuf payload for a transparent address tx-history index
     /// artifact.
     ZinderTransparentAddressTxIndexArtifactV1 = 8,
-    /// Zinder protobuf payload for a transparent prevout artifact.
-    ZinderTransparentPrevoutArtifactV1 = 9,
-    /// Zinder protobuf payload for the block-local transparent prevout index.
-    ZinderTransparentPrevoutBlockIndexV1 = 10,
+    /// Zinder protobuf payload for a transparent output artifact.
+    ZinderTransparentOutputArtifactV1 = 9,
+    /// Zinder protobuf payload for the transparent spend index.
+    ZinderTransparentOutputBlockIndexV1 = 10,
+    /// Zinder protobuf payload for a raw block blob.
+    ZinderBlockBlobArtifactV1 = 11,
+    /// Zinder protobuf payload for a block transaction-index row.
+    ZinderBlockTransactionIndexArtifactV1 = 12,
+    /// Zinder protobuf payload for a transaction location row.
+    ZinderTransactionLocationArtifactV1 = 13,
+    /// Zinder protobuf payload for a raw transaction blob.
+    ZinderTransactionBlobArtifactV1 = 14,
+    /// Zinder protobuf payload for the transparent spend fact block index.
+    ZinderTransparentSpendFactBlockIndexV1 = 15,
 }
 
 impl PayloadFormat {
     const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            1 => Some(Self::ZinderBlockArtifactV1),
+            1 => Some(Self::ZinderBlockHeaderArtifactV1),
             2 => Some(Self::ZinderCompactBlockArtifactV1),
-            3 => Some(Self::ZinderTransactionArtifactV1),
+            3 => Some(Self::ZinderTransactionFactsArtifactV1),
             4 => Some(Self::ZinderTreeStateArtifactV1),
             5 => Some(Self::ZinderSubtreeRootArtifactV1),
-            6 => Some(Self::ZinderTransparentAddressUtxoArtifactV1),
-            7 => Some(Self::ZinderTransparentUtxoSpendArtifactV1),
+            6 => Some(Self::ZinderAddressOutputIndexArtifactV1),
             8 => Some(Self::ZinderTransparentAddressTxIndexArtifactV1),
-            9 => Some(Self::ZinderTransparentPrevoutArtifactV1),
-            10 => Some(Self::ZinderTransparentPrevoutBlockIndexV1),
+            9 => Some(Self::ZinderTransparentOutputArtifactV1),
+            10 => Some(Self::ZinderTransparentOutputBlockIndexV1),
+            11 => Some(Self::ZinderBlockBlobArtifactV1),
+            12 => Some(Self::ZinderBlockTransactionIndexArtifactV1),
+            13 => Some(Self::ZinderTransactionLocationArtifactV1),
+            14 => Some(Self::ZinderTransactionBlobArtifactV1),
+            15 => Some(Self::ZinderTransparentSpendFactBlockIndexV1),
+            16 => Some(Self::ZinderTransparentSpendFactV2),
             _ => None,
         }
     }
@@ -352,7 +367,7 @@ mod tests {
     fn decode_rejects_unsupported_checksum_format_without_reading_checksum_bytes()
     -> Result<(), ArtifactEnvelopeError> {
         let mut envelope_bytes = ArtifactEnvelopeHeaderV1::encode_payload(
-            PayloadFormat::ZinderBlockArtifactV1,
+            PayloadFormat::ZinderBlockHeaderArtifactV1,
             b"payload",
         )?;
         envelope_bytes[7] = 1;
@@ -360,7 +375,7 @@ mod tests {
         assert!(matches!(
             ArtifactEnvelopeHeaderV1::decode_payload(
                 &envelope_bytes,
-                PayloadFormat::ZinderBlockArtifactV1,
+                PayloadFormat::ZinderBlockHeaderArtifactV1,
             ),
             Err(ArtifactEnvelopeError::UnsupportedChecksumFormat { format: 1 })
         ));

@@ -8,8 +8,9 @@
 use eyre::eyre;
 use zinder_client::{
     BlockHeight, BlockSelector, ChainIndex, LocalChainIndex, RawTransactionBytes, RemoteChainIndex,
-    SubtreeRootIndex, SubtreeRootRange, TransactionArtifact, TransactionId, TxStatus,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId, TxStatus,
 };
+use zinder_testkit::FixtureTransactionRows;
 
 use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
 
@@ -26,8 +27,8 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
         let _ = T::transaction_by_id;
         // standalone is_in_mempool boolean check
         let _ = T::is_in_mempool;
-        // tree_state_at with Option<ChainEpoch>
-        let _ = T::tree_state_at;
+        // tree_state_checkpoint_at_or_before with Option<ChainEpoch>
+        let _ = T::tree_state_checkpoint_at_or_before;
         // typed SubtreeRootHash + ShieldedProtocol enum
         let _ = T::subtree_roots_in_range;
         // typed RawTransactionBytes
@@ -48,13 +49,15 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
         .ok_or_else(|| eyre!("fixture must contain block 2"))?;
     let transaction_block_height = transaction_block.height;
     let transaction_block_hash = transaction_block.hash;
-    let transaction = TransactionArtifact::new(
+    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
         transaction_id,
         transaction_block_height,
         transaction_block_hash,
+        0,
         b"zallet-transaction-payload".to_vec(),
     );
-    let chain_fixture = base_fixture.with_transaction_artifact(transaction.clone());
+    let transaction_location = transaction_rows.location;
+    let chain_fixture = base_fixture.with_transaction_rows(transaction_rows);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let chain_index = open_local_chain_index(&store_fixture).await?;
 
@@ -73,7 +76,7 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
         )
         .await?;
     let tree_state = chain_index
-        .tree_state_at(BlockHeight::new(2), Some(current_epoch))
+        .tree_state_checkpoint_at_or_before(BlockHeight::new(2), Some(current_epoch))
         .await?;
     let subtree_roots = chain_index
         .subtree_roots_in_range(
@@ -100,7 +103,16 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let TxStatus::Mined(mined) = mined_status else {
         return Err(eyre!("expected mined transaction, got {mined_status:?}"));
     };
-    assert_eq!(mined.artifact, transaction);
+    assert_eq!(
+        mined.location.transaction_id,
+        transaction_location.transaction_id
+    );
+    assert_eq!(
+        mined.location.block_height,
+        transaction_location.block_height
+    );
+    assert_eq!(mined.location.block_hash, transaction_location.block_hash);
+    assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(mined.details.confirmations, 1);
     assert_eq!(missing_status, TxStatus::NotFound);
     assert!(matches!(

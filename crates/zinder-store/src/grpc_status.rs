@@ -33,7 +33,7 @@ fn code_and_typed_detail_for(error: &StoreError) -> (Code, ErrorDetails) {
     match error {
         StoreError::ChainEventCursorInvalid { reason }
         | StoreError::MempoolEventCursorInvalid { reason }
-        | StoreError::TransparentUtxoCursorInvalid { reason }
+        | StoreError::AddressOutputCursorInvalid { reason }
         | StoreError::TransparentHistoryCursorInvalid { reason } => (
             Code::InvalidArgument,
             ErrorDetails::with_bad_request(vec![FieldViolation::new("from_cursor", *reason)]),
@@ -110,9 +110,7 @@ fn error_reason_for_store_error(error: &StoreError) -> ErrorReason {
             // stream family; the family is encoded in the cursor itself.
             ErrorReason::ChainEventCursorInvalid
         }
-        StoreError::TransparentUtxoCursorInvalid { .. } => {
-            ErrorReason::TransparentUtxoCursorInvalid
-        }
+        StoreError::AddressOutputCursorInvalid { .. } => ErrorReason::AddressOutputCursorInvalid,
         StoreError::TransparentHistoryCursorInvalid { .. } => {
             ErrorReason::TransparentHistoryCursorInvalid
         }

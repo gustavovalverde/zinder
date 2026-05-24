@@ -12,11 +12,12 @@ use std::{
 
 use parking_lot::RwLock;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionArtifact,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentAddressUtxoArtifact, TransparentOutPoint, TransparentPrevoutArtifact,
-    TransparentUtxoSpendArtifact, TreeStateArtifact, UnixTimestampMillis,
+    AddressOutputIndexArtifact, ArtifactSchemaVersion, BlockBlobArtifact, BlockHash,
+    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionLocation, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputArtifact,
+    TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -24,24 +25,27 @@ use crate::{
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
     MempoolEventRetentionReport, ReorgWindowChange, StorageTuning, StoreError, StreamCursorTokenV1,
-    block_artifact::read_block_artifact,
+    block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     format::{
         ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
         StoreKey, decode_chain_epoch, decode_chain_event_envelope, decode_mempool_event_envelope,
         decode_mempool_event_kind, decode_mempool_event_observed_at,
-        decode_transparent_prevout_block_index, encode_block_artifact, encode_chain_epoch,
-        encode_chain_event_envelope, encode_compact_block_artifact, encode_mempool_event_envelope,
-        encode_subtree_root_artifact, encode_transaction_artifact,
-        encode_transparent_address_tx_index_artifact, encode_transparent_address_utxo_artifact,
-        encode_transparent_prevout_artifact, encode_transparent_prevout_block_index,
-        encode_transparent_utxo_spend_artifact, encode_tree_state_artifact,
+        decode_transparent_output_block_index, encode_address_output_index_artifact,
+        encode_block_blob_artifact, encode_block_header_artifact,
+        encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
+        encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
+        encode_transaction_blob_artifact, encode_transaction_facts_artifact,
+        encode_transaction_location_artifact, encode_transparent_address_tx_index_artifact,
+        encode_transparent_output_artifact, encode_transparent_output_block_index,
+        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
+        encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
         StorageTable,
     },
-    transparent_prevout::read_transparent_prevout_from_history_with_block_visibility,
+    transparent_spend_fact::read_visible_transparent_spend_fact_block_outpoints,
 };
 
 use validation::{
@@ -97,16 +101,16 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 4;
+const STORE_SCHEMA_VERSION: u16 = 9;
 /// Durable artifact schema version written by this binary.
 ///
-/// Version 4 splits transparent prevout storage into an exact current
-/// projection plus epoch-suffixed history for historical readers.
-/// (see [ADR-0022](../../../docs/adrs/0022-transparent-prevout-index.md)).
+/// Version 9 is the fact-first canonical schema: block headers,
+/// transaction locations and facts, transparent outputs, resolved transparent
+/// spend facts, and optional raw blob tables are persisted as separate durable
+/// facts.
 /// Stores written under earlier versions must be wiped and re-synced before
-/// opening with this binary; the project is pre-release and breaking
-/// changes are deliberate.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(4);
+/// opening with this binary.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(9);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 
@@ -160,19 +164,19 @@ pub struct TransparentAddressTxIndexPage {
     pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
-/// Bounded transparent-address UTXO read request.
+/// Bounded transparent-address output read request.
 ///
 /// Cursor handling lives entirely inside the store: the cursor token is
 /// HMAC-authenticated against the store's per-instance auth key and decoded
-/// into a typed position in `read_transparent_address_utxos_paged`.
+/// into a typed position in `read_address_output_index_rows_paged`.
 #[derive(Clone, Copy, Debug)]
-pub struct TransparentAddressUtxosPageRequest<'cursor> {
+pub struct AddressOutputIndexPageRequest<'cursor> {
     /// Optional chain epoch to pin the read to. `None` reads at the
     /// currently visible epoch.
     pub at_epoch: Option<ChainEpoch>,
     /// SHA-256 of the transparent address scriptPubKey.
     pub address_script_hash: TransparentAddressScriptHash,
-    /// Wallet-birthday optimization: skip UTXOs mined below this height.
+    /// Wallet-birthday optimization: skip outputs mined below this height.
     /// Ignored when `from_cursor` is `Some`.
     pub start_height: BlockHeight,
     /// Server-bounded maximum entries per page.
@@ -182,13 +186,13 @@ pub struct TransparentAddressUtxosPageRequest<'cursor> {
     pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
 }
 
-/// Bounded transparent-address UTXO page response.
+/// Bounded transparent-address output page response.
 #[derive(Clone, Debug)]
-pub struct TransparentAddressUtxosPage {
+pub struct AddressOutputIndexPage {
     /// Chain epoch used to answer this page.
     pub chain_epoch: ChainEpoch,
-    /// UTXOs in ascending `(block_height, outpoint)` order.
-    pub utxos: Vec<TransparentAddressUtxoArtifact>,
+    /// outputs in ascending `(block_height, outpoint)` order.
+    pub outputs: Vec<AddressOutputIndexArtifact>,
     /// Resume cursor when the page reached `max_entries`. `None` when the
     /// scan was fully drained.
     pub next_cursor: Option<StreamCursorTokenV1>,
@@ -315,11 +319,11 @@ pub trait ChainEpochReadApi {
     /// Decodes any supplied cursor against the store's per-instance auth key
     /// and resumes scanning strictly after the cursor position. Emits a
     /// `next_cursor` only when the page reached `max_entries`, signalling
-    /// that more UTXOs may be available.
-    fn transparent_address_utxos_page(
+    /// that more outputs may be available.
+    fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError>;
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError>;
 
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts inside an inclusive height range, in ascending or
@@ -405,11 +409,11 @@ impl PrimaryChainStore {
     }
 
     /// Reads a bounded page of unspent transparent outputs.
-    pub fn transparent_address_utxos_page(
+    pub fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError> {
-        self.store.transparent_address_utxos_page(request)
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError> {
+        self.store.address_output_index_page(request)
     }
 
     /// Reads a bounded page of transparent-address tx-history index
@@ -532,11 +536,11 @@ impl SecondaryChainStore {
     }
 
     /// Reads a bounded page of unspent transparent outputs.
-    pub fn transparent_address_utxos_page(
+    pub fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError> {
-        self.store.transparent_address_utxos_page(request)
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError> {
+        self.store.address_output_index_page(request)
     }
 
     /// Reads a bounded page of transparent-address tx-history index
@@ -669,15 +673,15 @@ impl ChainStoreInner {
         let block_range = committed_block_range(&artifacts, current_chain_epoch)?;
         let reorg_window_change = artifacts.reorg_window_change.clone();
         let current_projection_protected_outpoints = artifacts
-            .transparent_prevouts
+            .transparent_outputs_by_outpoint
             .iter()
             .map(|prevout| prevout.outpoint)
             .collect::<HashSet<_>>();
-        let committed_block_hashes = artifacts
-            .finalized_blocks
+        let current_spend_projection_protected_outpoints = artifacts
+            .transparent_spend_facts
             .iter()
-            .map(|block| (block.height, block.block_hash))
-            .collect::<HashMap<_, _>>();
+            .map(|spend| spend.spent_outpoint)
+            .collect::<HashSet<_>>();
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(
             event_sequence,
@@ -692,16 +696,26 @@ impl ChainStoreInner {
         }
         let projection_repairs = build_reorg_window_projection_repairs(
             self.inner.as_ref(),
-            TransparentPrevoutProjectionRepairInputs {
+            TransparentOutputProjectionRepairInputs {
                 previous_chain_epoch: current_chain_epoch,
                 chain_epoch,
                 reorg_window_change: &reorg_window_change,
                 protected_outpoints: &current_projection_protected_outpoints,
-                committed_block_hashes: &committed_block_hashes,
             },
         )?;
         puts.extend(projection_repairs.puts);
-        let deletes = projection_repairs.deletes;
+        let spend_projection_repairs = build_reorg_window_spend_fact_projection_repairs(
+            self.inner.as_ref(),
+            TransparentSpendFactProjectionRepairInputs {
+                previous_chain_epoch: current_chain_epoch,
+                chain_epoch,
+                reorg_window_change: &reorg_window_change,
+                protected_outpoints: &current_spend_projection_protected_outpoints,
+            },
+        )?;
+        puts.extend(spend_projection_repairs.puts);
+        let mut deletes = projection_repairs.deletes;
+        deletes.extend(spend_projection_repairs.deletes);
 
         self.inner.write_batch(puts, deletes)?;
 
@@ -770,10 +784,10 @@ impl ChainStoreInner {
     }
 
     /// Reads a bounded page of unspent transparent outputs.
-    fn transparent_address_utxos_page(
+    fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError> {
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError> {
         let read_view = self.read_view();
         let chain_epoch = match request.at_epoch {
             Some(at_epoch) => {
@@ -791,17 +805,17 @@ impl ChainStoreInner {
         let resume_after = match request.from_cursor {
             Some(cursor) => Some(
                 cursor
-                    .decode_transparent_utxo(chain_epoch.network, self.cursor_auth_key)
-                    .map_err(|_| StoreError::TransparentUtxoCursorInvalid {
+                    .decode_address_output(chain_epoch.network, self.cursor_auth_key)
+                    .map_err(|_| StoreError::AddressOutputCursorInvalid {
                         reason: "cursor token failed validation",
                     })?,
             ),
             None => None,
         };
 
-        let utxos = crate::transparent_utxo::read_transparent_address_utxos_paged(
+        let outputs = crate::address_output_index::read_address_output_index_rows_paged(
             &read_view,
-            crate::transparent_utxo::TransparentAddressUtxosScan {
+            crate::address_output_index::AddressOutputIndexRowsScan {
                 chain_epoch,
                 address_script_hash: request.address_script_hash,
                 start_height: request.start_height,
@@ -810,17 +824,17 @@ impl ChainStoreInner {
             },
         )?;
 
-        let next_cursor = if utxos.len() >= u32_to_usize(request.max_entries.get()) {
-            match utxos.last() {
-                Some(utxo) => Some(
-                    StreamCursorTokenV1::transparent_utxo(
+        let next_cursor = if outputs.len() >= u32_to_usize(request.max_entries.get()) {
+            match outputs.last() {
+                Some(output) => Some(
+                    StreamCursorTokenV1::address_output(
                         chain_epoch.network,
-                        crate::format::TransparentUtxoStreamFamily::TransparentUtxo,
-                        utxo.block_height,
-                        utxo.outpoint,
+                        crate::format::AddressOutputStreamFamily::AddressOutput,
+                        output.block_height,
+                        output.outpoint,
                         self.cursor_auth_key,
                     )
-                    .map_err(|_| StoreError::TransparentUtxoCursorInvalid {
+                    .map_err(|_| StoreError::AddressOutputCursorInvalid {
                         reason: "next-cursor encoding failed",
                     })?,
                 ),
@@ -830,9 +844,9 @@ impl ChainStoreInner {
             None
         };
 
-        Ok(TransparentAddressUtxosPage {
+        Ok(AddressOutputIndexPage {
             chain_epoch,
-            utxos,
+            outputs,
             next_cursor,
         })
     }
@@ -1454,11 +1468,11 @@ impl ChainEpochReadApi for PrimaryChainStore {
         self.chain_event_history(request)
     }
 
-    fn transparent_address_utxos_page(
+    fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError> {
-        self.store.transparent_address_utxos_page(request)
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError> {
+        self.store.address_output_index_page(request)
     }
 
     fn transparent_address_tx_index_page(
@@ -1488,11 +1502,11 @@ impl ChainEpochReadApi for SecondaryChainStore {
         self.chain_event_history(request)
     }
 
-    fn transparent_address_utxos_page(
+    fn address_output_index_page(
         &self,
-        request: TransparentAddressUtxosPageRequest<'_>,
-    ) -> Result<TransparentAddressUtxosPage, StoreError> {
-        self.store.transparent_address_utxos_page(request)
+        request: AddressOutputIndexPageRequest<'_>,
+    ) -> Result<AddressOutputIndexPage, StoreError> {
+        self.store.address_output_index_page(request)
     }
 
     fn transparent_address_tx_index_page(
@@ -1726,14 +1740,18 @@ fn build_chain_epoch_puts(
 ) -> Result<Vec<StoragePut>, StoreError> {
     let ChainEpochArtifacts {
         chain_epoch,
-        finalized_blocks,
+        block_headers,
+        block_blobs,
         compact_blocks,
-        transactions,
+        block_transaction_index,
+        transaction_locations,
+        transaction_facts,
+        transaction_blobs,
         tree_states,
         subtree_roots,
-        transparent_address_utxos,
-        transparent_prevouts,
-        transparent_utxo_spends,
+        address_output_index,
+        transparent_outputs_by_outpoint,
+        transparent_spend_facts,
         transparent_address_tx_index,
         reorg_window_change: _,
     } = artifacts;
@@ -1744,14 +1762,18 @@ fn build_chain_epoch_puts(
         key: StoreKey::chain_epoch(chain_epoch.id),
         value: encode_chain_epoch(&chain_epoch),
     });
-    push_block_artifact_puts(&mut puts, chain_epoch, finalized_blocks)?;
+    push_block_header_artifact_puts(&mut puts, chain_epoch, block_headers)?;
+    push_block_blob_artifact_puts(&mut puts, chain_epoch, block_blobs)?;
     push_compact_block_artifact_puts(&mut puts, chain_epoch, compact_blocks)?;
-    push_transaction_artifact_puts(&mut puts, chain_epoch, transactions)?;
+    push_block_transaction_index_artifact_puts(&mut puts, chain_epoch, block_transaction_index)?;
+    push_transaction_location_puts(&mut puts, chain_epoch, transaction_locations)?;
+    push_transaction_facts_artifact_puts(&mut puts, chain_epoch, transaction_facts)?;
+    push_transaction_blob_artifact_puts(&mut puts, chain_epoch, transaction_blobs)?;
     push_tree_state_artifact_puts(&mut puts, chain_epoch, tree_states)?;
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
-    push_transparent_address_utxo_artifact_puts(&mut puts, chain_epoch, transparent_address_utxos)?;
-    push_transparent_prevout_artifact_puts(&mut puts, chain_epoch, transparent_prevouts)?;
-    push_transparent_utxo_spend_artifact_puts(&mut puts, chain_epoch, transparent_utxo_spends)?;
+    push_address_output_index_artifact_puts(&mut puts, chain_epoch, address_output_index)?;
+    push_transparent_output_artifact_puts(&mut puts, chain_epoch, transparent_outputs_by_outpoint)?;
+    push_transparent_spend_fact_puts(&mut puts, chain_epoch, transparent_spend_facts)?;
     push_transparent_address_tx_index_artifact_puts(
         &mut puts,
         chain_epoch,
@@ -1762,32 +1784,30 @@ fn build_chain_epoch_puts(
     Ok(puts)
 }
 
-struct TransparentPrevoutProjectionRepairs {
+struct TransparentOutputProjectionRepairs {
     puts: Vec<StoragePut>,
     deletes: Vec<StorageDelete>,
 }
 
 #[derive(Clone, Copy)]
-struct TransparentPrevoutProjectionRepairInputs<'input> {
+struct TransparentOutputProjectionRepairInputs<'input> {
     previous_chain_epoch: Option<ChainEpoch>,
     chain_epoch: ChainEpoch,
     reorg_window_change: &'input ReorgWindowChange,
     protected_outpoints: &'input HashSet<TransparentOutPoint>,
-    committed_block_hashes: &'input HashMap<BlockHeight, BlockHash>,
 }
 
 fn build_reorg_window_projection_repairs(
     inner: &impl RocksChainStoreRead,
-    inputs: TransparentPrevoutProjectionRepairInputs<'_>,
-) -> Result<TransparentPrevoutProjectionRepairs, StoreError> {
+    inputs: TransparentOutputProjectionRepairInputs<'_>,
+) -> Result<TransparentOutputProjectionRepairs, StoreError> {
     let ReorgWindowChange::Replace { from_height } = inputs.reorg_window_change else {
-        return Ok(TransparentPrevoutProjectionRepairs {
+        return Ok(TransparentOutputProjectionRepairs {
             puts: Vec::new(),
             deletes: Vec::new(),
         });
     };
 
-    let mut puts = Vec::new();
     let mut deletes = Vec::new();
     let previous_chain_epoch =
         inputs
@@ -1796,57 +1816,84 @@ fn build_reorg_window_projection_repairs(
                 reason: "reorg replacement requires an existing previous chain epoch",
             })?;
     let reverted_outpoints =
-        read_reverted_transparent_prevout_outpoints(inner, previous_chain_epoch, *from_height)?;
+        read_reverted_transparent_output_outpoints(inner, previous_chain_epoch, *from_height)?;
     for outpoint in reverted_outpoints {
         if inputs.protected_outpoints.contains(&outpoint) {
             continue;
         }
 
-        let current_key = StoreKey::transparent_prevout(inputs.chain_epoch.network, outpoint);
-        let mut post_reorg_block_is_visible = |height: BlockHeight, expected_hash: BlockHash| {
-            if height >= *from_height {
-                return Ok(inputs
-                    .committed_block_hashes
-                    .get(&height)
-                    .is_some_and(|block_hash| *block_hash == expected_hash));
-            }
-
-            let Some(block) = read_block_artifact(inner, inputs.chain_epoch, height)? else {
-                return Ok(false);
-            };
-            Ok(block.block_hash == expected_hash)
-        };
-        match read_transparent_prevout_from_history_with_block_visibility(
-            inner,
-            inputs.chain_epoch,
-            outpoint,
-            &mut post_reorg_block_is_visible,
-        )? {
-            Some(restored_prevout) => {
-                puts.push(StoragePut {
-                    table: StorageTable::TransparentPrevout,
-                    key: current_key,
-                    value: encode_transparent_prevout_artifact(restored_prevout)?,
-                });
-            }
-            None => deletes.push(StorageDelete {
-                table: StorageTable::TransparentPrevout,
-                key: current_key,
-            }),
-        }
+        let current_key = StoreKey::transparent_output(inputs.chain_epoch.network, outpoint);
+        deletes.push(StorageDelete {
+            table: StorageTable::TransparentOutput,
+            key: current_key,
+        });
     }
 
-    Ok(TransparentPrevoutProjectionRepairs { puts, deletes })
+    Ok(TransparentOutputProjectionRepairs {
+        puts: Vec::new(),
+        deletes,
+    })
 }
 
-fn read_reverted_transparent_prevout_outpoints(
+struct TransparentSpendFactProjectionRepairs {
+    puts: Vec<StoragePut>,
+    deletes: Vec<StorageDelete>,
+}
+
+#[derive(Clone, Copy)]
+struct TransparentSpendFactProjectionRepairInputs<'input> {
+    previous_chain_epoch: Option<ChainEpoch>,
+    chain_epoch: ChainEpoch,
+    reorg_window_change: &'input ReorgWindowChange,
+    protected_outpoints: &'input HashSet<TransparentOutPoint>,
+}
+
+fn build_reorg_window_spend_fact_projection_repairs(
+    inner: &impl RocksChainStoreRead,
+    inputs: TransparentSpendFactProjectionRepairInputs<'_>,
+) -> Result<TransparentSpendFactProjectionRepairs, StoreError> {
+    let ReorgWindowChange::Replace { from_height } = inputs.reorg_window_change else {
+        return Ok(TransparentSpendFactProjectionRepairs {
+            puts: Vec::new(),
+            deletes: Vec::new(),
+        });
+    };
+
+    let mut deletes = Vec::new();
+    let previous_chain_epoch =
+        inputs
+            .previous_chain_epoch
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "reorg replacement requires an existing previous chain epoch",
+            })?;
+    let reverted_outpoints =
+        read_reverted_transparent_spend_fact_outpoints(inner, previous_chain_epoch, *from_height)?;
+    for outpoint in reverted_outpoints {
+        if inputs.protected_outpoints.contains(&outpoint) {
+            continue;
+        }
+
+        let current_key = StoreKey::transparent_spend_fact(inputs.chain_epoch.network, outpoint);
+        deletes.push(StorageDelete {
+            table: StorageTable::TransparentSpendFact,
+            key: current_key,
+        });
+    }
+
+    Ok(TransparentSpendFactProjectionRepairs {
+        puts: Vec::new(),
+        deletes,
+    })
+}
+
+fn read_reverted_transparent_spend_fact_outpoints(
     inner: &impl RocksChainStoreRead,
     previous_chain_epoch: ChainEpoch,
     from_height: BlockHeight,
 ) -> Result<Vec<TransparentOutPoint>, StoreError> {
     let mut outpoints = HashSet::new();
     for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height) {
-        outpoints.extend(read_visible_transparent_prevout_block_outpoints(
+        outpoints.extend(read_visible_transparent_spend_fact_block_outpoints(
             inner,
             previous_chain_epoch,
             height,
@@ -1858,29 +1905,48 @@ fn read_reverted_transparent_prevout_outpoints(
     Ok(outpoints)
 }
 
-fn read_visible_transparent_prevout_block_outpoints(
+fn read_reverted_transparent_output_outpoints(
+    inner: &impl RocksChainStoreRead,
+    previous_chain_epoch: ChainEpoch,
+    from_height: BlockHeight,
+) -> Result<Vec<TransparentOutPoint>, StoreError> {
+    let mut outpoints = HashSet::new();
+    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height) {
+        outpoints.extend(read_visible_transparent_output_block_outpoints(
+            inner,
+            previous_chain_epoch,
+            height,
+        )?);
+    }
+
+    let mut outpoints = outpoints.into_iter().collect::<Vec<_>>();
+    sort_transparent_outpoints(&mut outpoints);
+    Ok(outpoints)
+}
+
+fn read_visible_transparent_output_block_outpoints(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     height: BlockHeight,
 ) -> Result<Vec<TransparentOutPoint>, StoreError> {
-    let Some(block) = read_block_artifact(inner, chain_epoch, height)? else {
+    let Some(block) = read_block_header_artifact(inner, chain_epoch, height)? else {
         return Ok(Vec::new());
     };
 
-    let prefix = StoreKey::transparent_prevout_block_index_prefix(chain_epoch.network, height);
+    let prefix = StoreKey::transparent_output_block_index_prefix(chain_epoch.network, height);
     let mut outpoints = None;
     let mut scan_error = None;
     inner.scan_prefix_reverse(
-        StorageTable::TransparentPrevoutBlockIndex,
+        StorageTable::TransparentOutputBlockIndex,
         &prefix,
         &mut |key_bytes, envelope_bytes| {
             let key = StoreKey::from_raw_bytes(key_bytes);
             let Some(source_epoch) = StoreKey::transparent_artifact_chain_epoch_id(key_bytes)
             else {
                 scan_error = Some(StoreError::ArtifactCorrupt {
-                    family: ArtifactFamily::TransparentPrevout,
+                    family: ArtifactFamily::TransparentOutput,
                     key: key.into(),
-                    reason: "transparent prevout block index key is malformed",
+                    reason: "transparent spend index key is malformed",
                 });
                 return Ok(PrefixScanControl::Stop);
             };
@@ -1888,7 +1954,7 @@ fn read_visible_transparent_prevout_block_outpoints(
                 return Ok(PrefixScanControl::Continue);
             }
 
-            match decode_transparent_prevout_block_index(&key, envelope_bytes) {
+            match decode_transparent_output_block_index(&key, envelope_bytes) {
                 Ok((block_hash, block_outpoints)) if block_hash == block.block_hash => {
                     outpoints = Some(block_outpoints);
                     Ok(PrefixScanControl::Stop)
@@ -1918,18 +1984,18 @@ fn sort_transparent_outpoints(outpoints: &mut [TransparentOutPoint]) {
     });
 }
 
-fn push_block_artifact_puts(
+fn push_block_header_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
-    finalized_blocks: Vec<BlockArtifact>,
+    block_headers: Vec<BlockHeaderArtifact>,
 ) -> Result<(), StoreError> {
-    for block in finalized_blocks {
+    for block in block_headers {
         let height = block.height;
         let block_hash = block.block_hash;
-        let encoded_block = encode_block_artifact(block)?;
+        let encoded_block = encode_block_header_artifact(&block)?;
         puts.push(StoragePut {
-            table: StorageTable::FinalizedBlock,
-            key: StoreKey::finalized_block(chain_epoch.network, chain_epoch.id, height),
+            table: StorageTable::BlockHeader,
+            key: StoreKey::block_header(chain_epoch.network, chain_epoch.id, height),
             value: encoded_block,
         });
         puts.push(StoragePut {
@@ -1943,6 +2009,24 @@ fn push_block_artifact_puts(
             height,
             block_hash,
         ));
+    }
+
+    Ok(())
+}
+
+fn push_block_blob_artifact_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    block_blobs: Vec<BlockBlobArtifact>,
+) -> Result<(), StoreError> {
+    for block_blob in block_blobs {
+        let height = block_blob.height;
+        let encoded_blob = encode_block_blob_artifact(block_blob)?;
+        puts.push(StoragePut {
+            table: StorageTable::BlockBlob,
+            key: StoreKey::block_blob(chain_epoch.network, chain_epoch.id, height),
+            value: encoded_blob,
+        });
     }
 
     Ok(())
@@ -1971,17 +2055,63 @@ fn push_compact_block_artifact_puts(
     Ok(())
 }
 
-fn push_transaction_artifact_puts(
+fn push_block_transaction_index_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
-    transactions: Vec<TransactionArtifact>,
+    artifacts: Vec<BlockTransactionIndexArtifact>,
 ) -> Result<(), StoreError> {
-    for transaction in transactions {
-        let transaction_id = transaction.transaction_id;
-        let encoded_transaction = encode_transaction_artifact(transaction)?;
+    for artifact in artifacts {
+        let block_height = artifact.block_height;
+        let tx_index_in_block = artifact.tx_index_in_block;
+        let encoded_artifact = encode_block_transaction_index_artifact(artifact)?;
         puts.push(StoragePut {
-            table: StorageTable::Transaction,
-            key: StoreKey::transaction(chain_epoch.network, chain_epoch.id, transaction_id),
+            table: StorageTable::BlockTransactionIndex,
+            key: StoreKey::block_transaction_index(
+                chain_epoch.network,
+                chain_epoch.id,
+                block_height,
+                tx_index_in_block,
+            ),
+            value: encoded_artifact,
+        });
+    }
+
+    Ok(())
+}
+
+fn push_transaction_location_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    locations: Vec<TransactionLocation>,
+) -> Result<(), StoreError> {
+    for location in locations {
+        let transaction_id = location.transaction_id;
+        let encoded_location = encode_transaction_location_artifact(location)?;
+        puts.push(StoragePut {
+            table: StorageTable::TransactionLocation,
+            key: StoreKey::transaction_location(
+                chain_epoch.network,
+                chain_epoch.id,
+                transaction_id,
+            ),
+            value: encoded_location,
+        });
+    }
+
+    Ok(())
+}
+
+fn push_transaction_facts_artifact_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    transaction_facts: Vec<TransactionFactsArtifact>,
+) -> Result<(), StoreError> {
+    for transaction in transaction_facts {
+        let transaction_id = transaction.location.transaction_id;
+        let encoded_transaction = encode_transaction_facts_artifact(transaction)?;
+        puts.push(StoragePut {
+            table: StorageTable::TransactionFacts,
+            key: StoreKey::transaction_facts(chain_epoch.network, chain_epoch.id, transaction_id),
             value: encoded_transaction,
         });
         puts.push(StoragePut {
@@ -1992,6 +2122,24 @@ fn push_transaction_artifact_puts(
                 chain_epoch.id,
             ),
             value: visibility_value(chain_epoch),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_transaction_blob_artifact_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    transaction_blobs: Vec<TransactionBlobArtifact>,
+) -> Result<(), StoreError> {
+    for transaction_blob in transaction_blobs {
+        let transaction_id = transaction_blob.location.transaction_id;
+        let encoded_blob = encode_transaction_blob_artifact(transaction_blob)?;
+        puts.push(StoragePut {
+            table: StorageTable::TransactionBlob,
+            key: StoreKey::transaction_blob(chain_epoch.network, chain_epoch.id, transaction_id),
+            value: encoded_blob,
         });
     }
 
@@ -2055,22 +2203,22 @@ fn push_subtree_root_artifact_puts(
     Ok(())
 }
 
-fn push_transparent_address_utxo_artifact_puts(
+fn push_address_output_index_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
-    transparent_address_utxos: Vec<TransparentAddressUtxoArtifact>,
+    address_output_index: Vec<AddressOutputIndexArtifact>,
 ) -> Result<(), StoreError> {
-    for utxo in transparent_address_utxos {
-        let key = StoreKey::transparent_address_utxo(
+    for output in address_output_index {
+        let key = StoreKey::address_output_index(
             chain_epoch.network,
-            utxo.address_script_hash,
-            utxo.block_height,
-            utxo.outpoint,
+            output.address_script_hash,
+            output.block_height,
+            output.outpoint,
             chain_epoch.id,
         );
-        let encoded_utxo = encode_transparent_address_utxo_artifact(utxo)?;
+        let encoded_utxo = encode_address_output_index_artifact(output)?;
         puts.push(StoragePut {
-            table: StorageTable::TransparentAddressUtxo,
+            table: StorageTable::AddressOutputIndex,
             key,
             value: encoded_utxo,
         });
@@ -2079,32 +2227,22 @@ fn push_transparent_address_utxo_artifact_puts(
     Ok(())
 }
 
-fn push_transparent_prevout_artifact_puts(
+fn push_transparent_output_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
-    transparent_prevouts: Vec<TransparentPrevoutArtifact>,
+    transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
 ) -> Result<(), StoreError> {
     let mut block_outpoints = HashMap::<(BlockHeight, BlockHash), Vec<TransparentOutPoint>>::new();
-    for artifact in transparent_prevouts {
-        let current_key = StoreKey::transparent_prevout(chain_epoch.network, artifact.outpoint);
-        let history_key = StoreKey::transparent_prevout_history(
-            chain_epoch.network,
-            artifact.outpoint,
-            chain_epoch.id,
-        );
+    for artifact in transparent_outputs_by_outpoint {
+        let current_key = StoreKey::transparent_output(chain_epoch.network, artifact.outpoint);
         block_outpoints
             .entry((artifact.block_height, artifact.block_hash))
             .or_default()
             .push(artifact.outpoint);
-        let encoded = encode_transparent_prevout_artifact(artifact)?;
+        let encoded = encode_transparent_output_artifact(artifact)?;
         puts.push(StoragePut {
-            table: StorageTable::TransparentPrevout,
+            table: StorageTable::TransparentOutput,
             key: current_key,
-            value: encoded.clone(),
-        });
-        puts.push(StoragePut {
-            table: StorageTable::TransparentPrevoutHistory,
-            key: history_key,
             value: encoded,
         });
     }
@@ -2121,35 +2259,60 @@ fn push_transparent_prevout_artifact_puts(
         sort_transparent_outpoints(&mut outpoints);
         outpoints.dedup();
         puts.push(StoragePut {
-            table: StorageTable::TransparentPrevoutBlockIndex,
-            key: StoreKey::transparent_prevout_block_index(
+            table: StorageTable::TransparentOutputBlockIndex,
+            key: StoreKey::transparent_output_block_index(
                 chain_epoch.network,
                 block_height,
                 chain_epoch.id,
             ),
-            value: encode_transparent_prevout_block_index(block_hash, &outpoints)?,
+            value: encode_transparent_output_block_index(block_hash, &outpoints)?,
         });
     }
 
     Ok(())
 }
 
-fn push_transparent_utxo_spend_artifact_puts(
+fn push_transparent_spend_fact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
-    transparent_utxo_spends: Vec<TransparentUtxoSpendArtifact>,
+    transparent_spend_facts: Vec<TransparentSpendFact>,
 ) -> Result<(), StoreError> {
-    for spend in transparent_utxo_spends {
-        let key = StoreKey::transparent_utxo_spend(
-            chain_epoch.network,
-            spend.spent_outpoint,
-            chain_epoch.id,
-        );
-        let encoded_spend = encode_transparent_utxo_spend_artifact(spend)?;
+    let mut block_spent_outpoints =
+        HashMap::<(BlockHeight, BlockHash), Vec<TransparentOutPoint>>::new();
+    for spend in transparent_spend_facts {
+        let current_key =
+            StoreKey::transparent_spend_fact(chain_epoch.network, spend.spent_outpoint);
+        block_spent_outpoints
+            .entry((spend.block_height, spend.block_hash))
+            .or_default()
+            .push(spend.spent_outpoint);
+        let encoded_spend = encode_transparent_spend_fact(&spend)?;
         puts.push(StoragePut {
-            table: StorageTable::TransparentUtxoSpend,
-            key,
+            table: StorageTable::TransparentSpendFact,
+            key: current_key,
             value: encoded_spend,
+        });
+    }
+
+    let mut block_spent_outpoints = block_spent_outpoints.into_iter().collect::<Vec<_>>();
+    block_spent_outpoints.sort_by(
+        |((left_height, left_hash), _), ((right_height, right_hash), _)| {
+            left_height
+                .cmp(right_height)
+                .then(left_hash.as_bytes().cmp(&right_hash.as_bytes()))
+        },
+    );
+    for ((block_height, block_hash), mut spent_outpoints) in block_spent_outpoints {
+        sort_transparent_outpoints(&mut spent_outpoints);
+        spent_outpoints.dedup();
+        puts.push(StoragePut {
+            table: StorageTable::TransparentSpendFactBlockIndex,
+            key: StoreKey::transparent_spend_fact_block_index(
+                chain_epoch.network,
+                block_height,
+                chain_epoch.id,
+            ),
+            value: encode_transparent_spend_fact_block_index(block_hash, &spent_outpoints)?,
         });
     }
 
@@ -2677,7 +2840,7 @@ mod tests {
 
     use tempfile::tempdir;
     use zinder_core::{
-        BlockArtifact, BlockHash, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
+        BlockHash, BlockHeaderArtifact, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
         TreeStateArtifact, UnixTimestampMillis,
     };
 
@@ -2685,7 +2848,7 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 4);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 9);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
@@ -2856,7 +3019,7 @@ mod tests {
     fn synthetic_epoch(
         chain_epoch_id: u64,
         height: u32,
-    ) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+    ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
         synthetic_epoch_with_hash_seed(chain_epoch_id, height, height, height.saturating_sub(1))
     }
 
@@ -2865,7 +3028,7 @@ mod tests {
         height: u32,
         hash_seed: u32,
         parent_hash_seed: u32,
-    ) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+    ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
         let source_hash = block_hash(hash_seed);
         let parent_hash = block_hash(parent_hash_seed);
         let block_height = BlockHeight::new(height);
@@ -2882,11 +3045,11 @@ mod tests {
                 tip_metadata: ChainTipMetadata::empty(),
                 created_at: UnixTimestampMillis::new(1_774_668_500_000 + u64::from(height)),
             },
-            BlockArtifact::new(
+            synthetic_block_header(
                 block_height,
                 source_hash,
                 parent_hash,
-                format!("raw-block-{chain_epoch_id}-{height}").into_bytes(),
+                format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
             ),
             CompactBlockArtifact::new(
                 block_height,
@@ -2902,5 +3065,25 @@ mod tests {
             chunk.copy_from_slice(&seed.to_be_bytes());
         }
         BlockHash::from_bytes(bytes)
+    }
+
+    fn synthetic_block_header(
+        height: BlockHeight,
+        block_hash: BlockHash,
+        parent_hash: BlockHash,
+        raw_block_bytes: &[u8],
+    ) -> BlockHeaderArtifact {
+        BlockHeaderArtifact::new(
+            height,
+            block_hash,
+            parent_hash,
+            [0; 32],
+            [0; 32],
+            0,
+            0,
+            [0; 32],
+            0,
+            u64::try_from(raw_block_bytes.len()).unwrap_or(u64::MAX),
+        )
     }
 }

@@ -1,74 +1,62 @@
-//! Per-block parsed view shared across derive consumers for one commit.
+//! Per-block canonical fact view shared across derive consumers.
 //!
-//! [`BlockCommitContext`] carries the block bytes ingest just committed, the
-//! shared parsed `zebra-chain` block, and the prevout map ingest resolved from the
-//! canonical store. The same value is shared across every chain-events
-//! consumer in the writer fan-out, so the block parses once and prevouts
-//! resolve once even though four independent `apply_block` calls observe
-//! the same height.
-//!
-//! Hosting the parsed block (rather than the raw bytes) inside the cache
-//! matters: re-parsing a 2 MB mainnet block four times per commit would
-//! dominate the per-block CPU budget.
+//! [`BlockCommitContext`] is hydrated from the fact-first canonical store:
+//! block-header facts, ordered transaction facts, and resolved transparent
+//! outputs for the block's transparent inputs. Derive replay no longer depends
+//! on raw block blobs or `zebra-chain` parsing, so startup replay and
+//! steady-state tailing use the same typed input shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use zebra_chain::block::Block as ZebraBlock;
-use zinder_core::{BlockHeight, TransparentOutPoint, TransparentPrevout};
+use zinder_core::{
+    BlockHeight, TransactionFactsArtifact, TransparentOutPoint, TransparentSpendFact,
+};
 
-/// Errors surfaced while hydrating a [`BlockCommitContext`] or resolving
-/// its prevouts.
+/// Errors surfaced while reading a block context's hydrated transparent spends.
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BlockCommitContextError {
-    /// Reserved for future in-process resolver failures.
-    #[error("prevout resolver failed: {reason}")]
-    Resolver {
+    /// Reserved for future in-process hydration failures.
+    #[error("transparent spend hydration failed: {reason}")]
+    Hydration {
         /// Human-readable failure reason.
         reason: String,
     },
 }
 
-/// How [`BlockCommitContext::prevouts`] resolves missing values.
+/// Hydrated transparent spend facts available to derive consumers.
 ///
-/// `Offline` short-circuits to `None` so consumers that branch on prevout
-/// availability never block on a resolution attempt the binary has
-/// explicitly disabled. `Static` is the writer-owned path: ingest resolves
-/// prevouts from the canonical store and supplies the map directly.
+/// `Offline` short-circuits to `None` so consumers can emit explicit
+/// `UNAVAILABLE` records when transparent-spend hydration is disabled. `Static`
+/// is the writer-owned path: ingest resolves every event-scoped spend from the
+/// canonical store and supplies the map directly.
 #[derive(Clone)]
-pub enum PrevoutResolver {
-    /// Prevout resolution is not available; `prevouts()` returns `None`.
+pub enum TransparentSpendFacts {
+    /// Transparent-spend hydration is not available.
     Offline,
-    /// In-process resolution: the caller provides the precomputed prevout
-    /// map. Used when the consumer runs colocated with the writer that
-    /// holds the canonical store and the prevout lookup is a direct read
-    /// against canonical UTXO artifacts, not a gRPC round-trip.
-    Static(Arc<HashMap<TransparentOutPoint, TransparentPrevout>>),
+    /// In-process hydration: the caller provides the precomputed spend map.
+    Static(Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>),
 }
 
-impl PrevoutResolver {
-    /// Wraps a precomputed prevout map into the `Static` variant.
+impl TransparentSpendFacts {
+    /// Wraps a precomputed spend-fact map into the `Static` variant.
     #[must_use]
-    pub fn from_map(map: Arc<HashMap<TransparentOutPoint, TransparentPrevout>>) -> Self {
+    pub fn from_map(map: Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>) -> Self {
         Self::Static(map)
     }
 }
 
-impl std::fmt::Debug for PrevoutResolver {
+impl std::fmt::Debug for TransparentSpendFacts {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Offline => formatter.write_str("PrevoutResolver::Offline"),
-            Self::Static(map) => write!(formatter, "PrevoutResolver::Static({})", map.len()),
+            Self::Offline => formatter.write_str("TransparentSpendFacts::Offline"),
+            Self::Static(map) => write!(formatter, "TransparentSpendFacts::Static({})", map.len()),
         }
     }
 }
 
-/// Per-block parsed view threaded through one batch of consumer `apply_block`
-/// calls.
-///
-/// Held inside `Arc<BlockCommitContext>` and shared across consumers
-/// observing the same height.
+/// Per-block typed fact view threaded through consumer `apply_block` calls.
 pub struct BlockCommitContext {
     /// Height the context describes.
     pub height: BlockHeight,
@@ -76,16 +64,16 @@ pub struct BlockCommitContext {
     pub block_hash: Vec<u8>,
     /// Previous-block hash bytes (32 bytes, internal byte order).
     pub previous_block_hash: Vec<u8>,
-    /// Raw block byte count as the wallet plane delivered it. This is the
-    /// authoritative on-disk block size without retaining another copy of the
-    /// raw block payload.
-    pub raw_block_size_bytes: usize,
-    /// Block parsed once with `zebra-chain` and shared by derive consumers.
-    pub block: Arc<ZebraBlock>,
-    resolver: PrevoutResolver,
+    /// Block-time as Unix seconds.
+    pub block_time_unix_seconds: i64,
+    /// Serialized consensus block size in bytes.
+    pub block_size_bytes: u64,
+    /// Ordered transaction facts for every transaction in the block.
+    pub transactions: Vec<TransactionFactsArtifact>,
+    transparent_spends: TransparentSpendFacts,
 }
 
-/// Parsed-block payload [`BlockCommitContext::new`] takes by value.
+/// Canonical fact payload [`BlockCommitContext::new`] takes by value.
 pub struct BlockCommitPayload {
     /// Height of the block.
     pub height: BlockHeight,
@@ -93,42 +81,44 @@ pub struct BlockCommitPayload {
     pub block_hash: Vec<u8>,
     /// Previous-block hash bytes (32 bytes, internal byte order).
     pub previous_block_hash: Vec<u8>,
-    /// Raw block byte count.
-    pub raw_block_size_bytes: usize,
-    /// Block parsed once with `zebra-chain`.
-    pub block: Arc<ZebraBlock>,
+    /// Block-time as Unix seconds.
+    pub block_time_unix_seconds: i64,
+    /// Serialized consensus block size in bytes.
+    pub block_size_bytes: u64,
+    /// Ordered transaction facts for every transaction in the block.
+    pub transactions: Vec<TransactionFactsArtifact>,
 }
 
 impl BlockCommitContext {
-    /// Builds a context from an already-parsed block plus its raw bytes.
+    /// Builds a context from canonical block and transaction facts.
     #[must_use]
-    pub fn new(payload: BlockCommitPayload, resolver: PrevoutResolver) -> Self {
+    pub fn new(payload: BlockCommitPayload, transparent_spends: TransparentSpendFacts) -> Self {
         Self {
             height: payload.height,
             block_hash: payload.block_hash,
             previous_block_hash: payload.previous_block_hash,
-            raw_block_size_bytes: payload.raw_block_size_bytes,
-            block: payload.block,
-            resolver,
+            block_time_unix_seconds: payload.block_time_unix_seconds,
+            block_size_bytes: payload.block_size_bytes,
+            transactions: payload.transactions,
+            transparent_spends,
         }
     }
 
-    /// Returns the prevout map for the block's non-coinbase inputs.
+    /// Returns the hydrated transparent spend map for the block's transparent inputs.
     ///
-    /// `Ok(None)` means the binary configured an [`PrevoutResolver::Offline`]
-    /// resolver, so the consumer should treat every prevout as unresolved.
-    /// `Ok(Some(map))` resolves every transparent input the block contains;
-    /// the map may be missing individual outpoints when the upstream cannot
-    /// produce them.
-    pub fn prevouts(
+    /// `Ok(None)` means the binary configured [`TransparentSpendFacts::Offline`].
+    /// `Ok(Some(map))` contains every transparent input the store can identify;
+    /// the map may be missing individual outpoints when the source block
+    /// references an output outside retained canonical facts.
+    pub fn transparent_spends(
         &self,
     ) -> Result<
-        Option<Arc<HashMap<TransparentOutPoint, TransparentPrevout>>>,
+        Option<Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>>,
         BlockCommitContextError,
     > {
-        Ok(match &self.resolver {
-            PrevoutResolver::Offline => None,
-            PrevoutResolver::Static(map) => Some(Arc::clone(map)),
+        Ok(match &self.transparent_spends {
+            TransparentSpendFacts::Offline => None,
+            TransparentSpendFacts::Static(map) => Some(Arc::clone(map)),
         })
     }
 }

@@ -10,6 +10,8 @@ use thiserror::Error;
 pub enum NodeCapability {
     /// Source can fetch blocks from the current best chain.
     BestChainBlocks,
+    /// Source can fetch bounded ordered best-chain update segments.
+    SourceChainSegments,
     /// Source can report the current tip identity (height and hash).
     TipId,
     /// Source can provide tree-state data for fetched blocks.
@@ -43,6 +45,7 @@ impl NodeCapability {
     pub const fn name(self) -> &'static str {
         match self {
             Self::BestChainBlocks => "best_chain_blocks",
+            Self::SourceChainSegments => "source_chain_segments",
             Self::TipId => "tip_id",
             Self::TreeState => "tree_state",
             Self::SubtreeRoots => "subtree_roots",
@@ -58,6 +61,7 @@ impl NodeCapability {
 
 const ORDERED_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::BestChainBlocks,
+    NodeCapability::SourceChainSegments,
     NodeCapability::TipId,
     NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
@@ -72,15 +76,16 @@ const ORDERED_CAPABILITIES: &[NodeCapability] = &[
 const fn capability_bit(capability: NodeCapability) -> u16 {
     match capability {
         NodeCapability::BestChainBlocks => 1 << 0,
-        NodeCapability::TipId => 1 << 1,
-        NodeCapability::TreeState => 1 << 2,
-        NodeCapability::SubtreeRoots => 1 << 3,
-        NodeCapability::FinalizedHeight => 1 << 4,
-        NodeCapability::ReadinessProbe => 1 << 5,
-        NodeCapability::TransactionBroadcast => 1 << 6,
-        NodeCapability::JsonRpc => 1 << 7,
-        NodeCapability::OpenRpcDiscovery => 1 << 8,
-        NodeCapability::ChainValuePools => 1 << 9,
+        NodeCapability::SourceChainSegments => 1 << 1,
+        NodeCapability::TipId => 1 << 2,
+        NodeCapability::TreeState => 1 << 3,
+        NodeCapability::SubtreeRoots => 1 << 4,
+        NodeCapability::FinalizedHeight => 1 << 5,
+        NodeCapability::ReadinessProbe => 1 << 6,
+        NodeCapability::TransactionBroadcast => 1 << 7,
+        NodeCapability::JsonRpc => 1 << 8,
+        NodeCapability::OpenRpcDiscovery => 1 << 9,
+        NodeCapability::ChainValuePools => 1 << 10,
     }
 }
 

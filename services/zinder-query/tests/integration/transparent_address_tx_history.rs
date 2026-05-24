@@ -7,9 +7,9 @@ use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_core::{
-    BlockArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-    Network, TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    UnixTimestampMillis,
+    BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
@@ -18,7 +18,10 @@ use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, PrimaryChainStore, ReorgWindowChange,
 };
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    StoreFixture, open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
+    seed_transparent_address_transaction_history,
+};
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
 
@@ -28,10 +31,21 @@ const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xEF; 32];
 async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 5)?;
+    commit_tx_index(
+        &store,
+        &derive_store,
+        TxHistoryFixtureRows {
+            chain_epoch_id: ChainEpochId::new(1),
+            height: 1,
+            address_script_hash,
+            entries: 5,
+        },
+    )?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_derive_store(derive_store);
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
@@ -46,7 +60,6 @@ async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -
             end_height: 1000,
             max_entries: 0,
             from_cursor: Vec::new(),
-            at_epoch: None,
             descending: false,
         }),
     )
@@ -71,10 +84,21 @@ async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -
 async fn transparent_address_tx_ids_in_range_supports_descending() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 4)?;
+    commit_tx_index(
+        &store,
+        &derive_store,
+        TxHistoryFixtureRows {
+            chain_epoch_id: ChainEpochId::new(1),
+            height: 1,
+            address_script_hash,
+            entries: 4,
+        },
+    )?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_derive_store(derive_store);
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
@@ -89,7 +113,6 @@ async fn transparent_address_tx_ids_in_range_supports_descending() -> eyre::Resu
             end_height: 1000,
             max_entries: 0,
             from_cursor: Vec::new(),
-            at_epoch: None,
             descending: true,
         }),
     )
@@ -110,10 +133,21 @@ async fn transparent_address_tx_ids_in_range_supports_descending() -> eyre::Resu
 async fn transparent_address_tx_ids_cursor_preserves_descending_direction() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 4)?;
+    commit_tx_index(
+        &store,
+        &derive_store,
+        TxHistoryFixtureRows {
+            chain_epoch_id: ChainEpochId::new(1),
+            height: 1,
+            address_script_hash,
+            entries: 4,
+        },
+    )?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_derive_store(derive_store);
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let first_page =
@@ -148,10 +182,21 @@ async fn transparent_address_tx_ids_cursor_preserves_descending_direction() -> e
 async fn transparent_address_tx_ids_clamps_oversized_page_request() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_tx_index(&store, ChainEpochId::new(1), 1, address_script_hash, 1001)?;
+    commit_tx_index(
+        &store,
+        &derive_store,
+        TxHistoryFixtureRows {
+            chain_epoch_id: ChainEpochId::new(1),
+            height: 1,
+            address_script_hash,
+            entries: 1001,
+        },
+    )?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_derive_store(derive_store);
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let chunks = collect_tx_history_chunks(
@@ -172,10 +217,12 @@ async fn transparent_address_tx_ids_clamps_oversized_page_request() -> eyre::Res
 async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_reorged_tx_index_rows(&store, address_script_hash)?;
+    commit_reorged_tx_index_rows(&store, &derive_store, address_script_hash)?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_derive_store(derive_store);
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
     let chunks =
@@ -224,35 +271,24 @@ fn tx_history_request(
         end_height: 1000,
         max_entries,
         from_cursor,
-        at_epoch: None,
         descending,
     }
 }
 
 fn commit_reorged_tx_index_rows(
     store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
     address_script_hash: TransparentAddressScriptHash,
 ) -> eyre::Result<()> {
     let (finalized_epoch, finalized_block, finalized_compact_block) = synthetic_chain_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_chain_epoch(1, 2);
     initial_epoch.finalized_height = finalized_epoch.tip_height;
     initial_epoch.finalized_hash = finalized_epoch.tip_hash;
-    let stale_artifact = TransparentAddressTxIndexArtifact::new(
-        address_script_hash,
-        initial_block.height,
-        0,
-        TransactionId::from_bytes([0x11; 32]),
-        initial_block.block_hash,
-    );
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            initial_epoch,
-            vec![finalized_block.clone(), initial_block],
-            vec![finalized_compact_block, initial_compact_block],
-        )
-        .with_transparent_address_tx_index(vec![stale_artifact]),
-    )?;
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        initial_epoch,
+        vec![finalized_block.clone(), initial_block],
+        vec![finalized_compact_block, initial_compact_block],
+    ))?;
 
     let replacement_height = BlockHeight::new(2);
     let replacement_hash = block_hash_from_seed(20);
@@ -267,11 +303,17 @@ fn commit_reorged_tx_index_rows(
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_020),
     };
-    let replacement_block = BlockArtifact::new(
+    let replacement_block = BlockHeaderArtifact::new(
         replacement_height,
         replacement_hash,
         finalized_block.block_hash,
-        b"replacement-block-2".to_vec(),
+        [0; 32],
+        [0; 32],
+        0,
+        0,
+        [0; 32],
+        0,
+        u64::try_from(b"replacement-block-2".len()).unwrap_or(u64::MAX),
     );
     let replacement_compact_block = CompactBlockArtifact::new(
         replacement_height,
@@ -292,29 +334,36 @@ fn commit_reorged_tx_index_rows(
             vec![replacement_block],
             vec![replacement_compact_block],
         )
-        .with_transparent_address_tx_index(vec![visible_artifact])
         .with_reorg_window_change(ReorgWindowChange::Replace {
             from_height: replacement_height,
         }),
     )?;
+    seed_transparent_address_transaction_history(derive_store, &[visible_artifact])?;
 
     Ok(())
 }
 
-fn commit_tx_index(
-    store: &PrimaryChainStore,
+#[derive(Clone, Copy)]
+struct TxHistoryFixtureRows {
     chain_epoch_id: ChainEpochId,
     height: u32,
     address_script_hash: TransparentAddressScriptHash,
     entries: u32,
+}
+
+fn commit_tx_index(
+    store: &PrimaryChainStore,
+    derive_store: &zinder_derive::DeriveStore,
+    rows: TxHistoryFixtureRows,
 ) -> eyre::Result<()> {
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(chain_epoch_id.value(), height);
+    let (chain_epoch, block, compact_block) =
+        synthetic_chain_epoch(rows.chain_epoch_id.value(), rows.height);
     let mut artifacts = Vec::new();
-    for tx_index in 0..entries {
+    for tx_index in 0..rows.entries {
         let mut transaction_id_bytes = [0; 32];
         transaction_id_bytes[..4].copy_from_slice(&tx_index.to_be_bytes());
         artifacts.push(TransparentAddressTxIndexArtifact::new(
-            address_script_hash,
+            rows.address_script_hash,
             block.height,
             tx_index,
             TransactionId::from_bytes(transaction_id_bytes),
@@ -322,8 +371,11 @@ fn commit_tx_index(
         ));
     }
 
-    let mut commit = ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block]);
-    commit = commit.with_transparent_address_tx_index(artifacts);
-    store.commit_chain_epoch(commit)?;
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+    ))?;
+    seed_transparent_address_transaction_history(derive_store, &artifacts)?;
     Ok(())
 }

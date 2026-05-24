@@ -14,11 +14,10 @@
 //! optional batched fee lookup.
 
 use prost::Message as _;
-use zebra_chain::serialization::ZcashSerialize as _;
+use zinder_core::BlockHeight;
 use zinder_core::wire::{
     encode_height_key_descending, encode_in_block_position, encode_internal_transaction_id,
 };
-use zinder_core::{BlockHeight, TransactionId};
 use zinder_proto::v1::explorer::{
     RecentTransactionEntry, TransactionComponentCounts as WireComponentCounts,
 };
@@ -76,29 +75,22 @@ impl BlockKeyedConsumer for RecentTransactionsConsumer {
         let cf = ctx
             .store
             .consumer_column_family(RECENT_TRANSACTIONS_COLUMN_FAMILY)?;
-        let block_time_unix_seconds = block.block.header.time.timestamp();
-        for (position, transaction) in block.block.transactions.iter().enumerate() {
-            let in_block_position = u32::try_from(position)
-                .map_err(|_| RecentTransactionsConsumerError::PositionOverflow)?;
-            let is_coinbase = position == 0;
-            let counts = zinder_source::transaction_component_counts(transaction);
+        let block_time_unix_seconds = block.block_time_unix_seconds;
+        for transaction in &block.transactions {
+            let in_block_position = transaction.location.tx_index_in_block;
+            let facts = &transaction.public_facts;
+            let is_coinbase = facts.is_coinbase;
+            let counts = facts.counts;
             let logical_actions = counts.logical_actions();
-            let privacy_shape = zinder_core::classify_privacy_shape(
-                counts,
-                is_coinbase,
-                zinder_core::TransactionVersion::V5,
-            );
-            let size_bytes = u32::try_from(transaction.zcash_serialized_size()).unwrap_or(u32::MAX);
+            let privacy_shape = facts.privacy_shape;
+            let size_bytes = facts.size_bytes;
             let zip317_conventional_fee_zat = if is_coinbase {
                 None
             } else {
                 Some(counts.zip317_conventional_fee_zat())
             };
             let entry = RecentTransactionEntry {
-                transaction_id: encode_internal_transaction_id(TransactionId::from_bytes(
-                    transaction.hash().0,
-                ))
-                .to_vec(),
+                transaction_id: encode_internal_transaction_id(facts.transaction_id).to_vec(),
                 block_height: block.height.value(),
                 block_hash: block.block_hash.clone(),
                 block_time_unix_seconds,
@@ -155,7 +147,4 @@ pub enum RecentTransactionsConsumerError {
     /// Storage encoding of the materialized entry failed.
     #[error("RecentTransactionEntry prost encode failed: {0}")]
     Encode(String),
-    /// Block carried more than `u32::MAX` transactions.
-    #[error("transaction position overflowed u32")]
-    PositionOverflow,
 }

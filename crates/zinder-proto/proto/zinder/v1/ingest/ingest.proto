@@ -124,8 +124,8 @@ service IngestControl {
   // Used by chained-mempool flows: outpoints that reference outputs of
   // unconfirmed mempool transactions resolve here without a canonical-chain
   // round trip.
-  rpc TransparentMempoolPrevouts(zinder.v1.wallet.TransparentMempoolPrevoutsRequest)
-      returns (zinder.v1.wallet.TransparentPrevoutsResponse);
+  rpc TransparentMempoolOutputsByOutpoint(zinder.v1.wallet.TransparentMempoolOutputsByOutpointRequest)
+      returns (zinder.v1.wallet.TransparentOutputsByOutpointResponse);
 
   // Returns chain-wide value pool totals at the upstream node's tip by
   // calling `getblockchaininfo.valuePools`. The wallet data plane proxies

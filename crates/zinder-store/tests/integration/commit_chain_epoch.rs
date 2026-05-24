@@ -8,9 +8,9 @@ use std::{sync::Arc, thread};
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionArtifact,
-    TransactionId, TreeStateArtifact, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEvent, ChainEventHistoryRequest, ChainStoreOptions,
@@ -40,7 +40,7 @@ fn commit_chain_epoch_writes_artifacts_and_visible_epoch_atomically() -> eyre::R
     let reader = store.current_chain_epoch_reader()?;
 
     assert_eq!(reader.chain_epoch(), chain_epoch);
-    assert_eq!(reader.block_at(BlockHeight::new(1))?, Some(block));
+    assert_eq!(reader.block_header_at(BlockHeight::new(1))?, Some(block));
     assert_eq!(
         reader.compact_block_at(BlockHeight::new(1))?,
         Some(compact_block)
@@ -287,16 +287,21 @@ fn commit_rejects_transaction_above_tip() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    let transaction = TransactionArtifact::new(
-        TransactionId::from_bytes([1; 32]),
-        BlockHeight::new(2),
-        block.block_hash,
-        b"tx".to_vec(),
-    );
+    let (transaction_index, transaction_location, transaction_facts, transaction_blob) =
+        super::synthetic_transaction_rows(
+            TransactionId::from_bytes([1; 32]),
+            BlockHeight::new(2),
+            block.block_hash,
+            0,
+            b"tx",
+        );
 
     let error = match store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transactions(vec![transaction]),
+            .with_block_transaction_index(vec![transaction_index])
+            .with_transaction_locations(vec![transaction_location])
+            .with_transaction_facts(vec![transaction_facts])
+            .with_transaction_blobs(vec![transaction_blob]),
     ) {
         Ok(outcome) => return Err(eyre!("expected invalid artifacts, got {outcome:?}")),
         Err(error) => error,
@@ -380,16 +385,20 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         tip_hash: bootstrap_hash,
         finalized_height: bootstrap_height,
         finalized_hash: bootstrap_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: bootstrap_tip_metadata,
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
 
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(bootstrap_chain_epoch, Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
-                height: bootstrap_height,
-            }),
+        ChainEpochArtifacts::new(
+            bootstrap_chain_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+            height: bootstrap_height,
+        }),
     )?;
     assert_eq!(committed.chain_epoch, bootstrap_chain_epoch);
     assert_eq!(
@@ -403,9 +412,9 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
     // chain has no artifacts beyond the checkpoint; heights below surface a
     // typed `ArtifactMissing` error which the wallet layer already maps to
     // `QueryError::ArtifactUnavailable`.
-    assert_eq!(reader.block_at(BlockHeight::new(2_000))?, None);
+    assert_eq!(reader.block_header_at(BlockHeight::new(2_000))?, None);
     assert!(matches!(
-        reader.block_at(BlockHeight::new(1)),
+        reader.block_header_at(BlockHeight::new(1)),
         Err(StoreError::ArtifactMissing { .. })
     ));
     assert!(matches!(
@@ -434,15 +443,19 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: checkpoint_hash,
         finalized_height: checkpoint_height,
         finalized_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(bootstrap_chain_epoch, Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
-                height: checkpoint_height,
-            }),
+        ChainEpochArtifacts::new(
+            bootstrap_chain_epoch,
+            Vec::<zinder_core::BlockHeaderArtifact>::new(),
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+            height: checkpoint_height,
+        }),
     )?;
 
     // Attempt a reorg whose `from_height` rewinds onto the checkpoint height
@@ -459,15 +472,15 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: replaced_tip_hash,
         finalized_height: checkpoint_height,
         finalized_hash: replaced_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(4),
+        artifact_schema_version: ArtifactSchemaVersion::new(9),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_001),
     };
-    let replaced_block = BlockArtifact::new(
+    let replaced_block = super::synthetic_block_header(
         checkpoint_height,
         replaced_tip_hash,
         block_hash(checkpoint_height.value().saturating_sub(1)),
-        b"raw-replaced-block".to_vec(),
+        b"raw-replaced-block",
     );
     let replaced_compact_block = CompactBlockArtifact::new(
         checkpoint_height,
@@ -512,7 +525,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-) -> (ChainEpoch, BlockArtifact, CompactBlockArtifact) {
+) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
@@ -525,15 +538,15 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            artifact_schema_version: ArtifactSchemaVersion::new(9),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
-        BlockArtifact::new(
+        super::synthetic_block_header(
             block_height,
             source_hash,
             parent_hash,
-            format!("raw-block-{height}").into_bytes(),
+            format!("raw-block-{height}").as_bytes(),
         ),
         CompactBlockArtifact::new(
             block_height,

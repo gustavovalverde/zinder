@@ -7,23 +7,26 @@ use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
     ChainValuePoolsAtTip, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
     NetworkUpgradeActivations, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBroadcastResult, TransactionId, TreeStateArtifact, TxStatus,
 };
+use zinder_derive::{
+    DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+    TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
+};
 use zinder_proto::v1::wallet::WalletServerInfo;
-use zinder_source::block_header_info_from_raw_block_bytes;
 use zinder_store::{
-    BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions, SecondaryChainStore, StoreError,
-    TransparentAddressTxIndexPageRequest, TransparentAddressUtxosPageRequest,
+    AddressOutputIndexPageRequest, BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions,
+    SecondaryChainStore, StoreError,
 };
 
 use crate::{
-    BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream, IndexerError,
-    RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem, TransparentAddressUtxoStream,
-    TransparentAddressUtxoStreamItem, TransparentAddressUtxosQuery, TransparentAddressUtxosView,
+    AddressOutputIndexQuery, AddressOutputIndexStream, AddressOutputIndexStreamItem,
+    AddressOutputIndexView, BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream,
+    IndexerError, RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
 };
 
 /// Options for opening a local chain index over a `RocksDB` secondary.
@@ -54,6 +57,7 @@ pub struct LocalOpenOptions {
 /// Local chain index backed by a `RocksDB` secondary reader.
 pub struct LocalChainIndex {
     store: SecondaryChainStore,
+    derive_store: Option<DeriveStore>,
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
@@ -92,6 +96,31 @@ impl LocalChainIndex {
                 .map_err(IndexerError::from_store_error)
         }))
         .await?;
+        let derive_storage_path = DeriveStore::path_for_canonical(&options.storage_path);
+        let derive_secondary_path = options.secondary_path.join("derive");
+        let derive_storage_tuning = options.storage_tuning;
+        let derive_store =
+            join_blocking(tokio::task::spawn_blocking(
+                move || match DeriveStore::open_secondary(
+                    derive_storage_path,
+                    derive_secondary_path,
+                    DeriveStoreOptions {
+                        sync_writes: false,
+                        consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+                        tuning: derive_storage_tuning,
+                    },
+                ) {
+                    Ok(derive_store) => {
+                        derive_store
+                            .try_catch_up()
+                            .map_err(IndexerError::from_derive_store_error)?;
+                        Ok(Some(derive_store))
+                    }
+                    Err(zinder_derive::DeriveStoreError::Open { .. }) => Ok(None),
+                    Err(error) => Err(IndexerError::from_derive_store_error(error)),
+                },
+            ))
+            .await?;
 
         let remote_index = match options.subscription_endpoint {
             Some(endpoint) => Some(RemoteChainIndex::connect(RemoteOpenOptions {
@@ -109,6 +138,7 @@ impl LocalChainIndex {
 
         Ok(Self {
             store,
+            derive_store,
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
@@ -165,6 +195,10 @@ impl Drop for LocalChainIndex {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "The local implementation mirrors the public ChainIndex trait one method at a time."
+)]
 #[async_trait]
 impl ChainIndex for LocalChainIndex {
     async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
@@ -204,14 +238,10 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch, move |reader| {
             let block_id = resolve_block_id(reader, selector)?;
             let block = reader
-                .block_at(block_id.height)
+                .block_header_at(block_id.height)
                 .map_err(IndexerError::from_store_error)?
                 .ok_or(IndexerError::NotFound { resource: "block" })?;
-            block_header_info_from_raw_block_bytes(block_id.height, &block.payload_bytes).map_err(
-                |error| IndexerError::DataLoss {
-                    reason: error.to_string(),
-                },
-            )
+            Ok(block.into_header_info())
         })
         .await
     }
@@ -228,20 +258,6 @@ impl ChainIndex for LocalChainIndex {
                 .ok_or(IndexerError::NotFound {
                     resource: "compact block",
                 })
-        })
-        .await
-    }
-
-    async fn full_block_at(
-        &self,
-        height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<BlockArtifact, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| {
-            reader
-                .block_at(height)
-                .map_err(IndexerError::from_store_error)?
-                .ok_or(IndexerError::NotFound { resource: "block" })
         })
         .await
     }
@@ -282,14 +298,14 @@ impl ChainIndex for LocalChainIndex {
         Ok(Box::pin(stream::iter(compact_blocks.into_iter().map(Ok))))
     }
 
-    async fn tree_state_at(
+    async fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         self.read_at_epoch(at_epoch, move |reader| {
             reader
-                .tree_state_at(height)
+                .tree_state_checkpoint_at_or_before(height)
                 .map_err(IndexerError::from_store_error)?
                 .ok_or(IndexerError::NotFound {
                     resource: "tree state",
@@ -298,13 +314,13 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
-    async fn latest_tree_state(
+    async fn latest_tree_state_checkpoint(
         &self,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         self.read_at_epoch(at_epoch, |reader| {
             reader
-                .latest_tree_state()
+                .latest_tree_state_checkpoint()
                 .map_err(IndexerError::from_store_error)?
                 .ok_or(IndexerError::NotFound {
                     resource: "tree state",
@@ -348,32 +364,29 @@ impl ChainIndex for LocalChainIndex {
         let mined_outcome = self
             .read_at_epoch(at_epoch, move |reader| {
                 let Some(artifact) = reader
-                    .transaction_by_id(transaction_id)
+                    .transaction_facts_by_id(transaction_id)
                     .map_err(IndexerError::from_store_error)?
                 else {
                     return Ok(TxStatus::NotFound);
                 };
                 let chain_epoch = reader.chain_epoch();
                 let block_time = reader
-                    .block_at(artifact.block_height)
+                    .block_header_at(artifact.location.block_height)
                     .map_err(IndexerError::from_store_error)?
-                    .and_then(|block| {
-                        block_header_info_from_raw_block_bytes(
-                            artifact.block_height,
-                            &block.payload_bytes,
-                        )
-                        .ok()
-                        .map(|header| header.block_time)
-                    })
+                    .map(|block| block.block_time)
                     .unwrap_or_default();
-                let consensus_branch_id = activations.consensus_branch_id_at(artifact.block_height);
+                let consensus_branch_id =
+                    activations.consensus_branch_id_at(artifact.location.block_height);
                 let details = MinedDetails::from_response_epoch(
                     &chain_epoch,
-                    artifact.block_height,
+                    artifact.location.block_height,
                     consensus_branch_id,
                     block_time,
                 );
-                Ok(TxStatus::Mined(MinedTransaction::new(artifact, details)))
+                Ok(TxStatus::Mined(MinedTransaction::new(
+                    artifact.location,
+                    details,
+                )))
             })
             .await?;
 
@@ -439,14 +452,14 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn transparent_address_utxos(
+    async fn address_output_index(
         &self,
-        query: TransparentAddressUtxosQuery,
+        query: AddressOutputIndexQuery,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxosView, IndexerError> {
+    ) -> Result<AddressOutputIndexView, IndexerError> {
         let max_entries = query
             .max_entries
-            .unwrap_or(DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS);
+            .unwrap_or(DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS);
         let store = self.store.clone();
         join_blocking(tokio::task::spawn_blocking(move || {
             store
@@ -456,19 +469,19 @@ impl ChainIndex for LocalChainIndex {
                 zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
             });
             let page = store
-                .transparent_address_utxos_page(TransparentAddressUtxosPageRequest {
+                .address_output_index_page(AddressOutputIndexPageRequest {
                     at_epoch,
                     address_script_hash: query.address_script_hash,
                     start_height: query.start_height,
                     max_entries,
                     from_cursor: cursor_token.as_ref(),
                 })
-                .map_err(map_transparent_utxo_store_error)?;
-            Ok(TransparentAddressUtxosView {
+                .map_err(map_address_output_store_error)?;
+            Ok(AddressOutputIndexView {
                 chain_epoch: page.chain_epoch,
-                utxos: page.utxos,
+                outputs: page.outputs,
                 next_cursor: page.next_cursor.map(|cursor| {
-                    crate::TransparentUtxoCursor::from_bytes(cursor.as_bytes().to_vec())
+                    crate::AddressOutputCursor::from_bytes(cursor.as_bytes().to_vec())
                 }),
             })
         }))
@@ -478,39 +491,65 @@ impl ChainIndex for LocalChainIndex {
     async fn transparent_address_tx_ids_in_range(
         &self,
         query: TransparentAddressTxIdsQuery,
-        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
         let max_entries = query
             .max_entries
             .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
+        let Some(derive_store) = self.derive_store.clone() else {
+            return Err(IndexerError::FailedPrecondition {
+                reason: "transparent-address transaction history derive projection is unavailable"
+                    .to_owned(),
+            });
+        };
         let store = self.store.clone();
         let page = join_blocking(tokio::task::spawn_blocking(move || {
             store
                 .try_catch_up()
                 .map_err(IndexerError::from_store_error)?;
+            let chain_epoch = store
+                .current_chain_epoch_reader()
+                .map_err(IndexerError::from_store_error)?
+                .chain_epoch();
+            derive_store
+                .try_catch_up()
+                .map_err(IndexerError::from_derive_store_error)?;
+            let derive_height = derive_store
+                .last_materialized_height_ascending(
+                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+                )
+                .map_err(IndexerError::from_derive_store_error)?;
+            if derive_height.is_none_or(|height| height < chain_epoch.tip_height) {
+                return Err(IndexerError::FailedPrecondition {
+                    reason: format!(
+                        "transparent-address transaction history is behind canonical height {}: derive height {:?}",
+                        chain_epoch.tip_height.value(),
+                        derive_height.map(BlockHeight::value)
+                    ),
+                });
+            }
             let cursor_token = query.from_cursor.map(|cursor| {
                 zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
             });
-            store
-                .transparent_address_tx_index_page(TransparentAddressTxIndexPageRequest {
-                    at_epoch,
+            let page = TransparentAddressTransactionHistoryConsumer::read_page(
+                &derive_store,
+                TransparentAddressTransactionHistoryPageRequest {
                     address_script_hash: query.address_script_hash,
                     start_height: query.start_height,
                     end_height: query.end_height,
                     max_entries,
                     descending: query.descending,
                     from_cursor: cursor_token.as_ref(),
-                })
-                .map_err(map_transparent_utxo_store_error)
+                },
+            )
+            .map_err(IndexerError::from_derive_store_error)?;
+            Ok((chain_epoch, page.artifacts, page.next_cursor))
         }))
         .await?;
-        let chain_epoch = page.chain_epoch;
-        let next_cursor = page
-            .next_cursor
+        let (chain_epoch, artifacts, next_cursor) = page;
+        let next_cursor = next_cursor
             .map(|cursor| crate::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec()));
-        let last_index = page.artifacts.len().saturating_sub(1);
-        let items = page
-            .artifacts
+        let last_index = artifacts.len().saturating_sub(1);
+        let items = artifacts
             .into_iter()
             .enumerate()
             .map(move |(index, artifact)| {
@@ -527,23 +566,23 @@ impl ChainIndex for LocalChainIndex {
         Ok(Box::pin(stream::iter(items)))
     }
 
-    async fn transparent_address_utxos_stream(
+    async fn address_output_index_stream(
         &self,
-        query: TransparentAddressUtxosQuery,
+        query: AddressOutputIndexQuery,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<TransparentAddressUtxoStream, IndexerError> {
-        let view = self.transparent_address_utxos(query, at_epoch).await?;
+    ) -> Result<AddressOutputIndexStream, IndexerError> {
+        let view = self.address_output_index(query, at_epoch).await?;
         let chain_epoch = view.chain_epoch;
         let next_cursor = view.next_cursor;
-        let last_index = view.utxos.len().saturating_sub(1);
+        let last_index = view.outputs.len().saturating_sub(1);
         let items = view
-            .utxos
+            .outputs
             .into_iter()
             .enumerate()
-            .map(move |(index, utxo)| {
-                Ok(TransparentAddressUtxoStreamItem {
+            .map(move |(index, output)| {
+                Ok(AddressOutputIndexStreamItem {
                     chain_epoch,
-                    utxo,
+                    output,
                     cursor: if index == last_index {
                         next_cursor.clone()
                     } else {
@@ -582,35 +621,38 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn transparent_mempool_prevouts(
+    async fn transparent_mempool_outputs_by_outpoint(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],
-    ) -> Result<zinder_core::TransparentPrevoutsResponse, IndexerError> {
-        self.remote("transparent_mempool_prevouts")?
-            .transparent_mempool_prevouts(outpoints)
+    ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, IndexerError> {
+        self.remote("transparent_mempool_outputs_by_outpoint")?
+            .transparent_mempool_outputs_by_outpoint(outpoints)
             .await
     }
 
-    async fn transparent_prevouts(
+    async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<zinder_core::TransparentPrevoutsResponse, IndexerError> {
-        let outpoints = normalize_transparent_prevout_outpoints(outpoints)?;
+    ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, IndexerError> {
+        let outpoints = normalize_transparent_output_outpoints(outpoints)?;
         self.read_at_epoch(at_epoch, move |reader| {
             let chain_epoch = reader.chain_epoch();
             let prevouts_by_outpoint = reader
-                .transparent_prevouts_by_outpoints(&outpoints)
+                .transparent_outputs_by_outpoints(&outpoints)
                 .map_err(IndexerError::from_store_error)?;
             let mut entries = Vec::with_capacity(outpoints.len());
             for outpoint in outpoints {
                 let prevout = prevouts_by_outpoint
                     .get(&outpoint)
                     .cloned()
-                    .map(zinder_core::TransparentPrevoutArtifact::into_prevout);
-                entries.push(zinder_core::TransparentPrevoutEntry { outpoint, prevout });
+                    .map(zinder_core::TransparentOutputArtifact::into_output);
+                entries.push(zinder_core::TransparentOutputEntry {
+                    outpoint,
+                    output: prevout,
+                });
             }
-            Ok(zinder_core::TransparentPrevoutsResponse {
+            Ok(zinder_core::TransparentOutputsByOutpointResponse {
                 chain_epoch,
                 entries,
             })
@@ -623,7 +665,7 @@ impl ChainIndex for LocalChainIndex {
     }
 }
 
-fn normalize_transparent_prevout_outpoints(
+fn normalize_transparent_output_outpoints(
     outpoints: &[zinder_core::TransparentOutPoint],
 ) -> Result<Vec<zinder_core::TransparentOutPoint>, IndexerError> {
     for (request_index, outpoint) in outpoints.iter().enumerate() {
@@ -638,7 +680,7 @@ fn normalize_transparent_prevout_outpoints(
 
     Ok(outpoints
         .iter()
-        .take(zinder_core::MAX_TRANSPARENT_PREVOUTS_PER_REQUEST)
+        .take(zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST)
         .copied()
         .collect())
 }
@@ -660,18 +702,16 @@ fn spawn_catchup_loop(store: SecondaryChainStore, interval: Duration, cancel: Ca
     });
 }
 
-const DEFAULT_MAX_TRANSPARENT_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+const DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "Only the typed transparent-UTXO cursor error becomes a client invalid-request error; every other storage failure preserves its shared mapping."
+    reason = "Only the typed transparent-output cursor error becomes a client invalid-request error; every other storage failure preserves its shared mapping."
 )]
-fn map_transparent_utxo_store_error(error: StoreError) -> IndexerError {
+fn map_address_output_store_error(error: StoreError) -> IndexerError {
     match error {
-        StoreError::TransparentUtxoCursorInvalid { reason } => {
-            IndexerError::invalid_request(reason)
-        }
+        StoreError::AddressOutputCursorInvalid { reason } => IndexerError::invalid_request(reason),
         _ => IndexerError::from_store_error(error),
     }
 }
@@ -715,7 +755,7 @@ fn resolve_block_id(
                 return Err(IndexerError::NotFound { resource: "block" });
             }
             let block = reader
-                .block_at(height)
+                .block_header_at(height)
                 .map_err(IndexerError::from_store_error)?
                 .ok_or(IndexerError::NotFound { resource: "block" })?;
             Ok(BlockId::new(height, block.block_hash))

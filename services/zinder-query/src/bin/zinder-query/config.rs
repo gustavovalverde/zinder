@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
+use zinder_derive::DeriveStoreError;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlReaderToml,
     IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
@@ -98,6 +99,9 @@ pub(crate) enum QueryConfigError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    #[error(transparent)]
+    DeriveStore(#[from] DeriveStoreError),
 
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),

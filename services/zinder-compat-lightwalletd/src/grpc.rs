@@ -13,9 +13,8 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
     CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionArtifact,
-    TransactionBroadcastResult, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TxStatus,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
+    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
         encode_display_block_hash_hex, encode_display_transaction_id_hex,
@@ -27,8 +26,8 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUtxos,
-    TransparentAddressUtxosRequest, TreeState, WalletQueryApi, status_from_query_error,
+    AddressOutputIndex, AddressOutputIndexRequest, SubtreeRoots,
+    TransparentAddressTxIdsInRangeRequest, TreeState, WalletQueryApi, status_from_query_error,
     transparent_address_confirmed_balance_response,
 };
 use zinder_source::transparent_address_matches_network;
@@ -217,7 +216,7 @@ where
         let mut replies = Vec::new();
 
         for address in request.addresses {
-            let query_request = transparent_address_utxos_request(
+            let query_request = address_output_index_request(
                 &address,
                 latest_block.chain_epoch.network,
                 BlockHeight::new(start_height),
@@ -225,7 +224,7 @@ where
             )?;
             let address_utxos = self
                 .query_api
-                .transparent_address_utxos(query_request, Some(latest_block.chain_epoch))
+                .address_output_index(query_request, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
@@ -388,13 +387,14 @@ where
     ) -> Result<Response<lightwalletd::RawTransaction>, Status> {
         let filter = request.into_inner();
 
-        let mined_artifact = if let Some(block_id) = filter.block.as_ref() {
+        let (chain_epoch, location) = if let Some(block_id) = filter.block.as_ref() {
             let height = self.resolve_block_height(block_id).await?;
-            self.query_api
+            let response = self
+                .query_api
                 .transaction_at_block_index(height, filter.index, None)
                 .await
-                .map_err(|error| status_from_query_error(&error))?
-                .transaction
+                .map_err(|error| status_from_query_error(&error))?;
+            (response.chain_epoch, response.transaction)
         } else {
             let transaction_id = decode_internal_transaction_id(&filter.hash)
                 .map_err(|error| wire_decode_error_to_status(&error))?;
@@ -403,13 +403,15 @@ where
                 .transaction(transaction_id, None)
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            mined_artifact_from_status(response.status)?
+            (
+                response.chain_epoch,
+                mined_location_from_status(response.status)?,
+            )
         };
 
-        Ok(Response::new(lightwalletd::RawTransaction {
-            data: mined_artifact.payload_bytes,
-            height: u64::from(mined_artifact.block_height.value()),
-        }))
+        Ok(Response::new(
+            raw_transaction_from_location(&self.query_api, chain_epoch, location).await?,
+        ))
     }
 
     async fn send_transaction(
@@ -441,12 +443,7 @@ where
             .map_err(|error| status_from_query_error(&error))?;
         let typed_request =
             transparent_address_tx_history_request(&filter, latest_block.chain_epoch.network)?;
-        let history = transparent_address_tx_history(
-            &self.query_api,
-            typed_request,
-            latest_block.chain_epoch,
-        )
-        .await?;
+        let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
         let raw_transactions = history.into_iter().map(|artifact| {
             Ok(lightwalletd::RawTransaction {
                 data: encode_internal_transaction_id(artifact.transaction_id).to_vec(),
@@ -470,12 +467,7 @@ where
             .map_err(|error| status_from_query_error(&error))?;
         let typed_request =
             transparent_address_tx_history_request(&filter, latest_block.chain_epoch.network)?;
-        let history = transparent_address_tx_history(
-            &self.query_api,
-            typed_request,
-            latest_block.chain_epoch,
-        )
-        .await?;
+        let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
         for artifact in history {
             let response = self
@@ -483,11 +475,11 @@ where
                 .transaction(artifact.transaction_id, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            let mined = mined_artifact_from_status(response.status)?;
-            raw_transactions.push(Ok(lightwalletd::RawTransaction {
-                data: mined.payload_bytes,
-                height: u64::from(mined.block_height.value()),
-            }));
+            let location = mined_location_from_status(response.status)?;
+            raw_transactions.push(
+                raw_transaction_from_location(&self.query_api, response.chain_epoch, location)
+                    .await,
+            );
         }
         Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
     }
@@ -610,9 +602,14 @@ where
         let height = self.resolve_block_height(&block_id).await?;
         let tree_state = self
             .query_api
-            .tree_state_at(height, None)
+            .tree_state_checkpoint_at_or_before(height, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
+        if tree_state.height != height {
+            return Err(Status::not_found(
+                "tree state is only available at canonical checkpoints",
+            ));
+        }
 
         Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
     }
@@ -623,7 +620,7 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let tree_state = self
             .query_api
-            .latest_tree_state(None)
+            .latest_tree_state_checkpoint(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -711,7 +708,6 @@ where
 async fn transparent_address_tx_history<QueryApi>(
     query_api: &QueryApi,
     mut request: TransparentAddressTxIdsInRangeRequest,
-    chain_epoch: ChainEpoch,
 ) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
 where
     QueryApi: WalletQueryApi + ?Sized,
@@ -719,7 +715,7 @@ where
     let mut artifacts = Vec::new();
     loop {
         let response = query_api
-            .transparent_address_tx_ids_in_range(request.clone(), Some(chain_epoch))
+            .transparent_address_tx_ids_in_range(request.clone())
             .await
             .map_err(|error| status_from_query_error(&error))?;
         artifacts.extend(response.artifacts);
@@ -885,9 +881,9 @@ fn block_range_from_request(
     clippy::wildcard_enum_match_arm,
     reason = "TxStatus is #[non_exhaustive]; non-mined statuses map to gRPC NOT_FOUND on the lightwalletd wire because lightwalletd's RawTransaction shape is mined-only."
 )]
-fn mined_artifact_from_status(status: TxStatus) -> Result<TransactionArtifact, Status> {
+fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, Status> {
     match status {
-        TxStatus::Mined(mined) => Ok(mined.artifact),
+        TxStatus::Mined(mined) => Ok(mined.location),
         TxStatus::NotFound | TxStatus::InMempool(_) | TxStatus::ConflictingChain => Err(
             Status::not_found("transaction is not mined in the canonical chain"),
         ),
@@ -895,6 +891,26 @@ fn mined_artifact_from_status(status: TxStatus) -> Result<TransactionArtifact, S
             "transaction status is not representable on the lightwalletd wire",
         )),
     }
+}
+
+async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    chain_epoch: ChainEpoch,
+    location: TransactionLocation,
+) -> Result<lightwalletd::RawTransaction, Status> {
+    let raw_transaction = query_api
+        .raw_transaction(location.transaction_id, Some(chain_epoch))
+        .await
+        .map_err(|error| status_from_query_error(&error))?;
+    if raw_transaction.transaction.location != location {
+        return Err(Status::data_loss(
+            "stored raw transaction location does not match the indexed transaction location",
+        ));
+    }
+    Ok(lightwalletd::RawTransaction {
+        data: raw_transaction.transaction.raw_transaction_bytes,
+        height: u64::from(location.block_height.value()),
+    })
 }
 
 fn block_height_from_id(block_id: &lightwalletd::BlockId) -> Result<BlockHeight, Status> {
@@ -980,12 +996,12 @@ fn transparent_address_tx_history_request(
     })
 }
 
-fn transparent_address_utxos_request(
+fn address_output_index_request(
     address: &str,
     network: Network,
     start_height: BlockHeight,
     max_entries: NonZeroU32,
-) -> Result<TransparentAddressUtxosRequest, Status> {
+) -> Result<AddressOutputIndexRequest, Status> {
     let transparent_address = address
         .parse::<ZebraTransparentAddress>()
         .map_err(|source| {
@@ -1004,7 +1020,7 @@ fn transparent_address_utxos_request(
         ));
     }
 
-    Ok(TransparentAddressUtxosRequest {
+    Ok(AddressOutputIndexRequest {
         address_script_hash: TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
         start_height,
         max_entries,
@@ -1014,10 +1030,10 @@ fn transparent_address_utxos_request(
 
 fn lightwalletd_address_utxos(
     address: &str,
-    address_utxos: &TransparentAddressUtxos,
+    address_utxos: &AddressOutputIndex,
 ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
     address_utxos
-        .utxos
+        .outputs
         .iter()
         .map(|utxo| {
             Ok(lightwalletd::GetAddressUtxosReply {

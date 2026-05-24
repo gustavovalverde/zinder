@@ -305,6 +305,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md).",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
+        toml_path: "storage.raw_blob_policy",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to \
+                      `none` so fact-first indexing does not write raw block or transaction blobs \
+                      unless a deployment explicitly needs raw export.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",
         toml_path: "ingest.reorg_window_blocks",
         used_by: &["zinder-ingest"],
@@ -325,38 +335,94 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_BATCH_BLOCKS",
-        toml_path: "ingest.bulk_catchup.commit_batch_blocks",
+        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_BLOCKS",
+        toml_path: "ingest.bulk_catchup.canonical_batch_max_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block count per bulk-catchup commit batch. Defaults to 1000.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__MAX_TRANSPARENT_PREVOUT_STORE_LOOKUPS_PER_BATCH",
-        toml_path: "ingest.bulk_catchup.max_transparent_prevout_store_lookups_per_batch",
+        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ARTIFACT_BYTES",
+        toml_path: "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum unique transparent prevouts read from the store per \
-                      bulk-catchup commit batch. Defaults to 250000.",
+        description: "Canonical artifact bytes accumulated before closing a bulk-catchup batch. \
+                      Defaults to 536870912.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__FETCH_CONCURRENCY",
-        toml_path: "ingest.bulk_catchup.fetch_concurrency",
+        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS",
+        toml_path: "ingest.bulk_catchup.source_segment_max_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Width of the pipelined fetch buffer during bulk-catchup. Defaults to 32.",
+        description: "Maximum connected blocks requested from the source in one bulk-catchup \
+                      segment. Defaults to 128.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__CONCURRENCY",
-        toml_path: "ingest.derive.concurrency",
+        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
+        toml_path: "ingest.bulk_catchup.source_segment_target_response_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Parallel CPU-bound derive and replay block hydration tasks on the blocking \
-                      pool. Defaults to `clamp(available_parallelism() - 1, 4, 32)`.",
+        description: "Target source response bytes for adaptive segment sizing. Defaults to \
+                      50331648.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
+        toml_path: "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum concurrent source segment requests. Defaults to 8.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES",
+        toml_path: "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum reserved source response bytes across in-flight fetches. Defaults \
+                      to 268435456.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY",
+        toml_path: "ingest.bulk_catchup.fact_build_concurrency",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Parallel canonical fact-build slots. Defaults to \
+                      `min(available_parallelism(), 16)`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__REPLAY_CONCURRENCY",
+        toml_path: "ingest.derive.replay_concurrency",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Parallel block hydration slots used by derive replay. Defaults to \
+                      `min(available_parallelism(), 16)`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS",
+        toml_path: "ingest.derive.replay_batch_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum block contexts hydrated and dispatched in one derive replay write. \
+                      Must be greater than zero. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__REPLAY_POLICY",
+        toml_path: "ingest.derive.replay_policy",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive replay pressure policy. `canonical-first` pauses rebuildable derive \
+                      replay under memory pressure so canonical ingest keeps the process budget. \
+                      `continuous` replays retained chain events whenever they are available. \
+                      Defaults to `canonical-first`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",

@@ -14,7 +14,9 @@ use zinder_runtime::Readiness;
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live};
 
-use crate::common::{live_tip_follow_config, zebra_source_from_tip_follow};
+use crate::common::{
+    fetch_live_network_upgrade_activations, live_tip_follow_config, zebra_source_from_tip_follow,
+};
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
@@ -26,8 +28,13 @@ async fn tip_follow_advances_to_node_tip() -> Result<()> {
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
-    let tip_follow_config =
-        live_tip_follow_config(&env, &storage_path, 100, Duration::from_millis(100));
+    let tip_follow_config = live_tip_follow_config(
+        &env,
+        &storage_path,
+        100,
+        Duration::from_millis(100),
+        fetch_live_network_upgrade_activations(&env).await?,
+    );
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();

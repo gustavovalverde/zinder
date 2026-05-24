@@ -188,7 +188,7 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
 }
 
 #[test]
-fn tree_state_response_round_trips_through_prost() -> eyre::Result<()> {
+fn tree_state_checkpoint_response_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::TreeStateResponse {
         chain_epoch: Some(synthetic_chain_epoch()),
         height: 42,

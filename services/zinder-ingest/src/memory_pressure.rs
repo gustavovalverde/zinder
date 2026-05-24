@@ -1,0 +1,231 @@
+//! Runtime memory pressure sampling for ingest scheduling.
+//!
+//! Canonical ingest and derive replay share one process in the standard
+//! deployment. The scheduler needs cheap, lossy memory signals so rebuildable
+//! derive projections can back off before they compete with canonical writes.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
+const PROC_SELF_STATUS: &str = "/proc/self/status";
+
+/// Default cadence for runtime memory gauges exported by the ingest process.
+pub const DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Point-in-time process and cgroup memory sample.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the byte suffix keeps memory metric units explicit at every call site"
+)]
+pub(crate) struct RuntimeMemorySnapshot {
+    pub(crate) cgroup_current_bytes: Option<u64>,
+    pub(crate) cgroup_max_bytes: Option<u64>,
+    pub(crate) cgroup_high_bytes: Option<u64>,
+    pub(crate) cgroup_swap_current_bytes: Option<u64>,
+    pub(crate) process_rss_bytes: Option<u64>,
+    pub(crate) process_rss_anon_bytes: Option<u64>,
+}
+
+impl RuntimeMemorySnapshot {
+    pub(crate) fn sample() -> Self {
+        Self::sample_from_paths(
+            Path::new(CGROUP_ROOT),
+            Path::new(PROC_SELF_CGROUP),
+            Path::new(PROC_SELF_STATUS),
+        )
+    }
+
+    fn sample_from_paths(cgroup_root: &Path, proc_cgroup: &Path, proc_status: &Path) -> Self {
+        let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
+        let (process_rss_bytes, process_rss_anon_bytes) = process_rss_bytes(proc_status);
+        Self {
+            cgroup_current_bytes: read_cgroup_u64(&cgroup_dir, "memory.current"),
+            cgroup_max_bytes: read_cgroup_u64(&cgroup_dir, "memory.max"),
+            cgroup_high_bytes: read_cgroup_u64(&cgroup_dir, "memory.high"),
+            cgroup_swap_current_bytes: read_cgroup_u64(&cgroup_dir, "memory.swap.current"),
+            process_rss_bytes,
+            process_rss_anon_bytes,
+        }
+    }
+
+    pub(crate) fn pressure_ratio(self) -> Option<f64> {
+        let current = self.cgroup_current_bytes?;
+        let limit = self.cgroup_high_bytes.or(self.cgroup_max_bytes)?;
+        if limit == 0 {
+            return None;
+        }
+        Some(u64_to_f64(current) / u64_to_f64(limit))
+    }
+}
+
+/// Spawns the runtime memory gauge sampler for the ingest process.
+///
+/// Memory metrics are operational state, not derive replay state. Sampling them
+/// in an independent task keeps `/metrics` fresh even while canonical catchup or
+/// derive replay spends a long time inside a single work pass.
+#[must_use = "drop the handle to detach the runtime memory sampler or await it for symmetric shutdown"]
+pub fn spawn_runtime_memory_metrics_task(
+    interval: Duration,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            record_runtime_memory_metrics(RuntimeMemorySnapshot::sample());
+
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+        }
+    })
+}
+
+pub(crate) fn record_runtime_memory_metrics(snapshot: RuntimeMemorySnapshot) {
+    if let Some(bytes) = snapshot.cgroup_current_bytes {
+        metrics::gauge!("zinder_ingest_memory_current_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_max_bytes {
+        metrics::gauge!("zinder_ingest_memory_max_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_high_bytes {
+        metrics::gauge!("zinder_ingest_memory_high_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_swap_current_bytes {
+        metrics::gauge!("zinder_ingest_memory_swap_current_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.process_rss_bytes {
+        metrics::gauge!("zinder_ingest_process_rss_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.process_rss_anon_bytes {
+        metrics::gauge!("zinder_ingest_process_rss_anon_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(ratio) = snapshot.pressure_ratio() {
+        metrics::gauge!("zinder_ingest_memory_pressure_ratio").set(ratio);
+    }
+}
+
+fn cgroup_v2_dir(cgroup_root: &Path, proc_cgroup: &Path) -> PathBuf {
+    let Ok(cgroup_text) = fs::read_to_string(proc_cgroup) else {
+        return cgroup_root.to_path_buf();
+    };
+    for line in cgroup_text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let Some(hierarchy_id) = parts.next() else {
+            continue;
+        };
+        let Some(controllers) = parts.next() else {
+            continue;
+        };
+        let Some(relative_path) = parts.next() else {
+            continue;
+        };
+        if hierarchy_id == "0" && controllers.is_empty() {
+            return cgroup_root.join(relative_path.trim_start_matches('/'));
+        }
+    }
+    cgroup_root.to_path_buf()
+}
+
+fn read_cgroup_u64(cgroup_dir: &Path, file_name: &str) -> Option<u64> {
+    let file_text = fs::read_to_string(cgroup_dir.join(file_name)).ok()?;
+    let trimmed = file_text.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn process_rss_bytes(proc_status: &Path) -> (Option<u64>, Option<u64>) {
+    let Ok(status_text) = fs::read_to_string(proc_status) else {
+        return (None, None);
+    };
+    let mut rss = None;
+    let mut rss_anon = None;
+    for line in status_text.lines() {
+        if rss.is_none() {
+            rss = parse_status_kib_line(line, "VmRSS:");
+        }
+        if rss_anon.is_none() {
+            rss_anon = parse_status_kib_line(line, "RssAnon:");
+        }
+    }
+    (rss, rss_anon)
+}
+
+fn parse_status_kib_line(line: &str, key: &str) -> Option<u64> {
+    let kib_text = line.strip_prefix(key)?.split_whitespace().next()?;
+    kib_text.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 samples; runtime memory values are diagnostic magnitudes"
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, fs};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn samples_nested_cgroup_v2_memory_files() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("sys-fs-cgroup");
+        let service_dir = cgroup_root.join("docker/abc");
+        fs::create_dir_all(&service_dir)?;
+        fs::write(tempdir.path().join("cgroup"), "0::/docker/abc\n")?;
+        fs::write(service_dir.join("memory.current"), "900\n")?;
+        fs::write(service_dir.join("memory.max"), "1000\n")?;
+        fs::write(service_dir.join("memory.high"), "max\n")?;
+        fs::write(service_dir.join("memory.swap.current"), "10\n")?;
+        fs::write(
+            tempdir.path().join("status"),
+            "Name:\tzinder\nVmRSS:\t42 kB\nRssAnon:\t40 kB\n",
+        )?;
+
+        let snapshot = RuntimeMemorySnapshot::sample_from_paths(
+            &cgroup_root,
+            &tempdir.path().join("cgroup"),
+            &tempdir.path().join("status"),
+        );
+
+        assert_eq!(snapshot.cgroup_current_bytes, Some(900));
+        assert_eq!(snapshot.cgroup_max_bytes, Some(1000));
+        assert_eq!(snapshot.cgroup_high_bytes, None);
+        assert_eq!(snapshot.cgroup_swap_current_bytes, Some(10));
+        assert_eq!(snapshot.process_rss_bytes, Some(42 * 1024));
+        assert_eq!(snapshot.process_rss_anon_bytes, Some(40 * 1024));
+        assert_eq!(snapshot.pressure_ratio(), Some(0.9));
+
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_ratio_prefers_cgroup_high_when_set() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(900),
+            cgroup_max_bytes: Some(2000),
+            cgroup_high_bytes: Some(1000),
+            cgroup_swap_current_bytes: None,
+            process_rss_bytes: None,
+            process_rss_anon_bytes: None,
+        };
+
+        assert_eq!(snapshot.pressure_ratio(), Some(0.9));
+    }
+}

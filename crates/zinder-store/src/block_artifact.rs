@@ -1,24 +1,55 @@
-//! Block artifact read traits.
+//! Block fact and compact-block read traits.
 
-use zinder_core::{BlockArtifact, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact};
+use zinder_core::{
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockTransactionIndexArtifact, ChainEpoch, CompactBlockArtifact, TransactionId,
+};
 
 use crate::{
     ArtifactFamily, StoreError,
     artifact_visibility::{HeightVisibilityIndex, visible_height_source_epoch},
-    format::{StoreKey, decode_block_artifact, decode_compact_block_artifact},
-    kv::{RocksChainStoreRead, StorageTable},
+    format::{
+        StoreKey, decode_block_blob_artifact, decode_block_header_artifact,
+        decode_block_transaction_index_artifact, decode_compact_block_artifact,
+    },
+    kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
 
-/// Read boundary for finalized block artifacts.
-pub trait FinalizedBlockStore {
-    /// Reads the finalized block artifact at `height` for the reader's chain epoch.
-    fn block_at(&self, height: BlockHeight) -> Result<Option<BlockArtifact>, StoreError>;
+/// Read boundary for canonical block-header facts.
+pub trait BlockHeaderStore {
+    /// Reads the block-header facts at `height` for the reader's chain epoch.
+    fn block_header_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHeaderArtifact>, StoreError>;
 
-    /// Reads finalized block artifacts in one batched store read.
-    fn blocks_in_range(
+    /// Reads block-header facts in one batched store read.
+    fn block_headers_in_range(
         &self,
         block_range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockArtifact>>, StoreError>;
+    ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError>;
+}
+
+/// Read boundary for optional raw block blobs.
+pub trait BlockBlobStore {
+    /// Reads the raw block blob at `height` for the reader's chain epoch.
+    fn block_blob_at(&self, height: BlockHeight) -> Result<Option<BlockBlobArtifact>, StoreError>;
+}
+
+/// Read boundary for transaction ids at a block-local index.
+pub trait BlockTransactionIndexStore {
+    /// Reads the transaction id at `tx_index_in_block` for `height`.
+    fn transaction_id_at_block_index(
+        &self,
+        height: BlockHeight,
+        tx_index_in_block: u32,
+    ) -> Result<Option<TransactionId>, StoreError>;
+
+    /// Reads the ordered transaction ids for every transaction in `height`.
+    fn transaction_ids_at_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Vec<TransactionId>, StoreError>;
 }
 
 /// Read boundary for compact block artifacts.
@@ -30,11 +61,11 @@ pub trait CompactBlockStore {
     ) -> Result<Option<CompactBlockArtifact>, StoreError>;
 }
 
-pub(crate) fn read_block_artifact(
+pub(crate) fn read_block_header_artifact(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     height: BlockHeight,
-) -> Result<Option<BlockArtifact>, StoreError> {
+) -> Result<Option<BlockHeaderArtifact>, StoreError> {
     if height > chain_epoch.tip_height {
         return Ok(None);
     }
@@ -43,25 +74,25 @@ pub(crate) fn read_block_artifact(
         inner,
         chain_epoch,
         height,
-        ArtifactFamily::FinalizedBlock,
+        ArtifactFamily::BlockHeader,
         HeightVisibilityIndex::FinalizedBlock,
     )?;
-    let key = StoreKey::finalized_block(chain_epoch.network, source_epoch, height);
-    if let Some(envelope_bytes) = inner.get(StorageTable::FinalizedBlock, &key)? {
-        return decode_block_artifact(&key, &envelope_bytes).map(Some);
+    let key = StoreKey::block_header(chain_epoch.network, source_epoch, height);
+    if let Some(envelope_bytes) = inner.get(StorageTable::BlockHeader, &key)? {
+        return decode_block_header_artifact(&key, &envelope_bytes).map(Some);
     }
 
     Err(StoreError::ArtifactMissing {
-        family: ArtifactFamily::FinalizedBlock,
+        family: ArtifactFamily::BlockHeader,
         key: key.into(),
     })
 }
 
-pub(crate) fn read_block_artifacts(
+pub(crate) fn read_block_header_artifacts(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     block_range: BlockHeightRange,
-) -> Result<Vec<Option<BlockArtifact>>, StoreError> {
+) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
     let mut keys = Vec::new();
     let mut heights = Vec::new();
 
@@ -76,7 +107,7 @@ pub(crate) fn read_block_artifacts(
             inner,
             chain_epoch,
             height,
-            ArtifactFamily::FinalizedBlock,
+            ArtifactFamily::BlockHeader,
             HeightVisibilityIndex::FinalizedBlock,
         ) {
             Ok(source_epoch) => source_epoch,
@@ -88,7 +119,7 @@ pub(crate) fn read_block_artifacts(
             Err(error) => return Err(error),
         };
         heights.push(height);
-        keys.push(Some(StoreKey::finalized_block(
+        keys.push(Some(StoreKey::block_header(
             chain_epoch.network,
             source_epoch,
             height,
@@ -97,7 +128,7 @@ pub(crate) fn read_block_artifacts(
 
     let block_keys = keys.iter().flatten().cloned().collect::<Vec<_>>();
     let mut block_values = inner
-        .multi_get(StorageTable::FinalizedBlock, &block_keys)?
+        .multi_get(StorageTable::BlockHeader, &block_keys)?
         .into_iter();
     let mut blocks = Vec::with_capacity(keys.len());
 
@@ -108,21 +139,21 @@ pub(crate) fn read_block_artifacts(
         };
 
         let envelope_value = block_values.next().ok_or(StoreError::ArtifactMissing {
-            family: ArtifactFamily::FinalizedBlock,
+            family: ArtifactFamily::BlockHeader,
             key: key.clone().into(),
         })?;
         let Some(envelope_bytes) = envelope_value else {
             return Err(StoreError::ArtifactMissing {
-                family: ArtifactFamily::FinalizedBlock,
+                family: ArtifactFamily::BlockHeader,
                 key: key.into(),
             });
         };
-        let block = decode_block_artifact(&key, &envelope_bytes)?;
+        let block = decode_block_header_artifact(&key, &envelope_bytes)?;
         if block.height != height {
             return Err(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::FinalizedBlock,
+                family: ArtifactFamily::BlockHeader,
                 key: key.into(),
-                reason: "finalized block artifact height does not match requested height",
+                reason: "block-header artifact height does not match requested height",
             });
         }
 
@@ -130,6 +161,107 @@ pub(crate) fn read_block_artifacts(
     }
 
     Ok(blocks)
+}
+
+pub(crate) fn read_block_blob_artifact(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+) -> Result<Option<BlockBlobArtifact>, StoreError> {
+    if height > chain_epoch.tip_height {
+        return Ok(None);
+    }
+
+    let source_epoch = visible_height_source_epoch(
+        inner,
+        chain_epoch,
+        height,
+        ArtifactFamily::BlockBlob,
+        HeightVisibilityIndex::FinalizedBlock,
+    )?;
+    let key = StoreKey::block_blob(chain_epoch.network, source_epoch, height);
+    let Some(envelope_bytes) = inner.get(StorageTable::BlockBlob, &key)? else {
+        return Ok(None);
+    };
+    decode_block_blob_artifact(&key, &envelope_bytes).map(Some)
+}
+
+pub(crate) fn read_block_transaction_index_artifact(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+    tx_index_in_block: u32,
+) -> Result<Option<BlockTransactionIndexArtifact>, StoreError> {
+    if height > chain_epoch.tip_height {
+        return Ok(None);
+    }
+
+    let source_epoch = visible_height_source_epoch(
+        inner,
+        chain_epoch,
+        height,
+        ArtifactFamily::BlockTransactionIndex,
+        HeightVisibilityIndex::FinalizedBlock,
+    )?;
+    let key = StoreKey::block_transaction_index(
+        chain_epoch.network,
+        source_epoch,
+        height,
+        tx_index_in_block,
+    );
+    let Some(envelope_bytes) = inner.get(StorageTable::BlockTransactionIndex, &key)? else {
+        return Ok(None);
+    };
+    let artifact = decode_block_transaction_index_artifact(&key, &envelope_bytes)?;
+    if artifact.block_height == height && artifact.tx_index_in_block == tx_index_in_block {
+        return Ok(Some(artifact));
+    }
+
+    Err(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::BlockTransactionIndex,
+        key: key.into(),
+        reason: "block transaction-index row does not match requested location",
+    })
+}
+
+pub(crate) fn read_block_transaction_index_artifacts_at_height(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+) -> Result<Vec<BlockTransactionIndexArtifact>, StoreError> {
+    if height > chain_epoch.tip_height {
+        return Ok(Vec::new());
+    }
+
+    let source_epoch = visible_height_source_epoch(
+        inner,
+        chain_epoch,
+        height,
+        ArtifactFamily::BlockTransactionIndex,
+        HeightVisibilityIndex::FinalizedBlock,
+    )?;
+    let prefix =
+        StoreKey::block_transaction_index_prefix(chain_epoch.network, source_epoch, height);
+    let mut artifacts = Vec::new();
+    inner.scan_prefix(
+        StorageTable::BlockTransactionIndex,
+        &prefix,
+        &mut |key_bytes, envelope_bytes| {
+            let key = StoreKey::from_raw_bytes(key_bytes);
+            let artifact = decode_block_transaction_index_artifact(&key, envelope_bytes)?;
+            if artifact.block_height != height {
+                return Err(StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::BlockTransactionIndex,
+                    key: key.into(),
+                    reason: "block transaction-index row height does not match scan prefix",
+                });
+            }
+            artifacts.push(artifact);
+            Ok(PrefixScanControl::Continue)
+        },
+    )?;
+    artifacts.sort_by_key(|artifact| artifact.tx_index_in_block);
+    Ok(artifacts)
 }
 
 pub(crate) fn read_compact_block_artifact(

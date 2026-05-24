@@ -18,7 +18,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 pub(crate) struct ExplorerConfig {
     pub(crate) network: Network,
     pub(crate) storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget applied to the derive store.
+    /// Bounded `RocksDB` resource budget applied to explorer secondary stores.
     pub(crate) storage_tuning: zinder_store::StorageTuning,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
@@ -49,6 +49,9 @@ pub(crate) enum ExplorerConfigError {
 
     #[error(transparent)]
     Store(#[from] zinder_explorer::DeriveStoreError),
+
+    #[error(transparent)]
+    CanonicalStore(#[from] zinder_store::StoreError),
 
     #[error("explorer runtime failed: {0}")]
     Runtime(#[from] zinder_explorer::DeriveError),

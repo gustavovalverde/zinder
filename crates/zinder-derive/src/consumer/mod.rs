@@ -6,7 +6,7 @@
 //! lives in each consumer module.
 //!
 //! A consumer that needs the parsed block in `apply_block` does NOT fetch
-//! `WalletQuery.FullBlock` itself. `zinder-ingest` constructs a shared
+//! raw block data itself. `zinder-ingest` constructs a shared
 //! [`BlockCommitContext`] from the canonical commit and passes it to every
 //! consumer observing that height.
 
@@ -16,6 +16,7 @@ pub(crate) mod mempool_event_counts;
 pub(crate) mod recent_transactions;
 pub(crate) mod transaction_fees;
 pub(crate) mod transparent_address_activity;
+pub(crate) mod transparent_address_transaction_history;
 
 use std::collections::HashMap;
 
@@ -23,7 +24,7 @@ use rust_rocksdb::WriteBatch;
 use zinder_core::{BlockHeight, ChainEpoch};
 
 pub use block_commit_context::{
-    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, PrevoutResolver,
+    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, TransparentSpendFacts,
 };
 
 use crate::store::DeriveStore;
