@@ -31,6 +31,7 @@ deploy/
 !deploy/single-container/services/**
 !deploy/single-container/config.example.ingest.toml
 !deploy/single-container/config.example.query.toml
+!deploy/single-container/config.example.explorer.toml
 
 # Test outputs.
 **/test-results/
