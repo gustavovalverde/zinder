@@ -419,7 +419,7 @@ async fn run_ingest(
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store_options = ChainStoreOptions {
-        tuning: command_config.loop_config.storage_tuning,
+        rocksdb_resource_budget: command_config.loop_config.canonical_rocksdb_budget,
         ..ChainStoreOptions::for_network(command_config.loop_config.node.network)
     };
     let store =
@@ -434,7 +434,7 @@ async fn run_ingest(
         };
     let derive_store = match open_primary_derive_store_for_canonical(
         &command_config.loop_config.storage_path,
-        command_config.loop_config.storage_tuning,
+        command_config.loop_config.derive_rocksdb_budget,
     ) {
         Ok(store) => store,
         Err(error) => {
@@ -462,16 +462,28 @@ async fn run_ingest(
     open_storage_phase.complete();
 
     let mempool_index = MempoolIndex::new();
-    let ingest_control_handle = spawn_ingest_control_endpoint(IngestControlEndpointSpec {
-        listen_addr: command_config.ingest_control_listen_addr,
-        network: command_config.loop_config.node.network,
-        store: store.clone(),
-        mempool_index: mempool_index.clone(),
-        node_source: Some(Arc::new(source.clone())),
-        bearer_token: command_config.ingest_control_bearer_token.clone(),
-        cancel: cancel.clone(),
-    })
-    .await?;
+    let ingest_control_handle = if let Some(listen_addr) = command_config.ingest_control_listen_addr
+    {
+        Some(
+            spawn_ingest_control_endpoint(IngestControlEndpointSpec {
+                listen_addr,
+                network: command_config.loop_config.node.network,
+                store: store.clone(),
+                mempool_index: mempool_index.clone(),
+                node_source: Some(Arc::new(source.clone())),
+                bearer_token: command_config.ingest_control_bearer_token.clone(),
+                cancel: cancel.clone(),
+            })
+            .await?,
+        )
+    } else {
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "ingest_control_endpoint_disabled",
+            "ingest-control endpoint disabled by configuration"
+        );
+        None
+    };
     let _upstream_health_probe_handle = spawn_upstream_health_probe_for(
         &command_config.loop_config.node,
         &source,
@@ -509,7 +521,7 @@ async fn run_ingest(
         )
         .unwrap_or(u64::MAX),
         lag_threshold_blocks = command_config.loop_config.tip_follow.lag_threshold_blocks,
-        ingest_control_listen_addr = %command_config.ingest_control_listen_addr,
+        ingest_control_listen_addr = ?command_config.ingest_control_listen_addr,
         "unified ingest loop started"
     );
 
@@ -572,7 +584,9 @@ async fn run_ingest(
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
-    ingest_control_handle.shutdown().await;
+    if let Some(handle) = ingest_control_handle {
+        handle.shutdown().await;
+    }
 
     final_result
 }
@@ -1070,7 +1084,7 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
     let store = PrimaryChainStore::open(
         &backup_config.storage_path,
         ChainStoreOptions {
-            tuning: backup_config.storage_tuning,
+            rocksdb_resource_budget: backup_config.canonical_rocksdb_budget,
             ..ChainStoreOptions::for_network(backup_config.network)
         },
     )

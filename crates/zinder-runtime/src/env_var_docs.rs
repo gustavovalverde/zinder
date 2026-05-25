@@ -294,6 +294,142 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       rejected at config load.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__PATH",
+        toml_path: "storage.path",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Canonical RocksDB store path. Writers open it as primary; readers open it \
+                      as a secondary.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__SECONDARY_PATH",
+        toml_path: "storage.secondary_path",
+        used_by: &[
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Process-unique RocksDB secondary metadata directory. Never share this path \
+                      across reader processes.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
+        toml_path: "storage.canonical.rocksdb.block_cache_bytes",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES",
+        toml_path: "storage.canonical.rocksdb.max_wal_bytes",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES",
+        toml_path: "storage.canonical.rocksdb.max_open_files",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store RocksDB open SST file cap. Defaults to 512.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES",
+        toml_path: "storage.canonical.rocksdb.write_buffer_bytes",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store per-column-family RocksDB write buffer size. Defaults to \
+                      16777216.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
+        toml_path: "storage.canonical.rocksdb.max_write_buffer_count",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store per-column-family mutable plus immutable RocksDB write \
+                      buffer count. Defaults to 2.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__BLOCK_CACHE_BYTES",
+        toml_path: "storage.derive.rocksdb.block_cache_bytes",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 134217728.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WAL_BYTES",
+        toml_path: "storage.derive.rocksdb.max_wal_bytes",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 67108864.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_OPEN_FILES",
+        toml_path: "storage.derive.rocksdb.max_open_files",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store RocksDB open SST file cap. Defaults to 256.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__WRITE_BUFFER_BYTES",
+        toml_path: "storage.derive.rocksdb.write_buffer_bytes",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store per-column-family RocksDB write buffer size. Defaults to \
+                      8388608.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
+        toml_path: "storage.derive.rocksdb.max_write_buffer_count",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store per-column-family mutable plus immutable RocksDB write buffer \
+                      count. Defaults to 2.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__SOURCE",
         toml_path: "ingest.source",
         used_by: &["zinder-ingest"],
@@ -383,8 +519,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum reserved source response bytes across in-flight fetches. Defaults \
-                      to 402653184.",
+        description: "Maximum reserved source response bytes across active fetches and completed \
+                      source reassembly. Must be greater than or equal to \
+                      node.max_response_bytes. Defaults to 402653184.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY",
@@ -623,15 +760,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_EXPLORER__STORAGE_PATH",
-        toml_path: "explorer.storage_path",
-        used_by: &["zinder-explorer"],
-        requirement: Requirement::Required,
-        sensitive: false,
-        description: "Canonical store path used to locate the writer-owned derive store at its \
-                      `derive` subdirectory.",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",

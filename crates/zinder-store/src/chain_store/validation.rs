@@ -20,7 +20,7 @@ pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result
         });
     }
     options
-        .tuning
+        .rocksdb_resource_budget
         .validate()
         .map_err(|reason| StoreError::InvalidChainStoreOptions { reason })?;
 

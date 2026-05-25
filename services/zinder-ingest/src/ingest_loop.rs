@@ -74,8 +74,10 @@ pub struct IngestLoopConfig {
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget applied when opening the store.
-    pub storage_tuning: zinder_store::StorageTuning,
+    /// Bounded `RocksDB` resource budget for the canonical store.
+    pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Bounded `RocksDB` resource budget for the derive store.
+    pub derive_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
     /// Reorg-window invariant. Bulk catch-up never finalizes blocks inside
@@ -551,7 +553,7 @@ fn build_bulk_catchup_batch_config(
         node: config.node.clone(),
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
-        storage_tuning: config.storage_tuning,
+        canonical_rocksdb_budget: config.canonical_rocksdb_budget,
         raw_blob_policy: config.raw_blob_policy,
         network_upgrade_activations,
         from_height,
@@ -587,7 +589,7 @@ fn build_tip_follow_config(
     TipFollowConfig {
         node: config.node.clone(),
         storage_path: config.storage_path.clone(),
-        storage_tuning: config.storage_tuning,
+        canonical_rocksdb_budget: config.canonical_rocksdb_budget,
         raw_blob_policy: config.raw_blob_policy,
         network_upgrade_activations,
         reorg_window_blocks: config.reorg_window_blocks,
@@ -646,7 +648,8 @@ mod tests {
             ),
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: PathBuf::from("/tmp/unit-test"),
-            storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
             raw_blob_policy: RawBlobPolicy::None,
             reorg_window_blocks: 100,
             phases: PhasesConfig {

@@ -11,6 +11,7 @@ use tempfile::tempdir;
 fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("derive-print-config-store");
+    let secondary_path = tempdir.path().join("derive-print-config-secondary");
     let token_path = tempdir.path().join("derive-explorer.token");
     fs::write(&token_path, "expected-token\n")?;
 
@@ -21,6 +22,8 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
             "zcash-regtest",
             "--storage-path",
             path_str(&storage_path)?,
+            "--secondary-path",
+            path_str(&secondary_path)?,
             "--listen-addr",
             "127.0.0.1:9068",
             "--bearer-token-path",
@@ -49,6 +52,7 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("derive-invalid-token-store");
+    let secondary_path = tempdir.path().join("derive-invalid-token-secondary");
     let token_path = tempdir.path().join("derive-empty.token");
     fs::write(&token_path, "\n")?;
 
@@ -59,6 +63,8 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
             "zcash-regtest",
             "--storage-path",
             path_str(&storage_path)?,
+            "--secondary-path",
+            path_str(&secondary_path)?,
             "--listen-addr",
             "127.0.0.1:9068",
             "--bearer-token-path",

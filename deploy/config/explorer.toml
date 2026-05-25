@@ -10,26 +10,32 @@
 [network]
 name = "zcash-mainnet"
 
+[storage]
+path = "/var/lib/zinder/store"
+secondary_path = "/var/lib/zinder/explorer-secondary"
+
+# Bounded RocksDB resource budgets for the canonical and derive secondaries.
+# See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+# [storage.canonical.rocksdb]
+# block_cache_bytes = 536870912
+# max_wal_bytes = 268435456
+# max_open_files = 512
+# write_buffer_bytes = 16777216
+# max_write_buffer_count = 2
+#
+# [storage.derive.rocksdb]
+# block_cache_bytes = 134217728
+# max_wal_bytes = 67108864
+# max_open_files = 256
+# write_buffer_bytes = 8388608
+# max_write_buffer_count = 2
+
 [explorer]
 listen_addr = "0.0.0.0:9068"
-# Canonical store path. The derive secondary opens
-# /var/lib/zinder/store/derive, and its scratch directory lives under that
-# derive path.
-storage_path = "/var/lib/zinder/store"
 # The explorer plane delegates some reads to the wallet plane through
 # the in-network DNS name the query service publishes. ADR-0009 records
 # this co-located topology.
 wallet_query_endpoint = "http://zinder-query:9101"
-
-# Bounded RocksDB resource budget for the derive store. Uncomment to
-# override the derive defaults (128 MiB block cache, 64 MiB max WAL, 256
-# max open files); derive stores hold smaller working sets than the
-# canonical chain store so the budget is halved. See
-# docs/adrs/0020-bounded-rocksdb-resource-budget.md.
-# [explorer.tuning]
-# block_cache_bytes = 134217728
-# max_wal_bytes = 67108864
-# max_open_files = 256
 
 [ops]
 listen_addr = "0.0.0.0:9069"

@@ -1,6 +1,6 @@
 # Zinder-side bulk catchup bottlenecks and implementation record
 
-Status: Implemented architecture, deployed to mainnet stack, derive projections draining
+Status: Implemented architecture, deployed to mainnet stack, benchmark validated
 Date: 2026-05-24
 Updated: 2026-05-25
 Scope: `zinder-ingest`, `zinder-source`, canonical storage pressure, derive replay pressure, deployment validation
@@ -30,13 +30,19 @@ degrade-before-pause.
 
 The final architecture was rebuilt, deployed, and validated against the local
 mainnet stack. The final `zinder-ingest:latest` rebuild exported image manifest
-`sha256:f1e8dfbc8a285bfd0c87a982d9acab8072f35f93c0df7c7f8b67f560415eb3a1`
+`sha256:9d6e60453a0cc8605c43ab38e311574b70e2e8d92cc8ca8eeb764a626167393f`
 and manifest list
-`sha256:85b02f66aaf76b0537d02d7fa7131f66a8f771c7f4b9a8e96695c953663ffd65`.
+`sha256:0272b37728ad78e23048d456c80420a84dbd1a05ed46233b4b460f54a383d808`.
+The colocated reader image manifest lists are
+`zinder-query:latest@sha256:9e8eb850f7d51859658a9d86fcef4db371c3c57e409381df554c94de4f0ae4f0`
+and
+`zinder-explorer:latest@sha256:846d9d423bd41a33c6f43c781a8ccee8ab07f0fa65c3c85eb5a2881be771200f`.
+The compatibility image, rebuilt after the canonical-only storage cleanup, is
+`zinder-compat-lightwalletd:latest@sha256:5eaafe8a45906e89d1767e779376aeec582d6936cc8a7c33e3ec4eb94ea1a540`.
 `/readyz` is served on `127.0.0.1:9105` and reported after the final deploy:
 
 ```json
-{"status":"ready","cause":"ready","current_height":3352985,"target_height":3352985}
+{"status":"ready","cause":"ready","current_height":3353078,"target_height":3353078}
 ```
 
 The initial production baseline on 2026-05-24 was `6.94 blocks/s` over 1 hour,
@@ -52,6 +58,34 @@ about `280.7 blocks/s`, roughly `40x` the baseline.
 Current 30-minute and 60-minute writer rates are intentionally near zero
 because the stack is at tip. Treat those windows as tip-follow idleness, not as
 bulk-catchup throughput evidence.
+
+After the strict source-watermark audit, the source fetch stage now reserves
+`node.max_response_bytes` before each active request and rejects
+`source_fetch_max_in_flight_bytes < node.max_response_bytes`. That keeps the
+declared byte watermark ahead of the allocation rather than shrinking only
+after the response is already decoded.
+
+The final isolated benchmark used a disposable Docker volume, the existing
+mainnet Zebra, checkpoint height `3,300,000`, and target height `3,350,000`.
+It committed `50,000` blocks in `42.447299533` seconds, about
+`1,177.9 blocks/s`, which is roughly `169.7x` the original `6.94 blocks/s`
+baseline. The benchmark volume was removed after validation. A mid-run sample
+showed source fetch active reservations at `5`, source queue bytes at
+`77,897,814`, working-set memory at `1,592,229,888` bytes, scheduler memory
+pressure at `0.1059`, raw cgroup pressure at `0.1308`, WAL bytes at
+`11,795,914 / 268,435,456`, and derive replay state `normal=1`,
+`degraded=0`, `paused=0`.
+
+Post-deploy steady-state validation showed all colocated services ready:
+ingest and query at height `3,353,078`, explorer ready, scheduler memory
+pressure `0.0041`, raw cgroup pressure `0.0221`, working-set memory
+`60,985,344` bytes, WAL bytes `0`, and derive replay state `normal=1`,
+`degraded=0`, `paused=0`.
+
+Final contract cleanup removed two pieces of baggage found during the audit:
+`zinder-compat-lightwalletd` now accepts and prints only canonical-secondary
+storage config, and its build-time git commit injection no longer uses a
+`ZINDER_*` runtime-config prefix.
 
 ### Source transport decision
 
@@ -101,7 +135,7 @@ of staying opaque and paused.
 | --- | --- | --- |
 | Measurement contract | Implemented | `observability-smoke.sh snapshot` reports writer rates, source averages, bulk-stage p95, queues, memory, derive state, and commit/query counters. |
 | Stage module extraction | Implemented | `bulk_catchup/mod.rs` is the facade; source fetch, fact build, commit reassembly, flush, and watermarks have owned modules. |
-| Byte-watermark foundation | Implemented | Source, fact-build, and commit-reassembly memory are bounded and separately observable. |
+| Byte-watermark foundation | Implemented | Source, fact-build, and commit-reassembly memory are bounded and separately observable. Source fetch reserves `node.max_response_bytes` before each active request and keeps completed out-of-order bytes reserved until emission. |
 | Unordered source fetch | Implemented | Source segments complete out of order and emit in canonical order through source reassembly. |
 | Independent canonical fact build | Implemented | Fact build uses bounded concurrency and emits ordered blocks after out-of-order completion. |
 | Commit reassembly and flush overlap | Implemented | One canonical commit can run while bounded source/fact work fills the next batch. |
@@ -649,8 +683,9 @@ Goal: tune memory only after stage metrics prove what remains.
 Work:
 
 - Use the stage watermarks to estimate process-level memory partitions.
-- Evaluate separate canonical and derive store tuning instead of opening both
-  with identical `storage_tuning` by default.
+- Done: canonical and derive stores now use separate
+  `RocksDbResourceBudget` defaults through `[storage.canonical.rocksdb]` and
+  `[storage.derive.rocksdb]`, including independent write-buffer budgets.
 - Test `WriteBufferManager` only if memtable metrics show it is the remaining
   pressure source.
 - Test allocator changes such as jemalloc only as an operations slice with
@@ -827,8 +862,10 @@ The next implementation slice moved the remaining memory and coupling work
 into the code path:
 
 - `source_fetch` now uses the shared `ByteWatermark` reservation primitive.
-  Active source response bytes release on completion or error, while completed
-  out-of-order segments are reported separately as source reorder-buffer bytes.
+  Active source requests reserve `node.max_response_bytes` before fetch, shrink
+  to measured response bytes on completion, and keep completed out-of-order
+  segment bytes reserved until ordered emission. Completed segments are also
+  reported separately as source reorder-buffer bytes.
 - `canonical_fact_build` uses the same reservation primitive for active and
   completed derived artifacts and is bounded by
   `fact_build_max_in_flight_artifact_bytes`.

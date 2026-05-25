@@ -32,7 +32,7 @@ use zinder_derive::{
 };
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
-    PrimaryChainStore, StorageTuning, StreamCursorTokenV1,
+    PrimaryChainStore, RocksDbResourceBudget, StreamCursorTokenV1,
 };
 
 use crate::{
@@ -43,6 +43,7 @@ use crate::{
 
 const DERIVE_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
+const DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS: &str = "build_block_contexts";
 const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
 
@@ -104,12 +105,14 @@ impl DeriveReplayBudget {
             .map(std::num::NonZeroU64::get)
             .or(memory_snapshot.cgroup_high_bytes)
             .or(memory_snapshot.cgroup_max_bytes);
-        let memory_pressure_ratio = memory_snapshot
-            .cgroup_current_bytes
-            .zip(memory_budget_bytes)
-            .and_then(|(current_bytes, budget_bytes)| {
+        let memory_pressure_bytes = memory_snapshot
+            .working_set_bytes()
+            .or(memory_snapshot.cgroup_current_bytes);
+        let memory_pressure_ratio = memory_pressure_bytes.zip(memory_budget_bytes).and_then(
+            |(current_bytes, budget_bytes)| {
                 (budget_bytes > 0).then(|| u64_to_f64(current_bytes) / u64_to_f64(budget_bytes))
-            });
+            },
+        );
         self.state = next_budget_state(self.config, self.state, memory_pressure_ratio);
         EffectiveDeriveReplayLimits {
             state: self.state,
@@ -191,14 +194,14 @@ fn effective_replay_batch_blocks(
 /// Opens the ingest-owned derive store primary for a canonical store path.
 pub fn open_primary_derive_store_for_canonical(
     canonical_path: &Path,
-    tuning: StorageTuning,
+    rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Result<DeriveStore, zinder_derive::DeriveStoreError> {
     DeriveStore::open(
         DeriveStore::path_for_canonical(canonical_path),
         DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: DeriveStore::bundled_consumer_column_families(),
-            tuning,
+            rocksdb_resource_budget,
         },
     )
 }
@@ -518,7 +521,7 @@ async fn replay_committed_event_to_derive_in_batches(
         )
         .await;
         record_derive_replay_stage(
-            DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
+            DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS,
             resolve_started_at,
             &contexts_outcome,
         );
@@ -623,7 +626,7 @@ async fn replay_reorg_event_to_derive(
     )
     .await;
     record_derive_replay_stage(
-        DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
+        DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS,
         resolve_started_at,
         &contexts_outcome,
     );
@@ -1279,5 +1282,22 @@ mod tests {
             budget.evaluate(memory_snapshot(700)).state,
             DeriveReplayBudgetState::Normal
         );
+    }
+
+    #[test]
+    fn replay_budget_uses_working_set_pressure_when_cgroup_stat_is_available() {
+        let mut budget = DeriveReplayBudget::new(replay_config());
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(980),
+            cgroup_max_bytes: Some(1_000),
+            cgroup_inactive_file_bytes: Some(300),
+            ..RuntimeMemorySnapshot::default()
+        };
+
+        let limits = budget.evaluate(snapshot);
+
+        assert_eq!(limits.memory_pressure_ratio, Some(0.68));
+        assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
+        assert_eq!(limits.batch_blocks, 100);
     }
 }

@@ -380,6 +380,20 @@ secondary_path = "/var/lib/zinder/query-secondary"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
 
+[storage.canonical.rocksdb]
+block_cache_bytes = 536870912
+max_wal_bytes = 268435456
+max_open_files = 512
+write_buffer_bytes = 16777216
+max_write_buffer_count = 2
+
+[storage.derive.rocksdb]
+block_cache_bytes = 134217728
+max_wal_bytes = 67108864
+max_open_files = 256
+write_buffer_bytes = 8388608
+max_write_buffer_count = 2
+
 [ingest_control]
 # Writer-side (zinder-ingest): bind address. "" disables the endpoint.
 listen_addr = "127.0.0.1:9100"
@@ -513,6 +527,18 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. Set to an empty string to disable the endpoint for diagnostic one-shot runs (such as `--target-height` pre-seed). |
 | `ZINDER_INGEST_CONTROL__ADDR` | zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
 | `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
+| `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.path` | Canonical RocksDB store path. Writers open it as primary; readers open it as a secondary. |
+| `ZINDER_STORAGE__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.block_cache_bytes` | Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_wal_bytes` | Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_open_files` | Canonical-store RocksDB open SST file cap. Defaults to 512. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.write_buffer_bytes` | Canonical-store per-column-family RocksDB write buffer size. Defaults to 16777216. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_write_buffer_count` | Canonical-store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 2. |
+| `ZINDER_STORAGE__DERIVE__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-query, zinder-explorer | Optional | `storage.derive.rocksdb.block_cache_bytes` | Derive-store RocksDB block cache budget in bytes. Defaults to 134217728. |
+| `ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-query, zinder-explorer | Optional | `storage.derive.rocksdb.max_wal_bytes` | Derive-store RocksDB live WAL ceiling in bytes. Defaults to 67108864. |
+| `ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-query, zinder-explorer | Optional | `storage.derive.rocksdb.max_open_files` | Derive-store RocksDB open SST file cap. Defaults to 256. |
+| `ZINDER_STORAGE__DERIVE__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-ingest, zinder-query, zinder-explorer | Optional | `storage.derive.rocksdb.write_buffer_bytes` | Derive-store per-column-family RocksDB write buffer size. Defaults to 8388608. |
+| `ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-ingest, zinder-query, zinder-explorer | Optional | `storage.derive.rocksdb.max_write_buffer_count` | Derive-store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 2. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
 | `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to `none` so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
@@ -522,7 +548,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Maximum connected blocks requested from the source in one bulk-catchup segment. Defaults to 16. |
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Target source response bytes for adaptive segment sizing. Defaults to 33554432. |
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_requests` | Maximum concurrent source segment requests. Defaults to 12. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Maximum reserved source response bytes across in-flight fetches. Defaults to 402653184. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Maximum reserved source response bytes across active fetches and completed source reassembly. Must be greater than or equal to node.max_response_bytes. Defaults to 402653184. |
 | `ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.fact_build_concurrency` | Parallel canonical fact-build slots. Defaults to `min(available_parallelism(), 16)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes` | Maximum reserved derived artifact bytes across active and completed fact-build work. Defaults to 536870912. |
 | `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum finalized artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
@@ -549,8 +575,8 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES` | zinder-ingest | Optional | `retention.mempool_cursor_at_risk_warning_minutes` | Mempool cursor-at-risk warning lead time in minutes. Must be ≤ the shortest configured mempool retention window. Defaults to 12. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
-| `ZINDER_EXPLORER__STORAGE_PATH` | zinder-explorer | Required | `explorer.storage_path` | Canonical store path used to locate the writer-owned derive store at its `derive` subdirectory. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. Empty/unset disables the `explorer.transparent_address.balance_v1` capability. |
+
 <!-- env-var-table:public-interfaces:end -->
 
 ### `--print-config`
@@ -729,6 +755,8 @@ let chain = LocalChainIndex::open(LocalOpenOptions {
     storage_path: "/var/lib/zinder".into(),
     secondary_path: "/var/lib/zinder/zallet-secondary".into(),
     network: zinder_client::Network::ZcashTestnet,
+    canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::canonical_defaults(),
+    derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::derive_defaults(),
     subscription_endpoint: Some("http://127.0.0.1:9101".into()),
     catchup_interval: Duration::from_millis(250),
 }).await?;

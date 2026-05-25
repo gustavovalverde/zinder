@@ -1,12 +1,12 @@
-//! Injects the short git commit hash into the binary as `ZINDER_GIT_COMMIT` so
-//! `lightd_info` can report it without runtime git access. Empty string when
-//! the build runs outside a git checkout.
+//! Injects the short git commit hash into the binary so `lightd_info` can
+//! report it without runtime git access. Empty string when the build runs
+//! outside a git checkout.
 
 use std::process::Command;
 
 fn main() {
     let git_hash = git_command(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
-    println!("cargo:rustc-env=ZINDER_GIT_COMMIT={git_hash}");
+    println!("cargo:rustc-env=LIGHTWALLETD_COMPAT_BUILD_GIT_COMMIT={git_hash}");
 
     // Watch the files git updates as commits land or refs repack so the
     // recorded hash stays current. `.git/HEAD` flips on checkout, the

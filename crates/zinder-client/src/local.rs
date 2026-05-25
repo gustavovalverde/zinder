@@ -38,11 +38,12 @@ pub struct LocalOpenOptions {
     pub secondary_path: PathBuf,
     /// Expected network stored in the canonical database.
     pub network: Network,
-    /// Bounded `RocksDB` resource budget applied when opening the
-    /// secondary. Defaults to
-    /// [`zinder_store::StorageTuning::canonical_defaults`] when callers
-    /// construct via the public field set.
-    pub storage_tuning: zinder_store::StorageTuning,
+    /// Bounded `RocksDB` resource budget applied when opening the canonical
+    /// secondary store.
+    pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Bounded `RocksDB` resource budget applied when opening the derive
+    /// secondary store.
+    pub derive_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional service endpoint used for subscriptions and command RPCs.
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
@@ -76,13 +77,13 @@ impl LocalChainIndex {
         let storage_path = options.storage_path.clone();
         let secondary_path = options.secondary_path.clone();
         let network = options.network;
-        let storage_tuning = options.storage_tuning;
+        let canonical_rocksdb_budget = options.canonical_rocksdb_budget;
         let store = join_blocking(tokio::task::spawn_blocking(move || {
             SecondaryChainStore::open(
                 storage_path,
                 secondary_path,
                 ChainStoreOptions {
-                    tuning: storage_tuning,
+                    rocksdb_resource_budget: canonical_rocksdb_budget,
                     ..ChainStoreOptions::for_network(network)
                 },
             )
@@ -98,7 +99,7 @@ impl LocalChainIndex {
         .await?;
         let derive_storage_path = DeriveStore::path_for_canonical(&options.storage_path);
         let derive_secondary_path = options.secondary_path.join("derive");
-        let derive_storage_tuning = options.storage_tuning;
+        let derive_rocksdb_budget = options.derive_rocksdb_budget;
         let derive_store =
             join_blocking(tokio::task::spawn_blocking(
                 move || match DeriveStore::open_secondary(
@@ -107,7 +108,7 @@ impl LocalChainIndex {
                     DeriveStoreOptions {
                         sync_writes: false,
                         consumer_column_families: DeriveStore::bundled_consumer_column_families(),
-                        tuning: derive_storage_tuning,
+                        rocksdb_resource_budget: derive_rocksdb_budget,
                     },
                 ) {
                     Ok(derive_store) => {

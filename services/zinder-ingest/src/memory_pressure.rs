@@ -31,6 +31,12 @@ pub(crate) struct RuntimeMemorySnapshot {
     pub(crate) cgroup_max_bytes: Option<u64>,
     pub(crate) cgroup_high_bytes: Option<u64>,
     pub(crate) cgroup_swap_current_bytes: Option<u64>,
+    pub(crate) cgroup_anon_bytes: Option<u64>,
+    pub(crate) cgroup_file_bytes: Option<u64>,
+    pub(crate) cgroup_inactive_file_bytes: Option<u64>,
+    pub(crate) cgroup_active_file_bytes: Option<u64>,
+    pub(crate) cgroup_kernel_bytes: Option<u64>,
+    pub(crate) cgroup_slab_bytes: Option<u64>,
     pub(crate) process_rss_bytes: Option<u64>,
     pub(crate) process_rss_anon_bytes: Option<u64>,
 }
@@ -46,19 +52,45 @@ impl RuntimeMemorySnapshot {
 
     fn sample_from_paths(cgroup_root: &Path, proc_cgroup: &Path, proc_status: &Path) -> Self {
         let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
+        let cgroup_memory_stat = read_cgroup_memory_stat(&cgroup_dir);
         let (process_rss_bytes, process_rss_anon_bytes) = process_rss_bytes(proc_status);
         Self {
             cgroup_current_bytes: read_cgroup_u64(&cgroup_dir, "memory.current"),
             cgroup_max_bytes: read_cgroup_u64(&cgroup_dir, "memory.max"),
             cgroup_high_bytes: read_cgroup_u64(&cgroup_dir, "memory.high"),
             cgroup_swap_current_bytes: read_cgroup_u64(&cgroup_dir, "memory.swap.current"),
+            cgroup_anon_bytes: cgroup_memory_stat.anon,
+            cgroup_file_bytes: cgroup_memory_stat.file,
+            cgroup_inactive_file_bytes: cgroup_memory_stat.inactive_file,
+            cgroup_active_file_bytes: cgroup_memory_stat.active_file,
+            cgroup_kernel_bytes: cgroup_memory_stat.kernel,
+            cgroup_slab_bytes: cgroup_memory_stat.slab,
             process_rss_bytes,
             process_rss_anon_bytes,
         }
     }
 
     pub(crate) fn pressure_ratio(self) -> Option<f64> {
+        self.working_set_pressure_ratio()
+            .or_else(|| self.current_pressure_ratio())
+    }
+
+    pub(crate) fn current_pressure_ratio(self) -> Option<f64> {
         let current = self.cgroup_current_bytes?;
+        let limit = self.cgroup_high_bytes.or(self.cgroup_max_bytes)?;
+        if limit == 0 {
+            return None;
+        }
+        Some(u64_to_f64(current) / u64_to_f64(limit))
+    }
+
+    pub(crate) fn working_set_bytes(self) -> Option<u64> {
+        let current = self.cgroup_current_bytes?;
+        Some(current.saturating_sub(self.cgroup_inactive_file_bytes.unwrap_or(0)))
+    }
+
+    pub(crate) fn working_set_pressure_ratio(self) -> Option<f64> {
+        let current = self.working_set_bytes()?;
         let limit = self.cgroup_high_bytes.or(self.cgroup_max_bytes)?;
         if limit == 0 {
             return None;
@@ -102,6 +134,27 @@ pub(crate) fn record_runtime_memory_metrics(snapshot: RuntimeMemorySnapshot) {
     if let Some(bytes) = snapshot.cgroup_swap_current_bytes {
         metrics::gauge!("zinder_ingest_memory_swap_current_bytes").set(u64_to_f64(bytes));
     }
+    if let Some(bytes) = snapshot.cgroup_anon_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_anon_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_file_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_file_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_inactive_file_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_inactive_file_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_active_file_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_active_file_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_kernel_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_kernel_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.cgroup_slab_bytes {
+        metrics::gauge!("zinder_ingest_memory_cgroup_slab_bytes").set(u64_to_f64(bytes));
+    }
+    if let Some(bytes) = snapshot.working_set_bytes() {
+        metrics::gauge!("zinder_ingest_memory_working_set_bytes").set(u64_to_f64(bytes));
+    }
     if let Some(bytes) = snapshot.process_rss_bytes {
         metrics::gauge!("zinder_ingest_process_rss_bytes").set(u64_to_f64(bytes));
     }
@@ -110,6 +163,9 @@ pub(crate) fn record_runtime_memory_metrics(snapshot: RuntimeMemorySnapshot) {
     }
     if let Some(ratio) = snapshot.pressure_ratio() {
         metrics::gauge!("zinder_ingest_memory_pressure_ratio").set(ratio);
+    }
+    if let Some(ratio) = snapshot.current_pressure_ratio() {
+        metrics::gauge!("zinder_ingest_memory_current_pressure_ratio").set(ratio);
     }
 }
 
@@ -142,6 +198,45 @@ fn read_cgroup_u64(cgroup_dir: &Path, file_name: &str) -> Option<u64> {
         return None;
     }
     trimmed.parse::<u64>().ok()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CgroupMemoryStat {
+    anon: Option<u64>,
+    file: Option<u64>,
+    inactive_file: Option<u64>,
+    active_file: Option<u64>,
+    kernel: Option<u64>,
+    slab: Option<u64>,
+}
+
+fn read_cgroup_memory_stat(cgroup_dir: &Path) -> CgroupMemoryStat {
+    let Ok(stat_text) = fs::read_to_string(cgroup_dir.join("memory.stat")) else {
+        return CgroupMemoryStat::default();
+    };
+    let mut stat = CgroupMemoryStat::default();
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(sample_bytes) = parts
+            .next()
+            .and_then(|sample_text| sample_text.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key {
+            "anon" => stat.anon = Some(sample_bytes),
+            "file" => stat.file = Some(sample_bytes),
+            "inactive_file" => stat.inactive_file = Some(sample_bytes),
+            "active_file" => stat.active_file = Some(sample_bytes),
+            "kernel" => stat.kernel = Some(sample_bytes),
+            "slab" => stat.slab = Some(sample_bytes),
+            _ => {}
+        }
+    }
+    stat
 }
 
 fn process_rss_bytes(proc_status: &Path) -> (Option<u64>, Option<u64>) {
@@ -194,6 +289,10 @@ mod tests {
         fs::write(service_dir.join("memory.high"), "max\n")?;
         fs::write(service_dir.join("memory.swap.current"), "10\n")?;
         fs::write(
+            service_dir.join("memory.stat"),
+            "anon 400\nfile 500\ninactive_file 300\nactive_file 200\nkernel 50\nslab 20\n",
+        )?;
+        fs::write(
             tempdir.path().join("status"),
             "Name:\tzinder\nVmRSS:\t42 kB\nRssAnon:\t40 kB\n",
         )?;
@@ -208,9 +307,17 @@ mod tests {
         assert_eq!(snapshot.cgroup_max_bytes, Some(1000));
         assert_eq!(snapshot.cgroup_high_bytes, None);
         assert_eq!(snapshot.cgroup_swap_current_bytes, Some(10));
+        assert_eq!(snapshot.cgroup_anon_bytes, Some(400));
+        assert_eq!(snapshot.cgroup_file_bytes, Some(500));
+        assert_eq!(snapshot.cgroup_inactive_file_bytes, Some(300));
+        assert_eq!(snapshot.cgroup_active_file_bytes, Some(200));
+        assert_eq!(snapshot.cgroup_kernel_bytes, Some(50));
+        assert_eq!(snapshot.cgroup_slab_bytes, Some(20));
+        assert_eq!(snapshot.working_set_bytes(), Some(600));
         assert_eq!(snapshot.process_rss_bytes, Some(42 * 1024));
         assert_eq!(snapshot.process_rss_anon_bytes, Some(40 * 1024));
-        assert_eq!(snapshot.pressure_ratio(), Some(0.9));
+        assert_eq!(snapshot.current_pressure_ratio(), Some(0.9));
+        assert_eq!(snapshot.pressure_ratio(), Some(0.6));
 
         Ok(())
     }
@@ -222,10 +329,38 @@ mod tests {
             cgroup_max_bytes: Some(2000),
             cgroup_high_bytes: Some(1000),
             cgroup_swap_current_bytes: None,
+            cgroup_anon_bytes: None,
+            cgroup_file_bytes: None,
+            cgroup_inactive_file_bytes: None,
+            cgroup_active_file_bytes: None,
+            cgroup_kernel_bytes: None,
+            cgroup_slab_bytes: None,
             process_rss_bytes: None,
             process_rss_anon_bytes: None,
         };
 
         assert_eq!(snapshot.pressure_ratio(), Some(0.9));
+    }
+
+    #[test]
+    fn pressure_ratio_ignores_inactive_file_cache_when_available() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(900),
+            cgroup_max_bytes: Some(1000),
+            cgroup_high_bytes: None,
+            cgroup_swap_current_bytes: None,
+            cgroup_anon_bytes: Some(200),
+            cgroup_file_bytes: Some(700),
+            cgroup_inactive_file_bytes: Some(500),
+            cgroup_active_file_bytes: Some(200),
+            cgroup_kernel_bytes: None,
+            cgroup_slab_bytes: None,
+            process_rss_bytes: None,
+            process_rss_anon_bytes: None,
+        };
+
+        assert_eq!(snapshot.working_set_bytes(), Some(400));
+        assert_eq!(snapshot.current_pressure_ratio(), Some(0.9));
+        assert_eq!(snapshot.pressure_ratio(), Some(0.4));
     }
 }

@@ -19,15 +19,21 @@ path = "/var/run/auth/.cookie"
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
 
-# Bounded RocksDB resource budget. Uncomment to override the canonical
-# defaults (512 MiB block cache, 512 max open files). Secondaries don't
-# generate a WAL, so `max_wal_bytes` is a no-op on this side; setting it
-# anyway keeps the schema symmetric with the writer. See
-# docs/adrs/0020-bounded-rocksdb-resource-budget.md.
-# [storage.tuning]
+# Bounded RocksDB resource budgets for the canonical and derive secondaries.
+# See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+# [storage.canonical.rocksdb]
 # block_cache_bytes = 536870912
 # max_wal_bytes = 268435456
 # max_open_files = 512
+# write_buffer_bytes = 16777216
+# max_write_buffer_count = 2
+#
+# [storage.derive.rocksdb]
+# block_cache_bytes = 134217728
+# max_wal_bytes = 67108864
+# max_open_files = 256
+# write_buffer_bytes = 8388608
+# max_write_buffer_count = 2
 
 [ingest_control]
 addr = "http://zinder-ingest:9100"

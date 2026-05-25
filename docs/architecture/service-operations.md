@@ -122,7 +122,7 @@ Implemented baseline metrics:
 | `zinder_ingest_fact_build_reassembly_blocks` | gauge | `zinder-ingest` | Completed derived blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
-| `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. |
+| `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. Stages include `build_block_contexts` and `read_transparent_spend_facts`; the former wraps context construction, the latter is only the store read. |
 | `zinder_ingest_derive_replay_events_total` | counter | `zinder-ingest` | Derive tailer replay event count by status and error class. |
 | `zinder_ingest_derive_replay_blocks_total` | counter | `zinder-ingest` | Derive tailer replay block count by status and error class. |
 | `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before a derive tailer catch-up pass. |
@@ -132,6 +132,10 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
 | `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
 | `zinder_ingest_derive_replay_paused` | gauge | `zinder-ingest` | Compatibility operational gauge set to `1` only when derive replay is paused. |
+| `zinder_ingest_memory_pressure_ratio` | gauge | `zinder-ingest` | Scheduler pressure ratio. Uses cgroup working set (`memory.current - inactive_file`) over `memory.high` or `memory.max` when available, falling back to current cgroup pressure. |
+| `zinder_ingest_memory_current_pressure_ratio` | gauge | `zinder-ingest` | Raw cgroup `memory.current` pressure ratio over `memory.high` or `memory.max`. |
+| `zinder_ingest_memory_working_set_bytes` | gauge | `zinder-ingest` | Cgroup working set bytes after subtracting inactive file cache. |
+| `zinder_ingest_memory_cgroup_anon_bytes`, `zinder_ingest_memory_cgroup_file_bytes`, `zinder_ingest_memory_cgroup_inactive_file_bytes`, `zinder_ingest_memory_cgroup_active_file_bytes`, `zinder_ingest_memory_cgroup_kernel_bytes`, `zinder_ingest_memory_cgroup_slab_bytes` | gauge | `zinder-ingest` | cgroup `memory.stat` components used to distinguish anonymous heap pressure from reclaimable file cache. |
 | `zinder_ingest_transparent_spend_fact_resolution_total` | counter | `zinder-ingest` | Transparent spend facts resolved during canonical ingest by status: `resolved` or `unresolved`. |
 | `zinder_ingest_transparent_spend_fact_read_total` | counter | `zinder-ingest` | Transparent spend facts read while building derive contexts by status: `resolved` or `unresolved`. |
 | `zinder_ingest_transparent_spend_fact_requested_outpoint_count` | histogram | `zinder-ingest` | Unique transparent outpoints requested while building one derive context batch. |
@@ -294,7 +298,7 @@ local-binary smoke or compose-attached deploy.
 `mem_limit`, with network-specific defaults in `deploy/.env.<network>`.
 These limits are cgroup guardrails, not throughput controls. The
 application still owns bounded work units through canonical commit size,
-derive replay batch size, RocksDB WAL/cache budgets, and explicit
+derive replay batch size, RocksDB WAL/cache/write-buffer budgets, and explicit
 backpressure. A memory limit should catch a regression that escapes those
 bounds; it should not be the mechanism that makes normal bulk catchup fit.
 
@@ -305,11 +309,15 @@ under smaller limits so one runaway sidecar cannot starve the writer or the
 upstream Zebra process.
 
 `zinder-ingest` samples its cgroup and process RSS on a dedicated periodic
-task. The exported memory gauges are runtime health signals, not derive-replay
-progress signals, so they remain fresh while canonical catchup or derive replay
-spends a long time inside a single work pass. The derive replay budget gauges
-use the same current memory cadence, so `canonical-first` pressure state is
-observable even when the tailer is still finishing a retained-event pass.
+task. The scheduler pressure gauge uses cgroup working set so reclaimable file
+cache does not pause rebuildable derive work. The raw current-pressure gauge and
+`memory.stat` component gauges remain available for diagnosing page-cache growth,
+RocksDB cache, anonymous heap, and kernel/slab pressure separately. These memory
+gauges are runtime health signals, not derive-replay progress signals, so they
+remain fresh while canonical catchup or derive replay spends a long time inside a
+single work pass. The derive replay budget gauges use the same current memory
+cadence, so `canonical-first` pressure state is observable even when the tailer
+is still finishing a retained-event pass.
 
 ### Federation patterns
 
@@ -419,7 +427,7 @@ The loader shape is:
 5. Deserialize into the service-specific config type.
 6. Run `validate_config` before storage, source, or network-bind side effects.
 
-Use `ZINDER_` with `__` for nesting, for example `ZINDER_NODE__JSON_RPC_ADDR` and `ZINDER_QUERY__LISTEN_ADDR`. Service code should not read production configuration directly from `std::env`; test-only gates use the explicit `ZINDER_TEST_*` namespace (`ZINDER_TEST_LIVE`, `ZINDER_STORE_CRASH_*`) which is stripped from production reads in `zinder_runtime::zinder_environment_source`. There is no parallel `ZINDER_Z3_*` namespace; live tests reuse the production `ZINDER_NETWORK` and `ZINDER_NODE__*` schema (see [§Validation Tiers](#validation-tiers)).
+Use `ZINDER_` with `__` for nesting, for example `ZINDER_NETWORK__NAME`, `ZINDER_NODE__JSON_RPC_ADDR`, and `ZINDER_QUERY__LISTEN_ADDR`. Service code should not read production configuration directly from `std::env`; test-only gates use the explicit `ZINDER_TEST_*` namespace (`ZINDER_TEST_LIVE`, `ZINDER_STORE_CRASH_*`) which is stripped from production reads in `zinder_runtime::zinder_environment_source`. There is no parallel `ZINDER_Z3_*` namespace; live-test gates read the bare `ZINDER_NETWORK` selector before invoking production config loaders (see [§Validation Tiers](#validation-tiers)).
 
 Secrets pass through the env-var loader unchanged. Secret hygiene lives at the emit boundary: `--print-config`, structured logs, and `Debug` impls redact every secret regardless of how it was supplied. The ingest-control bearer token remains file-only ([ADR-0006](../adrs/0006-ingest-control-transport-security.md)).
 
@@ -649,4 +657,4 @@ T3 tests carry two gates: `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a first-lin
 
 Test functions under `tests/live/` use plain `snake_case_describing_behavior` names. Do not include `live`, `regtest`, `testnet`, `mainnet`, or `z3` in the function name; the directory and runtime parameterization handle that.
 
-`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live tests and production binaries read the same env-var schema (`ZINDER_NETWORK`, `ZINDER_NODE__*`); the full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
+`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live-test gates read `ZINDER_NETWORK`; production binaries read `ZINDER_NETWORK__NAME` through the nested config loader. Both use the same `ZINDER_NODE__*` node schema. The full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).

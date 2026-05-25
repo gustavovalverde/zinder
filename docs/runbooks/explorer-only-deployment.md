@@ -29,10 +29,11 @@ stay on a separate operational footprint (see
 
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
-| `ZINDER_NETWORK` | Yes | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Must match the `zinder-query` deployment. |
-| `ZINDER_EXPLORER__STORAGE_PATH` | Yes | Canonical store path; explorer opens the writer-owned derive store at its `derive` subdirectory. |
+| `ZINDER_NETWORK__NAME` | Yes | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Must match the `zinder-query` deployment. |
+| `ZINDER_STORAGE__PATH` | Yes | Canonical store path; explorer opens the writer-owned derive store at its `derive` subdirectory. |
+| `ZINDER_STORAGE__SECONDARY_PATH` | Yes | Process-unique RocksDB secondary metadata path for this explorer process. |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | Yes | gRPC listen address (e.g. `0.0.0.0:9087`). |
-| `ZINDER_EXPLORER__OPS_LISTEN_ADDR` | Yes | HTTP listen address for `/healthz`, `/readyz`, `/metrics`. |
+| `ZINDER_OPS__LISTEN_ADDR` | Yes | HTTP listen address for `/healthz`, `/readyz`, `/metrics`. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | Yes | gRPC URL of the upstream `zinder-query`. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | Optional | Path to a file containing the shared-secret bearer token. When set, every inbound gRPC request must carry `authorization: Bearer <token>`. |
 
@@ -85,10 +86,11 @@ Type=simple
 User=zinder
 WorkingDirectory=/var/lib/zinder-explorer
 ExecStart=/usr/local/bin/zinder-explorer
-Environment=ZINDER_NETWORK=zcash-mainnet
-Environment=ZINDER_EXPLORER__STORAGE_PATH=/var/lib/zinder/store
+Environment=ZINDER_NETWORK__NAME=zcash-mainnet
+Environment=ZINDER_STORAGE__PATH=/var/lib/zinder/store
+Environment=ZINDER_STORAGE__SECONDARY_PATH=/var/lib/zinder/explorer-secondary
 Environment=ZINDER_EXPLORER__LISTEN_ADDR=0.0.0.0:9087
-Environment=ZINDER_EXPLORER__OPS_LISTEN_ADDR=0.0.0.0:9088
+Environment=ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9088
 Environment=ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT=http://10.1.0.10:9085
 Environment=ZINDER_EXPLORER__BEARER_TOKEN_PATH=/etc/zinder/bearer-token
 Restart=on-failure
@@ -105,10 +107,11 @@ services:
     image: zinder/zinder-explorer:latest
     restart: unless-stopped
     environment:
-      ZINDER_NETWORK: zcash-mainnet
-      ZINDER_EXPLORER__STORAGE_PATH: /var/lib/zinder/store
+      ZINDER_NETWORK__NAME: zcash-mainnet
+      ZINDER_STORAGE__PATH: /var/lib/zinder/store
+      ZINDER_STORAGE__SECONDARY_PATH: /var/lib/zinder/explorer-secondary
       ZINDER_EXPLORER__LISTEN_ADDR: 0.0.0.0:9087
-      ZINDER_EXPLORER__OPS_LISTEN_ADDR: 0.0.0.0:9088
+      ZINDER_OPS__LISTEN_ADDR: 0.0.0.0:9088
       ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: http://zinder-query:9085
       ZINDER_EXPLORER__BEARER_TOKEN_PATH: /run/secrets/bearer_token
     ports:

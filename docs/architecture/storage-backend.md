@@ -171,7 +171,7 @@ Readiness causes and operational metrics are owned by [Service operations](servi
   active-memtable size.
 - WAL ceiling diagnostics through `zinder_store_wal_bytes` (live `*.log`
   bytes inside the store path) and `zinder_store_wal_bytes_limit` (the
-  configured `storage.tuning.max_wal_bytes`). Both feed
+  configured role-scoped RocksDB `max_wal_bytes`). Both feed
   `ZinderStoreWalGrowth` per [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
 - Block-cache capacity and usage through dedicated gauges
   `zinder_store_block_cache_capacity_bytes` and

@@ -126,7 +126,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         &lightwalletd_config.storage.path,
         &lightwalletd_config.storage.secondary_path,
         zinder_store::ChainStoreOptions {
-            tuning: lightwalletd_config.storage.tuning,
+            rocksdb_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
             ..zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network)
         },
     ) {

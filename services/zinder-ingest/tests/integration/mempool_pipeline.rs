@@ -61,7 +61,7 @@ fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> 
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: &[],
-            tuning: zinder_store::StorageTuning::for_local_tests(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)
 }

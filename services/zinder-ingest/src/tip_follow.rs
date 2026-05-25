@@ -60,8 +60,8 @@ pub struct TipFollowConfig {
     pub node: NodeTarget,
     /// Local canonical store path.
     pub storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget applied when opening the store.
-    pub storage_tuning: zinder_store::StorageTuning,
+    /// Bounded `RocksDB` resource budget applied when opening the canonical store.
+    pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Number of near-tip blocks that may be replaced by a reorg. Must be greater than zero.
     pub reorg_window_blocks: u32,
     /// Delay between tip polls when no cancellation is requested. Must be greater than zero.
@@ -101,7 +101,7 @@ where
 pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainStore, IngestError> {
     let mut store_options = ChainStoreOptions::for_network(config.node.network);
     store_options.reorg_window_blocks = config.reorg_window_blocks;
-    store_options.tuning = config.storage_tuning;
+    store_options.rocksdb_resource_budget = config.canonical_rocksdb_budget;
     PrimaryChainStore::open(&config.storage_path, store_options).map_err(IngestError::from)
 }
 
@@ -1387,7 +1387,7 @@ mod tests {
                 zinder_source::DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
             ),
             storage_path: storage_path.to_owned(),
-            storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
             raw_blob_policy: RawBlobPolicy::All,
             network_upgrade_activations: Arc::new(
                 zinder_testkit::sample_regtest_upgrade_activations(),

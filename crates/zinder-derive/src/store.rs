@@ -23,7 +23,7 @@ use rust_rocksdb::{
 };
 use zinder_core::{BlockHeight, ChainEpoch};
 use zinder_store::{
-    ChainEvent, StorageTuning, build_block_based_table_factory, build_block_cache,
+    ChainEvent, RocksDbResourceBudget, build_block_based_table_factory, build_block_cache,
     build_primary_db_options, build_secondary_db_options,
 };
 
@@ -99,10 +99,13 @@ const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
 /// defaults (one block-based table factory bound to the shared block
 /// cache). Two write buffers let one rotate to immutable while another
 /// keeps absorbing puts during compaction.
-fn column_family_options(cache: &Cache) -> Options {
+fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResourceBudget) -> Options {
     let mut options = Options::default();
     options.set_block_based_table_factory(&build_block_based_table_factory(cache));
-    options.set_max_write_buffer_number(2);
+    options.set_write_buffer_size(
+        usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
+    );
+    options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
     options
 }
 
@@ -153,9 +156,8 @@ impl DeriveStoreTable {
 
 /// Configurable knobs the binary applies before opening the database.
 ///
-/// `tuning` ships with [`StorageTuning::derive_defaults`] (half the
-/// canonical-store budget); operators override individual fields through
-/// `[storage.tuning]` in their TOML.
+/// `rocksdb_resource_budget` ships with
+/// [`RocksDbResourceBudget::derive_defaults`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeriveStoreOptions {
     /// When set, every write is flushed to the OS page cache before returning.
@@ -167,7 +169,7 @@ pub struct DeriveStoreOptions {
     /// [`DeriveStore::consumer_column_family`].
     pub consumer_column_families: &'static [&'static str],
     /// Bounded `RocksDB` resource budget applied at open time.
-    pub tuning: StorageTuning,
+    pub rocksdb_resource_budget: RocksDbResourceBudget,
 }
 
 impl Default for DeriveStoreOptions {
@@ -175,7 +177,7 @@ impl Default for DeriveStoreOptions {
         Self {
             sync_writes: false,
             consumer_column_families: &[],
-            tuning: StorageTuning::derive_defaults(),
+            rocksdb_resource_budget: RocksDbResourceBudget::derive_defaults(),
         }
     }
 }
@@ -266,21 +268,23 @@ impl DeriveStore {
     ) -> Result<Self, DeriveStoreError> {
         let path = path.as_ref();
         options
-            .tuning
+            .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
-        let block_cache = build_block_cache(options.tuning.block_cache_bytes);
-        let db_options = build_primary_db_options(options.tuning, &block_cache);
+        let block_cache = build_block_cache(options.rocksdb_resource_budget.block_cache_bytes);
+        let db_options = build_primary_db_options(options.rocksdb_resource_budget, &block_cache);
         let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
             ColumnFamilyDescriptor::new(
                 table.column_family_name(),
-                column_family_options(&block_cache),
+                column_family_options(&block_cache, options.rocksdb_resource_budget),
             )
         });
-        let consumer_families = options
-            .consumer_column_families
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, column_family_options(&block_cache)));
+        let consumer_families = options.consumer_column_families.iter().map(|name| {
+            ColumnFamilyDescriptor::new(
+                *name,
+                column_family_options(&block_cache, options.rocksdb_resource_budget),
+            )
+        });
         let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
         let db = DB::open_cf_descriptors(&db_options, path, column_families).map_err(|source| {
             DeriveStoreError::Open {
@@ -322,21 +326,23 @@ impl DeriveStore {
         let primary_path = primary_path.as_ref();
         let secondary_path = secondary_path.as_ref();
         options
-            .tuning
+            .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
-        let block_cache = build_block_cache(options.tuning.block_cache_bytes);
-        let db_options = build_secondary_db_options(options.tuning, &block_cache);
+        let block_cache = build_block_cache(options.rocksdb_resource_budget.block_cache_bytes);
+        let db_options = build_secondary_db_options(options.rocksdb_resource_budget, &block_cache);
         let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
             ColumnFamilyDescriptor::new(
                 table.column_family_name(),
-                column_family_options(&block_cache),
+                column_family_options(&block_cache, options.rocksdb_resource_budget),
             )
         });
-        let consumer_families = options
-            .consumer_column_families
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, column_family_options(&block_cache)));
+        let consumer_families = options.consumer_column_families.iter().map(|name| {
+            ColumnFamilyDescriptor::new(
+                *name,
+                column_family_options(&block_cache, options.rocksdb_resource_budget),
+            )
+        });
         let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
         let db = DB::open_cf_descriptors_as_secondary(
             &db_options,
@@ -1013,7 +1019,7 @@ mod tests {
     fn opening_store_rejects_zero_wal_budget() -> Result<()> {
         let tempdir = tempdir()?;
         let mut options = DeriveStoreOptions::default();
-        options.tuning.max_wal_bytes = 0;
+        options.rocksdb_resource_budget.max_wal_bytes = 0;
 
         let outcome = DeriveStore::open(tempdir.path(), options);
 
@@ -1029,7 +1035,7 @@ mod tests {
     fn opening_store_rejects_negative_open_file_budget() -> Result<()> {
         let tempdir = tempdir()?;
         let mut options = DeriveStoreOptions::default();
-        options.tuning.max_open_files = -1;
+        options.rocksdb_resource_budget.max_open_files = -1;
 
         let outcome = DeriveStore::open(tempdir.path(), options);
 

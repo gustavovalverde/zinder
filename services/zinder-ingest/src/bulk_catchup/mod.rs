@@ -62,8 +62,8 @@ pub struct BulkCatchupRunConfig {
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
     pub storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget applied when opening the store.
-    pub storage_tuning: zinder_store::StorageTuning,
+    /// Bounded `RocksDB` resource budget applied when opening the canonical store.
+    pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// First block height to ingest.
     pub from_height: BlockHeight,
     /// Last block height to ingest.
@@ -230,7 +230,7 @@ where
     Source: NodeSource,
 {
     let store_options = ChainStoreOptions {
-        tuning: config.storage_tuning,
+        rocksdb_resource_budget: config.canonical_rocksdb_budget,
         ..ChainStoreOptions::for_network(config.node.network)
     };
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
@@ -601,7 +601,7 @@ where
         + Sync,
 {
     let store_options = ChainStoreOptions {
-        tuning: config.storage_tuning,
+        rocksdb_resource_budget: config.canonical_rocksdb_budget,
         ..ChainStoreOptions::for_network(config.node.network)
     };
     validate_bulk_catchup_finality_bound(
@@ -1151,7 +1151,7 @@ mod tests {
                     .ok_or("invalid target response bytes")?,
                 source_fetch_max_in_flight_requests: NonZeroU32::new(2)
                     .ok_or("invalid source fetch requests")?,
-                source_fetch_max_in_flight_bytes: NonZeroU64::new(25 * 1024 * 1024)
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(48 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 fact_build_concurrency: 2,
@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_fetch_watermark_blocks_segments_until_active_bytes_release()
+    async fn source_fetch_counts_completed_reassembly_bytes_against_watermark()
     -> Result<(), Box<dyn Error>> {
         let fetch_events = Arc::new(Mutex::new(Vec::new()));
         let source = DelayedSegmentSource {
@@ -1214,7 +1214,70 @@ mod tests {
                     .ok_or("invalid target response bytes")?,
                 source_fetch_max_in_flight_requests: NonZeroU32::new(8)
                     .ok_or("invalid source fetch requests")?,
-                source_fetch_max_in_flight_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(36 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                fact_build_concurrency: 2,
+                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid fact build artifact bytes")?,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+        );
+        futures_util::pin_mut!(fact_build_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(next_block) = fact_build_stream.next().await {
+            observed_heights.push(next_block?.block_header.height.value());
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
+        let fetch_events = fetch_events.lock().clone();
+        let finish_first_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Finished {
+                start_height: BlockHeight::new(1),
+            },
+        )?;
+        let start_third_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Started {
+                start_height: BlockHeight::new(5),
+            },
+        )?;
+        assert!(
+            finish_first_segment < start_third_segment,
+            "expected completed out-of-order segment bytes to block segment 5 until segment 1 emitted; events: {fetch_events:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_fetch_watermark_covers_active_and_completed_bytes() -> Result<(), Box<dyn Error>>
+    {
+        let fetch_events = Arc::new(Mutex::new(Vec::new()));
+        let source = DelayedSegmentSource {
+            fetch_events: Arc::clone(&fetch_events),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let fact_build_stream = build_fact_build_stream(
+            &source,
+            BulkCatchupFactBuildStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(6),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(24 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 fact_build_concurrency: 2,
@@ -1775,7 +1838,7 @@ mod tests {
             ),
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
-            storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+            canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
             raw_blob_policy: RawBlobPolicy::All,
             network_upgrade_activations: Arc::new(
                 zinder_testkit::sample_regtest_upgrade_activations(),
@@ -1903,7 +1966,10 @@ mod tests {
                 next_height = height.next();
             }
 
-            Ok(SourceChainSegment::connected_blocks(blocks))
+            Ok(SourceChainSegment::connected_blocks_with_stats(
+                blocks,
+                SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024),
+            ))
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

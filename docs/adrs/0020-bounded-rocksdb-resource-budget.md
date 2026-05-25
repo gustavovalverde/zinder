@@ -16,11 +16,11 @@ Related: [ADR-0001](0001-rocksdb-canonical-store.md),
 4. The next start replays the WAL into memtables before the store is usable. RocksDB needs roughly 2.5× the WAL size in resident memory during replay (memtable plus per-CF index/bloom pins from `max_open_files = -1`).
 5. On a RAM-constrained host the kernel kills `zinder-ingest` before replay completes. The container restarts, replays the same WAL, gets killed again. The cycle never breaks.
 
-[ADR-0001](0001-rocksdb-canonical-store.md) states that "RocksDB tuning is part of Zinder's operational surface" but does not say *where* the choices live. Before this ADR, every tuning choice was a hardcoded constant inside two separate option factories (one in `zinder-store/src/kv/rocksdb.rs` and one in `services/zinder-explorer/src/store.rs`). Both factories used bare `Options::default()` plus a handful of create flags. Neither set a WAL ceiling, a block cache, or an open-file cap. The two factories were not aware of each other.
+[ADR-0001](0001-rocksdb-canonical-store.md) states that "RocksDB tuning is part of Zinder's operational surface" but does not say *where* the choices live. Before this ADR, every resource choice was a hardcoded constant inside separate option factories. Those factories used bare `Options::default()` plus a handful of create flags. They did not set a WAL ceiling, a block cache, an open-file cap, or a memtable budget from one shared contract.
 
 Two problems compounded:
 
-- **No tuning surface.** Operators could not raise the cache or cap the WAL without recompiling.
+- **No resource-budget surface.** Operators could not raise the cache or cap the WAL without recompiling.
 - **No central source of truth.** A fix applied to the canonical store would leave the derive plane vulnerable to the same OOM trap, and any future RocksDB-using component would re-invent the same defaults.
 
 ## Decision
@@ -40,19 +40,21 @@ These four are encoded in `zinder_store::build_primary_db_options` and `zinder_s
 
 ### Tier 2 — Bounded resource budget (operator-configurable)
 
-Three knobs cap the open-time RAM peak. They live under `[storage.tuning]` for the canonical store (writer + secondaries) and `[explorer.tuning]` for the derive plane:
+Five knobs cap the open-time and write-time RAM peak. They live under `[storage.canonical.rocksdb]` for canonical store instances and `[storage.derive.rocksdb]` for derive store instances:
 
 | Knob | Default (canonical) | Default (derive) | Effect |
 | --- | --- | --- | --- |
 | `block_cache_bytes` | 512 MiB | 128 MiB | Bounded LRU cache size shared by data, index, and bloom blocks. Without it, RocksDB pins index and bloom blocks per-SST in resident memory, which scales with store size. |
 | `max_wal_bytes` | 256 MiB | 64 MiB | Total live WAL ceiling. Crossing it triggers a memtable flush so the WAL truncates. The default of 0 (RocksDB's own) means "never trigger from WAL size," which is the bug. |
 | `max_open_files` | 512 | 256 | Open SST file handle cap. The default of -1 (RocksDB's own) means "open every SST and pin its metadata," which scales with store size. |
+| `write_buffer_bytes` | 16 MiB | 8 MiB | Per-column-family mutable memtable size. This keeps write bursts bounded instead of inheriting RocksDB's larger default in every column family. |
+| `max_write_buffer_count` | 2 | 2 | Per-column-family mutable plus immutable memtable count. Two buffers let one flush while another accepts writes without allowing unbounded memtable growth. |
 
-The typed value `zinder_store::StorageTuning` carries these three numbers. Both the canonical store (`ChainStoreOptions::tuning`) and the derive store (`DeriveStoreOptions::tuning`) consume the same type.
+The typed value `zinder_store::RocksDbResourceBudget` carries these numbers. Both the canonical store (`ChainStoreOptions::rocksdb_resource_budget`) and the derive store (`DeriveStoreOptions::rocksdb_resource_budget`) consume the same type.
 
 `block_cache_index_and_filter_blocks = true` and `pin_l0_filter_and_index_blocks_in_cache = true` are paired with the bounded block cache: index and bloom blocks live inside the bounded cache instead of being pinned per-SST. This caps at-rest metadata budget at the cache size.
 
-A validation gate in `validate_chain_store_options` rejects values below the minimums (`StorageTuning::MIN_BLOCK_CACHE_BYTES` = 4 MiB, `MIN_MAX_WAL_BYTES` = 4 MiB, `MIN_MAX_OPEN_FILES` = 32). `max_wal_bytes = 0` is specifically rejected because, on writer-posture stores, it disables the safety trigger; the schema is symmetric on secondaries (where the field is inert) so the same minimum applies on both sides.
+A validation gate rejects values below the minimums (`RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES` = 4 MiB, `MIN_MAX_WAL_BYTES` = 4 MiB, `MIN_MAX_OPEN_FILES` = 32, `MIN_WRITE_BUFFER_BYTES` = 4 MiB, `MIN_MAX_WRITE_BUFFER_COUNT` = 2). `max_wal_bytes = 0` is specifically rejected because, on writer-posture stores, it disables the safety trigger; the schema is symmetric on secondaries (where the field is inert) so the same minimum applies on both sides.
 
 ### Tier 3 — Phase-aware flush policy
 
@@ -82,11 +84,11 @@ Two alerts in `observability/prometheus/rules/zinder-readiness.yml`:
 - **Operators have a tunable surface.** RAM-constrained hosts can drop the cache to 128 MiB; high-throughput hosts can raise to 1 GiB. The invariants stay locked.
 - **Operators cannot disable WAL or atomic flush.** This is deliberate.
 - **The metric set lets SREs alert before the trap fires.** Watching `zinder_store_wal_bytes / zinder_store_wal_bytes_limit` and the `open_storage` p95 catches both the pre-trap state and the post-trap restart loop.
-- **All existing tests use `StorageTuning::for_local_tests`** (32 MiB cache, 16 MiB WAL ceiling, 64 open files) so unit tests keep their tight memory footprint while exercising the bounded code path.
+- **All existing tests use `RocksDbResourceBudget::for_local_tests`** (32 MiB cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers) so unit tests keep their tight memory footprint while exercising the bounded code path.
 
 ## Alternatives considered
 
 - **A single hardcoded fix in `primary_db_options`.** Closes the trap for the canonical store only; leaves the derive plane and any future component vulnerable. Rejected.
-- **A `[rocksdb]` config section exposing every option.** Surfaces too many knobs that operators have no signal to tune; many of them break invariants if mis-set. Rejected in favor of the curated three-knob `[storage.tuning]` surface plus the locked invariants.
-- **`StorageTuning` as a serde-deserializable type directly.** Forced every consuming crate to take a hard dep on serde just to construct one. Rejected; the type is a plain struct, with serde shaping done at the runtime config boundary (`StorageTuningSection`).
+- **A `[rocksdb]` config section exposing every option.** Surfaces too many knobs that operators have no signal to tune; many of them break invariants if mis-set. Rejected in favor of curated role-scoped `[storage.<role>.rocksdb]` budgets plus the locked invariants.
+- **`RocksDbResourceBudget` as a serde-deserializable type directly.** Forced every consuming crate to take a hard dep on serde just to construct one. Rejected; the type is a plain struct, with serde shaping done at the runtime config boundary (`RocksDbResourceBudgetSection`).
 - **Filesystem-scrape `du` for WAL bytes vs RocksDB property API.** `rust-rocksdb` 0.47 does not expose `DB::GetSortedWalFiles` or a per-DB WAL-size property. A filesystem scan of `*.log` is one syscall plus N stat calls per commit; the overhead is negligible. Accepted.

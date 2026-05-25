@@ -21,13 +21,22 @@ path = "/var/run/auth/.cookie"
 [storage]
 path = "/var/lib/zinder/store"
 
-# Bounded RocksDB resource budget. Uncomment to override the canonical
-# defaults (512 MiB block cache, 256 MiB max WAL, 512 max open files).
+# Bounded RocksDB resource budgets. Uncomment per role only when the host
+# memory envelope requires a different budget.
 # See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
-# [storage.tuning]
+# [storage.canonical.rocksdb]
 # block_cache_bytes = 536870912
 # max_wal_bytes = 268435456
 # max_open_files = 512
+# write_buffer_bytes = 16777216
+# max_write_buffer_count = 2
+#
+# [storage.derive.rocksdb]
+# block_cache_bytes = 134217728
+# max_wal_bytes = 67108864
+# max_open_files = 256
+# write_buffer_bytes = 8388608
+# max_write_buffer_count = 2
 
 [ingest]
 source = "zebra-json-rpc"

@@ -44,7 +44,7 @@ pub(crate) fn live_bulk_catchup_run_config(
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
-        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations,
         from_height,

@@ -156,7 +156,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         &query_config.storage.path,
         &query_config.storage.secondary_path,
         zinder_store::ChainStoreOptions {
-            tuning: query_config.storage.tuning,
+            rocksdb_resource_budget: query_config.storage.canonical_rocksdb_budget,
             ..zinder_store::ChainStoreOptions::for_network(query_config.network)
         },
     ) {
@@ -174,7 +174,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: DeriveStore::bundled_consumer_column_families(),
-            tuning: query_config.storage.tuning,
+            rocksdb_resource_budget: query_config.storage.derive_rocksdb_budget,
         },
     ) {
         Ok(derive_store) => {

@@ -54,7 +54,12 @@ The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
 default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
 fact build may complete out of order, but ordered reassembly is the only place
-that releases blocks to the serial finalization boundary.
+that releases blocks to the serial finalization boundary. Completed out-of-order
+source segments keep their byte reservation until emitted. Each request reserves
+`node.max_response_bytes` before it is sent, then shrinks to the measured
+response size after the segment is decoded. `source_fetch_max_in_flight_bytes`
+therefore bounds both worst-case active responses and completed reassembly
+bytes; config validation requires it to be at least `node.max_response_bytes`.
 
 The durable writer remains serial, but subtree-root attachment, checkpoint
 tree-state fetch, canonical commit, and flush run as one in-flight commit

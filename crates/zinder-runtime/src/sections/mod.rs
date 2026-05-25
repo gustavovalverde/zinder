@@ -22,7 +22,10 @@ pub use ops::{OpsSection, OpsToml, resolve_ops_listen_addr};
 pub use retention::{ResolvedRetention, RetentionSection, RetentionToml, resolve_retention};
 pub use service::ServiceIdentifier;
 pub use storage::{
-    PrimaryStorageSection, PrimaryStorageToml, ResolvedPrimaryStorage, ResolvedSecondaryStorage,
-    SecondaryStorageSection, SecondaryStorageToml, StorageTuningSection, StorageTuningToml,
-    resolve_primary_storage, resolve_secondary_storage, resolve_storage_tuning,
+    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, PrimaryStorageSection,
+    PrimaryStorageToml, ResolvedCanonicalSecondaryStorage, ResolvedPrimaryStorage,
+    ResolvedSecondaryStorage, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    SecondaryStorageSection, SecondaryStorageToml, StorageRoleSection, StorageRoleToml,
+    resolve_canonical_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_derive_rocksdb_budget, resolve_primary_storage, resolve_secondary_storage,
 };

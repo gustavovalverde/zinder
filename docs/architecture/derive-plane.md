@@ -182,9 +182,12 @@ Configuration follows the canonical TOML conventions ([Public Interfaces §Confi
 [ops]
 listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
 
+[storage]
+path = "/var/lib/zinder/store"
+secondary_path = "/var/lib/zinder/explorer-secondary"
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
-storage_path = "/var/lib/zinder"          # canonical path; derive store is nested under it
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9101"   # zinder-query gRPC
 

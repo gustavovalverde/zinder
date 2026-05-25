@@ -21,8 +21,8 @@ The decisions that govern this plane:
 
 `zinder-explorer` is a fourth deployable alongside `zinder-ingest`, `zinder-query`, and `zinder-compat-lightwalletd`. It:
 
-- **Consumes** the writer-owned derive store as a RocksDB secondary under `explorer.storage_path`, plus `WalletQuery` over gRPC for federated read paths.
-- **Owns** no primary RocksDB. `explorer.storage_path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
+- **Consumes** the writer-owned derive store as a RocksDB secondary under `storage.path`, plus `WalletQuery` over gRPC for federated read paths.
+- **Owns** no primary RocksDB. `storage.path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
 - **Produces** the `ExplorerQuery` gRPC service plus federated additions to `WalletQuery` (currently `TransparentAddressBalance`'s mempool overlay).
 - **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret.
 
@@ -197,9 +197,12 @@ Configuration follows the canonical TOML conventions:
 [ops]
 listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
 
+[storage]
+path = "/var/lib/zinder/store"
+secondary_path = "/var/lib/zinder/explorer-secondary"
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
-storage_path = "/var/lib/zinder-explorer"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9101"   # zinder-query gRPC
 
@@ -213,9 +216,10 @@ When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enfo
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
 - `ZINDER_EXPLORER__LISTEN_ADDR`
-- `ZINDER_EXPLORER__STORAGE_PATH`
 - `ZINDER_EXPLORER__BEARER_TOKEN_PATH`
 - `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT`
+- `ZINDER_STORAGE__PATH`
+- `ZINDER_STORAGE__SECONDARY_PATH`
 - `ZINDER_OPS__LISTEN_ADDR` (shared with every Zinder binary; default `127.0.0.1:9069` for the explorer)
 
 ## Failure isolation

@@ -39,6 +39,8 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         )),
         "{stdout}"
     );
+    assert!(stdout.contains("[storage.canonical.rocksdb]"), "{stdout}");
+    assert!(!stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
     assert!(stdout.contains("[ingest_control]"), "{stdout}");
     assert!(
         stdout.contains("addr = \"http://127.0.0.1:9100\""),
@@ -111,6 +113,28 @@ fn ingest_only_section_is_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+#[test]
+fn derive_storage_section_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("compat-derive-store");
+    let secondary_path = tempdir.path().join("compat-derive-secondary");
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_with_derive_storage_toml(&storage_path, &secondary_path)?,
+    )?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("unknown field `derive`"), "{stderr}");
+
+    Ok(())
+}
+
 fn compat_config_toml(storage_path: &Path, secondary_path: &Path) -> eyre::Result<String> {
     Ok(format!(
         r#"[network]
@@ -119,6 +143,29 @@ name = "zcash-regtest"
 [storage]
 path = "{}"
 secondary_path = "{}"
+
+[compat]
+listen_addr = "127.0.0.1:9067"
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?,
+    ))
+}
+
+fn compat_config_with_derive_storage_toml(
+    storage_path: &Path,
+    secondary_path: &Path,
+) -> eyre::Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+
+[storage.derive.rocksdb]
+block_cache_bytes = 134217728
 
 [compat]
 listen_addr = "127.0.0.1:9067"

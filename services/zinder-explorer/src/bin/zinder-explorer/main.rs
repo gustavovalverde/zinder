@@ -37,11 +37,11 @@ struct Cli {
     #[arg(long)]
     network: Option<String>,
     /// Filesystem path of the canonical store the writer opens as primary.
-    ///
-    /// The derive store the explorer reads in secondary mode is at the
-    /// `derive` subdirectory of this path (see [`DeriveStore::path_for_canonical`]).
     #[arg(long = "storage-path")]
     storage_path: Option<PathBuf>,
+    /// Process-unique `RocksDB` secondary metadata path.
+    #[arg(long = "secondary-path")]
+    secondary_path: Option<PathBuf>,
     /// `ExplorerQuery` gRPC listen address, such as 127.0.0.1:9068.
     #[arg(long = "listen-addr")]
     listen_addr: Option<SocketAddr>,
@@ -157,7 +157,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         event = "explorer_started",
         network = encode_zinder_native_chain_name(explorer_config.network),
         listen_addr = %explorer_config.listen_addr,
-        storage_path = %explorer_config.storage_path.display(),
+        storage_path = %explorer_config.storage.path.display(),
         "explorer query gRPC server started"
     );
 
@@ -184,15 +184,12 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
 fn open_canonical_store(
     explorer_config: &ExplorerConfig,
 ) -> Result<SecondaryChainStore, ExplorerConfigError> {
-    let secondary_path = explorer_config
-        .storage_path
-        .join("secondary-explorer-canonical");
     let open_storage_phase = StartupPhase::OpenStorage.start();
     match SecondaryChainStore::open(
-        &explorer_config.storage_path,
-        secondary_path,
+        &explorer_config.storage.path,
+        &explorer_config.storage.secondary_path,
         ChainStoreOptions {
-            tuning: explorer_config.storage_tuning,
+            rocksdb_resource_budget: explorer_config.storage.canonical_rocksdb_budget,
             ..ChainStoreOptions::for_network(explorer_config.network)
         },
     ) {
@@ -210,8 +207,8 @@ fn open_canonical_store(
 }
 
 fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, ExplorerConfigError> {
-    let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage_path);
-    let secondary_path = derive_path.join("secondary-explorer");
+    let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage.path);
+    let secondary_path = explorer_config.storage.secondary_path.join("derive");
     let open_storage_phase = StartupPhase::OpenStorage.start();
     match DeriveStore::open_secondary(
         &derive_path,
@@ -219,7 +216,7 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
         DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: DeriveStore::bundled_consumer_column_families(),
-            tuning: explorer_config.storage_tuning,
+            rocksdb_resource_budget: explorer_config.storage.derive_rocksdb_budget,
         },
     ) {
         Ok(handle) => {
@@ -318,6 +315,7 @@ impl From<Cli> for ExplorerConfigOverrides {
         Self {
             network: cli.network,
             storage_path: cli.storage_path,
+            secondary_path: cli.secondary_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
             bearer_token_path: cli.bearer_token_path,

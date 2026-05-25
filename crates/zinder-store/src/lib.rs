@@ -18,7 +18,7 @@ mod kv;
 mod mempool_event;
 mod mempool_event_store;
 mod proto_codec;
-mod storage_tuning;
+mod rocksdb_resource_budget;
 mod store_error;
 mod subtree_root;
 mod transaction_artifact;
@@ -72,7 +72,7 @@ pub use proto_codec::{
     transparent_mempool_spend_message, transparent_output_entry_message,
     transparent_output_message,
 };
-pub use storage_tuning::StorageTuning;
+pub use rocksdb_resource_budget::RocksDbResourceBudget;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::{

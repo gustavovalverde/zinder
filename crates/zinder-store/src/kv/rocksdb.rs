@@ -6,7 +6,7 @@ use rust_rocksdb::{
     Snapshot, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 
-use crate::{StorageTuning, StoreError, format::StoreKey, kv::StorageTable};
+use crate::{RocksDbResourceBudget, StoreError, format::StoreKey, kv::StorageTable};
 
 type PrefixScanVisitor<'visitor> =
     &'visitor mut dyn FnMut(&[u8], &[u8]) -> Result<PrefixScanControl, StoreError>;
@@ -25,16 +25,16 @@ impl RocksChainStore {
     pub(crate) fn open_primary(
         path: impl AsRef<Path>,
         sync_writes: bool,
-        tuning: StorageTuning,
+        rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
-        let block_cache = build_block_cache(tuning.block_cache_bytes);
-        let db_options = build_primary_db_options(tuning, &block_cache);
+        let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
+        let db_options = build_primary_db_options(rocksdb_resource_budget, &block_cache);
         let column_families = StorageTable::all()
             .into_iter()
             .map(|table| {
                 ColumnFamilyDescriptor::new(
                     table.column_family_name(),
-                    column_family_options(table, &block_cache),
+                    column_family_options(table, &block_cache, rocksdb_resource_budget),
                 )
             })
             .collect::<Vec<_>>();
@@ -47,8 +47,8 @@ impl RocksChainStore {
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
             block_cache,
-            block_cache_capacity_bytes: tuning.block_cache_bytes,
-            wal_size_limit_bytes: tuning.max_wal_bytes,
+            block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
+            wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
         };
         store.record_rocksdb_properties();
 
@@ -59,16 +59,16 @@ impl RocksChainStore {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         sync_writes: bool,
-        tuning: StorageTuning,
+        rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
-        let block_cache = build_block_cache(tuning.block_cache_bytes);
-        let db_options = build_secondary_db_options(tuning, &block_cache);
+        let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
+        let db_options = build_secondary_db_options(rocksdb_resource_budget, &block_cache);
         let column_families = StorageTable::all()
             .into_iter()
             .map(|table| {
                 ColumnFamilyDescriptor::new(
                     table.column_family_name(),
-                    column_family_options(table, &block_cache),
+                    column_family_options(table, &block_cache, rocksdb_resource_budget),
                 )
             })
             .collect::<Vec<_>>();
@@ -86,8 +86,8 @@ impl RocksChainStore {
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
             block_cache,
-            block_cache_capacity_bytes: tuning.block_cache_bytes,
-            wal_size_limit_bytes: tuning.max_wal_bytes,
+            block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
+            wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
         };
         store.record_rocksdb_properties();
 
@@ -441,13 +441,16 @@ impl RocksChainStore {
 /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
 /// for the full design.
 #[must_use]
-pub fn build_primary_db_options(tuning: StorageTuning, cache: &Cache) -> Options {
+pub fn build_primary_db_options(
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    cache: &Cache,
+) -> Options {
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
     db_options.create_missing_column_families(true);
     db_options.enable_statistics();
-    db_options.set_max_total_wal_size(tuning.max_wal_bytes);
-    db_options.set_max_open_files(tuning.max_open_files);
+    db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
+    db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_atomic_flush(true);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
@@ -461,12 +464,15 @@ pub fn build_primary_db_options(tuning: StorageTuning, cache: &Cache) -> Options
 /// (block cache, open file handles) apply identically because the secondary's
 /// open-time RAM peak grows with store size the same way the primary's does.
 #[must_use]
-pub fn build_secondary_db_options(tuning: StorageTuning, cache: &Cache) -> Options {
+pub fn build_secondary_db_options(
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    cache: &Cache,
+) -> Options {
     let mut db_options = Options::default();
     db_options.create_if_missing(false);
     db_options.create_missing_column_families(false);
     db_options.enable_statistics();
-    db_options.set_max_open_files(tuning.max_open_files);
+    db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }
@@ -487,7 +493,7 @@ pub fn build_block_cache(capacity_bytes: u64) -> Cache {
 /// Builds the shared `BlockBasedOptions` every column family routes through.
 ///
 /// Index and filter blocks are accounted to `cache` so the at-rest
-/// metadata budget stays bounded by [`StorageTuning::block_cache_bytes`].
+/// metadata budget stays bounded by [`RocksDbResourceBudget::block_cache_bytes`].
 /// Public because the derive store re-uses the same factory; see
 /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 #[must_use]
@@ -1001,9 +1007,15 @@ fn usize_to_f64(sample: usize) -> f64 {
 /// shrinks the writer's resident memtable footprint by an order of magnitude.
 const SMALL_CF_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-fn column_family_options(table: StorageTable, cache: &Cache) -> Options {
+fn column_family_options(
+    table: StorageTable,
+    cache: &Cache,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+) -> Options {
     let mut options = Options::default();
     options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+    options.set_write_buffer_size(write_buffer_bytes_for_table(table, rocksdb_resource_budget));
+    options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
 
     if table == StorageTable::ReorgWindow {
         options.set_prefix_extractor(SliceTransform::create(
@@ -1013,10 +1025,21 @@ fn column_family_options(table: StorageTable, cache: &Cache) -> Options {
         ));
         options.set_memtable_prefix_bloom_ratio(0.2);
         options.set_optimize_filters_for_hits(true);
-        options.set_write_buffer_size(SMALL_CF_WRITE_BUFFER_BYTES);
     }
 
     options
+}
+
+fn write_buffer_bytes_for_table(
+    table: StorageTable,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+) -> usize {
+    let budgeted_bytes =
+        usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX);
+    if table == StorageTable::ReorgWindow {
+        return budgeted_bytes.min(SMALL_CF_WRITE_BUFFER_BYTES);
+    }
+    budgeted_bytes
 }
 
 fn reorg_window_visibility_prefix(key: &[u8]) -> &[u8] {

@@ -108,24 +108,28 @@ Option B is the same path documented under [Initial sync § Forked store](initia
 
 ## Operator-tunable knobs
 
-The current code applies a three-tier bounded resource budget at open. Two tiers are operator-configurable through `[storage.tuning]` (canonical store) and `[explorer.tuning]` (derive store); the third is locked in code as an architectural invariant. The full design lives in [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
+The current code applies role-scoped bounded resource budgets at open. Operators configure the canonical store through `[storage.canonical.rocksdb]` and the derive store through `[storage.derive.rocksdb]`; the remaining RocksDB invariants are locked in code. The full design lives in [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
 
 The defaults target a mainnet-sized canonical store:
 
 ```toml
-[storage.tuning]
+[storage.canonical.rocksdb]
 block_cache_bytes = 536870912   # 512 MiB
 max_wal_bytes = 268435456       # 256 MiB
 max_open_files = 512
+write_buffer_bytes = 16777216   # 16 MiB per column family
+max_write_buffer_count = 2
 ```
 
 And a smaller derive store:
 
 ```toml
-[explorer.tuning]
+[storage.derive.rocksdb]
 block_cache_bytes = 134217728   # 128 MiB
 max_wal_bytes = 67108864        # 64 MiB
 max_open_files = 256
+write_buffer_bytes = 8388608    # 8 MiB per column family
+max_write_buffer_count = 2
 ```
 
 Plus the derive and bulk-catchup ingest knobs:
@@ -150,7 +154,8 @@ flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
 
 Do not use `source_segment_max_blocks` as the primary response-size tuning knob. The
-writer targets 75% of `node.max_response_bytes`, shrinks the next source segment
+writer targets `source_segment_target_response_bytes`, which must stay at or
+below `node.max_response_bytes`, shrinks the next source segment
 after oversized or dense responses, carries learned density across bulk commit
 batches, and resets density when the consensus branch changes. If
 `zinder_node_source_segment_split_total{reason="response_too_large"}` keeps
@@ -160,6 +165,8 @@ large JSON payloads. If split bursts repeat immediately after every
 `chain_committed` event, the source-density state is being reset too often.
 
 With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+
+`ingest.bulk_catchup.source_fetch_max_in_flight_bytes` reserves `node.max_response_bytes` before each source request and then shrinks to the measured response bytes after decode. Keep it at least as large as `node.max_response_bytes`; otherwise startup rejects the config because a single active source response would not fit the declared watermark.
 
 `ingest.bulk_catchup.fact_build_concurrency` controls CPU workers; `fact_build_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 

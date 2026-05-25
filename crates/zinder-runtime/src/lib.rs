@@ -55,14 +55,16 @@ pub use readiness::{
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
-    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
-    PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlReader,
+    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, IngestControlReaderToml,
+    IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml, PrimaryStorageSection,
+    PrimaryStorageToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
     ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
-    ResolvedSecondaryStorage, RetentionSection, RetentionToml, SecondaryStorageSection,
-    SecondaryStorageToml, ServiceIdentifier, StorageTuningSection, StorageTuningToml,
-    defaults as section_defaults, resolve_ingest_control_reader, resolve_ingest_control_writer,
+    ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
+    StorageRoleSection, StorageRoleToml, defaults as section_defaults,
+    resolve_canonical_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_derive_rocksdb_budget, resolve_ingest_control_reader, resolve_ingest_control_writer,
     resolve_ops_listen_addr, resolve_primary_storage, resolve_retention, resolve_secondary_storage,
-    resolve_storage_tuning,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{

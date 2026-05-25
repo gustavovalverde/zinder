@@ -106,6 +106,27 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("disabled-ingest-control-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = ingest_config_toml(&storage_path)?
+        .replace("listen_addr = \"127.0.0.1:9100\"", "listen_addr = \"\"");
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[ingest_control]"));
+    assert!(stdout.contains("listen_addr = \"\""));
+
+    Ok(())
+}
+
+#[test]
 fn backup_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("backup-print-config-store");
@@ -544,6 +565,38 @@ fn zero_max_response_bytes_fails_before_storage_creation() -> Result<(), Box<dyn
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("node.max_response_bytes must be greater than zero"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn source_fetch_byte_budget_below_max_response_fails_before_storage_creation()
+-> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("source-fetch-budget-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--max-response-bytes",
+            "67108864",
+            "--source-fetch-max-in-flight-bytes",
+            "33554432",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes must be greater than or equal to node.max_response_bytes"
+        ),
         "{stderr}"
     );
 

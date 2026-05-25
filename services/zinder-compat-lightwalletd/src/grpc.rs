@@ -1148,7 +1148,7 @@ fn lightd_info(
         sapling_activation_height,
         consensus_branch_id,
         block_height: u64::from(tip_height.value()),
-        git_commit: option_env!("ZINDER_GIT_COMMIT")
+        git_commit: option_env!("LIGHTWALLETD_COMPAT_BUILD_GIT_COMMIT")
             .unwrap_or_default()
             .to_owned(),
         branch: String::new(),

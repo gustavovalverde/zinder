@@ -24,7 +24,8 @@ use crate::{
     ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
-    MempoolEventRetentionReport, ReorgWindowChange, StorageTuning, StoreError, StreamCursorTokenV1,
+    MempoolEventRetentionReport, ReorgWindowChange, RocksDbResourceBudget, StoreError,
+    StreamCursorTokenV1,
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     format::{
@@ -58,9 +59,8 @@ use validation::{
 /// Construct one with [`ChainStoreOptions::for_network`] for production use, or
 /// [`ChainStoreOptions::for_local_tests`] for throwaway test stores. The struct
 /// has no `Default` so callers must pick a posture explicitly. The
-/// `tuning` field carries the bounded `RocksDB` resource budget described
-/// in [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md);
-/// operators override it through `[storage.tuning]` in their TOML.
+/// `rocksdb_resource_budget` carries the bounded `RocksDB` resource budget
+/// described in [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainStoreOptions {
     /// Number of near-tip blocks that may be replaced by a reorg.
@@ -70,7 +70,7 @@ pub struct ChainStoreOptions {
     /// Expected network for this store, used to persist and validate store metadata.
     pub network: Option<Network>,
     /// Bounded `RocksDB` resource budget applied at open time.
-    pub tuning: StorageTuning,
+    pub rocksdb_resource_budget: RocksDbResourceBudget,
 }
 
 impl ChainStoreOptions {
@@ -81,14 +81,14 @@ impl ChainStoreOptions {
             reorg_window_blocks: 100,
             sync_writes: true,
             network: Some(network),
-            tuning: StorageTuning::canonical_defaults(),
+            rocksdb_resource_budget: RocksDbResourceBudget::canonical_defaults(),
         }
     }
 
     /// Returns options suitable for throwaway local test stores.
     ///
     /// Uses unsynchronized writes, a regtest network anchor, and the
-    /// tighter [`StorageTuning::for_local_tests`] budget. Production code
+    /// tighter [`RocksDbResourceBudget::for_local_tests`] budget. Production code
     /// must use [`Self::for_network`] instead.
     #[must_use]
     pub const fn for_local_tests() -> Self {
@@ -96,7 +96,7 @@ impl ChainStoreOptions {
             reorg_window_blocks: 100,
             sync_writes: false,
             network: Some(Network::ZcashRegtest),
-            tuning: StorageTuning::for_local_tests(),
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
         }
     }
 }
@@ -341,7 +341,7 @@ impl PrimaryChainStore {
         let inner = Arc::new(RocksChainStore::open_primary(
             path,
             options.sync_writes,
-            options.tuning,
+            options.rocksdb_resource_budget,
         )?);
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
@@ -501,7 +501,7 @@ impl SecondaryChainStore {
             primary_path,
             secondary_path,
             options.sync_writes,
-            options.tuning,
+            options.rocksdb_resource_budget,
         )?);
         let store =
             ChainStoreInner::from_secondary_inner(inner, options, ChainStoreReadPosture::Direct)?;

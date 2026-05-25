@@ -116,12 +116,12 @@ fn zero_reorg_window_is_rejected() -> eyre::Result<()> {
 #[test]
 fn zero_max_wal_bytes_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let mut tuning = zinder_store::StorageTuning::for_local_tests();
-    tuning.max_wal_bytes = 0;
+    let mut rocksdb_resource_budget = zinder_store::RocksDbResourceBudget::for_local_tests();
+    rocksdb_resource_budget.max_wal_bytes = 0;
     let Err(error) = PrimaryChainStore::open(
         tempdir.path(),
         ChainStoreOptions {
-            tuning,
+            rocksdb_resource_budget,
             ..ChainStoreOptions::for_local_tests()
         },
     ) else {
@@ -138,12 +138,12 @@ fn zero_max_wal_bytes_is_rejected() -> eyre::Result<()> {
 #[test]
 fn negative_max_open_files_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let mut tuning = zinder_store::StorageTuning::for_local_tests();
-    tuning.max_open_files = -1;
+    let mut rocksdb_resource_budget = zinder_store::RocksDbResourceBudget::for_local_tests();
+    rocksdb_resource_budget.max_open_files = -1;
     let Err(error) = PrimaryChainStore::open(
         tempdir.path(),
         ChainStoreOptions {
-            tuning,
+            rocksdb_resource_budget,
             ..ChainStoreOptions::for_local_tests()
         },
     ) else {

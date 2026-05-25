@@ -7,8 +7,9 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    OpsSection, OpsToml, ServiceIdentifier, load_bearer_token, parse_socket_addr, require_field,
-    resolve_ops_listen_addr,
+    OpsSection, OpsToml, ResolvedSecondaryStorage, SecondaryStorageSection, SecondaryStorageToml,
+    ServiceIdentifier, load_bearer_token, parse_socket_addr, require_field,
+    resolve_ops_listen_addr, resolve_secondary_storage,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
@@ -17,9 +18,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 #[derive(Clone, Debug)]
 pub(crate) struct ExplorerConfig {
     pub(crate) network: Network,
-    pub(crate) storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget applied to explorer secondary stores.
-    pub(crate) storage_tuning: zinder_store::StorageTuning,
+    pub(crate) storage: ResolvedSecondaryStorage,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) bearer_token_path: Option<PathBuf>,
@@ -35,6 +34,7 @@ pub(crate) struct ExplorerConfig {
 pub(crate) struct ExplorerConfigOverrides {
     pub(crate) network: Option<String>,
     pub(crate) storage_path: Option<PathBuf>,
+    pub(crate) secondary_path: Option<PathBuf>,
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) bearer_token_path: Option<PathBuf>,
@@ -77,7 +77,8 @@ pub(crate) fn load_explorer_config(
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
-        .with_override_path_if("explorer.storage_path", overrides.storage_path)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_path_if("storage.secondary_path", overrides.secondary_path)?
         .with_override_if(
             "explorer.listen_addr",
             overrides.listen_addr.map(|addr| addr.to_string()),
@@ -102,23 +103,11 @@ pub(crate) fn explorer_config_toml(config: &ExplorerConfig) -> Result<String, Ex
     Ok(toml_text)
 }
 
-/// Merges explorer `[explorer.tuning]` overrides onto the derive defaults.
-///
-/// Backed by [`zinder_store::StorageTuning::derive_defaults`]; derive
-/// stores hold smaller working sets than the canonical chain store, so
-/// the derive defaults halve the canonical-store budget.
-fn resolve_explorer_storage_tuning(
-    section: zinder_runtime::StorageTuningSection,
-) -> Result<zinder_store::StorageTuning, ExplorerConfigError> {
-    let tuning = section.apply_to(zinder_store::StorageTuning::derive_defaults());
-    tuning.validate().map_err(ConfigError::invalid)?;
-    Ok(tuning)
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ExplorerRawConfig {
     network: NetworkSection,
+    storage: SecondaryStorageSection,
     explorer: ExplorerSection,
     ops: OpsSection,
 }
@@ -127,27 +116,24 @@ struct ExplorerRawConfig {
 #[serde(default, deny_unknown_fields)]
 struct ExplorerSection {
     listen_addr: Option<String>,
-    storage_path: Option<String>,
     bearer_token_path: Option<PathBuf>,
     wallet_query_endpoint: Option<String>,
-    tuning: zinder_runtime::StorageTuningSection,
 }
 
 #[derive(Debug, Serialize)]
 struct ExplorerConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    storage: SecondaryStorageToml,
     explorer: ExplorerToml,
 }
 
 #[derive(Debug, Serialize)]
 struct ExplorerToml {
     listen_addr: String,
-    storage_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
     wallet_query_endpoint: String,
-    tuning: zinder_runtime::StorageTuningToml,
 }
 
 impl ExplorerConfigToml {
@@ -155,15 +141,14 @@ impl ExplorerConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            storage: SecondaryStorageToml::from_resolved(&config.storage),
             explorer: ExplorerToml {
                 listen_addr: config.listen_addr.to_string(),
-                storage_path: config.storage_path.to_string_lossy().into_owned(),
                 bearer_token_path: config
                     .bearer_token_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
-                tuning: zinder_runtime::StorageTuningToml::from_resolved(config.storage_tuning),
             },
         }
     }
@@ -171,11 +156,9 @@ impl ExplorerConfigToml {
 
 fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, ExplorerConfigError> {
     let network = raw.network.resolve()?;
+    let storage = resolve_secondary_storage(raw.storage)?;
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
-    let storage_path_text = require_field(raw.explorer.storage_path, "explorer.storage_path")?;
-    let storage_path = PathBuf::from(storage_path_text);
-    let storage_tuning = resolve_explorer_storage_tuning(raw.explorer.tuning)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
     let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
@@ -185,45 +168,11 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         .filter(|endpoint| !endpoint.is_empty());
     Ok(ExplorerConfig {
         network,
-        storage_path,
-        storage_tuning,
+        storage,
         listen_addr,
         ops_listen_addr,
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explorer_tuning_rejects_zero_wal_budget() {
-        let outcome = resolve_explorer_storage_tuning(zinder_runtime::StorageTuningSection {
-            max_wal_bytes: Some(0),
-            ..zinder_runtime::StorageTuningSection::default()
-        });
-
-        assert!(matches!(
-            outcome,
-            Err(ExplorerConfigError::Config(ConfigError::Invalid { reason }))
-                if reason.contains("max_wal_bytes")
-        ));
-    }
-
-    #[test]
-    fn explorer_tuning_rejects_negative_open_file_budget() {
-        let outcome = resolve_explorer_storage_tuning(zinder_runtime::StorageTuningSection {
-            max_open_files: Some(-1),
-            ..zinder_runtime::StorageTuningSection::default()
-        });
-
-        assert!(matches!(
-            outcome,
-            Err(ExplorerConfigError::Config(ConfigError::Invalid { reason }))
-                if reason.contains("max_open_files")
-        ));
-    }
 }

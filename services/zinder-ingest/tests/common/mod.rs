@@ -57,7 +57,7 @@ pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::De
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
             consumer_column_families: &[],
-            tuning: zinder_store::StorageTuning::for_local_tests(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)
 }
@@ -82,7 +82,7 @@ pub(crate) fn live_bulk_catchup_run_config(
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
-        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations,
         from_height,
@@ -119,7 +119,7 @@ pub(crate) fn live_tip_follow_config(
     TipFollowConfig {
         node: env.target.clone(),
         storage_path: storage_path.to_owned(),
-        storage_tuning: zinder_store::StorageTuning::for_local_tests(),
+        canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations,
         reorg_window_blocks,

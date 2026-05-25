@@ -28,12 +28,12 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
     IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageTuningSection,
-    StorageTuningToml, duration_as_millis_u64, require_field, resolve_ingest_control_writer,
+    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageRoleSection,
+    StorageRoleToml, duration_as_millis_u64, require_field, resolve_ingest_control_writer,
     resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
-use zinder_store::{MempoolEventRetentionConfig, StorageTuning};
+use zinder_store::{MempoolEventRetentionConfig, RocksDbResourceBudget};
 
 use crate::cli::parse::{
     parse_canonical_batch_max_blocks, parse_node_source, parse_poll_interval_ms,
@@ -67,7 +67,7 @@ const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 pub(crate) struct IngestCommandConfig {
     pub(crate) loop_config: IngestLoopConfig,
     pub(crate) coverage: IngestCoverage,
-    pub(crate) ingest_control_listen_addr: SocketAddr,
+    pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
@@ -127,7 +127,8 @@ impl Default for IngestCoverage {
 pub(crate) struct BackupCommandConfig {
     pub(crate) network: zinder_core::Network,
     pub(crate) storage_path: PathBuf,
-    pub(crate) storage_tuning: StorageTuning,
+    pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
+    pub(crate) derive_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) to_path: PathBuf,
 }
 
@@ -431,7 +432,8 @@ struct IngestConfig {
 #[serde(default, deny_unknown_fields)]
 struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
-    tuning: StorageTuningSection,
+    canonical: StorageRoleSection,
+    derive: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
 }
 
@@ -439,7 +441,8 @@ impl IngestPrimaryStorageSection {
     fn into_primary_storage(self) -> PrimaryStorageSection {
         PrimaryStorageSection {
             path: self.path,
-            tuning: self.tuning,
+            canonical: self.canonical,
+            derive: self.derive,
         }
     }
 }
@@ -591,7 +594,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .unwrap_or(DEFAULT_RAW_BLOB_POLICY);
     let ResolvedPrimaryStorage {
         path: storage_path,
-        tuning: storage_tuning,
+        canonical_rocksdb_budget,
+        derive_rocksdb_budget,
     } = resolve_primary_storage(config.storage.into_primary_storage())?;
 
     let reorg_window_blocks = require_field(
@@ -757,18 +761,22 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     }
 
     let ResolvedIngestControlWriter {
-        listen_addr: ingest_control_listen_addr_opt,
+        listen_addr: ingest_control_listen_addr,
         bearer_token_path: ingest_control_bearer_token_path,
         bearer_token: ingest_control_bearer_token,
     } = resolve_ingest_control_writer(config.ingest_control)?;
-    let ingest_control_listen_addr = ingest_control_listen_addr_opt
-        .ok_or_else(|| ConfigError::missing_field("ingest_control.listen_addr"))?;
     let retention = resolve_retention(config.retention)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
     if source_segment_target_response_bytes > node_target.max_response_bytes {
         return Err(ConfigError::invalid(
             "ingest.bulk_catchup.source_segment_target_response_bytes must not exceed node.max_response_bytes",
+        )
+        .into());
+    }
+    if source_fetch_max_in_flight_bytes.get() < node_target.max_response_bytes.get() {
+        return Err(ConfigError::invalid(
+            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes must be greater than or equal to node.max_response_bytes",
         )
         .into());
     }
@@ -788,7 +796,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         node: node_target,
         node_source,
         storage_path,
-        storage_tuning,
+        canonical_rocksdb_budget,
+        derive_rocksdb_budget,
         raw_blob_policy,
         reorg_window_blocks,
         phases: PhasesConfig {
@@ -837,7 +846,8 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
     let network = config.network.resolve()?;
     let ResolvedPrimaryStorage {
         path: storage_path,
-        tuning: storage_tuning,
+        canonical_rocksdb_budget,
+        derive_rocksdb_budget,
     } = resolve_primary_storage(config.storage.into_primary_storage())?;
     let to_path = config
         .backup
@@ -847,7 +857,8 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
     Ok(BackupCommandConfig {
         network,
         storage_path,
-        storage_tuning,
+        canonical_rocksdb_budget,
+        derive_rocksdb_budget,
         to_path,
     })
 }
@@ -883,7 +894,8 @@ impl RedactedIngestConfigToml {
             node: NodeToml::from_node_target(&loop_config.node),
             storage: IngestPrimaryStorageToml {
                 path: loop_config.storage_path.display().to_string(),
-                tuning: StorageTuningToml::from_resolved(loop_config.storage_tuning),
+                canonical: StorageRoleToml::from_resolved(loop_config.canonical_rocksdb_budget),
+                derive: StorageRoleToml::from_resolved(loop_config.derive_rocksdb_budget),
                 raw_blob_policy: loop_config.raw_blob_policy,
             },
             ingest: IngestToml {
@@ -955,7 +967,7 @@ impl RedactedIngestConfigToml {
                 },
             },
             ingest_control: IngestControlWriterToml::from_resolved(
-                Some(config.ingest_control_listen_addr),
+                config.ingest_control_listen_addr,
                 config.ingest_control_bearer_token_path.as_deref(),
             ),
             retention: RetentionToml::from_resolved(config.retention),
@@ -969,7 +981,8 @@ impl RedactedBackupConfigToml {
             network: NetworkToml::from_network(config.network),
             storage: PrimaryStorageToml {
                 path: config.storage_path.display().to_string(),
-                tuning: StorageTuningToml::from_resolved(config.storage_tuning),
+                canonical: StorageRoleToml::from_resolved(config.canonical_rocksdb_budget),
+                derive: StorageRoleToml::from_resolved(config.derive_rocksdb_budget),
             },
             backup: BackupToml {
                 to_path: config.to_path.display().to_string(),
@@ -992,7 +1005,8 @@ struct IngestToml {
 #[derive(Serialize)]
 struct IngestPrimaryStorageToml {
     path: String,
-    tuning: StorageTuningToml,
+    canonical: StorageRoleToml,
+    derive: StorageRoleToml,
     raw_blob_policy: RawBlobPolicy,
 }
 

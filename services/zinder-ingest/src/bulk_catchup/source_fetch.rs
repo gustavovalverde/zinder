@@ -148,10 +148,7 @@ where
         };
 
         let cursor = SourceChainCursor::before_height(next_height);
-        let reserved_response_bytes = state
-            .target_response_payload_bytes
-            .get()
-            .min(state.max_response_bytes.get());
+        let reserved_response_bytes = state.max_response_bytes.get();
         let Some(reservation) = state
             .source_fetch_watermark
             .try_reserve(reserved_response_bytes)
@@ -194,6 +191,7 @@ struct PrefetchedSourceSegment {
     max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
     queued_response_bytes: u64,
+    _reservation: ByteReservation,
 }
 
 fn fetch_prefetched_chain_segment<'a, Source>(
@@ -224,12 +222,14 @@ where
             fetch_chain_segment_with_retry(request_timeout, source, limits, &mut retry_state)
                 .await?;
         let queued_response_bytes = queued_source_segment_bytes(&segment, reserved_response_bytes);
-        reservation.release();
+        let mut reservation = reservation;
+        reservation.resize(queued_response_bytes);
         Ok(PrefetchedSourceSegment {
             start_height,
             max_connected_blocks,
             segment,
             queued_response_bytes,
+            _reservation: reservation,
         })
     }
     .boxed()
@@ -292,11 +292,8 @@ fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, So
     metrics::gauge!("zinder_ingest_source_fetch_queue_requests").set(f64::from(
         usize_to_u32_saturating(state.in_flight_segments.len()),
     ));
-    metrics::gauge!("zinder_ingest_source_fetch_queue_bytes").set(u64_to_f64(
-        source_fetch_snapshot
-            .reserved_bytes
-            .saturating_add(state.completed_segment_bytes),
-    ));
+    metrics::gauge!("zinder_ingest_source_fetch_queue_bytes")
+        .set(u64_to_f64(source_fetch_snapshot.reserved_bytes));
     metrics::gauge!("zinder_ingest_source_segment_reassembly_segments").set(f64::from(
         usize_to_u32_saturating(state.completed_segments.len()),
     ));
