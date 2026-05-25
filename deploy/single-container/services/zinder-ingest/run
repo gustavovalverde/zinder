@@ -17,6 +17,16 @@ set -eu
 # across restarts.
 chown -R zinder:zinder /var/lib/zinder
 
+# Remove a stale RocksDB primary LOCK left behind by an unclean shutdown.
+# This is safe inside the single-container image because at most one
+# zinder-ingest writer ever runs in this PID namespace; if the LOCK file
+# exists at boot it cannot belong to a live process. RocksDB itself only
+# clears stale POSIX advisory locks when the holding PID is dead AND on
+# the same host kernel; PaaS targets that re-schedule containers across
+# hosts (Railway, Fly) trip on that constraint, so we unconditionally
+# delete the file before opening the store.
+rm -f /var/lib/zinder/store/LOCK
+
 # Unified ingest loop per ADR-0015. The single process classifies the
 # gap to the upstream tip on every iteration and dispatches to
 # AwaitingUpstream / BulkCatchup / FollowingTip; no separate bootstrap
