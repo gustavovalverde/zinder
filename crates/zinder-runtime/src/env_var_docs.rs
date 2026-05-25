@@ -331,7 +331,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912.",
+        description: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 \
+                      for writers and 134217728 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES",
@@ -344,7 +345,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456.",
+        description: "Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 \
+                      for writers and 33554432 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES",
@@ -357,7 +359,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical-store RocksDB open SST file cap. Defaults to 512.",
+        description: "Canonical-store RocksDB open SST file cap. Defaults to 512 for writers and \
+                      128 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES",
@@ -371,7 +374,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Canonical-store per-column-family RocksDB write buffer size. Defaults to \
-                      16777216.",
+                      16777216 for writers and 8388608 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
@@ -393,7 +396,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 134217728.",
+        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 134217728 for \
+                      writers and 67108864 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WAL_BYTES",
@@ -401,7 +405,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 67108864.",
+        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 67108864 for \
+                      writers and 16777216 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_OPEN_FILES",
@@ -409,7 +414,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB open SST file cap. Defaults to 256.",
+        description: "Derive-store RocksDB open SST file cap. Defaults to 256 for writers and 64 \
+                      for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__WRITE_BUFFER_BYTES",
@@ -418,7 +424,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Derive-store per-column-family RocksDB write buffer size. Defaults to \
-                      8388608.",
+                      8388608 for writers and 4194304 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
@@ -488,6 +494,25 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 536870912.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES",
+        toml_path: "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Estimated canonical write bytes accumulated before closing a \
+                      bulk-catchup batch. Defaults to 536870912.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE",
+        toml_path: "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Minimum blocks accumulated before estimated write bytes can close a \
+                      bulk-catchup batch. Single oversized blocks can still close immediately. \
+                      Defaults to 100.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS",
         toml_path: "ingest.bulk_catchup.source_segment_max_blocks",
         used_by: &["zinder-ingest"],
@@ -524,22 +549,22 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       node.max_response_bytes. Defaults to 402653184.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_CONCURRENCY",
-        toml_path: "ingest.bulk_catchup.fact_build_concurrency",
+        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY",
+        toml_path: "ingest.bulk_catchup.block_prepare_concurrency",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Parallel canonical fact-build slots. Defaults to \
+        description: "Parallel canonical block-prepare slots. Defaults to \
                       `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES",
-        toml_path: "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
+        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES",
+        toml_path: "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum reserved derived artifact bytes across active and completed \
-                      fact-build work. Defaults to 536870912.",
+                      block-prepare work. Defaults to 536870912.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",

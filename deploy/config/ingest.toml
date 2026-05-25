@@ -56,12 +56,14 @@ min_replay_batch_blocks = 50
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
+canonical_batch_max_estimated_write_bytes = 536870912
+canonical_batch_min_blocks_before_estimated_write_close = 100
 source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
-fact_build_concurrency = 16
-fact_build_max_in_flight_artifact_bytes = 536870912
+block_prepare_concurrency = 16
+block_prepare_max_in_flight_artifact_bytes = 536870912
 commit_reassembly_max_queued_artifact_bytes = 536870912
 # Force a RocksDB flush every N committed epochs (≈ N × canonical_batch_max_blocks
 # blocks). Caps the live WAL by writer cadence and bounds crash-recovery

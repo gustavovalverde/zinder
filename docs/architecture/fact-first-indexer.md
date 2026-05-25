@@ -90,7 +90,7 @@ Implementation rules:
 
 Bulk catchup uses the resource-budgeted staged pipeline in
 [ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md). Tip-follow uses the
-same canonical fact builders and commits one live-edge transition at a time.
+same canonical block-preparation path and commits one live-edge transition at a time.
 
 ## Derive Tailer
 

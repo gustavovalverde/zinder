@@ -88,12 +88,14 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
+    assert!(stdout.contains("canonical_batch_max_estimated_write_bytes = 536870912"));
+    assert!(stdout.contains("canonical_batch_min_blocks_before_estimated_write_close = 100"));
     assert!(stdout.contains("source_segment_max_blocks = 16"));
     assert!(stdout.contains("source_segment_target_response_bytes = 33554432"));
     assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
     assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));
-    assert!(stdout.contains("fact_build_concurrency ="));
-    assert!(stdout.contains("fact_build_max_in_flight_artifact_bytes = 536870912"));
+    assert!(stdout.contains("block_prepare_concurrency ="));
+    assert!(stdout.contains("block_prepare_max_in_flight_artifact_bytes = 536870912"));
     assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
     assert!(stdout.contains("[ingest.tip_follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
@@ -449,6 +451,69 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn zero_estimated_write_batch_budget_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("zero-estimated-write-budget-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--canonical-batch-max-estimated-write-bytes",
+            "0",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes must be greater than zero"
+        ),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn estimated_write_close_floor_above_block_cap_fails_before_storage_creation()
+-> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir
+        .path()
+        .join("estimated-write-floor-above-block-cap-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--canonical-batch-max-blocks",
+            "10",
+            "--canonical-batch-min-blocks-before-estimated-write-close",
+            "11",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.bulk_catchup.canonical_batch_max_blocks"
+        ),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zero-source-segment-store");
@@ -474,7 +539,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
 }
 
 #[test]
-fn zero_fact_build_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zero-derive-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
@@ -485,7 +550,7 @@ fn zero_fact_build_concurrency_fails_before_storage_creation() -> Result<(), Box
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "--fact-build-concurrency",
+            "--block-prepare-concurrency",
             "0",
         ])
         .output()?;
@@ -493,7 +558,7 @@ fn zero_fact_build_concurrency_fails_before_storage_creation() -> Result<(), Box
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.fact_build_concurrency must be greater than zero"),
+        stderr.contains("ingest.bulk_catchup.block_prepare_concurrency must be greater than zero"),
         "{stderr}"
     );
 

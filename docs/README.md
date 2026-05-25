@@ -13,6 +13,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [Chain ingestion](architecture/chain-ingestion.md)
 - [Chain events](architecture/chain-events.md)
 - [Node source boundary](architecture/node-source-boundary.md): trait shape, capability model, and upstream-platform-binding catalogue (Z3 canonical, bare-Zebra, future in-process).
+- [Zcash chain workload eras](architecture/zcash-chain-workload-eras.md): consensus epochs, historical workload bands, and benchmark anchors for performance-budget work.
 - [Protocol boundary](architecture/protocol-boundary.md)
 - [Wallet data plane](architecture/wallet-data-plane.md)
 - [Derive plane](architecture/derive-plane.md)
@@ -45,7 +46,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0018: Capability-gated optional payload fields](adrs/0018-capability-gated-optional-payload-fields.md)
 - [ADR-0019: Transport policy ownership and self-healing](adrs/0019-transport-policy-ownership.md)
 - [ADR-0020: Bounded RocksDB resource budget](adrs/0020-bounded-rocksdb-resource-budget.md)
-- [ADR-0021: Parallel canonical fact build in bulk catchup](adrs/0021-parallel-block-derivation.md)
+- [ADR-0021: Parallel canonical block prepare in bulk catchup](adrs/0021-parallel-block-derivation.md)
 - [ADR-0022: Resource-budgeted bulk catchup and checkpoint tree state](adrs/0022-resource-budgeted-bulk-catchup.md)
 
 ## Reference

@@ -201,6 +201,14 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
             canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
+            canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+                zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+            )
+            .ok_or_else(|| eyre!("nonzero"))?,
+            canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+                zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+            )
+            .ok_or_else(|| eyre!("nonzero"))?,
             source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
             source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
@@ -208,8 +216,8 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
                 .ok_or_else(|| eyre!("nonzero"))?,
             source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
-            fact_build_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
-            fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            block_prepare_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+            block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,

@@ -22,9 +22,65 @@ The implemented architecture is a resource-budgeted staged pipeline:
 `NodeSource::fetch_chain_segment`, JSON-RPC segment fetching behind
 `NodeSource`, checkpoint-only tree state, source byte prefetch, adaptive segment
 sizing, unordered source completion with ordered reassembly, bounded parallel
-canonical fact build, overlapped commit under commit-reassembly watermarks,
-canonical batch artifact byte limits, runtime memory gauges, and derive replay
-degrade-before-pause.
+canonical block prepare, spent-transparent-output prefetch before commit,
+overlapped commit under commit-reassembly watermarks, canonical batch artifact
+byte limits, estimated canonical write-byte limits, runtime memory gauges, and
+derive replay degrade-before-pause.
+
+## 2026-05-25 clean-sync transparent-input validation
+
+The clean-sync validation used the disposable Docker volume
+`zinder-mainnet-clean-sync-20260525092628-data`; the original
+`zinder-mainnet-data` volume was left untouched. The clean run first exposed the
+May 2017 transparent-input range as the remaining bottleneck: around
+`106000..107592`, batches were closing after only `4..27` blocks because the old
+transparent-spend-reference budget fired before source fetch or block
+derivation could amortize work. That range advanced at about `3.38 blocks/s`,
+with transparent-output `multi_get` calls dominating commit time.
+
+The first fix replaced the raw transparent-spend-reference close trigger with
+`canonical_batch_max_estimated_write_bytes` plus
+`canonical_batch_min_blocks_before_estimated_write_close`. That removed tiny
+batch churn, but it did not meet the target by itself: the commit path still had
+to resolve hundreds of thousands of spent transparent outputs before each
+RocksDB write.
+
+The final fix moved spent-transparent-output hydration into canonical block
+prepare. Each prepared block carries any already-visible spent outputs into
+commit reassembly; `commit_ingest_batch` still performs the authoritative
+fallback lookup for same-batch outputs and outputs that became visible after an
+overlapped previous commit. This keeps the commit boundary correct while moving
+historical RocksDB reads out of the serial commit path.
+
+Deployment evidence:
+
+| Window | Height delta | Wall time | Rate | Notes |
+| ------ | ------------ | --------- | ---- | ----- |
+| First prefetch deploy | `112592 -> 166592` | 394.6s | 136.8 blocks/s | 54 block-count commits; `estimated_write_bytes` triggers stayed at 0. |
+| Rolling sample | `129592 -> 165592` | 301s | 119.6 blocks/s | Transparent-output read time continued accumulating, but commit height kept advancing. |
+| Final-name deploy | `186592 -> 199592` | 241s | 53.9 blocks/s | Validated final `block_prepare_*` config and metric namespace. |
+| Slowest 60s slice observed | `191592 -> 193592` | 60s | 33.3 blocks/s | Still about 9.9x the `3.38 blocks/s` clean-sync pathological baseline. |
+
+The clean-sync target of at least `2x..3x` was exceeded in the stressed
+transparent-input range. The remaining optimization surface is no longer commit
+serialization; it is total transparent-output lookup work. If this range becomes
+the dominant production cost again, the next architectural step is a bounded
+windowed prevout-hydration stage that deduplicates outpoints across adjacent
+prepared blocks before issuing RocksDB reads. Do not reintroduce a raw
+transparent-spend-reference batch budget; it optimizes the wrong unit and
+creates tiny commits in exactly the historical range that needs amortization.
+
+Reader deployment validation:
+
+- Query and explorer secondaries OOM-restarted under the old `2g` mainnet
+  cgroup while clean sync was advancing quickly. The failure was outside the
+  writer critical path, but it made the end-to-end Compose stack unstable.
+- Reader defaults now use a secondary-specific RocksDB posture and a `1000 ms`
+  catchup cadence; mainnet Compose sets query and explorer to `4g` cgroups.
+- After redeploying those reader settings against the same clean-sync volume,
+  query and explorer stayed healthy with zero restarts beyond the prior failure
+  window, while RSS sat around `1.6..1.8 GiB` per reader and ingest continued
+  committing.
 
 ## 2026-05-25 finalization checkpoint
 
@@ -34,9 +90,9 @@ mainnet stack. The final `zinder-ingest:latest` rebuild exported image manifest
 and manifest list
 `sha256:0272b37728ad78e23048d456c80420a84dbd1a05ed46233b4b460f54a383d808`.
 The colocated reader image manifest lists are
-`zinder-query:latest@sha256:9e8eb850f7d51859658a9d86fcef4db371c3c57e409381df554c94de4f0ae4f0`
+`zinder-query:latest@sha256:915153732db53c9da2be2ec139321248e0ecb98428c1d1783a4226d8c600eb2f`
 and
-`zinder-explorer:latest@sha256:846d9d423bd41a33c6f43c781a8ccee8ab07f0fa65c3c85eb5a2881be771200f`.
+`zinder-explorer:latest@sha256:6b6a7c0bc6b1634d71cf2650985d4878e97e142532657ab15b5b9a3862450097`.
 The compatibility image, rebuilt after the canonical-only storage cleanup, is
 `zinder-compat-lightwalletd:latest@sha256:5eaafe8a45906e89d1767e779376aeec582d6936cc8a7c33e3ec4eb94ea1a540`.
 `/readyz` is served on `127.0.0.1:9105` and reported after the final deploy:
@@ -93,11 +149,11 @@ Keep JSON-RPC for this architecture revision. During the high-throughput
 catchup window at `1779667800`, `fetch_chain_segment` averaged `0.114 s` and
 had p95 `0.297 s`; `fetch_tree_state_for_block` averaged `0.0036 s`. Source
 transport was no longer the wall-time limiter once unordered source completion,
-fact-build concurrency, commit overlap, and byte watermarks were active.
+block-prepare concurrency, commit overlap, and byte watermarks were active.
 
 The replacement path remains explicit: if future long-window evidence on a
 healthy Zebra shows JSON-RPC p95 dominating wall time while ingest CPU,
-fact-build, commit, flush, and memory have headroom, replace the adapter behind
+block-prepare, commit, flush, and memory have headroom, replace the adapter behind
 `NodeSource`. Do not leak `JsonRpcBatch`, `ZebraBatch`, or transport-specific
 names into ingest, store, query, or derive.
 
@@ -134,10 +190,10 @@ of staying opaque and paused.
 | Phase | State | Notes |
 | --- | --- | --- |
 | Measurement contract | Implemented | `observability-smoke.sh snapshot` reports writer rates, source averages, bulk-stage p95, queues, memory, derive state, and commit/query counters. |
-| Stage module extraction | Implemented | `bulk_catchup/mod.rs` is the facade; source fetch, fact build, commit reassembly, flush, and watermarks have owned modules. |
-| Byte-watermark foundation | Implemented | Source, fact-build, and commit-reassembly memory are bounded and separately observable. Source fetch reserves `node.max_response_bytes` before each active request and keeps completed out-of-order bytes reserved until emission. |
+| Stage module extraction | Implemented | `bulk_catchup/mod.rs` is the facade; source fetch, block prepare, commit reassembly, flush, and watermarks have owned modules. |
+| Byte-watermark foundation | Implemented | Source, block-prepare, and commit-reassembly memory are bounded and separately observable. Source fetch reserves `node.max_response_bytes` before each active request and keeps completed out-of-order bytes reserved until emission. |
 | Unordered source fetch | Implemented | Source segments complete out of order and emit in canonical order through source reassembly. |
-| Independent canonical fact build | Implemented | Fact build uses bounded concurrency and emits ordered blocks after out-of-order completion. |
+| Independent canonical block prepare | Implemented | Block prepare uses bounded concurrency and emits ordered blocks after out-of-order completion. |
 | Commit reassembly and flush overlap | Implemented | One canonical commit can run while bounded source/fact work fills the next batch. |
 | Derive replay degrade-before-pause | Implemented and tuned | Current deploy uses `0.90/0.99/0.80` memory ratios and validates active replay at tip. |
 | Derive replay data-path cleanup | Not required for the 2x/3x target | Current replay rate is above the original writer baseline; revisit only if projection drain becomes the user-visible bottleneck. |
@@ -194,24 +250,24 @@ Source fetch still explains most of the pace. At roughly 19 blocks per segment
 and 9.3 seconds per source segment, the observed throughput lines up with a
 source-limited pipeline even with several requests in flight. The queue is
 bounded and active, so the problem is not that the writer is idle. The problem
-is that the current ordered fetch and fact-build stream cannot use later
+is that the current ordered fetch and block-prepare stream cannot use later
 completed work while the next required lower-height source segment is slow.
 
-### Fact build, commit, and flush pressure
+### Block prepare, commit, and flush pressure
 
 | Signal | Value |
 | --- | ---: |
-| fact-build average | `0.651 s/block` |
-| fact-build p95 | `2.73 s/block` |
-| fact-build completion rate | `7.01 blocks/s` |
+| block-prepare average | `0.651 s/block` |
+| block-prepare p95 | `2.73 s/block` |
+| block-prepare completion rate | `7.01 blocks/s` |
 | commit average | `3.54 s/epoch` |
 | commit p95 | `9.35 s/epoch` |
 | commit rate | `0.00725 commits/s`, about `26.1 commits/hour` |
 | store commit average | `1.48 s` |
 | flush average | `0.799 s` |
 | flush p95 | `2.5 s` |
-| `await_fact_build` average | `0.139 s` |
-| `await_fact_build` p95 | `0.905 s` |
+| `await_block_prepare` average | `0.139 s` |
+| `await_block_prepare` p95 | `0.905 s` |
 | tree-state checkpoint fetch average | `0.086 s` |
 | subtree-root population average | `0.007 s` |
 | block-count batch closes | about `24 / hour` |
@@ -219,8 +275,8 @@ completed work while the next required lower-height source segment is slow.
 
 Commit and flush are visible but not the current ceiling. The writer is closing
 mostly 1,000-block epochs, and store commit work is much smaller than source
-fetch time. Fact build is close to the writer rate, so the next pipeline must
-let source fetch, fact build, and commit proceed independently under byte
+fetch time. Block prepare is close to the writer rate, so the next pipeline must
+let source fetch, block prepare, and commit proceed independently under byte
 watermarks instead of hiding one stage behind the other.
 
 ### Memory and derive replay pressure
@@ -269,7 +325,7 @@ this revision, and keep any replacement behind `NodeSource`.
 ## Final diagnosis
 
 The original Zinder-side bottleneck was not one knob. It was the combination
-of source segment latency, ordered source completion, ordered fact-build output,
+of source segment latency, ordered source completion, ordered block-prepare output,
 high anonymous-memory pressure, and a derive replay scheduler that could only
 pause rather than degrade.
 
@@ -280,7 +336,7 @@ remaining coupled-stream behavior. The old shape was:
 ```text
 source segment fetch
   -> ordered block stream
-  -> ordered fact-build stream
+  -> ordered block-prepare stream
   -> mutable tree-size finalization
   -> subtree/tree-state attachment
   -> commit
@@ -291,7 +347,7 @@ The implemented shape is a staged pipeline with explicit budgets:
 
 ```text
 SourceFetchStage
-  -> CanonicalFactBuildStage
+  -> CanonicalBlockPrepareStage
   -> CanonicalFinalizeStage
   -> SubtreeRootAttachmentStage
   -> CanonicalCommitStage
@@ -330,7 +386,7 @@ stage internals into cohesive modules under `services/zinder-ingest/src/bulk_cat
 | Module | Ownership |
 | --- | --- |
 | `source_fetch.rs` | Adaptive source sizing, unordered segment completion, source byte reservations, continuity validation |
-| `fact_build.rs` | Bounded `SourceBlock` to `DerivedBlockArtifacts` dispatch and fact-build metrics |
+| `block_prepare.rs` | Bounded `SourceBlock` to `DerivedBlockArtifacts` dispatch and block-prepare metrics |
 | `commit_reassembly.rs` | Ordered height reassembly, commitment-tree finalization, canonical batch close decisions, checkpoint tree state, subtree roots, commit calls |
 | `watermark.rs` | Shared byte watermarks, reservations, queue accounting, release-on-drop behavior |
 | `flush.rs` | Bulk-catchup flush cadence and blocking `PrimaryChainStore::flush` wrapper if the current helper grows |
@@ -348,7 +404,7 @@ Work:
 
 - Keep this document as the roadmap and live evidence ledger.
 - Extend `scripts/observability-smoke.sh` so `calibrate` and `snapshot` report
-  source, fact-build, commit, derive, memory, and Zebra health breakdowns.
+  source, block-prepare, commit, derive, memory, and Zebra health breakdowns.
 - Add a `mainnet measurement` section to the script output with image digest,
   resolved compose config, writer height deltas, and 15-minute, 30-minute, and
   60-minute rates.
@@ -365,7 +421,7 @@ Acceptance:
 
 - A future agent can run one command and obtain the same categories of evidence
   before and after a deploy.
-- The report distinguishes source latency, fact-build CPU, commit/flush,
+- The report distinguishes source latency, block-prepare CPU, commit/flush,
   memory pressure, and derive replay pressure.
 
 ## Phase 1: Extract bulk-catchup stage modules without behavior change
@@ -376,7 +432,7 @@ Work:
 
 - Move source sizing, source queue state, prefetch reservation, and continuity
   validation into `bulk_catchup/source_fetch.rs`.
-- Move fact-build stream construction into `bulk_catchup/fact_build.rs`.
+- Move block-prepare stream construction into `bulk_catchup/block_prepare.rs`.
 - Move batch accumulation, tree-size finalization, subtree-root attachment,
   tree-state checkpoint fetch, commit, and batch close orchestration into
   `bulk_catchup/commit_reassembly.rs`.
@@ -413,7 +469,7 @@ Work:
 - Add derived-artifact and commit-reassembly watermark configs, using names
   that state the bounded resource:
   - `source_fetch_max_in_flight_bytes`
-  - `fact_build_max_in_flight_artifact_bytes`
+  - `block_prepare_max_in_flight_artifact_bytes`
   - `commit_reassembly_max_queued_artifact_bytes`
 - Emit:
   - `zinder_ingest_bulk_pipeline_queue_depth{stage}`
@@ -430,7 +486,7 @@ Tests and validation:
 
 Acceptance:
 
-- Source bytes, fact-build backlog bytes, and commit-reassembly bytes are
+- Source bytes, block-prepare backlog bytes, and commit-reassembly bytes are
   visible separately.
 - No stage can grow an unbounded in-memory backlog.
 
@@ -465,32 +521,32 @@ Acceptance:
   freeing source capacity.
 - Canonical commits remain strictly ordered.
 
-## Phase 4: Independent CanonicalFactBuildStage
+## Phase 4: Independent CanonicalBlockPrepareStage
 
 Goal: keep CPU-bound fact construction independent from source fetch and commit.
 
 Work:
 
-- Convert fact build into an explicit bounded stage that accepts source blocks
+- Convert block prepare into an explicit bounded stage that accepts source blocks
   and emits `(height, DerivedBlockArtifacts, artifact_bytes)`.
-- Keep `fact_build_concurrency` as the worker count.
+- Keep `block_prepare_concurrency` as the worker count.
 - Account queued derived artifact bytes against
-  `fact_build_max_in_flight_artifact_bytes`.
+  `block_prepare_max_in_flight_artifact_bytes`.
 - Emit:
-  - `zinder_ingest_bulk_pipeline_stage_duration_seconds{stage="canonical_fact_build"}`
-  - `zinder_ingest_bulk_pipeline_active{stage="canonical_fact_build"}`
-  - `zinder_ingest_bulk_pipeline_queue_bytes{stage="canonical_fact_build"}`
+  - `zinder_ingest_bulk_pipeline_stage_duration_seconds{stage="canonical_block_prepare"}`
+  - `zinder_ingest_bulk_pipeline_active{stage="canonical_block_prepare"}`
+  - `zinder_ingest_bulk_pipeline_queue_bytes{stage="canonical_block_prepare"}`
 
 Tests and validation:
 
-- Slow fact build at height `N` and fast fact build at height `N+1`.
+- Slow block prepare at height `N` and fast block prepare at height `N+1`.
 - Assert completion can be out of order.
 - Assert finalization still waits for height `N`.
-- Assert fact-build workers remain active while source fetch has queued work.
+- Assert block-prepare workers remain active while source fetch has queued work.
 
 Acceptance:
 
-- Source fetch capacity is not consumed by blocks waiting for fact-build
+- Source fetch capacity is not consumed by blocks waiting for block-prepare
   permits.
 - Fact-build capacity is not hidden behind commit or tree-state fetch latency.
 
@@ -526,7 +582,7 @@ Tests and validation:
 Acceptance:
 
 - Ordered finalization is explicit and auditable.
-- Commit order is preserved without forcing source and fact-build completion
+- Commit order is preserved without forcing source and block-prepare completion
   order.
 
 ## Phase 6: SubtreeRootAttachmentStage, checkpoint tree state, commit, and flush
@@ -560,7 +616,7 @@ Tests and validation:
 Acceptance:
 
 - Commit remains serial and atomic.
-- Commit and flush no longer hide source and fact-build pressure.
+- Commit and flush no longer hide source and block-prepare pressure.
 
 ## Phase 7: Derive replay degrade-before-pause
 
@@ -644,12 +700,12 @@ Goal: decide from evidence whether JSON-RPC remains acceptable for the hot path.
 Decision gate:
 
 - Keep JSON-RPC if `batch_getblock` p95 is low on a healthy Zebra, source queue
-  is not saturated, fact-build CPU is the ceiling, and commit/flush/memory
+  is not saturated, block-prepare CPU is the ceiling, and commit/flush/memory
   explain the remaining gap.
 - Tune JSON-RPC if segment splits, response targets, or in-flight byte limits
   are the bottleneck while Zebra is healthy and CPU has headroom.
 - Replace JSON-RPC if, on a healthy Zebra, `batch_getblock` p95 and max dominate
-  wall time, ingest CPU has headroom, fact build is not saturated, commit and
+  wall time, ingest CPU has headroom, block prepare is not saturated, commit and
   flush are small, and raising safe concurrency only increases tail latency or
   Zebra instability.
 
@@ -696,12 +752,12 @@ Tests and validation:
 - Compare current allocator and candidate allocator under the same height
   regime for at least 30 minutes.
 - Record RSS, anonymous RSS, cgroup pressure, swap, writer rate, source p95,
-  fact-build p95, commit p95, and restart/OOM behavior.
+  block-prepare p95, commit p95, and restart/OOM behavior.
 
 Acceptance:
 
 - Ingest does not run steadily at the cgroup hard limit.
-- Memory improvements do not hide leaks or increase source/fact-build tail
+- Memory improvements do not hide leaks or increase source/block-prepare tail
   latency.
 
 ## Phase 11: Final documentation and cleanup
@@ -720,7 +776,7 @@ Work:
   - `docs/runbooks/bulk-catchup-oom-recovery.md`
 - Remove obsolete metric names and old config examples.
 - Remove any wrapper modules that only forward to the final modules.
-- Keep `tree_state_checkpoint_*`, `canonical_*`, `fact_build_*`, and
+- Keep `tree_state_checkpoint_*`, `canonical_*`, `block_prepare_*`, and
   `derive_replay_*` names consistent across code, config, docs, and metrics.
 
 Tests and validation:
@@ -766,7 +822,7 @@ curl -sG http://127.0.0.1:9095/api/v1/query \
   --data-urlencode 'query=histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[1h])))'
 
 curl -sG http://127.0.0.1:9095/api/v1/query \
-  --data-urlencode 'query=sum(rate(zinder_ingest_fact_build_total[1h]))'
+  --data-urlencode 'query=sum(rate(zinder_ingest_block_prepare_total[1h]))'
 
 curl -sG http://127.0.0.1:9095/api/v1/query \
   --data-urlencode 'query=max_over_time(zinder_ingest_memory_pressure_ratio[1h])'
@@ -794,7 +850,7 @@ docker logs --since 1h z3-mainnet-zebra-1 2>&1 \
 
 The performance architecture is complete for this revision:
 
-- Source, fact-build, finalize, attachment, commit, flush, and derive replay
+- Source, block-prepare, finalize, attachment, commit, flush, and derive replay
   pressures are independently visible.
 - Source fetch completion is unordered, while canonical commit remains ordered.
 - Each stage has hard byte or work limits expressed in the unit that bounds the
@@ -832,13 +888,13 @@ Two architectural slices were deployed and measured:
    reassembly. This made the new reassembly metrics visible but did not improve
    end-to-end writer throughput by itself: the five-minute writer rate was
    7.02 blocks/s.
-2. Fact build uses unordered completion plus ordered fact-build reassembly.
+2. Block prepare uses unordered completion plus ordered block-prepare reassembly.
    The five-minute writer rate reached 24.56 blocks/s, 2.75x the one-hour
    baseline. Source segment latency dropped to 2.26s average with 8.51s p95,
    `batch_getblock` dropped to 2.13s average, memory pressure averaged 0.38,
    and derive replay was not paused.
 
-The deployed source/fact-build follow-up bounded fact-build reassembly and
+The deployed source/block-prepare follow-up bounded block-prepare reassembly and
 changed cold-start source defaults to avoid 128-block split storms:
 
 - `source_segment_max_blocks = 16`
@@ -847,10 +903,10 @@ changed cold-start source defaults to avoid 128-block split storms:
 - `source_fetch_max_in_flight_bytes = 402653184`
 
 The bounded+tuned deployment reached 28.07 blocks/s over five minutes, 3.14x
-the one-hour baseline. The same window showed 31.02 fact builds/s, 2.93s
+the one-hour baseline. The same window showed 31.02 block prepares/s, 2.93s
 average source segment latency, 9.28s source p95, 2.77s average
 `batch_getblock`, 7.70 active source requests on average, 5.55 completed
-derived blocks waiting in fact-build reassembly on average, 1.66s average
+derived blocks waiting in block-prepare reassembly on average, 1.66s average
 commit latency, 0.38 average memory pressure, and no derive replay pause.
 
 This checkpoint was superseded by the 2026-05-24 follow-up implementation and
@@ -866,9 +922,9 @@ into the code path:
   to measured response bytes on completion, and keep completed out-of-order
   segment bytes reserved until ordered emission. Completed segments are also
   reported separately as source reorder-buffer bytes.
-- `canonical_fact_build` uses the same reservation primitive for active and
+- `canonical_block_prepare` uses the same reservation primitive for active and
   completed derived artifacts and is bounded by
-  `fact_build_max_in_flight_artifact_bytes`.
+  `block_prepare_max_in_flight_artifact_bytes`.
 - `commit_reassembly` can continue finalizing the next batch while one
   subtree-root/checkpoint/commit/flush future is in flight, bounded by
   `commit_reassembly_max_queued_artifact_bytes`.
@@ -914,6 +970,6 @@ blocks/s over the clean five-minute window, 242.06 derive replay blocks/s,
 then-current derive replay lag at zero, derive replay state `normal`, effective replay
 batch `500`, source queue bytes at the bounded 640 MiB watermark, no watermark
 blocks, 0.63 memory pressure over 15 minutes, source segment latency at 4.48s
-average, canonical fact-build p95 at 0.13s, and canonical commit p95 at 8.70s.
+average, canonical block-prepare p95 at 0.13s, and canonical commit p95 at 8.70s.
 The 2026-05-25 checkpoint supersedes this snapshot for post-catchup projection
 backlog behavior.

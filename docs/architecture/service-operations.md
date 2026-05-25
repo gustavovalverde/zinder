@@ -107,7 +107,7 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
-| `zinder_ingest_bulk_pipeline_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup stage latency by stage, status, and error class. Stages include `canonical_fact_build`, `canonical_finalize`, `subtree_root_attachment`, `checkpoint_tree_state`, `canonical_commit`, and `canonical_flush`. |
+| `zinder_ingest_bulk_pipeline_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup stage latency by stage, status, and error class. Stages include `canonical_block_prepare`, `canonical_finalize`, `subtree_root_attachment`, `checkpoint_tree_state`, `canonical_commit`, and `canonical_flush`. |
 | `zinder_ingest_bulk_pipeline_queue_depth` | gauge | `zinder-ingest` | Active or queued work items by bulk-catchup stage. |
 | `zinder_ingest_bulk_pipeline_queue_bytes` | gauge | `zinder-ingest` | Byte reservations held by a bulk-catchup stage, labeled by stage. |
 | `zinder_ingest_bulk_pipeline_active` | gauge | `zinder-ingest` | Active work count by bulk-catchup stage. |
@@ -117,9 +117,9 @@ Implemented baseline metrics:
 | `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds` | histogram | `zinder-ingest` | Time later source segments spend waiting for an earlier segment before ordered emission. |
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | `zinder-ingest` | Completed source segments waiting for earlier heights before ordered bulk-catchup emission. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | `zinder-ingest` | Estimated response bytes held by completed source segments waiting in ordered reassembly. |
-| `zinder_ingest_fact_build_duration_seconds` | histogram | `zinder-ingest` | Per-block bulk-catchup derive latency by status and error class. |
-| `zinder_ingest_fact_build_total` | counter | `zinder-ingest` | Per-block bulk-catchup derive count by status and error class. |
-| `zinder_ingest_fact_build_reassembly_blocks` | gauge | `zinder-ingest` | Completed derived blocks waiting for earlier heights before the serial finalization fold. |
+| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block block-prepare latency by status and error class. Bulk catchup includes derivation plus spent-transparent-output prefetch; tip follow records sequential derivation plus finalization. |
+| `zinder_ingest_block_prepare_total` | counter | `zinder-ingest` | Per-block block-prepare count by status and error class. |
+| `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
 | `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. Stages include `build_block_contexts` and `read_transparent_spend_facts`; the former wraps context construction, the latter is only the store read. |
@@ -146,11 +146,13 @@ Implemented baseline metrics:
 | `zinder_ingest_commit_batch_transaction_count` | histogram | `zinder-ingest` | Transactions per ingest commit batch by status. |
 | `zinder_ingest_commit_batch_transparent_output_count` | histogram | `zinder-ingest` | Transparent outputs per ingest commit batch by status. |
 | `zinder_ingest_commit_batch_transparent_spend_reference_count` | histogram | `zinder-ingest` | Transparent spend references per ingest commit batch by status. |
+| `zinder_ingest_commit_batch_estimated_write_bytes` | histogram | `zinder-ingest` | Estimated canonical write bytes per ingest commit batch by status. |
 | `zinder_ingest_batch_accumulator_blocks` | gauge | `zinder-ingest` | Blocks currently accumulated in the in-flight ingest batch. |
 | `zinder_ingest_batch_accumulator_transactions` | gauge | `zinder-ingest` | Transactions currently accumulated in the in-flight ingest batch. |
 | `zinder_ingest_batch_accumulator_transparent_outputs` | gauge | `zinder-ingest` | Transparent outputs currently accumulated in the in-flight ingest batch. |
 | `zinder_ingest_batch_accumulator_transparent_spend_references` | gauge | `zinder-ingest` | Transparent spend references currently accumulated in the in-flight ingest batch. |
-| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count`, `artifact_bytes`, `transactions`, `transparent_outputs`, or `transparent_spend_references`. |
+| `zinder_ingest_batch_accumulator_estimated_write_bytes` | gauge | `zinder-ingest` | Estimated canonical write bytes currently accumulated in the in-flight ingest batch. |
+| `zinder_ingest_batch_commit_trigger_total` | counter | `zinder-ingest` | Bulk-catchup batch commits by trigger: `block_count`, `artifact_bytes`, or `estimated_write_bytes`. |
 | `zinder_ingest_writer_has_chain_epoch` | gauge | `zinder-ingest` | Whether the ingest writer currently has a visible chain epoch. |
 | `zinder_ingest_writer_chain_epoch_id` | gauge | `zinder-ingest` | Latest visible chain-epoch id published by the ingest writer. |
 | `zinder_ingest_writer_tip_height` | gauge | `zinder-ingest` | Latest visible tip height published by the ingest writer. |
@@ -308,6 +310,13 @@ reach multi-GiB RSS during catchup. Readers and observability services stay
 under smaller limits so one runaway sidecar cannot starve the writer or the
 upstream Zebra process.
 
+Reader secondaries also use reader-sized RocksDB defaults and a 1,000 ms
+secondary catchup cadence. That posture lets query and explorer attach during
+clean sync without competing with the writer-sized cache, file-handle, and
+memtable envelope used by `zinder-ingest`. Mainnet Compose sets each long-lived
+reader cgroup to 4 GiB; the limit is intentionally smaller than the writer's
+14 GiB ceiling but large enough for RocksDB secondary catch-up transients.
+
 `zinder-ingest` samples its cgroup and process RSS on a dedicated periodic
 task. The scheduler pressure gauge uses cgroup working set so reclaimable file
 cache does not pause rebuildable derive work. The raw current-pressure gauge and
@@ -462,12 +471,14 @@ min_replay_batch_blocks = 50
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
+canonical_batch_max_estimated_write_bytes = 536870912
+canonical_batch_min_blocks_before_estimated_write_close = 100
 source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
-fact_build_concurrency = 16
-fact_build_max_in_flight_artifact_bytes = 536870912
+block_prepare_concurrency = 16
+block_prepare_max_in_flight_artifact_bytes = 536870912
 commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]

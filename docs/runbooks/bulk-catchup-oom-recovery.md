@@ -110,7 +110,7 @@ Option B is the same path documented under [Initial sync § Forked store](initia
 
 The current code applies role-scoped bounded resource budgets at open. Operators configure the canonical store through `[storage.canonical.rocksdb]` and the derive store through `[storage.derive.rocksdb]`; the remaining RocksDB invariants are locked in code. The full design lives in [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
 
-The defaults target a mainnet-sized canonical store:
+Writer defaults target a mainnet-sized canonical store:
 
 ```toml
 [storage.canonical.rocksdb]
@@ -121,7 +121,7 @@ write_buffer_bytes = 16777216   # 16 MiB per column family
 max_write_buffer_count = 2
 ```
 
-And a smaller derive store:
+And a smaller writer-owned derive store:
 
 ```toml
 [storage.derive.rocksdb]
@@ -129,6 +129,28 @@ block_cache_bytes = 134217728   # 128 MiB
 max_wal_bytes = 67108864        # 64 MiB
 max_open_files = 256
 write_buffer_bytes = 8388608    # 8 MiB per column family
+max_write_buffer_count = 2
+```
+
+Reader secondaries default lower so query, explorer, and compat services do not
+compete with the ingest writer during clean sync:
+
+```toml
+[storage]
+secondary_catchup_interval_ms = 1000
+
+[storage.canonical.rocksdb]
+block_cache_bytes = 134217728   # 128 MiB
+max_wal_bytes = 33554432        # 32 MiB
+max_open_files = 128
+write_buffer_bytes = 8388608    # 8 MiB per column family
+max_write_buffer_count = 2
+
+[storage.derive.rocksdb]
+block_cache_bytes = 67108864    # 64 MiB
+max_wal_bytes = 16777216        # 16 MiB
+max_open_files = 64
+write_buffer_bytes = 4194304    # 4 MiB per column family
 max_write_buffer_count = 2
 ```
 
@@ -143,12 +165,16 @@ memory_resume_ratio = 0.80
 min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]
+canonical_batch_max_blocks = 1000
+canonical_batch_max_artifact_bytes = 536870912
+canonical_batch_max_estimated_write_bytes = 536870912
+canonical_batch_min_blocks_before_estimated_write_close = 100
 source_segment_max_blocks = 16      # hard ceiling; runtime size adapts by response bytes
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
-fact_build_concurrency = 16
-fact_build_max_in_flight_artifact_bytes = 536870912
+block_prepare_concurrency = 16
+block_prepare_max_in_flight_artifact_bytes = 536870912
 commit_reassembly_max_queued_artifact_bytes = 536870912
 flush_interval_epochs = 5      # RocksDB flush cadence (epochs)
 ```
@@ -164,11 +190,11 @@ raise `node.max_response_bytes` or switch to a source feed that does not require
 large JSON payloads. If split bursts repeat immediately after every
 `chain_committed` event, the source-density state is being reset too often.
 
-With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
+With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. `canonical_batch_max_artifact_bytes` is a hard raw-artifact memory limit. `canonical_batch_max_estimated_write_bytes` closes dense canonical-write batches only after `canonical_batch_min_blocks_before_estimated_write_close`, except for a single oversized block. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
 
 `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` reserves `node.max_response_bytes` before each source request and then shrinks to the measured response bytes after decode. Keep it at least as large as `node.max_response_bytes`; otherwise startup rejects the config because a single active source response would not fit the declared watermark.
 
-`ingest.bulk_catchup.fact_build_concurrency` controls CPU workers; `fact_build_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
+`ingest.bulk_catchup.block_prepare_concurrency` controls CPU workers; `block_prepare_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
 RAM-constrained hosts drop the cache to 128 MiB and the WAL ceiling to 64 MiB; high-throughput hosts can raise the cache to 1 GiB. The architectural invariants (WAL on, point-in-time recovery, atomic cross-CF flush, ordered writes) are not exposed to operator tuning because each one is a contract of the per-`ChainEpoch` commit guarantee.
 

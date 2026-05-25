@@ -90,14 +90,22 @@ pub(crate) fn live_bulk_catchup_run_config(
         canonical_batch_max_blocks,
         canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
+        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )
+        .unwrap_or(NonZeroU64::MIN),
+        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )
+        .unwrap_or(NonZeroU32::MIN),
         source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
         source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
-        fact_build_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
-        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
+        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),

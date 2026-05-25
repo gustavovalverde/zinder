@@ -19,10 +19,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
-    BulkCatchupConfig, ChainEventRetentionConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-    DeriveReplayPolicy, IngestDeriveConfig, IngestError, IngestLoopConfig, IngestModifiers,
-    MempoolEventRetentionWorkerConfig, NodeSourceKind, PhasesConfig, RawBlobPolicy,
-    TipFollowPhaseConfig,
+    BulkCatchupConfig, ChainEventRetentionConfig,
+    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
+    IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig, NodeSourceKind,
+    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
@@ -47,7 +49,7 @@ const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 16;
 const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 33_554_432;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184;
-const DEFAULT_FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912;
+const DEFAULT_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912;
 const DEFAULT_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912;
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
 const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
@@ -55,7 +57,7 @@ const DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
 const DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.90;
 const DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.99;
 const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
-const FACT_BUILD_CONCURRENCY_CEILING: u32 = 16;
+const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
@@ -148,11 +150,13 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) catchup_threshold_blocks: Option<u32>,
     pub(crate) canonical_batch_max_blocks: Option<u32>,
     pub(crate) canonical_batch_max_artifact_bytes: Option<u64>,
+    pub(crate) canonical_batch_max_estimated_write_bytes: Option<u64>,
+    pub(crate) canonical_batch_min_blocks_before_estimated_write_close: Option<u32>,
     pub(crate) source_segment_max_blocks: Option<u32>,
     pub(crate) source_segment_target_response_bytes: Option<u64>,
     pub(crate) source_fetch_max_in_flight_requests: Option<u32>,
     pub(crate) source_fetch_max_in_flight_bytes: Option<u64>,
-    pub(crate) fact_build_concurrency: Option<u32>,
+    pub(crate) block_prepare_concurrency: Option<u32>,
     pub(crate) poll_interval_ms: Option<u64>,
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) target_height: Option<u32>,
@@ -218,6 +222,14 @@ pub(crate) fn load_ingest_config(
             DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES,
         )?
         .with_default(
+            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+            DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )?
+        .with_default(
+            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+            DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )?
+        .with_default(
             "ingest.bulk_catchup.source_segment_max_blocks",
             DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS,
         )?
@@ -234,12 +246,12 @@ pub(crate) fn load_ingest_config(
             DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES,
         )?
         .with_default(
-            "ingest.bulk_catchup.fact_build_concurrency",
-            default_fact_build_concurrency(),
+            "ingest.bulk_catchup.block_prepare_concurrency",
+            default_block_prepare_concurrency(),
         )?
         .with_default(
-            "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
-            DEFAULT_FACT_BUILD_MAX_IN_FLIGHT_ARTIFACT_BYTES,
+            "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
+            DEFAULT_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES,
         )?
         .with_default(
             "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
@@ -319,6 +331,14 @@ pub(crate) fn load_ingest_config(
             overrides.canonical_batch_max_artifact_bytes,
         )?
         .with_override_if(
+            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+            overrides.canonical_batch_max_estimated_write_bytes,
+        )?
+        .with_override_if(
+            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+            overrides.canonical_batch_min_blocks_before_estimated_write_close,
+        )?
+        .with_override_if(
             "ingest.bulk_catchup.source_segment_max_blocks",
             overrides.source_segment_max_blocks,
         )?
@@ -335,8 +355,8 @@ pub(crate) fn load_ingest_config(
             overrides.source_fetch_max_in_flight_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.fact_build_concurrency",
-            overrides.fact_build_concurrency,
+            "ingest.bulk_catchup.block_prepare_concurrency",
+            overrides.block_prepare_concurrency,
         )?
         .with_override_if(
             "ingest.tip_follow.poll_interval_ms",
@@ -494,12 +514,14 @@ struct IngestDeriveSection {
 struct IngestBulkCatchupSection {
     canonical_batch_max_blocks: Option<u32>,
     canonical_batch_max_artifact_bytes: Option<u64>,
+    canonical_batch_max_estimated_write_bytes: Option<u64>,
+    canonical_batch_min_blocks_before_estimated_write_close: Option<u32>,
     source_segment_max_blocks: Option<u32>,
     source_segment_target_response_bytes: Option<u64>,
     source_fetch_max_in_flight_requests: Option<u32>,
     source_fetch_max_in_flight_bytes: Option<u64>,
-    fact_build_concurrency: Option<u32>,
-    fact_build_max_in_flight_artifact_bytes: Option<u64>,
+    block_prepare_concurrency: Option<u32>,
+    block_prepare_max_in_flight_artifact_bytes: Option<u64>,
     commit_reassembly_max_queued_artifact_bytes: Option<u64>,
     flush_interval_epochs: Option<u32>,
 }
@@ -624,6 +646,28 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             .canonical_batch_max_artifact_bytes,
         "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
     )?;
+    let canonical_batch_max_estimated_write_bytes = nonzero_u64_config(
+        config
+            .ingest
+            .bulk_catchup
+            .canonical_batch_max_estimated_write_bytes,
+        "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+    )?;
+    let canonical_batch_min_blocks_before_estimated_write_close = nonzero_u32_config(
+        config
+            .ingest
+            .bulk_catchup
+            .canonical_batch_min_blocks_before_estimated_write_close,
+        "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+    )?;
+    if canonical_batch_min_blocks_before_estimated_write_close.get()
+        > canonical_batch_max_blocks.get()
+    {
+        return Err(ConfigError::invalid(
+            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.bulk_catchup.canonical_batch_max_blocks",
+        )
+        .into());
+    }
 
     let source_segment_max_blocks_raw = require_field(
         config.ingest.bulk_catchup.source_segment_max_blocks,
@@ -636,19 +680,22 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             )
         })?;
 
-    let fact_build_concurrency_raw = require_field(
-        config.ingest.bulk_catchup.fact_build_concurrency,
-        "ingest.bulk_catchup.fact_build_concurrency",
+    let block_prepare_concurrency_raw = require_field(
+        config.ingest.bulk_catchup.block_prepare_concurrency,
+        "ingest.bulk_catchup.block_prepare_concurrency",
     )?;
-    let fact_build_concurrency = NonZeroU32::new(fact_build_concurrency_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.bulk_catchup.fact_build_concurrency must be greater than zero")
-    })?;
-    let fact_build_max_in_flight_artifact_bytes = nonzero_u64_config(
+    let block_prepare_concurrency =
+        NonZeroU32::new(block_prepare_concurrency_raw).ok_or_else(|| {
+            ConfigError::invalid(
+                "ingest.bulk_catchup.block_prepare_concurrency must be greater than zero",
+            )
+        })?;
+    let block_prepare_max_in_flight_artifact_bytes = nonzero_u64_config(
         config
             .ingest
             .bulk_catchup
-            .fact_build_max_in_flight_artifact_bytes,
-        "ingest.bulk_catchup.fact_build_max_in_flight_artifact_bytes",
+            .block_prepare_max_in_flight_artifact_bytes,
+        "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
     )?;
     let commit_reassembly_max_queued_artifact_bytes = nonzero_u64_config(
         config
@@ -815,12 +862,14 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         bulk_catchup: BulkCatchupConfig {
             canonical_batch_max_blocks,
             canonical_batch_max_artifact_bytes,
+            canonical_batch_max_estimated_write_bytes,
+            canonical_batch_min_blocks_before_estimated_write_close,
             source_segment_max_blocks,
             source_segment_target_response_bytes,
             source_fetch_max_in_flight_requests,
             source_fetch_max_in_flight_bytes,
-            fact_build_concurrency,
-            fact_build_max_in_flight_artifact_bytes,
+            block_prepare_concurrency,
+            block_prepare_max_in_flight_artifact_bytes,
             commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
@@ -925,6 +974,14 @@ impl RedactedIngestConfigToml {
                         .bulk_catchup
                         .canonical_batch_max_artifact_bytes
                         .get(),
+                    canonical_batch_max_estimated_write_bytes: loop_config
+                        .bulk_catchup
+                        .canonical_batch_max_estimated_write_bytes
+                        .get(),
+                    canonical_batch_min_blocks_before_estimated_write_close: loop_config
+                        .bulk_catchup
+                        .canonical_batch_min_blocks_before_estimated_write_close
+                        .get(),
                     source_segment_max_blocks: loop_config
                         .bulk_catchup
                         .source_segment_max_blocks
@@ -941,10 +998,13 @@ impl RedactedIngestConfigToml {
                         .bulk_catchup
                         .source_fetch_max_in_flight_bytes
                         .get(),
-                    fact_build_concurrency: loop_config.bulk_catchup.fact_build_concurrency.get(),
-                    fact_build_max_in_flight_artifact_bytes: loop_config
+                    block_prepare_concurrency: loop_config
                         .bulk_catchup
-                        .fact_build_max_in_flight_artifact_bytes
+                        .block_prepare_concurrency
+                        .get(),
+                    block_prepare_max_in_flight_artifact_bytes: loop_config
+                        .bulk_catchup
+                        .block_prepare_max_in_flight_artifact_bytes
                         .get(),
                     commit_reassembly_max_queued_artifact_bytes: loop_config
                         .bulk_catchup
@@ -1033,22 +1093,24 @@ struct IngestDeriveToml {
 struct IngestBulkCatchupToml {
     canonical_batch_max_blocks: u32,
     canonical_batch_max_artifact_bytes: u64,
+    canonical_batch_max_estimated_write_bytes: u64,
+    canonical_batch_min_blocks_before_estimated_write_close: u32,
     source_segment_max_blocks: u32,
     source_segment_target_response_bytes: u64,
     source_fetch_max_in_flight_requests: u32,
     source_fetch_max_in_flight_bytes: u64,
-    fact_build_concurrency: u32,
-    fact_build_max_in_flight_artifact_bytes: u64,
+    block_prepare_concurrency: u32,
+    block_prepare_max_in_flight_artifact_bytes: u64,
     commit_reassembly_max_queued_artifact_bytes: u64,
     flush_interval_epochs: u32,
 }
 
-/// Computes the default fact-build concurrency from available logical cores.
-fn default_fact_build_concurrency() -> u32 {
+/// Computes the default block-prepare concurrency from available logical cores.
+fn default_block_prepare_concurrency() -> u32 {
     let logical_cores =
         u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
             .unwrap_or(8);
-    logical_cores.clamp(1, FACT_BUILD_CONCURRENCY_CEILING)
+    logical_cores.clamp(1, BLOCK_PREPARE_CONCURRENCY_CEILING)
 }
 
 #[derive(Serialize)]

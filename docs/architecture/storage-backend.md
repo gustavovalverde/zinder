@@ -149,7 +149,7 @@ Checkpoint readers must open a documented manifest and validate store identity, 
 
 ## Multi-Process Operations
 
-The primary/secondary contract is in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md): one writer per store path, process-unique `secondary_path`, 250 ms catchup default, schema-version one-directional compatibility, gRPC-only subscription delivery. Storage code follows that ADR; this document owns the storage-family details.
+The primary/secondary contract is in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md): one writer per store path, process-unique `secondary_path`, 1,000 ms catchup default, schema-version one-directional compatibility, gRPC-only subscription delivery. Storage code follows that ADR; this document owns the storage-family details.
 
 ## Storage Metrics
 

@@ -108,7 +108,7 @@ If a phase shows `outcome=failed`, the `reason=` field has the underlying error.
 For a fresh deployment (empty store, mainnet/testnet sync from scratch):
 
 1. **starting** (seconds): config load, storage open; `phase=awaiting_upstream`.
-2. **bulk catch-up** (minutes to hours): the unified ingest loop uses byte-watermarked source fetches and parallel canonical fact build; `phase=bulk_catchup`, `cause=syncing`, `lag_blocks` shrinks as progress accumulates.
+2. **bulk catch-up** (minutes to hours): the unified ingest loop uses byte-watermarked source fetches and parallel canonical block prepare; `phase=bulk_catchup`, `cause=syncing`, `lag_blocks` shrinks as progress accumulates.
 3. **tip-follow ready** (steady state): accepting traffic; `phase=following_tip`, `cause=ready`.
 
 `/readyz` returns 503 with `cause = "syncing"` during phase 2 and 200 with `cause = "ready"` in phase 3. If Zebra is itself behind the network tip, the cause becomes `upstream_not_ready` with the structured `upstream_health` substructure; configure `[node.health].addr` to point at Zebra's `/ready` endpoint for the precise signal. See [Initial sync](../runbooks/initial-sync.md) for the full diagnostic.

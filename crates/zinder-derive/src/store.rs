@@ -157,7 +157,7 @@ impl DeriveStoreTable {
 /// Configurable knobs the binary applies before opening the database.
 ///
 /// `rocksdb_resource_budget` ships with
-/// [`RocksDbResourceBudget::derive_defaults`].
+/// [`RocksDbResourceBudget::derive_writer_defaults`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeriveStoreOptions {
     /// When set, every write is flushed to the OS page cache before returning.
@@ -177,7 +177,7 @@ impl Default for DeriveStoreOptions {
         Self {
             sync_writes: false,
             consumer_column_families: &[],
-            rocksdb_resource_budget: RocksDbResourceBudget::derive_defaults(),
+            rocksdb_resource_budget: RocksDbResourceBudget::derive_writer_defaults(),
         }
     }
 }

@@ -147,6 +147,28 @@ impl RocksChainStore {
         read_outcome
     }
 
+    pub(crate) fn sorted_multi_get(
+        &self,
+        table: StorageTable,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let column_family = self.column_family(table)?;
+        let started_at = Instant::now();
+        let read_outcome = self
+            .db
+            .batched_multi_get_cf_slice(&column_family, keys.iter().map(StoreKey::as_bytes), true)
+            .into_iter()
+            .map(|rocksdb_result| {
+                rocksdb_result
+                    .map(|maybe_slice| maybe_slice.map(|slice| slice.to_vec()))
+                    .map_err(StoreError::storage_unavailable)
+            })
+            .collect();
+        record_store_multi_get_outcome(table, started_at, keys.len(), &read_outcome);
+
+        read_outcome
+    }
+
     pub(crate) fn get_previous_by_prefix(
         &self,
         table: StorageTable,
@@ -514,6 +536,14 @@ pub(crate) trait RocksChainStoreRead {
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError>;
 
+    fn sorted_multi_get(
+        &self,
+        table: StorageTable,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        self.multi_get(table, keys)
+    }
+
     fn get_previous_by_prefix(
         &self,
         table: StorageTable,
@@ -559,6 +589,14 @@ impl RocksChainStoreRead for RocksChainStore {
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         Self::multi_get(self, table, keys)
+    }
+
+    fn sorted_multi_get(
+        &self,
+        table: StorageTable,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        Self::sorted_multi_get(self, table, keys)
     }
 
     fn get_previous_by_prefix(
@@ -624,6 +662,17 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
         match self {
             Self::Snapshot(snapshot) => snapshot.multi_get(table, keys),
             Self::Direct(store) => store.multi_get(table, keys),
+        }
+    }
+
+    fn sorted_multi_get(
+        &self,
+        table: StorageTable,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.multi_get(table, keys),
+            Self::Direct(store) => store.sorted_multi_get(table, keys),
         }
     }
 

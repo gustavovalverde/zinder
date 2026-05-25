@@ -143,7 +143,8 @@ splits the rest into four concern-named sub-sections:
 - `[ingest.derive]` carries shared CPU-bound derive execution knobs
   (`concurrency`).
 - `[ingest.bulk_catchup]` carries the pipelined-fetch and commit-work
-  knobs (`canonical_batch_max_blocks`, `source_segment_max_blocks`).
+  knobs (`canonical_batch_max_blocks`,
+  `canonical_batch_max_estimated_write_bytes`, `source_segment_max_blocks`).
 - `[ingest.tip_follow]` carries the serial-loop knobs
   (`poll_interval_ms`, `lag_threshold_blocks`).
 - `[ingest.modifiers]` carries the optional one-shot or

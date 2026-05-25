@@ -18,22 +18,23 @@ path = "/var/run/auth/.cookie"
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
+secondary_catchup_interval_ms = 1000
 
-# Bounded RocksDB resource budgets for the canonical and derive secondaries.
+# Bounded RocksDB resource budgets for reader secondaries.
 # See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
-# [storage.canonical.rocksdb]
-# block_cache_bytes = 536870912
-# max_wal_bytes = 268435456
-# max_open_files = 512
-# write_buffer_bytes = 16777216
-# max_write_buffer_count = 2
-#
-# [storage.derive.rocksdb]
-# block_cache_bytes = 134217728
-# max_wal_bytes = 67108864
-# max_open_files = 256
-# write_buffer_bytes = 8388608
-# max_write_buffer_count = 2
+[storage.canonical.rocksdb]
+block_cache_bytes = 134217728
+max_wal_bytes = 33554432
+max_open_files = 128
+write_buffer_bytes = 8388608
+max_write_buffer_count = 2
+
+[storage.derive.rocksdb]
+block_cache_bytes = 67108864
+max_wal_bytes = 16777216
+max_open_files = 64
+write_buffer_bytes = 4194304
+max_write_buffer_count = 2
 
 [ingest_control]
 addr = "http://zinder-ingest:9100"

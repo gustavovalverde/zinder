@@ -62,9 +62,11 @@ pub use sections::{
     ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
     RocksDbResourceBudgetToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
     StorageRoleSection, StorageRoleToml, defaults as section_defaults,
-    resolve_canonical_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_derive_rocksdb_budget, resolve_ingest_control_reader, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention, resolve_secondary_storage,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_canonical_writer_rocksdb_budget, resolve_derive_reader_rocksdb_budget,
+    resolve_derive_writer_rocksdb_budget, resolve_ingest_control_reader,
+    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
+    resolve_retention, resolve_secondary_storage,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{

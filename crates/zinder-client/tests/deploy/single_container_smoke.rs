@@ -330,7 +330,7 @@ source_segment_max_blocks = 16
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 12
 source_fetch_max_in_flight_bytes = 402653184
-fact_build_concurrency = 16
+block_prepare_concurrency = 16
 
 [ingest_control]
 listen_addr = "127.0.0.1:9100"

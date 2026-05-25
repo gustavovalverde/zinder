@@ -169,6 +169,10 @@ pub struct BulkCatchupConfig {
     pub canonical_batch_max_blocks: NonZeroU32,
     /// Maximum canonical artifact bytes accumulated before closing a batch.
     pub canonical_batch_max_artifact_bytes: NonZeroU64,
+    /// Maximum estimated canonical write bytes accumulated before closing a batch.
+    pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
+    /// Minimum batch size before estimated write bytes can close the batch.
+    pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
     /// Maximum connected blocks requested from the source in one segment.
     pub source_segment_max_blocks: NonZeroU32,
     /// Target source response bytes for adaptive segment sizing.
@@ -177,11 +181,11 @@ pub struct BulkCatchupConfig {
     pub source_fetch_max_in_flight_requests: NonZeroU32,
     /// Maximum reserved response bytes across source fetches.
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Parallel canonical fact-build slots.
-    pub fact_build_concurrency: NonZeroU32,
+    /// Parallel canonical block-prepare slots.
+    pub block_prepare_concurrency: NonZeroU32,
     /// Maximum reserved derived artifact bytes across active and completed
-    /// canonical fact builds.
-    pub fact_build_max_in_flight_artifact_bytes: NonZeroU64,
+    /// canonical block prepares.
+    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
     /// Maximum finalized artifact bytes allowed to queue while the previous
     /// canonical batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -560,6 +564,12 @@ fn build_bulk_catchup_batch_config(
         to_height: BlockHeight::new(batch_target),
         canonical_batch_max_blocks: config.bulk_catchup.canonical_batch_max_blocks,
         canonical_batch_max_artifact_bytes: config.bulk_catchup.canonical_batch_max_artifact_bytes,
+        canonical_batch_max_estimated_write_bytes: config
+            .bulk_catchup
+            .canonical_batch_max_estimated_write_bytes,
+        canonical_batch_min_blocks_before_estimated_write_close: config
+            .bulk_catchup
+            .canonical_batch_min_blocks_before_estimated_write_close,
         source_segment_max_blocks: config.bulk_catchup.source_segment_max_blocks,
         source_segment_target_response_bytes: config
             .bulk_catchup
@@ -568,10 +578,10 @@ fn build_bulk_catchup_batch_config(
             .bulk_catchup
             .source_fetch_max_in_flight_requests,
         source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
-        fact_build_concurrency: config.bulk_catchup.fact_build_concurrency,
-        fact_build_max_in_flight_artifact_bytes: config
+        block_prepare_concurrency: config.bulk_catchup.block_prepare_concurrency,
+        block_prepare_max_in_flight_artifact_bytes: config
             .bulk_catchup
-            .fact_build_max_in_flight_artifact_bytes,
+            .block_prepare_max_in_flight_artifact_bytes,
         commit_reassembly_max_queued_artifact_bytes: config
             .bulk_catchup
             .commit_reassembly_max_queued_artifact_bytes,
@@ -669,6 +679,14 @@ mod tests {
                 canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,
                 canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
                     .ok_or("invalid batch artifact bytes")?,
+                canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+                    crate::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+                )
+                .ok_or("invalid estimated write byte budget")?,
+                canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+                    crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+                )
+                .ok_or("invalid estimated write close floor")?,
                 source_segment_max_blocks: NonZeroU32::new(128)
                     .ok_or("invalid source segment blocks")?,
                 source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
@@ -677,9 +695,10 @@ mod tests {
                     .ok_or("invalid source fetch requests")?,
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
-                fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid fact build slots")?,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: NonZeroU32::new(4)
+                    .ok_or("invalid block prepare slots")?,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
                 commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                     .ok_or("invalid commit reassembly bytes")?,
                 flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,

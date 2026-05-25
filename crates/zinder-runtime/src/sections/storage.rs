@@ -17,7 +17,7 @@ use zinder_store::RocksDbResourceBudget;
 
 use crate::{ConfigError, config::duration_as_millis_u64};
 
-const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 250;
+const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
 
 /// Raw role-scoped `rocksdb` sub-section.
@@ -43,8 +43,7 @@ pub struct RocksDbResourceBudgetSection {
 
 impl RocksDbResourceBudgetSection {
     /// Merges any `Some` overrides onto `defaults`. Use
-    /// [`RocksDbResourceBudget::canonical_defaults`] for the canonical store and
-    /// [`RocksDbResourceBudget::derive_defaults`] for the derive store.
+    /// writer or reader defaults for the selected store posture.
     #[must_use]
     pub const fn apply_to(self, mut defaults: RocksDbResourceBudget) -> RocksDbResourceBudget {
         if let Some(bytes) = self.block_cache_bytes {
@@ -184,24 +183,47 @@ fn resolve_rocksdb_resource_budget(
 }
 
 /// Merges canonical-role overrides onto
-/// [`RocksDbResourceBudget::canonical_defaults`].
-pub fn resolve_canonical_rocksdb_budget(
+/// [`RocksDbResourceBudget::canonical_writer_defaults`].
+pub fn resolve_canonical_writer_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
     resolve_rocksdb_resource_budget(
         section,
-        RocksDbResourceBudget::canonical_defaults(),
+        RocksDbResourceBudget::canonical_writer_defaults(),
         "storage.canonical.rocksdb",
     )
 }
 
-/// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_defaults`].
-pub fn resolve_derive_rocksdb_budget(
+/// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_writer_defaults`].
+pub fn resolve_derive_writer_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
     resolve_rocksdb_resource_budget(
         section,
-        RocksDbResourceBudget::derive_defaults(),
+        RocksDbResourceBudget::derive_writer_defaults(),
+        "storage.derive.rocksdb",
+    )
+}
+
+/// Merges canonical-role overrides onto
+/// [`RocksDbResourceBudget::canonical_reader_defaults`].
+pub fn resolve_canonical_reader_rocksdb_budget(
+    section: RocksDbResourceBudgetSection,
+) -> Result<RocksDbResourceBudget, ConfigError> {
+    resolve_rocksdb_resource_budget(
+        section,
+        RocksDbResourceBudget::canonical_reader_defaults(),
+        "storage.canonical.rocksdb",
+    )
+}
+
+/// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_reader_defaults`].
+pub fn resolve_derive_reader_rocksdb_budget(
+    section: RocksDbResourceBudgetSection,
+) -> Result<RocksDbResourceBudget, ConfigError> {
+    resolve_rocksdb_resource_budget(
+        section,
+        RocksDbResourceBudget::derive_reader_defaults(),
         "storage.derive.rocksdb",
     )
 }
@@ -213,8 +235,9 @@ pub fn resolve_primary_storage(
     let path = section
         .path
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let canonical_rocksdb_budget = resolve_canonical_rocksdb_budget(section.canonical.rocksdb)?;
-    let derive_rocksdb_budget = resolve_derive_rocksdb_budget(section.derive.rocksdb)?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_writer_rocksdb_budget(section.canonical.rocksdb)?;
+    let derive_rocksdb_budget = resolve_derive_writer_rocksdb_budget(section.derive.rocksdb)?;
     Ok(ResolvedPrimaryStorage {
         path,
         canonical_rocksdb_budget,
@@ -245,8 +268,9 @@ pub fn resolve_secondary_storage(
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
-    let canonical_rocksdb_budget = resolve_canonical_rocksdb_budget(section.canonical.rocksdb)?;
-    let derive_rocksdb_budget = resolve_derive_rocksdb_budget(section.derive.rocksdb)?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
+    let derive_rocksdb_budget = resolve_derive_reader_rocksdb_budget(section.derive.rocksdb)?;
     Ok(ResolvedSecondaryStorage {
         path,
         secondary_path,
@@ -280,7 +304,8 @@ pub fn resolve_canonical_secondary_storage(
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
-    let canonical_rocksdb_budget = resolve_canonical_rocksdb_budget(section.canonical.rocksdb)?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
     Ok(ResolvedCanonicalSecondaryStorage {
         path,
         secondary_path,
@@ -494,6 +519,14 @@ mod tests {
             resolved.secondary_replica_lag_threshold_chain_epochs,
             DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS
         );
+        assert_eq!(
+            resolved.canonical_rocksdb_budget,
+            RocksDbResourceBudget::canonical_reader_defaults()
+        );
+        assert_eq!(
+            resolved.derive_rocksdb_budget,
+            RocksDbResourceBudget::derive_reader_defaults()
+        );
         Ok(())
     }
 
@@ -520,6 +553,10 @@ mod tests {
             Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)
         );
         assert_eq!(resolved.canonical_rocksdb_budget.max_open_files, 128);
+        assert_eq!(
+            resolved.canonical_rocksdb_budget.block_cache_bytes,
+            RocksDbResourceBudget::canonical_reader_defaults().block_cache_bytes
+        );
         Ok(())
     }
 
@@ -535,30 +572,51 @@ mod tests {
     }
 
     #[test]
-    fn canonical_budget_resolution_falls_through_to_canonical_defaults() -> Result<(), ConfigError>
-    {
-        let resolved = resolve_canonical_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        assert_eq!(resolved, RocksDbResourceBudget::canonical_defaults());
+    fn canonical_writer_budget_resolution_falls_through_to_writer_defaults()
+    -> Result<(), ConfigError> {
+        let resolved =
+            resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
+        assert_eq!(resolved, RocksDbResourceBudget::canonical_writer_defaults());
         Ok(())
     }
 
     #[test]
-    fn derive_budget_resolution_falls_through_to_derive_defaults() -> Result<(), ConfigError> {
-        let resolved = resolve_derive_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        assert_eq!(resolved, RocksDbResourceBudget::derive_defaults());
+    fn derive_writer_budget_resolution_falls_through_to_writer_defaults() -> Result<(), ConfigError>
+    {
+        let resolved =
+            resolve_derive_writer_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
+        assert_eq!(resolved, RocksDbResourceBudget::derive_writer_defaults());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_reader_budget_resolution_falls_through_to_reader_defaults()
+    -> Result<(), ConfigError> {
+        let resolved =
+            resolve_canonical_reader_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
+        assert_eq!(resolved, RocksDbResourceBudget::canonical_reader_defaults());
+        Ok(())
+    }
+
+    #[test]
+    fn derive_reader_budget_resolution_falls_through_to_reader_defaults() -> Result<(), ConfigError>
+    {
+        let resolved =
+            resolve_derive_reader_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
+        assert_eq!(resolved, RocksDbResourceBudget::derive_reader_defaults());
         Ok(())
     }
 
     #[test]
     fn canonical_budget_resolution_applies_individual_overrides() -> Result<(), ConfigError> {
-        let resolved = resolve_canonical_rocksdb_budget(RocksDbResourceBudgetSection {
+        let resolved = resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection {
             block_cache_bytes: Some(8 * 1024 * 1024),
             max_wal_bytes: None,
             max_open_files: Some(256),
             write_buffer_bytes: Some(8 * 1024 * 1024),
             max_write_buffer_count: Some(3),
         })?;
-        let defaults = RocksDbResourceBudget::canonical_defaults();
+        let defaults = RocksDbResourceBudget::canonical_writer_defaults();
         assert_eq!(resolved.block_cache_bytes, 8 * 1024 * 1024);
         assert_eq!(resolved.max_wal_bytes, defaults.max_wal_bytes);
         assert_eq!(resolved.max_open_files, 256);

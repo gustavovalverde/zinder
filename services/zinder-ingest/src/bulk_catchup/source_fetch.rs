@@ -17,7 +17,6 @@ use zinder_source::{
     SourceChainSegmentStats, SourceChainUpdate, SourceError,
 };
 
-use super::fact_build::BulkCatchupFactBuildStreamConfig;
 use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
 use super::{
     BULK_STAGE_SOURCE_FETCH, IngestError, SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT,
@@ -27,6 +26,17 @@ use super::{
     usize_to_u32_saturating,
 };
 use crate::chain_ingest::{IngestRetryState, fetch_chain_segment_with_retry};
+
+pub(super) struct BulkCatchupSourceFetchStreamConfig {
+    pub(super) request_timeout: Duration,
+    pub(super) from_height: BlockHeight,
+    pub(super) to_height: BlockHeight,
+    pub(super) max_response_bytes: NonZeroU64,
+    pub(super) target_response_payload_bytes: NonZeroU64,
+    pub(super) source_fetch_max_in_flight_requests: NonZeroU32,
+    pub(super) source_fetch_max_in_flight_bytes: NonZeroU64,
+    pub(super) source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+}
 
 struct SourceBlockStreamState<'a, Source> {
     source: &'a Source,
@@ -51,7 +61,7 @@ struct SourceBlockStreamState<'a, Source> {
 
 pub(super) fn build_source_block_stream<'a, Source>(
     source: &'a Source,
-    config: BulkCatchupFactBuildStreamConfig,
+    config: BulkCatchupSourceFetchStreamConfig,
 ) -> impl Stream<Item = Result<SourceBlock, IngestError>> + Send + 'a
 where
     Source: NodeSource + 'a,

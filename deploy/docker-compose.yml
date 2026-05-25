@@ -97,7 +97,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-query
     image: zinder-query:latest
-    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-2g}
+    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
     restart: on-failure
     depends_on:
       zinder-ingest:
@@ -136,7 +136,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-explorer
     image: zinder-explorer:latest
-    mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-2g}
+    mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-4g}
     restart: on-failure
     depends_on:
       zinder-ingest:

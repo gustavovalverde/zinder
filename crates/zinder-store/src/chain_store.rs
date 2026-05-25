@@ -46,6 +46,7 @@ use crate::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
         StorageTable,
     },
+    transparent_output::read_current_transparent_outputs_by_outpoints,
     transparent_spend_fact::read_visible_transparent_spend_fact_block_outpoints,
 };
 
@@ -81,7 +82,7 @@ impl ChainStoreOptions {
             reorg_window_blocks: 100,
             sync_writes: true,
             network: Some(network),
-            rocksdb_resource_budget: RocksDbResourceBudget::canonical_defaults(),
+            rocksdb_resource_budget: RocksDbResourceBudget::canonical_writer_defaults(),
         }
     }
 
@@ -388,6 +389,23 @@ impl PrimaryChainStore {
         chain_epoch: ChainEpochId,
     ) -> Result<ChainEpochReader<'_>, StoreError> {
         self.store.chain_epoch_reader_at(chain_epoch)
+    }
+
+    /// Resolves transparent outputs on the primary writer's direct read path.
+    ///
+    /// This skips snapshot pinning and visibility filtering because the writer
+    /// calls it while deriving a node-validated commit against the current
+    /// visible epoch. External readers must use [`ChainEpochReader`] instead.
+    pub fn transparent_outputs_by_outpoints_for_writer_commit(
+        &self,
+        chain_epoch: ChainEpoch,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentOutputArtifact>, StoreError> {
+        read_current_transparent_outputs_by_outpoints(
+            &self.store.inner.direct_read_view(),
+            chain_epoch,
+            outpoints,
+        )
     }
 
     /// Atomically commits artifacts for one chain epoch and advances the visible pointer.

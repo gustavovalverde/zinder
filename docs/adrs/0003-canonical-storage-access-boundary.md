@@ -49,7 +49,7 @@ LocalChainIndex
   -> explicit subscription endpoint for chain and mempool events
 ```
 
-Each secondary uses a distinct `secondary_path`; sharing one secondary directory across processes is invalid. Secondary readers replay the writer's WAL and manifest by calling `try_catch_up_with_primary` on a configurable interval. The default catchup interval is 250 ms.
+Each secondary uses a distinct `secondary_path`; sharing one secondary directory across processes is invalid. Secondary readers replay the writer's WAL and manifest by calling `try_catch_up_with_primary` on a configurable interval. The default catchup interval is 1,000 ms.
 
 ## Visibility Contract
 

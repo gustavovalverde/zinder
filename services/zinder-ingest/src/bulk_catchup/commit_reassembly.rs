@@ -7,16 +7,17 @@ use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, PrimaryChainStore, ReorgWindowChange,
 };
 
+use super::block_prepare::PreparedBlockArtifacts;
 use super::flush::flush_pending_bulk_catchup_writes;
 use super::watermark::{record_queue_depth, record_reorder_buffer};
 use super::{
-    BULK_STAGE_CANONICAL_COMMIT, BULK_STAGE_CANONICAL_FACT_BUILD, BULK_STAGE_CANONICAL_FINALIZE,
+    BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_COMMIT, BULK_STAGE_CANONICAL_FINALIZE,
     BULK_STAGE_CHECKPOINT_TREE_STATE, BULK_STAGE_COMMIT_REASSEMBLY,
     BULK_STAGE_SUBTREE_ROOT_ATTACHMENT, BulkCatchupCompletionFlush, BulkCatchupFlushState,
     BulkCatchupRunConfig, BulkCatchupRunContext, BulkCatchupStart, nonzero_u64_to_usize,
     record_bulk_pipeline_stage_duration, usize_to_u64_saturating,
 };
-use crate::artifact_builder::{CommitmentTreeSizes, DerivedBlockArtifacts, finalize_derived_block};
+use crate::artifact_builder::{CommitmentTreeSizes, finalize_derived_block};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
@@ -31,7 +32,7 @@ use crate::chain_ingest::{
 )]
 pub(super) async fn run_commit_reassembly<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
-    fact_build_stream: impl Stream<Item = Result<DerivedBlockArtifacts, IngestError>> + Send,
+    block_prepare_stream: impl Stream<Item = Result<PreparedBlockArtifacts, IngestError>> + Send,
     bulk_catchup_start: BulkCatchupStart,
     flush_state: &mut BulkCatchupFlushState,
     completion_flush: BulkCatchupCompletionFlush,
@@ -52,8 +53,11 @@ where
     let batch_budget = CanonicalBatchBudget::new(
         run.config.canonical_batch_max_blocks,
         run.config.canonical_batch_max_artifact_bytes,
+        run.config.canonical_batch_max_estimated_write_bytes,
+        run.config
+            .canonical_batch_min_blocks_before_estimated_write_close,
     );
-    futures_util::pin_mut!(fact_build_stream);
+    futures_util::pin_mut!(block_prepare_stream);
 
     loop {
         if in_flight_commit.is_some()
@@ -74,26 +78,30 @@ where
             }
         }
 
-        let await_fact_build_started_at = Instant::now();
-        let Some(fact_build_result) = fact_build_stream.next().await else {
+        let await_block_prepare_started_at = Instant::now();
+        let Some(block_prepare_result) = block_prepare_stream.next().await else {
             break;
         };
         record_bulk_pipeline_stage_duration(
-            BULK_STAGE_CANONICAL_FACT_BUILD,
-            await_fact_build_started_at,
-            fact_build_result.as_ref().err(),
+            BULK_STAGE_CANONICAL_BLOCK_PREPARE,
+            await_block_prepare_started_at,
+            block_prepare_result.as_ref().err(),
         );
         let finalize_started_at = Instant::now();
-        let built_outcome = fact_build_result.and_then(|derived| {
-            finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
+        let built_outcome = block_prepare_result.and_then(|prepared| {
+            let prefetched_spent_transparent_outputs =
+                prepared.prefetched_spent_transparent_outputs;
+            finalize_derived_block(prepared.derived, &mut running_tree_sizes)
+                .map(|built| (built, prefetched_spent_transparent_outputs))
+                .map_err(IngestError::from)
         });
         record_bulk_pipeline_stage_duration(
             BULK_STAGE_CANONICAL_FINALIZE,
             finalize_started_at,
             built_outcome.as_ref().err(),
         );
-        let built = match built_outcome {
-            Ok(built) => built,
+        let (built, prefetched_spent_transparent_outputs) = match built_outcome {
+            Ok(prepared) => prepared,
             Err(error) => {
                 if let Err(commit_error) = wait_for_in_flight_canonical_commit(
                     &mut in_flight_commit,
@@ -112,7 +120,7 @@ where
             }
         };
 
-        batch.absorb(built);
+        batch.absorb_with_prefetched_spent_outputs(built, prefetched_spent_transparent_outputs);
         let batch_cost = batch.work_cost();
         record_ingest_batch_work_cost(batch_cost);
         record_commit_reassembly_state(&batch);
@@ -509,6 +517,7 @@ fn record_canonical_batch_commit_trigger(
         transaction_count = batch_cost.transactions,
         transparent_output_count = batch_cost.transparent_outputs,
         transparent_spend_reference_count = batch_cost.transparent_spend_references,
+        estimated_write_bytes = batch_cost.estimated_write_bytes,
         max_blocks = config.canonical_batch_max_blocks.get(),
         "bulk-catchup batch budget reached; committing accumulated artifacts"
     );

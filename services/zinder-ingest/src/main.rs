@@ -103,6 +103,15 @@ struct Cli {
     /// Maximum canonical artifact bytes accumulated before closing a batch.
     #[arg(long = "canonical-batch-max-artifact-bytes", global = true)]
     canonical_batch_max_artifact_bytes: Option<u64>,
+    /// Maximum estimated canonical write bytes accumulated before closing a batch.
+    #[arg(long = "canonical-batch-max-estimated-write-bytes", global = true)]
+    canonical_batch_max_estimated_write_bytes: Option<u64>,
+    /// Minimum blocks before estimated write bytes can close a batch.
+    #[arg(
+        long = "canonical-batch-min-blocks-before-estimated-write-close",
+        global = true
+    )]
+    canonical_batch_min_blocks_before_estimated_write_close: Option<u32>,
     /// Maximum connected blocks requested from the source in one bulk-catchup segment.
     #[arg(long = "source-segment-max-blocks", global = true)]
     source_segment_max_blocks: Option<u32>,
@@ -116,8 +125,8 @@ struct Cli {
     #[arg(long = "source-fetch-max-in-flight-bytes", global = true)]
     source_fetch_max_in_flight_bytes: Option<u64>,
     /// Number of parallel `derive_block` invocations on the blocking pool.
-    #[arg(long = "fact-build-concurrency", global = true)]
-    fact_build_concurrency: Option<u32>,
+    #[arg(long = "block-prepare-concurrency", global = true)]
+    block_prepare_concurrency: Option<u32>,
     /// Delay between upstream node tip polls, in milliseconds.
     #[arg(long = "poll-interval-ms", global = true)]
     poll_interval_ms: Option<u64>,
@@ -254,11 +263,14 @@ fn ingest_overrides_with_ops(
         catchup_threshold_blocks: cli.catchup_threshold_blocks,
         canonical_batch_max_blocks: cli.canonical_batch_max_blocks,
         canonical_batch_max_artifact_bytes: cli.canonical_batch_max_artifact_bytes,
+        canonical_batch_max_estimated_write_bytes: cli.canonical_batch_max_estimated_write_bytes,
+        canonical_batch_min_blocks_before_estimated_write_close: cli
+            .canonical_batch_min_blocks_before_estimated_write_close,
         source_segment_max_blocks: cli.source_segment_max_blocks,
         source_segment_target_response_bytes: cli.source_segment_target_response_bytes,
         source_fetch_max_in_flight_requests: cli.source_fetch_max_in_flight_requests,
         source_fetch_max_in_flight_bytes: cli.source_fetch_max_in_flight_bytes,
-        fact_build_concurrency: cli.fact_build_concurrency,
+        block_prepare_concurrency: cli.block_prepare_concurrency,
         poll_interval_ms: cli.poll_interval_ms,
         lag_threshold_blocks: cli.lag_threshold_blocks,
         target_height: cli.target_height,
@@ -502,14 +514,16 @@ async fn run_ingest(
         json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
         reorg_window_blocks = command_config.loop_config.reorg_window_blocks,
         catchup_threshold_blocks = command_config.loop_config.phases.catchup_threshold_blocks,
-        fact_build_concurrency = command_config.loop_config.bulk_catchup.fact_build_concurrency.get(),
+        block_prepare_concurrency = command_config.loop_config.bulk_catchup.block_prepare_concurrency.get(),
         canonical_batch_max_blocks = command_config.loop_config.bulk_catchup.canonical_batch_max_blocks.get(),
         canonical_batch_max_artifact_bytes = command_config.loop_config.bulk_catchup.canonical_batch_max_artifact_bytes.get(),
+        canonical_batch_max_estimated_write_bytes = command_config.loop_config.bulk_catchup.canonical_batch_max_estimated_write_bytes.get(),
+        canonical_batch_min_blocks_before_estimated_write_close = command_config.loop_config.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close.get(),
         source_segment_max_blocks = command_config.loop_config.bulk_catchup.source_segment_max_blocks.get(),
         source_segment_target_response_bytes = command_config.loop_config.bulk_catchup.source_segment_target_response_bytes.get(),
         source_fetch_max_in_flight_requests = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_requests.get(),
         source_fetch_max_in_flight_bytes = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_bytes.get(),
-        fact_build_max_in_flight_artifact_bytes = command_config.loop_config.bulk_catchup.fact_build_max_in_flight_artifact_bytes.get(),
+        block_prepare_max_in_flight_artifact_bytes = command_config.loop_config.bulk_catchup.block_prepare_max_in_flight_artifact_bytes.get(),
         commit_reassembly_max_queued_artifact_bytes = command_config.loop_config.bulk_catchup.commit_reassembly_max_queued_artifact_bytes.get(),
         derive_replay_batch_blocks = command_config.loop_config.derive.replay_batch_blocks.get(),
         derive_memory_degrade_ratio = command_config.loop_config.derive.memory_degrade_ratio,

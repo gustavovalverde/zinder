@@ -26,6 +26,7 @@ pub use storage::{
     PrimaryStorageToml, ResolvedCanonicalSecondaryStorage, ResolvedPrimaryStorage,
     ResolvedSecondaryStorage, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
     SecondaryStorageSection, SecondaryStorageToml, StorageRoleSection, StorageRoleToml,
-    resolve_canonical_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_derive_rocksdb_budget, resolve_primary_storage, resolve_secondary_storage,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_canonical_writer_rocksdb_budget, resolve_derive_reader_rocksdb_budget,
+    resolve_derive_writer_rocksdb_budget, resolve_primary_storage, resolve_secondary_storage,
 };

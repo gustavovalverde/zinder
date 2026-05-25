@@ -90,6 +90,14 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid batch size"))?,
         canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write bytes"))?,
+        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
         source_segment_max_blocks: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid source segment blocks"))?,
         source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
@@ -98,10 +106,10 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid source fetch requests"))?,
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        fact_build_concurrency: NonZeroU32::new(4)
+        block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -208,6 +216,14 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid batch size"))?,
         canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write bytes"))?,
+        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
         source_segment_max_blocks: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid source segment blocks"))?,
         source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
@@ -216,10 +232,10 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid source fetch requests"))?,
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        fact_build_concurrency: NonZeroU32::new(4)
+        block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -328,6 +344,14 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
             .ok_or_else(|| eyre!("invalid batch size"))?,
         canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write bytes"))?,
+        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
         source_segment_max_blocks: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid source segment blocks"))?,
         source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
@@ -336,10 +360,10 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
             .ok_or_else(|| eyre!("invalid source fetch requests"))?,
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        fact_build_concurrency: NonZeroU32::new(4)
+        block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -358,6 +382,10 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "scenario keeps retry-deadline recovery, readiness, and fetch-count assertions in one observable bulk-catchup flow"
+)]
 async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
@@ -395,6 +423,14 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .ok_or_else(|| eyre!("invalid batch size"))?,
         canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
+        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write bytes"))?,
+        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+        )
+        .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
         source_segment_max_blocks: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid source segment blocks"))?,
         source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
@@ -403,10 +439,10 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .ok_or_else(|| eyre!("invalid source fetch requests"))?,
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        fact_build_concurrency: NonZeroU32::new(4)
+        block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid fact build artifact bytes"))?,
+        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,

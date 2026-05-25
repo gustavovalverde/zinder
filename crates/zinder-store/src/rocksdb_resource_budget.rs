@@ -14,10 +14,8 @@
 //!   a mainnet-sized store and are documented in
 //!   [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
 //!
-//! Construct one with [`RocksDbResourceBudget::canonical_defaults`] for the writer
-//! and reader replicas of the canonical chain store, or
-//! [`RocksDbResourceBudget::derive_defaults`] for the derive plane's own `RocksDB`
-//! instance. Operators may override individual fields through
+//! Construct one with writer defaults for primary stores and reader defaults
+//! for `RocksDB` secondaries. Operators may override individual fields through
 //! `[storage.canonical.rocksdb]` and `[storage.derive.rocksdb]` in their TOML.
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
@@ -83,13 +81,13 @@ impl RocksDbResourceBudget {
     /// absorb writes while another buffer flushes.
     pub const MIN_MAX_WRITE_BUFFER_COUNT: i32 = 2;
 
-    /// Canonical-store defaults sized for a mainnet-shaped deployment.
+    /// Canonical-store writer defaults sized for a mainnet-shaped deployment.
     ///
     /// `512 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
     /// and `16 MiB x 2` write buffers per column family. See ADR-0020 for the
     /// budget derivation.
     #[must_use]
-    pub const fn canonical_defaults() -> Self {
+    pub const fn canonical_writer_defaults() -> Self {
         Self {
             block_cache_bytes: 512 * MIB,
             max_wal_bytes: 256 * MIB,
@@ -99,20 +97,52 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Derive-plane defaults sized for the smaller projected stores managed
-    /// by `zinder-explorer`.
+    /// Derive-store writer defaults sized for smaller rebuildable artifacts.
     ///
     /// `128 MiB` block cache, `64 MiB` WAL ceiling, `256` open file handles,
     /// and `8 MiB x 2` write buffers per column family. Derive stores hold
     /// smaller working sets than the canonical chain store and are rebuildable
     /// from retained chain events.
     #[must_use]
-    pub const fn derive_defaults() -> Self {
+    pub const fn derive_writer_defaults() -> Self {
         Self {
             block_cache_bytes: 128 * MIB,
             max_wal_bytes: 64 * MIB,
             max_open_files: 256,
             write_buffer_bytes: 8 * MIB,
+            max_write_buffer_count: 2,
+        }
+    }
+
+    /// Canonical-store reader defaults for secondary processes.
+    ///
+    /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
+    /// and `8 MiB x 2` write buffers per column family. Secondary readers
+    /// replay the writer's manifest and serve public traffic; their memory
+    /// posture must stay below the writer so readers cannot starve clean sync.
+    #[must_use]
+    pub const fn canonical_reader_defaults() -> Self {
+        Self {
+            block_cache_bytes: 128 * MIB,
+            max_wal_bytes: 32 * MIB,
+            max_open_files: 128,
+            write_buffer_bytes: 8 * MIB,
+            max_write_buffer_count: 2,
+        }
+    }
+
+    /// Derive-store reader defaults for secondary processes.
+    ///
+    /// `64 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
+    /// and `4 MiB x 2` write buffers per column family. Derive reader stores
+    /// are rebuildable and subordinate to the canonical reader path.
+    #[must_use]
+    pub const fn derive_reader_defaults() -> Self {
+        Self {
+            block_cache_bytes: 64 * MIB,
+            max_wal_bytes: 16 * MIB,
+            max_open_files: 64,
+            write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
         }
     }
@@ -166,8 +196,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_defaults_match_mainnet_envelope() {
-        let budget = RocksDbResourceBudget::canonical_defaults();
+    fn canonical_writer_defaults_match_mainnet_envelope() {
+        let budget = RocksDbResourceBudget::canonical_writer_defaults();
         assert_eq!(budget.block_cache_bytes, 512 * MIB);
         assert_eq!(budget.max_wal_bytes, 256 * MIB);
         assert_eq!(budget.max_open_files, 512);
@@ -176,12 +206,24 @@ mod tests {
     }
 
     #[test]
-    fn derive_defaults_are_smaller_than_canonical_budget() {
-        let canonical = RocksDbResourceBudget::canonical_defaults();
-        let derive = RocksDbResourceBudget::derive_defaults();
+    fn derive_writer_defaults_are_smaller_than_canonical_writer_budget() {
+        let canonical = RocksDbResourceBudget::canonical_writer_defaults();
+        let derive = RocksDbResourceBudget::derive_writer_defaults();
         assert_eq!(derive.block_cache_bytes * 4, canonical.block_cache_bytes);
         assert_eq!(derive.max_wal_bytes * 4, canonical.max_wal_bytes);
         assert_eq!(derive.write_buffer_bytes * 2, canonical.write_buffer_bytes);
+    }
+
+    #[test]
+    fn reader_defaults_are_smaller_than_writer_defaults() {
+        assert!(
+            RocksDbResourceBudget::canonical_reader_defaults().block_cache_bytes
+                < RocksDbResourceBudget::canonical_writer_defaults().block_cache_bytes
+        );
+        assert!(
+            RocksDbResourceBudget::derive_reader_defaults().block_cache_bytes
+                < RocksDbResourceBudget::derive_writer_defaults().block_cache_bytes
+        );
     }
 
     #[test]

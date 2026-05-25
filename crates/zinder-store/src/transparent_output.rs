@@ -31,7 +31,7 @@ pub(crate) fn read_current_transparent_outputs_by_outpoints(
         .copied()
         .map(|outpoint| StoreKey::transparent_output(chain_epoch.network, outpoint))
         .collect::<Vec<_>>();
-    let rows = inner.multi_get(StorageTable::TransparentOutput, &keys)?;
+    let rows = inner.sorted_multi_get(StorageTable::TransparentOutput, &keys)?;
     let mut resolved = HashMap::with_capacity(outpoints.len());
 
     for ((outpoint, key), row) in outpoints.into_iter().zip(keys).zip(rows) {

@@ -26,7 +26,10 @@ pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,
 };
-pub use chain_ingest::{BuiltArtifacts, IngestError, NodeSourceKind};
+pub use chain_ingest::{
+    BuiltArtifacts, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
+};
 pub use derive_consumers::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,
     open_primary_derive_store_for_canonical, spawn_derive_replay_budget_metrics_task,

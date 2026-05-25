@@ -23,8 +23,8 @@ use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
 };
+use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;
-use fact_build::{BulkCatchupFactBuildStreamConfig, build_fact_build_stream};
 pub(crate) use flush::flush_pending_bulk_catchup_writes;
 use source_fetch::SourceSegmentSizer;
 use watermark::record_stage_duration;
@@ -32,8 +32,8 @@ use watermark::record_stage_duration;
 #[cfg(test)]
 use crate::artifact_builder::{CommitmentTreeSizes, DerivedBlockArtifacts};
 
+mod block_prepare;
 mod commit_reassembly;
-mod fact_build;
 mod flush;
 mod source_fetch;
 mod watermark;
@@ -44,7 +44,7 @@ const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
 const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
 
 const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
-const BULK_STAGE_CANONICAL_FACT_BUILD: &str = "canonical_fact_build";
+const BULK_STAGE_CANONICAL_BLOCK_PREPARE: &str = "canonical_block_prepare";
 const BULK_STAGE_CANONICAL_FINALIZE: &str = "canonical_finalize";
 const BULK_STAGE_SUBTREE_ROOT_ATTACHMENT: &str = "subtree_root_attachment";
 const BULK_STAGE_CHECKPOINT_TREE_STATE: &str = "checkpoint_tree_state";
@@ -72,6 +72,10 @@ pub struct BulkCatchupRunConfig {
     pub canonical_batch_max_blocks: NonZeroU32,
     /// Maximum in-memory canonical artifact bytes accumulated before commit.
     pub canonical_batch_max_artifact_bytes: NonZeroU64,
+    /// Maximum estimated canonical write bytes accumulated before commit.
+    pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
+    /// Minimum batch size before estimated write bytes can close the batch.
+    pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
     /// Maximum connected blocks requested from the source adapter in one
     /// bounded bulk-catchup segment.
     ///
@@ -92,12 +96,12 @@ pub struct BulkCatchupRunConfig {
     /// deserialization, per-tx canonical re-serialization, compact-block
     /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
     /// scales nearly linearly with cores up to the commit-batch boundary.
-    /// Operator-tunable via `ingest.bulk_catchup.fact_build_concurrency`.
+    /// Operator-tunable via `ingest.bulk_catchup.block_prepare_concurrency`.
     /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub fact_build_concurrency: NonZeroU32,
+    pub block_prepare_concurrency: NonZeroU32,
     /// Maximum reserved derived artifact bytes across active and completed
-    /// fact-build work.
-    pub fact_build_max_in_flight_artifact_bytes: NonZeroU64,
+    /// block-prepare work.
+    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
     /// Maximum finalized artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -483,10 +487,10 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let fact_build_concurrency = config.fact_build_concurrency.get() as usize;
-    let fact_build_stream = build_fact_build_stream(
+    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
+    let block_prepare_stream = build_block_prepare_stream(
         run.source,
-        BulkCatchupFactBuildStreamConfig {
+        BulkCatchupBlockPrepareStreamConfig {
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
@@ -496,8 +500,10 @@ where
             source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
-            fact_build_concurrency,
-            fact_build_max_in_flight_artifact_bytes: config.fact_build_max_in_flight_artifact_bytes,
+            block_prepare_concurrency,
+            block_prepare_max_in_flight_artifact_bytes: config
+                .block_prepare_max_in_flight_artifact_bytes,
+            store: run.store.clone(),
         },
         move |source_block| {
             let activations = Arc::clone(&network_upgrade_activations);
@@ -516,7 +522,7 @@ where
 
     run_commit_reassembly(
         run,
-        fact_build_stream,
+        block_prepare_stream,
         bulk_catchup_start,
         flush_state,
         completion_flush,
@@ -648,11 +654,11 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let fact_build_concurrency = config.fact_build_concurrency.get() as usize;
+    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
     let mut flush_state = BulkCatchupFlushState::default();
-    let fact_build_stream = build_fact_build_stream(
+    let block_prepare_stream = build_block_prepare_stream(
         source,
-        BulkCatchupFactBuildStreamConfig {
+        BulkCatchupBlockPrepareStreamConfig {
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
@@ -662,8 +668,10 @@ where
             source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
-            fact_build_concurrency,
-            fact_build_max_in_flight_artifact_bytes: config.fact_build_max_in_flight_artifact_bytes,
+            block_prepare_concurrency,
+            block_prepare_max_in_flight_artifact_bytes: config
+                .block_prepare_max_in_flight_artifact_bytes,
+            store: store.clone(),
         },
         move |source_block| async move { derive_fn(&source_block).map_err(IngestError::from) },
     );
@@ -671,7 +679,7 @@ where
     let run = BulkCatchupRunContext::new(config, source, store);
     run_commit_reassembly(
         &run,
-        fact_build_stream,
+        block_prepare_stream,
         bulk_catchup_start,
         &mut flush_state,
         BulkCatchupCompletionFlush::FlushPending,
@@ -853,9 +861,11 @@ mod tests {
     use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockId, ConsensusBranchId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT,
-        ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, UnixTimestampMillis,
-        wire::encode_internal_block_hash,
+        AddressOutputIndexArtifact, BlockHash, BlockId, ConsensusBranchId,
+        NetworkUpgradeActivation, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
+        SubtreeRootIndex, TransactionFactsArtifact, TransactionId, TransactionLocation,
+        TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
+        UnixTimestampMillis, wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
@@ -1080,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fact_build_stream_fetches_source_segments_and_yields_ordered_blocks()
+    async fn block_prepare_stream_fetches_source_segments_and_yields_ordered_blocks()
     -> Result<(), Box<dyn Error>> {
         let requested_segments = Arc::new(Mutex::new(Vec::new()));
         let source = RecordingSegmentSource {
@@ -1093,9 +1103,10 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let fact_build_stream = build_fact_build_stream(
+        let (_store_tempdir, store) = test_primary_chain_store("block-prepare-ordered-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
             &source,
-            BulkCatchupFactBuildStreamConfig {
+            BulkCatchupBlockPrepareStreamConfig {
                 request_timeout: Duration::from_secs(30),
                 from_height: BlockHeight::new(1),
                 to_height: BlockHeight::new(6),
@@ -1108,20 +1119,88 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
-                fact_build_concurrency: 2,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
-        futures_util::pin_mut!(fact_build_stream);
+        futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = fact_build_stream.next().await {
-            observed_heights.push(next_block?.block_header.height.value());
+        while let Some(next_block) = block_prepare_stream.next().await {
+            observed_heights.push(next_block?.derived.block_header.height.value());
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(*requested_segments.lock(), vec![(1, 2), (3, 2), (5, 2)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn block_prepare_stream_prefetches_spent_transparent_outputs()
+    -> Result<(), Box<dyn Error>> {
+        let (_store_tempdir, store) = test_primary_chain_store("prefetched-prevout-store")?;
+        let funding_transaction_id = TransactionId::from_bytes([0x11; 32]);
+        let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
+        seed_prefetched_output(&store, spent_outpoint)?;
+
+        let requested_segments = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingSegmentSource {
+            requested_segments: Arc::clone(&requested_segments),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = test_source_segment_sizer(BlockHeight::new(2), 1)?;
+        let spending_transaction_id = TransactionId::from_bytes([0x22; 32]);
+        let block_prepare_stream = build_block_prepare_stream(
+            &source,
+            BulkCatchupBlockPrepareStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(2),
+                to_height: BlockHeight::new(2),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(1)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                block_prepare_concurrency: 1,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store: store.clone(),
+            },
+            move |source_block| async move {
+                Ok(test_transparent_spend_block(
+                    &source_block,
+                    spending_transaction_id,
+                    spent_outpoint,
+                ))
+            },
+        );
+        futures_util::pin_mut!(block_prepare_stream);
+
+        let prepared = block_prepare_stream
+            .next()
+            .await
+            .ok_or("missing prepared block")??;
+        assert_eq!(prepared.derived.block_header.height, BlockHeight::new(2));
+        assert_eq!(
+            prepared.prefetched_spent_transparent_outputs,
+            store
+                .transparent_outputs_by_outpoints_for_writer_commit(
+                    store
+                        .current_chain_epoch()?
+                        .ok_or("missing current epoch")?,
+                    &[spent_outpoint],
+                )?
+                .into_values()
+                .collect::<Vec<_>>()
+        );
+        assert!(block_prepare_stream.next().await.is_none());
 
         Ok(())
     }
@@ -1139,9 +1218,10 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let fact_build_stream = build_fact_build_stream(
+        let (_store_tempdir, store) = test_primary_chain_store("slow-segment-prefetch-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
             &source,
-            BulkCatchupFactBuildStreamConfig {
+            BulkCatchupBlockPrepareStreamConfig {
                 request_timeout: Duration::from_secs(30),
                 from_height: BlockHeight::new(1),
                 to_height: BlockHeight::new(6),
@@ -1154,16 +1234,17 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(48 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
-                fact_build_concurrency: 2,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
-        futures_util::pin_mut!(fact_build_stream);
+        futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = fact_build_stream.next().await {
-            observed_heights.push(next_block?.block_header.height.value());
+        while let Some(next_block) = block_prepare_stream.next().await {
+            observed_heights.push(next_block?.derived.block_header.height.value());
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1202,9 +1283,10 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let fact_build_stream = build_fact_build_stream(
+        let (_store_tempdir, store) = test_primary_chain_store("reassembly-bytes-prefetch-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
             &source,
-            BulkCatchupFactBuildStreamConfig {
+            BulkCatchupBlockPrepareStreamConfig {
                 request_timeout: Duration::from_secs(30),
                 from_height: BlockHeight::new(1),
                 to_height: BlockHeight::new(6),
@@ -1217,16 +1299,17 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(36 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
-                fact_build_concurrency: 2,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
-        futures_util::pin_mut!(fact_build_stream);
+        futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = fact_build_stream.next().await {
-            observed_heights.push(next_block?.block_header.height.value());
+        while let Some(next_block) = block_prepare_stream.next().await {
+            observed_heights.push(next_block?.derived.block_header.height.value());
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1265,9 +1348,10 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let fact_build_stream = build_fact_build_stream(
+        let (_store_tempdir, store) = test_primary_chain_store("watermark-prefetch-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
             &source,
-            BulkCatchupFactBuildStreamConfig {
+            BulkCatchupBlockPrepareStreamConfig {
                 request_timeout: Duration::from_secs(30),
                 from_height: BlockHeight::new(1),
                 to_height: BlockHeight::new(6),
@@ -1280,16 +1364,17 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(24 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
-                fact_build_concurrency: 2,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
             },
             |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
         );
-        futures_util::pin_mut!(fact_build_stream);
+        futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = fact_build_stream.next().await {
-            observed_heights.push(next_block?.block_header.height.value());
+        while let Some(next_block) = block_prepare_stream.next().await {
+            observed_heights.push(next_block?.derived.block_header.height.value());
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1315,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fact_build_schedules_past_slow_earlier_block() -> Result<(), Box<dyn Error>> {
+    async fn block_prepare_schedules_past_slow_earlier_block() -> Result<(), Box<dyn Error>> {
         let derive_events = Arc::new(Mutex::new(Vec::new()));
         let source = RecordingSegmentSource {
             requested_segments: Arc::new(Mutex::new(Vec::new())),
@@ -1328,9 +1413,11 @@ mod tests {
             BlockHeight::new(1),
         )));
         let derive_events_for_stream = Arc::clone(&derive_events);
-        let fact_build_stream = build_fact_build_stream(
+        let (_store_tempdir, store) =
+            test_primary_chain_store("slow-block-prepare-prefetch-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
             &source,
-            BulkCatchupFactBuildStreamConfig {
+            BulkCatchupBlockPrepareStreamConfig {
                 request_timeout: Duration::from_secs(30),
                 from_height: BlockHeight::new(1),
                 to_height: BlockHeight::new(6),
@@ -1343,9 +1430,10 @@ mod tests {
                 source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
-                fact_build_concurrency: 2,
-                fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid fact build artifact bytes")?,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
             },
             move |source_block| {
                 let derive_events = Arc::clone(&derive_events_for_stream);
@@ -1353,7 +1441,7 @@ mod tests {
                     let height = source_block.height;
                     derive_events
                         .lock()
-                        .push(FactBuildEvent::Started { height });
+                        .push(BlockPrepareEvent::Started { height });
                     match height.value() {
                         1 => tokio::time::sleep(Duration::from_millis(80)).await,
                         2 => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -1361,34 +1449,34 @@ mod tests {
                     }
                     derive_events
                         .lock()
-                        .push(FactBuildEvent::Finished { height });
+                        .push(BlockPrepareEvent::Finished { height });
                     Ok(test_derived_block(&source_block, 0, 0))
                 }
             },
         );
-        futures_util::pin_mut!(fact_build_stream);
+        futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = fact_build_stream.next().await {
-            observed_heights.push(next_block?.block_header.height.value());
+        while let Some(next_block) = block_prepare_stream.next().await {
+            observed_heights.push(next_block?.derived.block_header.height.value());
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
         let derive_events = derive_events.lock().clone();
-        let start_third_block = fact_build_event_index(
+        let start_third_block = block_prepare_event_index(
             &derive_events,
-            FactBuildEvent::Started {
+            BlockPrepareEvent::Started {
                 height: BlockHeight::new(3),
             },
         )?;
-        let finish_first_block = fact_build_event_index(
+        let finish_first_block = block_prepare_event_index(
             &derive_events,
-            FactBuildEvent::Finished {
+            BlockPrepareEvent::Finished {
                 height: BlockHeight::new(1),
             },
         )?;
         assert!(
             start_third_block < finish_first_block,
-            "expected later fact build to start before the slow first block finished; events: {derive_events:?}"
+            "expected later block prepare to start before the slow first block finished; events: {derive_events:?}"
         );
 
         Ok(())
@@ -1849,6 +1937,14 @@ mod tests {
                 .ok_or("invalid test batch size")?,
             canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
                 .ok_or("invalid test batch artifact bytes")?,
+            canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
+                crate::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+            )
+            .ok_or("invalid test estimated write byte budget")?,
+            canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
+                crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
+            )
+            .ok_or("invalid test estimated write close floor")?,
             source_segment_max_blocks: NonZeroU32::new(4)
                 .ok_or("invalid test source segment blocks")?,
             source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
@@ -1857,9 +1953,10 @@ mod tests {
                 .ok_or("invalid test source fetch requests")?,
             source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
                 .ok_or("invalid test source fetch bytes")?,
-            fact_build_concurrency: NonZeroU32::new(4).ok_or("invalid test derive concurrency")?,
-            fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                .ok_or("invalid test fact build artifact bytes")?,
+            block_prepare_concurrency: NonZeroU32::new(4)
+                .ok_or("invalid test derive concurrency")?,
+            block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .ok_or("invalid test block prepare artifact bytes")?,
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test commit reassembly bytes")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
@@ -1867,6 +1964,82 @@ mod tests {
             allow_near_tip_finalize,
             checkpoint: None,
         })
+    }
+
+    fn test_primary_chain_store(
+        storage_name: &str,
+    ) -> Result<(tempfile::TempDir, PrimaryChainStore), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join(storage_name);
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        Ok((tempdir, store))
+    }
+
+    fn seed_prefetched_output(
+        store: &PrimaryChainStore,
+        spent_outpoint: TransparentOutPoint,
+    ) -> Result<(), Box<dyn Error>> {
+        let funding_fixture =
+            zinder_testkit::ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let funding_block = funding_fixture
+            .block_at(BlockHeight::new(1))
+            .ok_or("missing funding block")?;
+        let funding_block_height = funding_block.height;
+        let funding_block_hash = funding_block.hash;
+        let script_pub_key = vec![0x76, 0xa9, 0x14, 0x88];
+        let funding_fixture =
+            funding_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+                TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+                script_pub_key,
+                spent_outpoint,
+                42,
+                funding_block_height,
+                funding_block_hash,
+            ));
+        let funding_artifacts = funding_fixture
+            .chain_epoch_artifacts(ChainEpochId::new(1))
+            .ok_or("missing funding artifacts")?;
+        store.commit_chain_epoch(funding_artifacts)?;
+        Ok(())
+    }
+
+    fn test_source_segment_sizer(
+        from_height: BlockHeight,
+        max_segment_blocks: u32,
+    ) -> Result<Arc<Mutex<SourceSegmentSizer>>, Box<dyn Error>> {
+        Ok(Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(max_segment_blocks).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            from_height,
+        ))))
+    }
+
+    fn test_transparent_spend_block(
+        source_block: &SourceBlock,
+        spending_transaction_id: TransactionId,
+        spent_outpoint: TransparentOutPoint,
+    ) -> DerivedBlockArtifacts {
+        let mut derived = test_derived_block(source_block, 0, 0);
+        let location = TransactionLocation::new(
+            spending_transaction_id,
+            source_block.height,
+            source_block.hash,
+            0,
+        );
+        let transaction_facts = TransactionFactsArtifact::new(
+            location,
+            zinder_testkit::synthetic_transaction_public_facts(spending_transaction_id, 64),
+        )
+        .with_transparent_facts(
+            vec![TransparentInputFact::new(0, spent_outpoint)],
+            Vec::new(),
+        );
+        derived.transaction_facts.push(transaction_facts);
+        derived
     }
 
     struct TestNodeSource {
@@ -1891,7 +2064,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum FactBuildEvent {
+    enum BlockPrepareEvent {
         Started { height: BlockHeight },
         Finished { height: BlockHeight },
     }
@@ -2172,14 +2345,16 @@ mod tests {
             })
     }
 
-    fn fact_build_event_index(
-        events: &[FactBuildEvent],
-        expected_event: FactBuildEvent,
+    fn block_prepare_event_index(
+        events: &[BlockPrepareEvent],
+        expected_event: BlockPrepareEvent,
     ) -> Result<usize, Box<dyn Error>> {
         events
             .iter()
             .position(|event| *event == expected_event)
-            .ok_or_else(|| format!("missing expected fact build event: {expected_event:?}").into())
+            .ok_or_else(|| {
+                format!("missing expected block prepare event: {expected_event:?}").into()
+            })
     }
 
     fn test_source_block(network: Network, height: BlockHeight) -> SourceBlock {

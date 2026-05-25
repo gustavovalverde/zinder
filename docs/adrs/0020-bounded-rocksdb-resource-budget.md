@@ -40,15 +40,15 @@ These four are encoded in `zinder_store::build_primary_db_options` and `zinder_s
 
 ### Tier 2 — Bounded resource budget (operator-configurable)
 
-Five knobs cap the open-time and write-time RAM peak. They live under `[storage.canonical.rocksdb]` for canonical store instances and `[storage.derive.rocksdb]` for derive store instances:
+Five knobs cap the open-time and write-time RAM peak. They live under `[storage.canonical.rocksdb]` for canonical store instances and `[storage.derive.rocksdb]` for derive store instances. Defaults are posture-specific: writer processes own bulk catch-up and WAL flushing, while reader secondaries must stay below the writer's memory envelope.
 
-| Knob | Default (canonical) | Default (derive) | Effect |
-| --- | --- | --- | --- |
-| `block_cache_bytes` | 512 MiB | 128 MiB | Bounded LRU cache size shared by data, index, and bloom blocks. Without it, RocksDB pins index and bloom blocks per-SST in resident memory, which scales with store size. |
-| `max_wal_bytes` | 256 MiB | 64 MiB | Total live WAL ceiling. Crossing it triggers a memtable flush so the WAL truncates. The default of 0 (RocksDB's own) means "never trigger from WAL size," which is the bug. |
-| `max_open_files` | 512 | 256 | Open SST file handle cap. The default of -1 (RocksDB's own) means "open every SST and pin its metadata," which scales with store size. |
-| `write_buffer_bytes` | 16 MiB | 8 MiB | Per-column-family mutable memtable size. This keeps write bursts bounded instead of inheriting RocksDB's larger default in every column family. |
-| `max_write_buffer_count` | 2 | 2 | Per-column-family mutable plus immutable memtable count. Two buffers let one flush while another accepts writes without allowing unbounded memtable growth. |
+| Knob | Writer canonical | Writer derive | Reader canonical | Reader derive | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `block_cache_bytes` | 512 MiB | 128 MiB | 128 MiB | 64 MiB | Bounded LRU cache size shared by data, index, and bloom blocks. Without it, RocksDB pins index and bloom blocks per-SST in resident memory, which scales with store size. |
+| `max_wal_bytes` | 256 MiB | 64 MiB | 32 MiB | 16 MiB | Total live WAL ceiling. Crossing it triggers a memtable flush so the WAL truncates on writer-posture stores. The default of 0 (RocksDB's own) means "never trigger from WAL size," which is the bug. |
+| `max_open_files` | 512 | 256 | 128 | 64 | Open SST file handle cap. The default of -1 (RocksDB's own) means "open every SST and pin its metadata," which scales with store size. |
+| `write_buffer_bytes` | 16 MiB | 8 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. This keeps write bursts bounded instead of inheriting RocksDB's larger default in every column family. |
+| `max_write_buffer_count` | 2 | 2 | 2 | 2 | Per-column-family mutable plus immutable memtable count. Two buffers let one flush while another accepts writes without allowing unbounded memtable growth. |
 
 The typed value `zinder_store::RocksDbResourceBudget` carries these numbers. Both the canonical store (`ChainStoreOptions::rocksdb_resource_budget`) and the derive store (`DeriveStoreOptions::rocksdb_resource_budget`) consume the same type.
 
@@ -80,7 +80,7 @@ Two alerts in `observability/prometheus/rules/zinder-readiness.yml`:
 ## Consequences
 
 - **The trap is closed by construction.** With a non-zero WAL ceiling, a non-pinning open file cap, a bounded block cache, and a periodic flush, the bulk-catchup OOM trap cannot fire on a host that satisfies the documented memory envelope.
-- **The fix applies once.** Both the canonical store and the derive store route through `zinder_store::build_primary_db_options`. A future RocksDB-using component (a fourth store, a checkpoint inspector, a repair tool) uses the same factory.
+- **The fix applies once per posture.** The canonical store and derive store route through the same primary/secondary option factories, with writer-sized defaults for primary handles and reader-sized defaults for secondary handles.
 - **Operators have a tunable surface.** RAM-constrained hosts can drop the cache to 128 MiB; high-throughput hosts can raise to 1 GiB. The invariants stay locked.
 - **Operators cannot disable WAL or atomic flush.** This is deliberate.
 - **The metric set lets SREs alert before the trap fires.** Watching `zinder_store_wal_bytes / zinder_store_wal_bytes_limit` and the `open_storage` p95 catches both the pre-trap state and the post-trap restart loop.

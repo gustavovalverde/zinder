@@ -31,7 +31,7 @@ use crate::chain_ingest::{
     CanonicalBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
     current_unix_millis, fetch_block_with_retry, fetch_tree_state_for_block_with_retry,
     next_chain_epoch_id_after, next_chain_epoch_id_from, populate_subtree_root_artifacts,
-    record_commit_outcome, record_ingest_fact_build_outcome, select_best_chain,
+    record_commit_outcome, record_ingest_block_prepare_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
 use crate::phase::current_chain_height;
@@ -830,13 +830,13 @@ where
             ));
         }
 
-        let fact_build_started_at = Instant::now();
+        let block_prepare_started_at = Instant::now();
         let built_outcome = derive_fn(&source_block)
             .map_err(IngestError::from)
             .and_then(|derived| {
                 finalize_derived_block(derived, &mut running_tree_sizes).map_err(IngestError::from)
             });
-        record_ingest_fact_build_outcome(fact_build_started_at, &built_outcome);
+        record_ingest_block_prepare_outcome(block_prepare_started_at, &built_outcome);
         let built = built_outcome?;
         batch.absorb(built);
     }
