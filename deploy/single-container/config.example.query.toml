@@ -27,7 +27,10 @@ path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/secondary"
 
 [ingest_control]
-addr = "http://zinder-ingest:9100"
+# Loopback in the single-container image. The writer's IngestControl
+# binds on 0.0.0.0:9100 inside this PID namespace. Operators on a
+# cross-host topology override this with the writer's external URL.
+addr = "http://127.0.0.1:9100"
 
 [query]
 listen_addr = "0.0.0.0:9101"
