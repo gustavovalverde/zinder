@@ -42,9 +42,5 @@ listen_addr = "0.0.0.0:9068"
 # container's s6 supervision tree and binds 0.0.0.0:9101.
 wallet_query_endpoint = "http://127.0.0.1:9101"
 
-[explorer.grpc]
-enable_reflection = true
-enable_health = true
-
 [ops]
 listen_addr = "0.0.0.0:9069"
