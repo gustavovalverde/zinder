@@ -18,18 +18,20 @@ set -eu
 chown -R zinder:zinder /var/lib/zinder
 
 # Remove a stale RocksDB primary LOCK left behind by an unclean shutdown.
-# This is safe inside the single-container image because at most one
-# zinder-ingest writer ever runs in this PID namespace; if the LOCK file
-# exists at boot it cannot belong to a live process. RocksDB itself only
-# clears stale POSIX advisory locks when the holding PID is dead AND on
-# the same host kernel; PaaS targets that re-schedule containers across
-# hosts (Railway, Fly) trip on that constraint, so we unconditionally
-# delete the file before opening the store.
-echo "zinder-ingest/run: pre-cleanup store contents:" >&2
-ls -la /var/lib/zinder/store/ 2>&1 | head -20 >&2 || true
 rm -f /var/lib/zinder/store/LOCK
-echo "zinder-ingest/run: post-cleanup store contents (LOCK removed):" >&2
-ls -la /var/lib/zinder/store/ 2>&1 | head -20 >&2 || true
+
+# Diagnostic dump: full store contents, any zinder processes, current
+# manifest pointer. Sent to stderr so it lands in Railway's log stream.
+echo "==== zinder-ingest/run diagnostics ====" >&2
+echo "[ls /var/lib/zinder/store/]" >&2
+ls -la /var/lib/zinder/store/ >&2 2>&1 || true
+echo "[CURRENT]" >&2
+cat /var/lib/zinder/store/CURRENT >&2 2>&1 || true
+echo "[ps -ef | grep zinder]" >&2
+ps -ef | grep -v grep | grep zinder >&2 2>&1 || true
+echo "[fcntl locks on store directory]" >&2
+cat /proc/locks 2>&1 | head -20 >&2 || true
+echo "==== end diagnostics ====" >&2
 
 # Unified ingest loop per ADR-0015. The single process classifies the
 # gap to the upstream tip on every iteration and dispatches to
