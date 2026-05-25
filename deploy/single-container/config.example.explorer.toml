@@ -5,22 +5,13 @@
 # RocksDB secondary under a distinct catchup directory so it never races
 # with `zinder-query`'s secondary inside the same container. It serves
 # the ExplorerQuery gRPC surface used by block-explorer clients (ADR-0009).
+#
+# zinder-explorer does NOT speak Zebra JSON-RPC, so this config has no
+# [node] section. The reader-only stance also means no [ingest_control]
+# section is needed: the explorer doesn't issue IngestControl RPCs.
 
 [network]
 name = "zcash-testnet"
-
-[node]
-# Z3 in-network DNS. Mainnet uses port 8232; testnet/regtest use 18232.
-json_rpc_addr = "http://zebra:18232"
-request_timeout_secs = 30
-
-[node.auth]
-# Cookie auth is the default. Operators choose one source for the cookie:
-#  - Mounted cookie file (Z3 binding): set ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
-#  - Inline cookie (PaaS / Railway):   set ZINDER_NODE__AUTH__COOKIE=<cookie content>
-# `path` and `cookie` are mutually exclusive, so leave the file source out of
-# the TOML and let the deployment env declare exactly one.
-method = "cookie"
 
 [storage]
 path = "/var/lib/zinder/store"
@@ -44,9 +35,6 @@ max_wal_bytes = 16777216
 max_open_files = 64
 write_buffer_bytes = 4194304
 max_write_buffer_count = 2
-
-[ingest_control]
-addr = "http://127.0.0.1:9100"
 
 [explorer]
 listen_addr = "0.0.0.0:9068"
