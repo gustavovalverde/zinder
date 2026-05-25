@@ -25,7 +25,11 @@ chown -R zinder:zinder /var/lib/zinder
 # the same host kernel; PaaS targets that re-schedule containers across
 # hosts (Railway, Fly) trip on that constraint, so we unconditionally
 # delete the file before opening the store.
+echo "zinder-ingest/run: pre-cleanup store contents:" >&2
+ls -la /var/lib/zinder/store/ 2>&1 | head -20 >&2 || true
 rm -f /var/lib/zinder/store/LOCK
+echo "zinder-ingest/run: post-cleanup store contents (LOCK removed):" >&2
+ls -la /var/lib/zinder/store/ 2>&1 | head -20 >&2 || true
 
 # Unified ingest loop per ADR-0015. The single process classifies the
 # gap to the upstream tip on every iteration and dispatches to
