@@ -31,6 +31,15 @@ until nc -z "$INGEST_CONTROL_HOST" "$INGEST_CONTROL_PORT"; do
     elapsed=$((elapsed + WAIT_INTERVAL_SECONDS))
 done
 
+# Strip env vars whose TOML section the query schema doesn't allow.
+# The single-container image shares one process env across all three
+# supervised binaries; query's schema permits [network], [node],
+# [storage], [ingest_control], [query], [retention], [ops]. Any
+# ZINDER_INGEST__* var (catchup tunables that belong to the writer
+# only) gets parsed as an [ingest] section here and crashes
+# load_config; strip them before exec.
+unset $(env | sed -n 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p') 2>/dev/null || true
+
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-query \
     --config /etc/zinder/query.toml \
