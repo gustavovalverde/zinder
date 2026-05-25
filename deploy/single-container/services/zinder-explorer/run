@@ -33,8 +33,8 @@ done
 # ZINDER_NODE__* (writer-only upstream node settings) or
 # ZINDER_INGEST__* (writer-only catchup tunables) inherited from the
 # shared env crashes load_config and tears the container down.
-unset $(env | sed -n 's/^\(ZINDER_NODE__[^=]*\)=.*/\1/p' \
-                -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p') 2>/dev/null || true
+unset $(env | sed -n -e 's/^\(ZINDER_NODE__[^=]*\)=.*/\1/p' \
+                     -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p') 2>/dev/null || true
 
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-explorer \
