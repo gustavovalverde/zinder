@@ -971,6 +971,19 @@ service ExplorerQuery {
   // so the request bytes never reach span attributes.
   rpc VerifyPaymentDisclosure(VerifyPaymentDisclosureRequest)
       returns (VerifyPaymentDisclosureResponse);
+
+  // Returns one coherent point-in-time bundle of every field a consumer
+  // needs to render an overview dashboard. The handler anchors the bundle
+  // on a single `WalletQuery.LatestBlock` tip and reads every other field
+  // from the derive store in one pass, so all fields share one
+  // `ExplorerFreshness` and one snapshot identity. Replaces the per-card
+  // fan-out (`MempoolSummary` + `FeeSummary` + `ValuePoolSummary` +
+  // `BlockSummariesInRange` + `RecentTransactions` + `MempoolEventCounts`)
+  // that consumers would otherwise stitch together client-side and that
+  // cannot guarantee tip-coherence across calls. Capability:
+  // `explorer.overview.snapshot_v1`.
+  rpc OverviewSnapshot(OverviewSnapshotRequest)
+      returns (OverviewSnapshotResponse);
 }
 
 // `ExplorerQuery.ValuePoolSummary` request.
@@ -1198,4 +1211,159 @@ message CursorExpiredError {
   // Short reason hint a UI can render verbatim. The canonical sentences
   // live in `crates/zinder-core/src/explorer_reasons.rs`.
   string hint = 2;
+}
+
+// `ExplorerQuery.OverviewSnapshot` request.
+//
+// All limit fields clamp at the server side: zero requests the default,
+// values above the cap are silently lowered. Callers receive the
+// effective values back inside the response (`recent_blocks.len()`,
+// `recent_transactions.len()`, `mempool_events.window_seconds`,
+// `fee_summary.block_count`).
+message OverviewSnapshotRequest {
+  // Number of `recent_blocks` entries to return, newest-first.
+  // Range `[1, 16]`; default 8 when zero.
+  uint32 recent_blocks_limit = 1;
+
+  // Number of `recent_transactions` entries to return, newest-first.
+  // Drives both the recent-transactions list and the privacy-mix
+  // aggregation on the consumer side. Range `[1, 64]`; default 32 when
+  // zero.
+  uint32 recent_transactions_limit = 2;
+
+  // Sliding-window size for `mempool_events` in seconds. Range
+  // `[60, 3600]`; default 300 when zero. Matches the clamp range of
+  // `MempoolEventCountsRequest.window_seconds`.
+  uint32 mempool_window_seconds = 3;
+
+  // Lookback for `fee_summary`, in blocks ending at the snapshot's tip.
+  // Range `[1, 256]`; default 50 when zero. Matches the per-request cap
+  // of `FeeSummaryRequest`.
+  uint32 fee_summary_block_count = 4;
+}
+
+// `ExplorerQuery.OverviewSnapshot` response.
+//
+// All sub-fields are read against the snapshot identified by
+// `freshness.chain_epoch`; the bundle never spans two tips. The handler
+// reads the wallet tip once and every derive-store field once, in one
+// pass, then assembles the single freshness envelope. Consumers compare
+// `freshness.chain_epoch` (and the higher-level `tip_hash` they derive
+// from it) across responses to detect snapshot boundary crosses.
+message OverviewSnapshotResponse {
+  // Cross-cutting envelope (field tag 1 per ADR-0011). Single freshness
+  // for the entire bundle.
+  ExplorerFreshness freshness = 1;
+
+  // Header-block timestamp of the snapshot's tip. Surfaced separately
+  // from `ChainEpoch` because the current `wallet.ChainEpoch` does not
+  // carry block time; consumers render "Ns ago" without a second lookup.
+  // Set to zero when the upstream has no committed blocks.
+  int64 tip_block_time_unix_seconds = 2;
+
+  // Mempool snapshot (counts and freshness extremes) at the bundle's
+  // observation instant.
+  OverviewMempool mempool = 3;
+
+  // Rolling counts of mempool events over a sliding window ending at the
+  // bundle's observation instant.
+  OverviewMempoolEvents mempool_events = 4;
+
+  // Fee summary over the last `fee_summary_block_count` blocks ending at
+  // the snapshot's tip.
+  OverviewFeeSummary fee_summary = 5;
+
+  // Chain-wide value pool totals at the snapshot's tip. Preserves
+  // upstream order so unknown future pools flow through without a wire
+  // shape change.
+  repeated zinder.v1.wallet.ChainValuePool value_pools = 6;
+
+  // Top-K block summaries ending at the snapshot's tip, ordered by
+  // descending height. `recent_blocks[0]` is the tip; `recent_blocks[K-1]`
+  // is the oldest entry in the window.
+  repeated BlockSummary recent_blocks = 7;
+
+  // Top-N recent canonical transactions, newest-first. The consumer
+  // uses this single array for both the "recent transactions" list
+  // (typically the first 8) and the "privacy mix" aggregation (typically
+  // all 32). Mirrors the per-entry shape `RecentTransactionEntry`
+  // returned by `ExplorerQuery.RecentTransactions`.
+  repeated RecentTransactionEntry recent_transactions = 8;
+}
+
+// Mempool sub-field of `OverviewSnapshotResponse`.
+//
+// Mirrors the counts and freshness extremes from `MempoolSummaryResponse`.
+// The distribution arrays (`privacy_shape_distribution`,
+// `version_distribution`) are deliberately omitted from the bundle: the
+// overview surface aggregates privacy shape from `recent_transactions`
+// instead, and the version distribution is a per-feature concern served
+// by `ExplorerQuery.MempoolSummary` for callers that need it.
+message OverviewMempool {
+  // Number of transactions in the snapshot.
+  uint32 transaction_count = 1;
+
+  // Sum of `size_bytes` across every entry.
+  uint64 total_size_bytes = 2;
+
+  // Age of the oldest mempool entry vs. the bundle's observation instant.
+  // Zero when the snapshot is empty.
+  uint64 oldest_entry_age_millis = 3;
+
+  // Age of the newest mempool entry vs. the bundle's observation instant.
+  // Zero when the snapshot is empty.
+  uint64 newest_entry_age_millis = 4;
+}
+
+// Mempool-event sub-field of `OverviewSnapshotResponse`.
+//
+// Mirrors `MempoolEventCountsResponse`. The `window_seconds` field is the
+// effective server-clamped value, not the requested value; consumers can
+// rely on it for cadence math without echoing the request.
+message OverviewMempoolEvents {
+  // Effective window size after server clamping.
+  uint32 window_seconds = 1;
+
+  // Number of `Added` events the source emitted during the window.
+  uint32 added_count = 2;
+
+  // Number of `Mined` events the source emitted during the window.
+  uint32 mined_count = 3;
+
+  // Number of `Invalidated` events the source emitted during the window.
+  uint32 invalidated_count = 4;
+
+  // Number of `Suppressed` events the source emitted during the window.
+  // Stays zero for sources that do not surface ZIP-401-style admission
+  // refusals.
+  uint32 suppressed_count = 5;
+}
+
+// Fee-summary sub-field of `OverviewSnapshotResponse`.
+//
+// Mirrors `FeeSummaryResponse`. The values aggregate ZIP-317
+// conventional-fee floors across non-coinbase transactions in the last
+// `block_count` blocks ending at the snapshot's tip.
+message OverviewFeeSummary {
+  // Effective number of blocks the aggregate was computed over after
+  // server clamping. Identical to `recent_blocks.len()` only when the
+  // caller's `recent_blocks_limit` equals `fee_summary_block_count`;
+  // otherwise the two windows can differ.
+  uint32 block_count = 1;
+
+  // Number of non-coinbase transactions in the aggregate. Zero when the
+  // window contains only coinbases.
+  uint32 transaction_count = 2;
+
+  // Sum of `zip317_conventional_fee_zat` across the window. Zero when
+  // `transaction_count == 0`.
+  uint64 total_zip317_conventional_fee_zat = 3;
+
+  // Smallest `zip317_conventional_fee_zat` observed in the window. Zero
+  // when `transaction_count == 0`.
+  uint64 min_zip317_conventional_fee_zat = 4;
+
+  // Largest `zip317_conventional_fee_zat` observed in the window. Zero
+  // when `transaction_count == 0`.
+  uint64 max_zip317_conventional_fee_zat = 5;
 }

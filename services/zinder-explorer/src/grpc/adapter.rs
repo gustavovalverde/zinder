@@ -25,10 +25,10 @@ use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
-    EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1, EXPLORER_SEARCH_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_RECENT_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-    EXPLORER_VALUE_POOL_SUMMARY_V1,
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1, EXPLORER_SEARCH_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_TRANSACTION_RECENT_V1, EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, EXPLORER_VALUE_POOL_SUMMARY_V1,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -36,11 +36,11 @@ use zinder_proto::v1::{
         BlockSummariesInRangeResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
         MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
         MempoolEventCountsResponse, MempoolSummaryRequest, MempoolSummaryResponse,
-        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
-        ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
-        TransparentAddressActivityRequest, TransparentAddressActivityResponse,
-        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
-        VerifyPaymentDisclosureResponse,
+        OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionsRequest,
+        SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
+        TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
+        TransparentAddressActivityResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
+        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -64,6 +64,7 @@ use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::fee_summary::handle_fee_summary;
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
+use super::overview_snapshot::handle_overview_snapshot;
 use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
 use super::search::handle_search;
 use super::transaction_detail::handle_transaction_detail;
@@ -239,6 +240,12 @@ impl ExplorerQueryGrpcAdapter {
             capabilities.push(EXPLORER_MEMPOOL_EVENT_COUNTS_V1);
             capabilities.push(EXPLORER_TRANSACTION_RECENT_V1);
             capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1);
+            // OverviewSnapshot composes block summaries, recent
+            // transactions, mempool event counts, fee summary, value
+            // pools, and the wallet mempool snapshot into one coherent
+            // bundle. Its preconditions are the union of every
+            // derive-backed card it composes.
+            capabilities.push(EXPLORER_OVERVIEW_SNAPSHOT_V1);
             // ADR-0018: TRANSACTION_FEES_V1 surfaces paid_fee_zat on
             // TransactionDetail / RecentTransactions / MempoolActivity,
             // all of which need the transparent-output upstream to be
@@ -541,6 +548,25 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 .ok_or_else(|| Status::unavailable("RecentTransactions requires a derive store"))?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_recent_transactions(derive_store, &mut client, request).await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn overview_snapshot(
+        &self,
+        request: Request<OverviewSnapshotRequest>,
+    ) -> Result<Response<OverviewSnapshotResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "OverviewSnapshot",
+            metric: "overview_snapshot",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_overview_snapshot(derive_store, &mut client, request).await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());

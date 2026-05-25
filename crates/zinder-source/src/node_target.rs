@@ -33,6 +33,7 @@ use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 use zinder_core::Network;
 use zinder_core::wire::decode_zinder_native_chain_name;
 
@@ -435,10 +436,10 @@ fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigErr
 
     match method {
         "none" => {
-            reject_present(section.username.is_some(), "node.auth.username", "none")?;
-            reject_present(section.password.is_some(), "node.auth.password", "none")?;
-            reject_present(section.path.is_some(), "node.auth.path", "none")?;
-            reject_present(section.cookie.is_some(), "node.auth.cookie", "none")?;
+            warn_unused(section.username.is_some(), "node.auth.username");
+            warn_unused(section.password.is_some(), "node.auth.password");
+            warn_unused(section.path.is_some(), "node.auth.path");
+            warn_unused(section.cookie.is_some(), "node.auth.cookie");
             Ok(NodeAuth::None)
         }
         "basic" => {
@@ -486,6 +487,17 @@ fn reject_present(
         return Err(NodeConfigError::AuthFieldNotApplicable { field, method });
     }
     Ok(())
+}
+
+fn warn_unused(is_field_present: bool, field: &'static str) {
+    if is_field_present {
+        warn!(
+            event = "node_auth_field_ignored",
+            field,
+            method = "none",
+            "node.auth field is set but ignored because node.auth.method is none"
+        );
+    }
 }
 
 fn read_required(env_var: &'static str) -> Result<String, NodeConfigError> {
@@ -544,6 +556,28 @@ mod tests {
         );
         assert_eq!(target.request_timeout, Duration::from_secs(15));
         assert_eq!(target.node_auth.scheme_name(), "basic");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_none_auth_tolerates_unused_path() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: None,
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            auth: NodeAuthSection {
+                method: Some("none".to_owned()),
+                username: None,
+                password: None,
+                path: Some(PathBuf::from("/var/run/auth/.cookie")),
+                cookie: None,
+            },
+            health: NodeHealthSection::default(),
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+
+        assert!(matches!(target.node_auth, NodeAuth::None));
         Ok(())
     }
 

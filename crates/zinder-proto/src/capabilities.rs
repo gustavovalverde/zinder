@@ -178,6 +178,18 @@ pub const EXPLORER_MEMPOOL_EVENT_COUNTS_V1: &str = "explorer.mempool.event_count
 /// falls back to its own local verifier; presence is the consumer's
 /// signal to route to the hosted path.
 pub const EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1: &str = "explorer.payment_disclosure.verify_v1";
+/// Capability advertised for `ExplorerQuery.OverviewSnapshot`.
+///
+/// Signals that the explorer plane composes a single coherent overview
+/// bundle — tip identity, mempool counts, fee summary, value pools,
+/// recent blocks, recent transactions, mempool event counts — in one
+/// read pass over the derive store, sharing one `ExplorerFreshness`
+/// across every sub-field. Consumers that render a dashboard avoid the
+/// per-card fan-out (six independent RPCs whose freshness can diverge)
+/// in favor of this single RPC. Gated on `derive_store` and
+/// `wallet_query_endpoint` both being online (same precondition as the
+/// derive-backed cards the bundle composes).
+pub const EXPLORER_OVERVIEW_SNAPSHOT_V1: &str = "explorer.overview.snapshot_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -294,6 +306,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
     EXPLORER_TRANSACTION_FEES_V1,
     EXPLORER_TRANSACTION_RECENT_V1,
+    EXPLORER_OVERVIEW_SNAPSHOT_V1,
 ];
 
 /// Helpers for client-side capability discovery.

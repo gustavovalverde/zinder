@@ -5,6 +5,7 @@ mod block_view;
 mod fee_summary;
 mod mempool;
 mod mempool_event_counts;
+mod overview_snapshot;
 mod recent_transactions;
 mod search;
 mod transaction_detail;

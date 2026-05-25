@@ -20,12 +20,13 @@ use zinder_derive::{
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1,
-    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
+    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
+    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::explorer::{
-    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, ServerInfoRequest,
-    TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
+    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, OverviewSnapshotRequest,
+    ServerInfoRequest, TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
@@ -147,6 +148,26 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
     assert_eq!(detail_status.code(), tonic::Code::Unavailable);
 
+    assert!(
+        !common
+            .capabilities
+            .iter()
+            .any(|advertised| { advertised == EXPLORER_OVERVIEW_SNAPSHOT_V1 }),
+        "overview_snapshot capability must not advertise without a derive store",
+    );
+    let overview_outcome = client
+        .overview_snapshot(OverviewSnapshotRequest {
+            recent_blocks_limit: 0,
+            recent_transactions_limit: 0,
+            mempool_window_seconds: 0,
+            fee_summary_block_count: 0,
+        })
+        .await;
+    let overview_status = overview_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected UNAVAILABLE without derive store"))?;
+    assert_eq!(overview_status.code(), tonic::Code::Unavailable);
+
     server_handle.abort();
     let _ = server_handle.await;
     Ok(())
@@ -185,6 +206,97 @@ async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Re
     assert_eq!(response.summaries.len(), 1);
     assert_eq!(response.summaries[0].block_height, 1);
     assert_eq!(response.summaries[0].confirmations, 1);
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+/// `OverviewSnapshot` returns one coherent bundle anchored to a single chain epoch.
+///
+/// Two consecutive calls against the same upstream tip return the same
+/// `tip_hash`; the response's `recent_blocks[0]` carries the seeded
+/// block's height and timestamp; the bundle's single
+/// `freshness.capability_version` is the overview capability string.
+#[tokio::test]
+async fn explorer_query_serves_overview_snapshot_with_seeded_derive_store() -> Result<()> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let (mut client, explorer_handle) =
+        spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
+
+    let explorer_info = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
+
+    let first = client
+        .overview_snapshot(OverviewSnapshotRequest {
+            recent_blocks_limit: 0,
+            recent_transactions_limit: 0,
+            mempool_window_seconds: 0,
+            fee_summary_block_count: 0,
+        })
+        .await?
+        .into_inner();
+    let first_freshness = first
+        .freshness
+        .as_ref()
+        .ok_or_else(|| eyre!("overview response missing freshness"))?;
+    let first_epoch = first_freshness
+        .chain_epoch
+        .as_ref()
+        .ok_or_else(|| eyre!("freshness missing chain_epoch"))?;
+    assert_eq!(
+        first_freshness.capability_version,
+        EXPLORER_OVERVIEW_SNAPSHOT_V1
+    );
+    assert_eq!(first_epoch.tip_height, 1);
+    assert_eq!(first.recent_blocks.len(), 1);
+    assert_eq!(first.recent_blocks[0].block_height, 1);
+    assert_eq!(first.recent_blocks[0].confirmations, 1);
+    assert!(first.recent_blocks[0].is_canonical);
+    assert_eq!(
+        first.tip_block_time_unix_seconds,
+        first.recent_blocks[0].block_time_unix_seconds
+    );
+    assert_eq!(first.value_pools.len(), 0);
+    let first_mempool = first
+        .mempool
+        .as_ref()
+        .ok_or_else(|| eyre!("mempool sub-field missing"))?;
+    assert_eq!(first_mempool.transaction_count, 0);
+
+    // Coherence guarantee: a second call against the same upstream tip
+    // returns the same snapshot identity (tip_hash). The bundle never
+    // straddles two tips.
+    let second = client
+        .overview_snapshot(OverviewSnapshotRequest {
+            recent_blocks_limit: 0,
+            recent_transactions_limit: 0,
+            mempool_window_seconds: 0,
+            fee_summary_block_count: 0,
+        })
+        .await?
+        .into_inner();
+    let second_epoch = second
+        .freshness
+        .as_ref()
+        .and_then(|freshness| freshness.chain_epoch.as_ref())
+        .ok_or_else(|| eyre!("second response missing chain_epoch"))?;
+    assert_eq!(second_epoch.tip_hash, first_epoch.tip_hash);
+    assert_eq!(second_epoch.tip_height, first_epoch.tip_height);
 
     explorer_handle.abort();
     let _ = explorer_handle.await;
