@@ -14,10 +14,8 @@ rust-version.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
 thiserror.workspace = true
-zebra-chain.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
-zinder-source.workspace = true
 zinder-store.workspace = true
 
 [dev-dependencies]
