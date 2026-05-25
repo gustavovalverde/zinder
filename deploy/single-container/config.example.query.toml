@@ -15,9 +15,12 @@ json_rpc_addr = "http://zebra:18232"
 request_timeout_secs = 30
 
 [node.auth]
-# Reads the cookie from the Z3 shared cookie volume mounted at /var/run/auth.
+# Cookie auth is the default. Operators choose one source for the cookie:
+#  - Mounted cookie file (Z3 binding): set ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
+#  - Inline cookie (PaaS / Railway):   set ZINDER_NODE__AUTH__COOKIE=<cookie content>
+# `path` and `cookie` are mutually exclusive, so leave the file source out of
+# the TOML and let the deployment env declare exactly one.
 method = "cookie"
-path = "/var/run/auth/.cookie"
 
 [storage]
 path = "/var/lib/zinder/store"
