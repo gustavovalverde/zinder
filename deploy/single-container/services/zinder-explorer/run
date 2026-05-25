@@ -26,6 +26,14 @@ until nc -z "$INGEST_CONTROL_HOST" "$INGEST_CONTROL_PORT"; do
     elapsed=$((elapsed + WAIT_INTERVAL_SECONDS))
 done
 
+# Strip ZINDER_NODE__* env vars before exec'ing the explorer. The
+# single-container image shares one process env across ingest, query, and
+# explorer, but only ingest and query need the upstream-node connection
+# details ([node] section). The explorer's TOML schema is reader-only and
+# rejects [node] as an unknown field, so any ZINDER_NODE__* var in the
+# inherited env crashes load_config and tears the container down.
+unset $(env | sed -n 's/^\(ZINDER_NODE__[^=]*\)=.*/\1/p') 2>/dev/null || true
+
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-explorer \
     --config /etc/zinder/explorer.toml \
