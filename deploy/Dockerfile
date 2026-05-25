@@ -53,10 +53,12 @@ ARG TARGETVARIANT
 
 COPY . .
 
-RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
-    cargo build --locked --release \
+# Cache mounts were dropped to keep the Dockerfile portable across builders
+# that disallow unscoped cache IDs (Railway BuildKit rejects them with
+# "missing the cacheKey prefix from its id"). Local docker compose builds
+# still benefit from BuildKit's per-session layer cache; only cross-session
+# Cargo cache reuse is lost.
+RUN cargo build --locked --release \
         --bin zinder-ingest \
         --bin zinder-query \
         --bin zinder-explorer \
