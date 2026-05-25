@@ -1,0 +1,10 @@
+#!/command/with-contenv sh
+#
+# zinder-explorer exit handler: tear down the whole container if the
+# explorer plane fails. The writer + query staying up alone without the
+# explorer is not a useful deployment state for an operator who opted into
+# the explorer-enabled single-container image.
+
+set -eu
+exit_code="${1:-0}"
+exec s6-svscanctl -t /run/service

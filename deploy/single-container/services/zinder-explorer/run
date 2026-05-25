@@ -1,0 +1,32 @@
+#!/command/with-contenv sh
+#
+# Supervises zinder-explorer inside the single-container image.
+#
+# Like zinder-query, the explorer plane opens a RocksDB secondary against
+# the writer's primary store and therefore can only start once the writer
+# has materialized its column families. The dependency is declared in
+# dependencies.d/, but s6's "started" only means "run script invoked";
+# wait until the writer's IngestControl endpoint binds (it binds once the
+# primary store is open) before launching the binary.
+
+set -eu
+
+INGEST_CONTROL_HOST=127.0.0.1
+INGEST_CONTROL_PORT=9100
+WAIT_DEADLINE_SECONDS=600
+WAIT_INTERVAL_SECONDS=2
+
+elapsed=0
+until nc -z "$INGEST_CONTROL_HOST" "$INGEST_CONTROL_PORT"; do
+    if [ "$elapsed" -ge "$WAIT_DEADLINE_SECONDS" ]; then
+        echo "zinder-explorer/run: ingest-control endpoint at ${INGEST_CONTROL_HOST}:${INGEST_CONTROL_PORT} did not accept connections within ${WAIT_DEADLINE_SECONDS}s; exiting so s6 can decide whether to retry or tear down." >&2
+        exit 1
+    fi
+    sleep "$WAIT_INTERVAL_SECONDS"
+    elapsed=$((elapsed + WAIT_INTERVAL_SECONDS))
+done
+
+exec s6-setuidgid zinder \
+    /usr/local/bin/zinder-explorer \
+    --config /etc/zinder/explorer.toml \
+    --ops-listen-addr 0.0.0.0:9069

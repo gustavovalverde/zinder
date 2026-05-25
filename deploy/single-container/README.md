@@ -5,27 +5,34 @@ This is the v1 recommended deployment shape for single-operator self-hosting (pe
 ## What runs inside
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Container (s6-overlay PID 1)                            │
-│                                                          │
-│  ┌────────────────────┐         ┌──────────────────────┐ │
-│  │   zinder-ingest    │ ──────▶ │ /var/lib/zinder/     │ │
-│  │   (writer)         │  commit │   store/             │ │
-│  │   port 9100 LO     │         │   (RocksDB primary)  │ │
-│  └──────────┬─────────┘         └──────────┬───────────┘ │
-│             │ IngestControl                │ secondary   │
-│             │ gRPC (loopback)              ▼  open       │
-│  ┌──────────▼─────────┐         ┌──────────────────────┐ │
-│  │   zinder-query     │ ◀────── │ /var/lib/zinder/     │ │
-│  │   (reader)         │  read   │   secondary/         │ │
-│  │   port 9101 → host │         │   (RocksDB secondary)│ │
-│  └────────────────────┘         └──────────────────────┘ │
-│                                                          │
-│  ops endpoint: localhost:9106 → /healthz /readyz /metrics│
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Container (s6-overlay PID 1)                                │
+│                                                              │
+│  ┌────────────────────┐         ┌──────────────────────────┐ │
+│  │   zinder-ingest    │ ──────▶ │ /var/lib/zinder/         │ │
+│  │   (writer)         │  commit │   store/                 │ │
+│  │   port 9100 LO     │         │   (RocksDB primary)      │ │
+│  └──────────┬─────────┘         └──────────┬───────────────┘ │
+│             │ IngestControl                │ secondary open  │
+│             │ gRPC (loopback)              ▼                 │
+│  ┌──────────▼─────────┐ ┌────────────────────┐               │
+│  │   zinder-query     │ │ /var/lib/zinder/   │               │
+│  │   (wallet reader)  │ │   secondary/       │               │
+│  │   port 9101 → host │ │ (RocksDB secondary)│               │
+│  └────────────────────┘ └────────────────────┘               │
+│  ┌──────────▼─────────┐ ┌──────────────────────────┐         │
+│  │   zinder-explorer  │ │ /var/lib/zinder/         │         │
+│  │   (explorer reader)│ │   explorer-secondary/    │         │
+│  │   port 9068 → host │ │ (RocksDB secondary)      │         │
+│  └────────────────────┘ └──────────────────────────┘         │
+│                                                              │
+│  ops endpoints: localhost:9106 (query)   /healthz/readyz/    │
+│                 localhost:9069 (explorer)  metrics           │
+└──────────────────────────────────────────────────────────────┘
         │
-        │ 9101 (WalletQuery gRPC, plaintext)
-        │ 9106 (ops HTTP, plaintext)
+        │ 9101 (WalletQuery   gRPC, plaintext)
+        │ 9068 (ExplorerQuery gRPC, plaintext)
+        │ 9106, 9069 (ops HTTP, plaintext)
         ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Operator-supplied reverse proxy                         │
@@ -43,9 +50,10 @@ Zinder does not own TLS termination, authentication, or rate limiting; those are
 
 ## Required volumes
 
-- `/var/lib/zinder/store`: canonical RocksDB primary. The writer (zinder-ingest) owns this; the reader (zinder-query) opens it as a RocksDB secondary.
-- `/var/lib/zinder/secondary`: secondary catchup directory. zinder-query writes here; zinder-ingest never touches it.
-- `/etc/zinder/ingest.toml` and `/etc/zinder/query.toml`: per-service configuration files. Each binary strict-parses its own TOML schema (writer and reader fields do not share a section set), so the single-container image mounts two configs. See `config.example.ingest.toml` and `config.example.query.toml` for starting points.
+- `/var/lib/zinder/store`: canonical RocksDB primary. The writer (zinder-ingest) owns this; the two readers (zinder-query, zinder-explorer) open it as RocksDB secondaries.
+- `/var/lib/zinder/secondary`: secondary catchup directory used by zinder-query. zinder-ingest never touches it.
+- `/var/lib/zinder/explorer-secondary`: secondary catchup directory used by zinder-explorer. Distinct from `secondary/` so the two readers never race inside the same container.
+- `/etc/zinder/ingest.toml`, `/etc/zinder/query.toml`, and `/etc/zinder/explorer.toml`: per-service configuration files. Each binary strict-parses its own TOML schema, so the single-container image mounts three configs. See `config.example.ingest.toml`, `config.example.query.toml`, and `config.example.explorer.toml` for starting points.
 
 A single named Docker volume covering `/var/lib/zinder` is the simplest layout. The two subdirectories live on the same filesystem so the secondary's catchup performance matches the primary's commit pace.
 
@@ -86,11 +94,14 @@ docker run --rm -d \
   --name zinder-testnet \
   --network z3-testnet \
   -p 19101:9101 \
+  -p 19068:9068 \
   -p 19106:9106 \
+  -p 19069:9069 \
   -v zinder-testnet-data:/var/lib/zinder \
   -v z3-testnet-cookie:/var/run/auth:ro \
   -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
   -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
+  -v $(pwd)/explorer.toml:/etc/zinder/explorer.toml:ro \
   -e ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
   -e ZINDER_NODE__AUTH__METHOD=cookie \
   -e ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie \
@@ -103,10 +114,13 @@ Standalone (legacy, against a non-Z3 Zebra):
 docker run --rm -d \
   --name zinder-testnet \
   -p 19101:9101 \
+  -p 19068:9068 \
   -p 19106:9106 \
+  -p 19069:9069 \
   -v zinder-testnet-data:/var/lib/zinder \
   -v $(pwd)/ingest.toml:/etc/zinder/ingest.toml:ro \
   -v $(pwd)/query.toml:/etc/zinder/query.toml:ro \
+  -v $(pwd)/explorer.toml:/etc/zinder/explorer.toml:ro \
   -e ZINDER_NODE__AUTH__COOKIE="${ZEBRA_COOKIE}" \
   zinder
 ```

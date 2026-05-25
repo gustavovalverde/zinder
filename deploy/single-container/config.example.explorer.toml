@@ -1,0 +1,59 @@
+# Reference `zinder-explorer` configuration for the single-container image
+# (mounted at /etc/zinder/explorer.toml).
+#
+# The explorer plane opens the writer-owned canonical store as its own
+# RocksDB secondary under a distinct catchup directory so it never races
+# with `zinder-query`'s secondary inside the same container. It serves
+# the ExplorerQuery gRPC surface used by block-explorer clients (ADR-0009).
+
+[network]
+name = "zcash-testnet"
+
+[node]
+# Z3 in-network DNS. Mainnet uses port 8232; testnet/regtest use 18232.
+json_rpc_addr = "http://zebra:18232"
+request_timeout_secs = 30
+
+[node.auth]
+# Reads the cookie from the Z3 shared cookie volume mounted at /var/run/auth.
+method = "cookie"
+path = "/var/run/auth/.cookie"
+
+[storage]
+path = "/var/lib/zinder/store"
+# Distinct secondary directory so the explorer never races zinder-query's
+# secondary catchup inside the same container.
+secondary_path = "/var/lib/zinder/explorer-secondary"
+secondary_catchup_interval_ms = 1000
+
+# Bounded RocksDB resource budgets for reader secondaries.
+# See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
+[storage.canonical.rocksdb]
+block_cache_bytes = 134217728
+max_wal_bytes = 33554432
+max_open_files = 128
+write_buffer_bytes = 8388608
+max_write_buffer_count = 2
+
+[storage.derive.rocksdb]
+block_cache_bytes = 67108864
+max_wal_bytes = 16777216
+max_open_files = 64
+write_buffer_bytes = 4194304
+max_write_buffer_count = 2
+
+[ingest_control]
+addr = "http://127.0.0.1:9100"
+
+[explorer]
+listen_addr = "0.0.0.0:9068"
+# Loopback because the wallet plane (zinder-query) runs in the same
+# container's s6 supervision tree and binds 0.0.0.0:9101.
+wallet_query_endpoint = "http://127.0.0.1:9101"
+
+[explorer.grpc]
+enable_reflection = true
+enable_health = true
+
+[ops]
+listen_addr = "0.0.0.0:9069"

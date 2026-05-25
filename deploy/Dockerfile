@@ -174,6 +174,7 @@ RUN set -eux; \
 
 COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
 COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
 
 COPY deploy/single-container/services/zinder-ingest/type /etc/s6-overlay/s6-rc.d/zinder-ingest/type
 COPY deploy/single-container/services/zinder-ingest/run /etc/s6-overlay/s6-rc.d/zinder-ingest/run
@@ -182,21 +183,29 @@ COPY deploy/single-container/services/zinder-query/type /etc/s6-overlay/s6-rc.d/
 COPY deploy/single-container/services/zinder-query/run /etc/s6-overlay/s6-rc.d/zinder-query/run
 COPY deploy/single-container/services/zinder-query/finish /etc/s6-overlay/s6-rc.d/zinder-query/finish
 COPY deploy/single-container/services/zinder-query/dependencies.d /etc/s6-overlay/s6-rc.d/zinder-query/dependencies.d
+COPY deploy/single-container/services/zinder-explorer/type /etc/s6-overlay/s6-rc.d/zinder-explorer/type
+COPY deploy/single-container/services/zinder-explorer/run /etc/s6-overlay/s6-rc.d/zinder-explorer/run
+COPY deploy/single-container/services/zinder-explorer/finish /etc/s6-overlay/s6-rc.d/zinder-explorer/finish
+COPY deploy/single-container/services/zinder-explorer/dependencies.d /etc/s6-overlay/s6-rc.d/zinder-explorer/dependencies.d
 COPY deploy/single-container/services/user/contents.d /etc/s6-overlay/s6-rc.d/user/contents.d
 COPY deploy/single-container/config.example.ingest.toml /etc/zinder/config.example.ingest.toml
 COPY deploy/single-container/config.example.query.toml /etc/zinder/config.example.query.toml
+COPY deploy/single-container/config.example.explorer.toml /etc/zinder/config.example.explorer.toml
 
 RUN cp /etc/zinder/config.example.ingest.toml /etc/zinder/ingest.toml \
     && cp /etc/zinder/config.example.query.toml /etc/zinder/query.toml \
-    && chown zinder:zinder /etc/zinder/ingest.toml /etc/zinder/query.toml \
+    && cp /etc/zinder/config.example.explorer.toml /etc/zinder/explorer.toml \
+    && chown zinder:zinder /etc/zinder/ingest.toml /etc/zinder/query.toml /etc/zinder/explorer.toml \
     && chmod +x /etc/s6-overlay/s6-rc.d/zinder-ingest/run \
                 /etc/s6-overlay/s6-rc.d/zinder-ingest/finish \
                 /etc/s6-overlay/s6-rc.d/zinder-query/run \
-                /etc/s6-overlay/s6-rc.d/zinder-query/finish
+                /etc/s6-overlay/s6-rc.d/zinder-query/finish \
+                /etc/s6-overlay/s6-rc.d/zinder-explorer/run \
+                /etc/s6-overlay/s6-rc.d/zinder-explorer/finish
 
 ENV S6_KEEP_ENV=1
 
-EXPOSE 9101 9106
+EXPOSE 9101 9106 9068 9069
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD curl -fsS http://localhost:9106/readyz || exit 1
