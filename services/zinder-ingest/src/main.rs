@@ -678,7 +678,7 @@ fn resolve_wallet_serving_modifiers(
     if wallet_serving_floor == BlockHeight::new(0) {
         return Err(
             IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
-                reason: "wallet-serving backfill floor cannot be the genesis block",
+                reason: "wallet-serving bulk_catchup floor cannot be the genesis block",
             })
             .into(),
         );

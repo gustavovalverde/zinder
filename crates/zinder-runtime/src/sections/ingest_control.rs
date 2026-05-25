@@ -30,7 +30,7 @@ use crate::{
 #[serde(default, deny_unknown_fields)]
 pub struct IngestControlSection {
     /// Writer-side bind address for the `IngestControl` gRPC endpoint.
-    /// Empty string disables the endpoint (used by `backfill` when an
+    /// Empty string disables the endpoint (used by one-shot bulk-catchup runs when an
     /// operator wants a one-shot bootstrap with no live readers).
     pub listen_addr: Option<String>,
     /// Reader-side URL the colocated readers dial. Defaults to
@@ -71,7 +71,7 @@ pub struct ResolvedIngestControlReader {
 /// An unset [`IngestControlSection::listen_addr`] falls back to
 /// [`DEFAULT_INGEST_CONTROL_LISTEN_ADDR`]. An empty string resolves to
 /// `Ok(ResolvedIngestControlWriter { listen_addr: None, .. })` so
-/// callers that allow disabling the endpoint (such as `backfill`) can
+/// callers that allow disabling the endpoint (such as one-shot bulk-catchup runs) can
 /// pattern-match without re-parsing.
 pub fn resolve_ingest_control_writer(
     section: IngestControlSection,

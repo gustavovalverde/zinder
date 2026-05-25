@@ -22,7 +22,7 @@ use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
     ValuePoolSummaryRequest, ValuePoolSummaryResponse,
@@ -34,8 +34,8 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
@@ -109,7 +109,7 @@ struct ValuePoolSummaryFixture {
 impl ValuePoolSummaryFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store, source) = backfill_store(env).await?;
+        let (store_tempdir, store, source) = bulk_catchup_store(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -156,7 +156,7 @@ impl ValuePoolSummaryFixture {
     }
 }
 
-async fn backfill_store(
+async fn bulk_catchup_store(
     env: &LiveTestEnv,
 ) -> Result<(
     TempDir,
@@ -175,7 +175,7 @@ async fn backfill_store(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -184,12 +184,12 @@ async fn backfill_store(
         true,
         activations,
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source)
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     Ok((tempdir, store, source))

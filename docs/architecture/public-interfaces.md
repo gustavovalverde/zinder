@@ -415,9 +415,9 @@ catchup_threshold_blocks = 100
 [ingest.derive]
 replay_batch_blocks = 500
 replay_policy = "canonical-first"
-memory_degrade_ratio = 0.85
-memory_pause_ratio = 0.95
-memory_resume_ratio = 0.75
+memory_degrade_ratio = 0.90
+memory_pause_ratio = 0.99
+memory_resume_ratio = 0.80
 min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]
@@ -529,9 +529,9 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available. Defaults to `canonical-first`. |
 | `ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES` | zinder-ingest | Optional | `ingest.derive.memory_budget_bytes` | Explicit derive replay memory budget in bytes. When unset, derive replay uses the runtime cgroup `memory.high` or `memory.max` value when present. |
-| `ZINDER_INGEST__DERIVE__MEMORY_DEGRADE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_degrade_ratio` | Memory pressure ratio at which derive replay shrinks the effective replay batch size. Defaults to 0.85. |
-| `ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_pause_ratio` | Memory pressure ratio at which canonical-first derive replay pauses. Defaults to 0.95. |
-| `ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_resume_ratio` | Memory pressure ratio below which degraded derive replay returns to the normal replay batch size. Paused replay resumes as degraded work once pressure falls below memory_pause_ratio. Defaults to 0.75. |
+| `ZINDER_INGEST__DERIVE__MEMORY_DEGRADE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_degrade_ratio` | Memory pressure ratio at which derive replay shrinks the effective replay batch size. Defaults to 0.90. |
+| `ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_pause_ratio` | Memory pressure ratio at which canonical-first derive replay pauses. Defaults to 0.99. |
+| `ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO` | zinder-ingest | Optional | `ingest.derive.memory_resume_ratio` | Memory pressure ratio below which degraded derive replay returns to the normal replay batch size. Paused replay resumes as degraded work once pressure falls below memory_pause_ratio. Defaults to 0.80. |
 | `ZINDER_INGEST__DERIVE__MIN_REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.min_replay_batch_blocks` | Smallest effective derive replay batch size under memory degradation. Must be greater than zero and no larger than replay_batch_blocks. Defaults to 10. |
 | `ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS` | zinder-ingest | Optional | `ingest.bulk_catchup.flush_interval_epochs` | Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater than zero. Defaults to 5. |
 | `ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.tip_follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
@@ -818,7 +818,7 @@ Public shapes describe behavior that production code can actually reach.
 - Delete unreachable public variants. Do not keep fallback variants only because they might be useful later.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
-- Backfill ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
+- Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
 - Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.

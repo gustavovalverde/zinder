@@ -6,7 +6,7 @@
 //! classification, phase stamping on readiness, the
 //! `target_height` modifier, and the spawn-once gate for the
 //! `FollowingTip` subsystems. Commit and transition coverage lives in
-//! the store, backfill, tip-follow, and live suites.
+//! the store, bulk catchup, tip-follow, and live suites.
 
 #![allow(
     missing_docs,

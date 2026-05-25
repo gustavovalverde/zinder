@@ -12,7 +12,7 @@ binaries that developers use during T3 live testing.
 against the selected local upstream node:
 
 1. Reads the selected Zebra node tip.
-2. Backfills a fresh store from a checkpoint.
+2. Bulk-catches-up a fresh store from a checkpoint.
 3. Creates a RocksDB checkpoint backup and verifies that a restored
    `zinder-query` process can serve the checkpointed tip.
 4. Starts `zinder-ingest`, `zinder-query`, and
@@ -89,7 +89,7 @@ ZINDER_OBSERVABILITY_NODE_ADDR=http://127.0.0.1:18232 \
 ZINDER_OBSERVABILITY_NODE_AUTH_USERNAME="${AUTH%%:*}" \
 ZINDER_OBSERVABILITY_NODE_AUTH_PASSWORD="${AUTH#*:}" \
 ZINDER_OBSERVABILITY_GENERATE_BLOCKS=0 \
-ZINDER_OBSERVABILITY_BACKFILL_BLOCKS=100 \
+ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS=100 \
 scripts/observability-smoke.sh run
 ```
 
@@ -100,7 +100,7 @@ ZINDER_OBSERVABILITY_NODE_ADDR=http://127.0.0.1:29232 \
 ZINDER_OBSERVABILITY_NODE_AUTH_USERNAME="${AUTH%%:*}" \
 ZINDER_OBSERVABILITY_NODE_AUTH_PASSWORD="${AUTH#*:}" \
 ZINDER_OBSERVABILITY_GENERATE_BLOCKS=0 \
-ZINDER_OBSERVABILITY_BACKFILL_BLOCKS=1000 \
+ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS=1000 \
 scripts/observability-smoke.sh run
 ```
 
@@ -115,7 +115,7 @@ ZINDER_OBSERVABILITY_NODE_ADDR=http://127.0.0.1:29232 \
 ZINDER_OBSERVABILITY_NODE_AUTH_USERNAME="${AUTH%%:*}" \
 ZINDER_OBSERVABILITY_NODE_AUTH_PASSWORD="${AUTH#*:}" \
 ZINDER_OBSERVABILITY_GENERATE_BLOCKS=0 \
-ZINDER_OBSERVABILITY_BACKFILL_BLOCKS=1000 \
+ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS=1000 \
 ZINDER_OBSERVABILITY_RUNS=6 \
 scripts/observability-smoke.sh calibrate
 ```
@@ -132,8 +132,8 @@ Reports are written to:
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `ZINDER_OBSERVABILITY_NETWORK` | `zcash-regtest` | Network written to service configs. |
-| `ZINDER_OBSERVABILITY_BACKFILL_BLOCKS` | `50` | Blocks backfilled after the checkpoint. |
-| `ZINDER_OBSERVABILITY_COMMIT_BATCH_BLOCKS` | `25` | Ingest commit batch size. |
+| `ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS` | `50` | Blocks ingested after the checkpoint. |
+| `ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS` | `25` | Maximum blocks per canonical bulk-catchup batch. |
 | `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `1` | Regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. Set `0` to skip. |
 | `ZINDER_OBSERVABILITY_RESET` | `1` | Reset `.tmp/observability` before a run. |
 | `ZINDER_OBSERVABILITY_BACKUP_RESTORE` | `1` | Create a checkpoint backup and verify it through a restored query process. |

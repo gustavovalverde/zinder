@@ -74,7 +74,7 @@ The eight shared sections at the time of writing are:
 Per-service sections (`[ingest]`, `[backup]`, `[query]`, `[compat]`,
 `[explorer]`) stay private to their owning binary.
 [ADR-0015](0015-unified-phase-driven-ingest.md) collapses the earlier
-`[backfill]` and `[tip_follow]` writer-side splits into the
+`[bulk catchup]` and `[tip_follow]` writer-side splits into the
 sub-sectioned `[ingest.phases]`, `[ingest.bulk_catchup]`,
 `[ingest.derive]`, `[ingest.tip_follow]`, and `[ingest.modifiers]`
 schema, and adds a new shared `[node.health]` sub-section on the

@@ -22,7 +22,7 @@ use zebra_chain::serialization::ZcashDeserializeInto as _;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
 use zinder_proto::capabilities::EXPLORER_SEARCH_V1;
 use zinder_proto::v1::explorer::{
     NotPubliclyIndexableReason, SearchRequest, SearchResponse,
@@ -35,8 +35,8 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
@@ -300,7 +300,7 @@ struct SearchFixture {
 impl SearchFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store, sample) = backfill_and_sample_tip(env).await?;
+        let (store_tempdir, store, sample) = bulk_catchup_and_sample_tip(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -367,7 +367,7 @@ struct SampleBlock {
     coinbase_transaction_id: TransactionId,
 }
 
-async fn backfill_and_sample_tip(
+async fn bulk_catchup_and_sample_tip(
     env: &LiveTestEnv,
 ) -> Result<(TempDir, PrimaryChainStore, SampleBlock)> {
     let tip_height = fetch_live_tip_height(env).await?;
@@ -383,7 +383,7 @@ async fn backfill_and_sample_tip(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -392,12 +392,12 @@ async fn backfill_and_sample_tip(
         true,
         activations,
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source)
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
     let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_tip(&tip_source_block)?;
     let store =

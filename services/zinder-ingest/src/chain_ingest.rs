@@ -1,6 +1,6 @@
 //! Shared per-block chain-ingest engine.
 //!
-//! Both backfill and tip-following ingest run through this module: it owns
+//! Both bulk catchup and tip-following ingest run through this module: it owns
 //! retryable node fetches, artifact-batch state, subtree-root population,
 //! and the `commit_chain_epoch` translation. Callers decide which
 //! [`ReorgWindowChange`] their commit represents and construct the durable
@@ -122,16 +122,16 @@ pub enum IngestError {
     #[error("internal error: attempted to commit an empty canonical batch")]
     EmptyCanonicalBatch,
 
-    /// Backfill loop ended without committing any batch.
-    #[error("internal error: backfill loop produced no commit")]
-    BackfillProducedNoCommit,
+    /// Bulk-catchup loop ended without committing any batch.
+    #[error("internal error: bulk catchup loop produced no commit")]
+    BulkCatchupProducedNoCommit,
 
-    /// Historical backfill was asked to finalize blocks inside the live reorg window.
+    /// Historical bulk catchup was asked to finalize blocks inside the live reorg window.
     #[error(
-        "backfill to height {to_height:?} is inside the node-reported reorg window: tip {tip_height:?}, reorg window {reorg_window_blocks} blocks, maximum historical height {maximum_historical_height:?}; pass --allow-near-tip-finalize only for local or explicitly disposable stores"
+        "bulk catchup to height {to_height:?} is inside the node-reported reorg window: tip {tip_height:?}, reorg window {reorg_window_blocks} blocks, maximum historical height {maximum_historical_height:?}; pass --allow-near-tip-finalize only for local or explicitly disposable stores"
     )]
-    NearTipBackfillRequiresExplicitFinalize {
-        /// Last requested backfill height.
+    NearTipBulkCatchupRequiresExplicitFinalize {
+        /// Last requested bulk catchup height.
         to_height: BlockHeight,
         /// Current node tip height.
         tip_height: BlockHeight,
@@ -141,25 +141,25 @@ pub enum IngestError {
         maximum_historical_height: BlockHeight,
     },
 
-    /// Backfill cannot derive a chain-global commitment-tree size base.
+    /// Bulk catchup cannot derive a chain-global commitment-tree size base.
     #[error(
-        "backfill from height {from_height:?} requires contiguous commitment-tree metadata; start a fresh store at height 1 or append immediately after current tip {current_tip_height:?}"
+        "bulk catchup from height {from_height:?} requires contiguous commitment-tree metadata; start a fresh store at height 1 or append immediately after current tip {current_tip_height:?}"
     )]
-    BackfillRequiresContiguousTipMetadata {
-        /// First requested backfill height.
+    BulkCatchupRequiresContiguousTipMetadata {
+        /// First requested bulk catchup height.
         from_height: BlockHeight,
         /// Current store tip height, when the store is not empty.
         current_tip_height: Option<BlockHeight>,
     },
 
-    /// Backfill checkpoint height does not match the requested `from_height`.
+    /// Bulk-catchup checkpoint height does not match the requested `from_height`.
     #[error(
-        "backfill checkpoint height {checkpoint_height:?} does not align with from_height {from_height:?}; from_height must equal checkpoint_height + 1"
+        "bulk catchup checkpoint height {checkpoint_height:?} does not align with from_height {from_height:?}; from_height must equal checkpoint_height + 1"
     )]
-    BackfillCheckpointMisaligned {
+    BulkCatchupCheckpointMisaligned {
         /// Operator-supplied checkpoint height.
         checkpoint_height: BlockHeight,
-        /// Requested first backfill height.
+        /// Requested first bulk catchup height.
         from_height: BlockHeight,
     },
 
@@ -912,7 +912,7 @@ fn append_subtree_root_artifacts(
 /// commit outcome.
 ///
 /// Each caller decides what `chain_epoch` and `reorg_window_change` mean for
-/// its mode: backfill always advances finalization to the new tip; the
+/// its mode: bulk catchup always advances finalization to the new tip; the
 /// tip-follower issues `Extend` for tip advancement and `Replace` for
 /// reorgs, then advances finalization separately once the new tip is at
 /// least `reorg_window_blocks` deep.
@@ -1349,14 +1349,16 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         }
         Some(IngestError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
         Some(IngestError::EmptyCanonicalBatch) => "empty_canonical_batch",
-        Some(IngestError::BackfillProducedNoCommit) => "backfill_produced_no_commit",
-        Some(IngestError::NearTipBackfillRequiresExplicitFinalize { .. }) => {
-            "near_tip_backfill_requires_explicit_finalize"
+        Some(IngestError::BulkCatchupProducedNoCommit) => "bulk_catchup_produced_no_commit",
+        Some(IngestError::NearTipBulkCatchupRequiresExplicitFinalize { .. }) => {
+            "near_tip_bulk_catchup_requires_explicit_finalize"
         }
-        Some(IngestError::BackfillRequiresContiguousTipMetadata { .. }) => {
-            "backfill_requires_contiguous_tip_metadata"
+        Some(IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }) => {
+            "bulk_catchup_requires_contiguous_tip_metadata"
         }
-        Some(IngestError::BackfillCheckpointMisaligned { .. }) => "backfill_checkpoint_misaligned",
+        Some(IngestError::BulkCatchupCheckpointMisaligned { .. }) => {
+            "bulk_catchup_checkpoint_misaligned"
+        }
         Some(IngestError::TipFollowObservedTipBehindStore { .. }) => {
             "tip_follow_observed_tip_behind_store"
         }

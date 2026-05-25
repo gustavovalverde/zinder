@@ -5,7 +5,7 @@
 
 //! Live regtest assertion that the typed
 //! `WalletQueryApi::address_output_index` surfaces UTXOs paid to the
-//! seed-derived test address after a fresh backfill.
+//! seed-derived test address after a fresh bulk catchup.
 //!
 //! # Operator precondition
 //!
@@ -21,15 +21,15 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_query::{AddressOutputIndexRequest, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::TransparentTestKey;
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    regtest_generate_blocks, zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    regtest_generate_blocks, zebra_source_from_bulk_catchup,
 };
 
 const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
@@ -52,7 +52,7 @@ async fn address_output_index_surface_through_typed_wallet_query() -> Result<()>
     );
 
     // Mine enough blocks that the seed-derived address has at least one
-    // confirmed coinbase before backfill.
+    // confirmed coinbase before bulk catchup.
     let tip_before = fetch_live_tip_height(&env).await?;
     if tip_before.value() == 0 {
         regtest_generate_blocks(&env, 1).await?;
@@ -62,7 +62,7 @@ async fn address_output_index_surface_through_typed_wallet_query() -> Result<()>
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let backfill_config = live_backfill_config(
+    let bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         BlockHeight::new(1),
@@ -71,10 +71,10 @@ async fn address_output_index_surface_through_typed_wallet_query() -> Result<()>
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
-    backfill(&backfill_config, &source)
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

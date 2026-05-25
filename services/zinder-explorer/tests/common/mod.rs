@@ -1,7 +1,7 @@
 //! Shared helpers for `zinder-explorer`'s integration and live tests.
 //!
 //! Subset of `services/zinder-ingest/tests/common/mod.rs` that the
-//! `services/zinder-explorer` test crate needs to backfill against a live
+//! `services/zinder-explorer` test crate needs to bulk catch up against a live
 //! upstream node and probe the federated balance read path. Duplicated
 //! deliberately so the live gating contract stays colocated with the
 //! consumer; a third consumer is the prompt for consolidating into
@@ -20,17 +20,17 @@ use std::{
 
 use eyre::Result;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_ingest::{BackfillConfig, NodeSourceKind};
+use zinder_ingest::{BulkCatchupRunConfig, NodeSourceKind};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::LiveTestEnv;
 
-/// Builds a [`BackfillConfig`] from a resolved live-test env plus per-test
+/// Builds a [`BulkCatchupRunConfig`] from a resolved live-test env plus per-test
 /// runtime knobs.
 #[allow(
     clippy::too_many_arguments,
-    reason = "Test helper mirrors the resolved BackfillConfig field set."
+    reason = "Test helper mirrors the resolved BulkCatchupRunConfig field set."
 )]
-pub(crate) fn live_backfill_config(
+pub(crate) fn live_bulk_catchup_run_config(
     env: &LiveTestEnv,
     storage_path: &Path,
     from_height: BlockHeight,
@@ -38,9 +38,9 @@ pub(crate) fn live_backfill_config(
     canonical_batch_max_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-) -> BackfillConfig {
+) -> BulkCatchupRunConfig {
     const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
-    BackfillConfig {
+    BulkCatchupRunConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
@@ -59,6 +59,10 @@ pub(crate) fn live_backfill_config(
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         fact_build_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
+        fact_build_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
         allow_near_tip_finalize,
@@ -66,18 +70,18 @@ pub(crate) fn live_backfill_config(
     }
 }
 
-/// Builds a [`ZebraJsonRpcSource`] from a resolved backfill config.
-pub(crate) fn zebra_source_from_backfill(
-    backfill_config: &BackfillConfig,
+/// Builds a [`ZebraJsonRpcSource`] from a resolved bulk-catchup config.
+pub(crate) fn zebra_source_from_bulk_catchup(
+    bulk_catchup_config: &BulkCatchupRunConfig,
 ) -> Result<ZebraJsonRpcSource> {
-    match backfill_config.node_source {
+    match bulk_catchup_config.node_source {
         NodeSourceKind::ZebraJsonRpc => Ok(ZebraJsonRpcSource::with_options(
-            backfill_config.node.network,
-            &backfill_config.node.json_rpc_addr,
-            backfill_config.node.node_auth.clone(),
+            bulk_catchup_config.node.network,
+            &bulk_catchup_config.node.json_rpc_addr,
+            bulk_catchup_config.node.node_auth.clone(),
             ZebraJsonRpcSourceOptions {
-                request_timeout: backfill_config.node.request_timeout,
-                max_response_bytes: backfill_config.node.max_response_bytes,
+                request_timeout: bulk_catchup_config.node.request_timeout,
+                max_response_bytes: bulk_catchup_config.node.max_response_bytes,
             },
         )?),
     }
@@ -97,7 +101,7 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
     Ok(NodeSource::tip_id(&probe_source).await?.height)
 }
 
-/// Fetches the node-advertised upgrade table for live backfill derivation.
+/// Fetches the node-advertised upgrade table for live bulk-catchup derivation.
 pub(crate) async fn fetch_live_network_upgrade_activations(
     env: &LiveTestEnv,
 ) -> Result<Arc<NetworkUpgradeActivations>> {

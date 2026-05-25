@@ -6,7 +6,7 @@
 //! Network-agnostic acceptance for the transparent-UTXO + tx-history
 //! surfaces.
 //!
-//! The test backfills a small window ending at the upstream tip on whatever
+//! The test bulk-catches-up a small window ending at the upstream tip on whatever
 //! network the operator points at (regtest, testnet, or mainnet), samples the
 //! tip block's first transparent coinbase output, derives its
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the ingest
@@ -35,7 +35,7 @@ use zinder_core::{
     AddressOutputIndexArtifact, BlockHash, BlockHeight, Network, NetworkUpgradeActivations,
     TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
 };
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_query::{
     AddressOutputIndexRequest, TransparentAddressTxIdsInRangeRequest, WalletQuery, WalletQueryApi,
 };
@@ -44,11 +44,11 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
-/// Number of blocks below the tip to backfill.
+/// Number of blocks below the tip to bulk catchup.
 ///
 /// Small enough to keep the test under a minute against mainnet; large enough
 /// that the sampled coinbase has been finalized by the time the wallet API
@@ -69,7 +69,7 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     };
     let network = env.network();
     let (storage_path_owner, store, sample, activations) =
-        backfill_and_sample_tip_coinbase(&env).await?;
+        bulk_catchup_and_sample_tip_coinbase(&env).await?;
     let _storage_path_owner = storage_path_owner;
     let wallet_query = WalletQuery::new(store, (), activations);
 
@@ -97,11 +97,11 @@ struct SampledCoinbase {
     value_zat: u64,
     block_height: BlockHeight,
     block_hash: BlockHash,
-    backfill_from_height: BlockHeight,
+    bulk_catchup_from_height: BlockHeight,
     tip_height: BlockHeight,
 }
 
-async fn backfill_and_sample_tip_coinbase(
+async fn bulk_catchup_and_sample_tip_coinbase(
     env: &LiveTestEnv,
 ) -> Result<(
     tempfile::TempDir,
@@ -124,7 +124,7 @@ async fn backfill_and_sample_tip_coinbase(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -133,12 +133,12 @@ async fn backfill_and_sample_tip_coinbase(
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source)
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let block_at_tip = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_coinbase_output(&block_at_tip, from_height, tip_height)?;
@@ -149,7 +149,7 @@ async fn backfill_and_sample_tip_coinbase(
 
 fn sample_first_coinbase_output(
     block: &SourceBlock,
-    backfill_from_height: BlockHeight,
+    bulk_catchup_from_height: BlockHeight,
     tip_height: BlockHeight,
 ) -> Result<SampledCoinbase> {
     let zebra_block: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
@@ -179,7 +179,7 @@ fn sample_first_coinbase_output(
         value_zat,
         block_height: block.height,
         block_hash: block.hash,
-        backfill_from_height,
+        bulk_catchup_from_height,
         tip_height,
     })
 }
@@ -192,7 +192,7 @@ async fn assert_utxo_round_trip(
         .address_output_index(
             AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
+                start_height: sample.bulk_catchup_from_height,
                 max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
                 from_cursor: None,
             },
@@ -230,7 +230,7 @@ async fn assert_tx_history_round_trip(
     let response = wallet_query
         .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
             address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
+            start_height: sample.bulk_catchup_from_height,
             end_height: sample.tip_height,
             max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
             descending: false,
@@ -256,7 +256,7 @@ async fn assert_tx_history_descending_matches_ascending(
     let ascending = wallet_query
         .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
             address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
+            start_height: sample.bulk_catchup_from_height,
             end_height: sample.tip_height,
             max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
             descending: false,
@@ -266,7 +266,7 @@ async fn assert_tx_history_descending_matches_ascending(
     let descending = wallet_query
         .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
             address_script_hash: sample.address_script_hash,
-            start_height: sample.backfill_from_height,
+            start_height: sample.bulk_catchup_from_height,
             end_height: sample.tip_height,
             max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
             descending: true,
@@ -298,7 +298,7 @@ async fn assert_utxo_cursor_resumes(
         .address_output_index(
             AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
+                start_height: sample.bulk_catchup_from_height,
                 max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
                 from_cursor: None,
             },
@@ -306,7 +306,7 @@ async fn assert_utxo_cursor_resumes(
         )
         .await?;
     if baseline.outputs.len() < 2 {
-        // Address only paid once in the backfill window: cursor pagination is
+        // Address only paid once in the bulk catchup window: cursor pagination is
         // covered by the integration tests, no signal to validate here.
         return Ok(());
     }
@@ -314,7 +314,7 @@ async fn assert_utxo_cursor_resumes(
         .address_output_index(
             AddressOutputIndexRequest {
                 address_script_hash: sample.address_script_hash,
-                start_height: sample.backfill_from_height,
+                start_height: sample.bulk_catchup_from_height,
                 max_entries: NonZeroU32::MIN,
                 from_cursor: None,
             },

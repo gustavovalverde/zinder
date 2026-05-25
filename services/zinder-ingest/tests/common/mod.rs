@@ -1,9 +1,9 @@
 //! Shared helpers for `zinder-ingest`'s live tests under `tests/live/`.
 //!
 //! These helpers turn a [`LiveTestEnv`] resolved from the unified env-var
-//! schema into the ingest-specific config types (`BackfillConfig`,
+//! schema into the ingest-specific config types (`BulkCatchupRunConfig`,
 //! `TipFollowConfig`) and run the cross-cutting wallet-API assertions every
-//! live backfill needs.
+//! live bulk catchup needs.
 
 #![allow(
     dead_code,
@@ -32,7 +32,7 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_ingest::{
-    BackfillConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, NodeSourceKind, TipFollowConfig,
+    BulkCatchupRunConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, NodeSourceKind, TipFollowConfig,
 };
 use zinder_proto::{
     compat::lightwalletd::{
@@ -62,13 +62,13 @@ pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::De
     )?)
 }
 
-/// Builds a `BackfillConfig` from a resolved live-test env plus per-test
+/// Builds a `BulkCatchupRunConfig` from a resolved live-test env plus per-test
 /// runtime knobs.
 #[allow(
     clippy::too_many_arguments,
-    reason = "Test helper mirrors the resolved BackfillConfig field set."
+    reason = "Test helper mirrors the resolved BulkCatchupRunConfig field set."
 )]
-pub(crate) fn live_backfill_config(
+pub(crate) fn live_bulk_catchup_run_config(
     env: &LiveTestEnv,
     storage_path: &Path,
     from_height: BlockHeight,
@@ -76,9 +76,9 @@ pub(crate) fn live_backfill_config(
     canonical_batch_max_blocks: NonZeroU32,
     allow_near_tip_finalize: bool,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-) -> BackfillConfig {
+) -> BulkCatchupRunConfig {
     const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
-    BackfillConfig {
+    BulkCatchupRunConfig {
         node: env.target.clone(),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
@@ -128,18 +128,18 @@ pub(crate) fn live_tip_follow_config(
     }
 }
 
-/// Builds a `ZebraJsonRpcSource` from a resolved backfill config.
-pub(crate) fn zebra_source_from_backfill(
-    backfill_config: &BackfillConfig,
+/// Builds a `ZebraJsonRpcSource` from a resolved bulk catchup config.
+pub(crate) fn zebra_source_from_bulk_catchup(
+    bulk_catchup_config: &BulkCatchupRunConfig,
 ) -> Result<ZebraJsonRpcSource> {
-    match backfill_config.node_source {
+    match bulk_catchup_config.node_source {
         NodeSourceKind::ZebraJsonRpc => Ok(ZebraJsonRpcSource::with_options(
-            backfill_config.node.network,
-            &backfill_config.node.json_rpc_addr,
-            backfill_config.node.node_auth.clone(),
+            bulk_catchup_config.node.network,
+            &bulk_catchup_config.node.json_rpc_addr,
+            bulk_catchup_config.node.node_auth.clone(),
             ZebraJsonRpcSourceOptions {
-                request_timeout: backfill_config.node.request_timeout,
-                max_response_bytes: backfill_config.node.max_response_bytes,
+                request_timeout: bulk_catchup_config.node.request_timeout,
+                max_response_bytes: bulk_catchup_config.node.max_response_bytes,
             },
         )?),
     }
@@ -313,7 +313,7 @@ pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> 
     Ok(block_hash)
 }
 
-/// Asserts that the backfilled store answers every wallet read RPC consistently
+/// Asserts that the bulk-caught-up store answers every wallet read RPC consistently
 /// for `[start_height..=end_height]` against the visible chain epoch.
 ///
 /// Live tests pass `activations` discovered from the running node via
@@ -344,10 +344,10 @@ pub(crate) async fn assert_native_wallet_read_responses(
 /// transaction with a non-zero error code.
 pub(crate) async fn assert_lightwalletd_send_transaction_classifies_invalid(
     store: &PrimaryChainStore,
-    backfill_config: &BackfillConfig,
+    bulk_catchup_config: &BulkCatchupRunConfig,
     activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
-    let source = zebra_source_from_backfill(backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(bulk_catchup_config)?;
     let wallet_query = WalletQuery::new(store.clone(), source, Arc::clone(&activations));
     let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, Arc::clone(&activations));
 

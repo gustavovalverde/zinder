@@ -1,4 +1,4 @@
-mod backfill;
+mod bulk_catchup;
 mod cli;
 mod fixture_block;
 mod ingest_loop;

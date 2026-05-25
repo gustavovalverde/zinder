@@ -260,9 +260,9 @@ fallback with no extra setup.
 
 **For developers.** New ingestion features land in one place. The
 triplicated `current_chain_height` helper collapses to one private
-helper beside the phase classifier. `BackfillConfig` becomes
-`BulkCatchupConfig` and shrinks: `from_height` and `to_height` are
-both derived per iteration instead of carried as configuration. The
+helper beside the phase classifier. The one-shot run surface is
+`BulkCatchupRunConfig`; the unified loop derives `from_height` and
+`to_height` per iteration before calling the bulk-catchup stage. The
 bulk-catchup source bound is `ingest.bulk_catchup.source_segment_max_blocks`,
 parameterized as a hard ceiling rather than the steady-state request size.
 The CLI surface tracks one front door, not two.
@@ -299,7 +299,7 @@ unchanged. [ADR-0014](0014-shared-configuration-sections.md) gains
 schema (the upstream-health knobs are operator-readable from any
 binary that wants them).
 [Chain ingestion](../architecture/chain-ingestion.md) renames its
-§Backfill and Tip Following section to §Bulk catch-up and tip
+§Bulk catchup and tip following section to §Bulk catch-up and tip
 following, replacing subcommand vocabulary with phase vocabulary,
 adds a §Phase transitions subsection covering the classifier rule and
 spawn-once semantics, and adds a §Upstream sync detection subsection

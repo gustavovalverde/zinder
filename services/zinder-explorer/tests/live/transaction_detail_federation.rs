@@ -5,7 +5,7 @@
 
 //! Live acceptance for `ExplorerQuery.TransactionDetail`.
 //!
-//! Backfills a small window ending at the upstream tip, picks the coinbase
+//! Bulk-catches-up a small window ending at the upstream tip, picks the coinbase
 //! transaction from the tip block, and asserts that the federated explorer
 //! response binds the [`zinder_core::TransactionPublicFacts`] shape consumers
 //! depend on:
@@ -37,7 +37,7 @@ use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::{encode_internal_transaction_id, encode_zinder_native_chain_name};
 use zinder_core::{BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
 use zinder_proto::v1::explorer::{
     PrivacyShape as WirePrivacyShape, TransactionDetailRequest, TransactionVersionKind,
     explorer_query_server::ExplorerQuery as ExplorerQueryService, transaction_location,
@@ -49,11 +49,11 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
-/// Number of blocks below the tip to backfill.
+/// Number of blocks below the tip to bulk catch up.
 ///
 /// Wide enough to ensure the sampled coinbase has been committed; narrow
 /// enough to keep the test under a minute on mainnet.
@@ -172,7 +172,7 @@ struct TransactionDetailFixture {
 impl TransactionDetailFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (tempdir, store, sample) = backfill_and_sample_tip_coinbase(env).await?;
+        let (tempdir, store, sample) = bulk_catchup_and_sample_tip_coinbase(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -287,7 +287,7 @@ struct SampledCoinbase {
     block_height: BlockHeight,
 }
 
-async fn backfill_and_sample_tip_coinbase(
+async fn bulk_catchup_and_sample_tip_coinbase(
     env: &LiveTestEnv,
 ) -> Result<(TempDir, PrimaryChainStore, SampledCoinbase)> {
     let tip_height = fetch_live_tip_height(env).await?;
@@ -305,7 +305,7 @@ async fn backfill_and_sample_tip_coinbase(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -314,15 +314,17 @@ async fn backfill_and_sample_tip_coinbase(
         true,
         activations,
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source).await?.ok_or_else(|| {
-        eyre!(
-            "expected committed backfill outcome against live {network}",
-            network = encode_zinder_native_chain_name(env.network()),
-        )
-    })?;
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
+        .await?
+        .ok_or_else(|| {
+            eyre!(
+                "expected committed bulk-catchup outcome against live {network}",
+                network = encode_zinder_native_chain_name(env.network()),
+            )
+        })?;
 
     let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_tip_coinbase(&tip_source_block)?;

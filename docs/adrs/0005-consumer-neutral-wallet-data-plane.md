@@ -42,12 +42,12 @@ The core contract is:
 
 `wallet-serving` is the operator-facing coverage profile for stores intended to serve wallet flows. It means the store was built with enough historical artifact coverage for wallet creation, recovery, rescan, imported-account, and transparent-UTXO flows supported by the published API.
 
-`wallet-serving` is not a Zashi profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. The backfill floor is derived from upstream-node-advertised shielded activation heights, because that is the simplest general rule that covers subtree roots from index `0` and historical tree-state anchors without encoding public-network constants into docs or config.
+`wallet-serving` is not a Zashi profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. The bulk-catchup floor is derived from upstream-node-advertised shielded activation heights, because that is the simplest general rule that covers subtree roots from index `0` and historical tree-state anchors without encoding public-network constants into docs or config.
 
 Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
-- `wallet-serving` rejects `allow_near_tip_finalize`; a serving store must stop backfill outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
+- `wallet-serving` rejects `allow_near_tip_finalize`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes.
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
@@ -84,12 +84,12 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows use explicit disposable stores or tip-follow rather than near-tip finalized backfill.
+- Local test workflows use explicit disposable stores or tip-follow rather than near-tip finalized bulk catchup.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:
 
-The backfill floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
+The bulk-catchup floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
 
 Upstream-node fallback is rejected. It would blur the source of truth, make readiness lie, and turn query services into partial node proxies. Repair tools may use upstream nodes to rebuild canonical artifacts, but public query methods read stored artifacts only.
 

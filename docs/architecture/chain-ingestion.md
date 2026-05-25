@@ -81,15 +81,15 @@ blocks on demand.
 Current status: `zinder-source` and `zinder-ingest` parse raw block bytes
 with `zebra-chain`. The builder extracts block identity, ordered compact
 transactions, transparent data, Sapling compact fields, Orchard compact fields,
-and stateful tree-size metadata for contiguous backfills. Subtree roots and
+and stateful tree-size metadata for contiguous bulk-catchup ranges. Subtree roots and
 latest tree state remain separate artifacts, not fields to reconstruct at query
 time.
 
-Commitment-tree sizes must be chain-global. A fresh backfill may start at
+Commitment-tree sizes must be chain-global. A fresh bulk-catchup run may start at
 height 1, an existing store may append immediately after its current tip, and a
-checkpoint-bounded backfill may start at `SourceChainCheckpoint.height + 1` after
+checkpoint-bounded bulk-catchup run may start at `SourceChainCheckpoint.height + 1` after
 seeding the builder from the checkpoint's `ChainTipMetadata`. Arbitrary
-non-genesis or non-contiguous backfills still fail closed unless they are backed
+non-genesis or non-contiguous bulk-catchup ranges still fail closed unless they are backed
 by a resolved upstream node checkpoint.
 
 ## Chain Epochs

@@ -31,7 +31,7 @@ use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_core::{BlockHeight, Network};
-use zinder_ingest::{IngestControlGrpcAdapter, backfill, tip_follow_with_primary_store};
+use zinder_ingest::{IngestControlGrpcAdapter, run_bulk_catchup, tip_follow_with_primary_store};
 use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
     wallet::{
@@ -44,9 +44,9 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
     live_tip_follow_config, regtest_generate_blocks, rpc_block_hash_at_height,
-    rpc_invalidate_block, rpc_reconsider_block, zebra_source_from_backfill,
+    rpc_invalidate_block, rpc_reconsider_block, zebra_source_from_bulk_catchup,
     zebra_source_from_tip_follow,
 };
 
@@ -60,7 +60,7 @@ const TIP_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// the default production-style window is plenty of headroom.
 const TIP_FOLLOW_REORG_WINDOW_BLOCKS: u32 = 100;
 
-/// Backfill batch size for the bulk catchup phase. Sized for fast catchup
+/// Bulk-catchup batch size for the bulk-catchup phase. Sized for fast catchup
 /// against a regtest sidecar that may already hold several thousand
 /// blocks accumulated from prior live runs.
 const BACKFILL_BATCH_BLOCKS: u32 = 1000;
@@ -99,26 +99,27 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     let tempdir = tempfile::tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
 
-    // Phase 1: bulk-backfill up to Zebra's current tip. Without this, the
+    // Phase 1: bulk-bulk catchup up to Zebra's current tip. Without this, the
     // tip-follow loop catches up at a single-block-per-poll rate that
     // does not scale to a sidecar that already holds thousands of
-    // regtest blocks. Backfill is built for this and finishes in
+    // regtest blocks. BulkCatchup is built for this and finishes in
     // seconds.
     let zebra_tip_before_mining = fetch_live_tip_height(&env).await?;
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let backfill_config = live_backfill_config(
+    let bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         BlockHeight::new(1),
         zebra_tip_before_mining,
-        NonZeroU32::new(BACKFILL_BATCH_BLOCKS).ok_or_else(|| eyre!("invalid backfill batch"))?,
+        NonZeroU32::new(BACKFILL_BATCH_BLOCKS)
+            .ok_or_else(|| eyre!("invalid bulk-catchup batch"))?,
         true,
         Arc::clone(&activations),
     );
-    let backfill_source = zebra_source_from_backfill(&backfill_config)?;
-    backfill(&backfill_config, &backfill_source)
+    let bulk_catchup_source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    run_bulk_catchup(&bulk_catchup_config, &bulk_catchup_source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     // Phase 2: open the store and the tip-follow loop on top of the
     // populated state. Tip-follow now only has to absorb the

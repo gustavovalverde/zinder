@@ -41,7 +41,7 @@ COMPAT_GRPC_ADDR="${ZINDER_OBSERVABILITY_COMPAT_GRPC_ADDR:-127.0.0.1:9067}"
 RESTORE_QUERY_GRPC_ADDR="${ZINDER_OBSERVABILITY_RESTORE_QUERY_GRPC_ADDR:-127.0.0.1:9103}"
 RESTORE_QUERY_OPS_ADDR="${ZINDER_OBSERVABILITY_RESTORE_QUERY_OPS_ADDR:-0.0.0.0:9193}"
 
-BACKFILL_BLOCKS="${ZINDER_OBSERVABILITY_BACKFILL_BLOCKS:-50}"
+BULK_CATCHUP_BLOCKS="${ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS:-50}"
 CANONICAL_BATCH_MAX_BLOCKS="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS:-25}"
 CANONICAL_BATCH_MAX_ARTIFACT_BYTES="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_ARTIFACT_BYTES:-536870912}"
 SOURCE_SEGMENT_MAX_BLOCKS="${ZINDER_OBSERVABILITY_SOURCE_SEGMENT_MAX_BLOCKS:-16}"
@@ -63,7 +63,7 @@ COMPAT_CONFIG="${CONFIG_DIR}/zinder-compat-lightwalletd.toml"
 RESTORE_QUERY_CONFIG="${CONFIG_DIR}/zinder-query-restore.toml"
 GRPC_HEALTH_PROTO="${CONFIG_DIR}/grpc-health-v1.proto"
 
-BACKFILL_SECONDS="null"
+BULK_CATCHUP_SECONDS="null"
 BACKUP_RESTORE_STATUS="not_run"
 BACKUP_RESTORE_ERROR_CLASS="none"
 REPORT_JSON_PATH=""
@@ -87,7 +87,7 @@ usage() {
 Usage: scripts/observability-smoke.sh [run|calibrate|snapshot|stop]
 
 Commands:
-  run        Start Prometheus/Grafana, backfill from a checkpoint, verify
+  run        Start Prometheus/Grafana, bulk catchup from a checkpoint, verify
              backup restore, start ingest/query/compat services, generate
              traffic, print Prometheus evidence, and write a readiness report.
              This is the default command.
@@ -528,10 +528,10 @@ build_binaries() {
   fi
 }
 
-run_backfill() {
-  local log_file="${LOG_DIR}/backfill.log"
+run_bulk_catchup_seed() {
+  local log_file="${LOG_DIR}/bulk-catchup.log"
   local started_at ended_at
-  log "running unified ingest until target_height ${BACKFILL_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
+  log "running unified ingest until target_height ${BULK_CATCHUP_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
   started_at="$(python3 - <<'PY'
 import time
 print(time.time())
@@ -544,24 +544,24 @@ PY
   if ! (
     cd "$ROOT_DIR"
     zinder_process_env "${ROOT_DIR}/target/debug/zinder-ingest" \
-      --config "$INGEST_CONFIG" --target-height "$BACKFILL_TO_HEIGHT"
+      --config "$INGEST_CONFIG" --target-height "$BULK_CATCHUP_TO_HEIGHT"
   ) >"$log_file" 2>&1; then
     tail -n 160 "$log_file" >&2 || true
-    die "checkpoint backfill failed"
+    die "checkpoint bulk catchup failed"
   fi
   ended_at="$(python3 - <<'PY'
 import time
 print(time.time())
 PY
 )"
-  BACKFILL_SECONDS="$(python3 - "$started_at" "$ended_at" <<'PY'
+  BULK_CATCHUP_SECONDS="$(python3 - "$started_at" "$ended_at" <<'PY'
 import sys
 started_at = float(sys.argv[1])
 ended_at = float(sys.argv[2])
 print(f"{ended_at - started_at:.6f}")
 PY
 )"
-  log "checkpoint backfill completed in ${BACKFILL_SECONDS}s"
+  log "checkpoint bulk catchup completed in ${BULK_CATCHUP_SECONDS}s"
 }
 
 run_backup_restore_check() {
@@ -609,13 +609,13 @@ run_backup_restore_check() {
     die "restored checkpoint query failed"
   fi
   restore_response="$(<"$restore_output")"
-  if ! jq -e --argjson height "$BACKFILL_TO_HEIGHT" '.latestBlock.height == $height' \
+  if ! jq -e --argjson height "$BULK_CATCHUP_TO_HEIGHT" '.latestBlock.height == $height' \
     >/dev/null <<<"$restore_response"; then
     BACKUP_RESTORE_STATUS="failed"
     BACKUP_RESTORE_ERROR_CLASS="restore_height_mismatch"
     cat "$restore_output" >&2 || true
     stop_process_pid zinder-query-restore "$restore_pid"
-    die "restored checkpoint did not serve expected height ${BACKFILL_TO_HEIGHT}"
+    die "restored checkpoint did not serve expected height ${BULK_CATCHUP_TO_HEIGHT}"
   fi
 
   stop_process_pid zinder-query-restore "$restore_pid"
@@ -697,7 +697,7 @@ run_grpc_call() {
 }
 
 maybe_generate_blocks() {
-  TARGET_TIP_HEIGHT="$BACKFILL_TO_HEIGHT"
+  TARGET_TIP_HEIGHT="$BULK_CATCHUP_TO_HEIGHT"
 
   if [[ "$GENERATE_BLOCKS" == "0" ]]; then
     log "skipping regtest block generation"
@@ -729,7 +729,7 @@ maybe_generate_blocks() {
 
 generate_traffic() {
   local range_end="$TARGET_TIP_HEIGHT"
-  local range_start="$BACKFILL_FROM_HEIGHT"
+  local range_start="$BULK_CATCHUP_FROM_HEIGHT"
   local range_limit=$((range_start + 2))
   if (( range_end > range_limit )); then
     range_end="$range_limit"
@@ -784,7 +784,7 @@ run_lightwalletd_testclient() {
   esac
 
   local range_start range_end range_limit log_file
-  range_start="$BACKFILL_FROM_HEIGHT"
+  range_start="$BULK_CATCHUP_FROM_HEIGHT"
   range_end="$TARGET_TIP_HEIGHT"
   range_limit=$((range_start + 2))
   if (( range_end > range_limit )); then
@@ -942,12 +942,12 @@ write_readiness_report() {
   export REPORT_RUN_ID="$RUN_ID"
   export REPORT_NETWORK="$NETWORK"
   export REPORT_NODE_ADDR="$NODE_ADDR"
-  export REPORT_NODE_TIP_HEIGHT="$BACKFILL_TO_HEIGHT"
+  export REPORT_NODE_TIP_HEIGHT="$BULK_CATCHUP_TO_HEIGHT"
   export REPORT_CHECKPOINT_HEIGHT="$CHECKPOINT_HEIGHT"
-  export REPORT_BACKFILL_FROM_HEIGHT="$BACKFILL_FROM_HEIGHT"
-  export REPORT_BACKFILL_TO_HEIGHT="$BACKFILL_TO_HEIGHT"
-  export REPORT_BACKFILL_BLOCKS="$((BACKFILL_TO_HEIGHT - CHECKPOINT_HEIGHT))"
-  export REPORT_BACKFILL_SECONDS="$BACKFILL_SECONDS"
+  export REPORT_BULK_CATCHUP_FROM_HEIGHT="$BULK_CATCHUP_FROM_HEIGHT"
+  export REPORT_BULK_CATCHUP_TO_HEIGHT="$BULK_CATCHUP_TO_HEIGHT"
+  export REPORT_BULK_CATCHUP_BLOCKS="$((BULK_CATCHUP_TO_HEIGHT - CHECKPOINT_HEIGHT))"
+  export REPORT_BULK_CATCHUP_SECONDS="$BULK_CATCHUP_SECONDS"
   export REPORT_BACKUP_RESTORE_STATUS="$BACKUP_RESTORE_STATUS"
   export REPORT_BACKUP_RESTORE_ERROR_CLASS="$BACKUP_RESTORE_ERROR_CLASS"
   export REPORT_PROMETHEUS_URL="http://127.0.0.1:${PROMETHEUS_PORT}"
@@ -1001,12 +1001,12 @@ report = {
     },
     "checkpoint": {
         "height": metric("REPORT_CHECKPOINT_HEIGHT"),
-        "backfill_from_height": metric("REPORT_BACKFILL_FROM_HEIGHT"),
-        "backfill_to_height": metric("REPORT_BACKFILL_TO_HEIGHT"),
-        "backfill_blocks": metric("REPORT_BACKFILL_BLOCKS"),
+        "bulk_catchup_from_height": metric("REPORT_BULK_CATCHUP_FROM_HEIGHT"),
+        "bulk_catchup_to_height": metric("REPORT_BULK_CATCHUP_TO_HEIGHT"),
+        "bulk_catchup_blocks": metric("REPORT_BULK_CATCHUP_BLOCKS"),
     },
     "measurements": {
-        "backfill_seconds": metric("REPORT_BACKFILL_SECONDS"),
+        "bulk_catchup_seconds": metric("REPORT_BULK_CATCHUP_SECONDS"),
         "targets_up": metric("REPORT_TARGETS_UP"),
         "traffic_blocking_services": metric("REPORT_TRAFFIC_BLOCKING_SERVICES"),
         "readiness_warning_services": metric("REPORT_READINESS_WARNING_SERVICES"),
@@ -1047,8 +1047,8 @@ lines = [
     f"- Generated: `{report['generated_at']}`",
     f"- Node tip: `{report['node']['tip_height']}`",
     f"- Checkpoint height: `{report['checkpoint']['height']}`",
-    f"- Backfill range: `{report['checkpoint']['backfill_from_height']}..{report['checkpoint']['backfill_to_height']}`",
-    f"- Backfill duration: `{measurements['backfill_seconds']}` seconds",
+    f"- Bulk-catchup range: `{report['checkpoint']['bulk_catchup_from_height']}..{report['checkpoint']['bulk_catchup_to_height']}`",
+    f"- Bulk-catchup duration: `{measurements['bulk_catchup_seconds']}` seconds",
     f"- Targets up: `{measurements['targets_up']}`",
     f"- Traffic-blocking services: `{measurements['traffic_blocking_services']}`",
     f"- Readiness warning services: `{measurements['readiness_warning_services']}`",
@@ -1121,7 +1121,7 @@ def measurement_values(name):
 
 
 metric_names = [
-    "backfill_seconds",
+    "bulk_catchup_seconds",
     "wallet_query_p95_max_seconds",
     "node_rpc_p95_max_seconds",
     "store_read_p95_max_seconds",
@@ -1154,8 +1154,8 @@ aggregate = {
             "path": str(path),
             "run_id": report["run_id"],
             "checkpoint_height": report["checkpoint"]["height"],
-            "backfill_to_height": report["checkpoint"]["backfill_to_height"],
-            "backfill_seconds": report["measurements"]["backfill_seconds"],
+            "bulk_catchup_to_height": report["checkpoint"]["bulk_catchup_to_height"],
+            "bulk_catchup_seconds": report["measurements"]["bulk_catchup_seconds"],
             "wallet_query_p95_max_seconds": report["measurements"]["wallet_query_p95_max_seconds"],
             "store_read_p95_max_seconds": report["measurements"]["store_read_p95_max_seconds"],
             "backup_restore_status": report["backup_restore"]["status"],
@@ -1195,25 +1195,25 @@ PY
 run_stack() {
   require_commands
 
-  local tip_height effective_backfill_blocks
+  local tip_height effective_bulk_catchup_blocks
   log "checking node ${NODE_ADDR} on ${NETWORK}"
   tip_height="$(node_tip_height)" || die "node did not return a tip height"
   if (( tip_height < 2 )); then
-    die "node tip ${tip_height} is too low for checkpoint backfill"
+    die "node tip ${tip_height} is too low for checkpoint bulk catchup"
   fi
 
-  effective_backfill_blocks="$BACKFILL_BLOCKS"
-  if (( effective_backfill_blocks >= tip_height )); then
-    effective_backfill_blocks=$((tip_height - 1))
+  effective_bulk_catchup_blocks="$BULK_CATCHUP_BLOCKS"
+  if (( effective_bulk_catchup_blocks >= tip_height )); then
+    effective_bulk_catchup_blocks=$((tip_height - 1))
   fi
-  if (( effective_backfill_blocks < 1 )); then
-    die "effective backfill window must be at least one block"
+  if (( effective_bulk_catchup_blocks < 1 )); then
+    die "effective bulk catchup window must be at least one block"
   fi
 
-  CHECKPOINT_HEIGHT=$((tip_height - effective_backfill_blocks))
-  BACKFILL_FROM_HEIGHT=$((CHECKPOINT_HEIGHT + 1))
-  BACKFILL_TO_HEIGHT="$tip_height"
-  export CHECKPOINT_HEIGHT BACKFILL_FROM_HEIGHT BACKFILL_TO_HEIGHT TARGET_TIP_HEIGHT
+  CHECKPOINT_HEIGHT=$((tip_height - effective_bulk_catchup_blocks))
+  BULK_CATCHUP_FROM_HEIGHT=$((CHECKPOINT_HEIGHT + 1))
+  BULK_CATCHUP_TO_HEIGHT="$tip_height"
+  export CHECKPOINT_HEIGHT BULK_CATCHUP_FROM_HEIGHT BULK_CATCHUP_TO_HEIGHT TARGET_TIP_HEIGHT
 
   stop_services
   prepare_work_dir
@@ -1226,7 +1226,7 @@ run_stack() {
   reload_prometheus
   wait_http grafana "http://127.0.0.1:${GRAFANA_PORT}/api/health" 120
 
-  run_backfill
+  run_bulk_catchup_seed
   run_backup_restore_check
 
   # Long-running unified ingest. No --target-height here, so the loop

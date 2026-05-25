@@ -145,8 +145,8 @@ contains hosted-network checks that deliberately refuse to run on regtest:
 the mainnet-only tests
 (`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`backfills_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
-(`cli_backfills_bounded_wallet_serving_floor_from_config`,
+`bulk_catchup_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
+(`cli_bulk_catchup_bounded_wallet_serving_floor_from_config`,
 `checkpoint_bounded_read_endpoint_latency_baseline`).
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three additional tests skip:
@@ -174,7 +174,7 @@ through `-E 'test(<name>)'` as above.
 
 The `node-mutating` test group in `.config/nextest.toml` serializes any test
 that mutates regtest state (broadcast cycles, indexer-restart, deep-chain
-backfills). Run them in isolation if you want to debug — parallel execution
+bulk-catchup runs). Run them in isolation if you want to debug — parallel execution
 will fight for the same node.
 
 ## T3: Live testnet (Zebra cookie auth)
@@ -223,7 +223,7 @@ ZINDER_TEST_LIVE=1 \
 Currently-mainnet-only tests are:
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`backfills_last_1000_blocks_from_checkpoint`, plus the federated balance
+`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the federated balance
 read-only confirmations under `services/zinder-explorer/tests/live/`.
 
 ## T3: Parity against a reference lightwalletd
@@ -316,7 +316,7 @@ The same invocation works for testnet (`ZINDER_NETWORK=zcash-testnet`,
 target activation = NU6.1 at height 3,536,500) and mainnet
 (`ZINDER_NETWORK=zcash-mainnet`, target activation = NU6.1 at height
 3,146,400). On testnet/mainnet the test anchors a checkpoint just below
-the activation so the backfill window stays at three blocks.
+the activation so the bulk catchup window stays at three blocks.
 
 File:
 [`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).
@@ -431,7 +431,7 @@ run with every `cargo nextest run --profile=ci`:
 
 ### Manual reproduction: N concurrent compat readers
 
-Operator-grade reproduction needs a real backfilled store plus a real
+Operator-grade reproduction needs a real bulk-caught-up store plus a real
 gRPC client. Two terminals:
 
 ```bash
@@ -503,7 +503,7 @@ These numbers are not asserted by the test; treat the printed values as
 operator-facing telemetry. Compare across changes to spot regressions in
 the read path. The baseline does not exercise `transaction()` — that path
 goes through `mempool_broadcast_cycle` (broadcast then look up the mined
-txid) and `deep_chain` (high-volume backfill).
+txid) and `deep_chain` (high-volume bulk catchup).
 
 ### Heavy probes (trust-sensitive code only)
 
@@ -704,7 +704,7 @@ at the running `zinder-compat-lightwalletd:9067`.
 What to validate by hand:
 
 - `GetLightdInfo.taddr_support` is `true` only on stores produced by the
-  wallet-serving backfill profile (per
+  wallet-serving bulk-catchup profile (per
   [wallet-data-plane §Transparent Address Outputs](../architecture/wallet-data-plane.md#transparent-address-outputs)).
 - `GetMempoolStream` closes cleanly on tip-change. Force a tip change with
   `docker exec z3_regtest_sidecar_zebra zebrad ... generate 1` and observe
@@ -902,7 +902,7 @@ update the referenced architecture or reference page.
 
 | Procedure | Friction | Run shape | Pass condition | Evidence to keep | Owning detail |
 | --- | --- | --- | --- | --- | --- |
-| Full wallet-serving testnet backfill | Medium | Against a synced testnet Zebra, run `zinder-ingest --wallet-serving --target-height <safe height>` to seed the store, then `zinder-ingest --wallet-serving`, `zinder-query`, and `zinder-compat-lightwalletd` over the same store. | Store covers the wallet-serving floor, readers open from secondaries, `/readyz` reports ready or bounded syncing, `GetLightdInfo` reports a non-zero height and `taddrSupport: true`. | Ingest and reader logs, `/readyz` JSON, `GetLightdInfo` output, first and last ingested heights. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) |
+| Full wallet-serving testnet bulk catchup | Medium | Against a synced testnet Zebra, run `zinder-ingest --wallet-serving --target-height <safe height>` to seed the store, then `zinder-ingest --wallet-serving`, `zinder-query`, and `zinder-compat-lightwalletd` over the same store. | Store covers the wallet-serving floor, readers open from secondaries, `/readyz` reports ready or bounded syncing, `GetLightdInfo` reports a non-zero height and `taddrSupport: true`. | Ingest and reader logs, `/readyz` JSON, `GetLightdInfo` output, first and last ingested heights. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) |
 | Lightwalletd-compatible wallet bootstrap and restore | Medium | Point a real lightwalletd-compatible wallet or SDK at the testnet compat endpoint. Exercise create-new-wallet first, then restore/import or resync against the same serving store. | Create-new-wallet and restored/resync wallets reach the chain tip when requested tree-state and subtree-root heights are at or above the store floor. Below-floor requests fail only as the documented strict `NOT_FOUND` unsupported-floor case; unknown tree-state or subtree-root gaps are blockers. | Wallet logs, endpoint config diff, wallet-visible height, store floor, requested tree-state/subtree-root heights, `GetAddressUtxosStream` sample. | [External integration: lightwalletd-compatible wallets](#external-integration-lightwalletd-compatible-wallets), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
 | Send plus mempool end-to-end | Medium | With the unified `zinder-ingest` loop and the mempool surface running, open the mempool stream, then submit a self-send from a real wallet through `zinder-compat-lightwalletd`. | `SendTransaction` returns the expected success mapping. `GetMempoolStream` emits `RawTransaction`, stays open while the tx is pending, and closes on mining. `GetMempoolTx` returns the compact tx while pending and empties after mining. Wallet scan-back observes the mined tx, and writer-tip lag stays inside the wallet expiry window. | Wallet logs, compat logs, mempool stream excerpt, `GetMempoolTx` before/after output, txid, mined height, `/readyz` lag sample at submit time. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Wallet data plane §Mempool Snapshot](../architecture/wallet-data-plane.md#mempool-snapshot) |
 | Real Zallet native-contract gate | Medium | Start a Zinder-native `zinder-query` integration target, then run `cargo nextest run --profile=ci-zallet-live --run-ignored=all` with `ZINDER_TEST_ZALLET*` pointing at a real Zallet binary and config. | The gate proves the Zallet config targets Zinder's native contract, rejects validator-direct config, and observes the required Zallet command output. | Zallet config path, command output, nextest result, `zinder-query` logs. | [T3: Real Zallet binary gate](#t3-real-zallet-binary-gate), [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder) |

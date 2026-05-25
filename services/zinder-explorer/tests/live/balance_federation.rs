@@ -6,7 +6,7 @@
 //! Network-agnostic acceptance for the federated transparent-address
 //! balance read path.
 //!
-//! The test backfills a small window ending at the upstream tip, samples one
+//! The test bulk-catches-up a small window ending at the upstream tip, samples one
 //! transparent coinbase output from the tip block, derives its
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the
 //! ingest pipeline uses, and asserts that:
@@ -49,7 +49,8 @@ use zinder_core::{
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{
-    IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, backfill, build_mempool_entry,
+    IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, build_mempool_entry,
+    run_bulk_catchup,
 };
 use zinder_proto::v1::explorer::explorer_query_server::ExplorerQuery as ExplorerQueryService;
 use zinder_proto::v1::wallet::{
@@ -69,11 +70,11 @@ use zinder_testkit::{
 };
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    regtest_generate_blocks, zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    regtest_generate_blocks, zebra_source_from_bulk_catchup,
 };
 
-/// Number of blocks below the tip to backfill.
+/// Number of blocks below the tip to bulk catch up.
 ///
 /// Small enough to keep the test under a minute against mainnet; large enough
 /// that the sampled coinbase has been finalized by the time the federated
@@ -143,7 +144,7 @@ struct FederatedBalanceFixture {
 impl FederatedBalanceFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (tempdir, store, sample) = backfill_and_sample_tip_coinbase(env).await?;
+        let (tempdir, store, sample) = bulk_catchup_and_sample_tip_coinbase(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -153,7 +154,7 @@ impl FederatedBalanceFixture {
             .address_output_index(
                 zinder_query::AddressOutputIndexRequest {
                     address_script_hash: sample.address_script_hash,
-                    start_height: sample.backfill_from_height,
+                    start_height: sample.bulk_catchup_from_height,
                     max_entries: NonZeroU32::new(1024)
                         .ok_or_else(|| eyre!("invalid max entries"))?,
                     from_cursor: None,
@@ -258,10 +259,10 @@ async fn serve_ingest_control_grpc(
 struct SampledCoinbase {
     address_script_hash: TransparentAddressScriptHash,
     block_height: BlockHeight,
-    backfill_from_height: BlockHeight,
+    bulk_catchup_from_height: BlockHeight,
 }
 
-async fn backfill_and_sample_tip_coinbase(
+async fn bulk_catchup_and_sample_tip_coinbase(
     env: &LiveTestEnv,
 ) -> Result<(TempDir, PrimaryChainStore, SampledCoinbase)> {
     let tip_height = fetch_live_tip_height(env).await?;
@@ -279,7 +280,7 @@ async fn backfill_and_sample_tip_coinbase(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -288,15 +289,17 @@ async fn backfill_and_sample_tip_coinbase(
         true,
         activations,
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source).await?.ok_or_else(|| {
-        eyre!(
-            "expected committed backfill outcome against live {network}",
-            network = encode_zinder_native_chain_name(env.network()),
-        )
-    })?;
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
+        .await?
+        .ok_or_else(|| {
+            eyre!(
+                "expected committed bulk-catchup outcome against live {network}",
+                network = encode_zinder_native_chain_name(env.network()),
+            )
+        })?;
 
     let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_transparent_coinbase_output(&tip_source_block, from_height)?;
@@ -308,7 +311,7 @@ async fn backfill_and_sample_tip_coinbase(
 
 fn sample_first_transparent_coinbase_output(
     block: &SourceBlock,
-    backfill_from_height: BlockHeight,
+    bulk_catchup_from_height: BlockHeight,
 ) -> Result<SampledCoinbase> {
     let parsed: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
     let coinbase = parsed
@@ -328,7 +331,7 @@ fn sample_first_transparent_coinbase_output(
     Ok(SampledCoinbase {
         address_script_hash,
         block_height: block.height,
-        backfill_from_height,
+        bulk_catchup_from_height,
     })
 }
 
@@ -404,7 +407,7 @@ impl MempoolOverlayFixture {
             .map_err(|error| eyre!("transparent signer rejected the spend: {error}"))?;
         let address_script_hash = sha256_address_script_hash(&test_key.address_script_bytes());
         let broadcast_txid = broadcast_signed_spend(&json_rpc, raw_tx.clone()).await?;
-        let (tempdir, store) = backfill_from_coinbase(env, coinbase.height).await?;
+        let (tempdir, store) = bulk_catchup_from_coinbase(env, coinbase.height).await?;
         let mempool_index = MempoolIndex::new();
         let visible_chain_epoch = visible_chain_epoch(&store)?;
         let pending_entry = hydrate_and_apply_pending_spend(
@@ -675,7 +678,7 @@ fn scratch_recipient_address(test_key: &TransparentTestKey, salt: u64) -> Transp
     TransparentAddress::PublicKeyHash(scratch)
 }
 
-async fn backfill_from_coinbase(
+async fn bulk_catchup_from_coinbase(
     env: &LiveTestEnv,
     coinbase_height: BlockHeight,
 ) -> Result<(TempDir, PrimaryChainStore)> {
@@ -685,7 +688,7 @@ async fn backfill_from_coinbase(
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -694,16 +697,16 @@ async fn backfill_from_coinbase(
         true,
         activations,
     );
-    backfill_config.node.request_timeout = std::cmp::max(
-        backfill_config.node.request_timeout,
+    bulk_catchup_config.node.request_timeout = std::cmp::max(
+        bulk_catchup_config.node.request_timeout,
         Duration::from_secs(90),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source)
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome on regtest"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome on regtest"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     Ok((tempdir, store))
@@ -733,7 +736,7 @@ async fn broadcast_signed_spend(
 fn visible_chain_epoch(store: &PrimaryChainStore) -> Result<ChainEpoch> {
     store
         .current_chain_epoch()?
-        .ok_or_else(|| eyre!("backfilled store has no visible chain epoch"))
+        .ok_or_else(|| eyre!("bulk-caught-up store has no visible chain epoch"))
 }
 
 fn hydrate_and_apply_pending_spend(

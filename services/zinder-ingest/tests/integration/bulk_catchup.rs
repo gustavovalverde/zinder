@@ -20,8 +20,8 @@ use zinder_core::{
 };
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, decode_stored_record};
 use zinder_ingest::{
-    BackfillConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind, backfill,
-    backfill_until_complete, catch_up_derive_store_to_canonical,
+    BulkCatchupRunConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind,
+    catch_up_derive_store_to_canonical, run_bulk_catchup, run_bulk_catchup_until_complete,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
@@ -51,9 +51,9 @@ fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStor
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "scenario covers checkpoint bootstrap, backfill outcome assertions, and follow-up wallet queries; splitting into helpers obscures the end-to-end story"
+    reason = "scenario covers checkpoint bootstrap, bulk-catchup outcome assertions, and follow-up wallet queries; splitting into helpers obscures the end-to-end story"
 )]
-async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
+async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = SourceChainCheckpoint::new(
@@ -70,8 +70,8 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     };
 
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("checkpoint-backfill-store");
-    let backfill_config = BackfillConfig {
+    let storage_path = tempdir.path().join("checkpoint-bulk-catchup-store");
+    let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
             Network::ZcashTestnet,
             "http://127.0.0.1:39232".to_owned(),
@@ -110,9 +110,9 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         checkpoint: Some(checkpoint),
     };
 
-    let outcome = backfill(&backfill_config, &source)
+    let outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected checkpoint backfill to commit"))?;
+        .ok_or_else(|| eyre!("expected checkpoint bulk catchup to commit"))?;
 
     assert_eq!(outcome.chain_epoch.network, Network::ZcashTestnet);
     assert_current_artifact_schema(outcome.chain_epoch);
@@ -133,7 +133,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
             .len(),
         2,
-        "bootstrap epoch plus first backfilled block must both publish events"
+        "bootstrap epoch plus first bulk-caught-up block must both publish events"
     );
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
@@ -170,7 +170,7 @@ async fn backfill_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "scenario covers checkpoint bootstrap, backfill, derive replay, and materialized projection assertions end to end"
+    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, derive replay, and materialized projection assertions end to end"
 )]
 async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
@@ -189,7 +189,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("derive-replay-catchup-store");
-    let backfill_config = BackfillConfig {
+    let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
             Network::ZcashTestnet,
             "http://127.0.0.1:39232".to_owned(),
@@ -233,9 +233,9 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
     )?;
     let readiness = Readiness::default();
 
-    backfill_until_complete(&backfill_config, &source, &store, &readiness)
+    run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
         .await?
-        .ok_or_else(|| eyre!("expected backfill to commit"))?;
+        .ok_or_else(|| eyre!("expected bulk catchup to commit"))?;
 
     let derive_store = bundled_derive_store(&storage_path)?;
     catch_up_derive_store_to_canonical(
@@ -292,7 +292,7 @@ fn assert_block_summary_materialized(
 }
 
 #[tokio::test]
-async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
+async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
     let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0);
     let expected_tip_metadata = ChainTipMetadata::new(107_796, 0);
     let source_block = fixture_source_block()?;
@@ -309,7 +309,7 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         pending_retryable_fetch_failures: Arc::new(Mutex::new(0)),
     };
     let tempdir = tempdir()?;
-    let backfill_config = BackfillConfig {
+    let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
             Network::ZcashTestnet,
             "http://127.0.0.1:39232".to_owned(),
@@ -319,7 +319,7 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         ),
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_tuning: zinder_store::StorageTuning::for_local_tests(),
-        storage_path: tempdir.path().join("nonzero-checkpoint-backfill-store"),
+        storage_path: tempdir.path().join("nonzero-checkpoint-bulk-catchup-store"),
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -348,9 +348,9 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
         checkpoint: Some(checkpoint),
     };
 
-    let outcome = backfill(&backfill_config, &source)
+    let outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected checkpoint backfill to commit"))?;
+        .ok_or_else(|| eyre!("expected checkpoint bulk catchup to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_metadata, expected_tip_metadata);
 
@@ -358,7 +358,7 @@ async fn backfill_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()>
 }
 
 #[tokio::test]
-async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
+async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = SourceChainCheckpoint::new(
@@ -375,8 +375,8 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
         pending_retryable_fetch_failures: pending_retryable_fetch_failures.clone(),
     };
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("recovering-backfill-store");
-    let backfill_config = BackfillConfig {
+    let storage_path = tempdir.path().join("recovering-bulk-catchup-store");
+    let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
             Network::ZcashTestnet,
             "http://127.0.0.1:39232".to_owned(),
@@ -420,9 +420,10 @@ async fn backfill_until_complete_resumes_after_retry_deadline() -> Result<()> {
     )?;
     let readiness = Readiness::default();
 
-    let outcome = backfill_until_complete(&backfill_config, &source, &store, &readiness)
-        .await?
-        .ok_or_else(|| eyre!("expected recovered backfill to commit"))?;
+    let outcome =
+        run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
+            .await?
+            .ok_or_else(|| eyre!("expected recovered bulk catchup to commit"))?;
 
     assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
     assert_eq!(*pending_retryable_fetch_failures.lock(), 0);

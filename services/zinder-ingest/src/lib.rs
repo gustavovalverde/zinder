@@ -1,4 +1,4 @@
-//! Ingestion artifact builders and backfill operations for Zinder.
+//! Ingestion artifact builders and bulk catchup operations for Zinder.
 //!
 //! This crate owns deterministic conversion from upstream node source values into
 //! canonical artifacts. Node I/O belongs to `zinder-source`; durable writes
@@ -22,7 +22,10 @@ pub use artifact_builder::{
     ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
     RawBlobPolicy, derive_block, derive_block_with_raw_blob_policy, finalize_derived_block,
 };
-pub use bulk_catchup::{BackfillConfig, backfill, backfill_until_complete, backfill_with_store};
+pub use bulk_catchup::{
+    BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
+    run_bulk_catchup_with_store,
+};
 pub use chain_ingest::{BuiltArtifacts, IngestError, NodeSourceKind};
 pub use derive_consumers::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,

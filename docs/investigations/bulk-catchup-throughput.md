@@ -65,7 +65,7 @@ while let Some(fetch_result) = block_stream.next().await {
     // … push into `batch` …
     if batch.len() == canonical_batch_max_blocks {
         populate_subtree_root_artifacts(...).await?;               // serial RPCs
-        commit_finalized_backfill_batch(store, … &mut batch)?;     // serial RocksDB write
+        commit_finalized_bulk_catchup_batch(store, … &mut batch)?;     // serial RocksDB write
         if epochs_since_last_flush >= flush_interval_epochs {
             flush_primary_chain_store(store).await?;
         }
@@ -100,7 +100,7 @@ The May 24 follow-up is different. Zebra is unhealthy, `getblock` tail latency i
 
 [ADR-0021](../adrs/0021-parallel-block-derivation.md) splits derivation into a pure `derive_block` (parallel-safe) and a serial `finalize_derived_block` (folds the two `u32` counters). The runtime topology is `Stream::buffered + spawn_blocking`, with `ingest.bulk_catchup.fact_build_concurrency` capping the in-flight derive count. Startup derive replay uses the same concurrency cap and chunks retained chain events with `ingest.derive.replay_batch_blocks`.
 
-The unified ingest loop runs bulk catchup one commit batch at a time so it can re-classify phase and readiness after each commit. The backfill flush state is therefore carried across those one-batch calls; otherwise `flush_interval_epochs = 5` degenerates into "flush after every batch" and introduces long, hard-to-explain pauses.
+The unified ingest loop runs bulk catchup one commit batch at a time so it can re-classify phase and readiness after each commit. The bulk-catchup flush state is therefore carried across those one-batch calls; otherwise `flush_interval_epochs = 5` degenerates into "flush after every batch" and introduces long, hard-to-explain pauses.
 
 Commit-time spend indexing uses first-class `transparent_output` rows. The
 normal writer path resolves `value_zat`, address script hash, and producing

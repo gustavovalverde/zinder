@@ -4,7 +4,7 @@
 //! aggregates per-transaction ZIP-317 conventional fee floors via
 //! `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat`.
 //! The test exercises the full pipeline against a real upstream node:
-//! backfill a window, ask the explorer for a fee summary over the
+//! bulk catch up a window, ask the explorer for a fee summary over the
 //! window, and assert the freshness envelope plus the structural
 //! invariants the wire shape promises (`block_count`,
 //! `transaction_count`, min/max bounds, total ≥ count × floor).
@@ -25,7 +25,7 @@ use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{
     DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
 };
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, backfill};
+use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
     FeeSummaryRequest, FeeSummaryResponse,
@@ -37,8 +37,8 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
@@ -120,7 +120,7 @@ struct FeeSummaryFixture {
 impl FeeSummaryFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store, tip_height) = backfill_store(env).await?;
+        let (store_tempdir, store, tip_height) = bulk_catchup_store(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -239,7 +239,9 @@ fn assert_fee_summary_shape(response: &FeeSummaryResponse, requested_blocks: u32
     Ok(())
 }
 
-async fn backfill_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore, BlockHeight)> {
+async fn bulk_catchup_store(
+    env: &LiveTestEnv,
+) -> Result<(TempDir, PrimaryChainStore, BlockHeight)> {
     let tip_height = fetch_live_tip_height(env).await?;
     if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
         return Err(eyre!(
@@ -252,7 +254,7 @@ async fn backfill_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         env,
         &storage_path,
         from_height,
@@ -261,12 +263,12 @@ async fn backfill_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore
         true,
         activations,
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
-    backfill(&backfill_config, &source)
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     Ok((tempdir, store, tip_height))

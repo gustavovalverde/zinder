@@ -1,5 +1,5 @@
 mod address_output_index;
-mod backfill;
+mod bulk_catchup;
 mod cli;
 mod deep_chain;
 mod latency;

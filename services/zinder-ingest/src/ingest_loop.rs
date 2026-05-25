@@ -9,7 +9,7 @@
 //! - [`IngestPhase::AwaitingUpstream`] parks until the upstream tip rises
 //!   above genesis;
 //! - [`IngestPhase::BulkCatchup`] runs one pipelined batch via
-//!   `backfill_until_complete_with_flush_state` and re-classifies after
+//!   `run_bulk_catchup_until_complete_with_flush_state` and re-classifies after
 //!   each batch;
 //! - [`IngestPhase::FollowingTip`] runs the serial
 //!   [`tip_follow_with_primary_store`] loop until the classifier would
@@ -36,12 +36,12 @@ use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceCh
 use zinder_store::PrimaryChainStore;
 
 use crate::bulk_catchup::{
-    BackfillFlushState, BackfillRunContext, backfill_until_complete_with_flush_state,
-    flush_pending_backfill_writes,
+    BulkCatchupFlushState, BulkCatchupRunContext, flush_pending_bulk_catchup_writes,
+    run_bulk_catchup_until_complete_with_flush_state,
 };
 use crate::{
-    BackfillConfig, IngestError, MempoolReadyGate, NodeSourceKind, RawBlobPolicy, TipFollowConfig,
-    classify_phase, current_chain_height, tip_follow_with_primary_store,
+    BulkCatchupRunConfig, IngestError, MempoolReadyGate, NodeSourceKind, RawBlobPolicy,
+    TipFollowConfig, classify_phase, current_chain_height, tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -122,7 +122,7 @@ pub struct IngestDeriveConfig {
     /// Optional explicit memory budget for derive replay pressure decisions.
     ///
     /// When unset, the replay budget uses the runtime cgroup `memory.high` or
-    /// `memory.max` value reported by [`crate::memory_pressure`].
+    /// `memory.max` value reported by the runtime memory-pressure sampler.
     pub memory_budget_bytes: Option<NonZeroU64>,
     /// Memory ratio at which derive replay starts shrinking the effective
     /// replay batch size.
@@ -277,7 +277,7 @@ pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems +
 /// - [`IngestPhase::BulkCatchup`] computes the per-batch target
 ///   `min(upstream_tip - reorg_window_blocks,
 ///       store_tip + canonical_batch_max_blocks)` and calls
-///   `backfill_until_complete_with_flush_state` for one batch.
+///   `run_bulk_catchup_until_complete_with_flush_state` for one batch.
 /// - [`IngestPhase::FollowingTip`] calls
 ///   [`tip_follow_with_primary_store`] with a child cancel token; a
 ///   parallel watcher task fires the child token if re-classification
@@ -307,11 +307,11 @@ where
     Source: NodeSource,
 {
     let mut tip_subsystems: Option<TipFollowSubsystems> = None;
-    let mut bulk_flush_state = BackfillFlushState::default();
+    let mut bulk_flush_state = BulkCatchupFlushState::default();
 
     loop {
         if cancel.is_cancelled() {
-            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+            flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
             return Ok(());
         }
         if reached_target_height(config.modifiers.target_height, &store) {
@@ -325,7 +325,7 @@ where
                     .map(|height| height.value()),
                 "unified loop reached configured target_height; exiting"
             );
-            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+            flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
             return Ok(());
         }
 
@@ -338,7 +338,7 @@ where
                     error = %error,
                     "upstream tip observation failed; retrying after backoff"
                 );
-                flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+                flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
                 if sleep_or_cancel(TIP_OBSERVATION_FAILURE_BACKOFF, &cancel)
                     .await
                     .is_break()
@@ -357,7 +357,7 @@ where
         );
         readiness.set_phase(phase);
         if !matches!(phase, IngestPhase::BulkCatchup) {
-            flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+            flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
         }
 
         #[allow(
@@ -386,7 +386,7 @@ where
                     // No height within the reorg window remains to be
                     // committed in bulk; let the next iteration re-
                     // classify (it will fall into `FollowingTip`).
-                    flush_pending_backfill_writes(&store, &mut bulk_flush_state).await?;
+                    flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
                     if sleep_or_cancel(config.tip_follow.poll_interval, &cancel)
                         .await
                         .is_break()
@@ -403,9 +403,10 @@ where
                     batch_target,
                     BlockHeight::new(upstream_tip),
                 );
-                let backfill_run = BackfillRunContext::new(&batch_config, source.as_ref(), &store);
-                backfill_until_complete_with_flush_state(
-                    backfill_run,
+                let bulk_catchup_run =
+                    BulkCatchupRunContext::new(&batch_config, source.as_ref(), &store);
+                run_bulk_catchup_until_complete_with_flush_state(
+                    bulk_catchup_run,
                     readiness,
                     &mut bulk_flush_state,
                 )
@@ -541,12 +542,12 @@ fn build_bulk_catchup_batch_config(
     store_tip: u32,
     batch_target: u32,
     upstream_tip: BlockHeight,
-) -> BackfillConfig {
+) -> BulkCatchupRunConfig {
     let from_height = match config.modifiers.checkpoint {
         Some(checkpoint) if store_tip == 0 => checkpoint.height.next().unwrap_or(checkpoint.height),
         _ => BlockHeight::new(store_tip.saturating_add(1)),
     };
-    BackfillConfig {
+    BulkCatchupRunConfig {
         node: config.node.clone(),
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
@@ -692,8 +693,8 @@ mod tests {
     fn empty_store_with_checkpoint_starts_at_checkpoint_plus_one() -> Result<(), &'static str> {
         // Regression guard: under the unified loop, a wallet-serving (or
         // operator-supplied) checkpoint must seed `from_height` even when
-        // the store is empty. Without this, `backfill` rejects the batch
-        // with `BackfillCheckpointMisaligned`.
+        // the store is empty. Without this, `bulk catchup` rejects the batch
+        // with `BulkCatchupCheckpointMisaligned`.
         let checkpoint = SourceChainCheckpoint::new(
             BlockHeight::new(279_999),
             BlockHash::from_bytes([0xAB; 32]),

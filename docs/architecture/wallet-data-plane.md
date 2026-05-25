@@ -492,8 +492,8 @@ The first published numbers are calibration targets, not strict limits. They wil
 The "regtest baseline" column records observed times from `services/zinder-ingest/tests/live/latency.rs::read_endpoint_latency_baseline` against a live Zebra regtest with 101 coinbase-only blocks. These are sanity-floor numbers; mainnet blocks carry real shielded payloads.
 
 The endpoint-specific mainnet columns record observed times from
-`services/zinder-ingest/tests/live/backfill.rs::backfills_last_1000_blocks_from_checkpoint`
-after backfilling the last 1000 mainnet blocks from a checkpoint at
+`services/zinder-ingest/tests/live/bulk_catchup.rs::bulk_catchup_last_1000_blocks_from_checkpoint`
+after bulk catching up the last 1000 mainnet blocks from a checkpoint at
 `tip - 1000`. Each cell aggregates 6 single-shot observations across separate
 test runs (5 warm, 1 with a cold first-call cache effect): "P50" is the median,
 "P99" is approximated by the maximum because n is too small to derive a true
@@ -514,7 +514,7 @@ The mainnet `subtree_roots` row times the checkpoint-bootstrapped read shape: qu
 
 The report-based mainnet baseline below comes from
 `scripts/observability-smoke.sh calibrate` against a synced local mainnet Zebra
-on 2026-04-28. It verifies checkpoint backfill, checkpoint backup restore,
+on 2026-04-28. It verifies checkpoint bulk catchup, checkpoint backup restore,
 native wallet gRPC, lightwalletd-compatible gRPC, readiness gauges, source
 RPC metrics, store-read metrics, RocksDB property gauges, and Prometheus alert
 rule loading. The current sample count is intentionally small because it proves
@@ -523,7 +523,7 @@ the same command with at least 6 samples.
 
 | Operational metric | Mainnet P50 (n=2) | Mainnet P99 (n=2, max-of-sample) | Mainnet worst-case (n=2) |
 | ------------------ | ----------------- | -------------------------------- | ------------------------ |
-| `backfill_seconds` | 13.204 s | 13.243 s | 13.243 s |
+| `bulk_catchup_seconds` | 13.204 s | 13.243 s | 13.243 s |
 | `wallet_query_p95_max_seconds` | 0.742 ms | 1.053 ms | 1.053 ms |
 | `node_rpc_p95_max_seconds` | 4.118 ms | 4.228 ms | 4.228 ms |
 | `store_read_p95_max_seconds` | 0.510 ms | 0.895 ms | 0.895 ms |

@@ -115,7 +115,7 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 /// readiness state stays in `Syncing` so consumers do not observe a
 /// "ready" writer that has not yet rebuilt its in-process mempool index.
 /// Pass `None` for callers that do not run the mempool orchestrator
-/// (tests, backfill).
+/// (tests, bulk catchup).
 #[allow(
     clippy::too_many_arguments,
     reason = "tip-follow's caller-owned dependencies are deliberately exposed as positional parameters; bundling them into an orchestration struct adds one indirection without changing the binding count callers must make."

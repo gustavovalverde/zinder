@@ -9,7 +9,7 @@ Accepted on 2026-05-16.
 `zinder-ingest` runs four long-lived loops that observe upstream node state:
 
 - `tip-follow`: per-poll tip observation plus chain-tip push subscription.
-- `backfill-until-complete`: historical range catchup.
+- `run-bulk-catchup-until-complete`: historical range catchup.
 - `mempool-orchestrator`: mempool source stream consumption.
 - `chain-tip-notification`: indexer gRPC re-subscriber.
 
@@ -46,4 +46,4 @@ A pre-existing runbook draft already specified that retryable upstream failures 
 
 - `docs/architecture/node-source-boundary.md` — Capability Model section: `SourceFailureClass` taxonomy and the operator-action table (`failure_class` → action).
 - `docs/architecture/service-operations.md` — Health and Readiness section: the `NodeUnavailableDetail` payload contract.
-- `docs/architecture/chain-ingestion.md` — Backfill and Tip Following: loop-owned recovery posture.
+- `docs/architecture/chain-ingestion.md` — Bulk catchup and tip following: loop-owned recovery posture.

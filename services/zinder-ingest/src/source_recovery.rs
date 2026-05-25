@@ -1,6 +1,6 @@
 //! Loop-recovery decisions for long-running writer subsystems.
 //!
-//! Every Zinder writer subsystem (tip-follow, backfill, mempool orchestrator,
+//! Every Zinder writer subsystem (tip-follow, bulk catchup, mempool orchestrator,
 //! chain-tip notification re-subscriber) runs an indefinite loop that
 //! observes upstream node state. When an iteration fails, the loop must
 //! decide whether to drain readiness and continue, or exit so the operator
@@ -184,10 +184,10 @@ pub(crate) fn decide_recovery(
         | IngestError::TransparentOutputOutputMissing { .. }
         | IngestError::UnsupportedShieldedProtocol { .. }
         | IngestError::EmptyCanonicalBatch
-        | IngestError::BackfillProducedNoCommit
-        | IngestError::NearTipBackfillRequiresExplicitFinalize { .. }
-        | IngestError::BackfillRequiresContiguousTipMetadata { .. }
-        | IngestError::BackfillCheckpointMisaligned { .. }
+        | IngestError::BulkCatchupProducedNoCommit
+        | IngestError::NearTipBulkCatchupRequiresExplicitFinalize { .. }
+        | IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }
+        | IngestError::BulkCatchupCheckpointMisaligned { .. }
         | IngestError::TipFollowObservedTipBehindStore { .. }
         | IngestError::TipFollowCommonAncestorMissing { .. }
         | IngestError::TipFollowParentMetadataUnavailable { .. }

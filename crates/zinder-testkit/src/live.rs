@@ -15,7 +15,7 @@
 //!
 //! #[tokio::test]
 //! #[ignore = LIVE_TEST_IGNORE_REASON]
-//! async fn backfills_initial_range() -> Result<()> {
+//! async fn bulk_catchup_initial_range() -> Result<()> {
 //!     let _guard = init();
 //!     let env = require_live()?;
 //!     // env.target.json_rpc_addr, env.target.node_auth, env.target.network ...

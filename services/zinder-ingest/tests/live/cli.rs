@@ -18,8 +18,8 @@ use zinder_testkit::live::{init, require_live, require_live_for};
 use crate::common::{
     BoundedIngestConfigToml, WalletServingIngestConfigToml, assert_native_wallet_read_responses,
     basic_auth_credentials, bounded_ingest_config_toml, fetch_live_network_upgrade_activations,
-    live_backfill_config, wallet_serving_ingest_config_toml, zebra_source_from_backfill,
-    zinder_ingest_command,
+    live_bulk_catchup_run_config, wallet_serving_ingest_config_toml,
+    zebra_source_from_bulk_catchup, zinder_ingest_command,
 };
 
 const WALLET_SERVING_BOUNDED_DEPTH_BLOCKS: u32 = 150;
@@ -110,7 +110,7 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
     let storage_path = tempdir.path().join("zinder-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let probe_config = live_backfill_config(
+    let probe_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         BlockHeight::new(1),
@@ -119,7 +119,7 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&probe_config)?;
+    let source = zebra_source_from_bulk_catchup(&probe_config)?;
     let wallet_serving_floor = activations
         .earliest_wallet_servable_activation()
         .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?

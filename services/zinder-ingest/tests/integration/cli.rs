@@ -81,9 +81,9 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[ingest.derive]"));
     assert!(stdout.contains("replay_batch_blocks = 100"));
     assert!(stdout.contains("replay_policy = \"canonical-first\""));
-    assert!(stdout.contains("memory_degrade_ratio = 0.85"));
-    assert!(stdout.contains("memory_pause_ratio = 0.95"));
-    assert!(stdout.contains("memory_resume_ratio = 0.75"));
+    assert!(stdout.contains("memory_degrade_ratio = 0.9"));
+    assert!(stdout.contains("memory_pause_ratio = 0.99"));
+    assert!(stdout.contains("memory_resume_ratio = 0.8"));
     assert!(stdout.contains("min_replay_batch_blocks = 10"));
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));

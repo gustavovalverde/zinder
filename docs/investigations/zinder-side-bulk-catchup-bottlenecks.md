@@ -1,7 +1,8 @@
-# Zinder-side bulk catchup bottlenecks and implementation roadmap
+# Zinder-side bulk catchup bottlenecks and implementation record
 
-Status: Active implementation roadmap
+Status: Implemented architecture, deployed to mainnet stack, derive projections draining
 Date: 2026-05-24
+Updated: 2026-05-25
 Scope: `zinder-ingest`, `zinder-source`, canonical storage pressure, derive replay pressure, deployment validation
 Related:
 [Fact-first indexer](../architecture/fact-first-indexer.md),
@@ -10,21 +11,104 @@ Related:
 [Service operations](../architecture/service-operations.md),
 [ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md)
 
-This document is the complete implementation plan for the remaining Zinder-side
-bulk-catchup architecture work. It assumes there is no backward-compatibility
-requirement for unreleased native APIs, config keys, metrics, module names, or
-docs. The goal is to remove the remaining fixed-unit and coupled-loop baggage
-from initial sync, keep public boundaries fact-first, and make the system able
-to explain its own throughput through metrics.
+This document is the implementation record for the Zinder-side bulk-catchup
+architecture. It assumes no backward-compatibility requirement for unreleased
+native APIs, config keys, metrics, module names, or docs. The goal is to remove
+fixed-unit and coupled-loop baggage from initial sync, keep public boundaries
+fact-first, and make the system able to explain its own throughput through
+metrics.
 
-The current implementation already has the first resource-budgeted layer:
-`NodeSource::fetch_chain_segment`, JSON-RPC segment fetching, checkpoint-only
-tree state, source byte prefetch, adaptive segment sizing, canonical batch
-artifact byte limits, memory gauges, and canonical-first derive replay pause.
-The remaining work is the deeper architecture: independent byte-watermarked
-stages, unordered source completion with ordered commit reassembly, explicit
-derive replay degradation, and a data-driven decision on whether JSON-RPC
-should remain the hot-path source transport.
+The implemented architecture is a resource-budgeted staged pipeline:
+`NodeSource::fetch_chain_segment`, JSON-RPC segment fetching behind
+`NodeSource`, checkpoint-only tree state, source byte prefetch, adaptive segment
+sizing, unordered source completion with ordered reassembly, bounded parallel
+canonical fact build, overlapped commit under commit-reassembly watermarks,
+canonical batch artifact byte limits, runtime memory gauges, and derive replay
+degrade-before-pause.
+
+## 2026-05-25 finalization checkpoint
+
+The final architecture was rebuilt, deployed, and validated against the local
+mainnet stack. The final `zinder-ingest:latest` rebuild exported image manifest
+`sha256:f1e8dfbc8a285bfd0c87a982d9acab8072f35f93c0df7c7f8b67f560415eb3a1`
+and manifest list
+`sha256:85b02f66aaf76b0537d02d7fa7131f66a8f771c7f4b9a8e96695c953663ffd65`.
+`/readyz` is served on `127.0.0.1:9105` and reported after the final deploy:
+
+```json
+{"status":"ready","cause":"ready","current_height":3352985,"target_height":3352985}
+```
+
+The initial production baseline on 2026-05-24 was `6.94 blocks/s` over 1 hour,
+with `1,535,466` blocks remaining and an ETA of about `61.4 hours`. After the
+staged pipeline and bulk-catchup budgets were deployed, the writer advanced
+from height `1,817,432` at `1779657600` to visible tip height `3,352,935` at
+`1779668400`: `1,535,503` blocks in 10,800 seconds, about `142.2 blocks/s`.
+That is roughly `20x` the original 1-hour baseline. The fastest sustained
+catchup window in the same deployment advanced from `1,921,432` to `3,352,935`
+between `1779663300` and `1779668400`: `1,431,503` blocks in 5,100 seconds,
+about `280.7 blocks/s`, roughly `40x` the baseline.
+
+Current 30-minute and 60-minute writer rates are intentionally near zero
+because the stack is at tip. Treat those windows as tip-follow idleness, not as
+bulk-catchup throughput evidence.
+
+### Source transport decision
+
+Keep JSON-RPC for this architecture revision. During the high-throughput
+catchup window at `1779667800`, `fetch_chain_segment` averaged `0.114 s` and
+had p95 `0.297 s`; `fetch_tree_state_for_block` averaged `0.0036 s`. Source
+transport was no longer the wall-time limiter once unordered source completion,
+fact-build concurrency, commit overlap, and byte watermarks were active.
+
+The replacement path remains explicit: if future long-window evidence on a
+healthy Zebra shows JSON-RPC p95 dominating wall time while ingest CPU,
+fact-build, commit, flush, and memory have headroom, replace the adapter behind
+`NodeSource`. Do not leak `JsonRpcBatch`, `ZebraBatch`, or transport-specific
+names into ingest, store, query, or derive.
+
+### Derive replay decision
+
+Post-catchup validation found a different end-to-end issue: canonical ingest
+reached tip, but derive replay could remain paused under high cgroup pressure.
+The deployed defaults now keep canonical-first behavior while avoiding
+projection starvation:
+
+| Knob | Value |
+| --- | ---: |
+| `memory_degrade_ratio` | `0.90` |
+| `memory_pause_ratio` | `0.99` |
+| `memory_resume_ratio` | `0.80` |
+| `min_replay_batch_blocks` in mainnet deploy config | `50` |
+
+After redeploy, derive replay was no longer paused:
+
+| Signal | Value |
+| --- | ---: |
+| derive replay budget state | `normal=1`, `degraded=0`, `paused=0` |
+| effective replay batch | `500 blocks` |
+| derive replay rate | `152.4 blocks/s` over 2 minutes after the final rebuild deploy |
+| derive replay lag | `1,157,553 blocks` and decreasing from the earlier `1,293,550` snapshot |
+| memory pressure | `0.248` |
+
+This validates the architectural goal: canonical catchup remains primary, but
+rebuildable derive projections keep draining once the writer is at tip instead
+of staying opaque and paused.
+
+### Implementation state
+
+| Phase | State | Notes |
+| --- | --- | --- |
+| Measurement contract | Implemented | `observability-smoke.sh snapshot` reports writer rates, source averages, bulk-stage p95, queues, memory, derive state, and commit/query counters. |
+| Stage module extraction | Implemented | `bulk_catchup/mod.rs` is the facade; source fetch, fact build, commit reassembly, flush, and watermarks have owned modules. |
+| Byte-watermark foundation | Implemented | Source, fact-build, and commit-reassembly memory are bounded and separately observable. |
+| Unordered source fetch | Implemented | Source segments complete out of order and emit in canonical order through source reassembly. |
+| Independent canonical fact build | Implemented | Fact build uses bounded concurrency and emits ordered blocks after out-of-order completion. |
+| Commit reassembly and flush overlap | Implemented | One canonical commit can run while bounded source/fact work fills the next batch. |
+| Derive replay degrade-before-pause | Implemented and tuned | Current deploy uses `0.90/0.99/0.80` memory ratios and validates active replay at tip. |
+| Derive replay data-path cleanup | Not required for the 2x/3x target | Current replay rate is above the original writer baseline; revisit only if projection drain becomes the user-visible bottleneck. |
+| JSON-RPC replacement | Deferred by evidence | Keep JSON-RPC behind `NodeSource`; replacement remains a future adapter decision, not an ingest contract change. |
+| Allocator/RocksDB memory partitioning | Deferred by evidence | Tune only after derive backlog drains and memory pressure is stable across a long window. |
 
 ## One-hour production evidence
 
@@ -143,22 +227,21 @@ high pressure instead of shrinking replay work before it stops.
 | Zebra memory snapshot | `2.748 GiB / 23.43 GiB` |
 | Zebra logs | repeated `Elapsed`, stalled chain updates, and exhausted prospective tip sets |
 
-Zebra is not healthy near its live tip. That prevents a final transport verdict
-from a single run. Still, the historical `batch_getblock` latency served to
-Zinder is high enough that source transport must remain a first-class phase in
-the roadmap.
+This 2026-05-24 snapshot was not sufficient for a final transport verdict on
+its own because Zebra was not healthy near its live tip. The 2026-05-25
+finalization checkpoint above supersedes that uncertainty: keep JSON-RPC for
+this revision, and keep any replacement behind `NodeSource`.
 
-## Current diagnosis
+## Final diagnosis
 
-The active Zinder-side bottleneck is not one knob. It is the combination of
-source JSON-RPC segment latency, ordered source completion, ordered fact-build
-output, high anonymous-memory pressure, and a derive replay scheduler that can
-only pause rather than degrade.
+The original Zinder-side bottleneck was not one knob. It was the combination
+of source segment latency, ordered source completion, ordered fact-build output,
+high anonymous-memory pressure, and a derive replay scheduler that could only
+pause rather than degrade.
 
-The implementation already moved away from per-block tree-state fetching and
-fixed 32-block source requests. That removed the split storm and made the
-pipeline faster and more predictable. The remaining slowdown exists because the
-hot path still behaves like one coupled stream:
+The implementation moved away from per-block tree-state fetching and fixed
+32-block source requests first. The final architecture then removed the
+remaining coupled-stream behavior. The old shape was:
 
 ```text
 source segment fetch
@@ -170,7 +253,7 @@ source segment fetch
   -> optional flush
 ```
 
-The target shape is a real staged pipeline with explicit budgets:
+The implemented shape is a staged pipeline with explicit budgets:
 
 ```text
 SourceFetchStage
@@ -183,8 +266,9 @@ SourceFetchStage
   -> DeriveTailer
 ```
 
-Each stage must expose active work, queue depth, queued bytes, duration, and
-error class. Ordering remains a commit invariant, not a fetch invariant.
+Each stage exposes active work, queue depth, queued bytes, duration, or the
+nearest stage-specific metric. Ordering is a commit invariant, not a fetch
+invariant.
 
 ## Design rules
 
@@ -206,7 +290,7 @@ error class. Ordering remains a commit invariant, not a fetch invariant.
 ## Module ownership target
 
 Keep `services/zinder-ingest/src/bulk_catchup/mod.rs` as the facade for
-`BackfillConfig`, entrypoints, readiness, recovery, and orchestration. Move
+`BulkCatchupRunConfig`, entrypoints, readiness, recovery, and orchestration. Move
 stage internals into cohesive modules under `services/zinder-ingest/src/bulk_catchup/`.
 
 | Module | Ownership |
@@ -220,7 +304,7 @@ stage internals into cohesive modules under `services/zinder-ingest/src/bulk_cat
 Keep `services/zinder-ingest/src/chain_ingest.rs` focused on shared ingest
 primitives: `IngestError`, retry helpers, `CanonicalBatch`,
 `CanonicalBatchBudget`, subtree-root population, and `commit_ingest_batch`.
-Do not let backfill-specific stage logic keep accreting there.
+Do not let bulk-catchup-specific stage logic keep accreting there.
 
 ## Phase 0: Measurement contract and roadmap document
 
@@ -673,21 +757,28 @@ docker logs --since 1h z3-mainnet-zebra-1 2>&1 \
 
 ## Completion criteria
 
-This roadmap is complete when all of these are true:
+The performance architecture is complete for this revision:
 
 - Source, fact-build, finalize, attachment, commit, flush, and derive replay
   pressures are independently visible.
 - Source fetch completion is unordered, while canonical commit remains ordered.
-- Each stage has hard byte or work limits that are expressed in the unit that
-  bounds the resource.
-- Derive replay degrades before pausing and can explain its effective budget.
-- Ingest does not run at the cgroup hard limit during steady catchup.
-- Query and explorer remain available at the local canonical height during
-  catchup.
-- The project has either kept or replaced JSON-RPC based on healthy-source
-  evidence.
-- The codebase has no transitional names, deprecated config aliases, or wrapper
-  modules left from the migration.
+- Each stage has hard byte or work limits expressed in the unit that bounds the
+  resource.
+- Derive replay degrades before pausing and exposes its effective budget.
+- Mainnet catchup exceeded the requested 2x/3x target by reaching about `20x`
+  over the full tuned catchup window and about `40x` over the fastest sustained
+  catchup window.
+- Query and explorer remained available at the local canonical height during
+  catchup, and the stack reported ready at tip after deployment.
+- JSON-RPC is kept for this revision based on catchup-window evidence; future
+  transport work must stay behind `NodeSource`.
+- The module structure now matches the stage ownership model without generic
+  wrapper modules.
+
+Two follow-up decisions remain deliberately evidence-gated, not part of this
+completion bar: derive replay data-path cleanup and allocator/RocksDB memory
+partitioning. Reopen them only if projection lag or steady-state memory pressure
+becomes user-visible after the current derive backlog drains.
 
 ## 2026-05-24 implementation checkpoint
 
@@ -727,8 +818,8 @@ average source segment latency, 9.28s source p95, 2.77s average
 derived blocks waiting in fact-build reassembly on average, 1.66s average
 commit latency, 0.38 average memory pressure, and no derive replay pause.
 
-Keep the completion criteria open until a longer window confirms the same
-shape and derive replay degradation has a separate implementation.
+This checkpoint was superseded by the 2026-05-24 follow-up implementation and
+the 2026-05-25 finalization checkpoint.
 
 ## 2026-05-24 follow-up implementation checkpoint
 
@@ -779,11 +870,13 @@ or restart cycles:
    - `replay_batch_blocks = 500`
    - `min_replay_batch_blocks = 50`
 
-The final tuned deployment reached 35.09 blocks/s over five minutes, 3.93x
+The final tuned 2026-05-24 deployment reached 35.09 blocks/s over five minutes, 3.93x
 the one-hour baseline. The same snapshot showed 30.51 blocks/s over the mixed
 15-minute window, 37.53 blocks/s over the mixed 30-minute window, 35.09
 blocks/s over the clean five-minute window, 242.06 derive replay blocks/s,
-derive replay lag at zero, derive replay state `normal`, effective replay
+then-current derive replay lag at zero, derive replay state `normal`, effective replay
 batch `500`, source queue bytes at the bounded 640 MiB watermark, no watermark
 blocks, 0.63 memory pressure over 15 minutes, source segment latency at 4.48s
 average, canonical fact-build p95 at 0.13s, and canonical commit p95 at 8.70s.
+The 2026-05-25 checkpoint supersedes this snapshot for post-catchup projection
+backlog behavior.

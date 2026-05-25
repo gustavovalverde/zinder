@@ -13,7 +13,7 @@
 //!
 //! 1. Fetch the activations from the running Zebra via
 //!    `ZebraJsonRpcSource::fetch_network_upgrade_activations()`.
-//! 2. Backfill a small near-tip window through `zinder-ingest`.
+//! 2. Bulk catch up a small near-tip window through `zinder-ingest`.
 //! 3. Open `zinder-query::WalletQuery` with the discovered activations.
 //! 4. Pick the tip block's coinbase via
 //!    `WalletQueryApi::transaction_at_block_index(tip, 0)`.
@@ -28,17 +28,17 @@ use std::num::NonZeroU32;
 use eyre::{Result, eyre};
 use tempfile::tempdir;
 use zinder_core::{BlockHeight, MinedTransaction, Network, TxStatus};
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    regtest_generate_blocks, zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    regtest_generate_blocks, zebra_source_from_bulk_catchup,
 };
 
-/// Near-tip backfill depth on testnet/mainnet. Small enough to finish in
+/// Near-tip bulk catchup depth on testnet/mainnet. Small enough to finish in
 /// seconds; large enough that the window contains a stable coinbase to query.
 const NEAR_TIP_DEPTH_BLOCKS: u32 = 16;
 
@@ -46,7 +46,7 @@ const NEAR_TIP_DEPTH_BLOCKS: u32 = 16;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 #[allow(
     clippy::too_many_lines,
-    reason = "Near-tip parity sweep keeps env resolution, backfill, multi-height assertions, and one optional regtest branch in one auditable scenario."
+    reason = "Near-tip parity sweep keeps env resolution, run_bulk_catchup, multi-height assertions, and one optional regtest branch in one auditable scenario."
 )]
 async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() -> Result<()> {
     let _guard = init();
@@ -69,8 +69,8 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
     let storage_path = tempdir.path().join("zinder-store");
 
     // On chains with non-trivial history (testnet/mainnet) anchor the
-    // backfill at a recent checkpoint so the test stays fast. On regtest the
-    // tip can be too shallow for that, so backfill from genesis.
+    // bulk catchup at a recent checkpoint so the test stays fast. On regtest the
+    // tip can be too shallow for that, so bulk catchup from genesis.
     let use_checkpoint = tip_height.value() > NEAR_TIP_DEPTH_BLOCKS + 1;
     let (from_height, checkpoint_height) = if use_checkpoint {
         let checkpoint = BlockHeight::new(tip_height.value() - NEAR_TIP_DEPTH_BLOCKS - 1);
@@ -80,22 +80,23 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
     };
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         from_height,
         tip_height,
-        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid backfill batch size"))?,
+        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid bulk-catchup batch size"))?,
         true,
         activations.clone(),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     if let Some(checkpoint_height) = checkpoint_height {
-        backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
+        bulk_catchup_config.checkpoint =
+            Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
-    backfill(&backfill_config, &source)
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

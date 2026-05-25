@@ -11,20 +11,20 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange,
 };
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
 
 use crate::common::{
     assert_lightwalletd_send_transaction_classifies_invalid, assert_native_wallet_read_responses,
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn backfills_initial_range() -> Result<()> {
+async fn bulk_catchup_initial_range() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live()? else {
         return Ok(());
@@ -35,10 +35,14 @@ async fn backfills_initial_range() -> Result<()> {
     let to_height = match env.network() {
         Network::ZcashRegtest => BlockHeight::new(1),
         Network::ZcashTestnet | Network::ZcashMainnet => BlockHeight::new(2),
-        other => return Err(eyre!("unsupported network for backfill test: {other:?}")),
+        other => {
+            return Err(eyre!(
+                "unsupported network for bulk-catchup test: {other:?}"
+            ));
+        }
     };
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let backfill_config = live_backfill_config(
+    let bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         BlockHeight::new(1),
@@ -47,10 +51,10 @@ async fn backfills_initial_range() -> Result<()> {
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
-    let commit_outcome = backfill(&backfill_config, &source)
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    let commit_outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     assert_eq!(commit_outcome.chain_epoch.network, env.network());
     assert_eq!(commit_outcome.chain_epoch.tip_height, to_height);
@@ -82,7 +86,7 @@ async fn backfills_initial_range() -> Result<()> {
     .await?;
     assert_lightwalletd_send_transaction_classifies_invalid(
         &store,
-        &backfill_config,
+        &bulk_catchup_config,
         Arc::clone(&activations),
     )
     .await?;
@@ -91,7 +95,7 @@ async fn backfills_initial_range() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn backfills_from_checkpoint() -> Result<()> {
+async fn bulk_catchup_from_checkpoint() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
@@ -100,7 +104,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
     let tip_height = fetch_live_tip_height(&env).await?;
     if tip_height.value() < 60 {
         return Err(eyre!(
-            "checkpoint backfill test needs tip >= 60; got {}; advance the chain (e.g. via the regtest `generate` RPC)",
+            "checkpoint bulk catchup test needs tip >= 60; got {}; advance the chain (e.g. via the regtest `generate` RPC)",
             tip_height.value()
         ));
     }
@@ -111,7 +115,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         from_height,
@@ -120,13 +124,13 @@ async fn backfills_from_checkpoint() -> Result<()> {
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    backfill_config.checkpoint = Some(checkpoint);
+    bulk_catchup_config.checkpoint = Some(checkpoint);
 
-    let commit_outcome = backfill(&backfill_config, &source)
+    let commit_outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed checkpoint backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed checkpoint bulk-catchup outcome"))?;
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
@@ -153,9 +157,12 @@ async fn backfills_from_checkpoint() -> Result<()> {
         Err(StoreError::ArtifactMissing { .. })
     ));
 
-    let first_filled = reader
-        .block_header_at(from_height)?
-        .ok_or_else(|| eyre!("missing first backfilled block at {}", from_height.value()))?;
+    let first_filled = reader.block_header_at(from_height)?.ok_or_else(|| {
+        eyre!(
+            "missing first bulk-caught-up block at {}",
+            from_height.value()
+        )
+    })?;
     assert_eq!(first_filled.height, from_height);
     let tip_block = reader
         .block_header_at(tip_height)?
@@ -180,7 +187,7 @@ async fn backfills_from_checkpoint() -> Result<()> {
 )]
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
+async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashMainnet])? else {
         return Ok(());
@@ -200,7 +207,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         from_height,
@@ -209,17 +216,17 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     let checkpoint_sapling_size = checkpoint.tip_metadata.sapling_commitment_tree_size;
     let checkpoint_orchard_size = checkpoint.tip_metadata.orchard_commitment_tree_size;
-    backfill_config.checkpoint = Some(checkpoint);
+    bulk_catchup_config.checkpoint = Some(checkpoint);
 
-    let backfill_started_at = std::time::Instant::now();
-    let commit_outcome = backfill(&backfill_config, &source)
+    let bulk_catchup_started_at = std::time::Instant::now();
+    let commit_outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
         .ok_or_else(|| eyre!("expected committed mainnet calibration outcome"))?;
-    let backfill_seconds = backfill_started_at.elapsed().as_secs();
+    let bulk_catchup_seconds = bulk_catchup_started_at.elapsed().as_secs();
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
@@ -308,7 +315,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
         eprintln!(
             "live_mainnet_calibration tip={} checkpoint_height={} \
              checkpoint_sapling_size={} checkpoint_orchard_size={} \
-             backfill_seconds={} latest_block={}us compact_block_at_first={}us \
+             bulk_catchup_seconds={} latest_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_1={}us \
              compact_block_range_10={}us compact_block_range_50={}us \
              compact_block_range_1000={}us tree_state_checkpoint_at_or_before={}us subtree_roots_8={}us",
@@ -316,7 +323,7 @@ async fn backfills_last_1000_blocks_from_checkpoint() -> Result<()> {
             checkpoint_height.value(),
             checkpoint_sapling_size,
             checkpoint_orchard_size,
-            backfill_seconds,
+            bulk_catchup_seconds,
             latest_block_micros,
             compact_block_at_first_micros,
             compact_block_at_tip_micros,

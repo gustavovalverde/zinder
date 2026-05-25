@@ -214,7 +214,7 @@ impl NetworkUpgradeActivations {
 
     /// Returns the activation height of the upgrade named `name`
     /// (case-insensitive), if advertised. Used by the wallet-serving
-    /// backfill floor and the lightwalletd `saplingActivationHeight`
+    /// bulk-catchup floor and the lightwalletd `saplingActivationHeight`
     /// response.
     #[must_use]
     pub fn activation_height_by_name(&self, name: &str) -> Option<BlockHeight> {
@@ -224,7 +224,7 @@ impl NetworkUpgradeActivations {
             .map(|activation| activation.activation_height)
     }
 
-    /// Returns the earliest activation a wallet-serving backfill must reach
+    /// Returns the earliest activation a wallet-serving bulk catchup must reach
     /// to serve lightwalletd clients on this network.
     ///
     /// Defined as the earlier of the Sapling and NU5 activations when both

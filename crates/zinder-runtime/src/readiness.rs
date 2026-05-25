@@ -92,7 +92,7 @@ pub enum ReadinessCause {
     Ready,
     /// Upstream node source is unavailable.
     ///
-    /// Long-running writer loops (tip-follow, backfill, mempool
+    /// Long-running writer loops (tip-follow, bulk catchup, mempool
     /// orchestrator) drain readiness here when an upstream source error
     /// classifies as recoverable. The payload carries the operator
     /// narrative the runbook expects: which class of upstream failure,

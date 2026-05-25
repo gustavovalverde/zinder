@@ -446,9 +446,9 @@ catchup_threshold_blocks = 100   # defaults to ingest.reorg_window_blocks
 [ingest.derive]
 replay_batch_blocks = 500        # bounded derive replay write chunk
 replay_policy = "canonical-first"
-memory_degrade_ratio = 0.85
-memory_pause_ratio = 0.95
-memory_resume_ratio = 0.75
+memory_degrade_ratio = 0.90
+memory_pause_ratio = 0.99
+memory_resume_ratio = 0.80
 min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]

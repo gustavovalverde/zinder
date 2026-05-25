@@ -14,7 +14,7 @@ use zinder_store::PrimaryChainStore;
 /// Returns the tip height of the store's visible chain epoch, or `None`
 /// when the store is empty or its epoch pointer cannot be read.
 ///
-/// Used by the per-phase handlers (`backfill`, `tip_follow`) and the
+/// Used by the per-phase handlers (`bulk catchup`, `tip_follow`) and the
 /// ingest binary entrypoint to populate readiness state. The
 /// implementation is intentionally infallible: a failure to read the
 /// epoch pointer is reported as "no height" rather than propagated,

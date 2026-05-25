@@ -410,7 +410,7 @@ message ValuePoolEntry {
   // ... existing fields ...
   bool monitored = N;       // true when the indexer is tracking deltas
                             // continuously since genesis; false when
-                            // a backfill is in progress or the source
+                            // a bulk-catchup run is in progress or the source
                             // boundary cannot guarantee continuity.
 }
 ```

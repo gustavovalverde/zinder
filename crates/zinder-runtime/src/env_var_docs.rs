@@ -450,7 +450,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Memory pressure ratio at which derive replay shrinks the effective replay \
-                      batch size. Defaults to 0.85.",
+                      batch size. Defaults to 0.90.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO",
@@ -459,7 +459,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Memory pressure ratio at which canonical-first derive replay pauses. \
-                      Defaults to 0.95.",
+                      Defaults to 0.99.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO",
@@ -469,7 +469,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Memory pressure ratio below which degraded derive replay returns to the \
                       normal replay batch size. Paused replay resumes as degraded work once \
-                      pressure falls below memory_pause_ratio. Defaults to 0.75.",
+                      pressure falls below memory_pause_ratio. Defaults to 0.80.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__DERIVE__MIN_REPLAY_BATCH_BLOCKS",

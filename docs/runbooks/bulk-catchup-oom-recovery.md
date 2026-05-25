@@ -133,9 +133,9 @@ Plus the derive and bulk-catchup ingest knobs:
 ```toml
 [ingest.derive]
 replay_batch_blocks = 500
-memory_degrade_ratio = 0.85
-memory_pause_ratio = 0.95
-memory_resume_ratio = 0.75
+memory_degrade_ratio = 0.90
+memory_pause_ratio = 0.99
+memory_resume_ratio = 0.80
 min_replay_batch_blocks = 50
 
 [ingest.bulk_catchup]

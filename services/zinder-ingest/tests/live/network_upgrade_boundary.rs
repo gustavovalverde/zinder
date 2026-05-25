@@ -8,14 +8,14 @@
 //! activation height that is reachable from the current chain tip.
 //!
 //! On regtest with ZFND's `z3` default sidecar, the latest activation is NU6
-//! at height 2: the test backfills heights 1..3 and asserts the consensus
+//! at height 2: the test bulk-catches-up heights 1..3 and asserts the consensus
 //! branch id at height 1 (Canopy) differs from the branch id at height 2
 //! (NU6) and that both match what
 //! [`zinder_core::NetworkUpgradeActivations::consensus_branch_id_at`]
 //! reports for each height.
 //!
 //! On testnet/mainnet, the most production-relevant activation is NU6.1.
-//! The test resolves its height from the running node and backfills a
+//! The test resolves its height from the running node and bulk-catches-up a
 //! three-block window around it.
 //!
 //! Reference: `docs/adrs/0008-network-parameter-discovery.md`.
@@ -34,19 +34,19 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations, TxStatus,
 };
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    regtest_generate_blocks, zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    regtest_generate_blocks, zebra_source_from_bulk_catchup,
 };
 
-/// Hard cap on the boundary-window backfill size on testnet/mainnet.
+/// Hard cap on the boundary-window bulk catchup size on testnet/mainnet.
 ///
-/// The window itself is three blocks; anchoring the backfill on a
+/// The window itself is three blocks; anchoring the bulk catchup on a
 /// checkpoint just below the window keeps the run under a few seconds
 /// even when the activation is millions of blocks back from the tip.
 const NEAR_BOUNDARY_DEPTH_BLOCKS: u32 = 16;
@@ -55,7 +55,7 @@ const NEAR_BOUNDARY_DEPTH_BLOCKS: u32 = 16;
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 #[allow(
     clippy::too_many_lines,
-    reason = "Boundary-crossing live test keeps env resolution, schedule discovery, backfill, and three-height assertions in one auditable path."
+    reason = "Boundary-crossing live test keeps env resolution, schedule discovery, run_bulk_catchup, and three-height assertions in one auditable path."
 )]
 async fn mined_consensus_branch_id_advances_across_latest_activation_height() -> Result<()> {
     let _guard = init();
@@ -91,7 +91,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     let storage_path = tempdir.path().join("zinder-store");
 
     // On chains where the activation is far above genesis (testnet/mainnet)
-    // anchor the backfill at a checkpoint just below the window. On regtest
+    // anchor the bulk catchup at a checkpoint just below the window. On regtest
     // the window can be 1..3 and a checkpoint is structurally unavailable.
     let use_checkpoint = window_start.value() > NEAR_BOUNDARY_DEPTH_BLOCKS + 1;
     let (from_height, checkpoint_height) = if use_checkpoint {
@@ -101,22 +101,23 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
         (BlockHeight::new(1), None)
     };
 
-    let mut backfill_config = live_backfill_config(
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         from_height,
         window_end,
-        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid backfill batch size"))?,
+        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid bulk-catchup batch size"))?,
         false,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     if let Some(checkpoint_height) = checkpoint_height {
-        backfill_config.checkpoint = Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
+        bulk_catchup_config.checkpoint =
+            Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
     }
-    backfill(&backfill_config, &source)
+    run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
@@ -184,7 +185,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
 
 /// Highest `activation_height` strictly greater than 1 (so a meaningful
 /// transition exists below it) that the chain tip has already crossed
-/// (so backfill can sample heights below, at, and above it).
+/// (so bulk catchup can sample heights below, at, and above it).
 fn latest_reachable_activation_height(
     activations: &NetworkUpgradeActivations,
     tip_height: BlockHeight,

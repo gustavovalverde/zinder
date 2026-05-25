@@ -32,7 +32,7 @@ explicit query-owned store.
 
 RocksDB has the strongest feature set for Zinder's canonical-store workload:
 
-- **Append-heavy ingest:** the LSM design fits height-ordered chain backfill and tip following.
+- **Append-heavy ingest:** the LSM design fits height-ordered chain bulk catchup and tip following.
 - **Atomic multi-table commits:** `WriteBatch` plus column families maps cleanly to per-`ChainEpoch` commits across block metadata, compact blocks, transaction lookups, tree state, and epoch pointers.
 - **Range serving:** iterators, prefix-oriented options, bloom filters, block cache controls, and snapshots support wallet `GetBlockRange` traffic and explorer-derived access.
 - **Operational resilience:** checkpoints, backup tooling, compaction controls, WAL configuration, recovery modes, statistics, and a mature tuning surface matter more at 100-200 GB than pure-Rust dependency cleanliness.
@@ -69,7 +69,7 @@ Switching from RocksDB to `fjall` requires all of:
 
 - `fjall` passes the same real-fixture replay and crash-recovery tests.
 - `fjall` stays within 2x of RocksDB's disk footprint at the measured fixture size.
-- `fjall` matches or beats RocksDB on chain backfill and reorg replacement within the accepted thresholds.
+- `fjall` matches or beats RocksDB on chain bulk catchup and reorg replacement within the accepted thresholds.
 - RocksDB's native build or cross-compilation cost blocks normal contributor or CI workflows.
 
 Switching to a third engine requires a new ADR.

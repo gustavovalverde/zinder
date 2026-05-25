@@ -13,7 +13,7 @@ use tonic::Request;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::BlockHeight;
 use zinder_core::Network;
-use zinder_ingest::backfill;
+use zinder_ingest::run_bulk_catchup;
 use zinder_proto::compat::lightwalletd::{
     self, CompactBlock as LightwalletdCompactBlock, compact_tx_streamer_server::CompactTxStreamer,
 };
@@ -22,16 +22,16 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_backfill_config,
-    zebra_source_from_backfill,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
+    zebra_source_from_bulk_catchup,
 };
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
+async fn bulk_catchup_deep_chain_with_by_block_index_lookups() -> Result<()> {
     let _guard = init();
-    // Backfilling [1, tip] only fits in CI budgets on regtest. Hosted networks
-    // need the checkpoint-bounded backfill (BackfillConfig::checkpoint) before
+    // Bulk catching up [1, tip] only fits in CI budgets on regtest. Hosted networks
+    // need the checkpoint-bounded bulk catchup (BulkCatchupRunConfig::checkpoint) before
     // this test can run there.
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
@@ -49,7 +49,7 @@ async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
     }
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let backfill_config = live_backfill_config(
+    let bulk_catchup_config = live_bulk_catchup_run_config(
         &env,
         &storage_path,
         BlockHeight::new(1),
@@ -58,10 +58,10 @@ async fn backfills_deep_chain_with_by_block_index_lookups() -> Result<()> {
         true,
         Arc::clone(&activations),
     );
-    let source = zebra_source_from_backfill(&backfill_config)?;
-    let commit_outcome = backfill(&backfill_config, &source)
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    let commit_outcome = run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
-        .ok_or_else(|| eyre!("expected committed deep-chain backfill outcome"))?;
+        .ok_or_else(|| eyre!("expected committed deep-chain bulk-catchup outcome"))?;
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
