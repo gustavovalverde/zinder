@@ -1,0 +1,10 @@
+#!/command/with-contenv sh
+#
+# nginx exit handler: tear down the whole container so operators see the
+# crash via the supervising platform instead of a silent half-up state
+# where wallet/explorer keep running but no external traffic can reach
+# them.
+
+set -eu
+exit_code="${1:-0}"
+exec s6-svscanctl -t /run/service

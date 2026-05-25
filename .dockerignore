@@ -32,6 +32,7 @@ deploy/
 !deploy/single-container/config.example.ingest.toml
 !deploy/single-container/config.example.query.toml
 !deploy/single-container/config.example.explorer.toml
+!deploy/single-container/nginx.conf
 
 # Test outputs.
 **/test-results/
