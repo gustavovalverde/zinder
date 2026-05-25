@@ -1,4 +1,4 @@
-//! `ExplorerQuery.OverviewSnapshot` handler. (rebuild-marker: r1)
+//! `ExplorerQuery.OverviewSnapshot` handler.
 //!
 //! Composes one coherent point-in-time bundle that overview consumers
 //! used to assemble from six independent RPCs (`MempoolSummary` +
