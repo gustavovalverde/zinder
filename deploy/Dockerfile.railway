@@ -1,19 +1,21 @@
 # syntax=docker/dockerfile:1.7
 
-# Canonical Zinder runtime image builder.
+# Railway-specific Zinder runtime image builder.
 #
-# Build service images from the repository root with:
+# Mirrors deploy/Dockerfile exactly except for the BuildKit cache mount IDs:
+# Railway's Railpack BuildKit rejects unscoped cache IDs and any ${...}
+# interpolation in the `id` field, requiring the literal format
+# `s/<service-id>-<cache-name>` (see
+# https://docs.railway.com/guides/dockerfiles). Keeping the local-build
+# Dockerfile with its templated IDs intact preserves the per-toolchain
+# cache hits we rely on during local development.
 #
-#     docker build -f deploy/Dockerfile --target zinder-ingest -t zinder-ingest .
-#     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
-#     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
-#     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
-#     docker build -f deploy/Dockerfile --target zinder-single-container -t zinder .
+# Service-ID prefix here:
+#   zinder testnet single-container  -> 77ea59c6-5a33-4bf0-867e-97069a0375c2
 #
-# Every runtime target depends on the same `zinder-binaries` stage. That stage
-# compiles all shipped binaries in one Cargo invocation and keeps Cargo registry,
-# git, and target artifacts in BuildKit cache mounts. Rebuilding one service
-# warms the shared cache for every other service image.
+# When a new Railway service is provisioned (e.g. mainnet zinder), add a
+# sibling Dockerfile or parameterize this file via a release-time
+# substitution step.
 
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
@@ -53,9 +55,9 @@ ARG TARGETVARIANT
 
 COPY . .
 
-RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
+RUN --mount=type=cache,id=s/77ea59c6-5a33-4bf0-867e-97069a0375c2-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=s/77ea59c6-5a33-4bf0-867e-97069a0375c2-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=s/77ea59c6-5a33-4bf0-867e-97069a0375c2-cargo-target,target=/workspace/target,sharing=locked \
     cargo build --locked --release \
         --bin zinder-ingest \
         --bin zinder-query \

@@ -1,6 +1,10 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "deploy/Dockerfile"
+# Railway BuildKit rejects unscoped cache mount IDs and any ${...}
+# interpolation in `id`, so deploy/Dockerfile.railway carries the
+# `s/<service-id>-<cache-name>` form Railway requires. Local builds
+# still use deploy/Dockerfile, which preserves the templated cache IDs.
+dockerfilePath = "deploy/Dockerfile.railway"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
