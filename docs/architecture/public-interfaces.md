@@ -68,7 +68,8 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `ChainTipNotification` | Source-level chain-tip wake-up payload normalized from Zebra indexer streams |
 | `ChainTipNotificationSource` | Source boundary that opens chain-tip notification streams. Consumers treat it as a wake-up source and keep JSON-RPC polling as the canonical catch-up path |
 | `TransactionBroadcaster` | Source-backed transaction broadcast boundary implemented by source adapters |
-| `TransactionBroadcastResult` | Typed accepted, duplicate, invalid-encoding, rejected, or unknown broadcast outcome |
+| `TransactionBroadcastResult` | Typed accepted, duplicate, invalid-encoding, queued, rejected, or unknown broadcast outcome (see [ADR-0023](../adrs/0023-typed-broadcast-rejection-reasons.md)) |
+| `BroadcastRejectionReason` | Typed rejection reason on `BroadcastRejected`: `InvalidSignature`, `BadExpiryHeight`, `BadConsensusBranch`, `MempoolFull`, `Unknown` |
 | `RawTransactionBytes` | Raw serialized transaction bytes submitted by a wallet |
 
 ### Wallet protocol surface

@@ -400,6 +400,28 @@ message BroadcastInvalidEncoding {
   string message = 2;
 }
 
+// Typed rejection reason carried by BroadcastRejected. Callers match on
+// this enum instead of substring-checking the operator-facing message.
+enum BroadcastRejectionReason {
+  // Default zero value reserved by proto3; never written by the server.
+  BROADCAST_REJECTION_REASON_UNSPECIFIED = 0;
+
+  // Verifier rejected one or more transaction signatures.
+  BROADCAST_REJECTION_REASON_INVALID_SIGNATURE = 1;
+
+  // Transaction's nExpiryHeight is at or below the visible tip.
+  BROADCAST_REJECTION_REASON_BAD_EXPIRY_HEIGHT = 2;
+
+  // Transaction's consensus branch id does not match the current network upgrade.
+  BROADCAST_REJECTION_REASON_BAD_CONSENSUS_BRANCH = 3;
+
+  // Mempool is at capacity and refused the transaction.
+  BROADCAST_REJECTION_REASON_MEMPOOL_FULL = 4;
+
+  // Node returned a rejection that did not match any known reason.
+  BROADCAST_REJECTION_REASON_UNKNOWN = 5;
+}
+
 // Rejected transaction broadcast details.
 message BroadcastRejected {
   // Node error code when one was supplied.
@@ -407,6 +429,18 @@ message BroadcastRejected {
 
   // Operator-facing node message.
   string message = 2;
+
+  // Typed rejection reason; callers match on this instead of the message.
+  BroadcastRejectionReason kind = 3;
+}
+
+// In-flight broadcast queued for download or verification.
+//
+// Benign duplicate of a transaction the local caller submitted earlier:
+// the node will eventually accept or reject it.
+message BroadcastQueued {
+  // Operator-facing node message describing the queued state.
+  string message = 1;
 }
 
 // Unclassified transaction broadcast details.
@@ -426,6 +460,7 @@ message BroadcastTransactionResponse {
     BroadcastInvalidEncoding invalid_encoding = 3;
     BroadcastRejected rejected = 4;
     BroadcastUnknown unknown = 5;
+    BroadcastQueued queued = 6;
   }
 }
 

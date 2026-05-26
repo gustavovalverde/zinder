@@ -49,10 +49,10 @@ pub use subtree_root::{
     SubtreeRootRange, SubtreeRootRangeIter,
 };
 pub use transaction::{
-    AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
-    BroadcastUnknown, MinedDetails, MinedTransaction, RawTransactionBytes, TransactionBlobArtifact,
-    TransactionBroadcastResult, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TxStatus,
+    AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MinedDetails, MinedTransaction,
+    RawTransactionBytes, TransactionBlobArtifact, TransactionBroadcastResult,
+    TransactionFactsArtifact, TransactionId, TransactionLocation, TxStatus,
 };
 pub use transaction_public_facts::{
     LockTime, PrivacyShape, TransactionComponentCounts, TransactionPublicFacts, TransactionVersion,

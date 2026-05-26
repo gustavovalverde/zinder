@@ -48,6 +48,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0020: Bounded RocksDB resource budget](adrs/0020-bounded-rocksdb-resource-budget.md)
 - [ADR-0021: Parallel canonical block prepare in bulk catchup](adrs/0021-parallel-block-derivation.md)
 - [ADR-0022: Resource-budgeted bulk catchup and checkpoint tree state](adrs/0022-resource-budgeted-bulk-catchup.md)
+- [ADR-0023: Typed broadcast rejection reasons and a queued outcome](adrs/0023-typed-broadcast-rejection-reasons.md)
 
 ## Reference
 

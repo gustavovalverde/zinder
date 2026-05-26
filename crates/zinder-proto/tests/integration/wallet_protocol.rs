@@ -82,6 +82,7 @@ fn broadcast_transaction_response_round_trips_through_prost() -> eyre::Result<()
             wallet::BroadcastRejected {
                 error_code: Some(-25),
                 message: "bad-txns-invalid".to_owned(),
+                kind: wallet::BroadcastRejectionReason::InvalidSignature as i32,
             },
         )),
     };
@@ -90,7 +91,29 @@ fn broadcast_transaction_response_round_trips_through_prost() -> eyre::Result<()
     assert!(matches!(
         decoded_response.outcome,
         Some(wallet::broadcast_transaction_response::Outcome::Rejected(rejected))
-            if rejected.error_code == Some(-25) && rejected.message == "bad-txns-invalid"
+            if rejected.error_code == Some(-25)
+                && rejected.message == "bad-txns-invalid"
+                && rejected.kind == wallet::BroadcastRejectionReason::InvalidSignature as i32
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn broadcast_transaction_response_carries_queued_outcome() -> eyre::Result<()> {
+    let response = wallet::BroadcastTransactionResponse {
+        outcome: Some(wallet::broadcast_transaction_response::Outcome::Queued(
+            wallet::BroadcastQueued {
+                message: "already queued for download".to_owned(),
+            },
+        )),
+    };
+    let decoded_response = round_trip(&response)?;
+
+    assert!(matches!(
+        decoded_response.outcome,
+        Some(wallet::broadcast_transaction_response::Outcome::Queued(queued))
+            if queued.message == "already queued for download"
     ));
 
     Ok(())

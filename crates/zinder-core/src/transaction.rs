@@ -80,7 +80,16 @@ pub enum TransactionBroadcastResult {
     Duplicate(BroadcastDuplicate),
     /// The node could not decode the submitted transaction bytes.
     InvalidEncoding(BroadcastInvalidEncoding),
-    /// The node rejected the transaction with a known rejection message.
+    /// The node has the transaction queued for download or verification.
+    ///
+    /// Distinct from [`TransactionBroadcastResult::Duplicate`]: queued means
+    /// the upstream node has already accepted the broadcast into its
+    /// download or verification queue but has not yet produced a final
+    /// verdict. Callers that submit the same bytes again while a prior
+    /// submission is still in flight observe this state instead of a
+    /// hard rejection.
+    Queued(BroadcastQueued),
+    /// The node rejected the transaction with a typed reason.
     Rejected(BroadcastRejected),
     /// The node returned an unclassified broadcast response.
     Unknown(BroadcastUnknown),
@@ -112,11 +121,51 @@ pub struct BroadcastInvalidEncoding {
 }
 
 /// Rejected transaction broadcast details.
+///
+/// Carries a [`BroadcastRejectionReason`] so callers can match the typed
+/// reason without substring-checking the operator-facing message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BroadcastRejected {
+    /// Typed rejection reason.
+    pub kind: BroadcastRejectionReason,
     /// Node error code when one was supplied.
     pub error_code: Option<i64>,
     /// Operator-facing node message.
+    pub message: String,
+}
+
+/// Typed broadcast rejection reason.
+///
+/// Upstream Zebra reports mempool rejections through a single JSON-RPC error
+/// code (`-25 Verify`) with the original `MempoolError` variant collapsed
+/// into the error message. The submitter normalizes that message into one
+/// of these variants so downstream consumers (auto-shield retry loops,
+/// metrics labels, lightwalletd compat) can dispatch on the typed reason.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BroadcastRejectionReason {
+    /// Node returned a rejection that did not match any known reason.
+    #[default]
+    Unknown,
+    /// Verifier rejected one or more transaction signatures.
+    InvalidSignature,
+    /// Transaction's `nExpiryHeight` is at or below the visible tip.
+    BadExpiryHeight,
+    /// Transaction's consensus branch id does not match the network upgrade.
+    BadConsensusBranch,
+    /// Mempool is at capacity and refused the transaction.
+    MempoolFull,
+}
+
+/// Queued transaction broadcast details.
+///
+/// The node has accepted the broadcast into a download or verification
+/// queue but has not produced a final verdict. Re-submitting the same
+/// byte-identical transaction while the prior submission is in flight
+/// produces this state on Zebra.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastQueued {
+    /// Operator-facing node message describing the queued state.
     pub message: String,
 }
 
