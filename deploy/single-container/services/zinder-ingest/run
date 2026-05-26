@@ -42,11 +42,20 @@ mkdir -p /var/lib/zinder/store
 chown zinder:zinder /var/lib/zinder/store
 rm -f /var/lib/zinder/store/LOCK
 
+# Strip env vars whose TOML section the ingest schema doesn't allow. The
+# single-container image shares one process env across all three supervised
+# binaries; ingest's schema permits [network], [ops], [node], [storage],
+# [ingest], [ingest_control], [retention], [backup]. Any ZINDER_QUERY__* or
+# ZINDER_EXPLORER__* var (set in the Dockerfile single-container stage so
+# query and explorer can find their listen addresses) would be parsed by
+# ingest as unknown sections and crash load_config.
+unset $(env | sed -n -e 's/^\(ZINDER_QUERY__[^=]*\)=.*/\1/p' \
+                     -e 's/^\(ZINDER_EXPLORER__[^=]*\)=.*/\1/p') 2>/dev/null || true
+
 # Unified ingest loop per ADR-0015. The single process classifies the
 # gap to the upstream tip on every iteration and dispatches to
 # AwaitingUpstream / BulkCatchup / FollowingTip; no separate bootstrap
 # pass is needed.
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-ingest \
-    --config /etc/zinder/ingest.toml \
     --ops-listen-addr 127.0.0.1:9105

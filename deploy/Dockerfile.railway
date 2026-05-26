@@ -87,8 +87,8 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9105
-ENV ZINDER_INGEST_CONTROL__LISTEN_ADDR=0.0.0.0:9100
+ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
+ENV ZINDER_INGEST_CONTROL__LISTEN_ADDR=[::]:9100
 
 EXPOSE 9100 9105
 
@@ -96,7 +96,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9105/readyz || exit 1
 
 ENTRYPOINT ["zinder-ingest"]
-CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-runtime-base AS zinder-query
 
@@ -105,8 +104,8 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENV ZINDER_QUERY__LISTEN_ADDR=0.0.0.0:9101
-ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9106
+ENV ZINDER_QUERY__LISTEN_ADDR=[::]:9101
+ENV ZINDER_OPS__LISTEN_ADDR=[::]:9106
 
 EXPOSE 9101 9106
 
@@ -114,7 +113,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9106/readyz || exit 1
 
 ENTRYPOINT ["zinder-query"]
-CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-runtime-base AS zinder-explorer
 
@@ -123,8 +121,8 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zind
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENV ZINDER_EXPLORER__LISTEN_ADDR=0.0.0.0:9068
-ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9069
+ENV ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068
+ENV ZINDER_OPS__LISTEN_ADDR=[::]:9069
 
 EXPOSE 9068 9069
 
@@ -132,7 +130,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9069/readyz || exit 1
 
 ENTRYPOINT ["zinder-explorer"]
-CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-runtime-base AS zinder-compat-lightwalletd
 
@@ -141,8 +138,8 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /usr/loc
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENV ZINDER_COMPAT__LISTEN_ADDR=0.0.0.0:9067
-ENV ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9107
+ENV ZINDER_COMPAT__LISTEN_ADDR=[::]:9067
+ENV ZINDER_OPS__LISTEN_ADDR=[::]:9107
 
 EXPOSE 9067 9107
 
@@ -150,7 +147,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9107/readyz || exit 1
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
-CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-runtime-base AS zinder-single-container
 
@@ -199,22 +195,34 @@ COPY deploy/single-container/config.example.query.toml /etc/zinder/config.exampl
 COPY deploy/single-container/config.example.explorer.toml /etc/zinder/config.example.explorer.toml
 COPY deploy/single-container/nginx.conf /etc/nginx/nginx.conf
 
-RUN cp /etc/zinder/config.example.ingest.toml /etc/zinder/ingest.toml \
-    && cp /etc/zinder/config.example.query.toml /etc/zinder/query.toml \
-    && cp /etc/zinder/config.example.explorer.toml /etc/zinder/explorer.toml \
-    && chown zinder:zinder /etc/zinder/ingest.toml /etc/zinder/query.toml /etc/zinder/explorer.toml \
-    && chmod +x /etc/s6-overlay/s6-rc.d/zinder-ingest/run \
-                /etc/s6-overlay/s6-rc.d/zinder-ingest/finish \
-                /etc/s6-overlay/s6-rc.d/zinder-query/run \
-                /etc/s6-overlay/s6-rc.d/zinder-query/finish \
-                /etc/s6-overlay/s6-rc.d/zinder-explorer/run \
-                /etc/s6-overlay/s6-rc.d/zinder-explorer/finish \
-                /etc/s6-overlay/s6-rc.d/zinder-multiplexer/run \
-                /etc/s6-overlay/s6-rc.d/zinder-multiplexer/finish
+RUN chmod +x /etc/s6-overlay/s6-rc.d/zinder-ingest/run \
+             /etc/s6-overlay/s6-rc.d/zinder-ingest/finish \
+             /etc/s6-overlay/s6-rc.d/zinder-query/run \
+             /etc/s6-overlay/s6-rc.d/zinder-query/finish \
+             /etc/s6-overlay/s6-rc.d/zinder-explorer/run \
+             /etc/s6-overlay/s6-rc.d/zinder-explorer/finish \
+             /etc/s6-overlay/s6-rc.d/zinder-multiplexer/run \
+             /etc/s6-overlay/s6-rc.d/zinder-multiplexer/finish
 
-ENV S6_KEEP_ENV=1
+# Single-container deployment shape: every binary loads its configuration
+# from `ZINDER_*` env vars + `with_default` baselines compiled into the
+# binary. No `/etc/zinder/*.toml` files exist in this image, no `--config`
+# flag is passed by the s6 run scripts. Operators override individual
+# fields by setting `ZINDER_<SECTION>__<KEY>` on the Railway service (or
+# equivalent PaaS env), matching 12-factor convention.
+#
+# Listen addresses bind on `[::]` (IPv6 wildcard) so the listeners accept
+# both IPv6 and IPv4-mapped connections. Railway's legacy private network
+# resolves `*.railway.internal` to IPv6-only addresses, so an IPv4-only
+# bind (`0.0.0.0`) is unreachable from sibling services. The non-single-
+# container per-binary stages above set the same vars per-stage; this
+# duplication is deliberate so each deployment shape stays self-contained.
+ENV S6_KEEP_ENV=1 \
+    ZINDER_INGEST_CONTROL__LISTEN_ADDR=[::]:9100 \
+    ZINDER_QUERY__LISTEN_ADDR=[::]:9101 \
+    ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068
 
-EXPOSE 9068 9069 9099 9101 9106
+EXPOSE 9068 9069 9099 9100 9101 9106
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD curl -fsS http://localhost:9106/readyz || exit 1

@@ -212,6 +212,11 @@ pub(crate) fn load_ingest_config(
     overrides: IngestConfigOverrides,
 ) -> Result<IngestCommandConfig, IngestConfigError> {
     let raw_config: IngestConfig = ConfigLoader::new()
+        // Storage default matches the canonical Zinder layout. The writer's
+        // primary store lives at `/var/lib/zinder/store`. Operators on
+        // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
+        // `--storage-path` CLI flag.
+        .with_default("storage.path", "/var/lib/zinder/store")?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.bulk_catchup.canonical_batch_max_blocks",

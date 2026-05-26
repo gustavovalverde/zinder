@@ -122,6 +122,19 @@ pub(crate) fn load_query_config(
     overrides: QueryConfigOverrides,
 ) -> Result<QueryConfig, QueryConfigError> {
     let raw_config: QueryRawConfig = ConfigLoader::new()
+        // Storage defaults match the canonical Zinder layout (`/var/lib/zinder/store`
+        // for the writer's primary, `/var/lib/zinder/secondary` for this reader's
+        // RocksDB secondary). Operators override via env vars
+        // (`ZINDER_STORAGE__PATH`, `ZINDER_STORAGE__SECONDARY_PATH`) or `--storage-path`
+        // / `--secondary-path` CLI flags; non-Railway deployments that mount
+        // volumes elsewhere set the env vars.
+        .with_default("storage.path", "/var/lib/zinder/store")?
+        .with_default("storage.secondary_path", "/var/lib/zinder/secondary")?
+        // The single-container image runs the writer in the same PID namespace,
+        // so the reader connects to ingest's control endpoint over loopback.
+        // Cross-host topologies override with `ZINDER_INGEST_CONTROL__ADDR` or
+        // `--ingest-control-addr`.
+        .with_default("ingest_control.addr", "http://127.0.0.1:9100")?
         .with_default("query.listen_addr", "127.0.0.1:9101")?
         .with_default("query.grpc.enable_reflection", true)?
         .with_default("query.grpc.enable_health", true)?

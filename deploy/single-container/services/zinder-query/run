@@ -34,13 +34,20 @@ done
 # Strip env vars whose TOML section the query schema doesn't allow.
 # The single-container image shares one process env across all three
 # supervised binaries; query's schema permits [network], [node],
-# [storage], [ingest_control], [query], [retention], [ops]. Any
-# ZINDER_INGEST__* var (catchup tunables that belong to the writer
-# only) gets parsed as an [ingest] section here and crashes
-# load_config; strip them before exec.
-unset $(env | sed -n 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p') 2>/dev/null || true
+# [storage], [ingest_control], [query], [retention], [ops]. Strip:
+#  - ZINDER_INGEST__*  (writer-only catchup tunables)
+#  - ZINDER_EXPLORER__* (explorer binary's listen-addr lives in this
+#    namespace; query also has an [explorer] proxy section with
+#    `endpoint`/`bearer_token_path`/`probe_interval_ms` but no
+#    `listen_addr`, so the explorer binary's env vars would be
+#    rejected as unknown fields within the [explorer] section).
+#  - ZINDER_INGEST_CONTROL__LISTEN_ADDR (ingest's writer-binding addr;
+#    query's [ingest_control] only has `addr` for the reader-side
+#    target endpoint, so `listen_addr` is an unknown field here).
+unset $(env | sed -n -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p' \
+                     -e 's/^\(ZINDER_EXPLORER__[^=]*\)=.*/\1/p' \
+                     -e 's/^\(ZINDER_INGEST_CONTROL__LISTEN_ADDR\)=.*/\1/p') 2>/dev/null || true
 
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-query \
-    --config /etc/zinder/query.toml \
-    --ops-listen-addr 0.0.0.0:9106
+    --ops-listen-addr [::]:9106

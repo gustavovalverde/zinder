@@ -696,7 +696,13 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn missing_storage_path_is_rejected_before_storage_creation() -> Result<(), Box<dyn Error>> {
+fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<dyn Error>> {
+    // The binary's default for `storage.path` matches the canonical Zinder
+    // layout under `/var/lib/zinder/store`. Operators on non-PaaS hosts
+    // override via `ZINDER_STORAGE__PATH` or the `--storage-path` flag.
+    // This test guards the default's stability so the env-only deployment
+    // shape (single-container Docker image) keeps working without a TOML
+    // file or a `--config` argument.
     let output = zinder_ingest_command()
         .args([
             "--print-config",
@@ -709,11 +715,16 @@ fn missing_storage_path_is_rejected_before_storage_creation() -> Result<(), Box<
         ])
         .output()?;
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("missing configuration field: storage.path"),
-        "{stderr}"
+        output.status.success(),
+        "print-config failed: stderr=\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("path = \"/var/lib/zinder/store\"")
+            || stdout.contains("path = '/var/lib/zinder/store'"),
+        "stdout does not carry the canonical storage.path default:\n{stdout}"
     );
 
     Ok(())

@@ -58,40 +58,50 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
 }
 
 #[test]
-fn missing_storage_path_is_rejected_before_binding() -> eyre::Result<()> {
+fn storage_path_default_resolves_to_canonical_zinder_layout() -> eyre::Result<()> {
+    // The binary's default for `storage.path` matches the canonical Zinder
+    // layout under `/var/lib/zinder/store`. The default exists so the
+    // single-container Docker image works with env-only configuration and
+    // no `--config` argument. Operators on other deployment shapes override
+    // via `ZINDER_STORAGE__PATH` or the `--storage-path` flag.
     let output = zinder_query_command()
         .args(["--print-config", "--network", "zcash-regtest"])
         .output()?;
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("missing configuration field: storage.path"),
-        "{stderr}"
+        output.status.success(),
+        "print-config failed: stderr=\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("path = \"/var/lib/zinder/store\""),
+        "stdout does not carry the canonical storage.path default:\n{stdout}"
     );
 
     Ok(())
 }
 
 #[test]
-fn missing_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("query-missing-secondary-store");
-    let config_path = tempdir.path().join("zinder-query.toml");
-    fs::write(
-        &config_path,
-        query_config_without_secondary_toml(&storage_path)?,
-    )?;
-
+fn secondary_path_default_resolves_to_canonical_zinder_layout() -> eyre::Result<()> {
+    // Same rationale as `storage_path_default_resolves_to_canonical_zinder_layout`:
+    // the wallet-query reader opens its RocksDB secondary at
+    // `/var/lib/zinder/secondary` by default. Operators on shared-store
+    // deployments override via `ZINDER_STORAGE__SECONDARY_PATH` or the
+    // `--secondary-path` flag.
     let output = zinder_query_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
+        .args(["--print-config", "--network", "zcash-regtest"])
         .output()?;
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("missing configuration field: storage.secondary_path"),
-        "{stderr}"
+        output.status.success(),
+        "print-config failed: stderr=\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("secondary_path = \"/var/lib/zinder/secondary\""),
+        "stdout does not carry the canonical storage.secondary_path default:\n{stdout}"
     );
 
     Ok(())
@@ -227,21 +237,6 @@ source = "zebra-json-rpc"
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,
-    ))
-}
-
-fn query_config_without_secondary_toml(storage_path: &Path) -> eyre::Result<String> {
-    Ok(format!(
-        r#"[network]
-name = "zcash-regtest"
-
-[storage]
-path = "{}"
-
-[query]
-listen_addr = "127.0.0.1:9101"
-"#,
-        path_str(storage_path)?,
     ))
 }
 
