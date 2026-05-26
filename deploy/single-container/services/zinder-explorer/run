@@ -44,6 +44,16 @@ unset $(env | sed -n -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_INGEST_CONTROL__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_QUERY__[^=]*\)=.*/\1/p') 2>/dev/null || true
 
+# Default the wallet-query endpoint to the bundled wallet-query plane.
+# The single-container image runs zinder-query on localhost:9101; the
+# explorer must point at it for `advertised_capabilities()` to emit
+# anything beyond `explorer.server_info_v1`. Without this default the
+# explorer at-tip silently advertises an empty capability set and every
+# read returns `capability_unavailable`. Operators can still override
+# with a non-localhost endpoint by setting the env var externally; the
+# `:-` form only defaults if it's unset.
+export ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT="${ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT:-http://127.0.0.1:9101}"
+
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-explorer \
     --ops-listen-addr [::]:9069
