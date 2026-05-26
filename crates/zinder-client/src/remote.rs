@@ -163,8 +163,7 @@ impl RemoteChainIndex {
 
     fn rebuild_channel(&self) {
         let fresh = self.endpoint.connect_lazy();
-        self.client
-            .store(Arc::new(WalletQueryClient::new(fresh)));
+        self.client.store(Arc::new(WalletQueryClient::new(fresh)));
         warn!(
             target: "zinder_client",
             event = "remote_channel_rebuilt",

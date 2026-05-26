@@ -78,7 +78,10 @@ pub(crate) fn load_explorer_config(
         // Operators override via env vars (`ZINDER_STORAGE__PATH`,
         // `ZINDER_STORAGE__SECONDARY_PATH`) or CLI flags.
         .with_default("storage.path", "/var/lib/zinder/store")?
-        .with_default("storage.secondary_path", "/var/lib/zinder/explorer-secondary")?
+        .with_default(
+            "storage.secondary_path",
+            "/var/lib/zinder/explorer-secondary",
+        )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
         .with_ops_section(ServiceIdentifier::Explorer)?
         .with_file(config_path)
