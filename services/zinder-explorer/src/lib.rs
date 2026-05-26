@@ -8,6 +8,7 @@
 //! `docs/architecture/derive-plane.md` for the derive store this crate reads.
 
 mod grpc;
+mod payment_disclosure;
 
 pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
 pub use zinder_derive::{
