@@ -193,9 +193,10 @@ pub enum ReorgWindowChange {
         /// First height where the previous visible branch is invalidated.
         from_height: BlockHeight,
     },
-    /// Advance the finalized prefix through this height.
-    FinalizeThrough {
-        /// Finalized height after this commit.
+    /// Advance the safe-tip boundary through this height; the prefix below
+    /// is past the reorg window and no longer subject to local rollback.
+    AdvanceSafeTipTo {
+        /// Safe tip height after this commit.
         height: BlockHeight,
     },
     /// This commit does not mutate the reorg window.

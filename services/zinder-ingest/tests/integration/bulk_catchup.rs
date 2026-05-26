@@ -125,7 +125,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     assert_eq!(outcome.chain_epoch.network, Network::ZcashTestnet);
     assert_current_artifact_schema(outcome.chain_epoch);
     assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
-    assert_eq!(outcome.chain_epoch.finalized_height, source_block.height);
+    assert_eq!(outcome.chain_epoch.safe_tip_height, source_block.height);
     assert_eq!(
         outcome.chain_epoch.tip_metadata,
         ChainTipMetadata::new(1, 0)

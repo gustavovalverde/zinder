@@ -20,12 +20,14 @@ message ChainEpoch {
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
   string tip_hash = 4;
 
-  // Finalized height for this chain epoch.
-  uint32 finalized_height = 5;
+  // Highest block height in this chain epoch for which both compact-block
+  // and commitment-tree artifacts are coherent past the reorg window. The
+  // wallet uses this as its scan ceiling; see ADR-0005 in the zally repo.
+  uint32 safe_tip_height = 5;
 
-  // Finalized block hash in RPC byte order (64 lowercase hex characters).
-  // Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string finalized_hash = 6;
+  // Block hash at safe_tip_height in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string safe_tip_hash = 6;
 
   // Durable artifact schema version used by artifacts in this chain epoch.
   uint32 artifact_schema_version = 7;
@@ -62,6 +64,24 @@ message LatestBlockResponse {
 
 // Latest visible block metadata request.
 message LatestBlockRequest {
+  // Optional chain epoch that must be used to answer the request. When absent,
+  // the server uses the visible epoch at request time.
+  optional ChainEpoch at_epoch = 1;
+}
+
+// Safe-tip block metadata response bound to one chain epoch. Returns the
+// block at the chain epoch's safe_tip_height, which the wallet uses as its
+// scan ceiling.
+message LatestSafeBlockResponse {
+  // Chain epoch used to answer this response.
+  ChainEpoch chain_epoch = 1;
+
+  // Block at chain_epoch.safe_tip_height.
+  BlockMetadata safe_tip_block = 2;
+}
+
+// Safe-tip block metadata request.
+message LatestSafeBlockRequest {
   // Optional chain epoch that must be used to answer the request. When absent,
   // the server uses the visible epoch at request time.
   optional ChainEpoch at_epoch = 1;
@@ -488,11 +508,12 @@ message BroadcastTransactionResponse {
   }
 }
 
-// Chain-event stream family. Tip receives every chain event. Finalized
-// receives only finalized commits and never reorg events.
+// Chain-event stream family. Tip receives every chain event. Safe receives
+// only commits whose entire range is past the reorg window, and never reorg
+// events.
 enum ChainEventStreamFamily {
   CHAIN_EVENT_STREAM_FAMILY_TIP = 0;
-  CHAIN_EVENT_STREAM_FAMILY_FINALIZED = 1;
+  CHAIN_EVENT_STREAM_FAMILY_SAFE = 1;
 }
 
 // Replayable chain-event stream request.
@@ -541,15 +562,16 @@ message ChainRangeReverted {
 
 // Chain-committed event.
 //
-// Carries a non-reorg commit that advanced the canonical tip or finalized
+// Carries a non-reorg commit that advanced the canonical tip or the safe
 // prefix. The architectural-spine name; preferred over "tip-advance"
-// because Zinder commits to either the tip or the finalized height under
+// because Zinder commits to either the visible tip or the safe tip under
 // the same event variant.
 message ChainCommitted {
   ChainEpochCommitted committed = 1;
 }
 
-// Reorg chain event: a non-finalized range was replaced.
+// Reorg chain event: a range that had not yet reached the safe tip was
+// replaced.
 message ChainReorged {
   ChainRangeReverted reverted = 1;
   ChainEpochCommitted committed = 2;
@@ -566,8 +588,8 @@ message ChainEventEnvelope {
   // Chain epoch visible after this event.
   ChainEpoch chain_epoch = 3;
 
-  // Finalized height that was true for this event.
-  uint32 finalized_height = 4;
+  // Safe tip height that was true for this event.
+  uint32 safe_tip_height = 4;
 
   oneof event {
     ChainCommitted chain_committed = 10;
@@ -593,7 +615,8 @@ message WalletServerInfo {
   // Canonical artifact schema version.
   uint32 schema_version = 3;
 
-  // Configured non-finalized window depth, in blocks.
+  // Configured reorg window depth, in blocks. A block becomes part of the
+  // safe prefix (safe_tip_height) once it is buried at least this deep.
   uint32 reorg_window_blocks = 4;
 
   // Chain-event retention window in seconds. 0 indicates unbounded retention
@@ -1145,6 +1168,11 @@ message TransparentAddressTxIdsChunk {
 service WalletQuery {
   // Return latest visible block metadata.
   rpc LatestBlock(LatestBlockRequest) returns (LatestBlockResponse);
+
+  // Return the block at the safe tip height: the highest height at which
+  // both compact blocks and a coherent tree-state checkpoint are
+  // guaranteed available. The wallet uses this as its scan ceiling.
+  rpc LatestSafeBlock(LatestSafeBlockRequest) returns (LatestSafeBlockResponse);
 
   // Resolve a typed block selector against the canonical best chain.
   rpc BlockIdBySelector(BlockIdBySelectorRequest) returns (BlockIdResponse);

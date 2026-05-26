@@ -134,7 +134,7 @@ async fn bulk_catchup_from_checkpoint() -> Result<()> {
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.tip_height, tip_height);
-    assert_eq!(chain_epoch.finalized_height, tip_height);
+    assert_eq!(chain_epoch.safe_tip_height, tip_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

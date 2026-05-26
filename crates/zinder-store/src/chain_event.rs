@@ -38,8 +38,8 @@ pub struct ChainEventEnvelope {
     pub event_sequence: u64,
     /// Chain epoch visible after this event.
     pub chain_epoch: ChainEpoch,
-    /// Finalized height that was true for this event.
-    pub finalized_height: BlockHeight,
+    /// Safe tip height that was true for this event.
+    pub safe_tip_height: BlockHeight,
     /// Post-commit canonical transition.
     pub event: ChainEvent,
 }
@@ -49,14 +49,14 @@ impl ChainEventEnvelope {
         cursor: StreamCursorTokenV1,
         event_sequence: u64,
         chain_epoch: ChainEpoch,
-        finalized_height: BlockHeight,
+        safe_tip_height: BlockHeight,
         event: ChainEvent,
     ) -> Self {
         Self {
             cursor,
             event_sequence,
             chain_epoch,
-            finalized_height,
+            safe_tip_height,
             event,
         }
     }
@@ -66,12 +66,12 @@ impl ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip or finalized prefix.
+    /// A non-reorg commit advanced the canonical tip or safe-tip prefix.
     ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
-    /// A non-finalized range was replaced by a new committed range.
+    /// A range that had not yet reached the safe tip was replaced by a new committed range.
     ChainReorged {
         /// Previously visible range invalidated by this transition.
         reverted: ChainRangeReverted,
@@ -91,7 +91,7 @@ impl ChainEvent {
     }
 }
 
-/// Event payload for a previously visible non-finalized range.
+/// Event payload for a previously visible range that had not yet reached the safe tip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainRangeReverted {
     /// Chain epoch that contained the reverted range.

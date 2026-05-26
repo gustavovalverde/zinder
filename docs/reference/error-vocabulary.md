@@ -67,7 +67,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `CHAIN_EPOCH_PIN_MISMATCH` | Pinned chain epoch resolves to incompatible storage state | `subject=chain_epoch:<id>` |
 | `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
 | `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
-| `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured non-finalized window; operator must reconcile | — |
+| `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window; operator must reconcile | — |
 | `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
 

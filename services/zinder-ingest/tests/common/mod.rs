@@ -766,8 +766,8 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
                 network_name: encode_zinder_native_chain_name(range_chain_epoch.network).to_owned(),
                 tip_height: range_chain_epoch.tip_height.value(),
                 tip_hash: encode_rpc_block_hash_hex(range_chain_epoch.tip_hash),
-                finalized_height: range_chain_epoch.finalized_height.value(),
-                finalized_hash: encode_rpc_block_hash_hex(range_chain_epoch.finalized_hash),
+                safe_tip_height: range_chain_epoch.safe_tip_height.value(),
+                safe_tip_hash: encode_rpc_block_hash_hex(range_chain_epoch.safe_tip_hash),
                 artifact_schema_version: u32::from(
                     range_chain_epoch.artifact_schema_version.value(),
                 ),

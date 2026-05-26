@@ -44,7 +44,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `BlockId` | Stable block identity (`{ height: BlockHeight, hash: BlockHash }`); lives in `zinder-core` and is the canonical (height, hash) pair across the source boundary, the wallet protocol, and the reader API |
 | `TransactionLocation` | Durable transaction id to block-location fact |
 | `TransactionFactsArtifact` | Durable typed public transaction facts parsed once by ingest |
-| `ReorgWindow` | Non-finalized range where reorgs are expected and supported |
+| `ReorgWindow` | Range within the reorg window where reorgs are expected and supported |
 | `MempoolEntry` | One transaction currently observed in the mempool |
 | `MempoolEvent` | Typed mempool transition (`Added`, `Invalidated`, `Mined`) carried in the event log |
 | `MempoolEventEnvelope` | Cursor-bound mempool-event message exposed natively on `WalletQuery.MempoolEvents` |
@@ -125,7 +125,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 |------|---------|
 | `StreamCursorTokenV1` | Opaque cursor body for chain-event subscriptions; fork-aware, encodes epoch id, last visible block hash, in-epoch offset, and stream-family tag |
 | `MempoolStreamCursorV1` | Opaque cursor body for mempool-event subscriptions |
-| `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Finalized`; `Mempool` is a reserved family code, not an active chain-event family) |
+| `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Safe`; `Mempool` is a reserved family code, not an active chain-event family) |
 | `ArtifactFamily` | Open-ended enum naming an artifact family in storage and query errors |
 | `ArtifactKey` | Open-ended enum union of keys used to look up an artifact (`BlockHeight`, `TransactionId`, `SubtreeRootIndex`, `BlockTransactionIndex`, future variants) |
 
@@ -218,7 +218,7 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 `StreamCursorTokenV1` (chain events) is the canonical cursor body. The body is encoded as a `postcard`-serialized internal struct, then base-64 over the wire, never parsed by clients. The body fields are:
 
 - `network`: target network (mainnet / testnet / regtest)
-- `family`: `ChainEventStreamFamily` tag (`Tip`, `Finalized`, `Mempool`, `Derive`)
+- `family`: `ChainEventStreamFamily` tag (`Tip`, `Safe`, `Mempool`, `Derive`)
 - `epoch_id`: `ChainEpochId` of the most recently delivered envelope
 - `last_visible_block_hash`: block hash at the tip of that epoch (used to detect forks across reconnect)
 - `in_epoch_offset`: position within the epoch's emitted events
@@ -240,7 +240,7 @@ A cursor whose `last_visible_block_hash` is no longer present at its `epoch_id`'
 `WalletQuery.ChainEvents` exposes two consumer modes through the `family` tag in the request cursor:
 
 - `Tip` — receives every `ChainCommitted` and `ChainReorged` envelope. Wallet-shaped: clients must handle reorgs.
-- `Finalized` — receives only events past the reorg window. Never receives `ChainReorged`. Settlement-shaped: explorers and analytics that prefer slightly delayed but reorg-free data.
+- `Safe` — receives only events past the reorg window. Never receives `ChainReorged`. Settlement-shaped: explorers and analytics that prefer slightly delayed but reorg-free data.
 
 Both varieties share the wire format, retention policy, and resume semantics. They differ only in which envelopes the server emits.
 
@@ -264,7 +264,7 @@ ArtifactUnavailable {
 ```rust
 #[non_exhaustive]
 pub enum ArtifactFamily {
-    FinalizedBlock,
+    SafeBlock,
     CompactBlock,
     Transaction,
     TreeState,
@@ -559,7 +559,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Maximum reserved source response bytes across active fetches and completed source reassembly. Must be greater than or equal to node.max_response_bytes. Defaults to 402653184. |
 | `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_concurrency` | Parallel canonical block-prepare slots. Defaults to `min(available_parallelism(), 16)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes` | Maximum reserved derived artifact bytes across active and completed block-prepare work. Defaults to 536870912. |
-| `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum finalized artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
+| `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum safe-tip artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
 | `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available. Defaults to `canonical-first`. |
 | `ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES` | zinder-ingest | Optional | `ingest.derive.memory_budget_bytes` | Explicit derive replay memory budget in bytes. When unset, derive replay uses the runtime cgroup `memory.high` or `memory.max` value when present. |
@@ -613,7 +613,7 @@ message ServerCapabilities {
   string service_version = 2;                    // semver of the running binary
   string lightwalletd_protocol_commit = 3;       // vendored lightwalletd commit hash
   uint32 schema_version = 4;                     // canonical artifact schema version
-  uint32 reorg_window_blocks = 5;                // configured non-finalized window depth
+  uint32 reorg_window_blocks = 5;                // configured reorg window depth
   uint64 chain_event_retention_seconds = 6;         // 0 = unbounded retention (development only)
   uint64 mempool_mined_retention_seconds = 7;       // 0 = mined-event family not retained on this deployment
   uint64 mempool_invalidated_retention_seconds = 8; // 0 = invalidated-event family not retained on this deployment
@@ -697,7 +697,7 @@ The current `zinder-source::NodeCapability` diagnostic names are:
 - `tip_id`
 - `tree_state`
 - `subtree_roots`
-- `finalized_height`
+- `safe_tip_height`
 - `readiness_probe`
 - `transaction_broadcast`
 - `json_rpc`
@@ -868,7 +868,7 @@ Public shapes describe behavior that production code can actually reach.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
 - Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
-- Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-finalized fixtures.
+- Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-safe-tip fixtures.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.
 - Operator-facing errors name the real cause and carry useful fields. Prefer `NoVisibleChainEpoch`, sequence-overflow, and payload-size errors over sentinel IDs or reused malformed-input errors.

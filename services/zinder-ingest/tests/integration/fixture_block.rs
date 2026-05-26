@@ -24,7 +24,7 @@ use zinder_ingest::{
 ///
 /// Calls `derive_block` then `finalize_derived_block` on `source_block`
 /// with a zeroed running commitment-tree position, returning the
-/// finalized `BuiltArtifacts`. Use this when a test wants the full
+/// built `BuiltArtifacts`. Use this when a test wants the full
 /// artifact set from one fixture block.
 fn derive_for_test(source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError> {
     let activations = sample_regtest_upgrade_activations();
@@ -122,8 +122,8 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         network: Network::ZcashRegtest,
         tip_height: source_block.height,
         tip_hash: source_block.hash,
-        finalized_height: source_block.height,
-        finalized_hash: source_block.hash,
+        safe_tip_height: source_block.height,
+        safe_tip_hash: source_block.hash,
         artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
@@ -196,8 +196,8 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         network: Network::ZcashRegtest,
         tip_height: source_block.height,
         tip_hash: source_block.hash,
-        finalized_height: source_block.height,
-        finalized_hash: source_block.hash,
+        safe_tip_height: source_block.height,
+        safe_tip_hash: source_block.hash,
         artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),

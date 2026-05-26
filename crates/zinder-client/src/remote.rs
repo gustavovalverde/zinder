@@ -228,6 +228,31 @@ impl ChainIndex for RemoteChainIndex {
         })
     }
 
+    async fn latest_safe_block(
+        &self,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError> {
+        let response = self
+            .client()
+            .latest_safe_block(Request::new(wallet::LatestSafeBlockRequest {
+                at_epoch: at_epoch.map(chain_epoch_to_message),
+            }))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        let safe_tip_block = response
+            .safe_tip_block
+            .ok_or_else(|| IndexerError::malformed("safe_tip_block", "field is missing"))?;
+
+        Ok(BlockId {
+            height: BlockHeight::new(safe_tip_block.height),
+            hash: block_hash_from_rpc_hex(
+                "safe_tip_block.block_hash",
+                &safe_tip_block.block_hash,
+            )?,
+        })
+    }
+
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
@@ -896,8 +921,8 @@ fn chain_epoch_to_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
         tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-        finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
+        safe_tip_height: chain_epoch.safe_tip_height.value(),
+        safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -1182,7 +1207,7 @@ fn chain_event_envelope_from_message(
         cursor: ChainEventCursor::from_bytes(message.cursor),
         event_sequence: message.event_sequence,
         chain_epoch,
-        finalized_height: BlockHeight::new(message.finalized_height),
+        safe_tip_height: BlockHeight::new(message.safe_tip_height),
         event,
     })
 }
@@ -1255,7 +1280,7 @@ fn chain_event_stream_family_to_message(
 ) -> wallet::ChainEventStreamFamily {
     match family {
         ChainEventStreamFamily::Tip => wallet::ChainEventStreamFamily::Tip,
-        ChainEventStreamFamily::Finalized => wallet::ChainEventStreamFamily::Finalized,
+        ChainEventStreamFamily::Safe => wallet::ChainEventStreamFamily::Safe,
     }
 }
 

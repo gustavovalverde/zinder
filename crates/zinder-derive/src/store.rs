@@ -220,8 +220,8 @@ pub struct ChainEventDispatchInputs<'event> {
     pub chain_cursor: &'event [u8],
     /// Monotonic event sequence assigned by the canonical store.
     pub event_sequence: u64,
-    /// Finalized height observed at commit time.
-    pub finalized_height: BlockHeight,
+    /// Safe tip height observed at commit time.
+    pub safe_tip_height: BlockHeight,
 }
 
 /// `RocksDB`-backed durable storage for the derive plane.
@@ -893,7 +893,7 @@ where
             let event = ChainCommittedEvent::new(
                 inputs.event_sequence,
                 inputs.chain_epoch,
-                inputs.finalized_height,
+                inputs.safe_tip_height,
                 committed.block_range.start,
                 committed.block_range.end,
             );
@@ -907,7 +907,7 @@ where
             let event = ChainReorgedEvent::new(
                 inputs.event_sequence,
                 inputs.chain_epoch,
-                inputs.finalized_height,
+                inputs.safe_tip_height,
                 RevertedRange::new(
                     reverted.chain_epoch,
                     reverted.block_range.start,

@@ -20,7 +20,7 @@ fn chain_epoch_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(decoded_chain_epoch.chain_epoch_id, 7);
     assert_eq!(decoded_chain_epoch.network_name, "zcash-regtest");
     assert_eq!(decoded_chain_epoch.tip_hash, "11".repeat(32));
-    assert_eq!(decoded_chain_epoch.finalized_hash, "22".repeat(32));
+    assert_eq!(decoded_chain_epoch.safe_tip_hash, "22".repeat(32));
 
     Ok(())
 }
@@ -130,7 +130,7 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
         cursor: vec![0x99; 82],
         event_sequence: 11,
         chain_epoch: Some(synthetic_chain_epoch()),
-        finalized_height: 40,
+        safe_tip_height: 40,
         event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
             wallet::ChainCommitted {
                 committed: Some(wallet::ChainEpochCommitted {
@@ -163,7 +163,7 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
         network_name: "zcash-regtest".to_owned(),
         latest_writer_chain_epoch_id: Some(9),
         latest_writer_tip_height: Some(42),
-        latest_writer_finalized_height: Some(40),
+        latest_writer_safe_tip_height: Some(40),
         phase: ingest::WriterPhase::FollowingTip.into(),
         gap_blocks: Some(1),
         upstream_not_ready: Some(ops::UpstreamNotReadyDetail {
@@ -179,7 +179,7 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(decoded_response.network_name, "zcash-regtest");
     assert_eq!(decoded_response.latest_writer_chain_epoch_id, Some(9));
     assert_eq!(decoded_response.latest_writer_tip_height, Some(42));
-    assert_eq!(decoded_response.latest_writer_finalized_height, Some(40));
+    assert_eq!(decoded_response.latest_writer_safe_tip_height, Some(40));
     assert_eq!(decoded_response.phase(), ingest::WriterPhase::FollowingTip);
     assert_eq!(decoded_response.gap_blocks, Some(1));
     let detail = decoded_response
@@ -203,7 +203,7 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
             network_name: "zcash-regtest".to_owned(),
             latest_writer_chain_epoch_id: None,
             latest_writer_tip_height: None,
-            latest_writer_finalized_height: None,
+            latest_writer_safe_tip_height: None,
             phase: phase.into(),
             gap_blocks: None,
             upstream_not_ready: None,
@@ -307,8 +307,8 @@ fn synthetic_chain_epoch() -> wallet::ChainEpoch {
         network_name: "zcash-regtest".to_owned(),
         tip_height: 42,
         tip_hash: "11".repeat(32),
-        finalized_height: 40,
-        finalized_hash: "22".repeat(32),
+        safe_tip_height: 40,
+        safe_tip_hash: "22".repeat(32),
         artifact_schema_version: 1,
         created_at_millis: 1_774_670_400_000,
         sapling_commitment_tree_size: 0,

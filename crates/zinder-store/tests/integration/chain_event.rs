@@ -180,12 +180,12 @@ fn chain_event_history_encodes_requested_stream_family() -> eyre::Result<()> {
 
     let event_history = store.chain_event_history(ChainEventHistoryRequest::new_for_family(
         None,
-        ChainEventStreamFamily::Finalized,
+        ChainEventStreamFamily::Safe,
         NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
     ))?;
     let event_envelope = event_history
         .first()
-        .ok_or_else(|| eyre!("expected finalized event"))?;
+        .ok_or_else(|| eyre!("expected safe-tip event"))?;
 
     assert_eq!(event_envelope.cursor.as_bytes()[49], 0x1);
 
@@ -344,7 +344,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (_, initial_block_1, initial_compact_block_1) = synthetic_epoch(1, 1);
     let (initial_epoch, initial_block, initial_compact_block) =
-        synthetic_epoch_with_finalized(1, 2, 1, block_hash(2));
+        synthetic_epoch_with_safe_tip(1, 2, 1, block_hash(2));
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
         vec![initial_block_1, initial_block],
@@ -371,7 +371,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
 
     let replacement_hash = block_hash(20);
     let (replacement_epoch, replacement_block, replacement_compact_block) =
-        synthetic_epoch_with_finalized(2, 2, 1, replacement_hash);
+        synthetic_epoch_with_safe_tip(2, 2, 1, replacement_hash);
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             replacement_epoch,
@@ -412,8 +412,8 @@ fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: Chai
     assert_eq!(event_envelope.event_sequence, 1);
     assert_eq!(event_envelope.chain_epoch, chain_epoch);
     assert_eq!(
-        event_envelope.finalized_height,
-        chain_epoch.finalized_height
+        event_envelope.safe_tip_height,
+        chain_epoch.safe_tip_height
     );
     assert!(matches!(
         &event_envelope.event,
@@ -491,13 +491,13 @@ fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
-    synthetic_epoch_with_finalized(chain_epoch_id, height, height, block_hash(height))
+    synthetic_epoch_with_safe_tip(chain_epoch_id, height, height, block_hash(height))
 }
 
-fn synthetic_epoch_with_finalized(
+fn synthetic_epoch_with_safe_tip(
     chain_epoch_id: u64,
     height: u32,
-    finalized_height: u32,
+    safe_tip_height: u32,
     source_hash: BlockHash,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let parent_hash = block_hash(height.saturating_sub(1));
@@ -509,8 +509,8 @@ fn synthetic_epoch_with_finalized(
             network: Network::ZcashRegtest,
             tip_height: block_height,
             tip_hash: source_hash,
-            finalized_height: BlockHeight::new(finalized_height),
-            finalized_hash: block_hash(finalized_height),
+            safe_tip_height: BlockHeight::new(safe_tip_height),
+            safe_tip_hash: block_hash(safe_tip_height),
             artifact_schema_version: ArtifactSchemaVersion::new(10),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),

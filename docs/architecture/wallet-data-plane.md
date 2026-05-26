@@ -178,7 +178,7 @@ The contract:
 
 `ChainCommitted` and `ChainReorged` are the two event variants. `ChainReorged` carries both the reverted range and the replacement range, so a wallet receiving a reorg event truncates its local view at the reverted boundary and resumes from the replacement range without making additional indexer calls. Per [Chain events §Cursor varieties](chain-events.md#cursor-varieties), if a client reconnects with a cursor whose branch was reorged out, the server emits a synthetic `ChainReorged` envelope before resuming the stream; clients never observe silent branch changes.
 
-Two cursor varieties are advertised under capability string `wallet.events.chain_v1`: `Tip` and `Finalized`. Tip consumers receive every envelope including reorgs. Finalized consumers receive only post-finality envelopes and never see `ChainReorged`. The finalized cursor family is represented in the cursor body, not by a separate `WalletQuery.ChainEventFinalizedAnchor` RPC.
+Two cursor varieties are advertised under capability string `wallet.events.chain_v1`: `Tip` and `Safe`. Tip consumers receive every envelope including reorgs. Safe consumers receive only commits past the safe tip and never see `ChainReorged`. The safe cursor family is represented in the cursor body, not by a separate `WalletQuery.ChainEventSafeAnchor` RPC.
 
 The lightwalletd compatibility shim does not expose this subscription. The vendored `CompactTxStreamer` proto has no equivalent method, and ADR-0004 forbids inventing parallel surfaces in the compat layer. Wallet clients on the lightwalletd contract continue to use `GetLatestBlock` polling. Native Zinder clients receive the subscription contract from day one.
 
@@ -475,7 +475,7 @@ For example, a compact block range response should bind:
 - End height.
 - Tip hash.
 - Tip height.
-- Finalized height.
+- Safe tip height.
 - Artifact schema version.
 - Subtree-root range or cursor when subtree data is returned.
 

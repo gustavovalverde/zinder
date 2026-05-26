@@ -110,7 +110,7 @@ The current native network service exposes Zinder concepts:
 - `TreeStateCheckpoint`, `LatestTreeStateCheckpoint`, `SubtreeRoots`
 - `ServerInfo`
 
-The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Finalized cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
+The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Safe cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 
 Native read requests that depend on canonical chain state carry an optional
 `at_epoch` field. When it is absent, the server answers from the visible epoch

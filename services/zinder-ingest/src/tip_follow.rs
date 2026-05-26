@@ -236,8 +236,8 @@ where
 
         if let Some(commit_outcome) = iteration.commit_outcome.as_ref() {
             match finalize_tip_if_ready(config, &store, commit_outcome.chain_epoch) {
-                Ok(Some(finalized_outcome)) => {
-                    iteration.commit_outcome = Some(finalized_outcome);
+                Ok(Some(safe_tip_advance_outcome)) => {
+                    iteration.commit_outcome = Some(safe_tip_advance_outcome);
                 }
                 Ok(None) => {}
                 Err(error) => break Err(error),
@@ -934,9 +934,9 @@ fn chain_epoch_for_tip_commit(
         .block_headers
         .last()
         .ok_or(IngestError::EmptyCanonicalBatch)?;
-    let parent_finalized = current_chain_epoch.map_or(
+    let parent_safe_tip = current_chain_epoch.map_or(
         (BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
-        |chain_epoch| (chain_epoch.finalized_height, chain_epoch.finalized_hash),
+        |chain_epoch| (chain_epoch.safe_tip_height, chain_epoch.safe_tip_hash),
     );
 
     Ok(ChainEpoch {
@@ -944,8 +944,8 @@ fn chain_epoch_for_tip_commit(
         network,
         tip_height: tip_block.height,
         tip_hash: tip_block.block_hash,
-        finalized_height: parent_finalized.0,
-        finalized_hash: parent_finalized.1,
+        safe_tip_height: parent_safe_tip.0,
+        safe_tip_hash: parent_safe_tip.1,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: batch.tip_metadata.ok_or(IngestError::EmptyCanonicalBatch)?,
         created_at: current_unix_millis()?,
@@ -957,37 +957,37 @@ fn finalize_tip_if_ready(
     store: &PrimaryChainStore,
     chain_epoch: ChainEpoch,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError> {
-    let Some(finalized_height) =
-        finalized_height_for_tip(chain_epoch.tip_height, config.reorg_window_blocks)
+    let Some(safe_tip_height) =
+        safe_tip_height_for_tip(chain_epoch.tip_height, config.reorg_window_blocks)
     else {
         return Ok(None);
     };
-    if finalized_height <= chain_epoch.finalized_height {
+    if safe_tip_height <= chain_epoch.safe_tip_height {
         return Ok(None);
     }
 
     let reader = store.chain_epoch_reader_at(chain_epoch.id)?;
-    let finalized_block = reader.block_header_at(finalized_height)?.ok_or(
+    let safe_tip_block = reader.block_header_at(safe_tip_height)?.ok_or(
         IngestError::TipFollowParentMetadataUnavailable {
-            height: finalized_height,
+            height: safe_tip_height,
         },
     )?;
-    let finalized_chain_epoch = ChainEpoch {
+    let safe_tip_advanced_chain_epoch = ChainEpoch {
         id: next_chain_epoch_id_after(chain_epoch.id)?,
-        finalized_height,
-        finalized_hash: finalized_block.block_hash,
+        safe_tip_height,
+        safe_tip_hash: safe_tip_block.block_hash,
         created_at: current_unix_millis()?,
         ..chain_epoch
     };
     let commit_outcome = store
         .commit_chain_epoch(
             ChainEpochArtifacts::new(
-                finalized_chain_epoch,
+                safe_tip_advanced_chain_epoch,
                 Vec::<zinder_core::BlockHeaderArtifact>::new(),
                 Vec::new(),
             )
-            .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
-                height: finalized_height,
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
+                height: safe_tip_height,
             }),
         )
         .map_err(IngestError::from)?;
@@ -996,7 +996,7 @@ fn finalize_tip_if_ready(
     Ok(Some(commit_outcome))
 }
 
-fn finalized_height_for_tip(
+fn safe_tip_height_for_tip(
     tip_height: BlockHeight,
     reorg_window_blocks: u32,
 ) -> Option<BlockHeight> {
@@ -1053,7 +1053,7 @@ mod tests {
             CURRENT_ARTIFACT_SCHEMA_VERSION
         );
         assert_eq!(
-            commit_outcome.chain_epoch.finalized_height,
+            commit_outcome.chain_epoch.safe_tip_height,
             BlockHeight::new(0)
         );
 

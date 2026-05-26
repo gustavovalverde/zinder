@@ -57,8 +57,8 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
         Some(expected_chain_epoch.tip_height.value())
     );
     assert_eq!(
-        response.latest_writer_finalized_height,
-        Some(expected_chain_epoch.finalized_height.value())
+        response.latest_writer_safe_tip_height,
+        Some(expected_chain_epoch.safe_tip_height.value())
     );
 
     cancel.cancel();

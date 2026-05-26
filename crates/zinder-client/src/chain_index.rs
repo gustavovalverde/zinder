@@ -51,8 +51,8 @@ pub struct ChainEventEnvelope {
     pub event_sequence: u64,
     /// Chain epoch visible after this event.
     pub chain_epoch: ChainEpoch,
-    /// Finalized height reported with this event.
-    pub finalized_height: BlockHeight,
+    /// Safe tip height reported with this event.
+    pub safe_tip_height: BlockHeight,
     /// Canonical chain transition.
     pub event: ChainEvent,
 }
@@ -62,12 +62,12 @@ pub struct ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip or finalized prefix.
+    /// A non-reorg commit advanced the canonical tip or safe-tip prefix.
     ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
-    /// A non-finalized range was replaced.
+    /// A range that had not yet reached the safe tip was replaced.
     ChainReorged {
         /// Previously visible range invalidated by this transition.
         reverted: ChainRangeReverted,
@@ -387,6 +387,24 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// # let _ = block; Ok(()) }
     /// ```
     async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError>;
+
+    /// Resolves the block at the chain epoch's safe tip (the height a
+    /// wallet may safely use as its scan ceiling: both a compact block and
+    /// a coherent tree-state checkpoint are guaranteed available within the
+    /// wallet's rewind cap of that height).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let block = client.latest_safe_block(None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
+    async fn latest_safe_block(
+        &self,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError>;
 
     /// Resolves a block selector against the canonical best chain.
     ///

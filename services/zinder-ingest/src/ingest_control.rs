@@ -185,8 +185,8 @@ impl IngestControl for IngestControlGrpcAdapter {
                     network_name: encode_zinder_native_chain_name(self.network).to_owned(),
                     latest_writer_chain_epoch_id: chain_epoch.map(|epoch| epoch.id.value()),
                     latest_writer_tip_height: chain_epoch.map(|epoch| epoch.tip_height.value()),
-                    latest_writer_finalized_height: chain_epoch
-                        .map(|epoch| epoch.finalized_height.value()),
+                    latest_writer_safe_tip_height: chain_epoch
+                        .map(|epoch| epoch.safe_tip_height.value()),
                     phase: WriterPhase::Unspecified.into(),
                     gap_blocks: None,
                     upstream_not_ready: None,
@@ -708,10 +708,10 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
     )
     .set(u32_to_f64(chain_epoch.tip_height.value()));
     metrics::gauge!(
-        "zinder_ingest_writer_finalized_height",
+        "zinder_ingest_writer_safe_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.finalized_height.value()));
+    .set(u32_to_f64(chain_epoch.safe_tip_height.value()));
 }
 
 fn record_empty_writer_progress(network: Network) {
@@ -731,7 +731,7 @@ fn record_empty_writer_progress(network: Network) {
     )
     .set(0.0);
     metrics::gauge!(
-        "zinder_ingest_writer_finalized_height",
+        "zinder_ingest_writer_safe_tip_height",
         "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);

@@ -522,7 +522,7 @@ struct IngestSection {
     /// reserves `auto`, `zebra-indexer-grpc`, and `zebra-in-process`.
     source: Option<String>,
     /// Chain-truth invariant: how deep into the upstream tip the
-    /// finalized cliff sits. Defaults to `100`.
+    /// safe-tip cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
     /// Phase classifier knobs.
     phases: IngestPhasesSection,

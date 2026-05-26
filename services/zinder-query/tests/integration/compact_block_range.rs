@@ -110,12 +110,12 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         encode_rpc_block_hash_hex(chain_epoch.tip_hash)
     );
     assert_eq!(
-        response_chain_epoch.finalized_height,
-        chain_epoch.finalized_height.value()
+        response_chain_epoch.safe_tip_height,
+        chain_epoch.safe_tip_height.value()
     );
     assert_eq!(
-        response_chain_epoch.finalized_hash,
-        encode_rpc_block_hash_hex(chain_epoch.finalized_hash)
+        response_chain_epoch.safe_tip_hash,
+        encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash)
     );
     assert_eq!(
         response_chain_epoch.artifact_schema_version,
@@ -570,8 +570,8 @@ fn compact_block_range_chunk(
             network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
             tip_height: chain_epoch.tip_height.value(),
             tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-            finalized_height: chain_epoch.finalized_height.value(),
-            finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
+            safe_tip_height: chain_epoch.safe_tip_height.value(),
+            safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
             artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
             created_at_millis: chain_epoch.created_at.value(),
             sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,

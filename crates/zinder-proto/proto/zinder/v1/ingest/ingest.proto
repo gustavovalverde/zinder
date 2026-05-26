@@ -60,8 +60,9 @@ message WriterStatusResponse {
   // Writer's visible tip height for latest_writer_chain_epoch_id.
   optional uint32 latest_writer_tip_height = 3;
 
-  // Writer's finalized height for latest_writer_chain_epoch_id.
-  optional uint32 latest_writer_finalized_height = 4;
+  // Writer's safe tip height for latest_writer_chain_epoch_id (the height at
+  // which the writer's commitments are past the reorg window).
+  optional uint32 latest_writer_safe_tip_height = 4;
 
   // Current phase of the unified ingest loop. ADR-0015.
   WriterPhase phase = 5;

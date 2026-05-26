@@ -203,10 +203,12 @@ pub struct ChainEpoch {
     pub tip_height: BlockHeight,
     /// Best visible tip hash for this chain epoch.
     pub tip_hash: BlockHash,
-    /// Finalized height for this chain epoch.
-    pub finalized_height: BlockHeight,
-    /// Finalized block hash for this chain epoch.
-    pub finalized_hash: BlockHash,
+    /// Highest height in this chain epoch for which both compact-block and
+    /// commitment-tree artifacts are coherent past the reorg window. The
+    /// wallet uses this as its scan ceiling; see ADR-0005 in the zally repo.
+    pub safe_tip_height: BlockHeight,
+    /// Block hash at `safe_tip_height`.
+    pub safe_tip_hash: BlockHash,
     /// Artifact schema version used by artifacts in this chain epoch.
     pub artifact_schema_version: ArtifactSchemaVersion,
     /// Chain-derived metadata at the visible tip.

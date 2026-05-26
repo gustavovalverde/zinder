@@ -623,7 +623,7 @@ async fn handle_loop_outcome(
                 from_height = from_height.value(),
                 replacement_depth,
                 configured_window_blocks,
-                "ingest reorg replacement crossed the configured non-finalized window; readiness drained for operator review"
+                "ingest reorg replacement crossed the configured reorg window; readiness drained for operator review"
             );
             readiness.set(ReadinessState::reorg_window_exceeded(
                 u64::from(replacement_depth),

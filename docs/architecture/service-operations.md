@@ -156,7 +156,7 @@ Implemented baseline metrics:
 | `zinder_ingest_writer_has_chain_epoch` | gauge | `zinder-ingest` | Whether the ingest writer currently has a visible chain epoch. |
 | `zinder_ingest_writer_chain_epoch_id` | gauge | `zinder-ingest` | Latest visible chain-epoch id published by the ingest writer. |
 | `zinder_ingest_writer_tip_height` | gauge | `zinder-ingest` | Latest visible tip height published by the ingest writer. |
-| `zinder_ingest_writer_finalized_height` | gauge | `zinder-ingest` | Latest visible finalized height published by the ingest writer. |
+| `zinder_ingest_writer_safe_tip_height` | gauge | `zinder-ingest` | Latest visible safe tip height published by the ingest writer. |
 | `zinder_ingest_writer_status_request_duration_seconds` | histogram | `zinder-ingest` | Private writer-status RPC latency by status and error class. |
 | `zinder_ingest_writer_status_request_total` | counter | `zinder-ingest` | Private writer-status RPC count by status and error class. |
 | `zinder_ingest_writer_status_available` | gauge | `zinder-ingest` | Whether the latest writer-status RPC served successfully. |
@@ -178,7 +178,7 @@ Implemented baseline metrics:
 | `zinder_query_writer_status_has_chain_epoch` | gauge | `zinder-query` | Whether the latest writer-status response carried a writer chain epoch. |
 | `zinder_query_writer_status_chain_epoch_id` | gauge | `zinder-query` | Latest writer chain-epoch id observed through writer status. |
 | `zinder_query_writer_status_tip_height` | gauge | `zinder-query` | Latest writer tip height observed through writer status. |
-| `zinder_query_writer_status_finalized_height` | gauge | `zinder-query` | Latest writer finalized height observed through writer status. |
+| `zinder_query_writer_status_safe_tip_height` | gauge | `zinder-query` | Latest writer safe tip height observed through writer status. |
 | `zinder_store_read_duration_seconds` | histogram | `zinder-store` | RocksDB read latency by operation, column family, and status. |
 | `zinder_store_read_bytes_total` | counter | `zinder-store` | Bytes returned from successful RocksDB reads. |
 | `zinder_store_multi_get_key_count` | histogram | `zinder-store` | Key fanout for `multi_get` reads. |
@@ -212,7 +212,7 @@ P95, P99, and worst-case values before updating performance-budget tables.
 `zinder-ingest` should also expose:
 
 - Current chain height.
-- Current finalized height.
+- Current safe tip height.
 - Source height.
 - Chain lag.
 - Blocks processed per second.
@@ -391,7 +391,7 @@ Configuration output must make redaction observable. If `--print-config` include
 | `event`                       | Level  | Triggered by                                     |
 | ----------------------------- | ------ | ------------------------------------------------ |
 | `chain_committed`             | INFO   | Pure append, finalization advance, or any other transition that does not invalidate visible blocks |
-| `chain_reorged`               | WARN   | A non-finalized range is replaced by a new committed range inside the reorg window |
+| `chain_reorged`               | WARN   | A range within the reorg window is replaced by a new committed range inside the reorg window |
 | `ingest_started`              | INFO   | The unified ingest loop begins (after store open and upstream probe) |
 | `ingest_phase_changed`        | INFO   | The loop's classifier moves between `awaiting_upstream`, `bulk_catchup`, and `following_tip`; carries `from`, `to`, `gap_blocks` |
 | `ingest_source_unavailable`   | WARN   | The loop observed an upstream source failure and moved readiness to `node_unavailable` (tagged with `phase`, `failure_class`) |
@@ -401,7 +401,7 @@ Configuration output must make redaction observable. If `--print-config` include
 | `ingest_stopped`              | INFO   | The loop exits because the cancellation token fired or a fatal error escaped |
 | `ingest_run_failed`           | ERROR  | The process returned an error before clean shutdown |
 
-`chain_committed` carries `chain_epoch_id`, `network`, `tip_height`, `tip_hash`, `finalized_height`, `block_range_start`, `block_range_end`, `event_sequence`, and `phase` (`bulk_catchup` or `following_tip`). `chain_reorged` extends that schema with `committed_block_range_start`, `committed_block_range_end`, `reverted_block_range_start`, and `reverted_block_range_end`. `event_sequence` matches the monotonic chain-event sequence persisted by the store, so operators can correlate logs with `chain_event_history` cursor positions.
+`chain_committed` carries `chain_epoch_id`, `network`, `tip_height`, `tip_hash`, `safe_tip_height`, `block_range_start`, `block_range_end`, `event_sequence`, and `phase` (`bulk_catchup` or `following_tip`). `chain_reorged` extends that schema with `committed_block_range_start`, `committed_block_range_end`, `reverted_block_range_start`, and `reverted_block_range_end`. `event_sequence` matches the monotonic chain-event sequence persisted by the store, so operators can correlate logs with `chain_event_history` cursor positions.
 
 The two chain-transition event names (`chain_committed`, `chain_reorged`) match the `ChainEvent` variants defined in [chain events](chain-events.md). Future variants must extend this table before code emits them.
 

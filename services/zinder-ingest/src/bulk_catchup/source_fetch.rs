@@ -364,7 +364,7 @@ where
                     reason: "source chain segment reverted during bulk catchup",
                 }));
             }
-            SourceChainUpdate::FinalizedTip { .. } => {}
+            SourceChainUpdate::SafeTip { .. } => {}
         }
     }
 

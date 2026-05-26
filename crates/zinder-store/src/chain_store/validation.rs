@@ -39,7 +39,7 @@ pub(super) fn validate_chain_epoch_artifacts(
     validate_artifact_presence(artifacts)?;
 
     let tip_height = artifacts.chain_epoch.tip_height;
-    validate_finalized_height(artifacts.chain_epoch)?;
+    validate_safe_tip_height(artifacts.chain_epoch)?;
     let block_hash_by_height = block_hash_by_height(&artifacts.block_headers)?;
     validate_committed_boundary_hash_if_present(
         artifacts.chain_epoch.tip_height,
@@ -48,10 +48,10 @@ pub(super) fn validate_chain_epoch_artifacts(
         "tip hash must match the committed block at tip height",
     )?;
     validate_committed_boundary_hash_if_present(
-        artifacts.chain_epoch.finalized_height,
-        artifacts.chain_epoch.finalized_hash,
+        artifacts.chain_epoch.safe_tip_height,
+        artifacts.chain_epoch.safe_tip_hash,
         &block_hash_by_height,
-        "finalized hash must match the committed block at finalized height",
+        "safe_tip_hash must match the committed block at safe_tip_height",
     )?;
     validate_block_header_artifacts(&artifacts.block_headers, tip_height)?;
     validate_compact_block_artifacts(&artifacts.compact_blocks, tip_height, &block_hash_by_height)?;
@@ -88,9 +88,9 @@ pub(super) fn committed_block_range(
         return Ok(changed_block_range);
     }
 
-    if finalized_only_commit_without_artifacts(artifacts) {
+    if safe_tip_only_commit_without_artifacts(artifacts) {
         return Ok(BlockHeightRange::empty_at(
-            artifacts.chain_epoch.finalized_height,
+            artifacts.chain_epoch.safe_tip_height,
         ));
     }
 
@@ -103,13 +103,13 @@ pub(super) fn committed_block_range(
 }
 
 fn validate_artifact_presence(artifacts: &ChainEpochArtifacts) -> Result<(), StoreError> {
-    if finalized_only_commit_without_artifacts(artifacts) {
+    if safe_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     if artifacts.block_headers.is_empty() {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "at least one finalized block artifact is required",
+            reason: "at least one safe-tip block artifact is required",
         });
     }
 
@@ -122,10 +122,10 @@ fn validate_artifact_presence(artifacts: &ChainEpochArtifacts) -> Result<(), Sto
     Ok(())
 }
 
-fn finalized_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bool {
+fn safe_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bool {
     matches!(
         artifacts.reorg_window_change,
-        ReorgWindowChange::FinalizeThrough { .. }
+        ReorgWindowChange::AdvanceSafeTipTo { .. }
     ) && artifacts.block_headers.is_empty()
         && artifacts.compact_blocks.is_empty()
         && artifacts.transaction_facts.is_empty()
@@ -157,7 +157,7 @@ pub(super) fn validate_reorg_window_change(
                 return Err(StoreError::ReorgWindowExceeded {
                     attempted_from_height: from_height,
                     minimum_reorg_height,
-                    finalized_height: current_chain_epoch.finalized_height,
+                    safe_tip_height: current_chain_epoch.safe_tip_height,
                 });
             }
 
@@ -173,13 +173,13 @@ pub(super) fn validate_reorg_window_change(
                 });
             }
 
-            validate_replacement_preserves_finalized_anchor(artifacts, current_chain_epoch)?;
+            validate_replacement_preserves_safe_tip_anchor(artifacts, current_chain_epoch)?;
             validate_replacement_artifact_coverage(artifacts, from_height)
         }
-        ReorgWindowChange::FinalizeThrough { height } => {
-            if height > artifacts.chain_epoch.finalized_height {
+        ReorgWindowChange::AdvanceSafeTipTo { height } => {
+            if height > artifacts.chain_epoch.safe_tip_height {
                 return Err(StoreError::InvalidChainEpochArtifacts {
-                    reason: "finalize-through height cannot exceed epoch finalized height",
+                    reason: "AdvanceSafeTipTo height cannot exceed epoch safe_tip_height",
                 });
             }
 
@@ -212,7 +212,7 @@ pub(super) fn validate_visible_chain_commit(
         current_chain_epoch,
         changed_block_range,
     )?;
-    validate_finalized_hash_against_visible_chain(inner, artifacts, current_chain_epoch)
+    validate_safe_tip_hash_against_visible_chain(inner, artifacts, current_chain_epoch)
 }
 
 pub(super) fn block_height_range(
@@ -243,7 +243,7 @@ fn changed_block_range(
     // Bootstrap commit (empty store seeded by an operator-supplied
     // checkpoint) publishes no block artifacts, so it has no changed range.
     // See `validate_chain_epoch_range_coverage` for the full contract.
-    if current_chain_epoch.is_none() && finalized_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
         return None;
     }
 
@@ -253,7 +253,7 @@ fn changed_block_range(
             artifacts.chain_epoch.tip_height,
         )),
         ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::FinalizeThrough { .. }
+        | ReorgWindowChange::AdvanceSafeTipTo { .. }
         | ReorgWindowChange::Unchanged => match current_chain_epoch {
             Some(current_chain_epoch)
                 if artifacts.chain_epoch.tip_height > current_chain_epoch.tip_height =>
@@ -349,28 +349,28 @@ fn validate_committed_block_parent_links(
     Ok(())
 }
 
-fn validate_finalized_hash_against_visible_chain(
+fn validate_safe_tip_hash_against_visible_chain(
     inner: &RocksChainStore,
     artifacts: &ChainEpochArtifacts,
     current_chain_epoch: Option<ChainEpoch>,
 ) -> Result<(), StoreError> {
-    let finalized_height = artifacts.chain_epoch.finalized_height;
-    if finalized_height.value() == 0 {
+    let safe_tip_height = artifacts.chain_epoch.safe_tip_height;
+    if safe_tip_height.value() == 0 {
         return Ok(());
     }
 
-    // Bootstrap commit: the operator-supplied finalized hash is the
+    // Bootstrap commit: the operator-supplied safe_tip_hash is the
     // checkpoint's anchor of trust; there is no prior chain to validate
     // against.
-    if current_chain_epoch.is_none() && finalized_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     let committed_hash_by_height = block_hash_by_height(&artifacts.block_headers)?;
-    if let Some(committed_hash) = committed_hash_by_height.get(&finalized_height) {
-        if *committed_hash != artifacts.chain_epoch.finalized_hash {
+    if let Some(committed_hash) = committed_hash_by_height.get(&safe_tip_height) {
+        if *committed_hash != artifacts.chain_epoch.safe_tip_hash {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "finalized hash must match the committed block at finalized height",
+                reason: "safe_tip_hash must match the committed block at safe_tip_height",
             });
         }
 
@@ -378,17 +378,17 @@ fn validate_finalized_hash_against_visible_chain(
     }
 
     if let Some(current_chain_epoch) = current_chain_epoch
-        && finalized_height <= current_chain_epoch.tip_height
+        && safe_tip_height <= current_chain_epoch.tip_height
     {
-        let finalized_hash =
-            visible_block_hash_at(inner, Some(current_chain_epoch), finalized_height)?;
-        if finalized_hash == artifacts.chain_epoch.finalized_hash {
+        let safe_tip_hash =
+            visible_block_hash_at(inner, Some(current_chain_epoch), safe_tip_height)?;
+        if safe_tip_hash == artifacts.chain_epoch.safe_tip_hash {
             return Ok(());
         }
     }
 
     Err(StoreError::InvalidChainEpochArtifacts {
-        reason: "finalized hash must match the visible block at finalized height",
+        reason: "safe_tip_hash must match the visible block at safe_tip_height",
     })
 }
 
@@ -418,14 +418,14 @@ fn validate_chain_epoch_range_coverage(
     // checkpoint. Validation cannot demand block coverage because the
     // operator deliberately did not replay the chain prefix; reads at
     // heights below the checkpoint return `ArtifactUnavailable`.
-    if current_chain_epoch.is_none() && finalized_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     match artifacts.reorg_window_change {
         ReorgWindowChange::Replace { .. } => Ok(()),
         ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::FinalizeThrough { .. }
+        | ReorgWindowChange::AdvanceSafeTipTo { .. }
         | ReorgWindowChange::Unchanged => {
             let required_range = match current_chain_epoch {
                 Some(current_chain_epoch)
@@ -479,9 +479,9 @@ fn validate_non_reorg_chain_epoch_progression(
         });
     }
 
-    if chain_epoch.finalized_height < current_chain_epoch.finalized_height {
+    if chain_epoch.safe_tip_height < current_chain_epoch.safe_tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "non-replacement commit cannot lower finalized height",
+            reason: "non-replacement commit cannot lower safe_tip_height",
         });
     }
 
@@ -493,11 +493,11 @@ fn validate_non_reorg_chain_epoch_progression(
         });
     }
 
-    if chain_epoch.finalized_height == current_chain_epoch.finalized_height
-        && chain_epoch.finalized_hash != current_chain_epoch.finalized_hash
+    if chain_epoch.safe_tip_height == current_chain_epoch.safe_tip_height
+        && chain_epoch.safe_tip_hash != current_chain_epoch.safe_tip_hash
     {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "non-replacement commit cannot change the finalized hash at the current finalized height",
+            reason: "non-replacement commit cannot change safe_tip_hash at the current safe_tip_height",
         });
     }
 
@@ -505,13 +505,13 @@ fn validate_non_reorg_chain_epoch_progression(
 }
 
 fn minimum_reorg_height(chain_epoch: ChainEpoch, reorg_window_blocks: u32) -> BlockHeight {
-    let finalized_floor = chain_epoch.finalized_height.value().saturating_add(1);
+    let safe_tip_floor = chain_epoch.safe_tip_height.value().saturating_add(1);
     let window_floor = chain_epoch
         .tip_height
         .value()
         .saturating_sub(reorg_window_blocks.saturating_sub(1));
 
-    BlockHeight::new(finalized_floor.max(window_floor))
+    BlockHeight::new(safe_tip_floor.max(window_floor))
 }
 
 fn validate_replacement_artifact_coverage(
@@ -525,21 +525,21 @@ fn validate_replacement_artifact_coverage(
     )
 }
 
-fn validate_replacement_preserves_finalized_anchor(
+fn validate_replacement_preserves_safe_tip_anchor(
     artifacts: &ChainEpochArtifacts,
     current_chain_epoch: ChainEpoch,
 ) -> Result<(), StoreError> {
-    if artifacts.chain_epoch.finalized_height < current_chain_epoch.finalized_height {
+    if artifacts.chain_epoch.safe_tip_height < current_chain_epoch.safe_tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "replacement commit cannot lower finalized height",
+            reason: "replacement commit cannot lower safe_tip_height",
         });
     }
 
-    if artifacts.chain_epoch.finalized_height == current_chain_epoch.finalized_height
-        && artifacts.chain_epoch.finalized_hash != current_chain_epoch.finalized_hash
+    if artifacts.chain_epoch.safe_tip_height == current_chain_epoch.safe_tip_height
+        && artifacts.chain_epoch.safe_tip_hash != current_chain_epoch.safe_tip_hash
     {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "replacement commit cannot change the current finalized hash",
+            reason: "replacement commit cannot change the current safe_tip_hash",
         });
     }
 
@@ -571,10 +571,10 @@ fn validate_required_block_coverage(
     Ok(())
 }
 
-fn validate_finalized_height(chain_epoch: ChainEpoch) -> Result<(), StoreError> {
-    if chain_epoch.finalized_height > chain_epoch.tip_height {
+fn validate_safe_tip_height(chain_epoch: ChainEpoch) -> Result<(), StoreError> {
+    if chain_epoch.safe_tip_height > chain_epoch.tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "finalized height cannot exceed tip height",
+            reason: "safe_tip_height cannot exceed tip height",
         });
     }
 

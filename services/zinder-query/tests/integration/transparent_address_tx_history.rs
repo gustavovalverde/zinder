@@ -281,14 +281,14 @@ fn commit_reorged_tx_index_rows(
     derive_store: &zinder_derive::DeriveStore,
     address_script_hash: TransparentAddressScriptHash,
 ) -> eyre::Result<()> {
-    let (finalized_epoch, finalized_block, finalized_compact_block) = synthetic_chain_epoch(1, 1);
+    let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_chain_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_chain_epoch(1, 2);
-    initial_epoch.finalized_height = finalized_epoch.tip_height;
-    initial_epoch.finalized_hash = finalized_epoch.tip_hash;
+    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
+    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
-        vec![finalized_block.clone(), initial_block],
-        vec![finalized_compact_block, initial_compact_block],
+        vec![safe_tip_block.clone(), initial_block],
+        vec![safe_tip_compact_block, initial_compact_block],
     ))?;
 
     let replacement_height = BlockHeight::new(2);
@@ -298,8 +298,8 @@ fn commit_reorged_tx_index_rows(
         network: Network::ZcashRegtest,
         tip_height: replacement_height,
         tip_hash: replacement_hash,
-        finalized_height: finalized_epoch.tip_height,
-        finalized_hash: finalized_epoch.tip_hash,
+        safe_tip_height: safe_tip_epoch.tip_height,
+        safe_tip_hash: safe_tip_epoch.tip_hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_020),
@@ -307,7 +307,7 @@ fn commit_reorged_tx_index_rows(
     let replacement_block = BlockHeaderArtifact::new(
         replacement_height,
         replacement_hash,
-        finalized_block.block_hash,
+        safe_tip_block.block_hash,
         [0; 32],
         [0; 32],
         0,

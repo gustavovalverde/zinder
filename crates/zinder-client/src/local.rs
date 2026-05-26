@@ -222,6 +222,20 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
+    async fn latest_safe_block(
+        &self,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<BlockId, IndexerError> {
+        self.read_at_epoch(at_epoch, |reader| {
+            let chain_epoch = reader.chain_epoch();
+            Ok(BlockId {
+                height: chain_epoch.safe_tip_height,
+                hash: chain_epoch.safe_tip_hash,
+            })
+        })
+        .await
+    }
+
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,

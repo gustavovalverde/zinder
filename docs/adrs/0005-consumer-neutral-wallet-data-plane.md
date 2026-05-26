@@ -13,7 +13,7 @@ A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwa
 
 - `lightwalletd` exposes `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos`, and `GetAddressUtxosStream` as first-class `CompactTxStreamer` methods.
 - Zallet's `wallet` code fetches birthday tree state at `birthday - 1`, loads Sapling and Orchard subtree roots from index `0`, and polls transparent UTXOs for wallet-owned transparent receivers.
-- Zallet and in-process Rust applications need a typed `ChainIndex` model with snapshot semantics for atomic non-finalized reads.
+- Zallet and in-process Rust applications need a typed `ChainIndex` model with snapshot semantics for atomic reads above the safe tip.
 
 The architectural risk is treating one wallet as the design center. App-specific
 patches would leave Zinder without a durable consumer contract. The opposite
@@ -84,7 +84,7 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows use explicit disposable stores or tip-follow rather than near-tip finalized bulk catchup.
+- Local test workflows use explicit disposable stores or tip-follow rather than near-tip safe-tip bulk catchup.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:

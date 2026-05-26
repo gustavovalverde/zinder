@@ -102,7 +102,7 @@ pub struct BulkCatchupRunConfig {
     /// Maximum reserved derived artifact bytes across active and completed
     /// block-prepare work.
     pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
-    /// Maximum finalized artifact bytes that can accumulate while the previous
+    /// Maximum safe-tip artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
     /// Force a `RocksDB` flush after committing this many epochs. See
@@ -727,8 +727,8 @@ fn bootstrap_from_checkpoint_if_needed(
         network,
         tip_height: checkpoint.height,
         tip_hash: checkpoint.hash,
-        finalized_height: checkpoint.height,
-        finalized_hash: checkpoint.hash,
+        safe_tip_height: checkpoint.height,
+        safe_tip_hash: checkpoint.hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: checkpoint.tip_metadata,
         created_at: current_unix_millis()?,
@@ -739,7 +739,7 @@ fn bootstrap_from_checkpoint_if_needed(
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
         )
-        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
             height: checkpoint.height,
         }),
     )?;
@@ -2385,8 +2385,8 @@ mod tests {
             network: Network::ZcashRegtest,
             tip_height,
             tip_hash: block_hash(tip_height.value()),
-            finalized_height: tip_height,
-            finalized_hash: block_hash(tip_height.value()),
+            safe_tip_height: tip_height,
+            safe_tip_hash: block_hash(tip_height.value()),
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),

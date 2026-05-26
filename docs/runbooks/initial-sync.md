@@ -53,7 +53,7 @@ Steady state:
   "cause": "ready",
   "current_height": 4016431,
   "target_height": 4016431,
-  "finalized_height": 4016331
+  "safe_tip_height": 4016331
 }
 ```
 

@@ -584,7 +584,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum finalized artifact bytes that can accumulate while the previous \
+        description: "Maximum safe-tip artifact bytes that can accumulate while the previous \
                       bulk-catchup batch is attaching metadata, committing, or flushing. \
                       Defaults to 536870912.",
     },

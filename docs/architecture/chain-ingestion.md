@@ -102,7 +102,7 @@ An epoch becomes visible only after:
 - Parent and child links are internally consistent.
 - Compact block artifacts match their source blocks.
 - Reorg-window metadata is updated.
-- Finalized prefix metadata is updated.
+- Safe-tip prefix metadata is updated.
 - The commit transaction succeeds.
 
 Readers should either see the old epoch or the new epoch. They should not see a half-committed epoch.
@@ -111,7 +111,7 @@ Readers should either see the old epoch or the new epoch. They should not see a 
 
 Reorgs are normal control flow, not exception paths. The pipeline is the same as in §Operation Shape; reorg-specific invariants:
 
-- Reorgs inside the configured window apply by replacing non-finalized state.
+- Reorgs inside the configured window apply by replacing state above the safe tip.
 - Reorgs beyond the configured window fail closed with `ReorgWindowExceeded` and require operator intervention.
 - When a source exposes competing branches, best-chain selection uses cumulative chainwork, not tip height. The current polling source observes one upstream-node-selected best chain and validates parent-hash continuity.
 - Empty-chain startup is a first-class state through `ChainEpoch::empty()`. Genesis, height 1, and short regtest chains are valid inputs, not exceptional cases.
@@ -124,7 +124,7 @@ The unified ingest loop classifies its work into one of three phases at every it
 
 All phases share the same artifact builders and commit path. The source adapter is identical across phases. What differs is fetch shape (pipelined vs serial) and commit shape (`FinalizeThrough` vs `Extend`/`Replace` plus a separate finalization step).
 
-Source capability detection happens before processing starts. If the selected source cannot provide required data such as finalized height, chainwork, non-finalized blocks, or transaction broadcast support, ingestion fails closed with a typed startup or readiness cause.
+Source capability detection happens before processing starts. If the selected source cannot provide required data such as safe tip height, chainwork, non-finalized-blocks support, or transaction broadcast support, ingestion fails closed with a typed startup or readiness cause.
 
 ### Phase transitions
 
@@ -144,7 +144,7 @@ Bulk catch-up reaches single-digit-hours mainnet sync through bounded source fet
 2. **Byte-watermarked source prefetch with ordered reassembly.** Source segment requests complete out of order through `FuturesUnordered`, then `source segment reassembly` yields blocks in canonical height order. The active-request budget is `source_fetch_max_in_flight_requests`; `source_fetch_max_in_flight_bytes` covers active worst-case response reservations plus completed out-of-order source bytes waiting for earlier heights. Each active request reserves `node.max_response_bytes` before fetch and releases or shrinks the reservation only after the response is decoded, so dense ranges apply back-pressure by shrinking segment size or pausing scheduling instead of expanding process memory without limit.
 3. **Resource-bounded canonical batches.** `canonical_batch_max_blocks` is an upper bound, not the only trigger. The in-flight canonical batch also commits when it reaches `canonical_batch_max_artifact_bytes`, or when `canonical_batch_max_estimated_write_bytes` is reached after `canonical_batch_min_blocks_before_estimated_write_close`. Raw transaction, transparent-output, and transparent-spend-reference counts remain metrics for diagnosis; they are not separate batch-closing contracts. Dense ranges write smaller chain epochs before RocksDB write-batch construction can consume the cgroup memory budget, while transparent-input-heavy historical ranges avoid collapsing into tiny commits.
 4. **Parallel canonical block prepare with ordered reassembly.** Each connected block from the segment is handed to a block-prepare worker. The worker derives canonical block artifacts and prefetches already-visible spent transparent outputs before the block enters ordered reassembly. Up to `ingest.bulk_catchup.block_prepare_concurrency` blocks prepare concurrently, and `block_prepare_max_in_flight_artifact_bytes` bounds active plus completed derived artifacts and prefetched output payloads. Completed prepared blocks can return out of order, but `block-prepare reassembly` emits them in canonical height order before the serial `finalize_derived_block` fold. Commit still performs the authoritative fallback lookup for same-batch outputs and outputs that became visible after an overlapped previous commit.
-5. **Overlapped commit under bounded reassembly.** Subtree-root attachment, checkpoint tree-state fetch, canonical commit, and optional flush remain serial for each chain epoch, but the source and block-prepare stages can continue while one commit is in flight. `commit_reassembly_max_queued_artifact_bytes` bounds the next finalized batch while the previous batch is attaching metadata, committing, or flushing.
+5. **Overlapped commit under bounded reassembly.** Subtree-root attachment, checkpoint tree-state fetch, canonical commit, and optional flush remain serial for each chain epoch, but the source and block-prepare stages can continue while one commit is in flight. `commit_reassembly_max_queued_artifact_bytes` bounds the next built batch while the previous batch is attaching metadata, committing, or flushing.
 6. **Bounded derive replay.** Startup derive replay uses `ingest.derive.replay_batch_blocks`, `ingest.derive.replay_policy`, and memory watermarks under `[ingest.derive]`. Canonical-first replay shrinks the effective batch size at `memory_degrade_ratio`, pauses at `memory_pause_ratio`, resumes from pause as degraded work below `memory_pause_ratio`, and returns to the normal batch size below `memory_resume_ratio`; `min_replay_batch_blocks` is the lowest degraded batch size before pause.
 
 Tip-follow stays serial: it commits one block per poll because by definition it is following the tip, where pipelining offers no headroom. The same `derive_block` and `finalize_derived_block` functions feed the tip-follow loop, just sequentially.
@@ -241,8 +241,8 @@ Schema validation lives in `zinder-store` per [Storage backend §Schema Compatib
 
 ## First Invariants
 
-- Canonical storage is append-only for finalized data.
-- Non-finalized storage is replaceable only through the reorg state machine.
+- Canonical storage is append-only at or below the safe tip.
+- Storage above the safe tip is replaceable only through the reorg state machine.
 - Every visible query response that depends on chain state comes from one epoch.
 - Every artifact has a schema version.
 - Derived indexes are replayable from canonical artifacts.

@@ -560,7 +560,7 @@ Work:
 - Fold commitment-tree sizes only when the next expected height is available.
 - Keep `finalize_derived_block` single-threaded unless a future proof shows a
   safe associative fold.
-- Accumulate `CanonicalBatch` by finalized height order.
+- Accumulate `CanonicalBatch` by safe tip height order.
 - Preserve all current batch close triggers:
   - block count
   - artifact bytes

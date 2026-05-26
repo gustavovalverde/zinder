@@ -38,8 +38,8 @@ Direct embedded reads outside that contract are allowed only for `zinder dev` co
 - `network`
 - `tip_height`
 - `tip_hash`
-- `finalized_height`
-- `finalized_hash`
+- `safe_tip_height`
+- `safe_tip_hash`
 - `artifact_schema_version`
 - `tip_metadata`
 - `created_at`
@@ -76,8 +76,8 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `transparent_output_block_index` | Block-local transparent outpoint lists used to bound current-projection repair during reorg replacement |
 | `transparent_spend_fact` | Exact canonical `(network, spent_outpoint)` projection for resolved transparent spend facts |
 | `transparent_spend_fact_block_index` | Block-local spent-outpoint lists used to bound current spend-projection repair during reorg replacement |
-| `block_hash_index` | Best-chain `(network, block_hash) -> (height, source_chain_epoch_id)` resolver written on every finalized-block commit. Monotonic: reorged-out hashes are filtered at read time and never deleted, so the family grows roughly one row per finalized block (~50K rows per year on mainnet). A future retention pass may prune rows older than the reorg window once an active-reader proof exists. |
-| `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable non-finalized links |
+| `block_hash_index` | Best-chain `(network, block_hash) -> (height, source_chain_epoch_id)` resolver written on every safe-tip block commit. Monotonic: reorged-out hashes are filtered at read time and never deleted, so the family grows roughly one row per finalized block (~50K rows per year on mainnet). A future retention pass may prune rows older than the reorg window once an active-reader proof exists. |
+| `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable links within the reorg window |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
 | `mempool_event` | Durable mempool-event log per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
 
@@ -99,7 +99,7 @@ pattern justifies table-specific tuning.
 
 Readers must revalidate branch identity before returning data from a visibility lookup. For example, transaction lookup can find an older same-transaction-id row from a reorged branch, so the reader checks that the artifact's block hash still matches the visible block at that height before returning it.
 
-Production storage needs an explicit lifecycle for stale visibility rows before mainnet-scale ingest. Reorg replacement must not synchronously delete visibility rows for the replaced non-finalized range, because a secondary reader may have pinned the previous `ChainEpoch` without a RocksDB snapshot. Stale visibility rows are pruned only by an explicit retention pass that can prove no active reader, retained event cursor, or configured replay window can still need them.
+Production storage needs an explicit lifecycle for stale visibility rows before mainnet-scale ingest. Reorg replacement must not synchronously delete visibility rows for the replaced range within the reorg window, because a secondary reader may have pinned the previous `ChainEpoch` without a RocksDB snapshot. Stale visibility rows are pruned only by an explicit retention pass that can prove no active reader, retained event cursor, or configured replay window can still need them.
 
 ## Commit Protocol
 
@@ -156,7 +156,7 @@ The primary/secondary contract is in [ADR-0003](../adrs/0003-canonical-storage-a
 Readiness causes and operational metrics are owned by [Service operations](service-operations.md). Storage-specific metrics:
 
 - Current `ChainEpoch` height and hash.
-- Finalized height and hash.
+- Safe tip height and hash.
 - Commit latency. `zinder-ingest` records
   `zinder_ingest_commit_duration_seconds`; `zinder-store` records
   `zinder_store_write_batch_duration_seconds`.

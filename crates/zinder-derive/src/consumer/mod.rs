@@ -94,8 +94,8 @@ pub struct ChainCommittedEvent {
     pub event_sequence: u64,
     /// Chain epoch visible after the commit.
     pub chain_epoch: ChainEpoch,
-    /// Finalized block height that was true at delivery time.
-    pub finalized_height: BlockHeight,
+    /// Safe tip block height that was true at delivery time.
+    pub safe_tip_height: BlockHeight,
     /// First committed block height (inclusive).
     pub start_height: BlockHeight,
     /// Last committed block height (inclusive).
@@ -108,14 +108,14 @@ impl ChainCommittedEvent {
     pub const fn new(
         event_sequence: u64,
         chain_epoch: ChainEpoch,
-        finalized_height: BlockHeight,
+        safe_tip_height: BlockHeight,
         start_height: BlockHeight,
         end_height: BlockHeight,
     ) -> Self {
         Self {
             event_sequence,
             chain_epoch,
-            finalized_height,
+            safe_tip_height,
             start_height,
             end_height,
         }
@@ -130,8 +130,8 @@ pub struct ChainReorgedEvent {
     pub event_sequence: u64,
     /// Chain epoch visible after the reorg replacement commits.
     pub chain_epoch: ChainEpoch,
-    /// Finalized block height that was true at delivery time.
-    pub finalized_height: BlockHeight,
+    /// Safe tip block height that was true at delivery time.
+    pub safe_tip_height: BlockHeight,
     /// Range invalidated by the reorg.
     pub reverted: RevertedRange,
     /// Replacement range committed by the reorg.
@@ -144,14 +144,14 @@ impl ChainReorgedEvent {
     pub const fn new(
         event_sequence: u64,
         chain_epoch: ChainEpoch,
-        finalized_height: BlockHeight,
+        safe_tip_height: BlockHeight,
         reverted: RevertedRange,
         replacement: CommittedRange,
     ) -> Self {
         Self {
             event_sequence,
             chain_epoch,
-            finalized_height,
+            safe_tip_height,
             reverted,
             replacement,
         }

@@ -63,7 +63,7 @@ pub fn chain_event_envelope_message(
         cursor: event_envelope.cursor.as_bytes().into(),
         event_sequence: event_envelope.event_sequence,
         chain_epoch: Some(chain_epoch_message(event_envelope.chain_epoch)),
-        finalized_height: event_envelope.finalized_height.value(),
+        safe_tip_height: event_envelope.safe_tip_height.value(),
         event: Some(event),
     })
 }
@@ -219,7 +219,7 @@ pub fn stream_cursor_from_message_bytes(cursor_bytes: Vec<u8>) -> Option<StreamC
 pub fn chain_event_stream_family_from_message(family: i32) -> Option<ChainEventStreamFamily> {
     match wallet::ChainEventStreamFamily::try_from(family) {
         Ok(wallet::ChainEventStreamFamily::Tip) => Some(ChainEventStreamFamily::Tip),
-        Ok(wallet::ChainEventStreamFamily::Finalized) => Some(ChainEventStreamFamily::Finalized),
+        Ok(wallet::ChainEventStreamFamily::Safe) => Some(ChainEventStreamFamily::Safe),
         Err(_) => None,
     }
 }
@@ -278,8 +278,8 @@ pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
         tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-        finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
+        safe_tip_height: chain_epoch.safe_tip_height.value(),
+        safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -384,10 +384,10 @@ pub fn chain_epoch_from_message(
         network,
         tip_height: BlockHeight::new(message.tip_height),
         tip_hash: block_hash_from_rpc_hex("chain_epoch.tip_hash", &message.tip_hash)?,
-        finalized_height: BlockHeight::new(message.finalized_height),
-        finalized_hash: block_hash_from_rpc_hex(
-            "chain_epoch.finalized_hash",
-            &message.finalized_hash,
+        safe_tip_height: BlockHeight::new(message.safe_tip_height),
+        safe_tip_hash: block_hash_from_rpc_hex(
+            "chain_epoch.safe_tip_hash",
+            &message.safe_tip_hash,
         )?,
         artifact_schema_version: ArtifactSchemaVersion::new(artifact_schema_version),
         tip_metadata: ChainTipMetadata::new(

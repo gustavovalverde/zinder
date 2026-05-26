@@ -455,7 +455,7 @@ fn replay_empty_committed_event(
         chain_event: &envelope.event,
         chain_cursor: envelope.cursor.as_bytes(),
         event_sequence: envelope.event_sequence,
-        finalized_height: envelope.finalized_height,
+        safe_tip_height: envelope.safe_tip_height,
     };
     let dispatch_started_at = Instant::now();
     let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, true);
@@ -538,7 +538,7 @@ async fn replay_committed_event_to_derive_in_batches(
             chain_event: &chunk_event,
             chain_cursor: envelope.cursor.as_bytes(),
             event_sequence: envelope.event_sequence,
-            finalized_height: envelope.finalized_height,
+            safe_tip_height: envelope.safe_tip_height,
         };
         let dispatch_started_at = Instant::now();
         let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, final_chunk);
@@ -643,7 +643,7 @@ async fn replay_reorg_event_to_derive(
         chain_event: &envelope.event,
         chain_cursor: envelope.cursor.as_bytes(),
         event_sequence: envelope.event_sequence,
-        finalized_height: envelope.finalized_height,
+        safe_tip_height: envelope.safe_tip_height,
     };
     let dispatch_started_at = Instant::now();
     let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, true);

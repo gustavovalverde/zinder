@@ -99,7 +99,7 @@ pub struct IngestLoopConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhasesConfig {
     /// Boundary between `BulkCatchup` and `FollowingTip`. Defaults to
-    /// `reorg_window_blocks` so bulk catch-up's `FinalizeThrough`
+    /// `reorg_window_blocks` so bulk catch-up's `AdvanceSafeTipTo`
     /// horizon never crosses the reorg cliff.
     pub catchup_threshold_blocks: u32,
 }
@@ -186,7 +186,7 @@ pub struct BulkCatchupConfig {
     /// Maximum reserved derived artifact bytes across active and completed
     /// canonical block prepares.
     pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
-    /// Maximum finalized artifact bytes allowed to queue while the previous
+    /// Maximum safe-tip artifact bytes allowed to queue while the previous
     /// canonical batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
     /// Force a `RocksDB` flush every N committed epochs.

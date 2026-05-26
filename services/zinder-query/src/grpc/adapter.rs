@@ -42,7 +42,8 @@ use super::native::{
     broadcast_transaction_response, build_address_output_index_stream_chunk,
     build_chain_epoch_message, build_compact_block_message, build_transparent_address_tx_ids_chunk,
     build_wallet_server_info, compact_block_response, latest_block_response,
-    latest_tree_state_checkpoint_response, subtree_roots_response, transaction_response,
+    latest_safe_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
+    transaction_response,
     transparent_address_confirmed_balance_response, transparent_outputs_by_outpoint_response,
     tree_state_checkpoint_response,
 };
@@ -173,6 +174,19 @@ where
         request: Request<wallet::LatestBlockRequest>,
     ) -> Result<Response<wallet::LatestBlockResponse>, Status> {
         latest_block_response(
+            &self.query_api,
+            chain_epoch_from_request(request.into_inner().at_epoch)?,
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn latest_safe_block(
+        &self,
+        request: Request<wallet::LatestSafeBlockRequest>,
+    ) -> Result<Response<wallet::LatestSafeBlockResponse>, Status> {
+        latest_safe_block_response(
             &self.query_api,
             chain_epoch_from_request(request.into_inner().at_epoch)?,
         )

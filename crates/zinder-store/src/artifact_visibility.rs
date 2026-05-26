@@ -82,14 +82,14 @@ pub(crate) fn decode_visible_source_epoch(
 
 #[derive(Clone, Copy)]
 pub(crate) enum HeightVisibilityIndex {
-    FinalizedBlock,
+    SafeBlock,
     CompactBlock,
 }
 
 impl HeightVisibilityIndex {
     fn prefix_key(self, network: Network, height: BlockHeight) -> StoreKey {
         match self {
-            Self::FinalizedBlock => StoreKey::visible_block_epoch_prefix(network, height),
+            Self::SafeBlock => StoreKey::visible_block_epoch_prefix(network, height),
             Self::CompactBlock => StoreKey::visible_compact_block_epoch_prefix(network, height),
         }
     }
@@ -101,7 +101,7 @@ impl HeightVisibilityIndex {
         chain_epoch: ChainEpochId,
     ) -> StoreKey {
         match self {
-            Self::FinalizedBlock => StoreKey::visible_block_epoch(network, height, chain_epoch),
+            Self::SafeBlock => StoreKey::visible_block_epoch(network, height, chain_epoch),
             Self::CompactBlock => {
                 StoreKey::visible_compact_block_epoch(network, height, chain_epoch)
             }

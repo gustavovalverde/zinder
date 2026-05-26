@@ -122,7 +122,7 @@ pub fn spawn_secondary_catchup(
 struct WriterStatusSnapshot {
     chain_epoch_id: Option<ChainEpochId>,
     tip_height: Option<BlockHeight>,
-    finalized_height: Option<BlockHeight>,
+    safe_tip_height: Option<BlockHeight>,
 }
 
 struct WriterStatusUpstream {
@@ -188,8 +188,8 @@ impl WriterStatusUpstream {
         let snapshot = WriterStatusSnapshot {
             chain_epoch_id: response.latest_writer_chain_epoch_id.map(ChainEpochId::new),
             tip_height: response.latest_writer_tip_height.map(BlockHeight::new),
-            finalized_height: response
-                .latest_writer_finalized_height
+            safe_tip_height: response
+                .latest_writer_safe_tip_height
                 .map(BlockHeight::new),
         };
         self.last_snapshot = Some(snapshot);
@@ -488,7 +488,7 @@ fn record_writer_status_fetch_outcome(
 }
 
 fn record_writer_status_snapshot(snapshot: WriterStatusSnapshot) {
-    let (has_chain_epoch, chain_epoch_id, tip_height, finalized_height) = snapshot
+    let (has_chain_epoch, chain_epoch_id, tip_height, safe_tip_height) = snapshot
         .chain_epoch_id
         .map_or((0.0, 0.0, 0.0, 0.0), |chain_epoch_id| {
             (
@@ -498,7 +498,7 @@ fn record_writer_status_snapshot(snapshot: WriterStatusSnapshot) {
                     .tip_height
                     .map_or(0.0, |height| u32_to_f64(height.value())),
                 snapshot
-                    .finalized_height
+                    .safe_tip_height
                     .map_or(0.0, |height| u32_to_f64(height.value())),
             )
         });
@@ -506,7 +506,7 @@ fn record_writer_status_snapshot(snapshot: WriterStatusSnapshot) {
     metrics::gauge!("zinder_query_writer_status_has_chain_epoch").set(has_chain_epoch);
     metrics::gauge!("zinder_query_writer_status_chain_epoch_id").set(chain_epoch_id);
     metrics::gauge!("zinder_query_writer_status_tip_height").set(tip_height);
-    metrics::gauge!("zinder_query_writer_status_finalized_height").set(finalized_height);
+    metrics::gauge!("zinder_query_writer_status_safe_tip_height").set(safe_tip_height);
 }
 
 const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {

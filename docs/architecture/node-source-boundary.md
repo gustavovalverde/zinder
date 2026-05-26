@@ -106,7 +106,7 @@ Current `NodeCapability` names:
 - `tip_id`
 - `tree_state`
 - `subtree_roots`
-- `finalized_height`
+- `safe_tip_height`
 - `readiness_probe`
 - `transaction_broadcast`
 - `json_rpc`
@@ -232,7 +232,7 @@ Readiness carries operator-useful detail:
   "status": "not_ready",
   "cause": "node_unavailable",
   "nodeSource": "zebra-json-rpc",
-  "requiredCapability": "finalized_height"
+  "requiredCapability": "safe_tip_height"
 }
 ```
 

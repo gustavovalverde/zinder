@@ -206,15 +206,15 @@ pub enum StoreError {
 
     /// Attempted replacement crossed the configured reorg boundary.
     #[error(
-        "reorg window exceeded: attempted from {attempted_from_height:?}, minimum allowed {minimum_reorg_height:?}, finalized {finalized_height:?}"
+        "reorg window exceeded: attempted from {attempted_from_height:?}, minimum allowed {minimum_reorg_height:?}, safe tip {safe_tip_height:?}"
     )]
     ReorgWindowExceeded {
         /// First height requested for replacement.
         attempted_from_height: BlockHeight,
         /// Earliest height that may be replaced.
         minimum_reorg_height: BlockHeight,
-        /// Current finalized height.
-        finalized_height: BlockHeight,
+        /// Current safe tip height (boundary above which reorgs are still possible).
+        safe_tip_height: BlockHeight,
     },
 
     /// Chain event cursor points before retained chain-event history.

@@ -159,7 +159,7 @@ pub enum IngestError {
         tip_height: BlockHeight,
         /// Configured store reorg window in blocks.
         reorg_window_blocks: u32,
-        /// Highest height that can be finalized without explicit override.
+        /// Highest height that can be advanced past the safe tip without explicit override.
         maximum_historical_height: BlockHeight,
     },
 
@@ -208,7 +208,7 @@ pub enum IngestError {
         height: BlockHeight,
     },
 
-    /// Reorg replacement exceeded the configured non-finalized window.
+    /// Reorg replacement exceeded the configured reorg window.
     #[error(
         "reorg from {from_height:?} exceeds the configured window: replacement depth {replacement_depth}, window {configured_window_blocks} blocks"
     )]
@@ -276,7 +276,7 @@ pub enum IngestError {
     },
 }
 
-/// Finalized canonical artifacts produced for one source block.
+/// Built canonical artifacts produced for one source block.
 ///
 /// Output of [`finalize_derived_block`](crate::artifact_builder::finalize_derived_block).
 /// Each field is final once this struct exists; the consumer absorbs it
@@ -330,11 +330,11 @@ pub(crate) struct CanonicalBatch {
 }
 
 impl CanonicalBatch {
-    /// Appends one block's finalized artifacts into the in-flight batch.
+    /// Appends one block.s built artifacts into the in-flight batch.
     ///
     /// Called once per `finalize_derived_block` result. Each field is
     /// moved into its matching `CanonicalBatch` vector; the running tip
-    /// metadata is overwritten with the latest finalized value.
+    /// metadata is overwritten with the latest built value.
     pub(crate) fn absorb(&mut self, built: BuiltArtifacts) {
         self.transactions = self
             .transactions
@@ -374,7 +374,7 @@ impl CanonicalBatch {
         self.tip_metadata = Some(built.tip_metadata);
     }
 
-    /// Appends finalized artifacts with transparent prevouts prefetched upstream.
+    /// Appends built artifacts with transparent prevouts prefetched upstream.
     pub(crate) fn absorb_with_prefetched_spent_outputs(
         &mut self,
         built: BuiltArtifacts,
@@ -1508,7 +1508,7 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
 /// * `chain_committed` for pure appends, finalization advances, and any other
 ///   transition that does not invalidate previously visible blocks.
 /// * `chain_reorged` for transitions that replace a previously visible
-///   non-finalized range. Emitted at `WARN` because reorgs warrant operator
+///   range within the reorg window. Emitted at `WARN` because reorgs warrant operator
 ///   attention even when the configured window absorbs them.
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -1528,7 +1528,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.tip_hash),
-                finalized_height = chain_epoch.finalized_height.value(),
+                safe_tip_height = chain_epoch.safe_tip_height.value(),
                 block_range_start = committed.block_range.start.value(),
                 block_range_end = committed.block_range.end.value(),
                 event_sequence,
@@ -1546,7 +1546,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.tip_hash),
-                finalized_height = chain_epoch.finalized_height.value(),
+                safe_tip_height = chain_epoch.safe_tip_height.value(),
                 committed_block_range_start = committed.block_range.start.value(),
                 committed_block_range_end = committed.block_range.end.value(),
                 reverted_block_range_start = reverted.block_range.start.value(),
@@ -1579,10 +1579,10 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
     )
     .set(u32_to_f64(chain_epoch.tip_height.value()));
     metrics::gauge!(
-        "zinder_ingest_writer_finalized_height",
+        "zinder_ingest_writer_safe_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.finalized_height.value()));
+    .set(u32_to_f64(chain_epoch.safe_tip_height.value()));
 }
 
 fn display_block_hash(block_hash: BlockHash) -> String {

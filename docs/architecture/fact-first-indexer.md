@@ -41,7 +41,7 @@ block bytes, transaction bytes, or compact-block payloads.
 | `compact_block` | `(network, height)` | encoded lightwalletd compact block | Wallet sync cache |
 | `tree_state` | `(network, height)` | source tree-state payload or typed tree state | Wallet scan boundary |
 | `subtree_root` | `(network, pool, start_index)` | completed subtree root | Wallet scan acceleration |
-| `chain_event` | `(network, event_sequence)` | committed, reverted, finalized event envelope | Source of truth for derive tailers and chain subscriptions |
+| `chain_event` | `(network, event_sequence)` | committed, reverted, safe-tip event envelope | Source of truth for derive tailers and chain subscriptions |
 | `mempool_event` | `(network, event_sequence)` | mempool change envelope | Source of truth for mempool readers and mempool-derived projections |
 | `block_blob` | `(network, height)` | compressed raw block bytes | Explicit raw block export and rebuild aid |
 | `transaction_blob` | `(network, txid)` | raw transaction bytes | Explicit raw transaction export |

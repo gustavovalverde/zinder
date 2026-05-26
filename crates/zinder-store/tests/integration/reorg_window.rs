@@ -17,7 +17,7 @@ use zinder_store::{
 };
 
 #[test]
-fn replacing_non_finalized_state_emits_chain_reorged() -> eyre::Result<()> {
+fn replacing_non_safe_tip_state_emits_chain_reorged() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -63,7 +63,7 @@ fn replacing_non_finalized_state_emits_chain_reorged() -> eyre::Result<()> {
 }
 
 #[test]
-fn replacement_cannot_cross_finalized_height() -> eyre::Result<()> {
+fn replacement_cannot_cross_safe_tip_height() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -161,7 +161,7 @@ fn replacement_start_after_current_tip_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()> {
+fn safe_tip_height_can_advance_without_new_block_artifacts() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -173,39 +173,39 @@ fn finalized_height_can_advance_without_new_block_artifacts() -> eyre::Result<()
         .block_header_at(BlockHeight::new(2))?
         .ok_or_else(|| eyre!("expected visible tip block"))?;
 
-    let finalized_epoch = ChainEpoch {
+    let safe_tip_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
-        finalized_height: BlockHeight::new(2),
-        finalized_hash: block_hash(2),
+        safe_tip_height: BlockHeight::new(2),
+        safe_tip_hash: block_hash(2),
         created_at: UnixTimestampMillis::new(1_774_668_101_000),
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
         ChainEpochArtifacts::new(
-            finalized_epoch,
+            safe_tip_epoch,
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
         )
-        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
             height: BlockHeight::new(2),
         }),
     )?;
 
-    assert_eq!(committed.chain_epoch, finalized_epoch);
+    assert_eq!(committed.chain_epoch, safe_tip_epoch);
     assert_eq!(
-        committed.event_envelope.finalized_height,
+        committed.event_envelope.safe_tip_height,
         BlockHeight::new(2)
     );
     assert!(matches!(
         committed.event,
         ChainEvent::ChainCommitted { committed }
-            if committed.chain_epoch == finalized_epoch
+            if committed.chain_epoch == safe_tip_epoch
                 && committed.block_range == BlockHeightRange::empty_at(BlockHeight::new(2))
     ));
-    assert_eq!(store.current_chain_epoch()?, Some(finalized_epoch));
-    let finalized_reader = store.current_chain_epoch_reader()?;
+    assert_eq!(store.current_chain_epoch()?, Some(safe_tip_epoch));
+    let safe_tip_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
-        finalized_reader.block_header_at(BlockHeight::new(2))?,
+        safe_tip_reader.block_header_at(BlockHeight::new(2))?,
         Some(visible_tip_block)
     );
 
@@ -241,7 +241,7 @@ fn unchanged_commit_without_visible_transition_is_rejected() -> eyre::Result<()>
     assert!(matches!(
         error,
         StoreError::InvalidChainEpochArtifacts { reason }
-            if reason == "at least one finalized block artifact is required"
+            if reason == "at least one safe-tip block artifact is required"
     ));
     assert_eq!(store.current_chain_epoch()?, Some(initial_epoch));
 
@@ -286,7 +286,7 @@ fn replacement_start_after_attempted_tip_reports_boundary_error() -> eyre::Resul
 }
 
 #[test]
-fn finalize_through_height_can_be_below_epoch_finalized_height() -> eyre::Result<()> {
+fn advance_safe_tip_can_target_height_below_current_safe_tip() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -294,26 +294,26 @@ fn finalize_through_height_can_be_below_epoch_finalized_height() -> eyre::Result
         synthetic_epoch(1, 3, 1, block_hash(3), block_hash(2));
     store.commit_chain_epoch(artifacts_from_height_one_to_tip(initial_epoch))?;
 
-    let finalized_epoch = ChainEpoch {
+    let safe_tip_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
-        finalized_height: BlockHeight::new(3),
-        finalized_hash: block_hash(3),
+        safe_tip_height: BlockHeight::new(3),
+        safe_tip_hash: block_hash(3),
         created_at: UnixTimestampMillis::new(1_774_668_101_000),
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
         ChainEpochArtifacts::new(
-            finalized_epoch,
+            safe_tip_epoch,
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
         )
-        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
             height: BlockHeight::new(2),
         }),
     )?;
 
-    assert_eq!(committed.chain_epoch, finalized_epoch);
-    assert_eq!(store.current_chain_epoch()?, Some(finalized_epoch));
+    assert_eq!(committed.chain_epoch, safe_tip_epoch);
+    assert_eq!(store.current_chain_epoch()?, Some(safe_tip_epoch));
 
     Ok(())
 }
@@ -382,7 +382,7 @@ fn extend_window_end_after_tip_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn replacement_cannot_lower_finalized_anchor() -> eyre::Result<()> {
+fn replacement_cannot_lower_safe_tip_anchor() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -402,7 +402,7 @@ fn replacement_cannot_lower_finalized_anchor() -> eyre::Result<()> {
             from_height: BlockHeight::new(6),
         }),
     ) {
-        Ok(event) => return Err(eyre!("expected finalized-anchor error, got {event:?}")),
+        Ok(event) => return Err(eyre!("expected safe-tip-anchor error, got {event:?}")),
         Err(error) => error,
     };
 
@@ -416,7 +416,7 @@ fn replacement_cannot_lower_finalized_anchor() -> eyre::Result<()> {
 }
 
 #[test]
-fn replacement_cannot_change_finalized_anchor_hash() -> eyre::Result<()> {
+fn replacement_cannot_change_safe_tip_anchor_hash() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -426,7 +426,7 @@ fn replacement_cannot_change_finalized_anchor_hash() -> eyre::Result<()> {
 
     let (mut attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 6, 5, block_hash(60), block_hash(5));
-    attempted_epoch.finalized_hash = block_hash(50);
+    attempted_epoch.safe_tip_hash = block_hash(50);
     let error = match store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             attempted_epoch,
@@ -437,7 +437,7 @@ fn replacement_cannot_change_finalized_anchor_hash() -> eyre::Result<()> {
             from_height: BlockHeight::new(6),
         }),
     ) {
-        Ok(event) => return Err(eyre!("expected finalized-anchor error, got {event:?}")),
+        Ok(event) => return Err(eyre!("expected safe-tip-anchor error, got {event:?}")),
         Err(error) => error,
     };
 
@@ -485,7 +485,7 @@ fn non_replacement_commit_cannot_lower_tip_height() -> eyre::Result<()> {
 }
 
 #[test]
-fn non_replacement_commit_cannot_lower_finalized_height() -> eyre::Result<()> {
+fn non_replacement_commit_cannot_lower_safe_tip_height() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -578,7 +578,7 @@ fn append_commit_must_link_first_new_block_to_current_tip() -> eyre::Result<()> 
 }
 
 #[test]
-fn finalized_hash_must_match_existing_visible_block() -> eyre::Result<()> {
+fn safe_tip_hash_must_match_existing_visible_block() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
@@ -588,7 +588,7 @@ fn finalized_hash_must_match_existing_visible_block() -> eyre::Result<()> {
 
     let (mut attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 2, block_hash(3), block_hash(2));
-    attempted_epoch.finalized_hash = block_hash(99);
+    attempted_epoch.safe_tip_hash = block_hash(99);
     let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
         attempted_epoch,
         vec![appended_block],
@@ -774,7 +774,7 @@ fn tree_state_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
 fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
-    finalized_height: u32,
+    safe_tip_height: u32,
     hash: BlockHash,
     parent_hash: BlockHash,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
@@ -786,8 +786,8 @@ fn synthetic_epoch(
             network: Network::ZcashRegtest,
             tip_height: block_height,
             tip_hash: hash,
-            finalized_height: BlockHeight::new(finalized_height),
-            finalized_hash: block_hash(finalized_height),
+            safe_tip_height: BlockHeight::new(safe_tip_height),
+            safe_tip_hash: block_hash(safe_tip_height),
             artifact_schema_version: ArtifactSchemaVersion::new(10),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),

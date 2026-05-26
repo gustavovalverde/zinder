@@ -376,7 +376,7 @@ pub fn derive_block_with_raw_blob_policy(
 ///
 /// Applies `derived.tree_size_additions` to `running_tree_sizes`, stamps
 /// the final `chain_metadata` into the compact block, and returns the
-/// finalized [`BuiltArtifacts`].
+/// built [`BuiltArtifacts`].
 /// Mutates `running_tree_sizes` in place so a sequential loop can carry
 /// it forward across blocks.
 pub fn finalize_derived_block(

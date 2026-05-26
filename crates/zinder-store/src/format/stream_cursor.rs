@@ -22,15 +22,16 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum ChainEventStreamFamily {
     /// Tip stream: every committed chain event, including reorg events.
     Tip,
-    /// Finalized stream: only finalized chain events; never reorg events.
-    Finalized,
+    /// Safe stream: only commits whose range is past the reorg window;
+    /// never reorg events.
+    Safe,
 }
 
 impl ChainEventStreamFamily {
     pub(crate) const fn flags(self) -> u8 {
         match self {
             Self::Tip => 0x0,
-            Self::Finalized => 0x1,
+            Self::Safe => 0x1,
         }
     }
 
@@ -41,7 +42,7 @@ impl ChainEventStreamFamily {
 
         match flags & STREAM_FAMILY_MASK {
             0x0 => Some(Self::Tip),
-            0x1 => Some(Self::Finalized),
+            0x1 => Some(Self::Safe),
             _ => None,
         }
     }
@@ -274,7 +275,7 @@ impl StreamCursorTokenV1 {
             .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
         if !matches!(
             family,
-            ChainEventStreamFamily::Tip | ChainEventStreamFamily::Finalized
+            ChainEventStreamFamily::Tip | ChainEventStreamFamily::Safe
         ) {
             return Err(StreamCursorError::StreamFamilyMismatch { flags });
         }

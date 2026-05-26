@@ -63,6 +63,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads latest visible block metadata.
     async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<LatestBlock, QueryError>;
 
+    /// Reads the block at the chain epoch's safe tip (the wallet's scan
+    /// ceiling). Mirrors `latest_block` but resolves to
+    /// `chain_epoch.safe_tip_height` rather than `chain_epoch.tip_height`.
+    async fn latest_safe_block(
+        &self,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<LatestSafeBlock, QueryError>;
+
     /// Resolves a typed block selector against the canonical best chain.
     async fn block_id_by_selector(
         &self,
@@ -289,6 +297,26 @@ where
         }))
         .await;
         record_wallet_query_outcome("latest_block", started_at, &query_outcome, None);
+        query_outcome
+    }
+
+    async fn latest_safe_block(
+        &self,
+        at_epoch: Option<ChainEpoch>,
+    ) -> Result<LatestSafeBlock, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let chain_epoch = reader.chain_epoch();
+            Ok(LatestSafeBlock {
+                chain_epoch,
+                height: chain_epoch.safe_tip_height,
+                block_hash: chain_epoch.safe_tip_hash,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome("latest_safe_block", started_at, &query_outcome, None);
         query_outcome
     }
 
@@ -1150,6 +1178,19 @@ pub struct LatestBlock {
     /// Latest visible block height.
     pub height: BlockHeight,
     /// Latest visible block hash.
+    pub block_hash: zinder_core::BlockHash,
+}
+
+/// Safe-tip block metadata bound to one chain epoch. The block sits at
+/// `chain_epoch.safe_tip_height` and is the highest height the wallet can
+/// safely use as its scan ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LatestSafeBlock {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Safe tip height (`chain_epoch.safe_tip_height`).
+    pub height: BlockHeight,
+    /// Block hash at `safe_tip_height`.
     pub block_hash: zinder_core::BlockHash,
 }
 

@@ -32,7 +32,7 @@ enum ReadinessCause {
   READINESS_CAUSE_STORAGE_UNAVAILABLE = 6;
   // Persisted store schema is incompatible with this binary.
   READINESS_CAUSE_SCHEMA_MISMATCH = 7;
-  // Reorg replacement crossed the configured non-finalized window.
+  // Reorg replacement crossed the configured reorg window depth.
   READINESS_CAUSE_REORG_WINDOW_EXCEEDED = 8;
   // A RocksDB secondary reader is behind the primary beyond the configured
   // threshold.
@@ -108,7 +108,7 @@ message NodeCapabilityMissingDetail {
 message ReorgWindowExceededDetail {
   // Number of replaced visible heights.
   uint64 depth = 1;
-  // Configured non-finalized reorg window in blocks.
+  // Configured reorg window in blocks.
   uint64 configured = 2;
 }
 

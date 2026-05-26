@@ -161,7 +161,7 @@ The canonical store at `/var/lib/docker/volumes/zinder-<network>-data` survives 
 | `/readyz` stays `not_ready` with cause `node_unavailable` | Zebra not reachable through the Z3 network | Confirm `docker network inspect z3-<network>` lists both `zinder-ingest` and `zebra`; restart the zinder containers if they attached before Z3 was up |
 | `/readyz` cause is `node_capability_missing` | Z3's pinned Zebra is too old to serve a required RPC | Upgrade Z3 to a release with the required Zebra version |
 | `/readyz` cause is `schema_mismatch` | Existing store was created by an incompatible Zinder version | Migrate or recreate; consult the release notes |
-| `/readyz` cause is `reorg_window_exceeded` | The non-finalized reorg crossed `reorg_window_blocks` | Operator action: re-sync from the divergence point after preserving incident evidence |
+| `/readyz` cause is `reorg_window_exceeded` | The reorg crossed `reorg_window_blocks` | Operator action: re-sync from the divergence point after preserving incident evidence |
 | Startup logs show `phase=connect_node outcome=failed reason=permission denied` | Cookie file mode regression in Z3 (sidecar not chmod'ing) | Verify Z3's `cookie-permissions` container is up; the cookie should be mode 0644 |
 
 ## Appendix: attaching to a non-Z3 Zebra

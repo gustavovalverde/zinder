@@ -383,8 +383,8 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         network: Network::ZcashRegtest,
         tip_height: bootstrap_height,
         tip_hash: bootstrap_hash,
-        finalized_height: bootstrap_height,
-        finalized_hash: bootstrap_hash,
+        safe_tip_height: bootstrap_height,
+        safe_tip_hash: bootstrap_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: bootstrap_tip_metadata,
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
@@ -396,7 +396,7 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
         )
-        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
             height: bootstrap_height,
         }),
     )?;
@@ -429,11 +429,11 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
-    // Bootstrap a stub chain epoch at the checkpoint height. `finalized_height`
+    // Bootstrap a stub chain epoch at the checkpoint height. `safe_tip_height`
     // is pinned to the checkpoint, which is the load-bearing invariant for the
     // reorg-below-checkpoint defense: any subsequent Replace whose `from_height`
     // would rewind through the checkpoint runs into `minimum_reorg_height =
-    // finalized_height + 1` and surfaces `StoreError::ReorgWindowExceeded`.
+    // safe_tip_height + 1` and surfaces `StoreError::ReorgWindowExceeded`.
     let checkpoint_height = BlockHeight::new(1_000);
     let checkpoint_hash = block_hash(1_000);
     let bootstrap_chain_epoch = ChainEpoch {
@@ -441,8 +441,8 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         network: Network::ZcashRegtest,
         tip_height: checkpoint_height,
         tip_hash: checkpoint_hash,
-        finalized_height: checkpoint_height,
-        finalized_hash: checkpoint_hash,
+        safe_tip_height: checkpoint_height,
+        safe_tip_hash: checkpoint_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
@@ -453,13 +453,13 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
         )
-        .with_reorg_window_change(ReorgWindowChange::FinalizeThrough {
+        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
             height: checkpoint_height,
         }),
     )?;
 
     // Attempt a reorg whose `from_height` rewinds onto the checkpoint height
-    // itself. `minimum_reorg_height = finalized_height + 1 = 1001`, so 1000 is
+    // itself. `minimum_reorg_height = safe_tip_height + 1 = 1001`, so 1000 is
     // already below the floor and must be rejected. Artifacts at 1000 are
     // supplied only to clear `validate_artifact_presence`; the reorg-window
     // check fires before any coverage validation.
@@ -470,8 +470,8 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         network: Network::ZcashRegtest,
         tip_height: checkpoint_height,
         tip_hash: replaced_tip_hash,
-        finalized_height: checkpoint_height,
-        finalized_hash: replaced_tip_hash,
+        safe_tip_height: checkpoint_height,
+        safe_tip_hash: replaced_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_001),
@@ -511,12 +511,12 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
             error,
             StoreError::ReorgWindowExceeded {
                 attempted_from_height: attempted,
-                finalized_height: finalized,
+                safe_tip_height: safe_tip,
                 ..
-            } if attempted == attempted_from_height && finalized == checkpoint_height
+            } if attempted == attempted_from_height && safe_tip == checkpoint_height
         ),
         "expected ReorgWindowExceeded with attempted={attempted_from_height:?} \
-         and finalized={checkpoint_height:?}; got {error:?}"
+         and safe_tip={checkpoint_height:?}; got {error:?}"
     );
 
     Ok(())
@@ -536,8 +536,8 @@ fn synthetic_epoch(
             network: Network::ZcashRegtest,
             tip_height: block_height,
             tip_hash: source_hash,
-            finalized_height: block_height,
-            finalized_hash: source_hash,
+            safe_tip_height: block_height,
+            safe_tip_hash: source_hash,
             artifact_schema_version: ArtifactSchemaVersion::new(10),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),

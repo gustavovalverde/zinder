@@ -100,7 +100,7 @@ The loop is driven by an explicit phase classifier with three phases:
   Transparent-output hydration for spend-derived views is outside the
   canonical commit path and is handled by the derive tailer.
 - `IngestPhase::TipFollow` otherwise. Runs the serial fetch shape and
-  commits with `Extend` or `Replace`, then advances the finalized
+  commits with `Extend` or `Replace`, then advances the safe-tip
   boundary through the same `finalize_tip_if_ready` path that exists
   today.
 

@@ -39,7 +39,7 @@ pub enum IngestPhase {
     AwaitingUpstream,
     /// Gap to the upstream tip is above `ingest.phases.catchup_threshold_blocks`.
     /// The bulk-catchup driver runs pipelined block fetches and commits
-    /// batches with `FinalizeThrough`.
+    /// batches with `AdvanceSafeTipTo`.
     BulkCatchup,
     /// Gap is within the catch-up threshold. The serial tip-follow driver
     /// commits one block per poll cycle.
@@ -108,11 +108,11 @@ pub enum ReadinessCause {
     StorageUnavailable,
     /// Persisted store schema is incompatible with this binary.
     SchemaMismatch,
-    /// Reorg replacement crossed the configured non-finalized window.
+    /// Reorg replacement crossed the configured reorg window depth.
     ReorgWindowExceeded {
         /// Number of replaced visible heights.
         depth: u64,
-        /// Configured non-finalized reorg window in blocks.
+        /// Configured reorg window in blocks.
         configured: u64,
     },
     /// A `RocksDB` secondary reader is behind the primary beyond the configured threshold.

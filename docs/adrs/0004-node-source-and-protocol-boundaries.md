@@ -150,7 +150,7 @@ Current `NodeCapability` names:
 - `tip_id`
 - `tree_state`
 - `subtree_roots`
-- `finalized_height`
+- `safe_tip_height`
 - `readiness_probe`
 - `transaction_broadcast`
 - `json_rpc`

@@ -51,7 +51,7 @@ use crate::common::{
 /// Number of blocks below the tip to bulk catchup.
 ///
 /// Small enough to keep the test under a minute against mainnet; large enough
-/// that the sampled coinbase has been finalized by the time the wallet API
+/// that the sampled coinbase has crossed the safe tip by the time the wallet API
 /// reads it back.
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 

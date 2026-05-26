@@ -289,7 +289,7 @@ where
             });
         }
 
-        let commit_outcome = match commit_finalized_bulk_catchup_batch(
+        let commit_outcome = match commit_built_bulk_catchup_batch(
             run.store,
             run.config.node.network,
             request.chain_epoch_id,
@@ -538,8 +538,8 @@ fn record_canonical_batch_commit_trigger(
     );
 }
 
-/// Commits a finalized bulk catchup batch and returns the drained batch buffer.
-async fn commit_finalized_bulk_catchup_batch(
+/// Commits a built bulk catchup batch and returns the drained batch buffer.
+async fn commit_built_bulk_catchup_batch(
     store: &PrimaryChainStore,
     network: Network,
     chain_epoch_id: ChainEpochId,
@@ -547,12 +547,12 @@ async fn commit_finalized_bulk_catchup_batch(
 ) -> Result<(ChainEpochCommitOutcome, CanonicalBatch), IngestError> {
     let mut batch = batch;
     let outcome =
-        commit_finalized_bulk_catchup_batch_inner(store, network, chain_epoch_id, &mut batch)
+        commit_built_bulk_catchup_batch_inner(store, network, chain_epoch_id, &mut batch)
             .await?;
     Ok((outcome, batch))
 }
 
-async fn commit_finalized_bulk_catchup_batch_inner(
+async fn commit_built_bulk_catchup_batch_inner(
     store: &PrimaryChainStore,
     network: Network,
     chain_epoch_id: ChainEpochId,
@@ -570,8 +570,8 @@ async fn commit_finalized_bulk_catchup_batch_inner(
         network,
         tip_height,
         tip_hash,
-        finalized_height: tip_height,
-        finalized_hash: tip_hash,
+        safe_tip_height: tip_height,
+        safe_tip_hash: tip_hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata,
         created_at: current_unix_millis()?,
@@ -581,7 +581,7 @@ async fn commit_finalized_bulk_catchup_batch_inner(
         store,
         chain_epoch,
         batch,
-        ReorgWindowChange::FinalizeThrough { height: tip_height },
+        ReorgWindowChange::AdvanceSafeTipTo { height: tip_height },
     )
     .await;
     record_bulk_pipeline_stage_duration(

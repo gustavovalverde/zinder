@@ -280,7 +280,7 @@ Public surfaces: `/mempool`, dashboard mempool panel, mempool live ticker.
 
 Now: `MempoolActivity` returns each entry's transaction id, first-seen time, size, privacy shape, and component counts. Fee data is absent. The mempool table cannot show "fee" or "fee per logical action" columns.
 
-Why this belongs upstream: the value is computed the same way as the block-finalized fee (R-TX-1), against the same prevout index. Duplicating that compute downstream means duplicating the prevout index downstream.
+Why this belongs upstream: the value is computed the same way as the block-built fee (R-TX-1), against the same prevout index. Duplicating that compute downstream means duplicating the prevout index downstream.
 
 Proposed change: add to the `MempoolActivityEntry` shape:
 

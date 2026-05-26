@@ -1710,7 +1710,7 @@ fn build_chain_event(
         }
         ReorgWindowChange::Unchanged
         | ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::FinalizeThrough { .. } => ChainEvent::ChainCommitted { committed },
+        | ReorgWindowChange::AdvanceSafeTipTo { .. } => ChainEvent::ChainCommitted { committed },
     };
 
     Ok(event)
@@ -1743,7 +1743,7 @@ fn build_chain_event_envelope(
         cursor,
         event_sequence,
         chain_epoch,
-        chain_epoch.finalized_height,
+        chain_epoch.safe_tip_height,
         event,
     ))
 }
@@ -1754,8 +1754,8 @@ fn chain_event_matches_family(
 ) -> bool {
     match family {
         ChainEventStreamFamily::Tip => true,
-        ChainEventStreamFamily::Finalized => {
-            event_envelope.chain_epoch.tip_height <= event_envelope.finalized_height
+        ChainEventStreamFamily::Safe => {
+            event_envelope.chain_epoch.tip_height <= event_envelope.safe_tip_height
                 && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
         }
     }
@@ -2934,8 +2934,8 @@ mod tests {
         let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
         let (mut second_epoch, second_block, second_compact_block) =
             synthetic_epoch_with_hash_seed(2, 2, 2, 1);
-        second_epoch.finalized_height = first_epoch.tip_height;
-        second_epoch.finalized_hash = first_epoch.tip_hash;
+        second_epoch.safe_tip_height = first_epoch.tip_height;
+        second_epoch.safe_tip_hash = first_epoch.tip_hash;
         let second_tree_state = TreeStateArtifact::new(
             second_block.height,
             second_block.block_hash,
@@ -2943,8 +2943,8 @@ mod tests {
         );
         let (mut replacement_epoch, replacement_block, replacement_compact_block) =
             synthetic_epoch_with_hash_seed(3, 2, 200, 1);
-        replacement_epoch.finalized_height = first_epoch.tip_height;
-        replacement_epoch.finalized_hash = first_epoch.tip_hash;
+        replacement_epoch.safe_tip_height = first_epoch.tip_height;
+        replacement_epoch.safe_tip_hash = first_epoch.tip_hash;
         let replacement_tree_state = TreeStateArtifact::new(
             replacement_block.height,
             replacement_block.block_hash,
@@ -3066,8 +3066,8 @@ mod tests {
                 network: Network::ZcashRegtest,
                 tip_height: block_height,
                 tip_hash: source_hash,
-                finalized_height: block_height,
-                finalized_hash: source_hash,
+                safe_tip_height: block_height,
+                safe_tip_hash: source_hash,
                 artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
                 tip_metadata: ChainTipMetadata::empty(),
                 created_at: UnixTimestampMillis::new(1_774_668_500_000 + u64::from(height)),

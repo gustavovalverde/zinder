@@ -65,7 +65,7 @@ while let Some(fetch_result) = block_stream.next().await {
     // … push into `batch` …
     if batch.len() == canonical_batch_max_blocks {
         populate_subtree_root_artifacts(...).await?;               // serial RPCs
-        commit_finalized_bulk_catchup_batch(store, … &mut batch)?;     // serial RocksDB write
+        commit_built_bulk_catchup_batch(store, … &mut batch)?;     // serial RocksDB write
         if epochs_since_last_flush >= flush_interval_epochs {
             flush_primary_chain_store(store).await?;
         }

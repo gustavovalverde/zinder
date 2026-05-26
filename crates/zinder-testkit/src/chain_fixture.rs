@@ -578,8 +578,8 @@ impl ChainFixture {
             network: self.network,
             tip_height: tip_block.height,
             tip_hash: tip_block.hash,
-            finalized_height: tip_block.height,
-            finalized_hash: tip_block.hash,
+            safe_tip_height: tip_block.height,
+            safe_tip_hash: tip_block.hash,
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: self
                 .tip_metadata_override

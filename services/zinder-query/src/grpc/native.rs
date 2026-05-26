@@ -30,7 +30,8 @@ use zinder_source::transparent_address_matches_network;
 
 use crate::{
     AddressOutputIndex, AddressOutputIndexRequest, BlockHeaderResponseValue, BlockIdResponseValue,
-    ChainEvents, CompactBlock, LatestBlock, QueryError, SubtreeRoots, TransactionStatus,
+    ChainEvents, CompactBlock, LatestBlock, LatestSafeBlock, QueryError, SubtreeRoots,
+    TransactionStatus,
     TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TreeState, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
@@ -51,7 +52,7 @@ pub struct ServerInfoSettings {
     pub service_version: String,
     /// Canonical artifact schema version reported by `PrimaryChainStore`.
     pub schema_version: u32,
-    /// Configured non-finalized window depth in blocks.
+    /// Configured reorg window depth in blocks.
     pub reorg_window_blocks: u32,
     /// Whether this deployment has a transaction broadcaster configured.
     pub transaction_broadcast_enabled: bool,
@@ -185,6 +186,18 @@ pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
         .latest_block(at_epoch)
         .await
         .map(build_latest_block_response)
+}
+
+/// Reads the block at the chain epoch's safe tip and encodes the native
+/// wallet response.
+pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    at_epoch: Option<ChainEpoch>,
+) -> Result<wallet::LatestSafeBlockResponse, QueryError> {
+    query_api
+        .latest_safe_block(at_epoch)
+        .await
+        .map(build_latest_safe_block_response)
 }
 
 /// Reads the compact block at `height` and encodes the native wallet response.
@@ -566,6 +579,18 @@ fn build_latest_block_response(latest_block: LatestBlock) -> wallet::LatestBlock
         latest_block: Some(build_block_metadata_message(
             latest_block.height,
             latest_block.block_hash,
+        )),
+    }
+}
+
+fn build_latest_safe_block_response(
+    safe_block: LatestSafeBlock,
+) -> wallet::LatestSafeBlockResponse {
+    wallet::LatestSafeBlockResponse {
+        chain_epoch: Some(build_chain_epoch_message(safe_block.chain_epoch)),
+        safe_tip_block: Some(build_block_metadata_message(
+            safe_block.height,
+            safe_block.block_hash,
         )),
     }
 }

@@ -121,11 +121,12 @@ pub enum SourceChainUpdate {
         /// Block identity that should no longer be treated as connected.
         block_id: BlockId,
     },
-    /// Source-observed finality advanced.
-    FinalizedTip {
+    /// Source-observed safe tip advanced (the upstream node reports a new
+    /// height past its reorg window).
+    SafeTip {
         /// Cursor after this update is applied.
         cursor: SourceChainCursor,
-        /// Highest block the source reports as finalized.
+        /// Highest block the source reports as past its reorg window.
         tip_id: BlockId,
     },
 }
@@ -302,10 +303,10 @@ impl SourceChainUpdate {
         }
     }
 
-    /// Builds a finalized-tip source update.
+    /// Builds a safe-tip source update.
     #[must_use]
-    pub const fn finalized_tip(cursor: SourceChainCursor, tip_id: BlockId) -> Self {
-        Self::FinalizedTip { cursor, tip_id }
+    pub const fn safe_tip(cursor: SourceChainCursor, tip_id: BlockId) -> Self {
+        Self::SafeTip { cursor, tip_id }
     }
 
     /// Returns the feed cursor after this update is applied.
@@ -314,7 +315,7 @@ impl SourceChainUpdate {
         match self {
             Self::ConnectedBlock { cursor, .. }
             | Self::RevertedBlock { cursor, .. }
-            | Self::FinalizedTip { cursor, .. } => *cursor,
+            | Self::SafeTip { cursor, .. } => *cursor,
         }
     }
 }
