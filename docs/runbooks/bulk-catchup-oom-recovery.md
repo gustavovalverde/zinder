@@ -196,6 +196,8 @@ With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the wr
 
 `ingest.bulk_catchup.block_prepare_concurrency` controls CPU workers; `block_prepare_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
+The four `bulk_catchup` queue byte-caps auto-derive from the container memory budget when cgroup v2 is available, so containerized deploys (Railway, Fly, ECS, k8s, plain Docker) inherit sane defaults without per-deploy tuning. The formula is `container_memory / 64` per queue, clamped to `[128 MiB, 512 MiB]`. On dev hosts without cgroup the fallback 512 MiB / 384 MiB constants apply unchanged. `ZINDER_INGEST__BULK_CATCHUP__*_BYTES` env-var overrides still win when set; the auto-derived value is only the default. See [ADR-0022 § Revision: container-aware default queue caps](../adrs/0022-resource-budgeted-bulk-catchup.md#revision-container-aware-default-queue-caps-2026-05-26).
+
 RAM-constrained hosts drop the cache to 128 MiB and the WAL ceiling to 64 MiB; high-throughput hosts can raise the cache to 1 GiB. The architectural invariants (WAL on, point-in-time recovery, atomic cross-CF flush, ordered writes) are not exposed to operator tuning because each one is a contract of the per-`ChainEpoch` commit guarantee.
 
 ## What not to change in pursuit of "less memory"

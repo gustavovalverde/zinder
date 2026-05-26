@@ -99,6 +99,40 @@ impl RuntimeMemorySnapshot {
     }
 }
 
+/// Returns the container memory budget in bytes, derived from cgroup v2.
+///
+/// Prefers `memory.high` (the soft throttle where the kernel starts
+/// reclaiming) over `memory.max` (the hard kill threshold) so the
+/// budget describes the limit Zinder should stay under, not the limit
+/// past which the kernel kills it.
+///
+/// Returns `None` when cgroup v2 is unavailable (dev hosts without
+/// containers, macOS, older Linux) or when the limit is unset (the
+/// kernel exposes the literal string `max`, which the cgroup reader
+/// translates to `None`). Callers in that case fall through to their
+/// hand-tuned fallback constants, matching pre-existing behavior on
+/// dev hosts.
+///
+/// Used by the binary's config layer to size the bulk-catchup pipeline
+/// queue caps so a deploy on Railway, Fly, ECS, or any cgroup-enforcing
+/// container runtime inherits memory-aware defaults without per-deploy
+/// env-var tuning. Existing `ZINDER_INGEST__BULK_CATCHUP__*_BYTES`
+/// overrides still take precedence; this helper only changes the
+/// default.
+#[must_use]
+pub fn container_memory_budget_bytes() -> Option<u64> {
+    container_memory_budget_from_snapshot(RuntimeMemorySnapshot::sample())
+}
+
+/// Pure-function variant of [`container_memory_budget_bytes`] used by
+/// tests and any caller that already holds a snapshot.
+pub(crate) fn container_memory_budget_from_snapshot(
+    snapshot: RuntimeMemorySnapshot,
+) -> Option<u64> {
+    let limit = snapshot.cgroup_high_bytes.or(snapshot.cgroup_max_bytes)?;
+    if limit == 0 { None } else { Some(limit) }
+}
+
 /// Spawns the runtime memory gauge sampler for the ingest process.
 ///
 /// Memory metrics are operational state, not derive replay state. Sampling them
@@ -362,5 +396,48 @@ mod tests {
         assert_eq!(snapshot.working_set_bytes(), Some(400));
         assert_eq!(snapshot.current_pressure_ratio(), Some(0.9));
         assert_eq!(snapshot.pressure_ratio(), Some(0.4));
+    }
+
+    #[test]
+    fn container_budget_prefers_high_over_max() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_max_bytes: Some(24 * 1024 * 1024 * 1024),
+            cgroup_high_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..RuntimeMemorySnapshot::default()
+        };
+        assert_eq!(
+            container_memory_budget_from_snapshot(snapshot),
+            Some(20 * 1024 * 1024 * 1024),
+            "memory.high is the soft throttle Zinder should stay under"
+        );
+    }
+
+    #[test]
+    fn container_budget_falls_back_to_max_when_high_unset() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_max_bytes: Some(24 * 1024 * 1024 * 1024),
+            cgroup_high_bytes: None,
+            ..RuntimeMemorySnapshot::default()
+        };
+        assert_eq!(
+            container_memory_budget_from_snapshot(snapshot),
+            Some(24 * 1024 * 1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn container_budget_is_none_when_cgroup_absent() {
+        let snapshot = RuntimeMemorySnapshot::default();
+        assert_eq!(container_memory_budget_from_snapshot(snapshot), None);
+    }
+
+    #[test]
+    fn container_budget_treats_zero_limit_as_absent() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_max_bytes: Some(0),
+            cgroup_high_bytes: None,
+            ..RuntimeMemorySnapshot::default()
+        };
+        assert_eq!(container_memory_budget_from_snapshot(snapshot), None);
     }
 }

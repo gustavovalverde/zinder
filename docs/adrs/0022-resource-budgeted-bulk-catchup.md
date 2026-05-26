@@ -110,3 +110,33 @@ Bulk-catchup observability uses stage labels from this ADR:
 `source_fetch`, `canonical_block_prepare`, `canonical_finalize`,
 `subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
 `canonical_commit`, and `canonical_flush`.
+
+## Revision: container-aware default queue caps (2026-05-26)
+
+The four bulk-catchup queue byte-caps (`source_fetch_max_in_flight_bytes`,
+`block_prepare_max_in_flight_artifact_bytes`,
+`commit_reassembly_max_queued_artifact_bytes`,
+`canonical_batch_max_estimated_write_bytes`) shipped as fixed constants
+(~512 MiB) sized for hosts with plenty of headroom. Deployed inside a
+24 GiB container (Railway, Fly, mid-tier ECS), the documented worst-case
+in-flight envelope of `commit + prepare + reassembly + next-batch` runs
+~2.4 GiB of watermark, which then amplifies through decoded-artifact
+structures, in-flight commit futures, and RocksDB write buffers into
+container memory exhaustion during dense mainnet ranges (observed on
+2026-05-26 around blocks 297-298k: `estimated_write_bytes=510 MB` batch
+correlated with 22.7 GiB resident memory at a 24 GiB cap, ending in a
+SIGTERM from the container runtime).
+
+The queue-cap defaults now derive from the container memory budget at
+startup. `services/zinder-ingest/src/memory_pressure.rs` exposes
+`container_memory_budget_bytes()`, which returns `memory.high` (preferred)
+or `memory.max` from cgroup v2; `services/zinder-ingest/src/config.rs`
+computes each queue cap as `container_budget / 64`, clamped to
+`[128 MiB, original fallback]`. On a 24 GiB Railway container each queue
+shrinks from 512 MiB to 384 MiB; on dev hosts without cgroup the
+fallback constants apply unchanged.
+
+The `ZINDER_INGEST__BULK_CATCHUP__*_BYTES` env-var overrides still take
+precedence over the auto-derived default. No new env var, no new ADR.
+The mechanism reuses the existing `RuntimeMemorySnapshot` sampler that
+already feeds the derive-replay backpressure ratios.

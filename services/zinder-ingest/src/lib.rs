@@ -42,7 +42,8 @@ pub use ingest_loop::{
     run_ingest_loop,
 };
 pub use memory_pressure::{
-    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, container_memory_budget_bytes,
+    spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolOrchestratorError,

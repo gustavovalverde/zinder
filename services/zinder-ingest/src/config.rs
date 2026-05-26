@@ -24,7 +24,7 @@ use zinder_ingest::{
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig, NodeSourceKind,
-    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig,
+    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig, container_memory_budget_bytes,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
@@ -48,9 +48,51 @@ const DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES: u64 = 536_870_912;
 const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 16;
 const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 33_554_432;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
-const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184;
-const DEFAULT_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912;
-const DEFAULT_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912;
+
+// Bulk-catchup pipeline queue caps fall through to these constants when
+// the container memory budget can't be detected (dev hosts, macOS, older
+// Linux without cgroup v2). On a container runtime (Railway, Fly, ECS,
+// k8s, plain Docker) the actual defaults come from `default_pipeline_queue_bytes`,
+// which sizes each queue as `container_memory / PIPELINE_QUEUE_DIVISOR`
+// so the total in-flight watermark budget stays well under the kernel's
+// memory.max. Operator env-var overrides
+// (`ZINDER_INGEST__BULK_CATCHUP__*_BYTES`) still win when set. See
+// [ADR-0022](../../../docs/adrs/0022-resource-budgeted-bulk-catchup.md).
+const FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184; // 384 MiB
+const FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912; // 512 MiB
+const FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912; // 512 MiB
+
+// Floor and divisor for the container-aware default. The divisor
+// expresses how thinly the pipeline carves up the container's memory
+// budget: at `/ 64` the four queues together claim ~6% of the
+// container, leaving the remaining ~94% for RocksDB working set,
+// per-batch decoded-artifact amplification (a watermark counts
+// "estimated artifact bytes"; the actual Rust struct memory is several
+// times larger for dense ranges), in-flight commit futures, and the
+// query / explorer / multiplexer planes that share the same container.
+// The 7x amplification observed on mainnet around blocks 297-298k
+// (`estimated_write_bytes=510 MB` correlated with 22.7 GB resident
+// memory at a 24 GB cap) is what set this divisor; tighter divisors
+// trade catchup throughput for headroom.
+//
+// `MIN_PIPELINE_QUEUE_BYTES` keeps very small containers (single-digit
+// GB hosts the team occasionally runs locally) from collapsing the
+// queue to a value smaller than a single mainnet block can produce.
+const MIN_PIPELINE_QUEUE_BYTES: u64 = 134_217_728; // 128 MiB
+const PIPELINE_QUEUE_DIVISOR: u64 = 64;
+
+fn default_pipeline_queue_bytes(fallback_bytes: u64) -> u64 {
+    default_pipeline_queue_bytes_from_budget(container_memory_budget_bytes(), fallback_bytes)
+}
+
+fn default_pipeline_queue_bytes_from_budget(
+    container_budget: Option<u64>,
+    fallback_bytes: u64,
+) -> u64 {
+    container_budget.map_or(fallback_bytes, |budget| {
+        (budget / PIPELINE_QUEUE_DIVISOR).clamp(MIN_PIPELINE_QUEUE_BYTES, fallback_bytes)
+    })
+}
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
 const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
 const DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
@@ -228,7 +270,7 @@ pub(crate) fn load_ingest_config(
         )?
         .with_default(
             "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
-            DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+            default_pipeline_queue_bytes(DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES),
         )?
         .with_default(
             "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
@@ -248,7 +290,7 @@ pub(crate) fn load_ingest_config(
         )?
         .with_default(
             "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
-            DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES,
+            default_pipeline_queue_bytes(FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES),
         )?
         .with_default(
             "ingest.bulk_catchup.block_prepare_concurrency",
@@ -256,11 +298,11 @@ pub(crate) fn load_ingest_config(
         )?
         .with_default(
             "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
-            DEFAULT_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES,
+            default_pipeline_queue_bytes(FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES),
         )?
         .with_default(
             "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
-            DEFAULT_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES,
+            default_pipeline_queue_bytes(FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES),
         )?
         .with_default(
             "ingest.derive.replay_batch_blocks",
@@ -1146,3 +1188,53 @@ struct BackupToml {
     reason = "kept for forward-compat with code that touched it during refactor"
 )]
 const _: fn(Duration) -> u64 = duration_as_millis_u64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn pipeline_queue_falls_back_when_cgroup_absent() {
+        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        assert_eq!(
+            default_pipeline_queue_bytes_from_budget(None, fallback),
+            fallback,
+            "dev hosts without cgroup keep the pre-existing 512 MiB defaults"
+        );
+    }
+
+    #[test]
+    fn pipeline_queue_caps_at_fallback_on_fat_containers() {
+        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        // 64 GiB container -> raw computation would give 1 GiB per queue,
+        // but the fallback caps at the previously hand-tuned 512 MiB.
+        let result = default_pipeline_queue_bytes_from_budget(Some(64 * ONE_GIB), fallback);
+        assert_eq!(result, fallback);
+    }
+
+    #[test]
+    fn pipeline_queue_shrinks_for_railway_sized_containers() {
+        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        // The Railway zinder-mainnet incident: 24 GiB container cap,
+        // OOM at the 512 MiB default. Container-aware default must
+        // be smaller than the fallback to prevent recurrence.
+        let result = default_pipeline_queue_bytes_from_budget(Some(24 * ONE_GIB), fallback);
+        assert_eq!(result, 24 * ONE_GIB / PIPELINE_QUEUE_DIVISOR);
+        assert!(
+            result < fallback,
+            "Railway-sized containers must shrink below the 512 MiB fallback"
+        );
+    }
+
+    #[test]
+    fn pipeline_queue_floors_at_min_for_tight_containers() {
+        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        // 4 GiB container -> raw computation gives 64 MiB per queue,
+        // smaller than a single mainnet block can produce. Floor at
+        // 128 MiB so the pipeline can always make forward progress.
+        let result = default_pipeline_queue_bytes_from_budget(Some(4 * ONE_GIB), fallback);
+        assert_eq!(result, MIN_PIPELINE_QUEUE_BYTES);
+    }
+}
