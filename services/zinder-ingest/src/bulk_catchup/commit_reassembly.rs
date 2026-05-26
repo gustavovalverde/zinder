@@ -454,6 +454,18 @@ where
     outcome
 }
 
+/// Stride between intra-batch tree-state checkpoints during bulk catchup.
+///
+/// Wallet implementations (notably `zcash_client_backend`) cap their rewind
+/// window at roughly 100 blocks behind `fully_scanned_height`; if the
+/// nearest checkpoint at or below that window is older than the cap, the
+/// wallet cannot recover. A bulk-catchup batch can span thousands of blocks,
+/// so a single end-of-batch checkpoint leaves arbitrary gaps. Emitting one
+/// checkpoint every 100 ingested heights guarantees the wallet can always
+/// find an anchor inside its rewind window, regardless of where in a batch
+/// it landed.
+const BULK_CATCHUP_TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
+
 async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
     batch: &mut CanonicalBatch,
@@ -462,12 +474,6 @@ async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
 where
     Source: NodeSource,
 {
-    if !batch.tree_states.is_empty() {
-        return Ok(());
-    }
-    let Some(tip_block) = batch.block_headers.last() else {
-        return Ok(());
-    };
     if !run
         .source
         .capabilities()
@@ -476,30 +482,51 @@ where
         return Ok(());
     }
 
-    let block_id = BlockId::new(tip_block.height, tip_block.block_hash);
-    let started_at = Instant::now();
-    let outcome = fetch_tree_state_for_block_with_retry(
-        run.config.node.request_timeout,
-        run.source,
-        block_id,
-        retry_state,
-    )
-    .await;
-    record_bulk_pipeline_stage_duration(
-        BULK_STAGE_CHECKPOINT_TREE_STATE,
-        started_at,
-        outcome.as_ref().err(),
-    );
-    let source_tree_state = match outcome {
-        Ok(source_tree_state) => source_tree_state,
-        Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    batch.push_tree_state_checkpoint(TreeStateArtifact::new(
-        source_tree_state.block_id.height,
-        source_tree_state.block_id.hash,
-        source_tree_state.payload_bytes,
-    ));
+    let existing_heights: std::collections::HashSet<_> =
+        batch.tree_states.iter().map(|ts| ts.height).collect();
+    let mut targets: Vec<(zinder_core::BlockHeight, zinder_core::BlockHash)> = batch
+        .block_headers
+        .iter()
+        .filter(|header| {
+            header.height.value() % BULK_CATCHUP_TREE_STATE_CHECKPOINT_STRIDE == 0
+                && !existing_heights.contains(&header.height)
+        })
+        .map(|header| (header.height, header.block_hash))
+        .collect();
+    if let Some(tip) = batch.block_headers.last() {
+        let already_at_tip = targets.last().map(|(height, _)| *height) == Some(tip.height)
+            || existing_heights.contains(&tip.height);
+        if !already_at_tip {
+            targets.push((tip.height, tip.block_hash));
+        }
+    }
+
+    for (height, block_hash) in targets {
+        let block_id = BlockId::new(height, block_hash);
+        let started_at = Instant::now();
+        let outcome = fetch_tree_state_for_block_with_retry(
+            run.config.node.request_timeout,
+            run.source,
+            block_id,
+            retry_state,
+        )
+        .await;
+        record_bulk_pipeline_stage_duration(
+            BULK_STAGE_CHECKPOINT_TREE_STATE,
+            started_at,
+            outcome.as_ref().err(),
+        );
+        let source_tree_state = match outcome {
+            Ok(source_tree_state) => source_tree_state,
+            Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+            source_tree_state.block_id.height,
+            source_tree_state.block_id.hash,
+            source_tree_state.payload_bytes,
+        ));
+    }
     Ok(())
 }
 
