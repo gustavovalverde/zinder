@@ -22,8 +22,19 @@ message ExplorerServerInfo {
 message ServerInfoRequest {}
 
 // Server descriptor response.
+//
+// Carries the standard `ExplorerFreshness` envelope per
+// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md)
+// so consumers can read upstream-node observations and capability
+// versions from any explorer response, including the bootstrap call.
+// Without this, the upstream observation (which rides on
+// `ExplorerFreshness.upstream`) would only be reachable through
+// derive-backed endpoints that are capability-gated and unavailable
+// during `bulk_catchup`, leaving sync-progress UIs unable to compute
+// an honest denominator at exactly the moment they most need it.
 message ServerInfoResponse {
-  ExplorerServerInfo info = 1;
+  ExplorerFreshness freshness = 1;
+  ExplorerServerInfo info = 2;
 }
 
 // Per-field unavailability with structured reason and canonical text.

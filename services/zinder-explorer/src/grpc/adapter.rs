@@ -35,14 +35,15 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::{
     explorer::{
         BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-        BlockSummariesInRangeResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
-        MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
-        MempoolEventCountsResponse, MempoolSummaryRequest, MempoolSummaryResponse,
-        OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionsRequest,
-        SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
-        TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
-        TransparentAddressActivityResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
-        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
+        BlockSummariesInRangeResponse, ExplorerFreshness, ExplorerServerInfo, FeeSummaryRequest,
+        FeeSummaryResponse, MempoolActivityRequest, MempoolActivityResponse,
+        MempoolEventCountsRequest, MempoolEventCountsResponse, MempoolSummaryRequest,
+        MempoolSummaryResponse, OverviewSnapshotRequest, OverviewSnapshotResponse,
+        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
+        ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
+        TransparentAddressActivityRequest, TransparentAddressActivityResponse,
+        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
+        VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -65,7 +66,9 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::fee_summary::handle_fee_summary;
-use super::freshness::{UpstreamObservationCache, spawn_upstream_observation_probe_task};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, spawn_upstream_observation_probe_task,
+};
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
 use super::overview_snapshot::handle_overview_snapshot;
@@ -312,7 +315,25 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         &self,
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
+        // ServerInfo carries the standard ExplorerFreshness envelope per
+        // ADR-0011 so consumers can read `freshness.upstream` from the
+        // bootstrap call, before any derive-backed capability is up.
+        // During `bulk_catchup` this is the only explorer response that
+        // is guaranteed to succeed; sync-progress UIs depend on it for
+        // an honest denominator. `chain_epoch` is left unset here: this
+        // response does not read the store and so cannot make a
+        // snapshot-consistency claim, and the upstream observation is
+        // the only freshness signal callers need from ServerInfo today.
+        let freshness = attach_upstream_observation(
+            &self.upstream_observation_cache,
+            ExplorerFreshness {
+                capability_version: EXPLORER_SERVER_INFO_V1.to_owned(),
+                ..ExplorerFreshness::default()
+            },
+        )
+        .await;
         Ok(Response::new(ServerInfoResponse {
+            freshness: Some(freshness),
             info: Some(ExplorerServerInfo {
                 common: Some(ops::ServerInfo {
                     network: encode_zinder_native_chain_name(self.settings.network).to_owned(),
