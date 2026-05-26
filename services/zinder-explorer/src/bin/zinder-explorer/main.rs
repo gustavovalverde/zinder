@@ -1,9 +1,10 @@
 //! Zinder explorer-plane gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
     DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
@@ -13,6 +14,7 @@ use zinder_runtime::{
     Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
     install_tracing_subscriber, spawn_ops_endpoint_for,
 };
+use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{ChainStoreOptions, SecondaryChainStore};
 
 mod config;
@@ -22,6 +24,15 @@ use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 /// Cadence the background task uses to advance the secondary's view to the
 /// primary's latest durable state.
 const DERIVE_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default cadence for the upstream-observation probe.
+///
+/// Used when the resolved [`NodeTarget`] does not pin a `[node.health]`
+/// `poll_interval`. Mirrors the source plane's default so an
+/// explorer-side operator sees the same cadence as the ingest-side
+/// probe.
+const DEFAULT_UPSTREAM_OBSERVATION_POLL_INTERVAL: Duration =
+    Duration::from_millis(zinder_source::DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS);
 
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
@@ -136,6 +147,8 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
 
     let grpc_adapter = build_grpc_adapter(&explorer_config, canonical_store, store);
+    let upstream_observation_handle =
+        spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
 
     let ops_handle = spawn_ops_endpoint_for(
@@ -175,10 +188,62 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
+    if let Some(handle) = upstream_observation_handle {
+        let _ = handle.await;
+    }
     let _ = canonical_catchup_handle.await;
     let _ = catchup_handle.await;
 
     server_result.map_err(ExplorerConfigError::Transport)
+}
+
+fn spawn_upstream_observation_probe(
+    explorer_config: &ExplorerConfig,
+    grpc_adapter: &ExplorerQueryGrpcAdapter,
+    cancel: CancellationToken,
+) -> Result<Option<JoinHandle<()>>, ExplorerConfigError> {
+    let Some(node) = explorer_config.node.as_ref() else {
+        tracing::info!(
+            target: "zinder::explorer",
+            event = "upstream_observation_probe_skipped",
+            reason = "no [node] section configured; ExplorerFreshness.upstream stays unset",
+        );
+        return Ok(None);
+    };
+    let source = build_zebra_json_rpc_source(node)?;
+    let poll_interval = node
+        .health
+        .as_ref()
+        .map_or(DEFAULT_UPSTREAM_OBSERVATION_POLL_INTERVAL, |health| {
+            health.poll_interval
+        });
+    tracing::info!(
+        target: "zinder::explorer",
+        event = "upstream_observation_probe_started",
+        json_rpc_addr = node.json_rpc_addr.as_str(),
+        poll_interval_ms = u64::try_from(poll_interval.as_millis()).unwrap_or(u64::MAX),
+        "upstream observation probe started",
+    );
+    Ok(Some(grpc_adapter.spawn_upstream_observation_probe(
+        Arc::new(source),
+        poll_interval,
+        cancel,
+    )))
+}
+
+fn build_zebra_json_rpc_source(
+    node: &NodeTarget,
+) -> Result<ZebraJsonRpcSource, ExplorerConfigError> {
+    let source = ZebraJsonRpcSource::with_options(
+        node.network,
+        &node.json_rpc_addr,
+        node.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: node.request_timeout,
+            max_response_bytes: node.max_response_bytes,
+        },
+    )?;
+    Ok(source.with_health_config(node.health.clone()))
 }
 
 fn open_canonical_store(

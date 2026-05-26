@@ -33,14 +33,32 @@ use zinder_proto::v1::{
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+
+/// Read backends the `TransactionDetail` handler needs from the adapter.
+///
+/// Bundled into one struct so the handler signature stays under the
+/// workspace's clippy `too-many-arguments` threshold and so adding a new
+/// shared dependency does not ripple through every call site.
+pub(crate) struct TransactionDetailContext<'context> {
+    pub(crate) chain_store: Option<&'context SecondaryChainStore>,
+    pub(crate) derive_store: Option<&'context DeriveStore>,
+    pub(crate) network: zinder_core::Network,
+    pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
+}
+
 /// Executes one `ExplorerQuery.TransactionDetail` request.
 pub(crate) async fn handle_transaction_detail(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    chain_store: Option<&SecondaryChainStore>,
-    derive_store: Option<&DeriveStore>,
-    network: zinder_core::Network,
+    context: TransactionDetailContext<'_>,
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
+    let TransactionDetailContext {
+        chain_store,
+        derive_store,
+        network,
+        upstream_observation_cache,
+    } = context;
     let inner = request.into_inner();
     let transaction_id = decode_rpc_transaction_id_hex(&inner.transaction_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -82,14 +100,19 @@ pub(crate) async fn handle_transaction_detail(
         }
     };
 
-    let freshness = ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: 0,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_TRANSACTION_DETAIL_V1.to_owned(),
-        unavailable: Vec::new(),
-    };
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
+            chain_epoch: Some(chain_epoch),
+            snapshot_age_millis: 0,
+            derive_cursor_lag_blocks: 0,
+            derive_cursor_lag_millis: 0,
+            capability_version: EXPLORER_TRANSACTION_DETAIL_V1.to_owned(),
+            unavailable: Vec::new(),
+            upstream: None,
+        },
+    )
+    .await;
 
     let fees = derive_store
         .and_then(|store| TransactionFeesConsumer::read_fees_record(store, transaction_id).ok())

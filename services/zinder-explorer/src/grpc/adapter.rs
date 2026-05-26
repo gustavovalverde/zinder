@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::OnceCell;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
@@ -53,6 +55,7 @@ use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
     RpcMetricNames, RpcOutcome, connect_zinder_grpc, describe_rpc_metrics, record_rpc_request,
 };
+use zinder_source::NodeSource;
 
 /// Metric pair the `ExplorerQuery` adapter emits per request.
 const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
@@ -62,12 +65,13 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::fee_summary::handle_fee_summary;
+use super::freshness::{UpstreamObservationCache, spawn_upstream_observation_probe_task};
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
 use super::overview_snapshot::handle_overview_snapshot;
 use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
 use super::search::handle_search;
-use super::transaction_detail::handle_transaction_detail;
+use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
 use super::transparent_address_activity::handle_transparent_address_activity;
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::DeriveStore;
@@ -105,6 +109,7 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
     payment_disclosure_verifier_online: bool,
+    upstream_observation_cache: UpstreamObservationCache,
 }
 
 impl ExplorerQueryGrpcAdapter {
@@ -121,6 +126,7 @@ impl ExplorerQueryGrpcAdapter {
             wallet_channel: Arc::new(OnceCell::new()),
             prevout_resolution_online: false,
             payment_disclosure_verifier_online: false,
+            upstream_observation_cache: UpstreamObservationCache::empty(),
         }
     }
 
@@ -194,6 +200,33 @@ impl ExplorerQueryGrpcAdapter {
     pub const fn with_payment_disclosure_verifier_online(mut self, online: bool) -> Self {
         self.payment_disclosure_verifier_online = online;
         self
+    }
+
+    /// Spawns the background task that refreshes the cached
+    /// [`zinder_source::UpstreamHealthSnapshot`] every `poll_interval`
+    /// and seeds the shared cache the freshness builders read.
+    ///
+    /// Returns the spawned [`JoinHandle`]: the caller (binary entry point)
+    /// awaits or drops it during shutdown. Without this call the cache
+    /// stays empty and every `ExplorerFreshness.upstream` field is `None`;
+    /// that is the documented "probe has not fired yet" state per
+    /// ADR-0011.
+    #[must_use]
+    pub fn spawn_upstream_observation_probe<Source>(
+        &self,
+        source: Arc<Source>,
+        poll_interval: Duration,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()>
+    where
+        Source: NodeSource + 'static,
+    {
+        spawn_upstream_observation_probe_task(
+            source,
+            self.upstream_observation_cache.clone(),
+            poll_interval,
+            cancel,
+        )
     }
 
     /// Wraps the adapter into a tonic [`ExplorerQueryServer`] ready to be
@@ -334,9 +367,12 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let mut client = self.wallet_client(OP.method).await?;
             handle_transaction_detail(
                 &mut client,
-                self.canonical_store.as_ref(),
-                self.derive_store.as_ref(),
-                self.settings.network,
+                TransactionDetailContext {
+                    chain_store: self.canonical_store.as_ref(),
+                    derive_store: self.derive_store.as_ref(),
+                    network: self.settings.network,
+                    upstream_observation_cache: &self.upstream_observation_cache,
+                },
                 request,
             )
             .await
@@ -358,7 +394,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_summaries_in_range(derive_store, &mut client, request).await
+            handle_block_summaries_in_range(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -377,7 +419,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_detail(derive_store, &mut client, request).await
+            handle_block_detail(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -399,6 +447,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 self.derive_store.as_ref(),
                 &mut client,
                 self.settings.network,
+                &self.upstream_observation_cache,
                 request,
             )
             .await
@@ -419,7 +468,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_summary(&mut client, self.settings.network, request).await
+            handle_mempool_summary(
+                &mut client,
+                self.settings.network,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -437,7 +492,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_activity(&mut client, self.settings.network, request).await
+            handle_mempool_activity(
+                &mut client,
+                self.settings.network,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -462,6 +523,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 derive_store,
                 &mut client,
                 self.settings.network,
+                &self.upstream_observation_cache,
                 request,
             )
             .await
@@ -483,7 +545,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_fee_summary(derive_store, &mut client, request).await
+            handle_fee_summary(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -501,7 +569,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_summary(&mut client, request).await
+            handle_value_pool_summary(&mut client, &self.upstream_observation_cache, request).await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -523,7 +591,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 .as_ref()
                 .ok_or_else(|| Status::unavailable("MempoolEventCounts requires a derive store"))?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_event_counts(derive_store, &mut client, request).await
+            handle_mempool_event_counts(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -547,7 +621,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 .as_ref()
                 .ok_or_else(|| Status::unavailable("RecentTransactions requires a derive store"))?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_recent_transactions(derive_store, &mut client, request).await
+            handle_recent_transactions(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -566,7 +646,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_overview_snapshot(derive_store, &mut client, request).await
+            handle_overview_snapshot(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());

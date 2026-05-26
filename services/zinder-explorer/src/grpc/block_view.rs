@@ -23,6 +23,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 
 /// Hard cap on the number of block summaries one range request returns.
@@ -35,6 +36,7 @@ const MAX_BLOCK_SUMMARIES_PER_REQUEST: u32 = 1024;
 pub(crate) async fn handle_block_summaries_in_range(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockSummariesInRangeRequest>,
 ) -> Result<Response<BlockSummariesInRangeResponse>, Status> {
     let inner = request.into_inner();
@@ -77,12 +79,16 @@ pub(crate) async fn handle_block_summaries_in_range(
         summaries.push(summary);
     }
 
-    let freshness = build_freshness_from_tip(
-        derive_store,
-        EXPLORER_BLOCK_SUMMARY_V1,
-        chain_epoch,
-        canonical_tip,
-    )?;
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        build_freshness_from_tip(
+            derive_store,
+            EXPLORER_BLOCK_SUMMARY_V1,
+            chain_epoch,
+            canonical_tip,
+        )?,
+    )
+    .await;
 
     Ok(Response::new(BlockSummariesInRangeResponse {
         freshness: Some(freshness),
@@ -93,6 +99,7 @@ pub(crate) async fn handle_block_summaries_in_range(
 pub(crate) async fn handle_block_detail(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockDetailRequest>,
 ) -> Result<Response<BlockDetailResponse>, Status> {
     let inner = request.into_inner();
@@ -116,12 +123,16 @@ pub(crate) async fn handle_block_detail(
     let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
     annotate_request_time_fields(&mut summary, canonical_tip);
 
-    let freshness = build_freshness_from_tip(
-        derive_store,
-        EXPLORER_BLOCK_DETAIL_V1,
-        chain_epoch,
-        canonical_tip,
-    )?;
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        build_freshness_from_tip(
+            derive_store,
+            EXPLORER_BLOCK_DETAIL_V1,
+            chain_epoch,
+            canonical_tip,
+        )?,
+    )
+    .await;
 
     Ok(Response::new(BlockDetailResponse {
         freshness: Some(freshness),
@@ -207,5 +218,6 @@ fn build_freshness_from_tip(
         derive_cursor_lag_millis: 0,
         capability_version: capability_version.to_owned(),
         unavailable: Vec::new(),
+        upstream: None,
     })
 }

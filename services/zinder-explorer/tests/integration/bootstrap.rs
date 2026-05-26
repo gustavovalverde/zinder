@@ -8,12 +8,14 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use eyre::{Result, eyre};
 use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
-use zinder_core::{BlockHeight, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{BlockHeight, BlockId, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
     DeriveStoreOptions,
@@ -29,6 +31,10 @@ use zinder_proto::v1::explorer::{
     ServerInfoRequest, TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_source::{
+    NodeCapabilities, NodeSource, SourceBlock, SourceError,
+    UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
+};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -303,6 +309,126 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_derive_store() -> R
     wallet_handle.abort();
     let _ = wallet_handle.await;
     Ok(())
+}
+
+/// The upstream-observation probe surfaces the cached `UpstreamHealthSnapshot`
+/// on every `ExplorerFreshness` once the probe has fired.
+///
+/// Wires a stub `NodeSource` that reports a synthetic snapshot, spawns the
+/// adapter's background probe at a short cadence, and asserts the resulting
+/// `OverviewSnapshot` carries the same fields the stub returned.
+#[tokio::test]
+async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires() -> Result<()> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let explorer_addr = listener.local_addr()?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_derive_store(seeded_derive_store.secondary_store)
+    .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
+    .with_prevout_resolution_online(true);
+    let probe_cancel = CancellationToken::new();
+    let probe_handle = adapter.spawn_upstream_observation_probe(
+        Arc::new(StubUpstreamSource::ready(2_530_000, 2_544_375, 0.9943)),
+        Duration::from_millis(10),
+        probe_cancel.clone(),
+    );
+    let explorer_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let channel = await_with_retry(explorer_addr).await?;
+    let mut client = ExplorerQueryClient::new(channel);
+
+    // The probe loop waits one `poll_interval` before its first tick. Spin
+    // a few requests with a short pause between them so the test passes
+    // deterministically once the first snapshot lands.
+    let mut observed_upstream = None;
+    for _ in 0..50 {
+        let response = client
+            .overview_snapshot(OverviewSnapshotRequest {
+                recent_blocks_limit: 0,
+                recent_transactions_limit: 0,
+                mempool_window_seconds: 0,
+                fee_summary_block_count: 0,
+            })
+            .await?
+            .into_inner();
+        let freshness = response
+            .freshness
+            .ok_or_else(|| eyre!("overview response missing freshness"))?;
+        if let Some(upstream) = freshness.upstream {
+            observed_upstream = Some(upstream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let upstream = observed_upstream
+        .ok_or_else(|| eyre!("upstream observation probe never refreshed the cached snapshot"))?;
+    assert_eq!(upstream.upstream_committed_tip_height, Some(2_530_000));
+    assert_eq!(upstream.upstream_estimated_tip_height, Some(2_544_375));
+    assert_eq!(upstream.upstream_verification_progress, Some(0.9943));
+
+    probe_cancel.cancel();
+    let _ = probe_handle.await;
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+/// Minimal `NodeSource` stub used by the upstream-observation probe test.
+///
+/// Returns a fixed [`UpstreamHealthSnapshot`] from
+/// `poll_upstream_health` and surfaces `NodeCapabilityMissing` from
+/// every other method. Used only to exercise the adapter's
+/// upstream-observation probe; never hits a real node.
+struct StubUpstreamSource {
+    snapshot: UpstreamHealthSnapshot,
+}
+
+impl StubUpstreamSource {
+    fn ready(committed: u32, estimated: u32, progress: f64) -> Self {
+        Self {
+            snapshot: UpstreamHealthSnapshot::ready(
+                UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
+                Some(committed),
+                Some(estimated),
+                Some(progress),
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeSource for StubUpstreamSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        NodeCapabilities::default()
+    }
+
+    async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: zinder_source::NodeCapability::ReadinessProbe,
+        })
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: zinder_source::NodeCapability::ReadinessProbe,
+        })
+    }
+
+    async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
+        Ok(self.snapshot.clone())
+    }
 }
 
 async fn spawn_wallet_query_server(

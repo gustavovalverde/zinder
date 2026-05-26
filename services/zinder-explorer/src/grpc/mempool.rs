@@ -28,6 +28,8 @@ use zinder_proto::v1::wallet::{
 use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+
 /// Hard cap on the mempool entries the summary aggregates in one call.
 ///
 /// Mempool sizes on mainnet sit in the low thousands; bounding the read
@@ -64,6 +66,7 @@ const CURSOR_BYTES: usize = 12;
 pub(crate) async fn handle_mempool_summary(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolSummaryRequest>,
 ) -> Result<Response<MempoolSummaryResponse>, Status> {
     let _inner = request.into_inner();
@@ -100,14 +103,19 @@ pub(crate) async fn handle_mempool_summary(
         .chain_epoch
         .clone()
         .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
-    let freshness = ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: snapshot.snapshot_age_millis,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_MEMPOOL_SUMMARY_V1.to_owned(),
-        unavailable: Vec::new(),
-    };
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
+            chain_epoch: Some(chain_epoch),
+            snapshot_age_millis: snapshot.snapshot_age_millis,
+            derive_cursor_lag_blocks: 0,
+            derive_cursor_lag_millis: 0,
+            capability_version: EXPLORER_MEMPOOL_SUMMARY_V1.to_owned(),
+            unavailable: Vec::new(),
+            upstream: None,
+        },
+    )
+    .await;
 
     Ok(Response::new(MempoolSummaryResponse {
         freshness: Some(freshness),
@@ -132,6 +140,7 @@ pub(crate) async fn handle_mempool_summary(
 pub(crate) async fn handle_mempool_activity(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolActivityRequest>,
 ) -> Result<Response<MempoolActivityResponse>, Status> {
     let inner = request.into_inner();
@@ -193,14 +202,19 @@ pub(crate) async fn handle_mempool_activity(
     let chain_epoch = snapshot
         .chain_epoch
         .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
-    let freshness = ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: snapshot.snapshot_age_millis,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_MEMPOOL_ACTIVITY_V1.to_owned(),
-        unavailable: Vec::new(),
-    };
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
+            chain_epoch: Some(chain_epoch),
+            snapshot_age_millis: snapshot.snapshot_age_millis,
+            derive_cursor_lag_blocks: 0,
+            derive_cursor_lag_millis: 0,
+            capability_version: EXPLORER_MEMPOOL_ACTIVITY_V1.to_owned(),
+            unavailable: Vec::new(),
+            upstream: None,
+        },
+    )
+    .await;
 
     Ok(Response::new(MempoolActivityResponse {
         freshness: Some(freshness),

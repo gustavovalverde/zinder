@@ -23,6 +23,8 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+
 /// Hard cap on the blocks one `FeeSummary` request aggregates.
 ///
 /// The wire response is a single aggregate over a contiguous window; the cap
@@ -33,18 +35,19 @@ const MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST: u32 = 256;
 pub(crate) async fn handle_fee_summary(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<FeeSummaryRequest>,
 ) -> Result<Response<FeeSummaryResponse>, Status> {
     let inner = request.into_inner();
     validate_range(inner.start_height, inner.end_height)?;
     let aggregate = aggregate_block_summaries(derive_store, inner.start_height, inner.end_height)?;
     let (chain_epoch, canonical_tip) = fetch_latest_chain_epoch(wallet_client).await?;
-    Ok(Response::new(build_response(
-        derive_store,
-        aggregate,
-        chain_epoch,
-        canonical_tip,
-    )?))
+    let mut response = build_response(derive_store, aggregate, chain_epoch, canonical_tip)?;
+    if let Some(freshness) = response.freshness.take() {
+        response.freshness =
+            Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
+    }
+    Ok(Response::new(response))
 }
 
 fn validate_range(start_height: u32, end_height: u32) -> Result<(), Status> {
@@ -144,6 +147,7 @@ fn build_response(
         derive_cursor_lag_millis: 0,
         capability_version: EXPLORER_FEE_SUMMARY_V1.to_owned(),
         unavailable: Vec::new(),
+        upstream: None,
     };
     Ok(FeeSummaryResponse {
         freshness: Some(freshness),

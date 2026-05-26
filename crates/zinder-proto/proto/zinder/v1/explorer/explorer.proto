@@ -68,6 +68,36 @@ enum UnavailableReason {
   UNAVAILABLE_PARSER_VERSION_UNSUPPORTED = 6;
 }
 
+// Upstream node's view of the chain, copied verbatim from the source plane.
+//
+// Source: `UpstreamHealthSnapshot` produced by
+// `zinder_source::NodeSource::poll_upstream_health`. Lets explorer
+// consumers render honest sync-progress UI against the real chain tip
+// without reinventing protocol invariants (block-time math) in their
+// code.
+//
+// Optional because the source-plane probe is async; a response that
+// fires before the first probe has the field unset. Consumers MUST
+// treat an absent value as "unknown", not zero.
+//
+// Field names mirror `UpstreamNotReadyDetail` in
+// `zinder/v1/ops/readiness.proto` so an operator skimming the ops
+// surface and the explorer surface sees the same vocabulary for the
+// same upstream-node facts.
+message UpstreamObservation {
+  // Highest block height the upstream node has locally verified
+  // (Zebra's `blocks` from `getblockchaininfo`).
+  optional uint32 upstream_committed_tip_height = 1;
+  // Highest block height the upstream node estimates exists on the
+  // network (Zebra's `estimatedheight` from `getblockchaininfo`).
+  // Always `>= upstream_committed_tip_height`. Use this as the
+  // denominator for sync-progress UI.
+  optional uint32 upstream_estimated_tip_height = 2;
+  // Zebra's `verificationprogress` in `[0.0, 1.0]`. Useful for showing
+  // upstream's own catch-up state alongside the explorer's derive lag.
+  optional double upstream_verification_progress = 3;
+}
+
 // Cross-cutting freshness envelope embedded on every explorer response
 // (`field tag 1` by convention).
 //
@@ -94,6 +124,11 @@ message ExplorerFreshness {
 
   // Field-path-keyed unavailability entries.
   repeated UnavailableField unavailable = 6;
+
+  // Upstream node's view of the chain at response-construction time.
+  // Optional because the source-plane probe is async; an early response
+  // may fire before the first probe completes. See `UpstreamObservation`.
+  optional UpstreamObservation upstream = 7;
 }
 
 // Coarse transaction-format identifier.

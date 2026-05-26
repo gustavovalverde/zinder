@@ -35,6 +35,8 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+
 /// Range cap on `recent_blocks_limit`.
 const MIN_RECENT_BLOCKS_LIMIT: u32 = 1;
 /// Server-side ceiling on `recent_blocks_limit`.
@@ -76,6 +78,7 @@ const RECENT_TRANSACTIONS_ROW_KEY_LEN: usize = 8;
 pub(crate) async fn handle_overview_snapshot(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<OverviewSnapshotRequest>,
 ) -> Result<Response<OverviewSnapshotResponse>, Status> {
     let limits = RequestLimits::from_request(request.into_inner());
@@ -92,15 +95,21 @@ pub(crate) async fn handle_overview_snapshot(
     let mempool_events = read_mempool_event_counts(derive_store, limits.mempool_window_seconds)?;
     let mempool = aggregate_mempool_summary(wallet_client).await?;
     let value_pools = read_value_pools(wallet_client).await?;
-    Ok(Response::new(OverviewSnapshotResponse {
-        freshness: Some(ExplorerFreshness {
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
             chain_epoch: Some(anchor.chain_epoch),
             snapshot_age_millis: 0,
             derive_cursor_lag_blocks,
             derive_cursor_lag_millis: 0,
             capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
             unavailable: Vec::new(),
-        }),
+            upstream: None,
+        },
+    )
+    .await;
+    Ok(Response::new(OverviewSnapshotResponse {
+        freshness: Some(freshness),
         tip_block_time_unix_seconds,
         mempool: Some(mempool),
         mempool_events: Some(mempool_events),

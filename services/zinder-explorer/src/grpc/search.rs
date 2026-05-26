@@ -40,6 +40,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
 use zinder_derive::DeriveStore;
 
 const CONFIDENCE_HIGH: f32 = 1.0;
@@ -50,6 +51,7 @@ pub(crate) async fn handle_search(
     derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<SearchRequest>,
 ) -> Result<Response<SearchResponse>, Status> {
     let inner = request.into_inner();
@@ -58,7 +60,11 @@ pub(crate) async fn handle_search(
     for classification in classifications {
         candidates.extend(project_classification(wallet_client, network, classification).await?);
     }
-    let freshness = build_freshness(derive_store, wallet_client).await?;
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        build_freshness(derive_store, wallet_client).await?,
+    )
+    .await;
     Ok(Response::new(SearchResponse {
         freshness: Some(freshness),
         candidates,
@@ -404,6 +410,7 @@ async fn build_freshness(
         derive_cursor_lag_millis: 0,
         capability_version: EXPLORER_SEARCH_V1.to_owned(),
         unavailable: Vec::new(),
+        upstream: None,
     })
 }
 

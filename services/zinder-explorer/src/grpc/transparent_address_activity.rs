@@ -25,6 +25,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
 };
@@ -44,6 +45,7 @@ pub(crate) async fn handle_transparent_address_activity(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<TransparentAddressActivityRequest>,
 ) -> Result<Response<TransparentAddressActivityResponse>, Status> {
     let inner = request.into_inner();
@@ -73,15 +75,21 @@ pub(crate) async fn handle_transparent_address_activity(
     let chain_epoch = latest
         .chain_epoch
         .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
-    Ok(Response::new(TransparentAddressActivityResponse {
-        freshness: Some(ExplorerFreshness {
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
             chain_epoch: Some(chain_epoch),
             snapshot_age_millis: 0,
             derive_cursor_lag_blocks: 0,
             derive_cursor_lag_millis: 0,
             capability_version: EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1.to_owned(),
             unavailable: Vec::new(),
-        }),
+            upstream: None,
+        },
+    )
+    .await;
+    Ok(Response::new(TransparentAddressActivityResponse {
+        freshness: Some(freshness),
         entries,
         next_cursor,
     }))

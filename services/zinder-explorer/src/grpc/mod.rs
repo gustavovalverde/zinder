@@ -3,6 +3,7 @@
 mod adapter;
 mod block_view;
 mod fee_summary;
+mod freshness;
 mod mempool;
 mod mempool_event_counts;
 mod overview_snapshot;

@@ -34,12 +34,21 @@ message ExplorerFreshness {
   uint64 derive_cursor_lag_millis = 4;   // wall-clock equivalent of the block lag
   string capability_version = 5;         // capability string that produced this response
   repeated UnavailableField unavailable = 6;
+  optional UpstreamObservation upstream = 7;  // upstream node's view of the chain
+}
+
+message UpstreamObservation {
+  optional uint32 upstream_committed_tip_height = 1;
+  optional uint32 upstream_estimated_tip_height = 2;
+  optional double upstream_verification_progress = 3;
 }
 ```
 
 Every `ExplorerQuery` response carries `ExplorerFreshness freshness = 1;` as its first field. Responses that do not touch mempool state leave `snapshot_age_millis = 0`; responses that do not depend on the derive cursor leave `derive_cursor_lag_*` zero. The field is present unconditionally so consumers can write `response.freshness.chain_epoch` without conditional checks.
 
 `capability_version` carries the exact string from `ZINDER_CAPABILITIES` that produced the response (e.g. `explorer.transaction.detail_v1`). When a future `_v2` ships alongside `_v1`, clients can branch on which version a particular response uses without parsing the descriptor again.
+
+`upstream` carries the upstream node's view of the chain at response-construction time. The field mirrors three values from `UpstreamHealthSnapshot` (`upstream_committed_height`, `upstream_estimated_height`, `upstream_verification_progress`), matching the field names already used by `UpstreamNotReadyDetail` on the ops readiness surface. The field is optional because the source-plane probe is async; a response that fires before the first probe carries `upstream = None`. Consumers MUST treat the absence as "unknown", not zero. This lets explorer consumers render an honest sync-progress UI ("block X of Y") against the real chain tip without reinventing protocol invariants (block-time math) client-side.
 
 ### `UnavailableField` carries structured reasons
 
@@ -169,3 +178,7 @@ Rejected. A nullable field tells the client "value absent" but not why. The PRD'
 - A subscription channel for derive-cursor-lag updates. Clients re-poll explorer responses; the lag fields surface on every response and are sufficient for UI rendering.
 - A `Freshness` message on `WalletQuery` responses. The wallet plane's correctness model does not depend on the same fields; `ChainEpoch` alone covers what wallets need.
 - Localization of `human_reason` strings. The strings are English-only in v1; per-locale rendering is a UI concern.
+
+## Revision history
+
+- 2026-05-26: Added `optional UpstreamObservation upstream = 7` to `ExplorerFreshness`. Lets explorer consumers render honest sync-progress UI against the upstream node's own committed/estimated tips and verification progress instead of reinventing protocol invariants (block-time math) client-side. The field is optional and additive; consumers that do not read it see no behavior change. Source plane already produces the values via `UpstreamHealthSnapshot`; the explorer adapter caches the snapshot in a small background probe and folds it into every freshness envelope on response construction. Because every Zinder/Zexplorer consumer is unreleased alpha, the change lands on `_v1` in place rather than as a new `_v2` capability.

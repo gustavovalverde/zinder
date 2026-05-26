@@ -101,10 +101,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Upstream Zebra JSON-RPC URL the service connects to.",
+        description: "Upstream Zebra JSON-RPC URL the service connects to. Optional for \
+                      `zinder-explorer`: without it the upstream-observation probe stays \
+                      off and `ExplorerFreshness.upstream` is always unset.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
@@ -122,6 +125,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -134,6 +138,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=basic"),
         sensitive: false,
@@ -146,6 +151,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=basic"),
         sensitive: true,
@@ -158,6 +164,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=cookie"),
         sensitive: false,
@@ -170,6 +177,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=cookie"),
         sensitive: true,
@@ -184,6 +192,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -196,6 +205,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -215,11 +225,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
         toml_path: "node.health.poll_interval_ms",
-        used_by: &["zinder-ingest"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
-                      Must be greater than zero.",
+                      Must be greater than zero. `zinder-explorer` reuses the same cadence for \
+                      its upstream-observation probe (the one that populates \
+                      `ExplorerFreshness.upstream`).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",

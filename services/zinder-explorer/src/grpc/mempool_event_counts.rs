@@ -14,6 +14,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
 use zinder_derive::{DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer};
 
 /// Minimum window size accepted by the handler.
@@ -33,6 +34,7 @@ const MAX_ROWS_PER_REQUEST: usize = MAX_WINDOW_SECONDS as usize;
 pub(crate) async fn handle_mempool_event_counts(
     derive_store: &DeriveStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolEventCountsRequest>,
 ) -> Result<Response<MempoolEventCountsResponse>, Status> {
     let inner = request.into_inner();
@@ -73,15 +75,21 @@ pub(crate) async fn handle_mempool_event_counts(
         .chain_epoch
         .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
 
-    Ok(Response::new(MempoolEventCountsResponse {
-        freshness: Some(ExplorerFreshness {
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        ExplorerFreshness {
             chain_epoch: Some(chain_epoch),
             snapshot_age_millis: 0,
             derive_cursor_lag_blocks: 0,
             derive_cursor_lag_millis: 0,
             capability_version: EXPLORER_MEMPOOL_EVENT_COUNTS_V1.to_owned(),
             unavailable: Vec::new(),
-        }),
+            upstream: None,
+        },
+    )
+    .await;
+    Ok(Response::new(MempoolEventCountsResponse {
+        freshness: Some(freshness),
         window_seconds,
         added_count,
         mined_count,

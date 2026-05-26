@@ -11,6 +11,7 @@ use zinder_runtime::{
     ServiceIdentifier, load_bearer_token, parse_socket_addr, require_field,
     resolve_ops_listen_addr, resolve_secondary_storage,
 };
+use zinder_source::{NodeSection, NodeTarget};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 
@@ -27,6 +28,10 @@ pub(crate) struct ExplorerConfig {
     /// Empty string means the federated balance method is unavailable; the
     /// `explorer.transparent_address.balance_v1` capability is omitted.
     pub(crate) wallet_query_endpoint: Option<String>,
+    /// Resolved upstream node target. `None` when the operator did not
+    /// configure `[node]`; the upstream-observation probe stays unspawned
+    /// and every `ExplorerFreshness.upstream` field is unset.
+    pub(crate) node: Option<NodeTarget>,
 }
 
 /// Command-line overrides applied on top of the layered configuration.
@@ -64,6 +69,12 @@ pub(crate) enum ExplorerConfigError {
 
     #[error("invalid explorer bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),
+
+    #[error("invalid [node] configuration: {0}")]
+    Node(#[from] zinder_source::NodeConfigError),
+
+    #[error("failed to build upstream node source: {0}")]
+    NodeSource(#[from] zinder_source::SourceError),
 }
 
 /// Loads and validates explorer configuration from defaults, file, environment, and CLI overrides.
@@ -120,6 +131,7 @@ struct ExplorerRawConfig {
     storage: SecondaryStorageSection,
     explorer: ExplorerSection,
     ops: OpsSection,
+    node: NodeSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +188,7 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         .explorer
         .wallet_query_endpoint
         .filter(|endpoint| !endpoint.is_empty());
+    let node = NodeTarget::resolve_optional(network, raw.node)?;
     Ok(ExplorerConfig {
         network,
         storage,
@@ -184,5 +197,6 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,
+        node,
     })
 }
