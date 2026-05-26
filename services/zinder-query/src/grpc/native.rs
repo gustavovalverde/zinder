@@ -17,7 +17,7 @@ use zinder_core::{
     TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
     TxStatus,
-    wire::{encode_internal_block_hash, encode_internal_transaction_id},
+    wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
 use zinder_proto::capabilities::{
@@ -494,10 +494,10 @@ pub fn build_transparent_address_tx_ids_chunk(
 ) -> wallet::TransparentAddressTxIdsChunk {
     wallet::TransparentAddressTxIdsChunk {
         chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
-        transaction_id: encode_internal_transaction_id(artifact.transaction_id).to_vec(),
+        transaction_id: encode_rpc_transaction_id_hex(artifact.transaction_id),
         block_height: artifact.block_height.value(),
         tx_index_in_block: artifact.tx_index_in_block,
-        block_hash: encode_internal_block_hash(artifact.block_hash).to_vec(),
+        block_hash: encode_rpc_block_hash_hex(artifact.block_hash),
         cursor,
     }
 }
@@ -556,7 +556,7 @@ fn build_address_output_index_message(
         outpoint: Some(outpoint_message(&output.outpoint)),
         value_zat: output.value_zat,
         block_height: output.block_height.value(),
-        block_hash: encode_internal_block_hash(output.block_hash).to_vec(),
+        block_hash: encode_rpc_block_hash_hex(output.block_hash),
     }
 }
 
@@ -589,8 +589,8 @@ fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::B
                 header.block_id.height,
                 header.block_id.hash,
             )),
-            previous_block_hash: encode_internal_block_hash(header.previous_block_hash).to_vec(),
-            merkle_root_hash: header.merkle_root_hash.to_vec(),
+            previous_block_hash: encode_rpc_block_hash_hex(header.previous_block_hash),
+            merkle_root_hash: encode_rpc_merkle_root_hex(header.merkle_root_hash),
             commitment_bytes: header.commitment_bytes.to_vec(),
             block_time: header.block_time,
             bits: header.bits,
@@ -657,9 +657,9 @@ fn build_transaction_location_message(
     transaction: TransactionLocation,
 ) -> wallet::TransactionLocation {
     wallet::TransactionLocation {
-        transaction_id: encode_internal_transaction_id(transaction.transaction_id).into(),
+        transaction_id: encode_rpc_transaction_id_hex(transaction.transaction_id),
         block_height: transaction.block_height.value(),
-        block_hash: encode_internal_block_hash(transaction.block_hash).into(),
+        block_hash: encode_rpc_block_hash_hex(transaction.block_hash),
         tx_index_in_block: transaction.tx_index_in_block,
     }
 }
@@ -668,7 +668,7 @@ fn build_tree_state_checkpoint_response(tree_state: TreeState) -> wallet::TreeSt
     wallet::TreeStateResponse {
         chain_epoch: Some(build_chain_epoch_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),
-        block_hash: encode_internal_block_hash(tree_state.block_hash).into(),
+        block_hash: encode_rpc_block_hash_hex(tree_state.block_hash),
         payload_bytes: tree_state.payload_bytes,
     }
 }
@@ -725,7 +725,7 @@ fn build_broadcast_transaction_response(
 
 fn build_broadcast_accepted_message(accepted: BroadcastAccepted) -> wallet::BroadcastAccepted {
     wallet::BroadcastAccepted {
-        transaction_id: encode_internal_transaction_id(accepted.transaction_id).into(),
+        transaction_id: encode_rpc_transaction_id_hex(accepted.transaction_id),
     }
 }
 
@@ -819,7 +819,7 @@ fn build_block_metadata_message(
 ) -> wallet::BlockMetadata {
     wallet::BlockMetadata {
         height: height.value(),
-        block_hash: encode_internal_block_hash(block_hash).into(),
+        block_hash: encode_rpc_block_hash_hex(block_hash),
     }
 }
 
@@ -828,7 +828,7 @@ pub(crate) fn build_compact_block_message(
 ) -> wallet::CompactBlock {
     wallet::CompactBlock {
         height: compact_block.height.value(),
-        block_hash: encode_internal_block_hash(compact_block.block_hash).into(),
+        block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
         payload_bytes: compact_block.payload_bytes,
     }
 }
@@ -837,8 +837,7 @@ fn build_subtree_root_message(subtree_root: &SubtreeRootArtifact) -> wallet::Sub
     wallet::SubtreeRoot {
         subtree_index: subtree_root.subtree_index.value(),
         root_hash: subtree_root.root_hash.as_bytes().into(),
-        completing_block_hash: encode_internal_block_hash(subtree_root.completing_block_hash)
-            .into(),
+        completing_block_hash: encode_rpc_block_hash_hex(subtree_root.completing_block_hash),
         completing_block_height: subtree_root.completing_block_height.value(),
     }
 }

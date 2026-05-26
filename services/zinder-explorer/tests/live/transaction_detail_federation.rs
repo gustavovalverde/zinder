@@ -34,7 +34,7 @@ use tonic::Request;
 use tonic::transport::Channel;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
-use zinder_core::wire::{encode_internal_transaction_id, encode_zinder_native_chain_name};
+use zinder_core::wire::{encode_rpc_transaction_id_hex, encode_zinder_native_chain_name};
 use zinder_core::{BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
@@ -96,7 +96,7 @@ fn assert_response_invariants(
         .ok_or_else(|| eyre!("response missing public facts"))?;
     assert_eq!(
         facts.transaction_id,
-        encode_internal_transaction_id(fixture.coinbase_transaction_id).to_vec(),
+        encode_rpc_transaction_id_hex(fixture.coinbase_transaction_id),
         "transaction_id must match the txid the explorer was asked for",
     );
     assert!(facts.is_coinbase);
@@ -209,7 +209,7 @@ impl TransactionDetailFixture {
         &self,
     ) -> Result<zinder_proto::v1::explorer::TransactionDetailResponse> {
         let request = TransactionDetailRequest {
-            transaction_id: encode_internal_transaction_id(self.coinbase_transaction_id).to_vec(),
+            transaction_id: encode_rpc_transaction_id_hex(self.coinbase_transaction_id),
             at_epoch: None,
         };
         let response =

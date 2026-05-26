@@ -1,16 +1,23 @@
 //! Native to wire dialect conversions for Zinder domain types.
 //!
 //! Every native-to-wire translation lives in this module. Each submodule owns
-//! one concept (`chain_name`, `transaction_id`, `block_hash`, `branch_id`)
-//! across all dialects that use it. Function names disclose the convention:
-//! `encode_internal_*` and `decode_internal_*` for proto `bytes` fields,
-//! `encode_display_*_hex` and `decode_display_*_hex` for hex-string surfaces.
+//! one concept (`chain_name`, `transaction_id`, `block_hash`, `auth_digest`,
+//! `wtxid`, `branch_id`) across all dialects that use it. Function names
+//! disclose the convention: `encode_internal_*` and `decode_internal_*` for
+//! the storage form and the lightwalletd-compat `bytes` boundary;
+//! `encode_rpc_*_hex` and `decode_rpc_*_hex` for the RPC byte order hex form
+//! every public wallet UI, block explorer, log record, and Zcash JSON-RPC
+//! reply uses.
 //!
-//! [`encode_branch_id_hex`] drops the `_internal_`/`_display_` qualifier
-//! because consensus branch ids have a single canonical wire form (the
-//! `{:08x}` lowercase hex string used by lightwalletd and Zebra
-//! `getblockchaininfo`); there is no byte-order companion to disambiguate
-//! against. The single-form chain-name encoders ([`encode_bip70_chain_name`],
+//! RPC byte order is defined normatively in the Zcash protocol specification
+//! at protocol.tex:1127 (`\rpcByteOrder`) and used at protocol.tex:4036. It
+//! is the byte-reversal of the internal SHA-256d output form Zinder stores.
+//!
+//! [`encode_branch_id_hex`] drops the `_internal_`/`_rpc_` qualifier because
+//! consensus branch ids have a single canonical wire form (the `{:08x}`
+//! lowercase hex string used by lightwalletd and Zebra `getblockchaininfo`);
+//! there is no byte-order companion to disambiguate against. The single-form
+//! chain-name encoders ([`encode_bip70_chain_name`],
 //! [`encode_zinder_native_chain_name`]) follow the same pattern.
 //!
 //! Adding a new wire field or a new ingress dialect MUST route through a
@@ -20,20 +27,27 @@
 //! `crates/zinder-core/tests/wire_invariants.rs` enforces this.
 
 mod address_script_hash;
+mod auth_digest;
 mod block_hash;
 mod branch_id;
 mod chain_name;
 mod height_key;
 mod in_block_position;
+mod merkle_root;
 mod transaction_id;
 mod unix_seconds;
+mod wtxid;
 
 pub use address_script_hash::{
     ADDRESS_SCRIPT_HASH_LEN, decode_address_script_hash, encode_address_script_hash,
 };
+pub use auth_digest::{
+    decode_internal_auth_digest, decode_rpc_auth_digest_hex, encode_internal_auth_digest,
+    encode_rpc_auth_digest_hex,
+};
 pub use block_hash::{
-    decode_display_block_hash_hex, decode_internal_block_hash, encode_display_block_hash_hex,
-    encode_internal_block_hash,
+    decode_internal_block_hash, decode_rpc_block_hash_hex, encode_internal_block_hash,
+    encode_rpc_block_hash_hex,
 };
 pub use branch_id::{decode_branch_id_hex, encode_branch_id_hex};
 pub use chain_name::{
@@ -46,11 +60,15 @@ pub use height_key::{
 pub use in_block_position::{
     IN_BLOCK_POSITION_KEY_LEN, decode_in_block_position, encode_in_block_position,
 };
+pub use merkle_root::{decode_rpc_merkle_root_hex, encode_rpc_merkle_root_hex};
 pub use transaction_id::{
-    decode_display_transaction_id_hex, decode_internal_transaction_id,
-    encode_display_transaction_id_hex, encode_internal_transaction_id,
+    decode_internal_transaction_id, decode_rpc_transaction_id_hex, encode_internal_transaction_id,
+    encode_rpc_transaction_id_hex,
 };
 pub use unix_seconds::{UNIX_SECONDS_KEY_LEN, decode_unix_seconds, encode_unix_seconds};
+pub use wtxid::{
+    decode_internal_wtxid, decode_rpc_wtxid_hex, encode_internal_wtxid, encode_rpc_wtxid_hex,
+};
 
 /// Errors returned by `decode_*` functions in [`crate::wire`].
 ///

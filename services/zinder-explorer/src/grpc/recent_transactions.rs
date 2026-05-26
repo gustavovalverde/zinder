@@ -12,7 +12,7 @@ use prost::Message as _;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use zinder_core::TransactionId;
-use zinder_core::wire::decode_internal_transaction_id;
+use zinder_core::wire::decode_rpc_transaction_id_hex;
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_RECENT_V1;
 use zinder_proto::v1::explorer::{
     ExplorerFreshness, RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
@@ -130,7 +130,7 @@ fn join_paid_fees(
     let lookup_targets: Vec<TransactionId> = entries
         .iter()
         .filter(|entry| !entry.is_coinbase)
-        .map(|entry| decode_internal_transaction_id(&entry.transaction_id))
+        .map(|entry| decode_rpc_transaction_id_hex(&entry.transaction_id))
         .collect::<Result<_, _>>()
         .map_err(|error| Status::internal(error.to_string()))?;
     if lookup_targets.is_empty() {
@@ -142,7 +142,7 @@ fn join_paid_fees(
         if entry.is_coinbase {
             continue;
         }
-        let Ok(transaction_id) = decode_internal_transaction_id(&entry.transaction_id) else {
+        let Ok(transaction_id) = decode_rpc_transaction_id_hex(&entry.transaction_id) else {
             continue;
         };
         if let Some(record) = records.get(&transaction_id) {

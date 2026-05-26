@@ -6,7 +6,7 @@ use std::{pin::Pin, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::wire::{decode_rpc_transaction_id_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
@@ -488,18 +488,16 @@ fn script_hash_from_lookup(
     }
 }
 
-fn transaction_id_from_bytes(bytes: &[u8]) -> Result<TransactionId, Status> {
-    let id_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| Status::invalid_argument("transaction_id must be 32 bytes"))?;
-    Ok(TransactionId::from_bytes(id_bytes))
+fn transaction_id_from_rpc_hex(rpc_hex: &str) -> Result<TransactionId, Status> {
+    decode_rpc_transaction_id_hex(rpc_hex)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn outpoint_from_request_message(
     message: Option<wallet::OutPoint>,
 ) -> Result<TransparentOutPoint, Status> {
     let message = message.ok_or_else(|| Status::invalid_argument("outpoint is required"))?;
-    let transaction_id = transaction_id_from_bytes(&message.transaction_id)?;
+    let transaction_id = transaction_id_from_rpc_hex(&message.transaction_id)?;
     Ok(TransparentOutPoint::new(
         transaction_id,
         message.output_index,

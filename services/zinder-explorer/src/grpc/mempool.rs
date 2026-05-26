@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::{Request, Response, Status};
-use zinder_core::wire::encode_internal_transaction_id;
+use zinder_core::wire::{decode_rpc_transaction_id_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
     NetworkUpgradeActivations, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion,
@@ -172,7 +172,7 @@ pub(crate) async fn handle_mempool_activity(
         let counts = facts.counts;
         let logical_actions = counts.logical_actions();
         entries.push(MempoolActivityEntry {
-            transaction_id: encode_internal_transaction_id(facts.transaction_id).to_vec(),
+            transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
             first_seen_unix_millis: entry.first_seen_unix_millis,
             size_bytes: facts.size_bytes,
             privacy_shape: encode_privacy_shape(facts.privacy_shape) as i32,
@@ -261,13 +261,18 @@ fn encode_transaction_version(version: CoreTransactionVersion) -> WireVersion {
     }
 }
 
-fn transaction_id_tail(transaction_id: &[u8]) -> u32 {
-    let len = transaction_id.len();
-    if len < 4 {
+/// Returns the trailing 4 internal-byte-order bytes as a big-endian `u32`.
+///
+/// The caller passes the canonical RPC-form 64-character hex string;
+/// decode failures produce 0 so a pathological wallet response cannot
+/// panic the activity sort.
+fn transaction_id_tail(transaction_id_rpc_hex: &str) -> u32 {
+    let Ok(internal_bytes) = decode_rpc_transaction_id_hex(transaction_id_rpc_hex) else {
         return 0;
-    }
+    };
+    let bytes = internal_bytes.as_bytes();
     let mut tail = [0_u8; 4];
-    tail.copy_from_slice(&transaction_id[len - 4..]);
+    tail.copy_from_slice(&bytes[bytes.len() - 4..]);
     u32::from_be_bytes(tail)
 }
 

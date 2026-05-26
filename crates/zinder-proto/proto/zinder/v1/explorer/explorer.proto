@@ -166,15 +166,24 @@ message TransactionComponentCounts {
 // transaction bytes plus the node-discovered network upgrade table per
 // [ADR-0010](../../../../../docs/adrs/0010-transaction-public-facts.md).
 message TransactionPublicFacts {
-  // Canonical transaction identifier (32 bytes, internal byte order).
-  bytes transaction_id = 1;
+  // Canonical Zcash transaction identifier in RPC byte order (64 lowercase
+  // hex characters; the form `zcash-cli`, every wallet UI, and every block
+  // explorer display).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
 
-  // ZIP-244 authorization digest (32 bytes). Empty/unset for v1-v4.
-  bytes auth_digest = 2;
+  // ZIP-244 authorization digest in RPC byte order (64 lowercase hex
+  // characters). Empty for v1-v4 transactions, which have no distinct
+  // authorization digest.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string auth_digest = 2;
 
-  // ZIP-239 witness identifier (64 bytes, `txid || auth_digest`). Empty/unset
-  // for v1-v4 where the wtxid equals the txid by definition.
-  bytes wtxid = 3;
+  // ZIP-239 witness identifier in RPC byte order: 128 lowercase hex
+  // characters, the concatenation of the RPC-form `txid` (64 chars) and
+  // the RPC-form `auth_digest` (64 chars). Empty for v1-v4 where wtxid
+  // equals txid by definition.
+  // References: ZIP 239; Zcash protocol spec term `\rpcByteOrder`.
+  string wtxid = 3;
 
   // Coarse transaction-format identifier.
   TransactionVersion version = 4;
@@ -247,7 +256,9 @@ message TransactionLocation {
 // renders alongside the parsed facts.
 message MinedLocation {
   uint32 block_height = 1;
-  bytes block_hash = 2;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string block_hash = 2;
   int64 block_time_unix_seconds = 3;
   uint32 confirmations = 4;
 }
@@ -263,7 +274,10 @@ message MempoolLocation {
 // `at_epoch` optionally pins the read to a specific chain epoch so the
 // response stays consistent with a concurrent caller's other reads.
 message TransactionDetailRequest {
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters; the form callers paste from a wallet or block explorer).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
   optional zinder.v1.wallet.ChainEpoch at_epoch = 2;
 }
 
@@ -297,8 +311,9 @@ message BlockSummary {
   // Canonical block height.
   uint32 block_height = 1;
 
-  // Canonical block hash in internal byte order (32 bytes).
-  bytes block_hash = 2;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string block_hash = 2;
 
   // `nTime` from the block header.
   int64 block_time_unix_seconds = 3;
@@ -306,8 +321,9 @@ message BlockSummary {
   // Number of transactions in the block, including the coinbase.
   uint32 transaction_count = 4;
 
-  // Previous block hash in internal byte order (32 bytes).
-  bytes previous_block_hash = 5;
+  // Previous block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string previous_block_hash = 5;
 
   // Sum of serialized transaction byte lengths across the block. Includes
   // the coinbase transaction. Materialized by `BlockSummaryConsumer` at
@@ -361,9 +377,10 @@ message BlockSummary {
 // the consumer's `block_summary` column family.
 message BlockSummaryRecord {
   BlockSummary summary = 1;
-  // Transaction ids in canonical block order (32 bytes each, internal byte
-  // order). The leading entry is the coinbase.
-  repeated bytes transaction_ids = 2;
+  // Transaction ids in canonical block order (each entry is 64 lowercase
+  // hex characters in RPC byte order). The leading entry is the coinbase.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  repeated string transaction_ids = 2;
   // Number of non-coinbase transactions in this block.
   uint32 fee_transaction_count = 3;
   // Smallest ZIP-317 conventional fee floor among non-coinbase transactions,
@@ -404,7 +421,9 @@ message BlockSummariesInRangeResponse {
 message BlockDetailRequest {
   oneof selector {
     uint32 block_height = 1;
-    bytes block_hash = 2;
+    // Canonical block hash in RPC byte order (64 lowercase hex
+    // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+    string block_hash = 2;
   }
 
   // Optional chain-epoch pin for snapshot consistency with concurrent reads.
@@ -422,9 +441,10 @@ message BlockDetailResponse {
   ExplorerFreshness freshness = 1;
   BlockSummary summary = 2;
 
-  // Transaction ids in canonical block order (32 bytes each, internal byte
-  // order). The leading entry is the coinbase.
-  repeated bytes transaction_ids = 3;
+  // Transaction ids in canonical block order (each entry is 64 lowercase
+  // hex characters in RPC byte order). The leading entry is the coinbase.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  repeated string transaction_ids = 3;
 }
 
 // Per-arm privacy refusal payload returned for shielded receivers,
@@ -484,8 +504,9 @@ message BlockMatch {
   // Canonical block height of the resolved block.
   uint32 block_height = 1;
 
-  // Canonical block hash in internal byte order (32 bytes).
-  bytes block_hash = 2;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string block_hash = 2;
 }
 
 // Transaction candidate produced when the input parses as a 32-byte
@@ -494,8 +515,9 @@ message BlockMatch {
 // Mined transactions carry block-context fields; mempool transactions
 // populate only the transaction id.
 message TransactionMatch {
-  // Canonical transaction id (32 bytes, internal byte order).
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
 
   // True when the transaction is currently in the mempool.
   bool in_mempool = 2;
@@ -503,8 +525,10 @@ message TransactionMatch {
   // Populated when the transaction is mined; zero for mempool entries.
   uint32 mined_block_height = 3;
 
-  // Populated when the transaction is mined; empty for mempool entries.
-  bytes mined_block_hash = 4;
+  // Mined block hash in RPC byte order (64 lowercase hex characters) when
+  // the transaction is mined; empty for mempool entries.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string mined_block_hash = 4;
 }
 
 // Transparent (P2PKH or P2SH) address candidate.
@@ -729,8 +753,9 @@ message MempoolActivityRequest {
 
 // One mempool entry projected into the explorer wire shape.
 message MempoolActivityEntry {
-  // Canonical transaction identifier (32 bytes, internal byte order).
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
 
   // Wall-clock time when the indexer first observed this entry.
   uint64 first_seen_unix_millis = 2;
@@ -815,8 +840,9 @@ message TransparentAddressActivityRequest {
 // resolution did not produce a complete picture; the
 // `prevout_resolution_status` field disambiguates why.
 message TransparentAddressActivityEntry {
-  // Canonical transaction identifier (32 bytes, internal byte order).
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
 
   // Canonical block height of the confirming block.
   uint32 block_height = 2;
@@ -1014,7 +1040,9 @@ message ValuePoolSummaryResponse {
 // The handler projects this onto the wire `TransparentAddressActivityEntry`
 // shape and pulls the height + timestamp it already knows from the key.
 message TransparentAddressActivityRecord {
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
   int64 block_time_unix_seconds = 2;
   // Net transparent value the transaction moved for this address
   // (`sum(outputs to address) - sum(prevouts spent from address)`).
@@ -1100,9 +1128,13 @@ message RecentTransactionsChunk {
 //   transparent prevout via `WalletQuery.TransparentOutputsByOutpoint` AND the
 //   transaction has no shielded inputs.
 message RecentTransactionEntry {
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
   uint32 block_height = 2;
-  bytes block_hash = 3;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string block_hash = 3;
   int64 block_time_unix_seconds = 4;
   bool is_coinbase = 5;
   PrivacyShape privacy_shape = 6;
@@ -1187,7 +1219,11 @@ enum PaymentDisclosureVerdict {
 // payment subject; the disclosed amount is what the disclosure asserts
 // the payment moved.
 message PaymentDisclosurePublicFacts {
-  bytes transaction_id = 1;
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
+  // Opaque ZIP-311 payment identifier carried verbatim from the disclosure
+  // payload. Not a Zcash hash; kept as raw bytes.
   bytes payment_id = 2;
   uint64 disclosed_value_zat = 3;
 }

@@ -31,7 +31,7 @@ use crate::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
-    ZEBRA_REBUILD_THRESHOLD, decode_display_block_hash,
+    ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition, zebra_ready_endpoint::ZebraReadyClient,
 };
@@ -263,7 +263,7 @@ impl ZebraJsonRpcSource {
             u32::try_from(orchard).map_err(|_| SourceError::SourceProtocolMismatch {
                 reason: "orchard commitment tree size does not fit u32",
             })?;
-        let block_hash = decode_display_block_hash(&block_response.hash)?;
+        let block_hash = decode_rpc_block_hash(&block_response.hash)?;
         Ok(SourceChainCheckpoint::new(
             height,
             zinder_core::BlockHash::from_bytes(block_hash.as_bytes()),
@@ -730,7 +730,7 @@ impl ZebraJsonRpcSource {
                     .ok_or(SourceError::SourceProtocolMismatch {
                         reason: "verbose getrawtransaction reports a height without a blockhash",
                     })?;
-                let block_hash = decode_display_block_hash(block_hash_hex)?;
+                let block_hash = decode_rpc_block_hash(block_hash_hex)?;
                 Ok(UpstreamTransactionLookup::Mined {
                     mined_height,
                     block_hash,
@@ -911,7 +911,7 @@ impl NodeSource for ZebraJsonRpcSource {
         let best_block_hash_hex: String = self
             .call_typed("getbestblockhash", ArrayParams::new(), map_node_unavailable)
             .await?;
-        let best_block_hash = decode_display_block_hash(&best_block_hash_hex)?;
+        let best_block_hash = decode_rpc_block_hash(&best_block_hash_hex)?;
         let header: ZebraBlockHeader = self
             .call_typed(
                 "getblockheader",
@@ -919,7 +919,7 @@ impl NodeSource for ZebraJsonRpcSource {
                 map_node_unavailable,
             )
             .await?;
-        if decode_display_block_hash(&header.hash)? != best_block_hash {
+        if decode_rpc_block_hash(&header.hash)? != best_block_hash {
             return Err(SourceError::SourceProtocolMismatch {
                 reason: "best block header hash does not match tip hash",
             });
@@ -1479,7 +1479,7 @@ fn validate_zebra_tree_state(
         .ok_or(SourceError::SourceProtocolMismatch {
             reason: "tree-state response is missing block hash",
         })
-        .and_then(decode_display_block_hash)?;
+        .and_then(decode_rpc_block_hash)?;
     if tree_state_hash != block_hash {
         // Mid-flight reorg: `z_gettreestate` and the parsed `getblock`
         // bytes observed different blocks at the same height.
@@ -1506,7 +1506,7 @@ fn validate_zebra_tree_state(
 fn decode_display_transaction_id(
     display_transaction_id: &str,
 ) -> Result<TransactionId, SourceError> {
-    zinder_core::wire::decode_display_transaction_id_hex(display_transaction_id)
+    zinder_core::wire::decode_rpc_transaction_id_hex(display_transaction_id)
         .map_err(wire_error_to_transaction_id_error)
 }
 
@@ -1516,7 +1516,7 @@ fn decode_display_transaction_id(
 /// Internal Zinder storage holds canonical (network-order) txid bytes;
 /// Zebra's RPC surface accepts and returns display-order (reversed) hex.
 fn display_order_transaction_id_hex(transaction_id: TransactionId) -> String {
-    zinder_core::wire::encode_display_transaction_id_hex(transaction_id)
+    zinder_core::wire::encode_rpc_transaction_id_hex(transaction_id)
 }
 
 fn decode_subtree_root_hash(root_hash: &str) -> Result<SubtreeRootHash, SourceError> {

@@ -34,7 +34,7 @@ use zinder_proto::external::zebra_indexer_rpc::{
     BlockHashAndHeight, Empty, indexer_client::IndexerClient,
 };
 
-use crate::{SourceError, ZebraIndexerSourceTarget, decode_display_block_hash};
+use crate::{SourceError, ZebraIndexerSourceTarget, decode_rpc_block_hash};
 
 /// A chain-tip change observed via Zebra's gRPC indexer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,10 +181,10 @@ fn decode_chain_tip_message(
     }
     // `BlockHashAndHeight.hash` arrives in display order per the proto
     // contract, which matches what JSON-RPC consumers feed into
-    // `decode_display_block_hash` after hex-encoding. Reuse the same
+    // `decode_rpc_block_hash` after hex-encoding. Reuse the same
     // canonical decode path so internal byte ordering stays single-sourced.
     let display_hash_hex = hex::encode(&wire_message.hash);
-    let hash = decode_display_block_hash(&display_hash_hex)?;
+    let hash = decode_rpc_block_hash(&display_hash_hex)?;
     Ok(ChainTipNotification {
         tip_id: BlockId {
             height: BlockHeight::new(wire_message.height),

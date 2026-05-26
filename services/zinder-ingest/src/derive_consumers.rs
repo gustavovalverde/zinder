@@ -954,8 +954,8 @@ async fn build_block_contexts_from_committed_event(
         let context = BlockCommitContext::new(
             BlockCommitPayload {
                 height: block.height,
-                block_hash: encode_block_hash(block.block_hash),
-                previous_block_hash: encode_block_hash(block.previous_block_hash),
+                block_hash: block.block_hash,
+                previous_block_hash: block.previous_block_hash,
                 block_time_unix_seconds: block.block_time_unix_seconds,
                 block_size_bytes: block.block_size_bytes,
                 transactions: block.transactions,
@@ -1201,10 +1201,6 @@ fn usize_to_u64_saturating(amount: usize) -> u64 {
 
 fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).unwrap_or(u32::MAX)
-}
-
-fn encode_block_hash(hash: BlockHash) -> Vec<u8> {
-    hash.as_bytes().to_vec()
 }
 
 #[allow(

@@ -72,9 +72,10 @@ async fn project_classification(
 ) -> Result<Vec<SearchCandidate>, Status> {
     match classification {
         SearchClassification::Block { height } => probe_block_height(wallet_client, height).await,
-        SearchClassification::HashCandidate { bytes } => {
-            probe_hash_candidate(wallet_client, bytes).await
-        }
+        SearchClassification::HashCandidate {
+            rpc_hex,
+            internal_bytes: _,
+        } => probe_hash_candidate(wallet_client, rpc_hex).await,
         SearchClassification::TransparentAddress(classification) => Ok(vec![candidate_with_match(
             search_candidate::Match::TransparentAddress(transparent_match(&classification)),
             CONFIDENCE_HIGH,
@@ -174,10 +175,10 @@ async fn probe_block_height(
 
 async fn probe_hash_candidate(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    hash: [u8; 32],
+    rpc_hex: String,
 ) -> Result<Vec<SearchCandidate>, Status> {
     let mut candidates = Vec::new();
-    if let Some(block_id) = resolve_block_by_hash(wallet_client, hash).await? {
+    if let Some(block_id) = resolve_block_by_hash(wallet_client, &rpc_hex).await? {
         candidates.push(candidate_with_match(
             search_candidate::Match::Block(BlockMatch {
                 block_height: block_id.height,
@@ -186,7 +187,9 @@ async fn probe_hash_candidate(
             CONFIDENCE_AMBIGUOUS,
         ));
     }
-    if let Some(transaction_match) = resolve_transaction_by_hash(wallet_client, hash).await? {
+    if let Some(transaction_match) =
+        resolve_transaction_by_hash(wallet_client, rpc_hex.clone()).await?
+    {
         candidates.push(candidate_with_match(
             search_candidate::Match::Transaction(transaction_match),
             CONFIDENCE_AMBIGUOUS,
@@ -202,12 +205,12 @@ async fn probe_hash_candidate(
 
 async fn resolve_block_by_hash(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    hash: [u8; 32],
+    rpc_hex: &str,
 ) -> Result<Option<wallet::BlockMetadata>, Status> {
     match wallet_client
         .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
             selector: Some(BlockSelector {
-                selector: Some(block_selector::Selector::Hash(hash.to_vec())),
+                selector: Some(block_selector::Selector::Hash(rpc_hex.to_owned())),
             }),
             at_epoch: None,
         }))
@@ -221,11 +224,11 @@ async fn resolve_block_by_hash(
 
 async fn resolve_transaction_by_hash(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    hash: [u8; 32],
+    rpc_hex: String,
 ) -> Result<Option<TransactionMatch>, Status> {
     let response = wallet_client
         .transaction(Request::new(wallet::TransactionRequest {
-            transaction_id: hash.to_vec(),
+            transaction_id: rpc_hex.clone(),
             at_epoch: None,
         }))
         .await;
@@ -233,31 +236,31 @@ async fn resolve_transaction_by_hash(
         Ok(envelope) => Ok(envelope
             .into_inner()
             .status
-            .and_then(|status| build_transaction_match(hash, status))),
+            .and_then(|status| build_transaction_match(rpc_hex, status))),
         Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
         Err(status) => Err(status),
     }
 }
 
 fn build_transaction_match(
-    hash: [u8; 32],
+    rpc_hex: String,
     status: transaction_status_response::Status,
 ) -> Option<TransactionMatch> {
     match status {
         transaction_status_response::Status::Mined(mined) => {
             let transaction = mined.location?;
             Some(TransactionMatch {
-                transaction_id: hash.to_vec(),
+                transaction_id: rpc_hex,
                 in_mempool: false,
                 mined_block_height: transaction.block_height,
                 mined_block_hash: transaction.block_hash,
             })
         }
         transaction_status_response::Status::InMempool(_) => Some(TransactionMatch {
-            transaction_id: hash.to_vec(),
+            transaction_id: rpc_hex,
             in_mempool: true,
             mined_block_height: 0,
-            mined_block_hash: Vec::new(),
+            mined_block_hash: String::new(),
         }),
         transaction_status_response::Status::Conflicting(_) => None,
     }

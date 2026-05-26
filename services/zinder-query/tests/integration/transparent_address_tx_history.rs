@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
+use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
     BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, Network, TransactionId, TransparentAddressScriptHash,
@@ -230,10 +231,10 @@ async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() ->
 
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].tx_index_in_block, 0);
-    assert_eq!(chunks[0].transaction_id, vec![0x22; 32]);
+    assert_eq!(chunks[0].transaction_id, "22".repeat(32));
     assert_eq!(
         chunks[0].block_hash,
-        block_hash_from_seed(20).as_bytes().to_vec()
+        encode_rpc_block_hash_hex(block_hash_from_seed(20))
     );
     Ok(())
 }

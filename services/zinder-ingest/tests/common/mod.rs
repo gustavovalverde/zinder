@@ -26,8 +26,9 @@ use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Request, transport::Server};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::NetworkUpgradeActivations;
-use zinder_core::wire::encode_bip70_chain_name;
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::wire::{
+    encode_bip70_chain_name, encode_rpc_block_hash_hex, encode_zinder_native_chain_name,
+};
 use zinder_core::{
     BlockHeight, BlockHeightRange, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
@@ -764,9 +765,9 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
                 chain_epoch_id: range_chain_epoch.id.value(),
                 network_name: encode_zinder_native_chain_name(range_chain_epoch.network).to_owned(),
                 tip_height: range_chain_epoch.tip_height.value(),
-                tip_hash: range_chain_epoch.tip_hash.as_bytes().into(),
+                tip_hash: encode_rpc_block_hash_hex(range_chain_epoch.tip_hash),
                 finalized_height: range_chain_epoch.finalized_height.value(),
-                finalized_hash: range_chain_epoch.finalized_hash.as_bytes().into(),
+                finalized_hash: encode_rpc_block_hash_hex(range_chain_epoch.finalized_hash),
                 artifact_schema_version: u32::from(
                     range_chain_epoch.artifact_schema_version.value(),
                 ),
@@ -780,7 +781,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
             }),
             compact_block: Some(wallet::CompactBlock {
                 height: compact_block.height.value(),
-                block_hash: compact_block.block_hash.as_bytes().into(),
+                block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
                 payload_bytes: compact_block.payload_bytes,
             }),
         };
@@ -800,10 +801,12 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
         assert_eq!(chunk_chain_epoch.tip_height, end_height);
         assert_eq!(compact_block.height, height);
         assert!(!compact_block.payload_bytes.is_empty());
+        let expected_block_hash_internal =
+            zinder_core::wire::decode_rpc_block_hash_hex(&compact_block.block_hash)?;
         assert_lightwalletd_compact_block_payload(
             &compact_block.payload_bytes,
             height,
-            compact_block.block_hash.as_slice(),
+            expected_block_hash_internal.as_bytes().as_slice(),
         )?;
     }
 

@@ -17,7 +17,7 @@ use zinder_core::{
     NetworkUpgradeActivations, ShieldedProtocol, TransactionBlobArtifact, TransactionFactsArtifact,
     TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
     TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
-    wire::{encode_display_block_hash_hex, encode_internal_block_hash},
+    wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 
 use crate::chain_ingest::BuiltArtifacts;
@@ -786,7 +786,7 @@ fn count_to_u32(count: usize, field: &'static str) -> Result<u32, ArtifactDerive
 }
 
 fn format_block_hash(bytes: [u8; 32]) -> String {
-    encode_display_block_hash_hex(BlockHash::from_bytes(bytes))
+    encode_rpc_block_hash_hex(BlockHash::from_bytes(bytes))
 }
 
 #[cfg(test)]

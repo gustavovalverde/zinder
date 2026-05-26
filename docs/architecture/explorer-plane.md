@@ -64,10 +64,10 @@ The block listing and block-detail surfaces share one materialized view: a `Bloc
 ```proto
 message BlockSummary {
   uint32 block_height = 1;
-  bytes block_hash = 2;                  // internal byte order, 32 bytes
+  string block_hash = 2;                 // RPC byte order, 64 lowercase hex chars
   int64 block_time_unix_seconds = 3;
   uint32 transaction_count = 4;          // includes coinbase
-  bytes previous_block_hash = 5;         // internal byte order, 32 bytes
+  string previous_block_hash = 5;        // RPC byte order, 64 lowercase hex chars
 }
 ```
 

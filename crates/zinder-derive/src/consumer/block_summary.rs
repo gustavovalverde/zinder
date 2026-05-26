@@ -9,7 +9,8 @@
 
 use prost::Message as _;
 use zinder_core::wire::{
-    HEIGHT_KEY_LEN, encode_height_key_ascending, encode_internal_transaction_id,
+    HEIGHT_KEY_LEN, encode_height_key_ascending, encode_rpc_block_hash_hex,
+    encode_rpc_transaction_id_hex,
 };
 use zinder_core::{BlockHeight, TransactionFactsArtifact};
 use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
@@ -97,16 +98,14 @@ fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord 
     let transaction_ids = block
         .transactions
         .iter()
-        .map(|transaction| {
-            encode_internal_transaction_id(transaction.location.transaction_id).to_vec()
-        })
+        .map(|transaction| encode_rpc_transaction_id_hex(transaction.location.transaction_id))
         .collect();
     let summary = BlockSummary {
         block_height: block.height.value(),
-        block_hash: block.block_hash.clone(),
+        block_hash: encode_rpc_block_hash_hex(block.block_hash),
         block_time_unix_seconds,
         transaction_count,
-        previous_block_hash: block.previous_block_hash.clone(),
+        previous_block_hash: encode_rpc_block_hash_hex(block.previous_block_hash),
         total_size_bytes,
         fees_collected_zat: aggregates.zip317_conventional_fees_collected_zat,
         paid_fees_collected_zat: None,

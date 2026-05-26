@@ -34,7 +34,7 @@ fn derive_for_test(source_block: &SourceBlock) -> Result<BuiltArtifacts, Artifac
     finalize_derived_block(derived, &mut counters)
 }
 use zinder_proto::compat::lightwalletd::CompactBlock;
-use zinder_source::{SourceBlock, decode_display_block_hash};
+use zinder_source::{SourceBlock, decode_rpc_block_hash};
 use zinder_store::ChainEpochArtifacts;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
@@ -364,11 +364,11 @@ fn fixture_source_block_from(
 
     assert_eq!(
         source_block.hash,
-        decode_display_block_hash(string_field(&fixture, "hash")?)?
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
     );
     assert_eq!(
         source_block.parent_hash,
-        decode_display_block_hash(string_field(&fixture, "previousblockhash")?)?
+        decode_rpc_block_hash(string_field(&fixture, "previousblockhash")?)?
     );
     assert_eq!(
         source_block.block_time_seconds,

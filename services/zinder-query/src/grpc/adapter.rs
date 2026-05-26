@@ -5,11 +5,14 @@ use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Instant};
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
-use zinder_core::wire::{decode_zinder_native_chain_name, encode_internal_transaction_id};
+use zinder_core::wire::{
+    decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
+    encode_rpc_transaction_id_hex,
+};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
+    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
+    Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    TransactionId, TransparentOutPoint,
 };
 use zinder_proto::capabilities::{
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
@@ -849,11 +852,9 @@ fn typed_script_hash_address_lookup(script_hash_bytes: &[u8]) -> wallet::Address
     }
 }
 
-fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<TransactionId, Status> {
-    let bytes: [u8; 32] = transaction_id_bytes
-        .try_into()
-        .map_err(|_| Status::invalid_argument("transaction_id must be 32 bytes"))?;
-    Ok(TransactionId::from_bytes(bytes))
+fn transaction_id_from_request(transaction_id_rpc_hex: &str) -> Result<TransactionId, Status> {
+    decode_rpc_transaction_id_hex(transaction_id_rpc_hex)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 /// Rejects the coinbase sentinel outpoint with `INVALID_ARGUMENT` and a
@@ -861,14 +862,14 @@ fn transaction_id_from_request(transaction_id_bytes: &[u8]) -> Result<Transactio
 ///
 fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Status> {
     let sentinel = TransparentOutPoint::COINBASE_SENTINEL;
-    let sentinel_transaction_id = encode_internal_transaction_id(sentinel.transaction_id);
+    let sentinel_transaction_id_rpc_hex = encode_rpc_transaction_id_hex(sentinel.transaction_id);
     for (request_index, outpoint) in outpoints.iter().enumerate() {
-        if outpoint.transaction_id.as_slice() == sentinel_transaction_id.as_slice()
+        if outpoint.transaction_id == sentinel_transaction_id_rpc_hex
             && outpoint.output_index == sentinel.output_index
         {
             return Err(Status::invalid_argument(format!(
                 "outpoints[{request_index}] is the coinbase sentinel \
-                 (transaction_id == [0u8; 32], output_index == 0xFFFFFFFF); \
+                 (transaction_id is the all-zero RPC-form hash, output_index == 0xFFFFFFFF); \
                  filter coinbase inputs at the request boundary",
             )));
         }
@@ -915,11 +916,10 @@ fn block_selector_from_request(
         wallet::block_selector::Selector::Height(height) => {
             Ok(BlockSelector::Height(BlockHeight::new(height)))
         }
-        wallet::block_selector::Selector::Hash(hash_bytes) => {
-            let bytes: [u8; 32] = hash_bytes
-                .try_into()
-                .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
-            Ok(BlockSelector::Hash(BlockHash::from_bytes(bytes)))
+        wallet::block_selector::Selector::Hash(hash_rpc_hex) => {
+            let block_hash = decode_rpc_block_hash_hex(&hash_rpc_hex)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            Ok(BlockSelector::Hash(block_hash))
         }
     }
 }

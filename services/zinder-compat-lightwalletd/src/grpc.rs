@@ -17,8 +17,8 @@ use zinder_core::{
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
-        encode_display_block_hash_hex, encode_display_transaction_id_hex,
-        encode_internal_block_hash, encode_internal_transaction_id,
+        encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex,
+        encode_rpc_transaction_id_hex,
     },
 };
 use zinder_proto::compat::lightwalletd::{
@@ -1058,7 +1058,7 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeS
     Ok(lightwalletd::TreeState {
         network: encode_bip70_chain_name(tree_state.chain_epoch.network).to_owned(),
         height: u64::from(tree_state.height.value()),
-        hash: encode_display_block_hash_hex(tree_state.block_hash),
+        hash: encode_rpc_block_hash_hex(tree_state.block_hash),
         time: tree_state_time(&payload)?,
         sapling_tree: tree_state_pool_final_state(&payload, "sapling")?,
         orchard_tree: tree_state_pool_final_state(&payload, "orchard")?,
@@ -1193,7 +1193,7 @@ fn send_response_from_broadcast_result(
         TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
             lightwalletd::SendResponse {
                 error_code: 0,
-                error_message: encode_display_transaction_id_hex(transaction_id),
+                error_message: encode_rpc_transaction_id_hex(transaction_id),
             }
         }
         TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {

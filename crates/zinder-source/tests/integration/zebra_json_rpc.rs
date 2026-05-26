@@ -17,7 +17,7 @@ use zinder_source::{
     SourceError, TransactionBroadcaster, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
-    decode_display_block_hash,
+    decode_rpc_block_hash,
 };
 use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
@@ -44,7 +44,7 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
     assert_eq!(source_block.height, BlockHeight::new(1));
     assert_eq!(
         source_block.hash,
-        decode_display_block_hash(string_field(&fixture, "hash")?)?
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
     );
     let methods_called: HashSet<String> = requests.iter().map(|r| r.method.clone()).collect();
     let expected: HashSet<String> = std::iter::once("getblock").map(str::to_owned).collect();
@@ -104,7 +104,7 @@ async fn fetch_chain_update_after_start_emits_connected_block() -> eyre::Result<
     };
     let block_id = BlockId::new(
         BlockHeight::new(1),
-        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
     assert_eq!(cursor, SourceChainCursor::at_block(block_id));
     assert_eq!(block.height, BlockHeight::new(1));
@@ -124,7 +124,7 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
     let fixture = fixture_block()?;
     let block_id = BlockId::new(
         BlockHeight::new(1),
-        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
     let server = JsonRpcTestServer::start([
         method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
@@ -395,7 +395,7 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
     assert_eq!(tip_id.height, BlockHeight::new(1));
     assert_eq!(
         tip_id.hash,
-        decode_display_block_hash(string_field(&fixture, "hash")?)?
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
     );
     let methods_called: HashSet<String> =
         server.requests()?.into_iter().map(|r| r.method).collect();
@@ -459,7 +459,7 @@ async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre
     )?;
     let requested_block = BlockId::new(
         BlockHeight::new(1),
-        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
 
     let error = match source.fetch_tree_state_for_block(requested_block).await {
@@ -501,7 +501,7 @@ async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<
     )?;
     let requested_block = BlockId::new(
         BlockHeight::new(1),
-        decode_display_block_hash(string_field(&fixture, "hash")?)?,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
 
     let error = match source.fetch_tree_state_for_block(requested_block).await {
@@ -951,7 +951,7 @@ async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()
     let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
 
     assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_display_block_hash(block_hash_hex)?);
+    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
     assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::new(1234, 567));
     assert!(
         server.requests_for("getblockhash")?.is_empty(),
@@ -982,7 +982,7 @@ async fn fetch_chain_checkpoint_defaults_missing_tree_pools_to_zero() -> eyre::R
     let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
 
     assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_display_block_hash(block_hash_hex)?);
+    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
     assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::empty());
     Ok(())
 }

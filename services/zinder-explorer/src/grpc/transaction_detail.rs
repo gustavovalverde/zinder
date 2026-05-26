@@ -11,7 +11,10 @@ use tonic::{Request, Response, Status};
 use zinder_core::{
     BlockHeight, ConsensusBranchId, LockTime as CoreLockTime, NetworkUpgradeActivations,
     TransactionPublicFacts as CoreFacts, TransactionVersion as CoreTransactionVersion,
-    wire::{decode_internal_transaction_id, encode_branch_id_hex, encode_internal_transaction_id},
+    wire::{
+        decode_rpc_transaction_id_hex, encode_branch_id_hex, encode_rpc_auth_digest_hex,
+        encode_rpc_transaction_id_hex, encode_rpc_wtxid_hex,
+    },
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V1;
 use zinder_proto::wire::encode_privacy_shape;
@@ -39,12 +42,12 @@ pub(crate) async fn handle_transaction_detail(
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
     let inner = request.into_inner();
-    let transaction_id = decode_internal_transaction_id(&inner.transaction_id)
+    let transaction_id = decode_rpc_transaction_id_hex(&inner.transaction_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
     let status_response = wallet_client
         .transaction(Request::new(wallet::TransactionRequest {
-            transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
             at_epoch: inner.at_epoch,
         }))
         .await?
@@ -175,15 +178,12 @@ fn extract_mempool(mempool: wallet::MempoolTransaction) -> (Vec<u8>, WireTransac
 
 fn encode_public_facts(facts: &CoreFacts) -> WireFacts {
     WireFacts {
-        transaction_id: encode_internal_transaction_id(facts.transaction_id).to_vec(),
+        transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
         auth_digest: facts
             .auth_digest
-            .map(|digest| digest.as_bytes().to_vec())
+            .map(encode_rpc_auth_digest_hex)
             .unwrap_or_default(),
-        wtxid: facts
-            .wtxid
-            .map(|wtxid| wtxid.as_bytes().to_vec())
-            .unwrap_or_default(),
+        wtxid: facts.wtxid.map(encode_rpc_wtxid_hex).unwrap_or_default(),
         version: Some(encode_transaction_version(facts.version)),
         consensus_branch_id_hex: facts
             .consensus_branch_id

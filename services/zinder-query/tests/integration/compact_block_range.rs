@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use eyre::eyre;
 use prost::Message;
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
@@ -107,7 +107,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     );
     assert_eq!(
         response_chain_epoch.tip_hash,
-        chain_epoch.tip_hash.as_bytes()
+        encode_rpc_block_hash_hex(chain_epoch.tip_hash)
     );
     assert_eq!(
         response_chain_epoch.finalized_height,
@@ -115,7 +115,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     );
     assert_eq!(
         response_chain_epoch.finalized_hash,
-        chain_epoch.finalized_hash.as_bytes()
+        encode_rpc_block_hash_hex(chain_epoch.finalized_hash)
     );
     assert_eq!(
         response_chain_epoch.artifact_schema_version,
@@ -128,7 +128,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     assert_eq!(response_compact_block.height, compact_block.height.value());
     assert_eq!(
         response_compact_block.block_hash,
-        compact_block.block_hash.as_bytes()
+        encode_rpc_block_hash_hex(compact_block.block_hash)
     );
     assert_eq!(
         response_compact_block.payload_bytes,
@@ -165,7 +165,10 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
     assert_eq!(latest_block.height, chain_epoch.tip_height.value());
-    assert_eq!(latest_block.block_hash, chain_epoch.tip_hash.as_bytes());
+    assert_eq!(
+        latest_block.block_hash,
+        encode_rpc_block_hash_hex(chain_epoch.tip_hash)
+    );
 
     Ok(())
 }
@@ -199,7 +202,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     assert_eq!(decoded_response.height, tree_state.height.value());
     assert_eq!(
         decoded_response.block_hash,
-        tree_state.block_hash.as_bytes()
+        encode_rpc_block_hash_hex(tree_state.block_hash)
     );
     assert_eq!(decoded_response.payload_bytes, tree_state.payload_bytes);
 
@@ -230,7 +233,7 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
     assert_eq!(decoded_response.height, tree_state.height.value());
     assert_eq!(
         decoded_response.block_hash,
-        tree_state.block_hash.as_bytes()
+        encode_rpc_block_hash_hex(tree_state.block_hash)
     );
     assert_eq!(decoded_response.payload_bytes, tree_state.payload_bytes);
 
@@ -372,7 +375,7 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
     );
     assert_eq!(
         response_subtree_root.completing_block_hash,
-        subtree_root.completing_block_hash.as_bytes()
+        encode_rpc_block_hash_hex(subtree_root.completing_block_hash)
     );
     assert_eq!(
         response_subtree_root.completing_block_height,
@@ -566,9 +569,9 @@ fn compact_block_range_chunk(
             chain_epoch_id: chain_epoch.id.value(),
             network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
             tip_height: chain_epoch.tip_height.value(),
-            tip_hash: chain_epoch.tip_hash.as_bytes().into(),
+            tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
             finalized_height: chain_epoch.finalized_height.value(),
-            finalized_hash: chain_epoch.finalized_hash.as_bytes().into(),
+            finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
             artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
             created_at_millis: chain_epoch.created_at.value(),
             sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -576,7 +579,7 @@ fn compact_block_range_chunk(
         }),
         compact_block: Some(wallet::CompactBlock {
             height: compact_block.height.value(),
-            block_hash: compact_block.block_hash.as_bytes().into(),
+            block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
             payload_bytes: compact_block.payload_bytes,
         }),
     }

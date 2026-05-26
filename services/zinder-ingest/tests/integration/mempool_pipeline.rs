@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
+use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
     AuthDigest, BlockHash, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes,
     TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
@@ -122,7 +123,7 @@ async fn ingest_control_serves_mempool_snapshot_and_events() -> Result<()> {
         .ok_or_else(|| eyre::eyre!("snapshot has no entry"))?;
     assert_eq!(
         observed_entry.transaction_id,
-        admitted.transaction_id.as_bytes().to_vec()
+        encode_rpc_transaction_id_hex(admitted.transaction_id)
     );
 
     let mut event_stream = client
@@ -868,11 +869,13 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
         spawn_ingest_control(store_fixture.chain_store().clone(), mempool_index.clone()).await?;
     let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
 
-    // Synthetic entry spends outpoint ([0x55; 32], 0).
+    // Synthetic entry spends outpoint ([0x55; 32], 0); the wire form is the
+    // RPC-byte-order hex string of that internal byte pattern (which is
+    // identical for an all-0x55 hash).
     let spent_response = client
         .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
             outpoint: Some(OutPoint {
-                transaction_id: vec![0x55; 32],
+                transaction_id: "55".repeat(32),
                 output_index: 0,
             }),
         })
@@ -884,17 +887,17 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
     let spent_outpoint = spend
         .spent_outpoint
         .ok_or_else(|| eyre::eyre!("expected spent_outpoint on mempool spend"))?;
-    assert_eq!(spent_outpoint.transaction_id, vec![0x55; 32]);
+    assert_eq!(spent_outpoint.transaction_id, "55".repeat(32));
     assert_eq!(spent_outpoint.output_index, 0);
     assert_eq!(
         spend.spending_transaction_id,
-        admitted.transaction_id.as_bytes().to_vec()
+        encode_rpc_transaction_id_hex(admitted.transaction_id)
     );
 
     let unknown_response = client
         .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
             outpoint: Some(OutPoint {
-                transaction_id: vec![0xFF; 32],
+                transaction_id: "ff".repeat(32),
                 output_index: 7,
             }),
         })
@@ -929,15 +932,15 @@ async fn ingest_control_serves_transparent_mempool_outputs_by_outpoint() -> Resu
     let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
 
     let known_outpoint = OutPoint {
-        transaction_id: admitted.transaction_id.as_bytes().to_vec(),
+        transaction_id: encode_rpc_transaction_id_hex(admitted.transaction_id),
         output_index: 0,
     };
     let unknown_outpoint = OutPoint {
-        transaction_id: vec![0xFF; 32],
+        transaction_id: "ff".repeat(32),
         output_index: 0,
     };
     let oob_outpoint = OutPoint {
-        transaction_id: admitted.transaction_id.as_bytes().to_vec(),
+        transaction_id: encode_rpc_transaction_id_hex(admitted.transaction_id),
         output_index: 99,
     };
 
@@ -1011,9 +1014,9 @@ async fn mempool_mined_event_block_hash_rides_the_wire() -> Result<()> {
     let mempool_event_envelope::Event::Mined(mined) = event else {
         return Err(eyre::eyre!("expected Mined event"));
     };
-    assert_eq!(mined.transaction_id, txid.as_bytes().to_vec());
+    assert_eq!(mined.transaction_id, encode_rpc_transaction_id_hex(txid));
     assert_eq!(mined.mined_height, 42);
-    assert_eq!(mined.block_hash, block_hash.as_bytes().to_vec());
+    assert_eq!(mined.block_hash, encode_rpc_block_hash_hex(block_hash));
 
     Ok(())
 }

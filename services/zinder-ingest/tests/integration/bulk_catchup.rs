@@ -28,7 +28,7 @@ use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
     DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
     NodeTarget, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots,
-    SourceTreeState, decode_display_block_hash,
+    SourceTreeState, decode_rpc_block_hash,
 };
 use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
@@ -561,11 +561,11 @@ fn fixture_source_block() -> Result<SourceBlock> {
 
     assert_eq!(
         source_block.hash,
-        decode_display_block_hash(json_string(&fixture, "hash")?)?
+        decode_rpc_block_hash(json_string(&fixture, "hash")?)?
     );
     assert_eq!(
         source_block.parent_hash,
-        decode_display_block_hash(json_string(&fixture, "previousblockhash")?)?
+        decode_rpc_block_hash(json_string(&fixture, "previousblockhash")?)?
     );
     assert_eq!(source_block.block_time_seconds, json_u32(&fixture, "time")?);
 

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use prost::Message as _;
 use zinder_core::wire::{
     encode_address_script_hash, encode_height_key_ascending, encode_height_key_descending,
-    encode_in_block_position, encode_internal_transaction_id,
+    encode_in_block_position, encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
     BlockHeight, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
@@ -186,7 +186,7 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
 
 /// Per-row accumulator the apply path builds before encoding.
 struct RowAccumulator {
-    transaction_id: Vec<u8>,
+    transaction_id: String,
     input_count: u32,
     output_count: u32,
     output_value_zat: i128,
@@ -198,7 +198,7 @@ struct RowAccumulator {
 }
 
 impl RowAccumulator {
-    fn new(transaction_id: Vec<u8>) -> Self {
+    fn new(transaction_id: String) -> Self {
         Self {
             transaction_id,
             input_count: 0,
@@ -246,15 +246,15 @@ fn aggregate_address_rows(
     for transaction in &block.transactions {
         let in_block_position = transaction.location.tx_index_in_block;
         let is_coinbase = transaction.public_facts.is_coinbase;
-        let transaction_id_bytes =
-            encode_internal_transaction_id(transaction.location.transaction_id);
+        let transaction_id_rpc_hex =
+            encode_rpc_transaction_id_hex(transaction.location.transaction_id);
 
         // Output side: every transaction (including coinbase) contributes.
         for output in &transaction.transparent_outputs {
             let address = output.address_script_hash;
             let entry = accumulators
                 .entry((address, in_block_position))
-                .or_insert_with(|| RowAccumulator::new(transaction_id_bytes.to_vec()));
+                .or_insert_with(|| RowAccumulator::new(transaction_id_rpc_hex.clone()));
             entry.output_count = entry.output_count.saturating_add(1);
             entry.output_value_zat = entry
                 .output_value_zat
@@ -279,7 +279,7 @@ fn aggregate_address_rows(
                 let address = spend.spent_address_script_hash;
                 let entry = accumulators
                     .entry((address, in_block_position))
-                    .or_insert_with(|| RowAccumulator::new(transaction_id_bytes.to_vec()));
+                    .or_insert_with(|| RowAccumulator::new(transaction_id_rpc_hex.clone()));
                 entry.input_count = entry.input_count.saturating_add(1);
                 entry.input_value_zat = entry
                     .input_value_zat

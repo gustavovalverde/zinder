@@ -23,6 +23,7 @@
 //! caller is expected to wrap the response in
 //! [`SEARCH_QUERY_MAX_BYTES`]-bounded transport limits as well.
 
+use crate::wire::{decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex};
 use crate::{Network, TransparentAddressScriptHash};
 use zcash_address::unified::{Container as _, Receiver as UnifiedReceiver};
 use zcash_address::{
@@ -54,13 +55,22 @@ pub enum SearchClassification {
         height: u32,
     },
 
-    /// 64-character lowercase or uppercase hex that decodes into 32 bytes.
-    /// The handler resolves whether it names a block or a transaction by
-    /// probing both `WalletQuery.BlockIdBySelector` and
+    /// 64-character lowercase or uppercase hex the user pasted in
+    /// canonical RPC byte order (matching `zcash-cli`, wallets, and every
+    /// block explorer). The handler resolves whether it names a block or
+    /// a transaction by probing both `WalletQuery.BlockIdBySelector` and
     /// `WalletQuery.Transaction`.
     HashCandidate {
-        /// Decoded 32-byte payload (caller-supplied byte order).
-        bytes: [u8; 32],
+        /// User-provided hex in RPC byte order, lowercase, exactly 64
+        /// characters. Forwarded verbatim to the upstream wallet plane
+        /// (which expects RPC-form strings on its hash-shaped fields per
+        /// ADR-0021).
+        rpc_hex: String,
+        /// Decoded 32 bytes in internal byte order, ready for storage
+        /// lookups and for round-trip validation through
+        /// [`decode_rpc_transaction_id_hex`] /
+        /// [`decode_rpc_block_hash_hex`].
+        internal_bytes: [u8; 32],
     },
 
     /// Transparent P2PKH or P2SH address that decoded against the
@@ -208,8 +218,8 @@ pub fn classify_search_input(query: &str, network: Network) -> Vec<SearchClassif
         candidates.push(SearchClassification::Block { height });
     }
 
-    if let Some(bytes) = parse_32_byte_hex(trimmed) {
-        candidates.push(SearchClassification::HashCandidate { bytes });
+    if let Some(candidate) = parse_rpc_hash_hex(trimmed) {
+        candidates.push(candidate);
     }
 
     if let Some(address_classification) = classify_zcash_address(trimmed, network) {
@@ -233,13 +243,24 @@ fn parse_height(query: &str) -> Option<u32> {
     query.parse::<u32>().ok()
 }
 
-fn parse_32_byte_hex(query: &str) -> Option<[u8; 32]> {
+fn parse_rpc_hash_hex(query: &str) -> Option<SearchClassification> {
     if query.len() != 64 || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let mut bytes = [0_u8; 32];
-    hex::decode_to_slice(query, &mut bytes).ok()?;
-    Some(bytes)
+    // Decode through the wire helper so the result is in internal byte
+    // order, matching the storage form. Both txid and block-hash helpers
+    // share the same 32-byte RPC-form decoding; pick either, but use the
+    // txid one since the classifier itself does not yet know which arm
+    // the hex will resolve to.
+    let transaction_id = decode_rpc_transaction_id_hex(query).ok()?;
+    // Also validate the block-hash helper to keep both wire helpers
+    // honest; the two reject identically today, but a future change to
+    // one without the other would surface here.
+    let _ = decode_rpc_block_hash_hex(query).ok()?;
+    Some(SearchClassification::HashCandidate {
+        rpc_hex: query.to_ascii_lowercase(),
+        internal_bytes: transaction_id.as_bytes(),
+    })
 }
 
 /// HRPs the classifier treats as viewing-key forms. Detection is by

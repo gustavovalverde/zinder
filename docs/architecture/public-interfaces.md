@@ -711,13 +711,25 @@ through the ingest writer instead of opening independent upstream-node handles.
 
 ## Wire Conventions
 
-Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by concept (`transaction_id`, `block_hash`, `chain_name`, `branch_id`), not by dialect; every dialect for one concept shares one file.
+Native to wire identifier translations live in `crates/zinder-core/src/wire/` and only there. Files are organized by concept (`transaction_id`, `block_hash`, `auth_digest`, `wtxid`, `merkle_root`, `chain_name`, `branch_id`), not by dialect; every dialect for one concept shares one file.
 
-When adding a new wire field or a new ingress dialect, locate or add a function in that module before writing any boundary code. The following inline forms are forbidden anywhere outside the wire module:
+### Hash byte order
+
+Zcash 32-byte hashes have two byte orders. Both are spec-defined terms; both appear in this codebase by exactly those names:
+
+- **Internal byte order**: the raw SHA-256d output. Used in consensus serialization (`hashPrevBlock`, `hashMerkleRoot` per Zcash protocol spec `protocol.tex:13560-13564`), stored verbatim in the `[u8; 32]` newtypes (`TransactionId`, `BlockHash`, `AuthDigest`, `MerkleRoot`) and the `[u8; 64]` `Wtxid` newtype, and used as RocksDB keys.
+- **RPC byte order**: the byte-reversed form (per Zcash protocol spec `\rpcByteOrder`, `protocol.tex:1127`, defining sentence at `:4036`). The form `zcash-cli`, every wallet UI, every block explorer URL, and ZIP 308 (`zip-0308.rst:389`) use to present a hash to a human or an RPC client.
+
+The public proto contract uses **RPC byte order** for every hash-shaped field (`transaction_id`, `block_hash`, `previous_block_hash`, `merkle_root_hash`, `auth_digest`, `wtxid`, `tip_hash`, `mined_block_hash`, `completing_block_hash`, `spending_transaction_id`, etc.), conveyed as a lowercase ASCII hex `string`. The two forms convert via the `encode_rpc_*_hex` / `decode_rpc_*_hex` pair in `wire/`; the storage-facing `encode_internal_*` / `decode_internal_*` pair is the identity for `[u8; 32]` <-> `[u8; 32]` and exists so storage code never names raw byte slices. See [ADR-0024](../adrs/0024-wire-format-rpc-byte-order.md).
+
+### Forbidden inline forms
+
+When adding a new wire field or a new ingress dialect, locate or add a function in `crates/zinder-core/src/wire/` before writing any boundary code. The following inline forms are forbidden anywhere outside that module:
 
 - `transaction_id.as_bytes()` and `block_hash.as_bytes()` at a wire boundary. Use `encode_internal_transaction_id` or `encode_internal_block_hash`.
 - `format!("{:08x}", branch_id)` for wire output. Use `encode_branch_id_hex`.
-- Inline hex-string transaction id or block hash decode. Use `decode_display_*_hex`.
+- Inline hex-string transaction id or block hash encode or decode. Use `encode_rpc_*_hex` / `decode_rpc_*_hex`.
+- Manual byte-reversal of a hash before hex-encoding or after hex-decoding. The reversal lives inside `encode_rpc_*_hex` / `decode_rpc_*_hex`; callers never reverse.
 - Hardcoded capability literals. Import the `pub const` from [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs).
 - Duplicate `Network` to wire-string tables. Use `encode_bip70_chain_name` (`"main"`/`"test"`, BIP70/lightwalletd/Zebra JSON-RPC) or `encode_zinder_native_chain_name` (`"zcash-mainnet"`/`"zcash-testnet"`/`"zcash-regtest"`, native config and protobuf).
 

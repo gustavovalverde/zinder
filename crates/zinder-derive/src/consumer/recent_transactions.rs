@@ -16,7 +16,8 @@
 use prost::Message as _;
 use zinder_core::BlockHeight;
 use zinder_core::wire::{
-    encode_height_key_descending, encode_in_block_position, encode_internal_transaction_id,
+    encode_height_key_descending, encode_in_block_position, encode_rpc_block_hash_hex,
+    encode_rpc_transaction_id_hex,
 };
 use zinder_proto::v1::explorer::{
     RecentTransactionEntry, TransactionComponentCounts as WireComponentCounts,
@@ -90,9 +91,9 @@ impl BlockKeyedConsumer for RecentTransactionsConsumer {
                 Some(counts.zip317_conventional_fee_zat())
             };
             let entry = RecentTransactionEntry {
-                transaction_id: encode_internal_transaction_id(facts.transaction_id).to_vec(),
+                transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
                 block_height: block.height.value(),
-                block_hash: block.block_hash.clone(),
+                block_hash: encode_rpc_block_hash_hex(block.block_hash),
                 block_time_unix_seconds,
                 is_coinbase,
                 privacy_shape: encode_privacy_shape(privacy_shape) as i32,

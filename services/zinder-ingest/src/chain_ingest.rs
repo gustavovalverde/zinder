@@ -13,7 +13,7 @@ use std::{
 };
 
 use thiserror::Error;
-use zinder_core::wire::{encode_display_block_hash_hex, encode_zinder_native_chain_name};
+use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
@@ -1572,7 +1572,7 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
 }
 
 fn display_block_hash(block_hash: BlockHash) -> String {
-    encode_display_block_hash_hex(block_hash)
+    encode_rpc_block_hash_hex(block_hash)
 }
 
 #[allow(

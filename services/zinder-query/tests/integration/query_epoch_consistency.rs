@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use eyre::eyre;
 use parking_lot::Mutex;
+use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpochId, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange, TreeStateArtifact,
@@ -99,7 +100,10 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
     assert_eq!(latest_block.height, first_epoch.tip_height.value());
-    assert_eq!(latest_block.block_hash, first_epoch.tip_hash.as_bytes());
+    assert_eq!(
+        latest_block.block_hash,
+        encode_rpc_block_hash_hex(first_epoch.tip_hash)
+    );
 
     Ok(())
 }
@@ -141,7 +145,10 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
     assert_eq!(response.height, first_tree_state.height.value());
-    assert_eq!(response.block_hash, first_tree_state.block_hash.as_bytes());
+    assert_eq!(
+        response.block_hash,
+        encode_rpc_block_hash_hex(first_tree_state.block_hash)
+    );
     assert_eq!(response.payload_bytes, first_tree_state.payload_bytes);
 
     Ok(())
@@ -183,7 +190,10 @@ async fn latest_tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_cu
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
     assert_eq!(response.height, first_tree_state.height.value());
-    assert_eq!(response.block_hash, first_tree_state.block_hash.as_bytes());
+    assert_eq!(
+        response.block_hash,
+        encode_rpc_block_hash_hex(first_tree_state.block_hash)
+    );
     assert_eq!(response.payload_bytes, first_tree_state.payload_bytes);
 
     Ok(())

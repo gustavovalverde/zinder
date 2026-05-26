@@ -2,8 +2,9 @@
 
 use thiserror::Error;
 use zinder_core::wire::{
-    decode_zinder_native_chain_name, encode_internal_block_hash, encode_internal_transaction_id,
-    encode_zinder_native_chain_name,
+    decode_rpc_auth_digest_hex, decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex,
+    decode_zinder_native_chain_name, encode_rpc_auth_digest_hex, encode_rpc_block_hash_hex,
+    encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
 };
 use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
@@ -87,10 +88,10 @@ fn chain_range_reverted_message(reverted: ChainRangeReverted) -> wallet::ChainRa
 #[must_use]
 pub fn mempool_entry_message(entry: &MempoolEntry) -> wallet::MempoolEntry {
     wallet::MempoolEntry {
-        transaction_id: encode_internal_transaction_id(entry.transaction_id).into(),
+        transaction_id: encode_rpc_transaction_id_hex(entry.transaction_id),
         auth_digest: entry
             .auth_digest
-            .map(|digest| digest.as_bytes().into())
+            .map(encode_rpc_auth_digest_hex)
             .unwrap_or_default(),
         raw_transaction_bytes: entry.raw_transaction_bytes.as_slice().into(),
         compact_transaction_bytes: entry.compact_transaction_bytes.clone(),
@@ -127,7 +128,7 @@ pub fn mempool_event_envelope_message(
             transaction_id,
             reason,
         } => wallet::mempool_event_envelope::Event::Invalidated(wallet::MempoolInvalidatedEvent {
-            transaction_id: encode_internal_transaction_id(*transaction_id).into(),
+            transaction_id: encode_rpc_transaction_id_hex(*transaction_id),
             reason: mempool_eviction_reason_message(*reason).into(),
         }),
         MempoolEvent::Mined {
@@ -135,13 +136,13 @@ pub fn mempool_event_envelope_message(
             mined_height,
             block_hash,
         } => wallet::mempool_event_envelope::Event::Mined(wallet::MempoolMinedEvent {
-            transaction_id: encode_internal_transaction_id(*transaction_id).into(),
+            transaction_id: encode_rpc_transaction_id_hex(*transaction_id),
             mined_height: mined_height.value(),
-            block_hash: encode_internal_block_hash(*block_hash).into(),
+            block_hash: encode_rpc_block_hash_hex(*block_hash),
         }),
         MempoolEvent::Suppressed { transaction_id } => {
             wallet::mempool_event_envelope::Event::Suppressed(wallet::MempoolSuppressedEvent {
-                transaction_id: encode_internal_transaction_id(*transaction_id).into(),
+                transaction_id: encode_rpc_transaction_id_hex(*transaction_id),
             })
         }
         _ => {
@@ -166,7 +167,7 @@ pub fn mempool_event_envelope_message(
 #[must_use]
 pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
     wallet::OutPoint {
-        transaction_id: encode_internal_transaction_id(outpoint.transaction_id).into(),
+        transaction_id: encode_rpc_transaction_id_hex(outpoint.transaction_id),
         output_index: outpoint.output_index,
     }
 }
@@ -248,10 +249,9 @@ pub fn transparent_mempool_spend_message(
 ) -> wallet::TransparentMempoolSpend {
     wallet::TransparentMempoolSpend {
         spent_outpoint: Some(outpoint_message(&transparent_spend.spent_outpoint)),
-        spending_transaction_id: encode_internal_transaction_id(
+        spending_transaction_id: encode_rpc_transaction_id_hex(
             transparent_spend.spending_transaction_id,
-        )
-        .into(),
+        ),
     }
 }
 
@@ -277,9 +277,9 @@ pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
-        tip_hash: encode_internal_block_hash(chain_epoch.tip_hash).into(),
+        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
         finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: encode_internal_block_hash(chain_epoch.finalized_hash).into(),
+        finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -309,6 +309,14 @@ pub enum MempoolDecodeError {
         field: &'static str,
         /// Observed length on the wire.
         actual: usize,
+    },
+    /// An RPC-form hex hash field failed to decode.
+    #[error("{field}: invalid RPC-form hex hash: {reason}")]
+    InvalidRpcHashHex {
+        /// Static field path that carried the bad hex.
+        field: &'static str,
+        /// Human-readable description of the decode failure.
+        reason: String,
     },
     /// An integer field overflowed the canonical type.
     #[error("{field} does not fit a {target}")]
@@ -343,6 +351,7 @@ impl MempoolDecodeError {
         match self {
             Self::MissingField { field }
             | Self::WrongHashLength { field, .. }
+            | Self::InvalidRpcHashHex { field, .. }
             | Self::Overflow { field, .. }
             | Self::UnknownNetwork { field, .. }
             | Self::UnknownEvictionReason { field, .. } => field,
@@ -351,6 +360,10 @@ impl MempoolDecodeError {
 }
 
 /// Decodes a wallet-protocol [`wallet::ChainEpoch`] into the canonical type.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "ChainEpoch fields are all small POD; taking by value keeps caller ergonomics symmetric with the message constructor and avoids a borrow-vs-clone choice at every callsite."
+)]
 pub fn chain_epoch_from_message(
     message: wallet::ChainEpoch,
 ) -> Result<ChainEpoch, MempoolDecodeError> {
@@ -370,11 +383,11 @@ pub fn chain_epoch_from_message(
         id: ChainEpochId::new(message.chain_epoch_id),
         network,
         tip_height: BlockHeight::new(message.tip_height),
-        tip_hash: block_hash_from_bytes("chain_epoch.tip_hash", message.tip_hash)?,
+        tip_hash: block_hash_from_rpc_hex("chain_epoch.tip_hash", &message.tip_hash)?,
         finalized_height: BlockHeight::new(message.finalized_height),
-        finalized_hash: block_hash_from_bytes(
+        finalized_hash: block_hash_from_rpc_hex(
             "chain_epoch.finalized_hash",
-            message.finalized_hash,
+            &message.finalized_hash,
         )?,
         artifact_schema_version: ArtifactSchemaVersion::new(artifact_schema_version),
         tip_metadata: ChainTipMetadata::new(
@@ -390,14 +403,14 @@ pub fn mempool_entry_from_message(
     message: wallet::MempoolEntry,
 ) -> Result<MempoolEntry, MempoolDecodeError> {
     let transaction_id =
-        transaction_id_from_bytes("mempool_entry.transaction_id", message.transaction_id)?;
+        transaction_id_from_rpc_hex("mempool_entry.transaction_id", &message.transaction_id)?;
     let auth_digest = if message.auth_digest.is_empty() {
         None
     } else {
-        Some(AuthDigest::from_bytes(fixed_32_bytes(
+        Some(auth_digest_from_rpc_hex(
             "mempool_entry.auth_digest",
-            message.auth_digest,
-        )?))
+            &message.auth_digest,
+        )?)
     };
     let chain_epoch_message =
         message
@@ -446,9 +459,9 @@ pub fn mempool_event_envelope_from_message(
         }
         wallet::mempool_event_envelope::Event::Invalidated(invalidated) => {
             MempoolEvent::Invalidated {
-                transaction_id: transaction_id_from_bytes(
+                transaction_id: transaction_id_from_rpc_hex(
                     "mempool_event_envelope.invalidated.transaction_id",
-                    invalidated.transaction_id,
+                    &invalidated.transaction_id,
                 )?,
                 reason: mempool_eviction_reason_from_message(
                     "mempool_event_envelope.invalidated.reason",
@@ -457,20 +470,20 @@ pub fn mempool_event_envelope_from_message(
             }
         }
         wallet::mempool_event_envelope::Event::Mined(mined) => MempoolEvent::Mined {
-            transaction_id: transaction_id_from_bytes(
+            transaction_id: transaction_id_from_rpc_hex(
                 "mempool_event_envelope.mined.transaction_id",
-                mined.transaction_id,
+                &mined.transaction_id,
             )?,
             mined_height: BlockHeight::new(mined.mined_height),
-            block_hash: block_hash_from_bytes(
+            block_hash: block_hash_from_rpc_hex(
                 "mempool_event_envelope.mined.block_hash",
-                mined.block_hash,
+                &mined.block_hash,
             )?,
         },
         wallet::mempool_event_envelope::Event::Suppressed(suppressed) => MempoolEvent::Suppressed {
-            transaction_id: transaction_id_from_bytes(
+            transaction_id: transaction_id_from_rpc_hex(
                 "mempool_event_envelope.suppressed.transaction_id",
-                suppressed.transaction_id,
+                &suppressed.transaction_id,
             )?,
         },
     };
@@ -489,12 +502,16 @@ pub fn mempool_event_envelope_from_message(
 /// pre-unwrap the `Option<wallet::OutPoint>` and emit
 /// [`MempoolDecodeError::MissingField`] with their own precise path when
 /// the message is absent.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "OutPoint is a tiny POD; taking by value keeps caller ergonomics symmetric with the message constructor."
+)]
 pub fn outpoint_from_message(
     field: &'static str,
     message: wallet::OutPoint,
 ) -> Result<TransparentOutPoint, MempoolDecodeError> {
     Ok(TransparentOutPoint::new(
-        TransactionId::from_bytes(fixed_32_bytes(field, message.transaction_id)?),
+        transaction_id_from_rpc_hex(field, &message.transaction_id)?,
         message.output_index,
     ))
 }
@@ -537,9 +554,9 @@ pub fn transparent_mempool_spend_from_message(
             "transparent_spend.spent_outpoint",
             spent_outpoint_message,
         )?,
-        spending_transaction_id: transaction_id_from_bytes(
+        spending_transaction_id: transaction_id_from_rpc_hex(
             "transparent_spend.spending_transaction_id",
-            message.spending_transaction_id,
+            &message.spending_transaction_id,
         )?,
     })
 }
@@ -560,18 +577,34 @@ fn mempool_eviction_reason_from_message(
     }
 }
 
-fn transaction_id_from_bytes(
+fn transaction_id_from_rpc_hex(
     field: &'static str,
-    bytes: Vec<u8>,
+    rpc_hex: &str,
 ) -> Result<TransactionId, MempoolDecodeError> {
-    Ok(TransactionId::from_bytes(fixed_32_bytes(field, bytes)?))
+    decode_rpc_transaction_id_hex(rpc_hex).map_err(|error| MempoolDecodeError::InvalidRpcHashHex {
+        field,
+        reason: error.to_string(),
+    })
 }
 
-fn block_hash_from_bytes(
+fn block_hash_from_rpc_hex(
     field: &'static str,
-    bytes: Vec<u8>,
+    rpc_hex: &str,
 ) -> Result<BlockHash, MempoolDecodeError> {
-    Ok(BlockHash::from_bytes(fixed_32_bytes(field, bytes)?))
+    decode_rpc_block_hash_hex(rpc_hex).map_err(|error| MempoolDecodeError::InvalidRpcHashHex {
+        field,
+        reason: error.to_string(),
+    })
+}
+
+fn auth_digest_from_rpc_hex(
+    field: &'static str,
+    rpc_hex: &str,
+) -> Result<AuthDigest, MempoolDecodeError> {
+    decode_rpc_auth_digest_hex(rpc_hex).map_err(|error| MempoolDecodeError::InvalidRpcHashHex {
+        field,
+        reason: error.to_string(),
+    })
 }
 
 fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32], MempoolDecodeError> {

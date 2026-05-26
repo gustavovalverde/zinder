@@ -153,20 +153,24 @@ impl SourceBlock {
     }
 }
 
-/// Decodes an RPC display-order block hash into canonical little-endian bytes.
+/// Decodes an RPC-byte-order block hash hex string into canonical
+/// internal-byte-order bytes.
 ///
-/// Delegates to [`zinder_core::wire::decode_display_block_hash_hex`] for the
+/// Delegates to [`zinder_core::wire::decode_rpc_block_hash_hex`] for the
 /// hex parsing and byte reversal; this function exists to map the wire error
 /// to a typed [`SourceError`] variant the metrics layer aggregates on.
-pub fn decode_display_block_hash(display_hash: &str) -> Result<BlockHash, SourceError> {
-    zinder_core::wire::decode_display_block_hash_hex(display_hash)
-        .map_err(wire_error_to_block_hash_error)
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
+pub fn decode_rpc_block_hash(rpc_hash: &str) -> Result<BlockHash, SourceError> {
+    zinder_core::wire::decode_rpc_block_hash_hex(rpc_hash).map_err(wire_error_to_block_hash_error)
 }
 
-/// Encodes a canonical little-endian block hash as RPC display-order hex.
+/// Encodes a canonical internal-byte-order block hash as RPC-byte-order hex.
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
 #[must_use]
-pub fn encode_display_block_hash(hash: BlockHash) -> String {
-    zinder_core::wire::encode_display_block_hash_hex(hash)
+pub fn encode_rpc_block_hash(hash: BlockHash) -> String {
+    zinder_core::wire::encode_rpc_block_hash_hex(hash)
 }
 
 #[allow(
@@ -272,7 +276,7 @@ mod tests {
     #[test]
     fn display_hash_decoder_reverses_fixed_hash_without_allocation() -> Result<(), SourceError> {
         assert_eq!(
-            decode_display_block_hash(
+            decode_rpc_block_hash(
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             )?
             .as_bytes(),
@@ -289,7 +293,7 @@ mod tests {
     #[test]
     fn display_hash_decoder_reports_even_length_mismatch() {
         assert!(matches!(
-            decode_display_block_hash("0011"),
+            decode_rpc_block_hash("0011"),
             Err(SourceError::InvalidBlockHashLength { byte_count: 2 })
         ));
     }

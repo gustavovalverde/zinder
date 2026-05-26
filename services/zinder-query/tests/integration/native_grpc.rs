@@ -12,7 +12,9 @@ use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::wire::{
+    encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
+};
 use zinder_core::{
     ChainEpoch, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
@@ -187,7 +189,7 @@ async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyr
     let status = match WalletQueryService::transaction(
         &grpc_adapter,
         Request::new(wallet::TransactionRequest {
-            transaction_id: requested_transaction_id.as_bytes().to_vec(),
+            transaction_id: encode_rpc_transaction_id_hex(requested_transaction_id),
             at_epoch: None,
         }),
     )
@@ -231,7 +233,7 @@ async fn native_grpc_service_broadcasts_raw_transactions() -> eyre::Result<()> {
     assert!(matches!(
         response.outcome,
         Some(wallet::broadcast_transaction_response::Outcome::Accepted(accepted))
-            if accepted.transaction_id == transaction_id.as_bytes().to_vec()
+            if accepted.transaction_id == encode_rpc_transaction_id_hex(transaction_id)
     ));
     assert_eq!(broadcaster.call_count(), 1);
 
@@ -388,9 +390,9 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
             chain_epoch_id: 11,
             network_name: "zcash-regtest".to_owned(),
             tip_height: 5,
-            tip_hash: vec![0x05; 32],
+            tip_hash: "05".repeat(32),
             finalized_height: 4,
-            finalized_hash: vec![0x04; 32],
+            finalized_hash: "04".repeat(32),
             artifact_schema_version: 1,
             created_at_millis: 123,
             sapling_commitment_tree_size: 0,
@@ -404,9 +406,9 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
                         chain_epoch_id: 11,
                         network_name: "zcash-regtest".to_owned(),
                         tip_height: 5,
-                        tip_hash: vec![0x05; 32],
+                        tip_hash: "05".repeat(32),
                         finalized_height: 4,
-                        finalized_hash: vec![0x04; 32],
+                        finalized_hash: "04".repeat(32),
                         artifact_schema_version: 1,
                         created_at_millis: 123,
                         sapling_commitment_tree_size: 0,
@@ -743,9 +745,9 @@ fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
-        tip_hash: chain_epoch.tip_hash.as_bytes().to_vec(),
+        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
         finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: chain_epoch.finalized_hash.as_bytes().to_vec(),
+        finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,

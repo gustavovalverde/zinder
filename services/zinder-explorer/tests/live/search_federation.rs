@@ -19,7 +19,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto as _;
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::wire::{
+    encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
+};
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
@@ -87,13 +89,13 @@ async fn assert_block_height_resolves(fixture: &SearchFixture, tip: u32) -> Resu
     assert_eq!(block_candidate.block_height, tip);
     assert_eq!(
         block_candidate.block_hash,
-        fixture.sample_block_hash.as_bytes()
+        encode_rpc_block_hash_hex(fixture.sample_block_hash)
     );
     Ok(())
 }
 
 async fn assert_block_hash_resolves(fixture: &SearchFixture) -> Result<()> {
-    let query = hex::encode(fixture.sample_block_hash.as_bytes());
+    let query = encode_rpc_block_hash_hex(fixture.sample_block_hash);
     let response = fixture.search(&query).await?;
     assert!(
         find_block_match(&response).is_some(),
@@ -103,9 +105,7 @@ async fn assert_block_hash_resolves(fixture: &SearchFixture) -> Result<()> {
 }
 
 async fn assert_transaction_id_resolves(fixture: &SearchFixture, tip: u32) -> Result<()> {
-    let query = hex::encode(zinder_core::wire::encode_internal_transaction_id(
-        fixture.sample_coinbase_id,
-    ));
+    let query = encode_rpc_transaction_id_hex(fixture.sample_coinbase_id);
     let response = fixture.search(&query).await?;
     let transaction = find_transaction_match(&response)
         .ok_or_else(|| eyre!("expected TransactionMatch arm for coinbase {query}"))?;

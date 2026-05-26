@@ -13,7 +13,7 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint};
-use zinder_core::{BlockHeight, ChainEpochId, Network, wire::encode_internal_block_hash};
+use zinder_core::{BlockHeight, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
     DeriveStoreOptions,
@@ -139,7 +139,7 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
     );
     let detail_outcome = client
         .transaction_detail(TransactionDetailRequest {
-            transaction_id: vec![0_u8; 32],
+            transaction_id: "00".repeat(32),
             at_epoch: None,
         })
         .await;
@@ -364,10 +364,10 @@ fn seed_block_summary(derive_store: &DeriveStore, chain_fixture: &ChainFixture) 
     let record = BlockSummaryRecord {
         summary: Some(BlockSummary {
             block_height: fixture_block.height.value(),
-            block_hash: encode_internal_block_hash(fixture_block.hash).to_vec(),
+            block_hash: encode_rpc_block_hash_hex(fixture_block.hash),
             block_time_unix_seconds: i64::from(fixture_block.block_time_seconds),
             transaction_count: 0,
-            previous_block_hash: encode_internal_block_hash(fixture_block.parent_hash).to_vec(),
+            previous_block_hash: encode_rpc_block_hash_hex(fixture_block.parent_hash),
             total_size_bytes: u64::try_from(fixture_block.raw_block_bytes.len())?,
             fees_collected_zat: 0,
             paid_fees_collected_zat: None,

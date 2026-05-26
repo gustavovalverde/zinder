@@ -15,7 +15,8 @@ use tonic::{
 use tonic_types::StatusExt as _;
 use tracing::warn;
 use zinder_core::wire::{
-    decode_zinder_native_chain_name, encode_internal_block_hash, encode_internal_transaction_id,
+    decode_rpc_block_hash_hex, decode_rpc_merkle_root_hex, decode_rpc_transaction_id_hex,
+    decode_zinder_native_chain_name, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
@@ -223,7 +224,7 @@ impl ChainIndex for RemoteChainIndex {
 
         Ok(BlockId {
             height: BlockHeight::new(latest_block.height),
-            hash: block_hash_from_bytes("latest_block.block_hash", latest_block.block_hash)?,
+            hash: block_hash_from_rpc_hex("latest_block.block_hash", &latest_block.block_hash)?,
         })
     }
 
@@ -387,7 +388,7 @@ impl ChainIndex for RemoteChainIndex {
         let response = match self
             .client()
             .transaction(Request::new(wallet::TransactionRequest {
-                transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
@@ -752,10 +753,10 @@ fn transparent_output_entry_from_message(
     let outpoint_message = message.outpoint.ok_or_else(|| {
         IndexerError::malformed("transparent_output_entry.outpoint", "field is missing")
     })?;
-    let transaction_id = TransactionId::from_bytes(fixed_32_bytes(
+    let transaction_id = transaction_id_from_rpc_hex(
         "transparent_output_entry.outpoint.transaction_id",
-        outpoint_message.transaction_id,
-    )?);
+        &outpoint_message.transaction_id,
+    )?;
     let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
     let prevout = message
         .output
@@ -894,9 +895,9 @@ fn chain_epoch_to_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
         tip_height: chain_epoch.tip_height.value(),
-        tip_hash: encode_internal_block_hash(chain_epoch.tip_hash).to_vec(),
+        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
         finalized_height: chain_epoch.finalized_height.value(),
-        finalized_hash: encode_internal_block_hash(chain_epoch.finalized_hash).to_vec(),
+        finalized_hash: encode_rpc_block_hash_hex(chain_epoch.finalized_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
@@ -909,7 +910,7 @@ fn compact_block_from_message(
 ) -> Result<CompactBlockArtifact, IndexerError> {
     Ok(CompactBlockArtifact::new(
         BlockHeight::new(message.height),
-        block_hash_from_bytes("compact_block.block_hash", message.block_hash)?,
+        block_hash_from_rpc_hex("compact_block.block_hash", &message.block_hash)?,
         message.payload_bytes,
     ))
 }
@@ -919,7 +920,7 @@ fn tree_state_from_response(
 ) -> Result<TreeStateArtifact, IndexerError> {
     Ok(TreeStateArtifact::new(
         BlockHeight::new(response.height),
-        block_hash_from_bytes("tree_state.block_hash", response.block_hash)?,
+        block_hash_from_rpc_hex("tree_state.block_hash", &response.block_hash)?,
         response.payload_bytes,
     ))
 }
@@ -933,9 +934,9 @@ fn subtree_root_from_message(
         SubtreeRootIndex::new(message.subtree_index),
         subtree_root_hash_from_bytes("subtree_root.root_hash", message.root_hash)?,
         BlockHeight::new(message.completing_block_height),
-        block_hash_from_bytes(
+        block_hash_from_rpc_hex(
             "subtree_root.completing_block_hash",
-            message.completing_block_hash,
+            &message.completing_block_hash,
         )?,
     ))
 }
@@ -972,8 +973,8 @@ fn transparent_address_tx_ids_chunk_from_message(
             .chain_epoch
             .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
     )?;
-    let transaction_id = transaction_id_from_bytes("transaction_id", message.transaction_id)?;
-    let block_hash = block_hash_from_bytes("block_hash", message.block_hash)?;
+    let transaction_id = transaction_id_from_rpc_hex("transaction_id", &message.transaction_id)?;
+    let block_hash = block_hash_from_rpc_hex("block_hash", &message.block_hash)?;
     let artifact = TransparentAddressTxIndexArtifact::new(
         address_script_hash,
         BlockHeight::new(message.block_height),
@@ -1003,18 +1004,16 @@ fn address_output_index_from_message(
     let outpoint_message = message.outpoint.ok_or_else(|| {
         IndexerError::malformed("address_output_index.outpoint", "field is missing")
     })?;
-    let transaction_id_bytes = fixed_32_bytes(
+    let transaction_id = transaction_id_from_rpc_hex(
         "address_output_index.outpoint.transaction_id",
-        outpoint_message.transaction_id,
+        &outpoint_message.transaction_id,
     )?;
-    let block_hash = block_hash_from_bytes("address_output_index.block_hash", message.block_hash)?;
+    let block_hash =
+        block_hash_from_rpc_hex("address_output_index.block_hash", &message.block_hash)?;
     Ok(AddressOutputIndexArtifact::new(
         TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
         message.script_pub_key,
-        TransparentOutPoint::new(
-            TransactionId::from_bytes(transaction_id_bytes),
-            outpoint_message.output_index,
-        ),
+        TransparentOutPoint::new(transaction_id, outpoint_message.output_index),
         message.value_zat,
         BlockHeight::new(message.block_height),
         block_hash,
@@ -1048,16 +1047,20 @@ fn address_output_index_stream_item_from_message(
     })
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "TransactionLocation is a tiny POD; taking by value matches the symmetric encoder."
+)]
 fn transaction_location_from_message(
     message: wallet::TransactionLocation,
 ) -> Result<TransactionLocation, IndexerError> {
     Ok(TransactionLocation::new(
-        transaction_id_from_bytes(
+        transaction_id_from_rpc_hex(
             "transaction_location.transaction_id",
-            message.transaction_id,
+            &message.transaction_id,
         )?,
         BlockHeight::new(message.block_height),
-        block_hash_from_bytes("transaction_location.block_hash", message.block_hash)?,
+        block_hash_from_rpc_hex("transaction_location.block_hash", &message.block_hash)?,
         message.tx_index_in_block,
     ))
 }
@@ -1077,9 +1080,9 @@ fn transaction_broadcast_result_from_message(
     match outcome {
         Outcome::Accepted(accepted) => {
             Ok(TransactionBroadcastResult::Accepted(BroadcastAccepted {
-                transaction_id: transaction_id_from_bytes(
+                transaction_id: transaction_id_from_rpc_hex(
                     "accepted.transaction_id",
-                    accepted.transaction_id,
+                    &accepted.transaction_id,
                 )?,
             }))
         }
@@ -1256,9 +1259,9 @@ fn chain_event_stream_family_to_message(
     }
 }
 
-fn block_hash_from_bytes(field: &'static str, bytes: Vec<u8>) -> Result<BlockHash, IndexerError> {
-    let bytes = fixed_32_bytes(field, bytes)?;
-    Ok(BlockHash::from_bytes(bytes))
+fn block_hash_from_rpc_hex(field: &'static str, rpc_hex: &str) -> Result<BlockHash, IndexerError> {
+    decode_rpc_block_hash_hex(rpc_hex)
+        .map_err(|error| IndexerError::malformed(field, error.to_string()))
 }
 
 #[allow(
@@ -1271,7 +1274,7 @@ fn block_selector_to_message(
     let inner = match selector {
         BlockSelector::Height(height) => wallet::block_selector::Selector::Height(height.value()),
         BlockSelector::Hash(hash) => {
-            wallet::block_selector::Selector::Hash(encode_internal_block_hash(hash).to_vec())
+            wallet::block_selector::Selector::Hash(encode_rpc_block_hash_hex(hash))
         }
         _ => {
             return Err(IndexerError::invalid_request(
@@ -1341,7 +1344,7 @@ fn tx_status_from_message(
 fn block_id_from_message(block_id: Option<wallet::BlockMetadata>) -> Result<BlockId, IndexerError> {
     let metadata =
         block_id.ok_or_else(|| IndexerError::malformed("block_id", "field is missing"))?;
-    let block_hash = block_hash_from_bytes("block_id.block_hash", metadata.block_hash)?;
+    let block_hash = block_hash_from_rpc_hex("block_id.block_hash", &metadata.block_hash)?;
     Ok(BlockId::new(BlockHeight::new(metadata.height), block_hash))
 }
 
@@ -1349,12 +1352,12 @@ fn block_header_info_from_message(
     message: wallet::BlockHeaderInfo,
 ) -> Result<BlockHeaderInfo, IndexerError> {
     let block_id = block_id_from_message(message.block_id)?;
-    let previous_block_hash = block_hash_from_bytes(
+    let previous_block_hash = block_hash_from_rpc_hex(
         "block_header.previous_block_hash",
-        message.previous_block_hash,
+        &message.previous_block_hash,
     )?;
     let merkle_root_hash =
-        fixed_32_bytes("block_header.merkle_root_hash", message.merkle_root_hash)?;
+        merkle_root_hash_from_rpc_hex("block_header.merkle_root_hash", &message.merkle_root_hash)?;
     let commitment_bytes =
         fixed_32_bytes("block_header.commitment_bytes", message.commitment_bytes)?;
     let nonce = fixed_32_bytes("block_header.nonce", message.nonce)?;
@@ -1378,12 +1381,20 @@ fn subtree_root_hash_from_bytes(
     Ok(SubtreeRootHash::from_bytes(bytes))
 }
 
-fn transaction_id_from_bytes(
+fn transaction_id_from_rpc_hex(
     field: &'static str,
-    bytes: Vec<u8>,
+    rpc_hex: &str,
 ) -> Result<TransactionId, IndexerError> {
-    let bytes = fixed_32_bytes(field, bytes)?;
-    Ok(TransactionId::from_bytes(bytes))
+    decode_rpc_transaction_id_hex(rpc_hex)
+        .map_err(|error| IndexerError::malformed(field, error.to_string()))
+}
+
+fn merkle_root_hash_from_rpc_hex(
+    field: &'static str,
+    rpc_hex: &str,
+) -> Result<[u8; 32], IndexerError> {
+    decode_rpc_merkle_root_hex(rpc_hex)
+        .map_err(|error| IndexerError::malformed(field, error.to_string()))
 }
 
 fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32], IndexerError> {

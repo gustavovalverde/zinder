@@ -162,7 +162,7 @@ async fn transparent_mempool_outputs_by_outpoint_grpc_rejects_coinbase_sentinel(
 
     let request = Request::new(wallet::TransparentMempoolOutputsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {
-            transaction_id: vec![0u8; 32],
+            transaction_id: "00".repeat(32),
             output_index: u32::MAX,
         }],
     });
@@ -197,7 +197,7 @@ async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyr
 
     let request = Request::new(wallet::TransparentOutputsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {
-            transaction_id: vec![0u8; 32],
+            transaction_id: "00".repeat(32),
             output_index: u32::MAX,
         }],
         at_epoch: None,

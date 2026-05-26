@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use zinder_core::{
-    BlockHeight, TransactionFactsArtifact, TransparentOutPoint, TransparentSpendFact,
+    BlockHash, BlockHeight, TransactionFactsArtifact, TransparentOutPoint, TransparentSpendFact,
 };
 
 /// Errors surfaced while reading a block context's hydrated transparent spends.
@@ -60,10 +60,10 @@ impl std::fmt::Debug for TransparentSpendFacts {
 pub struct BlockCommitContext {
     /// Height the context describes.
     pub height: BlockHeight,
-    /// Block hash bytes (32 bytes, internal byte order).
-    pub block_hash: Vec<u8>,
-    /// Previous-block hash bytes (32 bytes, internal byte order).
-    pub previous_block_hash: Vec<u8>,
+    /// Canonical block hash.
+    pub block_hash: BlockHash,
+    /// Canonical previous-block hash.
+    pub previous_block_hash: BlockHash,
     /// Block-time as Unix seconds.
     pub block_time_unix_seconds: i64,
     /// Serialized consensus block size in bytes.
@@ -77,10 +77,10 @@ pub struct BlockCommitContext {
 pub struct BlockCommitPayload {
     /// Height of the block.
     pub height: BlockHeight,
-    /// Block hash bytes (32 bytes, internal byte order).
-    pub block_hash: Vec<u8>,
-    /// Previous-block hash bytes (32 bytes, internal byte order).
-    pub previous_block_hash: Vec<u8>,
+    /// Canonical block hash.
+    pub block_hash: BlockHash,
+    /// Canonical previous-block hash.
+    pub previous_block_hash: BlockHash,
     /// Block-time as Unix seconds.
     pub block_time_unix_seconds: i64,
     /// Serialized consensus block size in bytes.
