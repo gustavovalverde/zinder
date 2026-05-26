@@ -6,8 +6,9 @@
 use eyre::eyre;
 use std::sync::Arc;
 use zinder_core::{
-    BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected, Network,
-    RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+    BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+    BroadcastRejected, BroadcastRejectionReason, Network, RawTransactionBytes,
+    TransactionBroadcastResult, TransactionId,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
 use zinder_source::SourceError;
@@ -53,7 +54,16 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
             error_code: Some(-27),
             message: "transaction already in mempool".to_owned(),
         }),
+        TransactionBroadcastResult::Queued(BroadcastQueued {
+            message: "already queued for download".to_owned(),
+        }),
         TransactionBroadcastResult::Rejected(BroadcastRejected {
+            kind: BroadcastRejectionReason::InvalidSignature,
+            error_code: Some(-25),
+            message: "transaction signature is invalid".to_owned(),
+        }),
+        TransactionBroadcastResult::Rejected(BroadcastRejected {
+            kind: BroadcastRejectionReason::Unknown,
             error_code: Some(-25),
             message: "bad-txns-invalid".to_owned(),
         }),

@@ -1067,8 +1067,8 @@ fn transaction_broadcast_result_from_message(
 ) -> Result<TransactionBroadcastResult, IndexerError> {
     use wallet::broadcast_transaction_response::Outcome;
     use zinder_core::{
-        BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
-        BroadcastUnknown,
+        BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+        BroadcastRejected, BroadcastUnknown,
     };
 
     let outcome = response
@@ -1095,8 +1095,12 @@ fn transaction_broadcast_result_from_message(
                 message: invalid_encoding.message,
             }),
         ),
+        Outcome::Queued(queued) => Ok(TransactionBroadcastResult::Queued(BroadcastQueued {
+            message: queued.message,
+        })),
         Outcome::Rejected(rejected) => {
             Ok(TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: broadcast_rejection_reason_from_message(rejected.kind),
                 error_code: rejected.error_code,
                 message: rejected.message,
             }))
@@ -1105,6 +1109,27 @@ fn transaction_broadcast_result_from_message(
             error_code: unknown.error_code,
             message: unknown.message,
         })),
+    }
+}
+
+fn broadcast_rejection_reason_from_message(code: i32) -> zinder_core::BroadcastRejectionReason {
+    use zinder_core::BroadcastRejectionReason;
+
+    match wallet::BroadcastRejectionReason::try_from(code) {
+        Ok(wallet::BroadcastRejectionReason::InvalidSignature) => {
+            BroadcastRejectionReason::InvalidSignature
+        }
+        Ok(wallet::BroadcastRejectionReason::BadExpiryHeight) => {
+            BroadcastRejectionReason::BadExpiryHeight
+        }
+        Ok(wallet::BroadcastRejectionReason::BadConsensusBranch) => {
+            BroadcastRejectionReason::BadConsensusBranch
+        }
+        Ok(wallet::BroadcastRejectionReason::MempoolFull) => BroadcastRejectionReason::MempoolFull,
+        // Unspecified and Unknown both collapse to Unknown on the client side:
+        // an old server that never sets the field is indistinguishable from a
+        // server that explicitly reports an unclassified rejection.
+        _ => BroadcastRejectionReason::Unknown,
     }
 }
 

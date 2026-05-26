@@ -25,13 +25,14 @@ pub use remote::{RemoteChainIndex, RemoteOpenOptions};
 pub use zinder_core::{
     AddressOutputIndexArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
     BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastRejected, BroadcastUnknown, ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePools,
-    ChainValuePoolsAtTip, CompactBlockArtifact, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, MempoolEntry,
-    MempoolEvictionReason, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TreeStateArtifact, TxStatus,
+    BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch,
+    ChainEpochId, ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, CompactBlockArtifact,
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, MempoolEntry, MempoolEvictionReason, MinedDetails,
+    MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TreeStateArtifact, TxStatus,
 };
 pub use zinder_proto::ZINDER_CAPABILITIES;
 pub use zinder_proto::capabilities::{

@@ -11,7 +11,7 @@ use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpoch,
     CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
@@ -1206,6 +1206,7 @@ fn send_response_from_broadcast_result(
         TransactionBroadcastResult::Rejected(BroadcastRejected {
             error_code,
             message,
+            kind: _,
         }) => lightwalletd::SendResponse {
             error_code: classified_send_error_code(error_code, -26),
             error_message: message,
@@ -1217,6 +1218,16 @@ fn send_response_from_broadcast_result(
             error_code: classified_send_error_code(error_code, -27),
             error_message: message,
         },
+        TransactionBroadcastResult::Queued(BroadcastQueued { message }) => {
+            // lightwalletd's SendResponse has no queued concept; surface
+            // Zebra's underlying -25 Verify code so legacy wallets see the
+            // same error code they would have received from zcashd while the
+            // download queue drains.
+            lightwalletd::SendResponse {
+                error_code: -25,
+                error_message: message,
+            }
+        }
         TransactionBroadcastResult::Unknown(BroadcastUnknown {
             error_code,
             message,

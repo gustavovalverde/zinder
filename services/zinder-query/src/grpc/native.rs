@@ -11,11 +11,12 @@ use std::num::NonZeroU32;
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     AddressOutputIndexArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpoch,
-    CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TxStatus,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
+    TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TxStatus,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
@@ -702,6 +703,9 @@ fn build_broadcast_transaction_response(
         TransactionBroadcastResult::InvalidEncoding(invalid_encoding) => {
             Outcome::InvalidEncoding(build_broadcast_invalid_encoding_message(invalid_encoding))
         }
+        TransactionBroadcastResult::Queued(queued) => {
+            Outcome::Queued(build_broadcast_queued_message(queued))
+        }
         TransactionBroadcastResult::Rejected(rejected) => {
             Outcome::Rejected(build_broadcast_rejected_message(rejected))
         }
@@ -745,6 +749,37 @@ fn build_broadcast_rejected_message(rejected: BroadcastRejected) -> wallet::Broa
     wallet::BroadcastRejected {
         error_code: rejected.error_code,
         message: rejected.message,
+        kind: broadcast_rejection_reason_to_message(rejected.kind) as i32,
+    }
+}
+
+fn build_broadcast_queued_message(queued: BroadcastQueued) -> wallet::BroadcastQueued {
+    wallet::BroadcastQueued {
+        message: queued.message,
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BroadcastRejectionReason is #[non_exhaustive]; new variants must be wired into the proto enum in a deliberate change."
+)]
+fn broadcast_rejection_reason_to_message(
+    kind: BroadcastRejectionReason,
+) -> wallet::BroadcastRejectionReason {
+    match kind {
+        BroadcastRejectionReason::InvalidSignature => {
+            wallet::BroadcastRejectionReason::InvalidSignature
+        }
+        BroadcastRejectionReason::BadExpiryHeight => {
+            wallet::BroadcastRejectionReason::BadExpiryHeight
+        }
+        BroadcastRejectionReason::BadConsensusBranch => {
+            wallet::BroadcastRejectionReason::BadConsensusBranch
+        }
+        BroadcastRejectionReason::MempoolFull => wallet::BroadcastRejectionReason::MempoolFull,
+        // BroadcastRejectionReason::Unknown and every future non-exhaustive
+        // variant both collapse to the wire's Unknown enumerator.
+        _ => wallet::BroadcastRejectionReason::Unknown,
     }
 }
 

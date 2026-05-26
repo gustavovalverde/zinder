@@ -17,10 +17,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainValuePool, ChainValuePools,
-    ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
-    TransactionBroadcastResult, TransactionId,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainValuePool, ChainValuePools, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 
 use crate::{
@@ -109,6 +109,12 @@ const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
+/// JSON-RPC error code for general transaction verification failures.
+///
+/// Zebra collapses every mempool rejection into this code; the
+/// `classify_broadcast_error` unit tests use it as the call code.
+#[cfg(test)]
+const JSON_RPC_VERIFY_CODE: i32 = -25;
 
 /// Peer label for this source's [`ResilientClient`].
 ///
@@ -1526,32 +1532,77 @@ fn decode_subtree_root_hash(root_hash: &str) -> Result<SubtreeRootHash, SourceEr
 fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastResult {
     let JsonRpcCallError { code, message } = error;
 
-    if let Some(numeric_error_code) = code {
-        let error_code = Some(numeric_error_code);
-        return match i32::try_from(numeric_error_code).ok() {
-            Some(JSON_RPC_INVALID_ENCODING_CODE) => {
-                TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
-                    error_code,
-                    message,
-                })
-            }
-            Some(JSON_RPC_DUPLICATE_TRANSACTION_CODE) => {
-                TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
-                    error_code,
-                    message,
-                })
-            }
-            _ => TransactionBroadcastResult::Rejected(BroadcastRejected {
+    let Some(numeric_error_code) = code else {
+        return TransactionBroadcastResult::Unknown(BroadcastUnknown {
+            error_code: None,
+            message,
+        });
+    };
+
+    let error_code = Some(numeric_error_code);
+    match i32::try_from(numeric_error_code).ok() {
+        Some(JSON_RPC_INVALID_ENCODING_CODE) => {
+            TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
                 error_code,
                 message,
-            }),
-        };
+            })
+        }
+        Some(JSON_RPC_DUPLICATE_TRANSACTION_CODE) => {
+            TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+                error_code,
+                message,
+            })
+        }
+        _ => {
+            if is_already_queued_message(&message) {
+                TransactionBroadcastResult::Queued(BroadcastQueued { message })
+            } else {
+                let kind = classify_rejection_reason(&message);
+                TransactionBroadcastResult::Rejected(BroadcastRejected {
+                    kind,
+                    error_code,
+                    message,
+                })
+            }
+        }
     }
+}
 
-    TransactionBroadcastResult::Unknown(BroadcastUnknown {
-        error_code: None,
-        message,
-    })
+/// Returns whether the upstream node reported the broadcast as queued.
+///
+/// Zebra emits this state through `MempoolError::AlreadyQueued`, whose
+/// `Display` impl produces `"already queued for download"`. Detection is
+/// case-insensitive on the distinctive `queued for download` substring so
+/// future Zebra wording shifts (uppercase, prefixed sentence) keep matching.
+fn is_already_queued_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("queued for download")
+}
+
+/// Maps the upstream rejection message to a typed reason.
+///
+/// The submitter is the only crate allowed to peek at Zebra's free-form
+/// message strings (per ADR-0004); downstream consumers match on the typed
+/// [`BroadcastRejectionReason`] instead.
+fn classify_rejection_reason(message: &str) -> BroadcastRejectionReason {
+    let lowercased_message = message.to_ascii_lowercase();
+    if lowercased_message.contains("mempool is full")
+        || (lowercased_message.contains("mempool") && lowercased_message.contains("full"))
+    {
+        return BroadcastRejectionReason::MempoolFull;
+    }
+    if lowercased_message.contains("consensus branch") || lowercased_message.contains("branch id") {
+        return BroadcastRejectionReason::BadConsensusBranch;
+    }
+    if lowercased_message.contains("expiry") || lowercased_message.contains("expired") {
+        return BroadcastRejectionReason::BadExpiryHeight;
+    }
+    if lowercased_message.contains("invalid signature")
+        || lowercased_message.contains("bad signature")
+        || lowercased_message.contains("signature is invalid")
+    {
+        return BroadcastRejectionReason::InvalidSignature;
+    }
+    BroadcastRejectionReason::Unknown
 }
 
 /// Domain-shaped JSON-RPC `error` object after we strip jsonrpsee internals.
@@ -1859,6 +1910,100 @@ mod tests {
                 .supports(NodeCapability::ReadinessProbe)
         );
         Ok(())
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_already_queued_to_queued_variant() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "transaction was already queued for download".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Queued(BroadcastQueued { ref message })
+                if message == "transaction was already queued for download"
+        ));
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_invalid_signature_to_typed_kind() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "transaction signature is invalid".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::InvalidSignature,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_bad_expiry_height_to_typed_kind() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "transaction expiry height is past tip".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::BadExpiryHeight,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_bad_consensus_branch_to_typed_kind() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "transaction consensus branch id does not match".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::BadConsensusBranch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_mempool_full_to_typed_kind() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "mempool is full".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::MempoolFull,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classify_broadcast_error_defaults_unrecognized_rejection_to_unknown_kind() {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: "bad-txns-invalid".to_owned(),
+        });
+
+        assert!(matches!(
+            result,
+            TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::Unknown,
+                ..
+            })
+        ));
     }
 
     #[test]

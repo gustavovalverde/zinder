@@ -15,10 +15,11 @@ use zebra_chain::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
     AddressOutputIndexArtifact, BlockHash, BlockHeight, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastUnknown, ChainEpochId, ChainTipMetadata,
-    Network, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
-    SubtreeRootIndex, TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentSpendFact,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown,
+    ChainEpochId, ChainTipMetadata, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -573,6 +574,7 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
         ),
         (
             TransactionBroadcastResult::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::Unknown,
                 error_code: None,
                 message: "bad-txns-invalid".to_owned(),
             }),
@@ -621,6 +623,7 @@ async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Resul
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let broadcaster = MockTransactionBroadcaster::returning(TransactionBroadcastResult::Rejected(
         BroadcastRejected {
+            kind: BroadcastRejectionReason::Unknown,
             error_code: Some(-25),
             message: "missing-input".to_owned(),
         },
