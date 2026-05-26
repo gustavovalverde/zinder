@@ -28,15 +28,19 @@ done
 
 # Strip env vars whose TOML section the explorer schema doesn't allow.
 # The single-container image shares one process env across all three
-# supervised binaries, but explorer is a read-only secondary and its
-# schema only accepts [network], [storage], [explorer], [ops]. Strip:
-#  - ZINDER_NODE__*    (writer-only upstream node settings)
-#  - ZINDER_INGEST__*  (writer-only catchup tunables)
-#  - ZINDER_QUERY__*   (wallet-query's listen-addr and ingest_control
-#    settings; explorer has no [query] section in its schema)
+# supervised binaries; explorer's schema accepts [network], [storage],
+# [explorer], [ops], and [node]. The [node] section is read-only on the
+# explorer side: it feeds the optional upstream-observation probe that
+# populates ExplorerFreshness.upstream so consumers can render honest
+# sync-progress UI. Without it, the probe never spawns and every
+# response's `upstream` field stays unset. Strip the remaining
+# writer-only prefixes:
+#  - ZINDER_INGEST__*         (writer-only catchup tunables)
+#  - ZINDER_QUERY__*          (wallet-query's listen-addr and
+#                              ingest_control settings; explorer has no
+#                              [query] section)
 #  - ZINDER_INGEST_CONTROL__* (writer-binding only)
-unset $(env | sed -n -e 's/^\(ZINDER_NODE__[^=]*\)=.*/\1/p' \
-                     -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p' \
+unset $(env | sed -n -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_INGEST_CONTROL__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_QUERY__[^=]*\)=.*/\1/p') 2>/dev/null || true
 
