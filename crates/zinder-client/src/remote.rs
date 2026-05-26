@@ -2,11 +2,18 @@
 
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio_stream::StreamExt as _;
-use tonic::{Request, transport::Channel};
+use tonic::{
+    Request,
+    transport::{Channel, Endpoint},
+};
+use tonic_types::StatusExt as _;
+use tracing::warn;
 use zinder_core::wire::{
     decode_zinder_native_chain_name, encode_internal_block_hash, encode_internal_transaction_id,
     encode_zinder_native_chain_name,
@@ -31,6 +38,7 @@ use zinder_store::{
     transparent_mempool_spend_from_message as transparent_mempool_spend_from_message_shared,
 };
 
+use crate::error::ZINDER_ERROR_DOMAIN;
 use crate::{
     AddressOutputCursor, AddressOutputIndexQuery, AddressOutputIndexStream,
     AddressOutputIndexStreamItem, AddressOutputIndexView, BlockId, ChainEpochCommitted, ChainEvent,
@@ -63,11 +71,21 @@ pub struct RemoteOpenOptions {
 /// connection is detected by the keepalive PING within
 /// `KEEP_ALIVE_INTERVAL + KEEP_ALIVE_TIMEOUT`, so a stalled call errors out
 /// instead of hanging forever. The channel multiplexes concurrent calls over
-/// one HTTP/2 connection; the type is itself [`Clone`], and each clone
-/// shares the same underlying connection.
+/// one HTTP/2 connection.
+///
+/// The channel is held behind an [`ArcSwap`] so the index can self-heal from
+/// the tonic 0.14 failure mode where a stream-level h2 error leaves the
+/// internal multiplexer in a state where every subsequent call returns an
+/// empty `Code::Unavailable` without re-attempting the TCP/h2 handshake.
+/// When a call surfaces that exact signature (Unavailable with no
+/// `zinder.dev` `ErrorInfo` trailer), the index atomically swaps in a fresh
+/// lazy channel built from the saved [`Endpoint`]; the next call dials a new
+/// connection. Cloning the type via [`Clone`] is cheap and intentionally
+/// shares the swappable channel slot.
 #[derive(Clone)]
 pub struct RemoteChainIndex {
-    client: WalletQueryClient<Channel>,
+    client: Arc<ArcSwap<WalletQueryClient<Channel>>>,
+    endpoint: Endpoint,
     network: Network,
 }
 
@@ -96,26 +114,62 @@ impl RemoteChainIndex {
     /// established on the first gRPC call, not here. Only URI parsing can
     /// fail at this stage; transport errors surface at first use.
     pub fn connect(options: RemoteOpenOptions) -> Result<Self, IndexerError> {
-        let channel = Channel::from_shared(options.endpoint)
+        let endpoint = Channel::from_shared(options.endpoint)
             .map_err(|error| IndexerError::invalid_request(error.to_string()))?
             .keep_alive_while_idle(true)
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(TCP_KEEPALIVE))
-            .connect_lazy();
+            .tcp_keepalive(Some(TCP_KEEPALIVE));
+        let channel = endpoint.connect_lazy();
 
         Ok(Self {
-            client: WalletQueryClient::new(channel),
+            client: Arc::new(ArcSwap::new(Arc::new(WalletQueryClient::new(channel)))),
+            endpoint,
             network: options.network,
         })
     }
 
-    /// Returns a per-call `WalletQueryClient` clone. The underlying `Channel`
-    /// is shared and multiplexes the request over one HTTP/2 connection;
-    /// cloning the client is cheap and does not allocate a new connection.
+    /// Returns a per-call `WalletQueryClient` clone backed by the current
+    /// swappable channel slot. Cloning the client is cheap and does not
+    /// allocate a new connection; concurrent callers share the underlying
+    /// HTTP/2 multiplexer until [`Self::rebuild_channel`] swaps it out.
     fn client(&self) -> WalletQueryClient<Channel> {
-        self.client.clone()
+        (**self.client.load()).clone()
+    }
+
+    /// Maps a tonic [`Status`](tonic::Status) into the typed [`IndexerError`]
+    /// and rebuilds the underlying gRPC channel when the status carries the
+    /// "poisoned multiplexer" signature, i.e. `Code::Unavailable` (or
+    /// `Code::Unknown`, which tonic uses for some transport-level failures)
+    /// with no `zinder.dev` `ErrorInfo` trailer. Application-level errors
+    /// like `Code::InvalidArgument` always preserve the channel even when
+    /// the upstream omitted the trailer, since those are caller bugs that
+    /// reconnecting would not fix.
+    fn handle_status(&self, status: tonic::Status) -> IndexerError {
+        let poisoned_transport = matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::Unknown
+        ) && status
+            .get_error_details()
+            .error_info()
+            .is_none_or(|error_info| error_info.domain != ZINDER_ERROR_DOMAIN);
+        let err = IndexerError::from_status(status);
+        if poisoned_transport {
+            self.rebuild_channel();
+        }
+        err
+    }
+
+    fn rebuild_channel(&self) {
+        let fresh = self.endpoint.connect_lazy();
+        self.client
+            .store(Arc::new(WalletQueryClient::new(fresh)));
+        warn!(
+            target: "zinder_client",
+            event = "remote_channel_rebuilt",
+            "rebuilt remote chain index gRPC channel after poisoned-transport failure"
+        );
     }
 }
 
@@ -126,7 +180,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .server_info(Request::new(wallet::ServerInfoRequest {}))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         let wallet_info = response
             .info
@@ -144,7 +198,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .latest_block(Request::new(wallet::LatestBlockRequest { at_epoch: None }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
 
         chain_epoch_from_message_with_network(
@@ -162,7 +216,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         let latest_block = response
             .latest_block
@@ -186,7 +240,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         block_id_from_message(response.block_id)
     }
@@ -203,7 +257,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         let header_message = response
             .block_header
@@ -223,7 +277,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         compact_block_from_message(
             response
@@ -245,9 +299,10 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?;
-        let stream = response.into_inner().map(|chunk_result| {
-            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            .map_err(|status| self.handle_status(status))?;
+        let recovery = self.clone();
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
             compact_block_from_message(
                 chunk
                     .compact_block
@@ -270,7 +325,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         tree_state_from_response(response)
     }
@@ -285,7 +340,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         tree_state_from_response(response)
     }
@@ -305,7 +360,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         let protocol = shielded_protocol_from_message(response.shielded_protocol)?;
         response
@@ -320,7 +375,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         chain_value_pools_at_tip_from_message(self.network, response)
     }
@@ -345,7 +400,7 @@ impl ChainIndex for RemoteChainIndex {
                 }
                 return self.lookup_in_mempool(transaction_id).await;
             }
-            Err(status) => return Err(IndexerError::from_status(status)),
+            Err(status) => return Err(self.handle_status(status)),
         };
         tx_status_from_message(response)
     }
@@ -360,7 +415,7 @@ impl ChainIndex for RemoteChainIndex {
                 raw_transaction: raw_transaction.as_slice().to_vec(),
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         transaction_broadcast_result_from_message(response)
     }
@@ -388,10 +443,11 @@ impl ChainIndex for RemoteChainIndex {
                 address_filter,
             }))
             .await
-            .map_err(IndexerError::from_status)?;
+            .map_err(|status| self.handle_status(status))?;
         let expected_network = self.network;
+        let recovery = self.clone();
         let stream = response.into_inner().map(move |event_result| {
-            let event = event_result.map_err(IndexerError::from_status)?;
+            let event = event_result.map_err(|status| recovery.handle_status(status))?;
             chain_event_envelope_from_message(expected_network, event)
         });
 
@@ -413,7 +469,7 @@ impl ChainIndex for RemoteChainIndex {
                 from_cursor,
             }))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         mempool_snapshot_view_from_message(response)
     }
@@ -429,9 +485,10 @@ impl ChainIndex for RemoteChainIndex {
                 family: wallet::MempoolEventStreamFamily::Mempool as i32,
             }))
             .await
-            .map_err(IndexerError::from_status)?;
+            .map_err(|status| self.handle_status(status))?;
+        let recovery = self.clone();
         let stream = response.into_inner().map(move |event_result| {
-            let envelope_message = event_result.map_err(IndexerError::from_status)?;
+            let envelope_message = event_result.map_err(|status| recovery.handle_status(status))?;
             mempool_event_envelope_from_message(envelope_message)
         });
         Ok(Box::pin(stream))
@@ -456,7 +513,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .address_output_index(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         let chain_epoch = chain_epoch_from_message_with_network(
             self.network,
@@ -506,10 +563,11 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_address_tx_ids_in_range(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?;
+            .map_err(|status| self.handle_status(status))?;
         let expected_network = self.network;
+        let recovery = self.clone();
         let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
             transparent_address_tx_ids_chunk_from_message(
                 expected_network,
                 address_script_hash,
@@ -529,10 +587,11 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .address_output_index_stream(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?;
+            .map_err(|status| self.handle_status(status))?;
         let expected_network = self.network;
+        let recovery = self.clone();
         let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(IndexerError::from_status)?;
+            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
             address_output_index_stream_item_from_message(expected_network, chunk)
         });
         Ok(Box::pin(stream))
@@ -554,7 +613,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_outputs_by_address(Request::new(wire_request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         response
             .outputs
@@ -574,7 +633,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_spend_by_outpoint(Request::new(wire_request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         response
             .spend
@@ -603,7 +662,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_address_balance(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         transparent_address_balance_from_message(self.network, response)
     }
@@ -622,7 +681,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_outputs_by_outpoint(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
@@ -639,7 +698,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_outputs_by_outpoint(Request::new(request))
             .await
-            .map_err(IndexerError::from_status)?
+            .map_err(|status| self.handle_status(status))?
             .into_inner();
         transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
@@ -1380,4 +1439,63 @@ fn mempool_event_envelope_from_message(
         source_observed_unix_millis: store_envelope.source_observed_unix_millis,
         event,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IndexerError;
+    use tonic::{Code, Status};
+
+    #[allow(
+        clippy::expect_used,
+        reason = "syntactically valid URI; connect_lazy cannot fail here"
+    )]
+    fn build_index() -> RemoteChainIndex {
+        RemoteChainIndex::connect(RemoteOpenOptions {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            network: Network::ZcashRegtest,
+        })
+        .expect("connect_lazy never errors for a syntactically valid URI")
+    }
+
+    fn current_client_ptr(index: &RemoteChainIndex) -> usize {
+        Arc::as_ptr(&index.client.load_full()) as usize
+    }
+
+    #[tokio::test]
+    async fn handle_status_swaps_channel_on_poisoned_unavailable() {
+        let index = build_index();
+        let before = current_client_ptr(&index);
+
+        let err = index.handle_status(Status::new(Code::Unavailable, ""));
+
+        let after = current_client_ptr(&index);
+        assert!(
+            matches!(
+                &err,
+                IndexerError::ServiceUnavailable { reason }
+                    if reason.starts_with("missing zinder.dev ErrorInfo")
+            ),
+            "expected ServiceUnavailable with poisoned-transport reason, got {err:?}"
+        );
+        assert_ne!(
+            before, after,
+            "empty Code::Unavailable without zinder.dev ErrorInfo must swap the channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_status_keeps_channel_on_invalid_argument() {
+        let index = build_index();
+        let before = current_client_ptr(&index);
+
+        let _ = index.handle_status(Status::new(Code::InvalidArgument, "bad cursor"));
+
+        let after = current_client_ptr(&index);
+        assert_eq!(
+            before, after,
+            "application-level errors with InvalidArgument must not rebuild the channel"
+        );
+    }
 }

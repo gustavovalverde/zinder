@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
@@ -18,6 +19,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tonic-types.workspace = true
+tracing.workspace = true
 zinder-core.workspace = true
 zinder-derive.workspace = true
 zinder-proto.workspace = true

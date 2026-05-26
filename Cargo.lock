@@ -5080,6 +5080,7 @@ dependencies = [
 name = "zinder-client"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "eyre",
  "secrecy",
@@ -5092,6 +5093,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-types",
+ "tracing",
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
