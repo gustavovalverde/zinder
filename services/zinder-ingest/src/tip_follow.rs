@@ -872,34 +872,55 @@ async fn populate_tip_follow_tree_state_checkpoint<Source>(
 where
     Source: NodeSource,
 {
-    if !batch.tree_states.is_empty() {
-        return Ok(());
-    }
-    let Some(tip_block) = batch.block_headers.last() else {
-        return Ok(());
-    };
     if !source.capabilities().supports(NodeCapability::TreeState) {
         return Ok(());
     }
 
-    let block_id = BlockId::new(tip_block.height, tip_block.block_hash);
-    let source_tree_state = match fetch_tree_state_for_block_with_retry(
-        config.node.request_timeout,
-        source,
-        block_id,
-        retry_state,
-    )
-    .await
-    {
-        Ok(source_tree_state) => source_tree_state,
-        Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    batch.push_tree_state_checkpoint(TreeStateArtifact::new(
-        source_tree_state.block_id.height,
-        source_tree_state.block_id.hash,
-        source_tree_state.payload_bytes,
-    ));
+    // Stride checkpoints across the batch using the same cadence as
+    // bulk catchup; the wallet rewind cap does not change between phases,
+    // so the gap-class the constant addresses does not either. Tip-follow
+    // batches during chain catchup can still span tens of blocks, so the
+    // single-end-of-batch policy this function used to apply left gaps
+    // wide enough to wedge the wallet on the next resume.
+    let existing_heights: std::collections::HashSet<_> =
+        batch.tree_states.iter().map(|ts| ts.height).collect();
+    let mut targets: Vec<(zinder_core::BlockHeight, zinder_core::BlockHash)> = batch
+        .block_headers
+        .iter()
+        .filter(|header| {
+            header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
+                && !existing_heights.contains(&header.height)
+        })
+        .map(|header| (header.height, header.block_hash))
+        .collect();
+    if let Some(tip) = batch.block_headers.last() {
+        let already_at_tip = targets.last().map(|(height, _)| *height) == Some(tip.height)
+            || existing_heights.contains(&tip.height);
+        if !already_at_tip {
+            targets.push((tip.height, tip.block_hash));
+        }
+    }
+
+    for (height, block_hash) in targets {
+        let block_id = BlockId::new(height, block_hash);
+        let source_tree_state = match fetch_tree_state_for_block_with_retry(
+            config.node.request_timeout,
+            source,
+            block_id,
+            retry_state,
+        )
+        .await
+        {
+            Ok(source_tree_state) => source_tree_state,
+            Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+            source_tree_state.block_id.height,
+            source_tree_state.block_id.hash,
+            source_tree_state.payload_bytes,
+        ));
+    }
     Ok(())
 }
 

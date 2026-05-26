@@ -454,18 +454,6 @@ where
     outcome
 }
 
-/// Stride between intra-batch tree-state checkpoints during bulk catchup.
-///
-/// Wallet implementations (notably `zcash_client_backend`) cap their rewind
-/// window at roughly 100 blocks behind `fully_scanned_height`; if the
-/// nearest checkpoint at or below that window is older than the cap, the
-/// wallet cannot recover. A bulk-catchup batch can span thousands of blocks,
-/// so a single end-of-batch checkpoint leaves arbitrary gaps. Emitting one
-/// checkpoint every 100 ingested heights guarantees the wallet can always
-/// find an anchor inside its rewind window, regardless of where in a batch
-/// it landed.
-const BULK_CATCHUP_TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
-
 async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
     batch: &mut CanonicalBatch,
@@ -488,7 +476,7 @@ where
         .block_headers
         .iter()
         .filter(|header| {
-            header.height.value() % BULK_CATCHUP_TREE_STATE_CHECKPOINT_STRIDE == 0
+            header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
                 && !existing_heights.contains(&header.height)
         })
         .map(|header| (header.height, header.block_hash))
