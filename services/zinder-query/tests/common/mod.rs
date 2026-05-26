@@ -47,7 +47,7 @@ pub fn synthetic_chain_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(9),
+            artifact_schema_version: ArtifactSchemaVersion::new(10),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(height)),
         },

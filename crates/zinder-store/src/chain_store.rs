@@ -102,16 +102,25 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 9;
+const STORE_SCHEMA_VERSION: u16 = 10;
 /// Durable artifact schema version written by this binary.
 ///
-/// Version 9 is the fact-first canonical schema: block headers,
+/// Version 9 was the fact-first canonical schema: block headers,
 /// transaction locations and facts, transparent outputs, resolved transparent
-/// spend facts, and optional raw blob tables are persisted as separate durable
+/// spend facts, and optional raw blob tables persisted as separate durable
 /// facts.
-/// Stores written under earlier versions must be wiped and re-synced before
-/// opening with this binary.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(9);
+///
+/// Version 10 carries the same fact-first layout, but every hash-shaped
+/// proto field in stored artifacts (`BlockHeaderInfo.previous_block_hash`,
+/// `BlockHeaderInfo.merkle_root_hash`, `TransactionLocation.block_hash`,
+/// `OutPoint.transaction_id`, the `block_hash` and `transaction_id`
+/// fields across mempool and transparent-address artifacts) is `string`
+/// in RPC byte order instead of `bytes` in internal byte order. Stores
+/// written under earlier versions hold raw 32-byte sequences that the
+/// running binary would attempt to decode as UTF-8 strings and reject;
+/// the operator must wipe and re-sync the chain store before opening
+/// with this binary. See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(10);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 
@@ -2866,7 +2875,7 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 9);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 10);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

@@ -21,7 +21,7 @@ fn chain_epoch_carries_the_visible_consistency_boundary() {
         tip_hash,
         finalized_height: BlockHeight::new(1),
         finalized_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -38,7 +38,7 @@ fn chain_epoch_carries_the_visible_consistency_boundary() {
     assert_eq!(chain_epoch.finalized_hash, finalized_hash);
     assert_eq!(
         chain_epoch.artifact_schema_version,
-        ArtifactSchemaVersion::new(9)
+        ArtifactSchemaVersion::new(10)
     );
     assert_eq!(
         chain_epoch.created_at,

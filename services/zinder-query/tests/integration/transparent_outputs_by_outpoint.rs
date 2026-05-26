@@ -239,7 +239,7 @@ fn commit_two_block_fixture(
         tip_hash: second_hash,
         finalized_height: second_height,
         finalized_hash: second_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000),
     };

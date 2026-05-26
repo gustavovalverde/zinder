@@ -102,7 +102,7 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -170,7 +170,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -203,7 +203,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: reintroduced_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -262,7 +262,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -479,7 +479,7 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         tip_hash: replacement_hash,
         finalized_height: epoch_1.tip_height,
         finalized_hash: epoch_1.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -588,7 +588,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -677,7 +677,7 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         tip_hash: replacement_hash,
         finalized_height: finalized_epoch.tip_height,
         finalized_hash: finalized_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -988,7 +988,7 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             finalized_height: block_height,
             finalized_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(9),
+            artifact_schema_version: ArtifactSchemaVersion::new(10),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
@@ -1070,7 +1070,7 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         tip_hash: replacement_hash,
         finalized_height: first_epoch.tip_height,
         finalized_hash: first_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(9),
+        artifact_schema_version: ArtifactSchemaVersion::new(10),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };

@@ -70,7 +70,16 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 /// metadata payload format changes in a backwards-incompatible way. The
 /// version is persisted in the `consumer_metadata` column family on first
 /// open and validated on subsequent opens.
-pub const DERIVE_SCHEMA_VERSION: u16 = 4;
+///
+/// Version 5 is the first version where derive payloads (e.g. the
+/// `BlockSummaryRecord` and `RecentTransactionEntry` rows) carry
+/// hash-shaped fields as `string` in RPC byte order instead of `bytes`
+/// in internal byte order. Derive stores written under version 4 store
+/// transaction ids and block hashes as raw bytes that the running binary
+/// would attempt to decode as UTF-8 strings and reject; the operator
+/// must wipe the derive store directory before opening with this binary.
+/// See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
+pub const DERIVE_SCHEMA_VERSION: u16 = 5;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
