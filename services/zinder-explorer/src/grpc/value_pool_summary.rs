@@ -6,18 +6,20 @@
 
 use tonic::{Request, Response, Status};
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1;
-use zinder_proto::v1::explorer::{
-    ExplorerFreshness, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
-};
+use zinder_proto::v1::explorer::{ValuePoolSummaryRequest, ValuePoolSummaryResponse};
 use zinder_proto::v1::wallet::{
-    self, ChainValuePoolsAtTipRequest, wallet_query_client::WalletQueryClient,
+    ChainValuePoolsAtTipRequest, wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
+use zinder_derive::DeriveStore;
 
 /// Executes one `ExplorerQuery.ValuePoolSummary` request.
 pub(crate) async fn handle_value_pool_summary(
+    derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     _request: Request<ValuePoolSummaryRequest>,
@@ -32,7 +34,12 @@ pub(crate) async fn handle_value_pool_summary(
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        value_pool_freshness(chain_epoch),
+        build_explorer_freshness(
+            derive_store,
+            EXPLORER_VALUE_POOL_SUMMARY_V1,
+            Some(chain_epoch),
+            0,
+        )?,
     )
     .await;
     Ok(Response::new(ValuePoolSummaryResponse {
@@ -40,16 +47,4 @@ pub(crate) async fn handle_value_pool_summary(
         pools: response.pools,
         tip_height: response.tip_height,
     }))
-}
-
-fn value_pool_freshness(chain_epoch: wallet::ChainEpoch) -> ExplorerFreshness {
-    ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: 0,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_VALUE_POOL_SUMMARY_V1.to_owned(),
-        unavailable: Vec::new(),
-        upstream: None,
-    }
 }

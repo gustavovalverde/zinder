@@ -25,9 +25,8 @@ use zinder_derive::{
 };
 use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
 use zinder_proto::v1::explorer::{
-    BlockSummary, BlockSummaryRecord, ExplorerFreshness, OverviewFeeSummary, OverviewMempool,
-    OverviewMempoolEvents, OverviewSnapshotRequest, OverviewSnapshotResponse,
-    RecentTransactionEntry,
+    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
+    OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionEntry,
 };
 use zinder_proto::v1::wallet::{
     self, ChainValuePoolsAtTipRequest, LatestBlockRequest, MempoolSnapshotRequest,
@@ -35,7 +34,9 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 
 /// Range cap on `recent_blocks_limit`.
 const MIN_RECENT_BLOCKS_LIMIT: u32 = 1;
@@ -84,7 +85,6 @@ pub(crate) async fn handle_overview_snapshot(
     let limits = RequestLimits::from_request(request.into_inner());
     let anchor = anchor_to_wallet_tip(wallet_client).await?;
     let block_records = read_block_summary_records(derive_store, anchor.tip_height, &limits)?;
-    let derive_cursor_lag_blocks = compute_derive_lag(derive_store, anchor.tip_height)?;
     let recent_blocks =
         collect_recent_blocks(&block_records, limits.recent_blocks, anchor.tip_height);
     let fee_summary = aggregate_fee_summary(&block_records, limits.fee_summary_blocks);
@@ -97,15 +97,12 @@ pub(crate) async fn handle_overview_snapshot(
     let value_pools = read_value_pools(wallet_client).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(anchor.chain_epoch),
-            snapshot_age_millis: 0,
-            derive_cursor_lag_blocks,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            Some(derive_store),
+            EXPLORER_OVERVIEW_SNAPSHOT_V1,
+            Some(anchor.chain_epoch),
+            0,
+        )?,
     )
     .await;
     Ok(Response::new(OverviewSnapshotResponse {
@@ -211,20 +208,6 @@ fn read_block_summary_records(
         records.push(record);
     }
     Ok(records)
-}
-
-fn compute_derive_lag(
-    derive_store: &DeriveStore,
-    canonical_tip_height: u32,
-) -> Result<u64, Status> {
-    let derive_tip = derive_store
-        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map(BlockHeight::value);
-    Ok(derive_tip.map_or_else(
-        || u64::from(canonical_tip_height),
-        |materialized| u64::from(canonical_tip_height.saturating_sub(materialized)),
-    ))
 }
 
 fn collect_recent_blocks(

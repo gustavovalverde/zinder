@@ -16,14 +16,16 @@ use zinder_core::wire::encode_height_key_ascending;
 use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
     BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-    BlockSummariesInRangeResponse, BlockSummaryRecord, ExplorerFreshness, block_detail_request,
+    BlockSummariesInRangeResponse, BlockSummaryRecord, block_detail_request,
 };
 use zinder_proto::v1::wallet::{
     self, BlockSelector, LatestBlockRequest, block_selector, wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 
 /// Hard cap on the number of block summaries one range request returns.
@@ -81,11 +83,11 @@ pub(crate) async fn handle_block_summaries_in_range(
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        build_freshness_from_tip(
-            derive_store,
+        build_explorer_freshness(
+            Some(derive_store),
             EXPLORER_BLOCK_SUMMARY_V1,
-            chain_epoch,
-            canonical_tip,
+            Some(chain_epoch),
+            0,
         )?,
     )
     .await;
@@ -125,11 +127,11 @@ pub(crate) async fn handle_block_detail(
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        build_freshness_from_tip(
-            derive_store,
+        build_explorer_freshness(
+            Some(derive_store),
             EXPLORER_BLOCK_DETAIL_V1,
-            chain_epoch,
-            canonical_tip,
+            Some(chain_epoch),
+            0,
         )?,
     )
     .await;
@@ -195,29 +197,4 @@ async fn read_canonical_tip(
         .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
         .height;
     Ok((chain_epoch, canonical_tip))
-}
-
-fn build_freshness_from_tip(
-    derive_store: &DeriveStore,
-    capability_version: &str,
-    chain_epoch: wallet::ChainEpoch,
-    canonical_tip: u32,
-) -> Result<ExplorerFreshness, Status> {
-    let derive_tip = derive_store
-        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map(zinder_core::BlockHeight::value);
-    let derive_cursor_lag_blocks = derive_tip.map_or_else(
-        || u64::from(canonical_tip),
-        |materialized| u64::from(canonical_tip.saturating_sub(materialized)),
-    );
-    Ok(ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: 0,
-        derive_cursor_lag_blocks,
-        derive_cursor_lag_millis: 0,
-        capability_version: capability_version.to_owned(),
-        unavailable: Vec::new(),
-        upstream: None,
-    })
 }

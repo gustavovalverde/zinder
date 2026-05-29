@@ -18,9 +18,9 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
-    ExplorerFreshness, MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse,
-    MempoolSummaryRequest, MempoolSummaryResponse, PrivacyShapeCount,
-    TransactionVersion as WireVersion, TransactionVersionCount, TransactionVersionKind,
+    MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSummaryRequest,
+    MempoolSummaryResponse, PrivacyShapeCount, TransactionVersion as WireVersion,
+    TransactionVersionCount, TransactionVersionKind,
 };
 use zinder_proto::v1::wallet::{
     self, MempoolEntry, MempoolSnapshotRequest, wallet_query_client::WalletQueryClient,
@@ -28,7 +28,10 @@ use zinder_proto::v1::wallet::{
 use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
+use zinder_derive::DeriveStore;
 
 /// Hard cap on the mempool entries the summary aggregates in one call.
 ///
@@ -64,6 +67,7 @@ const CURSOR_BYTES: usize = 12;
 
 /// Executes one `ExplorerQuery.MempoolSummary` request.
 pub(crate) async fn handle_mempool_summary(
+    derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -105,15 +109,12 @@ pub(crate) async fn handle_mempool_summary(
         .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: snapshot.snapshot_age_millis,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_MEMPOOL_SUMMARY_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            derive_store,
+            EXPLORER_MEMPOOL_SUMMARY_V1,
+            Some(chain_epoch),
+            snapshot.snapshot_age_millis,
+        )?,
     )
     .await;
 
@@ -138,6 +139,7 @@ pub(crate) async fn handle_mempool_summary(
 
 /// Executes one `ExplorerQuery.MempoolActivity` request.
 pub(crate) async fn handle_mempool_activity(
+    derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -204,15 +206,12 @@ pub(crate) async fn handle_mempool_activity(
         .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: snapshot.snapshot_age_millis,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_MEMPOOL_ACTIVITY_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            derive_store,
+            EXPLORER_MEMPOOL_ACTIVITY_V1,
+            Some(chain_epoch),
+            snapshot.snapshot_age_millis,
+        )?,
     )
     .await;
 

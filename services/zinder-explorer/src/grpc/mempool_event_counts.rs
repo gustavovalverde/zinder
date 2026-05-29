@@ -8,13 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::{Request, Response, Status};
 use zinder_proto::capabilities::EXPLORER_MEMPOOL_EVENT_COUNTS_V1;
-use zinder_proto::v1::explorer::{
-    ExplorerFreshness, MempoolEventCountsRequest, MempoolEventCountsResponse,
-};
+use zinder_proto::v1::explorer::{MempoolEventCountsRequest, MempoolEventCountsResponse};
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 use zinder_derive::{DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer};
 
 /// Minimum window size accepted by the handler.
@@ -77,15 +77,12 @@ pub(crate) async fn handle_mempool_event_counts(
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: 0,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_MEMPOOL_EVENT_COUNTS_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            Some(derive_store),
+            EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+            Some(chain_epoch),
+            0,
+        )?,
     )
     .await;
     Ok(Response::new(MempoolEventCountsResponse {

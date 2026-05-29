@@ -12,10 +12,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as _;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_proto::v1::explorer::{ExplorerFreshness, UpstreamObservation};
+use tonic::Status;
+use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_proto::v1::explorer::{
+    BlockSummaryRecord, DeriveStatus, ExplorerFreshness, IndexedHead, UpstreamObservation,
+};
+use zinder_proto::v1::wallet;
 use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 
 /// Shared, lock-protected handle to the most recent
@@ -78,6 +84,79 @@ pub(crate) async fn attach_upstream_observation(
         freshness.upstream = Some(upstream_observation_from_snapshot(&snapshot));
     }
     freshness
+}
+
+/// Reads the explorer's indexed head: the highest block the derive
+/// projections have fully materialized, decoded from the newest
+/// `BlockSummaryRecord`. Returns `None` when no block is materialized yet.
+///
+/// All chain-event derive consumers advance under one shared cursor, so the
+/// block-summary head is an accurate indexed head for every capability.
+pub(crate) fn read_indexed_head(derive_store: &DeriveStore) -> Result<Option<IndexedHead>, Status> {
+    let Some((_, payload)) = derive_store
+        .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .map_err(|error| Status::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let summary = BlockSummaryRecord::decode(payload.as_slice())
+        .map_err(|error| Status::internal(format!("BlockSummaryRecord decode failed: {error}")))?
+        .summary
+        .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+    Ok(Some(IndexedHead {
+        height: summary.block_height,
+        hash: summary.block_hash,
+        block_time_unix_seconds: summary.block_time_unix_seconds,
+    }))
+}
+
+/// Builds the per-response [`ExplorerFreshness`] body shared by every read
+/// handler.
+///
+/// Carries the canonical follower tip (`chain_epoch`) and the derive plane's
+/// indexed head (the block the response actually reflects); consumers read
+/// index lag as `chain_epoch.tip_height - indexed_head.height`. `derive_store`
+/// is optional so the bootstrap `ServerInfo` call and any response built
+/// before a derive store is wired leave `indexed_head` unset. The upstream
+/// observation is overlaid separately by [`attach_upstream_observation`].
+pub(crate) fn build_explorer_freshness(
+    derive_store: Option<&DeriveStore>,
+    capability_version: &str,
+    chain_epoch: Option<wallet::ChainEpoch>,
+    snapshot_age_millis: u64,
+) -> Result<ExplorerFreshness, Status> {
+    let indexed_head = match derive_store {
+        Some(store) => read_indexed_head(store)?,
+        None => None,
+    };
+    Ok(ExplorerFreshness {
+        chain_epoch,
+        snapshot_age_millis,
+        capability_version: capability_version.to_owned(),
+        unavailable: Vec::new(),
+        upstream: None,
+        indexed_head,
+    })
+}
+
+/// Reads the derive-status record the ingest plane persists, decoding it into
+/// the wire [`DeriveStatus`]. Returns `None` when no derive store is wired or
+/// the ingest plane has not written a record yet.
+pub(crate) fn read_derive_status(
+    derive_store: Option<&DeriveStore>,
+) -> Result<Option<DeriveStatus>, Status> {
+    let Some(store) = derive_store else {
+        return Ok(None);
+    };
+    let Some(bytes) = store
+        .get_derive_status()
+        .map_err(|error| Status::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    DeriveStatus::decode(bytes.as_slice())
+        .map(Some)
+        .map_err(|error| Status::internal(format!("DeriveStatus decode failed: {error}")))
 }
 
 /// Spawns the background task that refreshes the
@@ -144,12 +223,11 @@ mod tests {
         ExplorerFreshness {
             chain_epoch: None,
             snapshot_age_millis: 0,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
             capability_version: zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1
                 .to_owned(),
             unavailable: Vec::new(),
             upstream: None,
+            indexed_head: None,
         }
     }
 

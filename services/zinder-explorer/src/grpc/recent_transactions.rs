@@ -15,12 +15,14 @@ use zinder_core::TransactionId;
 use zinder_core::wire::decode_rpc_transaction_id_hex;
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_RECENT_V1;
 use zinder_proto::v1::explorer::{
-    ExplorerFreshness, RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
+    RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
 };
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 use zinder_derive::{DeriveStore, RECENT_TRANSACTIONS_COLUMN_FAMILY, TransactionFeesConsumer};
 
 /// Server-side maximum entries the handler ever returns in one stream.
@@ -105,15 +107,12 @@ pub(crate) async fn handle_recent_transactions(
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: 0,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_TRANSACTION_RECENT_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            Some(derive_store),
+            EXPLORER_TRANSACTION_RECENT_V1,
+            Some(chain_epoch),
+            0,
+        )?,
     )
     .await;
     let chunk = RecentTransactionsChunk {

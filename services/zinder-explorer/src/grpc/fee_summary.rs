@@ -17,13 +17,13 @@ use zinder_core::BlockHeight;
 use zinder_core::wire::encode_height_key_ascending;
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
-use zinder_proto::v1::explorer::{
-    BlockSummaryRecord, ExplorerFreshness, FeeSummaryRequest, FeeSummaryResponse,
-};
+use zinder_proto::v1::explorer::{BlockSummaryRecord, FeeSummaryRequest, FeeSummaryResponse};
 use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 
 /// Hard cap on the blocks one `FeeSummary` request aggregates.
 ///
@@ -41,8 +41,8 @@ pub(crate) async fn handle_fee_summary(
     let inner = request.into_inner();
     validate_range(inner.start_height, inner.end_height)?;
     let aggregate = aggregate_block_summaries(derive_store, inner.start_height, inner.end_height)?;
-    let (chain_epoch, canonical_tip) = fetch_latest_chain_epoch(wallet_client).await?;
-    let mut response = build_response(derive_store, aggregate, chain_epoch, canonical_tip)?;
+    let chain_epoch = fetch_latest_chain_epoch(wallet_client).await?;
+    let mut response = build_response(derive_store, aggregate, chain_epoch)?;
     if let Some(freshness) = response.freshness.take() {
         response.freshness =
             Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
@@ -130,25 +130,13 @@ fn build_response(
     derive_store: &DeriveStore,
     aggregate: FeeAggregate,
     chain_epoch: wallet::ChainEpoch,
-    canonical_tip: u32,
 ) -> Result<FeeSummaryResponse, Status> {
-    let derive_tip = derive_store
-        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map(BlockHeight::value);
-    let derive_cursor_lag_blocks = derive_tip.map_or_else(
-        || u64::from(canonical_tip),
-        |materialized| u64::from(canonical_tip.saturating_sub(materialized)),
-    );
-    let freshness = ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: 0,
-        derive_cursor_lag_blocks,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_FEE_SUMMARY_V1.to_owned(),
-        unavailable: Vec::new(),
-        upstream: None,
-    };
+    let freshness = build_explorer_freshness(
+        Some(derive_store),
+        EXPLORER_FEE_SUMMARY_V1,
+        Some(chain_epoch),
+        0,
+    )?;
     Ok(FeeSummaryResponse {
         freshness: Some(freshness),
         block_count: aggregate.block_count,
@@ -161,17 +149,11 @@ fn build_response(
 
 async fn fetch_latest_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<(wallet::ChainEpoch, u32), Status> {
-    let response = wallet_client
+) -> Result<wallet::ChainEpoch, Status> {
+    wallet_client
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
-        .into_inner();
-    let chain_epoch = response
+        .into_inner()
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
-    let canonical_tip = response
-        .latest_block
-        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
-        .height;
-    Ok((chain_epoch, canonical_tip))
+        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))
 }

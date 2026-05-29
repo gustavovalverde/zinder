@@ -82,6 +82,7 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 pub const DERIVE_SCHEMA_VERSION: u16 = 5;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
+const DERIVE_STATUS_KEY: &[u8] = b"\x00\x02derive_status";
 const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
     BLOCK_SUMMARY_COLUMN_FAMILY,
     MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
@@ -627,6 +628,20 @@ impl DeriveStore {
             })
     }
 
+    /// Persists the ingest plane's derive-status record so the explorer plane
+    /// can surface it on `ServerInfo`. Opaque bytes by design: the store stays
+    /// free of the explorer wire types, matching how consumer payloads are
+    /// handled. See [`Self::get_derive_status`].
+    pub fn put_derive_status(&self, bytes: &[u8]) -> Result<(), DeriveStoreError> {
+        self.put(DeriveStoreTable::ConsumerMetadata, DERIVE_STATUS_KEY, bytes)
+    }
+
+    /// Reads the derive-status record the ingest plane writes each replay
+    /// tick, or `None` when ingest has not written one yet.
+    pub fn get_derive_status(&self) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        self.get(DeriveStoreTable::ConsumerMetadata, DERIVE_STATUS_KEY)
+    }
+
     /// Batch-reads multiple keys from a consumer-owned column family.
     ///
     /// Returns one entry per input key in input order: `None` when the key
@@ -721,6 +736,30 @@ impl DeriveStore {
             source,
         })?;
         Ok(Some(key.to_vec()))
+    }
+
+    /// Returns the lexicographically last `(key, value)` entry in a
+    /// consumer-owned column family, or `None` when it is empty.
+    ///
+    /// Like [`Self::last_consumer_key`] but also returns the payload, so a
+    /// caller that needs the newest materialized record (the indexed head)
+    /// reads it in one reverse-iterator step instead of a key lookup followed
+    /// by a point get.
+    pub fn last_consumer_entry(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<ConsumerEntry>, DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut iterator = self.db.iterator_cf(&handle, IteratorMode::End);
+        let Some(entry) = iterator.next() else {
+            return Ok(None);
+        };
+        let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation: "last_entry",
+            name: column_family,
+            source,
+        })?;
+        Ok(Some((key.to_vec(), payload.to_vec())))
     }
 
     /// Returns the highest height materialized in an ascending-height

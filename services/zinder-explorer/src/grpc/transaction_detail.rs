@@ -22,18 +22,20 @@ use zinder_proto::wire::encode_privacy_shape;
 use zinder_derive::{DeriveStore, TransactionFeesConsumer};
 use zinder_proto::v1::{
     explorer::{
-        ExplorerFreshness, LockTime as WireLockTime, LockTimeUnlocked, MempoolLocation,
-        MinedLocation, TransactionComponentCounts, TransactionDetailRequest,
-        TransactionDetailResponse, TransactionLocation as WireTransactionLocation,
-        TransactionPublicFacts as WireFacts, TransactionVersion as WireVersion,
-        TransactionVersionKind, lock_time as wire_lock_time, transaction_location as wire_location,
+        LockTime as WireLockTime, LockTimeUnlocked, MempoolLocation, MinedLocation,
+        TransactionComponentCounts, TransactionDetailRequest, TransactionDetailResponse,
+        TransactionLocation as WireTransactionLocation, TransactionPublicFacts as WireFacts,
+        TransactionVersion as WireVersion, TransactionVersionKind, lock_time as wire_lock_time,
+        transaction_location as wire_location,
     },
     wallet::{self, transaction_status_response, wallet_query_client::WalletQueryClient},
 };
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 
 /// Read backends the `TransactionDetail` handler needs from the adapter.
 ///
@@ -102,15 +104,12 @@ pub(crate) async fn handle_transaction_detail(
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: 0,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_TRANSACTION_DETAIL_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            derive_store,
+            EXPLORER_TRANSACTION_DETAIL_V1,
+            Some(chain_epoch),
+            0,
+        )?,
     )
     .await;
 

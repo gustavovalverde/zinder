@@ -40,7 +40,9 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 use zinder_derive::DeriveStore;
 
 const CONFIDENCE_HIGH: f32 = 1.0;
@@ -387,37 +389,11 @@ async fn build_freshness(
     derive_store: Option<&DeriveStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<ExplorerFreshness, Status> {
-    let latest = wallet_client
+    let chain_epoch = wallet_client
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
-        .into_inner();
-    let chain_epoch = latest
+        .into_inner()
         .chain_epoch
         .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
-    let canonical_tip = latest
-        .latest_block
-        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
-        .height;
-    let derive_cursor_lag_blocks = derive_store
-        .and_then(|store| highest_block_summary_height(store).ok().flatten())
-        .map_or(0, |materialized| {
-            u64::from(canonical_tip.saturating_sub(materialized))
-        });
-    Ok(ExplorerFreshness {
-        chain_epoch: Some(chain_epoch),
-        snapshot_age_millis: 0,
-        derive_cursor_lag_blocks,
-        derive_cursor_lag_millis: 0,
-        capability_version: EXPLORER_SEARCH_V1.to_owned(),
-        unavailable: Vec::new(),
-        upstream: None,
-    })
-}
-
-fn highest_block_summary_height(derive_store: &DeriveStore) -> Result<Option<u32>, Status> {
-    use zinder_derive::BLOCK_SUMMARY_COLUMN_FAMILY;
-    Ok(derive_store
-        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map(zinder_core::BlockHeight::value))
+    build_explorer_freshness(derive_store, EXPLORER_SEARCH_V1, Some(chain_epoch), 0)
 }

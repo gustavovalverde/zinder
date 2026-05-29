@@ -35,15 +35,14 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::{
     explorer::{
         BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-        BlockSummariesInRangeResponse, ExplorerFreshness, ExplorerServerInfo, FeeSummaryRequest,
-        FeeSummaryResponse, MempoolActivityRequest, MempoolActivityResponse,
-        MempoolEventCountsRequest, MempoolEventCountsResponse, MempoolSummaryRequest,
-        MempoolSummaryResponse, OverviewSnapshotRequest, OverviewSnapshotResponse,
-        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
-        ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
-        TransparentAddressActivityRequest, TransparentAddressActivityResponse,
-        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
-        VerifyPaymentDisclosureResponse,
+        BlockSummariesInRangeResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
+        MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
+        MempoolEventCountsResponse, MempoolSummaryRequest, MempoolSummaryResponse,
+        OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionsRequest,
+        SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
+        TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
+        TransparentAddressActivityResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
+        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -67,7 +66,8 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
 use super::fee_summary::handle_fee_summary;
 use super::freshness::{
-    UpstreamObservationCache, attach_upstream_observation, spawn_upstream_observation_probe_task,
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    read_derive_status, spawn_upstream_observation_probe_task,
 };
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
@@ -326,12 +326,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         // the only freshness signal callers need from ServerInfo today.
         let freshness = attach_upstream_observation(
             &self.upstream_observation_cache,
-            ExplorerFreshness {
-                capability_version: EXPLORER_SERVER_INFO_V1.to_owned(),
-                ..ExplorerFreshness::default()
-            },
+            build_explorer_freshness(self.derive_store.as_ref(), EXPLORER_SERVER_INFO_V1, None, 0)?,
         )
         .await;
+        let derive_status = read_derive_status(self.derive_store.as_ref())?;
         Ok(Response::new(ServerInfoResponse {
             freshness: Some(freshness),
             info: Some(ExplorerServerInfo {
@@ -346,6 +344,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .collect(),
                 }),
                 vendor: "Zinder".to_owned(),
+                derive_status,
             }),
         }))
     }
@@ -490,6 +489,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
             handle_mempool_summary(
+                self.derive_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -514,6 +514,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
             handle_mempool_activity(
+                self.derive_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -590,7 +591,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_summary(&mut client, &self.upstream_observation_cache, request).await
+            handle_value_pool_summary(
+                self.derive_store.as_ref(),
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());

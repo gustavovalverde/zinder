@@ -16,7 +16,7 @@ use zinder_core::wire::{
 use zinder_core::{Network, TransparentAddressScriptHash};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1;
 use zinder_proto::v1::explorer::{
-    ExplorerFreshness, TransparentAddressActivityEntry, TransparentAddressActivityRecord,
+    TransparentAddressActivityEntry, TransparentAddressActivityRecord,
     TransparentAddressActivityRequest, TransparentAddressActivityResponse,
 };
 use zinder_proto::v1::wallet::{
@@ -25,7 +25,9 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
-use super::freshness::{UpstreamObservationCache, attach_upstream_observation};
+use super::freshness::{
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+};
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
 };
@@ -77,15 +79,12 @@ pub(crate) async fn handle_transparent_address_activity(
         .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        ExplorerFreshness {
-            chain_epoch: Some(chain_epoch),
-            snapshot_age_millis: 0,
-            derive_cursor_lag_blocks: 0,
-            derive_cursor_lag_millis: 0,
-            capability_version: EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1.to_owned(),
-            unavailable: Vec::new(),
-            upstream: None,
-        },
+        build_explorer_freshness(
+            Some(derive_store),
+            EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
+            Some(chain_epoch),
+            0,
+        )?,
     )
     .await;
     Ok(Response::new(TransparentAddressActivityResponse {

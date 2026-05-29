@@ -28,13 +28,19 @@ The decisions to record here are:
 
 ```proto
 message ExplorerFreshness {
-  ChainEpoch chain_epoch = 1;            // canonical wallet-plane primitive
+  ChainEpoch chain_epoch = 1;            // canonical follower tip (block ingested)
   uint64 snapshot_age_millis = 2;        // age of the mempool snapshot, when relevant
-  uint64 derive_cursor_lag_blocks = 3;   // explorer derive cursor lag vs canonical tip
-  uint64 derive_cursor_lag_millis = 4;   // wall-clock equivalent of the block lag
+  reserved 3, 4;                         // was derive_cursor_lag_{blocks,millis}
   string capability_version = 5;         // capability string that produced this response
   repeated UnavailableField unavailable = 6;
   optional UpstreamObservation upstream = 7;  // upstream node's view of the chain
+  optional IndexedHead indexed_head = 8;      // highest block the projections reflect
+}
+
+message IndexedHead {
+  uint32 height = 1;
+  string hash = 2;                       // RPC byte order, 64 hex
+  int64 block_time_unix_seconds = 3;
 }
 
 message UpstreamObservation {
@@ -44,7 +50,7 @@ message UpstreamObservation {
 }
 ```
 
-Every `ExplorerQuery` response carries `ExplorerFreshness freshness = 1;` as its first field. Responses that do not touch mempool state leave `snapshot_age_millis = 0`; responses that do not depend on the derive cursor leave `derive_cursor_lag_*` zero. The field is present unconditionally so consumers can write `response.freshness.chain_epoch` without conditional checks.
+Every `ExplorerQuery` response carries `ExplorerFreshness freshness = 1;` as its first field. `chain_epoch` is the canonical follower tip (the latest block the node has committed); `indexed_head` is the highest block the derive projections have materialized and can answer queries about. The two differ while the derive plane catches up, and index lag is `chain_epoch.tip_height - indexed_head.height`. `indexed_head` is absent only on responses that do not read the derive store (`ServerInfo`) and on a cold start before the first block is materialized; consumers treat absence as "unknown", not "at tip".
 
 `capability_version` carries the exact string from `ZINDER_CAPABILITIES` that produced the response (e.g. `explorer.transaction.detail_v1`). When a future `_v2` ships alongside `_v1`, clients can branch on which version a particular response uses without parsing the descriptor again.
 
@@ -120,18 +126,22 @@ Wire responses populate `human_reason` from these constants. UI consumers can ei
 
 The list grows additively. A new condition adds a new constant; existing constants are stable and grep-able.
 
-### Derive cursor lag is computed at response time
+### Indexed head is computed at response time; derive health is persisted
 
-The explorer service tracks its derive cursor per consumer. When constructing a response, it computes:
+The explorer reads the highest materialized `BlockSummary` row at response time and returns it as `indexed_head` (height, hash, block time). All chain-event derive consumers advance under one shared cursor, so the block-summary head is an accurate indexed head for every capability: a single value, not one per consumer. The consumer computes index lag as `chain_epoch.tip_height - indexed_head.height`.
 
-- `derive_cursor_lag_blocks = canonical_tip_height - explorer_cursor_height`
-- `derive_cursor_lag_millis = wall_clock_now - canonical_tip_observed_at`
+Block lag alone cannot distinguish a derive plane that is healthily catching up from one that has stalled; a paused replay holds the lag constant. The ingest plane therefore persists a `DeriveStatus { health, indexed_height, lag_blocks, observed_at_millis }` record into the shared derive store on every replay tick, including the paused branch, and the explorer surfaces it on `ExplorerServerInfo.derive_status`:
 
-These two fields together describe both "how many blocks behind" (deterministic) and "how long has it been since the last advance" (wall-clock; surfaces stuck consumers).
+```proto
+enum DeriveHealth {
+  DERIVE_HEALTH_UNSPECIFIED = 0;
+  DERIVE_HEALTH_LIVE = 1;          // indexed head at the canonical tip
+  DERIVE_HEALTH_CATCHING_UP = 2;   // replay advancing, behind tip
+  DERIVE_HEALTH_PAUSED = 3;        // replay paused (e.g. memory pressure)
+}
+```
 
-A consumer that has caught up to within one block reports `derive_cursor_lag_blocks = 0`, `derive_cursor_lag_millis = small`. A consumer that is stuck on a particular block reports the lag growing in `derive_cursor_lag_millis` even though `derive_cursor_lag_blocks` stays constant.
-
-When the derive cursor lag exceeds the deployment's `explorer.freshness.max_lag_blocks` threshold (operator-configured), the response carries `ExplorerFreshness.unavailable` entries flagging affected fields as `UNAVAILABLE_STALE`, and the request may return `EXPLORER_DERIVE_NOT_READY` for views that strictly require fresh state.
+`observed_at_millis` lets an operator detect a status record that has itself gone stale (the ingest plane stopped writing it). When index lag exceeds the deployment threshold, a request may still return `EXPLORER_DERIVE_NOT_READY` for views that strictly require fresh state.
 
 ## Consequences
 
@@ -181,4 +191,5 @@ Rejected. A nullable field tells the client "value absent" but not why. The PRD'
 
 ## Revision history
 
+- 2026-05-29: Replaced `derive_cursor_lag_blocks`/`derive_cursor_lag_millis` (tags 3, 4, now reserved) with `optional IndexedHead indexed_head = 8`, and added `DeriveHealth` + `DeriveStatus` surfaced on `ExplorerServerInfo.derive_status`. Naming the indexed head explicitly, instead of a derived lag number, removes the proto3 zero-vs-absent ambiguity that made "at tip" and "field unset" indistinguishable, and gives consumers the indexed block's identity and time for honest age display. The persisted `DeriveStatus` makes a memory-paused derive plane observable on the wire (`DERIVE_HEALTH_PAUSED`) instead of silent. All explorer read RPCs now build freshness through one shared builder, so `indexed_head` is populated uniformly rather than hardcoded to zero on the RPCs that previously did not compute lag. Because every Zinder/Zexplorer consumer is unreleased alpha, the change lands on `_v1` in place rather than as a new `_v2` capability.
 - 2026-05-26: Added `optional UpstreamObservation upstream = 7` to `ExplorerFreshness`. Lets explorer consumers render honest sync-progress UI against the upstream node's own committed/estimated tips and verification progress instead of reinventing protocol invariants (block-time math) client-side. The field is optional and additive; consumers that do not read it see no behavior change. Source plane already produces the values via `UpstreamHealthSnapshot`; the explorer adapter caches the snapshot in a small background probe and folds it into every freshness envelope on response construction. Because every Zinder/Zexplorer consumer is unreleased alpha, the change lands on `_v1` in place rather than as a new `_v2` capability.

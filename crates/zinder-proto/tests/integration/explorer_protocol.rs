@@ -39,10 +39,9 @@ fn explorer_freshness_carries_optional_upstream_observation() -> eyre::Result<()
     let freshness = explorer::ExplorerFreshness {
         chain_epoch: None,
         snapshot_age_millis: 0,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
         capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
         unavailable: Vec::new(),
+        indexed_head: None,
         upstream: Some(explorer::UpstreamObservation {
             upstream_committed_tip_height: Some(2_530_000),
             upstream_estimated_tip_height: Some(2_544_375),
@@ -63,10 +62,9 @@ fn explorer_freshness_omits_upstream_when_probe_has_not_fired() -> eyre::Result<
     let freshness = explorer::ExplorerFreshness {
         chain_epoch: None,
         snapshot_age_millis: 0,
-        derive_cursor_lag_blocks: 0,
-        derive_cursor_lag_millis: 0,
         capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
         unavailable: Vec::new(),
+        indexed_head: None,
         upstream: None,
     };
     let decoded = round_trip(&freshness)?;

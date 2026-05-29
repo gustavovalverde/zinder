@@ -14,9 +14,10 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use prost::Message as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
@@ -24,12 +25,13 @@ use zinder_core::{
     TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_derive::{
-    BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer, ChainEventDispatchInputs,
-    DeriveStore, DeriveStoreOptions, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    MempoolEventCountsConsumer, RecentTransactionsConsumer, TransactionFeesConsumer,
-    TransparentAddressActivityConsumer, TransparentAddressTransactionHistoryConsumer,
-    TransparentSpendFacts,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
+    ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, MempoolConsumerEvent,
+    MempoolConsumerEventVariant, MempoolEventCountsConsumer, RecentTransactionsConsumer,
+    TransactionFeesConsumer, TransparentAddressActivityConsumer,
+    TransparentAddressTransactionHistoryConsumer, TransparentSpendFacts,
 };
+use zinder_proto::v1::explorer::{DeriveHealth, DeriveStatus};
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
     PrimaryChainStore, RocksDbResourceBudget, StreamCursorTokenV1,
@@ -248,6 +250,7 @@ pub fn spawn_derive_tailer_task(
                 effective_limits,
                 poll_interval,
             );
+            persist_derive_status(&chain_store, &derive_store, effective_limits.state);
             if effective_limits.state.is_paused() {
                 tracing::debug!(
                     target: "zinder::ingest",
@@ -1101,6 +1104,69 @@ fn record_current_derive_replay_tip(
             .set(f64::from(tip_height.value()));
     }
     Ok(canonical_tip_height)
+}
+
+/// Persists the derive plane's status into the shared derive store each tick.
+///
+/// The explorer plane surfaces it on `ServerInfo`. Written on the paused branch
+/// too, so a stalled derive plane is observable on the wire instead of silent.
+/// Best-effort: a write failure is logged, never fatal.
+fn persist_derive_status(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    budget_state: DeriveReplayBudgetState,
+) {
+    let indexed_height = derive_store
+        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .ok()
+        .flatten()
+        .map(BlockHeight::value);
+    let canonical_tip = record_current_derive_replay_tip(chain_store)
+        .ok()
+        .flatten()
+        .map(BlockHeight::value);
+    let lag_blocks = match (canonical_tip, indexed_height) {
+        (Some(tip), Some(indexed)) => u64::from(tip.saturating_sub(indexed)),
+        (Some(tip), None) => u64::from(tip),
+        (None, _) => 0,
+    };
+    let health = if budget_state.is_paused() {
+        DeriveHealth::Paused
+    } else if indexed_height.is_some() && lag_blocks == 0 {
+        DeriveHealth::Live
+    } else {
+        DeriveHealth::CatchingUp
+    };
+    let status = DeriveStatus {
+        health: health as i32,
+        indexed_height: indexed_height.unwrap_or(0),
+        lag_blocks,
+        observed_at_millis: now_unix_millis(),
+    };
+    let mut bytes = Vec::with_capacity(status.encoded_len());
+    if let Err(error) = status.encode(&mut bytes) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "derive_status_encode_failed",
+            error = %error,
+            "failed to encode derive status record",
+        );
+        return;
+    }
+    if let Err(error) = derive_store.put_derive_status(&bytes) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "derive_status_persist_failed",
+            error = %error,
+            "failed to persist derive status record",
+        );
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn record_derive_replay_budget(
