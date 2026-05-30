@@ -56,6 +56,9 @@ unset $(env | sed -n -e 's/^\(ZINDER_QUERY__[^=]*\)=.*/\1/p' \
 # gap to the upstream tip on every iteration and dispatches to
 # AwaitingUpstream / BulkCatchup / FollowingTip; no separate bootstrap
 # pass is needed.
+# Ops endpoint binds the IPv6 wildcard so Prometheus can scrape /metrics over
+# the private network (matching query :9106 and explorer :9069). Railway only
+# exposes the configured PORT publicly, so 9105 stays private-network-only.
 exec s6-setuidgid zinder \
     /usr/local/bin/zinder-ingest \
-    --ops-listen-addr 127.0.0.1:9105
+    --ops-listen-addr [::]:9105
