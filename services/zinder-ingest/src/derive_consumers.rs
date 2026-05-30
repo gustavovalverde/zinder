@@ -21,8 +21,8 @@ use prost::Message as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, TransactionFactsArtifact,
-    TransparentOutPoint, TransparentSpendFact,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpochId,
+    TransactionFactsArtifact, TransactionId, TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
@@ -52,6 +52,16 @@ const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
 /// Default poll cadence for the derive tailer when the canonical store is
 /// ingesting faster than chain-event notifications arrive.
 pub const DEFAULT_DERIVE_TAILER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cadence for refreshing the persisted [`DeriveStatus`] head/lag while the
+/// tailer stays inside one long catch-up pass.
+///
+/// A from-genesis rebuild keeps the tailer inside a single
+/// [`catch_up_derive_store_to_canonical_with_budget`] call for hours, so a
+/// status record written only when that call starts would freeze at the
+/// pass's opening head. Re-persisting on this throttle keeps the
+/// operator-facing health and indexed head truthful during the pass.
+const DERIVE_STATUS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeriveReplayBudgetState {
@@ -366,6 +376,7 @@ async fn catch_up_derive_store_to_canonical_with_budget(
     record_current_derive_replay_tip(chain_store)?;
 
     let mut cursor = persisted_chain_event_cursor(derive_store)?;
+    let mut last_status_persist: Option<Instant> = None;
     loop {
         let effective_limits = replay_budget.evaluate_current();
         record_derive_replay_budget(
@@ -406,10 +417,36 @@ async fn catch_up_derive_store_to_canonical_with_budget(
             match replay_chain_event_to_derive(chain_store, derive_store, envelope, replay_budget)
                 .await?
             {
-                DeriveReplayProgress::Advanced(next_cursor) => cursor = Some(next_cursor),
+                DeriveReplayProgress::Advanced(next_cursor) => {
+                    cursor = Some(next_cursor);
+                    // Use the budget state the inner replay last evaluated, not
+                    // the pre-replay snapshot, so the persisted health reflects
+                    // memory pressure as of the just-finished event.
+                    maybe_persist_derive_status(
+                        chain_store,
+                        derive_store,
+                        replay_budget.state,
+                        &mut last_status_persist,
+                    );
+                }
                 DeriveReplayProgress::Yielded => return Ok(()),
             }
         }
+    }
+}
+
+/// Re-persists [`DeriveStatus`] at most once per
+/// [`DERIVE_STATUS_PERSIST_INTERVAL`] so a long catch-up pass keeps the
+/// operator-facing head and lag fresh instead of frozen at the pass's start.
+fn maybe_persist_derive_status(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    budget_state: DeriveReplayBudgetState,
+    last_persist: &mut Option<Instant>,
+) {
+    if last_persist.is_none_or(|at| at.elapsed() >= DERIVE_STATUS_PERSIST_INTERVAL) {
+        persist_derive_status(chain_store, derive_store, budget_state);
+        *last_persist = Some(Instant::now());
     }
 }
 
@@ -701,6 +738,60 @@ fn committed_block_range_for_chain_event(
     Ok(committed.block_range)
 }
 
+/// One block staged for derive replay before its transaction facts are read.
+///
+/// Phase 1 of [`hydrate_committed_block_replay_batch`] collects these so the
+/// facts read can collapse into one batched store read for the whole replay
+/// batch instead of one read per block.
+struct StagedReplayBlock {
+    height: BlockHeight,
+    header: BlockHeaderArtifact,
+    transaction_ids: Vec<TransactionId>,
+}
+
+/// Reads each block's header and ordered transaction ids for the replay batch,
+/// returning the staged blocks plus the flat list of every transaction id.
+fn stage_committed_replay_blocks(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    envelope: &ChainEventEnvelope,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    max_blocks: usize,
+) -> Result<(Vec<StagedReplayBlock>, Vec<TransactionId>), IngestError> {
+    let capacity = usize::try_from(
+        end_height
+            .value()
+            .saturating_sub(start_height.value())
+            .saturating_add(1),
+    )
+    .unwrap_or(usize::MAX)
+    .min(max_blocks);
+    let mut staged = Vec::with_capacity(capacity);
+    let mut batch_transaction_ids = Vec::with_capacity(capacity);
+    let mut next_height = start_height;
+    while next_height <= end_height && staged.len() < max_blocks {
+        let height = next_height;
+        let Some(header) = reader.block_header_at(height)? else {
+            return Err(IngestError::DeriveDispatch(format!(
+                "committed chain event {} references unavailable block-header facts {}",
+                envelope.event_sequence,
+                height.value()
+            )));
+        };
+        let transaction_ids = reader.transaction_ids_at_height(height)?;
+        batch_transaction_ids.extend_from_slice(&transaction_ids);
+        staged.push(StagedReplayBlock {
+            height,
+            header,
+            transaction_ids,
+        });
+        next_height = height.next().ok_or_else(|| {
+            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
+        })?;
+    }
+    Ok((staged, batch_transaction_ids))
+}
+
 fn hydrate_committed_block_replay_batch(
     chain_store: &PrimaryChainStore,
     envelope: &ChainEventEnvelope,
@@ -715,29 +806,21 @@ fn hydrate_committed_block_replay_batch(
             "derive replay batch cannot hydrate while paused".to_owned(),
         ));
     }
-    let remaining_blocks = usize::try_from(
-        end_height
-            .value()
-            .saturating_sub(start_height.value())
-            .saturating_add(1),
-    )
-    .unwrap_or(usize::MAX);
-    let mut replay_blocks = Vec::with_capacity(max_blocks.min(remaining_blocks));
-    let mut next_height = start_height;
 
-    while next_height <= end_height && replay_blocks.len() < max_blocks {
-        let height = next_height;
-        let Some(header) = reader.block_header_at(height)? else {
-            return Err(IngestError::DeriveDispatch(format!(
-                "committed chain event {} references unavailable block-header facts {}",
-                envelope.event_sequence,
-                height.value()
-            )));
-        };
-        let transaction_ids = reader.transaction_ids_at_height(height)?;
-        let mut facts_by_id = reader.transaction_facts_by_ids(&transaction_ids)?;
-        let mut transactions = Vec::with_capacity(transaction_ids.len());
-        for transaction_id in transaction_ids {
+    // Phase 1: read each block's header and ordered transaction ids.
+    let (staged, batch_transaction_ids) =
+        stage_committed_replay_blocks(&reader, envelope, start_height, end_height, max_blocks)?;
+
+    // Phase 2: one batched facts read for the whole replay batch. Canonical
+    // transaction ids are chain-unique, so a single map distributes back to
+    // each block without collision.
+    let mut facts_by_id = reader.transaction_facts_by_ids(&batch_transaction_ids)?;
+
+    // Phase 3: assemble each block's ordered transactions from the shared map.
+    let mut replay_blocks = Vec::with_capacity(staged.len());
+    for staged_block in staged {
+        let mut transactions = Vec::with_capacity(staged_block.transaction_ids.len());
+        for transaction_id in staged_block.transaction_ids {
             let Some(transaction) = facts_by_id.remove(&transaction_id).flatten() else {
                 return Err(IngestError::DeriveDispatch(format!(
                     "committed chain event {} references unavailable transaction facts {}",
@@ -749,17 +832,14 @@ fn hydrate_committed_block_replay_batch(
         }
         let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
         replay_blocks.push(CanonicalReplayBlock {
-            height,
-            block_hash: header.block_hash,
-            previous_block_hash: header.parent_hash,
-            block_time_unix_seconds: header.block_time,
-            block_size_bytes: header.block_size_bytes,
+            height: staged_block.height,
+            block_hash: staged_block.header.block_hash,
+            previous_block_hash: staged_block.header.parent_hash,
+            block_time_unix_seconds: staged_block.header.block_time,
+            block_size_bytes: staged_block.header.block_size_bytes,
             transactions,
             transparent_spends,
         });
-        next_height = height.next().ok_or_else(|| {
-            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
-        })?;
     }
 
     let Some(first) = replay_blocks.first() else {
@@ -1166,7 +1246,9 @@ fn persist_derive_status(
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn record_derive_replay_budget(

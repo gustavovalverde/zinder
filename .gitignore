@@ -12,3 +12,9 @@ coverage/
 *.profraw
 lcov.info
 /.claude/
+
+# Local discovery notes kept out of the tracked doc tree.
+docs/investigations/
+
+# Browser-automation scratch (Playwright MCP).
+.playwright-mcp/

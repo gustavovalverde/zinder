@@ -58,12 +58,6 @@ Current integration references and API support material:
 - [Integration surfaces](reference/integration-surfaces.md): supported client and operator integration paths.
 - [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 
-## Investigations
-
-Measurement-based discovery notes that motivate future ADRs. Each document captures a reproducible observation, the structural cause, and the candidate changes it would take to address it. Edited in place when the underlying state changes; retired (or rolled into an ADR) once a decision is taken.
-
-- [Bulk-catchup throughput](investigations/bulk-catchup-throughput.md): mainnet catchup runs roughly one order of magnitude below the design target and slower than the source Zebra node it reads from. Cause: single-threaded consumer pipeline. Three candidate fixes ranked by burden.
-
 ## Runbooks
 
 Operational procedures for running Zinder against the workspace and external systems. Edited in place when the procedure changes; never describes architectural intent (that role belongs to the architecture docs).
@@ -93,4 +87,3 @@ Each tree under `docs/` has its own retire-on-ship rule.
 - **ADRs** (`docs/adrs/`): record of accepted design decisions in present tense. Edited in place when the decision rationale needs clarification; substantive design changes get a new ADR with a contiguous number. ADRs reference the owning architecture docs and only the predecessor decisions they directly build on.
 - **Reference** (`docs/reference/`): current integration patterns and API support material. Reference docs may point into architecture docs, but they should not carry transition history or dated validation notes.
 - **Runbooks** (`docs/runbooks/`): operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs (up) but do not describe architectural intent.
-- **Investigations** (`docs/investigations/`): measurement-based discovery notes that motivate future ADRs. Capture a reproducible observation, the structural cause found in code, and the candidate changes that would address it. Retire (or roll into an ADR) once a decision is taken.

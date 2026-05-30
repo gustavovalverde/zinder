@@ -144,8 +144,14 @@ pub fn spawn_runtime_memory_metrics_task(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut ticks_since_log: u32 = 0;
         loop {
-            record_runtime_memory_metrics(RuntimeMemorySnapshot::sample());
+            let snapshot = RuntimeMemorySnapshot::sample();
+            record_runtime_memory_metrics(snapshot);
+            if ticks_since_log == 0 {
+                log_runtime_memory_observation(snapshot);
+            }
+            ticks_since_log = (ticks_since_log + 1) % RUNTIME_MEMORY_LOG_EVERY_TICKS;
 
             tokio::select! {
                 () = cancel.cancelled() => return,
@@ -153,6 +159,34 @@ pub fn spawn_runtime_memory_metrics_task(
             }
         }
     })
+}
+
+/// Number of `interval` ticks between operational memory log lines.
+///
+/// The gauge sampler runs every second; logging every sample would flood the
+/// deploy log, so the cgroup limit and pressure ratio surface roughly once a
+/// minute. This is the denominator (`memory.high`/`memory.max`) that makes the
+/// derive replay pressure ratio interpretable from logs alone.
+const RUNTIME_MEMORY_LOG_EVERY_TICKS: u32 = 60;
+
+/// Logs the cgroup memory limit, working set, and pressure ratio at INFO.
+///
+/// Without this the container memory budget is only on the (often unscraped)
+/// metrics endpoint, so a paused or memory-throttled derive plane is hard to
+/// diagnose from logs. Best-effort and lossy: unset cgroup fields log as
+/// `None`.
+fn log_runtime_memory_observation(snapshot: RuntimeMemorySnapshot) {
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "runtime_memory_observed",
+        cgroup_limit_bytes = ?container_memory_budget_from_snapshot(snapshot),
+        cgroup_current_bytes = ?snapshot.cgroup_current_bytes,
+        working_set_bytes = ?snapshot.working_set_bytes(),
+        inactive_file_bytes = ?snapshot.cgroup_inactive_file_bytes,
+        process_rss_anon_bytes = ?snapshot.process_rss_anon_bytes,
+        pressure_ratio = ?snapshot.pressure_ratio(),
+        "runtime memory observation",
+    );
 }
 
 pub(crate) fn record_runtime_memory_metrics(snapshot: RuntimeMemorySnapshot) {
