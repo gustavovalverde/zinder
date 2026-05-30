@@ -13,6 +13,9 @@ coverage/
 lcov.info
 /.claude/
 
+# Private local agent memory (auto-loaded by Claude Code, never committed).
+CLAUDE.local.md
+
 # Local discovery notes kept out of the tracked doc tree.
 docs/investigations/
 
