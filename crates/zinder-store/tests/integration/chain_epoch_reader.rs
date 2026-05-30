@@ -459,6 +459,58 @@ fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
 }
 
 #[test]
+fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> eyre::Result<()> {
+    // A finalized spend (block_2 == safe_tip): the visibility-skipping
+    // current path the derive replay uses must equal the visible path, since
+    // an immutable block can never be filtered out. Guards the fast-path
+    // optimization in `read_transparent_spend_facts_for_committed_blocks`.
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
+    let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
+    let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([51; 32]), 0);
+    let output = AddressOutputIndexArtifact::new(
+        TransparentAddressScriptHash::from_bytes([52; 32]),
+        b"spendable-script".to_vec(),
+        spent_outpoint,
+        77,
+        block_1.height,
+        block_1.block_hash,
+    );
+    let spend = TransparentSpendFact::new(
+        spent_outpoint,
+        0,
+        TransactionId::from_bytes([53; 32]),
+        0,
+        block_2.height,
+        block_2.block_hash,
+        output.value_zat,
+        output.address_script_hash,
+        output.block_height,
+        output.block_hash,
+    );
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+            .with_address_output_index(vec![output.clone()])
+            .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
+    )?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_block_2])
+            .with_transparent_spend_facts(vec![spend.clone()]),
+    )?;
+
+    let epoch_2_reader = store.chain_epoch_reader_at(ChainEpochId::new(2))?;
+    let visible = epoch_2_reader.transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
+    let current = epoch_2_reader.current_transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
+
+    assert_eq!(visible.get(&spent_outpoint), Some(&spend));
+    assert_eq!(current, visible);
+
+    Ok(())
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the reorg fixture keeps the committed epochs visible inside the assertion"

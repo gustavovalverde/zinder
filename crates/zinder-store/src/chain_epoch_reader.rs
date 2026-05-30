@@ -268,6 +268,26 @@ impl<'store> ChainEpochReader<'store> {
             outpoints,
         )
     }
+
+    /// Resolves transparent spend facts from the current projection, skipping
+    /// the per-outpoint reorg-visibility header reads.
+    ///
+    /// Correct only when every referenced block is finalized (at or below
+    /// `safe_tip_height`): such blocks are immutable, so the visibility filter
+    /// that [`Self::transparent_spend_facts_by_outpoints`] applies on a
+    /// non-current reader can never drop a fact. Skipping it turns two reads per
+    /// outpoint into a single `multi_get`, which is the dominant cost of
+    /// from-genesis derive replay.
+    pub fn current_transparent_spend_facts_by_outpoints(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, StoreError> {
+        read_current_transparent_spend_facts_by_outpoints(
+            &self.read_view,
+            self.chain_epoch,
+            outpoints,
+        )
+    }
 }
 
 impl BlockHeaderStore for ChainEpochReader<'_> {

@@ -552,12 +552,14 @@ async fn replay_committed_event_to_derive_in_batches(
 
         let replay_range = replay_batch.block_range;
         let final_chunk = replay_range.end >= committed_range.end;
+        let finalized = replay_range.end <= envelope.safe_tip_height;
         let chunk_event = committed_chain_event_chunk(&envelope.event, replay_range);
         let resolve_started_at = Instant::now();
         let contexts_outcome = build_block_contexts_from_committed_event(
             chain_store,
             envelope.chain_epoch.id,
             replay_batch.blocks,
+            finalized,
         )
         .await;
         record_derive_replay_stage(
@@ -659,10 +661,13 @@ async fn replay_reorg_event_to_derive(
     };
 
     let resolve_started_at = Instant::now();
+    // Reorg events touch reorg-window blocks that can still change, so keep the
+    // per-outpoint visibility check (finalized = false).
     let contexts_outcome = build_block_contexts_from_committed_event(
         chain_store,
         envelope.chain_epoch.id,
         replay_blocks,
+        false,
     )
     .await;
     record_derive_replay_stage(
@@ -1025,11 +1030,13 @@ async fn build_block_contexts_from_committed_event(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: Vec<CanonicalReplayBlock>,
+    finalized: bool,
 ) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
     let transparent_spends = read_transparent_spend_facts_for_committed_blocks(
         chain_store,
         chain_epoch_id,
         &replay_blocks,
+        finalized,
     )
     .await?;
     let mut out = HashMap::with_capacity(replay_blocks.len());
@@ -1079,10 +1086,64 @@ fn transparent_spent_outpoints_for_transactions(
     spends
 }
 
+/// Concurrent blocking reads used to resolve a replay batch's spend facts.
+///
+/// The spend-fact `multi_get` is disk-seek-bound and serial per call. Splitting
+/// the batch's outpoints across this many `spawn_blocking` readers overlaps the
+/// seeks across cores, which is the dominant cost of from-genesis derive replay
+/// on a multi-core host with idle IO bandwidth.
+const SPEND_FACT_RESOLVE_CONCURRENCY: usize = 16;
+
+/// Resolves a batch's transparent spend facts across several blocking readers.
+///
+/// Outpoints are chain-unique, so chunk result maps have disjoint keys and
+/// merge without collision. `finalized` selects the visibility-skipping
+/// current-projection read; see
+/// [`read_transparent_spend_facts_for_committed_blocks`].
+async fn resolve_spend_facts_concurrently(
+    chain_store: &PrimaryChainStore,
+    chain_epoch_id: ChainEpochId,
+    outpoints: Vec<TransparentOutPoint>,
+    finalized: bool,
+) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
+    if outpoints.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let chunk_size = outpoints
+        .len()
+        .div_ceil(SPEND_FACT_RESOLVE_CONCURRENCY)
+        .max(1);
+    let mut handles = Vec::with_capacity(SPEND_FACT_RESOLVE_CONCURRENCY);
+    for chunk in outpoints.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        let store = chain_store.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let reader = store.chain_epoch_reader_at(chain_epoch_id)?;
+            if finalized {
+                reader.current_transparent_spend_facts_by_outpoints(&chunk)
+            } else {
+                reader.transparent_spend_facts_by_outpoints(&chunk)
+            }
+        }));
+    }
+    let mut resolved = HashMap::with_capacity(outpoints.len());
+    for handle in handles {
+        let chunk_map = handle
+            .await
+            .map_err(|join_error| IngestError::BlockingTaskFailed {
+                reason: join_error.to_string(),
+            })?
+            .map_err(IngestError::from)?;
+        resolved.extend(chunk_map);
+    }
+    Ok(resolved)
+}
+
 async fn read_transparent_spend_facts_for_committed_blocks(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: &[CanonicalReplayBlock],
+    finalized: bool,
 ) -> Result<Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>, IngestError> {
     let mut requested_outpoints = HashSet::<TransparentOutPoint>::new();
     for block in replay_blocks {
@@ -1092,17 +1153,9 @@ async fn read_transparent_spend_facts_for_committed_blocks(
     let unique_spent_outpoint_count = requested_outpoints.len();
     record_transparent_spend_fact_requested_outpoints(unique_spent_outpoint_count);
     let outpoints = requested_outpoints.into_iter().collect::<Vec<_>>();
-    let store = chain_store.clone();
     let read_started_at = Instant::now();
-    let read_outcome = tokio::task::spawn_blocking(move || {
-        let reader = store.chain_epoch_reader_at(chain_epoch_id)?;
-        reader.transparent_spend_facts_by_outpoints(&outpoints)
-    })
-    .await
-    .map_err(|join_error| IngestError::BlockingTaskFailed {
-        reason: join_error.to_string(),
-    })?
-    .map_err(IngestError::from);
+    let read_outcome =
+        resolve_spend_facts_concurrently(chain_store, chain_epoch_id, outpoints, finalized).await;
     record_derive_replay_stage(
         DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
         read_started_at,
