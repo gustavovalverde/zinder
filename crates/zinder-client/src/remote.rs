@@ -246,10 +246,7 @@ impl ChainIndex for RemoteChainIndex {
 
         Ok(BlockId {
             height: BlockHeight::new(safe_tip_block.height),
-            hash: block_hash_from_rpc_hex(
-                "safe_tip_block.block_hash",
-                &safe_tip_block.block_hash,
-            )?,
+            hash: block_hash_from_rpc_hex("safe_tip_block.block_hash", &safe_tip_block.block_hash)?,
         })
     }
 

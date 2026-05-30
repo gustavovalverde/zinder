@@ -31,8 +31,8 @@ use zinder_source::transparent_address_matches_network;
 use crate::{
     AddressOutputIndex, AddressOutputIndexRequest, BlockHeaderResponseValue, BlockIdResponseValue,
     ChainEvents, CompactBlock, LatestBlock, LatestSafeBlock, QueryError, SubtreeRoots,
-    TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TreeState, WalletQueryApi,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TreeState,
+    WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{

@@ -188,9 +188,7 @@ impl WriterStatusUpstream {
         let snapshot = WriterStatusSnapshot {
             chain_epoch_id: response.latest_writer_chain_epoch_id.map(ChainEpochId::new),
             tip_height: response.latest_writer_tip_height.map(BlockHeight::new),
-            safe_tip_height: response
-                .latest_writer_safe_tip_height
-                .map(BlockHeight::new),
+            safe_tip_height: response.latest_writer_safe_tip_height.map(BlockHeight::new),
         };
         self.last_snapshot = Some(snapshot);
         self.last_fetched_at = Some(Instant::now());

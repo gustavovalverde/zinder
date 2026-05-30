@@ -547,8 +547,7 @@ async fn commit_built_bulk_catchup_batch(
 ) -> Result<(ChainEpochCommitOutcome, CanonicalBatch), IngestError> {
     let mut batch = batch;
     let outcome =
-        commit_built_bulk_catchup_batch_inner(store, network, chain_epoch_id, &mut batch)
-            .await?;
+        commit_built_bulk_catchup_batch_inner(store, network, chain_epoch_id, &mut batch).await?;
     Ok((outcome, batch))
 }
 

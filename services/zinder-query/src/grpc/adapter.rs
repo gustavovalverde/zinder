@@ -43,9 +43,8 @@ use super::native::{
     build_chain_epoch_message, build_compact_block_message, build_transparent_address_tx_ids_chunk,
     build_wallet_server_info, compact_block_response, latest_block_response,
     latest_safe_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
-    transaction_response,
-    transparent_address_confirmed_balance_response, transparent_outputs_by_outpoint_response,
-    tree_state_checkpoint_response,
+    transaction_response, transparent_address_confirmed_balance_response,
+    transparent_outputs_by_outpoint_response, tree_state_checkpoint_response,
 };
 use super::status_from_query_error;
 

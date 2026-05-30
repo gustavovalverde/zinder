@@ -411,10 +411,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
 fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: ChainEpoch) {
     assert_eq!(event_envelope.event_sequence, 1);
     assert_eq!(event_envelope.chain_epoch, chain_epoch);
-    assert_eq!(
-        event_envelope.safe_tip_height,
-        chain_epoch.safe_tip_height
-    );
+    assert_eq!(event_envelope.safe_tip_height, chain_epoch.safe_tip_height);
     assert!(matches!(
         &event_envelope.event,
         ChainEvent::ChainCommitted { committed } if committed.chain_epoch == chain_epoch
