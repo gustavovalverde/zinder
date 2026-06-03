@@ -249,7 +249,7 @@ impl TransparentTestKey {
             },
         );
         builder
-            .add_transparent_input(pubkey, outpoint, coin)
+            .add_transparent_p2pkh_input(pubkey, outpoint, coin)
             .map_err(|error| TransparentSignerError::AddInput(error.to_string()))?;
         builder
             .add_transparent_output(args.recipient, send_amount)

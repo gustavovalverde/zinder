@@ -63,7 +63,7 @@ tonic-reflection = "0.14.5"
 tonic-types = "0.14.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
-zebra-chain = "6.0.2"
+zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v5.0.0" }
 zinder-core = { path = "crates/zinder-core" }
 zinder-client = { path = "crates/zinder-client" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
@@ -76,12 +76,6 @@ zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }
 zinder-store = { path = "crates/zinder-store" }
 zinder-testkit = { path = "crates/zinder-testkit" }
-
-[patch.crates-io]
-# Zebra 6.0.2 still resolves through equihash 0.2.2, whose core2 0.3.x
-# dependency was yanked on crates.io. Pin the last published core2 source
-# commit until Zebra or equihash publishes a crates.io-only resolution path.
-core2 = { git = "https://github.com/bbqsrc/core2", rev = "7bf2611" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
