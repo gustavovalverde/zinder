@@ -63,7 +63,7 @@ tonic-reflection = "0.14.5"
 tonic-types = "0.14.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
-zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v5.0.0" }
+zebra-chain = "9.0.0"
 zinder-core = { path = "crates/zinder-core" }
 zinder-client = { path = "crates/zinder-client" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
