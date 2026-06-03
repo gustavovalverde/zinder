@@ -316,10 +316,12 @@ message CompactBlockRangeChunk {
   CompactBlock compact_block = 2;
 }
 
-// Checkpoint tree-state request bounded by block height.
-message TreeStateCheckpointRequest {
-  // Highest checkpoint height the server may return.
-  uint32 max_height = 1;
+// Tree-state request for one exact block height.
+message TreeStateAtHeightRequest {
+  // Exact block height to return the tree state for. The response height
+  // always equals this value: the server serves a stored checkpoint when one
+  // exists at this height, otherwise it fills from the configured upstream node.
+  uint32 height = 1;
 
   // Optional chain epoch that must be used to answer the request. When absent,
   // the server uses the visible epoch at request time.
@@ -1191,8 +1193,9 @@ service WalletQuery {
   // are typed in the response oneof.
   rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
-  // Return the latest checkpoint tree state at or before a block height.
-  rpc TreeStateCheckpoint(TreeStateCheckpointRequest) returns (TreeStateResponse);
+  // Return the tree state at one exact block height. Served from a stored
+  // checkpoint when present, otherwise filled from the configured upstream node.
+  rpc TreeStateAtHeight(TreeStateAtHeightRequest) returns (TreeStateResponse);
 
   // Return the latest checkpoint tree state visible to the selected epoch.
   rpc LatestTreeStateCheckpoint(LatestTreeStateCheckpointRequest) returns (TreeStateResponse);

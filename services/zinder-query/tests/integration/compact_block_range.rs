@@ -18,7 +18,7 @@ use zinder_proto::v1::wallet;
 use zinder_query::{
     ArtifactKey, QueryError, WalletQuery, WalletQueryApi, WalletQueryOptions,
     latest_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
-    tree_state_checkpoint_response,
+    tree_state_at_response,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
@@ -190,7 +190,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = tree_state_checkpoint_response(&wallet_query, BlockHeight::new(1), None).await?;
+    let response = tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
@@ -478,12 +478,9 @@ async fn tree_state_checkpoint_response_reports_unavailable_artifact_without_nod
     ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match tree_state_checkpoint_response(&wallet_query, BlockHeight::new(1), None).await
-    {
-        Ok(tree_state_checkpoint_response) => {
-            return Err(eyre!(
-                "expected unavailable artifact, got {tree_state_checkpoint_response:?}"
-            ));
+    let error = match tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await {
+        Ok(tree_state) => {
+            return Err(eyre!("expected unavailable artifact, got {tree_state:?}"));
         }
         Err(error) => error,
     };

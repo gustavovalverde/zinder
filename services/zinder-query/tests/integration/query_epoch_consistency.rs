@@ -14,7 +14,7 @@ use zinder_core::{
 };
 use zinder_query::{
     WalletQuery, WalletQueryApi, latest_block_response, latest_tree_state_checkpoint_response,
-    subtree_roots_response, tree_state_checkpoint_response,
+    subtree_roots_response, tree_state_at_response,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochReadApi, ChainEpochReader, ChainEventEnvelope,
@@ -138,7 +138,7 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let response =
-        tree_state_checkpoint_response(&wallet_query, first_tree_state.height, None).await?;
+        tree_state_at_response(&wallet_query, first_tree_state.height, None).await?;
     let response_chain_epoch = response
         .chain_epoch
         .ok_or_else(|| eyre!("missing response chain epoch"))?;

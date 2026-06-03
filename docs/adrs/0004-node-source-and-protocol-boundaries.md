@@ -142,7 +142,7 @@ Forbidden:
 
 ## Capability Model
 
-Adapters expose capabilities instead of requiring exact upstream-node versions. Storage-only `zinder-query` deployments do not call upstream nodes, so `ServerCapabilities.node` stays empty unless a runtime source snapshot is explicitly handed to query.
+Adapters expose capabilities instead of requiring exact upstream-node versions. Storage-only `zinder-query` deployments do not call upstream nodes, so `ServerCapabilities.node` stays empty unless a runtime source snapshot is explicitly handed to query. Two query paths consume such a snapshot when present: transaction broadcast (`TransactionBroadcaster`) and the `tree_state_at(height)` upstream fill (`TreeStateUpstream`), the latter carved out in ADR-0005. Both are opt-in by the presence of the `[node]` config; neither is a hidden fallback.
 
 Current `NodeCapability` names:
 

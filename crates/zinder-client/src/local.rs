@@ -313,7 +313,7 @@ impl ChainIndex for LocalChainIndex {
         Ok(Box::pin(stream::iter(compact_blocks.into_iter().map(Ok))))
     }
 
-    async fn tree_state_checkpoint_at_or_before(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
@@ -322,6 +322,7 @@ impl ChainIndex for LocalChainIndex {
             reader
                 .tree_state_checkpoint_at_or_before(height)
                 .map_err(IndexerError::from_store_error)?
+                .filter(|tree_state| tree_state.height == height)
                 .ok_or(IndexerError::NotFound {
                     resource: "tree state",
                 })

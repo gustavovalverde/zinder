@@ -795,7 +795,7 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v1
 wallet.read.compact_block_range_v1
-wallet.read.tree_state_checkpoint_v1
+wallet.read.tree_state_at_height_v1
 wallet.read.latest_tree_state_checkpoint_v1
 wallet.read.subtree_roots_in_range_v1
 wallet.read.transaction_by_id_v1

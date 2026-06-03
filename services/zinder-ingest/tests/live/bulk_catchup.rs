@@ -288,10 +288,8 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     assert_eq!(full_blocks.compact_blocks.len(), 1000);
 
     let measurement_start = std::time::Instant::now();
-    let _tree_state = wallet_query
-        .tree_state_checkpoint_at_or_before(tip_height, None)
-        .await?;
-    let tree_state_checkpoint_at_or_before_micros = measurement_start.elapsed().as_micros();
+    let _tree_state = wallet_query.tree_state_at(tip_height, None).await?;
+    let tree_state_at_micros = measurement_start.elapsed().as_micros();
 
     // A checkpoint-bootstrapped store only carries subtree roots completed
     // after the checkpoint. Wallets bootstrapping against the same checkpoint
@@ -318,7 +316,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
              bulk_catchup_seconds={} latest_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_1={}us \
              compact_block_range_10={}us compact_block_range_50={}us \
-             compact_block_range_1000={}us tree_state_checkpoint_at_or_before={}us subtree_roots_8={}us",
+             compact_block_range_1000={}us tree_state_at={}us subtree_roots_8={}us",
             tip_height.value(),
             checkpoint_height.value(),
             checkpoint_sapling_size,
@@ -331,7 +329,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
             compact_block_range_10_micros,
             compact_block_range_50_micros,
             compact_block_range_1000_micros,
-            tree_state_checkpoint_at_or_before_micros,
+            tree_state_at_micros,
             subtree_roots_micros,
         );
     }

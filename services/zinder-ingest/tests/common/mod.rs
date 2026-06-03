@@ -44,7 +44,7 @@ use zinder_proto::{
 };
 use zinder_query::{
     ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter, latest_block_response,
-    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_checkpoint_response,
+    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
@@ -601,10 +601,10 @@ async fn assert_native_wallet_grpc_responses(
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
         compact_block_range.push(compact_block_chunk?);
     }
-    let tree_state = WalletQueryService::tree_state_checkpoint(
+    let tree_state = WalletQueryService::tree_state_at_height(
         &grpc_adapter,
-        Request::new(wallet::TreeStateCheckpointRequest {
-            max_height: end_height,
+        Request::new(wallet::TreeStateAtHeightRequest {
+            height: end_height,
             at_epoch: None,
         }),
     )
@@ -872,7 +872,7 @@ async fn assert_native_tree_state_checkpoint_response<QueryApi: WalletQueryApi>(
     end_height: u32,
 ) -> Result<()> {
     let response =
-        tree_state_checkpoint_response(wallet_query, BlockHeight::new(end_height), None).await?;
+        tree_state_at_response(wallet_query, BlockHeight::new(end_height), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response

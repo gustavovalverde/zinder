@@ -167,7 +167,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     assert_eq!(compact_block.chain_epoch.tip_height, source_block.height);
     assert_eq!(compact_block.compact_block.height, source_block.height);
     let tree_state = wallet_query
-        .tree_state_checkpoint_at_or_before(source_block.height, None)
+        .tree_state_at(source_block.height, None)
         .await?;
     assert_eq!(tree_state.height, source_block.height);
     assert_eq!(tree_state.block_hash, source_block.hash);

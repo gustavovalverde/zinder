@@ -91,9 +91,9 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
 
     let measurement_start = std::time::Instant::now();
     let _tree = wallet_query
-        .tree_state_checkpoint_at_or_before(BlockHeight::new(1), None)
+        .tree_state_at(BlockHeight::new(1), None)
         .await?;
-    let tree_state_checkpoint_at_or_before_micros = measurement_start.elapsed().as_micros();
+    let tree_state_at_micros = measurement_start.elapsed().as_micros();
 
     // Pick a real txid from the bulk-caught-up chain by reading the coinbase at
     // height 1 through the indexed compact block. Then call `transaction()`
@@ -122,14 +122,14 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     {
         eprintln!(
             "live_latency_baseline network={} tip={} latest_block={}us compact_block_at={}us \
-             compact_block_range_50={}us tree_state_checkpoint_at_or_before={}us transaction_avg={}us \
+             compact_block_range_50={}us tree_state_at={}us transaction_avg={}us \
              (n={} total={}us)",
             encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
             latest_block_micros,
             compact_block_at_micros,
             compact_block_range_50_micros,
-            tree_state_checkpoint_at_or_before_micros,
+            tree_state_at_micros,
             transaction_avg_micros,
             TRANSACTION_LOOKUP_ITERATIONS,
             transaction_total_micros,
@@ -212,10 +212,8 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     assert_eq!(range.compact_blocks.len(), expected_block_count);
 
     let measurement_start = std::time::Instant::now();
-    let _tree = wallet_query
-        .tree_state_checkpoint_at_or_before(tip_height, None)
-        .await?;
-    let tree_state_checkpoint_at_or_before_micros = measurement_start.elapsed().as_micros();
+    let _tree = wallet_query.tree_state_at(tip_height, None).await?;
+    let tree_state_at_micros = measurement_start.elapsed().as_micros();
 
     let coinbase_lookup = wallet_query
         .transaction_at_block_index(from_height, 0, None)
@@ -238,7 +236,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
         eprintln!(
             "live_checkpoint_latency_baseline network={} tip={} checkpoint_height={} \
              bulk_catchup={}us latest_block={}us compact_block_at_first={}us \
-             compact_block_at_tip={}us compact_block_range_{}={}us tree_state_checkpoint_at_or_before={}us \
+             compact_block_at_tip={}us compact_block_range_{}={}us tree_state_at={}us \
              transaction_avg={}us (n={} total={}us)",
             encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
@@ -249,7 +247,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
             compact_block_at_tip_micros,
             HOSTED_BACKFILL_DEPTH_BLOCKS,
             compact_block_range_micros,
-            tree_state_checkpoint_at_or_before_micros,
+            tree_state_at_micros,
             transaction_avg_micros,
             TRANSACTION_LOOKUP_ITERATIONS,
             transaction_total_micros,

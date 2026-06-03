@@ -28,7 +28,7 @@ use crate::{
     NodeSource, ResilientClient, SourceBlock, SourceChainCheckpoint, SourceChainCursor,
     SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
-    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    TreeStateUpstream, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash,
@@ -1130,6 +1130,16 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
                 self.max_response_bytes,
             )),
         }
+    }
+}
+
+#[async_trait]
+impl TreeStateUpstream for ZebraJsonRpcSource {
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError> {
+        <Self as NodeSource>::fetch_tree_state_for_block(self, block_id).await
     }
 }
 

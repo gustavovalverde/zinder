@@ -335,15 +335,15 @@ impl ChainIndex for RemoteChainIndex {
         Ok(Box::pin(stream))
     }
 
-    async fn tree_state_checkpoint_at_or_before(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
             .client()
-            .tree_state_checkpoint(Request::new(wallet::TreeStateCheckpointRequest {
-                max_height: height.value(),
+            .tree_state_at_height(Request::new(wallet::TreeStateAtHeightRequest {
+                height: height.value(),
                 at_epoch: at_epoch.map(chain_epoch_to_message),
             }))
             .await

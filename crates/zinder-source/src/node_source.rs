@@ -188,6 +188,22 @@ where
     }
 }
 
+/// Upstream tree-state fill boundary for the wallet query plane.
+///
+/// The query plane serves a coherent commitment tree state at any block height.
+/// Stored sparse checkpoints answer most requests; for a height without a stored
+/// checkpoint the plane fills from the configured upstream node, mirroring
+/// lightwalletd's `GetTreeState`. This is the one query path permitted to contact
+/// an upstream node (zinder ADR-0005), gated on an explicitly supplied source.
+#[async_trait]
+pub trait TreeStateUpstream: Send + Sync + 'static {
+    /// Fetches the tree state for one already-identified canonical block.
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError>;
+}
+
 fn bounded_segment_end_height(
     start_height: BlockHeight,
     tip_height: BlockHeight,

@@ -38,7 +38,7 @@ use zinder_client::{
     WALLET_READ_COMPACT_BLOCK_RANGE_V1, WALLET_READ_LATEST_BLOCK_V1,
     WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1, WALLET_READ_SERVER_INFO_V1,
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
-    WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TREE_STATE_CHECKPOINT_V1,
+    WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V1,
     WALLET_SNAPSHOT_MEMPOOL_V1, ZINDER_CAPABILITIES,
 };
 
@@ -57,10 +57,7 @@ const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
         WALLET_READ_COMPACT_BLOCK_RANGE_V1,
         "compact_blocks_in_range",
     ),
-    (
-        WALLET_READ_TREE_STATE_CHECKPOINT_V1,
-        "tree_state_checkpoint_at_or_before",
-    ),
+    (WALLET_READ_TREE_STATE_AT_HEIGHT_V1, "tree_state_at"),
     (
         WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
         "latest_tree_state_checkpoint",
@@ -187,7 +184,7 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::block_header_by_selector;
     let _ = T::compact_block_at;
     let _ = T::compact_blocks_in_range;
-    let _ = T::tree_state_checkpoint_at_or_before;
+    let _ = T::tree_state_at;
     let _ = T::latest_tree_state_checkpoint;
     let _ = T::subtree_roots_in_range;
     let _ = T::transaction_by_id;

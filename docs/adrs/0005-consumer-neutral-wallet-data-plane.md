@@ -2,7 +2,7 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted |
+| Status | Accepted; revised 2026-06-03 (tree-state-at-height upstream fill) |
 | Product | Zinder |
 | Domain | Wallet data plane, external wallet compatibility, typed client boundary |
 | Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Chain ingestion](../architecture/chain-ingestion.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md) |
@@ -48,7 +48,7 @@ Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
 - `wallet-serving` rejects `allow_near_tip_finalize`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
-- Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes.
+- Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
 ### Compatibility and native surfaces
@@ -92,6 +92,8 @@ Tradeoffs:
 The bulk-catchup floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
 
 Upstream-node fallback is rejected. It would blur the source of truth, make readiness lie, and turn query services into partial node proxies. Repair tools may use upstream nodes to rebuild canonical artifacts, but public query methods read stored artifacts only.
+
+Tree-state-at-height carve-out: `tree_state_at(height)` may fill from the configured upstream node on a cache-miss, mirroring lightwalletd's `GetTreeState` (which itself proxies `z_gettreestate` to the node). Zinder stores only sparse tree-state checkpoints (one per 100 blocks plus batch ends) because it delegates all commitment-tree math to the node; a wallet running the canonical `zcash_client_backend` scan loop needs the tree state at exact range boundaries that rarely land on a stored checkpoint. The fill is gated on an explicitly supplied source (the same `ZebraJsonRpcSource` snapshot ADR-0004 already permits for broadcast), is read-only against the store, and returns the exact requested height. This does not blur the source of truth: the node is the source of truth for tree state, and the stored checkpoints are a warm cache in front of it. Without a configured source the read serves only stored checkpoint heights and returns `ArtifactUnavailable` for the gaps.
 
 ## Out of Scope
 

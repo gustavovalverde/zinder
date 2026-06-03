@@ -25,8 +25,8 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
 /// Capability advertised for `WalletQuery.CompactBlockRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
-/// Capability advertised for `WalletQuery.TreeStateCheckpoint`.
-pub const WALLET_READ_TREE_STATE_CHECKPOINT_V1: &str = "wallet.read.tree_state_checkpoint_v1";
+/// Capability advertised for `WalletQuery.TreeStateAtHeight`.
+pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V1: &str = "wallet.read.tree_state_at_height_v1";
 /// Capability advertised for `WalletQuery.LatestTreeStateCheckpoint`.
 pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
     "wallet.read.latest_tree_state_checkpoint_v1";
@@ -275,7 +275,7 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
     WALLET_READ_COMPACT_BLOCK_AT_V1,
     WALLET_READ_COMPACT_BLOCK_RANGE_V1,
-    WALLET_READ_TREE_STATE_CHECKPOINT_V1,
+    WALLET_READ_TREE_STATE_AT_HEIGHT_V1,
     WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
     WALLET_READ_TRANSACTION_BY_ID_V1,

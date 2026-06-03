@@ -170,7 +170,7 @@ fn extract_trait_body_matches_known_method_set() -> Result<()> {
         "block_header_by_selector",
         "compact_block_at",
         "compact_blocks_in_range",
-        "tree_state_checkpoint_at_or_before",
+        "tree_state_at",
         "latest_tree_state_checkpoint",
         "subtree_roots_in_range",
         "transaction_by_id",

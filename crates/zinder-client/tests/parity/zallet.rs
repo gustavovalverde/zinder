@@ -27,8 +27,8 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
         let _ = T::transaction_by_id;
         // standalone is_in_mempool boolean check
         let _ = T::is_in_mempool;
-        // tree_state_checkpoint_at_or_before with Option<ChainEpoch>
-        let _ = T::tree_state_checkpoint_at_or_before;
+        // tree_state_at with Option<ChainEpoch>
+        let _ = T::tree_state_at;
         // typed SubtreeRootHash + ShieldedProtocol enum
         let _ = T::subtree_roots_in_range;
         // typed RawTransactionBytes
@@ -76,7 +76,7 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
         )
         .await?;
     let tree_state = chain_index
-        .tree_state_checkpoint_at_or_before(BlockHeight::new(2), Some(current_epoch))
+        .tree_state_at(BlockHeight::new(2), Some(current_epoch))
         .await?;
     let subtree_roots = chain_index
         .subtree_roots_in_range(

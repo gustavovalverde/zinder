@@ -161,8 +161,8 @@ Method names on public traits, types, and gRPC services follow a small set of ru
 
 Methods that look up exactly one artifact by exactly one key:
 
-- For an exact `BlockHeight` key, use `{artifact}_at(height)`. Example: `block_at(height)`, `compact_block_at(height)`.
-- For checkpoint floor reads, use `{artifact}_checkpoint_at_or_before(max_height)`. Example: `tree_state_checkpoint_at_or_before(max_height)`.
+- For an exact `BlockHeight` key, use `{artifact}_at(height)`. Example: `block_at(height)`, `compact_block_at(height)`, `tree_state_at(height)`.
+- For internal store-layer checkpoint-floor reads, use `{artifact}_checkpoint_at_or_before(max_height)`. Example: the store primitive `tree_state_checkpoint_at_or_before(max_height)` that backs the public `tree_state_at` read.
 - For any other unique key, use `{artifact}_by_{key_noun}(key)`. Example: `transaction_by_id(txid)`, `block_by_hash(hash)`.
 
 The `_at` suffix is reserved for height; using `_at` for any non-height key is a convention violation.
@@ -642,7 +642,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.read.block_header_by_selector_v1`
 - `wallet.read.compact_block_at_v1`
 - `wallet.read.compact_block_range_v1`
-- `wallet.read.tree_state_checkpoint_v1`
+- `wallet.read.tree_state_at_height_v1`
 - `wallet.read.latest_tree_state_checkpoint_v1`
 - `wallet.read.subtree_roots_in_range_v1`
 - `wallet.read.transaction_by_id_v1`

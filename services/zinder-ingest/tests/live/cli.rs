@@ -216,8 +216,6 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
         compact_blocks.compact_blocks.len(),
         usize::try_from(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS)?
     );
-    let _tree_state = wallet_query
-        .tree_state_checkpoint_at_or_before(to_height, None)
-        .await?;
+    let _tree_state = wallet_query.tree_state_at(to_height, None).await?;
     Ok(())
 }

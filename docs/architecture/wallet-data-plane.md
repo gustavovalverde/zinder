@@ -64,12 +64,18 @@ If a compact block artifact is missing, `zinder-query` should return a typed una
 
 The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the `chain_epoch` used to answer the read when the response depends on chain state. Native gRPC streams compact block ranges as `CompactBlockRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
-Tree-state storage preserves upstream node JSON only at canonical checkpoints
-and the latest committed tip. The native read surface is
-`tree_state_checkpoint_at_or_before(max_height, at_epoch)` and
-`latest_tree_state_checkpoint(at_epoch)`. Lightwalletd compatibility returns a
-`TreeState` response for `GetLatestTreeState`; `GetTreeState(BlockID)` returns
-`NOT_FOUND` unless the requested height is an exact stored checkpoint.
+Tree-state storage preserves upstream node JSON at canonical checkpoints and the
+latest committed tip. The native read surface is
+`tree_state_at(height, at_epoch)` and `latest_tree_state_checkpoint(at_epoch)`.
+`tree_state_at` serves the tree state at exactly `height`: a stored checkpoint
+when one exists there, otherwise a cache-fill from the configured upstream node
+(mirroring lightwalletd's `GetTreeState`), so the returned height always equals
+the requested height. The fill is the one query path permitted to contact an
+upstream node, gated on an explicitly supplied source (see ADR-0005). Without a
+source the read serves only stored checkpoint heights and returns
+`ArtifactUnavailable` for the gaps. Lightwalletd compatibility returns a
+`TreeState` response for `GetLatestTreeState`; `GetTreeState(BlockID)` is a clean
+passthrough to `tree_state_at` and serves any height the upstream can answer.
 
 Subtree roots are also wallet-sync artifacts. Query and compatibility services
 must serve them from epoch-bound indexed state and must distinguish a valid empty

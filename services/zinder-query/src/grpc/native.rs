@@ -255,16 +255,16 @@ pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
     build_transaction_status_response(status)
 }
 
-/// Reads the tree-state at `height` and encodes the native wallet response.
-pub async fn tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
+/// Reads the tree-state at exactly `height` and encodes the native wallet response.
+pub async fn tree_state_at_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     height: BlockHeight,
     at_epoch: Option<ChainEpoch>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .tree_state_checkpoint_at_or_before(height, at_epoch)
+        .tree_state_at(height, at_epoch)
         .await
-        .map(build_tree_state_checkpoint_response)
+        .map(build_tree_state_response)
 }
 
 /// Reads the latest tree-state and encodes the native wallet response.
@@ -275,7 +275,7 @@ pub async fn latest_tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api
         .latest_tree_state_checkpoint(at_epoch)
         .await
-        .map(build_tree_state_checkpoint_response)
+        .map(build_tree_state_response)
 }
 
 /// Reads subtree roots in `subtree_root_range` and encodes the native wallet response.
@@ -689,7 +689,7 @@ fn build_transaction_location_message(
     }
 }
 
-fn build_tree_state_checkpoint_response(tree_state: TreeState) -> wallet::TreeStateResponse {
+fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse {
     wallet::TreeStateResponse {
         chain_epoch: Some(build_chain_epoch_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),

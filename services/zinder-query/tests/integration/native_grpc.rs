@@ -144,10 +144,10 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let tree_state_status = match WalletQueryService::tree_state_checkpoint(
+    let tree_state_status = match WalletQueryService::tree_state_at_height(
         &grpc_adapter,
-        Request::new(wallet::TreeStateCheckpointRequest {
-            max_height: 1,
+        Request::new(wallet::TreeStateAtHeightRequest {
+            height: 1,
             at_epoch: None,
         }),
     )
@@ -629,10 +629,10 @@ async fn read_wallet_grpc_responses(
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
         compact_block_range.push(compact_block_chunk?);
     }
-    let explicit_tree_state = WalletQueryService::tree_state_checkpoint(
+    let explicit_tree_state = WalletQueryService::tree_state_at_height(
         grpc_adapter,
-        Request::new(wallet::TreeStateCheckpointRequest {
-            max_height: 1,
+        Request::new(wallet::TreeStateAtHeightRequest {
+            height: 1,
             at_epoch: None,
         }),
     )

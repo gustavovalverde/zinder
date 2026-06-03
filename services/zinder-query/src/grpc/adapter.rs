@@ -44,7 +44,7 @@ use super::native::{
     build_wallet_server_info, compact_block_response, latest_block_response,
     latest_safe_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
     transaction_response, transparent_address_confirmed_balance_response,
-    transparent_outputs_by_outpoint_response, tree_state_checkpoint_response,
+    transparent_outputs_by_outpoint_response, tree_state_at_response,
 };
 use super::status_from_query_error;
 
@@ -286,14 +286,14 @@ where
         Ok(Response::new(Box::pin(stream::iter(compact_block_chunks))))
     }
 
-    async fn tree_state_checkpoint(
+    async fn tree_state_at_height(
         &self,
-        request: Request<wallet::TreeStateCheckpointRequest>,
+        request: Request<wallet::TreeStateAtHeightRequest>,
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
         let request = request.into_inner();
-        tree_state_checkpoint_response(
+        tree_state_at_response(
             &self.query_api,
-            BlockHeight::new(request.max_height),
+            BlockHeight::new(request.height),
             chain_epoch_from_request(request.at_epoch)?,
         )
         .await

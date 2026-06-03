@@ -602,14 +602,9 @@ where
         let height = self.resolve_block_height(&block_id).await?;
         let tree_state = self
             .query_api
-            .tree_state_checkpoint_at_or_before(height, None)
+            .tree_state_at(height, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        if tree_state.height != height {
-            return Err(Status::not_found(
-                "tree state is only available at canonical checkpoints",
-            ));
-        }
 
         Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
     }

@@ -482,20 +482,23 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch: Option<ChainEpoch>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError>;
 
-    /// Reads one tree-state artifact.
+    /// Reads the tree-state artifact at exactly `height`.
     ///
     /// `at_epoch = None` resolves to the live tip; `Some(epoch)` pins the
-    /// read to that chain epoch.
+    /// read to that chain epoch. The returned artifact's height always equals
+    /// `height`: remote clients fill non-checkpoint heights from the query
+    /// plane's upstream node, while local clients serve only stored heights and
+    /// return [`IndexerError::NotFound`] for the gaps.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError};
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let tree = client.tree_state_checkpoint_at_or_before(BlockHeight::new(0), None).await?;
+    /// let tree = client.tree_state_at(BlockHeight::new(0), None).await?;
     /// # let _ = tree; Ok(()) }
     /// ```
-    async fn tree_state_checkpoint_at_or_before(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,

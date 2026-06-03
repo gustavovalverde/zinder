@@ -3,7 +3,7 @@
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
 //! calling upstream node sources or mutating canonical storage.
 
-use std::{num::NonZeroU32, sync::Arc, time::Instant};
+use std::{fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -20,7 +20,7 @@ use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
     TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
 };
-use zinder_source::{SourceError, TransactionBroadcaster};
+use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
@@ -45,7 +45,7 @@ pub use grpc::{
     compact_block_response, latest_block_response, latest_tree_state_checkpoint_response,
     status_from_query_error, subtree_roots_response, transaction_response,
     transparent_address_confirmed_balance_response, transparent_address_tx_ids_response,
-    transparent_outputs_by_outpoint_response, tree_state_checkpoint_response,
+    transparent_outputs_by_outpoint_response, tree_state_at_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -160,8 +160,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError>;
 
-    /// Reads the newest tree-state checkpoint not above `height`.
-    async fn tree_state_checkpoint_at_or_before(
+    /// Reads the tree state at exactly `height`.
+    ///
+    /// Served from a stored checkpoint when one exists at `height`, otherwise
+    /// filled from the configured upstream node. The returned height always
+    /// equals `height`.
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
@@ -197,13 +201,29 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 /// Query boundary backed by a [`ChainEpochReadApi`] implementation.
 ///
 /// Pass `()` as the broadcaster to disable transaction broadcast.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     read_api: ReadApi,
     derive_store: Option<DeriveStore>,
     transaction_broadcaster: Broadcaster,
     options: WalletQueryOptions,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
+}
+
+impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
+    for WalletQuery<ReadApi, Broadcaster>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletQuery")
+            .field("read_api", &self.read_api)
+            .field("derive_store", &self.derive_store)
+            .field("transaction_broadcaster", &self.transaction_broadcaster)
+            .field("options", &self.options)
+            .field("network_upgrade_activations", &self.network_upgrade_activations)
+            .field("tree_state_upstream", &self.tree_state_upstream.is_some())
+            .finish()
+    }
 }
 
 /// Default maximum compact-block count returned by one range call.
@@ -262,6 +282,7 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
             transaction_broadcaster,
             options,
             network_upgrade_activations,
+            tree_state_upstream: None,
         }
     }
 
@@ -271,6 +292,26 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
         self.derive_store = Some(derive_store);
         self
     }
+
+    /// Attaches the upstream node used to fill tree states at heights without a
+    /// stored checkpoint. Without it, `tree_state_at` serves only stored
+    /// checkpoint heights and returns `ArtifactUnavailable` for the gaps.
+    #[must_use]
+    pub fn with_tree_state_upstream(mut self, source: Arc<dyn TreeStateUpstream>) -> Self {
+        self.tree_state_upstream = Some(source);
+        self
+    }
+}
+
+/// Outcome of the synchronous store probe in [`WalletQuery::tree_state_at`].
+enum TreeStateProbe {
+    /// A stored checkpoint sits exactly at the requested height.
+    Stored(TreeState),
+    /// No stored checkpoint at the requested height; fill from the upstream node.
+    Fill {
+        chain_epoch: ChainEpoch,
+        block_id: BlockId,
+    },
 }
 
 #[allow(
@@ -719,46 +760,83 @@ where
         query_outcome
     }
 
-    async fn tree_state_checkpoint_at_or_before(
+    async fn tree_state_at(
         &self,
         height: BlockHeight,
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TreeState, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
-        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+        let probe = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
+            if height > chain_epoch.tip_height {
+                return Err(block_height_artifact_unavailable(
+                    ArtifactFamily::TreeState,
+                    height,
+                ));
+            }
 
-            let tree_state = match reader.tree_state_checkpoint_at_or_before(height) {
-                Ok(Some(tree_state)) => tree_state,
-                Ok(None)
-                | Err(StoreError::ArtifactMissing {
+            let stored = match reader.tree_state_checkpoint_at_or_before(height) {
+                Ok(stored) => stored,
+                Err(StoreError::ArtifactMissing {
                     family: ArtifactFamily::TreeState,
                     ..
-                }) => {
-                    return Err(block_height_artifact_unavailable(
-                        ArtifactFamily::TreeState,
-                        height,
-                    ));
-                }
+                }) => None,
                 Err(error) => return Err(QueryError::Store(error)),
             };
+            if let Some(stored) = stored
+                && stored.height == height
+            {
+                return Ok(TreeStateProbe::Stored(TreeState {
+                    chain_epoch,
+                    height: stored.height,
+                    block_hash: stored.block_hash,
+                    payload_bytes: stored.payload_bytes,
+                }));
+            }
 
-            Ok(TreeState {
+            let block = reader
+                .block_header_at(height)
+                .map_err(QueryError::Store)?
+                .ok_or_else(|| {
+                    block_height_artifact_unavailable(ArtifactFamily::TreeState, height)
+                })?;
+            Ok(TreeStateProbe::Fill {
                 chain_epoch,
-                height: tree_state.height,
-                block_hash: tree_state.block_hash,
-                payload_bytes: tree_state.payload_bytes,
+                block_id: BlockId::new(height, block.block_hash),
             })
         }))
         .await;
-        record_wallet_query_outcome(
-            "tree_state_checkpoint_at_or_before",
-            started_at,
-            &query_outcome,
-            None,
-        );
+
+        let query_outcome = match probe {
+            Ok(TreeStateProbe::Stored(tree_state)) => Ok(tree_state),
+            Ok(TreeStateProbe::Fill {
+                chain_epoch,
+                block_id,
+            }) => match self.tree_state_upstream.as_ref() {
+                Some(source) => {
+                    let height = block_id.height;
+                    let block_hash = block_id.hash;
+                    source
+                        .fetch_tree_state_for_block(block_id)
+                        .await
+                        .map(|source_tree_state| TreeState {
+                            chain_epoch,
+                            height,
+                            block_hash,
+                            payload_bytes: source_tree_state.payload_bytes,
+                        })
+                        .map_err(QueryError::Node)
+                }
+                None => Err(block_height_artifact_unavailable(
+                    ArtifactFamily::TreeState,
+                    block_id.height,
+                )),
+            },
+            Err(error) => Err(error),
+        };
+        record_wallet_query_outcome("tree_state_at", started_at, &query_outcome, None);
         query_outcome
     }
 

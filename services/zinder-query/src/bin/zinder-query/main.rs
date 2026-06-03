@@ -1,6 +1,6 @@
 //! Zinder wallet query gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
@@ -236,9 +236,15 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             )));
         }
     };
-    let wallet_query =
+    let tree_state_upstream = broadcaster
+        .as_ref()
+        .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
+    let mut wallet_query =
         zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations)
             .with_derive_store(derive_store);
+    if let Some(tree_state_upstream) = tree_state_upstream {
+        wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
+    }
     let cancel = CancellationToken::new();
     let server_info = zinder_query::ServerInfoSettings {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
