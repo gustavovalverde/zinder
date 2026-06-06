@@ -18,6 +18,7 @@ use zinder_store::RocksDbResourceBudget;
 use crate::{ConfigError, config::duration_as_millis_u64};
 
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
 
 /// Raw role-scoped `rocksdb` sub-section.
@@ -39,6 +40,8 @@ pub struct RocksDbResourceBudgetSection {
     pub write_buffer_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: Option<i32>,
+    /// Override [`RocksDbResourceBudget::memtable_budget_bytes`].
+    pub memtable_budget_bytes: Option<u64>,
 }
 
 impl RocksDbResourceBudgetSection {
@@ -60,6 +63,9 @@ impl RocksDbResourceBudgetSection {
         }
         if let Some(count) = self.max_write_buffer_count {
             defaults.max_write_buffer_count = count;
+        }
+        if let Some(bytes) = self.memtable_budget_bytes {
+            defaults.memtable_budget_bytes = bytes;
         }
         defaults
     }
@@ -98,6 +104,9 @@ pub struct SecondaryStorageSection {
     pub secondary_path: Option<PathBuf>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
+    /// Maximum startup catchup duration in milliseconds before the reader
+    /// proceeds with the opened secondary and lets readiness report lag.
+    pub initial_catchup_timeout_ms: Option<u64>,
     /// Replica-lag threshold in chain epochs. Crossing this threshold
     /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
@@ -120,6 +129,9 @@ pub struct CanonicalSecondaryStorageSection {
     pub secondary_path: Option<PathBuf>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
+    /// Maximum startup catchup duration in milliseconds before the reader
+    /// proceeds with the opened secondary and lets readiness report lag.
+    pub initial_catchup_timeout_ms: Option<u64>,
     /// Replica-lag threshold in chain epochs. Crossing this threshold
     /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
@@ -147,6 +159,8 @@ pub struct ResolvedSecondaryStorage {
     pub secondary_path: PathBuf,
     /// Catchup tick cadence.
     pub secondary_catchup_interval: Duration,
+    /// Maximum startup catchup duration before serving with the opened secondary.
+    pub initial_catchup_timeout: Duration,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Bounded `RocksDB` resource budget for the canonical store.
@@ -164,6 +178,8 @@ pub struct ResolvedCanonicalSecondaryStorage {
     pub secondary_path: PathBuf,
     /// Catchup tick cadence.
     pub secondary_catchup_interval: Duration,
+    /// Maximum startup catchup duration before serving with the opened secondary.
+    pub initial_catchup_timeout: Duration,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Bounded `RocksDB` resource budget for the canonical store.
@@ -265,6 +281,14 @@ pub fn resolve_secondary_storage(
             "storage.secondary_catchup_interval_ms must be greater than zero",
         ));
     }
+    let initial_catchup_timeout_ms = section
+        .initial_catchup_timeout_ms
+        .unwrap_or(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS);
+    if initial_catchup_timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "storage.initial_catchup_timeout_ms must be greater than zero",
+        ));
+    }
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
@@ -275,6 +299,7 @@ pub fn resolve_secondary_storage(
         path,
         secondary_path,
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
+        initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
         secondary_replica_lag_threshold_chain_epochs,
         canonical_rocksdb_budget,
         derive_rocksdb_budget,
@@ -301,6 +326,14 @@ pub fn resolve_canonical_secondary_storage(
             "storage.secondary_catchup_interval_ms must be greater than zero",
         ));
     }
+    let initial_catchup_timeout_ms = section
+        .initial_catchup_timeout_ms
+        .unwrap_or(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS);
+    if initial_catchup_timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "storage.initial_catchup_timeout_ms must be greater than zero",
+        ));
+    }
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
@@ -310,6 +343,7 @@ pub fn resolve_canonical_secondary_storage(
         path,
         secondary_path,
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
+        initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
         secondary_replica_lag_threshold_chain_epochs,
         canonical_rocksdb_budget,
     })
@@ -328,6 +362,8 @@ pub struct RocksDbResourceBudgetToml {
     pub write_buffer_bytes: u64,
     /// Resolved [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: i32,
+    /// Resolved [`RocksDbResourceBudget::memtable_budget_bytes`].
+    pub memtable_budget_bytes: u64,
 }
 
 impl RocksDbResourceBudgetToml {
@@ -340,6 +376,7 @@ impl RocksDbResourceBudgetToml {
             max_open_files: budget.max_open_files,
             write_buffer_bytes: budget.write_buffer_bytes,
             max_write_buffer_count: budget.max_write_buffer_count,
+            memtable_budget_bytes: budget.memtable_budget_bytes,
         }
     }
 }
@@ -393,6 +430,8 @@ pub struct SecondaryStorageToml {
     pub secondary_path: String,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: u64,
+    /// Initial catchup timeout in milliseconds.
+    pub initial_catchup_timeout_ms: u64,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Canonical store role projection.
@@ -412,6 +451,7 @@ impl SecondaryStorageToml {
             secondary_catchup_interval_ms: duration_as_millis_u64(
                 resolved.secondary_catchup_interval,
             ),
+            initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
             secondary_replica_lag_threshold_chain_epochs: resolved
                 .secondary_replica_lag_threshold_chain_epochs,
             canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
@@ -429,6 +469,8 @@ pub struct CanonicalSecondaryStorageToml {
     pub secondary_path: String,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: u64,
+    /// Initial catchup timeout in milliseconds.
+    pub initial_catchup_timeout_ms: u64,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Canonical store role projection.
@@ -446,6 +488,7 @@ impl CanonicalSecondaryStorageToml {
             secondary_catchup_interval_ms: duration_as_millis_u64(
                 resolved.secondary_catchup_interval,
             ),
+            initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
             secondary_replica_lag_threshold_chain_epochs: resolved
                 .secondary_replica_lag_threshold_chain_epochs,
             canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
@@ -516,6 +559,10 @@ mod tests {
             Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)
         );
         assert_eq!(
+            resolved.initial_catchup_timeout,
+            Duration::from_millis(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS)
+        );
+        assert_eq!(
             resolved.secondary_replica_lag_threshold_chain_epochs,
             DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS
         );
@@ -572,6 +619,17 @@ mod tests {
     }
 
     #[test]
+    fn secondary_storage_rejects_zero_initial_catchup_timeout() {
+        let outcome = resolve_secondary_storage(SecondaryStorageSection {
+            path: Some(PathBuf::from("/tmp/store")),
+            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
+            initial_catchup_timeout_ms: Some(0),
+            ..SecondaryStorageSection::default()
+        });
+        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
     fn canonical_writer_budget_resolution_falls_through_to_writer_defaults()
     -> Result<(), ConfigError> {
         let resolved =
@@ -615,6 +673,7 @@ mod tests {
             max_open_files: Some(256),
             write_buffer_bytes: Some(8 * 1024 * 1024),
             max_write_buffer_count: Some(3),
+            memtable_budget_bytes: Some(16 * 1024 * 1024),
         })?;
         let defaults = RocksDbResourceBudget::canonical_writer_defaults();
         assert_eq!(resolved.block_cache_bytes, 8 * 1024 * 1024);
@@ -622,6 +681,7 @@ mod tests {
         assert_eq!(resolved.max_open_files, 256);
         assert_eq!(resolved.write_buffer_bytes, 8 * 1024 * 1024);
         assert_eq!(resolved.max_write_buffer_count, 3);
+        assert_eq!(resolved.memtable_budget_bytes, 16 * 1024 * 1024);
         Ok(())
     }
 

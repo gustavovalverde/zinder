@@ -3,7 +3,7 @@ use std::{fs, path::Path, sync::Arc, time::Instant};
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, SliceTransform,
-    Snapshot, WriteBatch, WriteOptions, checkpoint::Checkpoint,
+    Snapshot, WriteBatch, WriteBufferManager, WriteOptions, checkpoint::Checkpoint,
 };
 
 use crate::{RocksDbResourceBudget, StoreError, format::StoreKey, kv::StorageTable};
@@ -11,12 +11,224 @@ use crate::{RocksDbResourceBudget, StoreError, format::StoreKey, kv::StorageTabl
 type PrefixScanVisitor<'visitor> =
     &'visitor mut dyn FnMut(&[u8], &[u8]) -> Result<PrefixScanControl, StoreError>;
 
+const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Filesystem I/O mode resolved while opening a `RocksDB` instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RocksDbIoMode {
+    /// `RocksDB` opened with direct reads, and primary stores also opened
+    /// flush and compaction work with direct I/O.
+    Direct,
+    /// `RocksDB` opened with buffered filesystem I/O after direct I/O was
+    /// rejected by the filesystem or platform.
+    Buffered,
+}
+
+impl RocksDbIoMode {
+    /// Stable label used in logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Buffered => "buffered",
+        }
+    }
+}
+
+/// Open role and filesystem paths for a bounded `RocksDB` instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RocksDbOpenRole<'path> {
+    /// Primary writer opening its owned store path.
+    Primary {
+        /// Primary store path.
+        path: &'path Path,
+    },
+    /// Secondary reader opening a writer-owned primary path plus its own
+    /// reader-local metadata path.
+    Secondary {
+        /// Writer-owned primary store path.
+        primary_path: &'path Path,
+        /// Reader-local secondary metadata path.
+        secondary_path: &'path Path,
+    },
+}
+
+impl<'path> RocksDbOpenRole<'path> {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary { .. } => "primary",
+            Self::Secondary { .. } => "secondary",
+        }
+    }
+
+    const fn store_path(self) -> &'path Path {
+        match self {
+            Self::Primary { path } => path,
+            Self::Secondary { primary_path, .. } => primary_path,
+        }
+    }
+
+    const fn is_primary(self) -> bool {
+        matches!(self, Self::Primary { .. })
+    }
+}
+
+/// Opened `RocksDB` handle plus the resource handles that must outlive it.
+pub struct BoundedRocksDbOpen {
+    /// Opened database handle.
+    pub db: DB,
+    /// Shared block cache retained for the database lifetime.
+    pub block_cache: Cache,
+    /// Shared write-buffer manager retained for the database lifetime.
+    pub write_buffer_manager: WriteBufferManager,
+    /// Resolved filesystem I/O mode.
+    pub io_mode: RocksDbIoMode,
+}
+
+/// Opens a bounded `RocksDB` instance with direct I/O when the platform supports it.
+///
+/// The column-family descriptors are rebuilt for each open attempt because
+/// their options hold references to the helper-owned block cache. On direct
+/// I/O failure, the function logs the unsupported mode and retries with the
+/// same bounded resource budget under buffered I/O.
+pub fn open_bounded_rocksdb(
+    role: RocksDbOpenRole<'_>,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    build_column_families: impl Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+) -> Result<BoundedRocksDbOpen, rust_rocksdb::Error> {
+    let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
+    let write_buffer_manager =
+        build_write_buffer_manager(rocksdb_resource_budget.memtable_budget_bytes);
+    let open_attempt = BoundedRocksDbOpenAttempt {
+        role,
+        rocksdb_resource_budget,
+        block_cache: &block_cache,
+        write_buffer_manager: &write_buffer_manager,
+        build_column_families: &build_column_families,
+    };
+
+    match open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Direct) {
+        Ok(db) => {
+            record_rocksdb_io_mode(role, RocksDbIoMode::Direct);
+            Ok(BoundedRocksDbOpen {
+                db,
+                block_cache,
+                write_buffer_manager,
+                io_mode: RocksDbIoMode::Direct,
+            })
+        }
+        Err(direct_error) => {
+            tracing::warn!(
+                target: "zinder::store",
+                event = "rocksdb_direct_io_unsupported",
+                store_path = %role.store_path().display(),
+                role = role.as_str(),
+                error = %direct_error,
+                "RocksDB direct I/O open failed; retrying with buffered I/O"
+            );
+            let db = open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
+            record_rocksdb_io_mode(role, RocksDbIoMode::Buffered);
+            Ok(BoundedRocksDbOpen {
+                db,
+                block_cache,
+                write_buffer_manager,
+                io_mode: RocksDbIoMode::Buffered,
+            })
+        }
+    }
+}
+
+struct BoundedRocksDbOpenAttempt<'attempt, 'path, BuildColumnFamilies>
+where
+    BuildColumnFamilies: Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+{
+    role: RocksDbOpenRole<'path>,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    block_cache: &'attempt Cache,
+    write_buffer_manager: &'attempt WriteBufferManager,
+    build_column_families: &'attempt BuildColumnFamilies,
+}
+
+fn open_bounded_rocksdb_once<BuildColumnFamilies>(
+    open_attempt: &BoundedRocksDbOpenAttempt<'_, '_, BuildColumnFamilies>,
+    io_mode: RocksDbIoMode,
+) -> Result<DB, rust_rocksdb::Error>
+where
+    BuildColumnFamilies: Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+{
+    let mut db_options = match open_attempt.role {
+        RocksDbOpenRole::Primary { .. } => build_primary_db_options(
+            open_attempt.rocksdb_resource_budget,
+            open_attempt.block_cache,
+        ),
+        RocksDbOpenRole::Secondary { .. } => build_secondary_db_options(
+            open_attempt.rocksdb_resource_budget,
+            open_attempt.block_cache,
+        ),
+    };
+    db_options.set_write_buffer_manager(open_attempt.write_buffer_manager);
+    if io_mode == RocksDbIoMode::Direct {
+        db_options.set_use_direct_reads(true);
+        if open_attempt.role.is_primary() {
+            db_options.set_use_direct_io_for_flush_and_compaction(true);
+            db_options.set_compaction_readahead_size(DIRECT_IO_COMPACTION_READAHEAD_BYTES);
+        }
+    }
+    let column_families = (open_attempt.build_column_families)(
+        open_attempt.block_cache,
+        open_attempt.rocksdb_resource_budget,
+    );
+
+    match open_attempt.role {
+        RocksDbOpenRole::Primary { path } => {
+            DB::open_cf_descriptors(&db_options, path, column_families)
+        }
+        RocksDbOpenRole::Secondary {
+            primary_path,
+            secondary_path,
+        } => DB::open_cf_descriptors_as_secondary(
+            &db_options,
+            primary_path,
+            secondary_path,
+            column_families,
+        ),
+    }
+}
+
+fn record_rocksdb_io_mode(role: RocksDbOpenRole<'_>, io_mode: RocksDbIoMode) {
+    tracing::info!(
+        target: "zinder::store",
+        event = "rocksdb_io_mode",
+        store_path = %role.store_path().display(),
+        role = role.as_str(),
+        mode = io_mode.as_str(),
+        "RocksDB I/O mode resolved"
+    );
+}
+
+fn storage_column_family_descriptors(
+    block_cache: &Cache,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+) -> Vec<ColumnFamilyDescriptor> {
+    StorageTable::all()
+        .into_iter()
+        .map(|table| {
+            ColumnFamilyDescriptor::new(
+                table.column_family_name(),
+                column_family_options(table, block_cache, rocksdb_resource_budget),
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub(crate) struct RocksChainStore {
     db: Arc<DB>,
     control_lock: Arc<Mutex<()>>,
     sync_writes: bool,
     block_cache: Cache,
+    write_buffer_manager: WriteBufferManager,
+    io_mode: RocksDbIoMode,
     block_cache_capacity_bytes: u64,
     wal_size_limit_bytes: u64,
 }
@@ -27,26 +239,22 @@ impl RocksChainStore {
         sync_writes: bool,
         rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
-        let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
-        let db_options = build_primary_db_options(rocksdb_resource_budget, &block_cache);
-        let column_families = StorageTable::all()
-            .into_iter()
-            .map(|table| {
-                ColumnFamilyDescriptor::new(
-                    table.column_family_name(),
-                    column_family_options(table, &block_cache, rocksdb_resource_budget),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let db = DB::open_cf_descriptors(&db_options, path.as_ref(), column_families)
-            .map_err(|source| StoreError::primary_open_failed(path.as_ref(), source))?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: path.as_ref(),
+            },
+            rocksdb_resource_budget,
+            storage_column_family_descriptors,
+        )
+        .map_err(|source| StoreError::primary_open_failed(path.as_ref(), source))?;
 
         let store = Self {
-            db: Arc::new(db),
+            db: Arc::new(bounded_open.db),
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
-            block_cache,
+            block_cache: bounded_open.block_cache,
+            write_buffer_manager: bounded_open.write_buffer_manager,
+            io_mode: bounded_open.io_mode,
             block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
             wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
         };
@@ -61,31 +269,23 @@ impl RocksChainStore {
         sync_writes: bool,
         rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
-        let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
-        let db_options = build_secondary_db_options(rocksdb_resource_budget, &block_cache);
-        let column_families = StorageTable::all()
-            .into_iter()
-            .map(|table| {
-                ColumnFamilyDescriptor::new(
-                    table.column_family_name(),
-                    column_family_options(table, &block_cache, rocksdb_resource_budget),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let db = DB::open_cf_descriptors_as_secondary(
-            &db_options,
-            primary_path.as_ref(),
-            secondary_path.as_ref(),
-            column_families,
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Secondary {
+                primary_path: primary_path.as_ref(),
+                secondary_path: secondary_path.as_ref(),
+            },
+            rocksdb_resource_budget,
+            storage_column_family_descriptors,
         )
         .map_err(StoreError::storage_unavailable)?;
 
         let store = Self {
-            db: Arc::new(db),
+            db: Arc::new(bounded_open.db),
             control_lock: Arc::new(Mutex::new(())),
             sync_writes,
-            block_cache,
+            block_cache: bounded_open.block_cache,
+            write_buffer_manager: bounded_open.write_buffer_manager,
+            io_mode: bounded_open.io_mode,
             block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
             wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
         };
@@ -448,6 +648,15 @@ impl RocksChainStore {
             .set(u64_to_f64(self.block_cache_capacity_bytes));
         metrics::gauge!("zinder_store_block_cache_usage_bytes")
             .set(usize_to_f64(self.block_cache.get_usage()));
+        metrics::gauge!("zinder_store_memtable_budget_bytes")
+            .set(usize_to_f64(self.write_buffer_manager.get_buffer_size()));
+        metrics::gauge!("zinder_store_memtable_budget_usage_bytes")
+            .set(usize_to_f64(self.write_buffer_manager.get_usage()));
+        metrics::gauge!(
+            "zinder_store_rocksdb_io_mode",
+            "mode" => self.io_mode.as_str()
+        )
+        .set(1.0);
     }
 }
 
@@ -463,7 +672,7 @@ impl RocksChainStore {
 /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
 /// for the full design.
 #[must_use]
-pub fn build_primary_db_options(
+fn build_primary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
     cache: &Cache,
 ) -> Options {
@@ -486,7 +695,7 @@ pub fn build_primary_db_options(
 /// (block cache, open file handles) apply identically because the secondary's
 /// open-time RAM peak grows with store size the same way the primary's does.
 #[must_use]
-pub fn build_secondary_db_options(
+fn build_secondary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
     cache: &Cache,
 ) -> Options {
@@ -507,9 +716,14 @@ pub fn build_secondary_db_options(
 /// is reference counted), so callers needing the same cache across
 /// multiple open paths pass `&` references rather than reconstructing.
 #[must_use]
-pub fn build_block_cache(capacity_bytes: u64) -> Cache {
+fn build_block_cache(capacity_bytes: u64) -> Cache {
     let capacity = usize::try_from(capacity_bytes).unwrap_or(usize::MAX);
     Cache::new_lru_cache(capacity)
+}
+
+fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager {
+    let capacity = usize::try_from(memtable_budget_bytes).unwrap_or(usize::MAX);
+    WriteBufferManager::new_write_buffer_manager(capacity, false)
 }
 
 /// Builds the shared `BlockBasedOptions` every column family routes through.

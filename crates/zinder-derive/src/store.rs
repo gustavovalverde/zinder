@@ -5,7 +5,7 @@
 //! its own schema version. The two stores never share keys.
 //!
 //! Both stores share one source of truth for `RocksDB` option choices:
-//! [`zinder_store::build_primary_db_options`] from
+//! [`zinder_store::open_bounded_rocksdb`] from
 //! [ADR-0020](../../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 //! That keeps the bulk-catchup-OOM trap, which is a property of unbounded
 //! `RocksDB` defaults rather than the canonical store's specific layout,
@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     hash::BuildHasher,
     path::{Path, PathBuf},
     sync::Arc,
@@ -23,8 +24,8 @@ use rust_rocksdb::{
 };
 use zinder_core::{BlockHeight, ChainEpoch};
 use zinder_store::{
-    ChainEvent, RocksDbResourceBudget, build_block_based_table_factory, build_block_cache,
-    build_primary_db_options, build_secondary_db_options,
+    ChainEvent, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
+    build_block_based_table_factory, open_bounded_rocksdb,
 };
 
 use crate::{
@@ -117,6 +118,23 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
     );
     options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
     options
+}
+
+fn column_family_descriptors(
+    cache: &Cache,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    consumer_column_families: &'static [&'static str],
+) -> Vec<ColumnFamilyDescriptor> {
+    let store_families = DeriveStoreTable::all().into_iter().map(|table| {
+        ColumnFamilyDescriptor::new(
+            table.column_family_name(),
+            column_family_options(cache, rocksdb_resource_budget),
+        )
+    });
+    let consumer_families = consumer_column_families.iter().map(|name| {
+        ColumnFamilyDescriptor::new(*name, column_family_options(cache, rocksdb_resource_budget))
+    });
+    store_families.chain(consumer_families).collect()
 }
 
 /// Logical column-family identifier.
@@ -231,13 +249,39 @@ pub struct ChainEventDispatchInputs<'event> {
 /// writes always go in a single batch with the consumer's data writes so a
 /// crash mid-write never advances the cursor without persisting the
 /// underlying state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DeriveStore {
     db: Arc<DB>,
     sync_writes: bool,
     storage_path: PathBuf,
     consumer_column_families: &'static [&'static str],
     is_secondary: bool,
+    block_cache: Cache,
+    write_buffer_manager: rust_rocksdb::WriteBufferManager,
+    io_mode: RocksDbIoMode,
+}
+
+impl fmt::Debug for DeriveStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeriveStore")
+            .field("db", &self.db)
+            .field("sync_writes", &self.sync_writes)
+            .field("storage_path", &self.storage_path)
+            .field("consumer_column_families", &self.consumer_column_families)
+            .field("is_secondary", &self.is_secondary)
+            .field("io_mode", &self.io_mode)
+            .field("block_cache_usage_bytes", &self.block_cache.get_usage())
+            .field(
+                "memtable_budget_bytes",
+                &self.write_buffer_manager.get_buffer_size(),
+            )
+            .field(
+                "memtable_budget_usage_bytes",
+                &self.write_buffer_manager.get_usage(),
+            )
+            .finish()
+    }
 }
 
 impl DeriveStore {
@@ -281,36 +325,30 @@ impl DeriveStore {
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
-        let block_cache = build_block_cache(options.rocksdb_resource_budget.block_cache_bytes);
-        let db_options = build_primary_db_options(options.rocksdb_resource_budget, &block_cache);
-        let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
-            ColumnFamilyDescriptor::new(
-                table.column_family_name(),
-                column_family_options(&block_cache, options.rocksdb_resource_budget),
-            )
-        });
-        let consumer_families = options.consumer_column_families.iter().map(|name| {
-            ColumnFamilyDescriptor::new(
-                *name,
-                column_family_options(&block_cache, options.rocksdb_resource_budget),
-            )
-        });
-        let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
-        let db = DB::open_cf_descriptors(&db_options, path, column_families).map_err(|source| {
-            DeriveStoreError::Open {
-                path: path.to_path_buf(),
-                source,
-            }
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path },
+            options.rocksdb_resource_budget,
+            |cache, rocksdb_resource_budget| {
+                column_family_descriptors(
+                    cache,
+                    rocksdb_resource_budget,
+                    options.consumer_column_families,
+                )
+            },
+        )
+        .map_err(|source| DeriveStoreError::Open {
+            path: path.to_path_buf(),
+            source,
         })?;
-        // RocksDB holds its own shared_ptr to the cache through
-        // `BlockBasedOptions::set_block_cache`, so the local `block_cache`
-        // can drop at end of scope without affecting the live DB.
         let store = Self {
-            db: Arc::new(db),
+            db: Arc::new(bounded_open.db),
             sync_writes: options.sync_writes,
             storage_path: path.to_path_buf(),
             consumer_column_families: options.consumer_column_families,
             is_secondary: false,
+            block_cache: bounded_open.block_cache,
+            write_buffer_manager: bounded_open.write_buffer_manager,
+            io_mode: bounded_open.io_mode,
         };
         store.validate_or_initialize_schema_version()?;
         Ok(store)
@@ -339,37 +377,33 @@ impl DeriveStore {
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
-        let block_cache = build_block_cache(options.rocksdb_resource_budget.block_cache_bytes);
-        let db_options = build_secondary_db_options(options.rocksdb_resource_budget, &block_cache);
-        let sdk_families = DeriveStoreTable::all().into_iter().map(|table| {
-            ColumnFamilyDescriptor::new(
-                table.column_family_name(),
-                column_family_options(&block_cache, options.rocksdb_resource_budget),
-            )
-        });
-        let consumer_families = options.consumer_column_families.iter().map(|name| {
-            ColumnFamilyDescriptor::new(
-                *name,
-                column_family_options(&block_cache, options.rocksdb_resource_budget),
-            )
-        });
-        let column_families = sdk_families.chain(consumer_families).collect::<Vec<_>>();
-        let db = DB::open_cf_descriptors_as_secondary(
-            &db_options,
-            primary_path,
-            secondary_path,
-            column_families,
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Secondary {
+                primary_path,
+                secondary_path,
+            },
+            options.rocksdb_resource_budget,
+            |cache, rocksdb_resource_budget| {
+                column_family_descriptors(
+                    cache,
+                    rocksdb_resource_budget,
+                    options.consumer_column_families,
+                )
+            },
         )
         .map_err(|source| DeriveStoreError::Open {
             path: primary_path.to_path_buf(),
             source,
         })?;
         let store = Self {
-            db: Arc::new(db),
+            db: Arc::new(bounded_open.db),
             sync_writes: options.sync_writes,
             storage_path: primary_path.to_path_buf(),
             consumer_column_families: options.consumer_column_families,
             is_secondary: true,
+            block_cache: bounded_open.block_cache,
+            write_buffer_manager: bounded_open.write_buffer_manager,
+            io_mode: bounded_open.io_mode,
         };
         store.schema_version()?;
         Ok(store)
@@ -397,6 +431,30 @@ impl DeriveStore {
     #[must_use]
     pub fn storage_path(&self) -> &Path {
         &self.storage_path
+    }
+
+    /// Returns the filesystem I/O mode resolved when opening this store.
+    #[must_use]
+    pub const fn rocksdb_io_mode(&self) -> RocksDbIoMode {
+        self.io_mode
+    }
+
+    /// Returns the current shared block-cache usage in bytes.
+    #[must_use]
+    pub fn block_cache_usage_bytes(&self) -> usize {
+        self.block_cache.get_usage()
+    }
+
+    /// Returns the configured total memtable budget in bytes.
+    #[must_use]
+    pub fn memtable_budget_bytes(&self) -> usize {
+        self.write_buffer_manager.get_buffer_size()
+    }
+
+    /// Returns the current write-buffer-manager memory usage in bytes.
+    #[must_use]
+    pub fn memtable_budget_usage_bytes(&self) -> usize {
+        self.write_buffer_manager.get_usage()
     }
 
     /// Returns true when this store was opened with at least one

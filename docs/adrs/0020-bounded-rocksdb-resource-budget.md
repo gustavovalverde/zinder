@@ -1,94 +1,160 @@
-# ADR-0020: Bounded RocksDB resource budget
+# ADR-0020: Store-size-independent RocksDB memory
 
 Status: Accepted
 Date: 2026-05-20
 Related: [ADR-0001](0001-rocksdb-canonical-store.md),
 [ADR-0003](0003-canonical-storage-access-boundary.md),
-[ADR-0015](0015-unified-phase-driven-ingest.md)
+[ADR-0015](0015-unified-phase-driven-ingest.md),
+[ADR-0022](0022-resource-budgeted-bulk-catchup.md)
 
 ## Context
 
-`zinder-ingest` enters a self-perpetuating restart loop during initial sync on hosts that under-allocate RAM for RocksDB's WAL replay. The trap is documented in [the OOM-recovery runbook](../runbooks/bulk-catchup-oom-recovery.md):
+Zinder's canonical and derive stores are allowed to grow with chain history, but
+their resident memory must not grow with on-disk store size. The storage layer
+serves long sequential reads during startup catchup, secondary replay, and
+wallet-facing scans. With buffered filesystem I/O, those reads can populate the
+host page cache with large portions of the RocksDB store. In cgroup-enforced
+deployments, that reclaimable page cache counts against the container memory
+limit even though it is not Zinder heap or RocksDB-owned cache.
 
-1. During `BulkCatchup`, the writer commits large `WriteBatch`es. Each batch lands in the WAL first and flushes to SST on the next memtable rotation.
-2. RocksDB's `max_total_wal_size = 0` default means "never trigger a flush based on WAL size."
-3. When the process is killed mid-bulk-catchup (oncall restart, host reboot, prior OOM, deploy), the WAL keeps every uncommitted write. A 2.7 GiB WAL has been observed on mainnet.
-4. The next start replays the WAL into memtables before the store is usable. RocksDB needs roughly 2.5× the WAL size in resident memory during replay (memtable plus per-CF index/bloom pins from `max_open_files = -1`).
-5. On a RAM-constrained host the kernel kills `zinder-ingest` before replay completes. The container restarts, replays the same WAL, gets killed again. The cycle never breaks.
+The operational invariant is therefore stricter than "set a smaller block
+cache": resident memory owned by Zinder and RocksDB must be bounded by the
+configured budget, and on-disk store size must not determine process RSS or the
+memory-pressure signal that throttles rebuildable work.
 
-[ADR-0001](0001-rocksdb-canonical-store.md) states that "RocksDB tuning is part of Zinder's operational surface" but does not say *where* the choices live. Before this ADR, every resource choice was a hardcoded constant inside separate option factories. Those factories used bare `Options::default()` plus a handful of create flags. They did not set a WAL ceiling, a block cache, an open-file cap, or a memtable budget from one shared contract.
+Before this ADR revision, ADR-0020 focused on WAL growth and per-column-family
+write buffers. Those controls are still required, but they are incomplete:
 
-Two problems compounded:
-
-- **No resource-budget surface.** Operators could not raise the cache or cap the WAL without recompiling.
-- **No central source of truth.** A fix applied to the canonical store would leave the derive plane vulnerable to the same OOM trap, and any future RocksDB-using component would re-invent the same defaults.
+1. Buffered reads can fill the cgroup through the OS page cache.
+2. Per-column-family write buffers do not bound total memtable memory across
+   many column families.
+3. A pressure signal based on `memory.current - inactive_file` still includes
+   active file cache, which is reclaimable.
+4. Startup catchup must not block a reader process indefinitely before
+   `/readyz` can report replica lag.
 
 ## Decision
 
-RocksDB option choices are layered into three tiers with explicit ownership:
+Both RocksDB users in the workspace route through one bounded open path in
+`zinder-store`: the canonical store (`RocksChainStore`) and the derive store
+(`DeriveStore`). The helper owns the block cache, write-buffer manager, direct
+I/O resolution, and open retry policy.
 
-### Tier 1 — Architectural invariants (locked in code)
+### Direct I/O With Buffered Fallback
 
-Four RocksDB options are contracts of the storage layer and are not operator-configurable:
+Every RocksDB open first attempts direct I/O:
 
-- **WAL on** (no `set_disable_wal`). Disabling the WAL would erase every unflushed write on shutdown and break the per-`ChainEpoch` atomicity guarantee from ADR-0001 §Commit Protocol.
-- **Point-in-time recovery** (RocksDB default; do not call `set_wal_recovery_mode(SkipAnyCorruptedRecords)`). Letting RocksDB silently truncate a partial WAL would lose committed writes without an audit trail.
-- **Atomic cross-CF flush on** (`set_atomic_flush(true)`). The per-epoch invariant requires a single atomic flush across the artifact families that commit together.
-- **Ordered writes** (no `set_unordered_write`). The derive plane assumes per-epoch sequence ordering.
+- Primary and secondary opens set `use_direct_reads = true`.
+- Primary opens also set `use_direct_io_for_flush_and_compaction = true` and
+  `compaction_readahead_size = 2 MiB`.
 
-These four are encoded in `zinder_store::build_primary_db_options` and `zinder_store::build_secondary_db_options`. Operators cannot toggle them through config.
+If the direct-I/O open fails, Zinder logs
+`event="rocksdb_direct_io_unsupported"` with the store path, role, and error,
+then retries the same bounded open under buffered I/O. This keeps the default
+path store-size-independent on filesystems that support direct I/O while
+remaining portable on filesystems and development platforms that do not.
 
-### Tier 2 — Bounded resource budget (operator-configurable)
+Successful opens log `event="rocksdb_io_mode"` with the resolved mode
+(`direct` or `buffered`), store path, and role. The resolved mode is retained
+beside the RocksDB handle for observability.
 
-Five knobs cap the open-time and write-time RAM peak. They live under `[storage.canonical.rocksdb]` for canonical store instances and `[storage.derive.rocksdb]` for derive store instances. Defaults are posture-specific: writer processes own bulk catch-up and WAL flushing, while reader secondaries must stay below the writer's memory envelope.
+### Resource Budget
+
+`RocksDbResourceBudget` is the single typed budget for canonical and derive
+stores. It carries:
 
 | Knob | Writer canonical | Writer derive | Reader canonical | Reader derive | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `block_cache_bytes` | 512 MiB | 128 MiB | 128 MiB | 64 MiB | Bounded LRU cache size shared by data, index, and bloom blocks. Without it, RocksDB pins index and bloom blocks per-SST in resident memory, which scales with store size. |
-| `max_wal_bytes` | 256 MiB | 64 MiB | 32 MiB | 16 MiB | Total live WAL ceiling. Crossing it triggers a memtable flush so the WAL truncates on writer-posture stores. The default of 0 (RocksDB's own) means "never trigger from WAL size," which is the bug. |
-| `max_open_files` | 512 | 256 | 128 | 64 | Open SST file handle cap. The default of -1 (RocksDB's own) means "open every SST and pin its metadata," which scales with store size. |
-| `write_buffer_bytes` | 16 MiB | 8 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. This keeps write bursts bounded instead of inheriting RocksDB's larger default in every column family. |
-| `max_write_buffer_count` | 2 | 2 | 2 | 2 | Per-column-family mutable plus immutable memtable count. Two buffers let one flush while another accepts writes without allowing unbounded memtable growth. |
+| `block_cache_bytes` | 512 MiB | 128 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
+| `max_wal_bytes` | 256 MiB | 64 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
+| `max_open_files` | 512 | 256 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
+| `write_buffer_bytes` | 16 MiB | 8 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
+| `max_write_buffer_count` | 2 | 2 | 2 | 2 | Per-column-family mutable plus immutable memtable count. |
+| `memtable_budget_bytes` | 256 MiB | 64 MiB | 16 MiB | 16 MiB | Total memtable memory budget across column families via `WriteBufferManager`. |
 
-The typed value `zinder_store::RocksDbResourceBudget` carries these numbers. Both the canonical store (`ChainStoreOptions::rocksdb_resource_budget`) and the derive store (`DeriveStoreOptions::rocksdb_resource_budget`) consume the same type.
+Local tests use the same bounded path with a smaller profile: 32 MiB block
+cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers, two write
+buffers, and an 8 MiB total memtable budget.
 
-`block_cache_index_and_filter_blocks = true` and `pin_l0_filter_and_index_blocks_in_cache = true` are paired with the bounded block cache: index and bloom blocks live inside the bounded cache instead of being pinned per-SST. This caps at-rest metadata budget at the cache size.
+The validation gate rejects values below the minimums:
 
-A validation gate rejects values below the minimums (`RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES` = 4 MiB, `MIN_MAX_WAL_BYTES` = 4 MiB, `MIN_MAX_OPEN_FILES` = 32, `MIN_WRITE_BUFFER_BYTES` = 4 MiB, `MIN_MAX_WRITE_BUFFER_COUNT` = 2). `max_wal_bytes = 0` is specifically rejected because, on writer-posture stores, it disables the safety trigger; the schema is symmetric on secondaries (where the field is inert) so the same minimum applies on both sides.
+- `MIN_BLOCK_CACHE_BYTES = 4 MiB`
+- `MIN_MAX_WAL_BYTES = 4 MiB`
+- `MIN_MAX_OPEN_FILES = 32`
+- `MIN_WRITE_BUFFER_BYTES = 4 MiB`
+- `MIN_MAX_WRITE_BUFFER_COUNT = 2`
+- `MIN_MEMTABLE_BUDGET_BYTES = 4 MiB`
 
-### Tier 3 — Phase-aware flush policy
+`max_wal_bytes = 0` remains invalid because it disables RocksDB's WAL-size
+flush trigger.
 
-`BulkCatchup` forces an explicit `db.flush()` every `flush_interval_epochs` committed epochs (default 5). With the default `canonical_batch_max_blocks = 1000`, this truncates the WAL after every 5,000 committed blocks. The flush is also performed once on `BulkCatchup` exit so the phase hands off a clean WAL state to `TipFollow`.
+### Locked RocksDB Invariants
 
-`TipFollow` does not flush explicitly. Each commit is one block; the WAL stays under a few MiB; natural memtable rotation handles it.
+These options are storage-layer contracts and are not operator-configurable:
 
-### Tier 4 — Observable peaks
+- WAL stays enabled.
+- Point-in-time recovery stays enabled through RocksDB's default recovery mode.
+- Atomic cross-CF flush stays enabled on primary stores.
+- Ordered writes stay enabled.
+- Index and bloom filter blocks are charged to the bounded block cache through
+  `cache_index_and_filter_blocks = true` and
+  `pin_l0_filter_and_index_blocks_in_cache = true`.
+- The write-buffer manager handle is retained for the lifetime of the DB
+  handle, alongside the block cache.
 
-Metrics that would catch the trap before it became operational:
+### Memory Pressure
 
-- `zinder_store_wal_bytes` (gauge) — sum of `*.log` file sizes in the store path. Scraped at every commit.
-- `zinder_store_wal_bytes_limit` (gauge) — the configured `max_wal_bytes`. Lets alerts express thresholds as a percentage of the limit.
-- `zinder_store_block_cache_capacity_bytes` and `zinder_store_block_cache_usage_bytes` — block cache size and current usage. Sampled from the bounded LRU directly, not duplicated as `zinder_store_rocksdb_property` labels.
-- `zinder_store_rocksdb_property{property="rocksdb.cur-size-active-mem-table"}` — added to the existing per-CF property gauge so an oversized memtable shows up alongside the WAL gauge.
-- `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — emitted by `StartupPhaseGuard` on every phase exit. Coarser-bucketed than the project's general `_duration_seconds` rule because cold WAL replay can run for several minutes.
+Ingest memory-pressure backpressure uses non-reclaimable memory, not working
+set. The derive replay budget computes its pressure ratio from cgroup `anon`
+memory divided by `memory.high` when set, otherwise `memory.max`. If cgroup
+`anon` is unavailable, it falls back to process `RssAnon` from
+`/proc/self/status`.
 
-Two alerts in `observability/prometheus/rules/zinder-readiness.yml`:
+`working_set_bytes` remains exported as a diagnostic metric, but it does not
+drive derive replay throttling because active file cache is reclaimable.
 
-- `ZinderStoreWalGrowth` fires when `wal_bytes / wal_bytes_limit > 0.75` for five minutes.
-- `ZinderStartupOpenStorageSlow` fires when `histogram_quantile(0.95, …)` of the `open_storage` phase exceeds 60 seconds.
+### Startup Catchup
+
+Reader startup performs bounded initial catchup. If a secondary does not
+converge within `storage.initial_catchup_timeout_ms` (default 30 seconds), the
+reader continues with the opened secondary view and the periodic catchup task
+lets readiness report replica lag. Startup does not block indefinitely on a
+far-behind secondary and does not crash-loop solely because catchup needs more
+time.
 
 ## Consequences
 
-- **The trap is closed by construction.** With a non-zero WAL ceiling, a non-pinning open file cap, a bounded block cache, and a periodic flush, the bulk-catchup OOM trap cannot fire on a host that satisfies the documented memory envelope.
-- **The fix applies once per posture.** The canonical store and derive store route through the same primary/secondary option factories, with writer-sized defaults for primary handles and reader-sized defaults for secondary handles.
-- **Operators have a tunable surface.** RAM-constrained hosts can drop the cache to 128 MiB; high-throughput hosts can raise to 1 GiB. The invariants stay locked.
-- **Operators cannot disable WAL or atomic flush.** This is deliberate.
-- **The metric set lets SREs alert before the trap fires.** Watching `zinder_store_wal_bytes / zinder_store_wal_bytes_limit` and the `open_storage` p95 catches both the pre-trap state and the post-trap restart loop.
-- **All existing tests use `RocksDbResourceBudget::for_local_tests`** (32 MiB cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers) so unit tests keep their tight memory footprint while exercising the bounded code path.
+- Store-size-independent memory is the storage contract. On supported
+  filesystems, direct I/O prevents store reads from filling the cgroup through
+  page cache. On unsupported platforms, the same bounded RocksDB-owned caches
+  are used with buffered I/O.
+- The canonical and derive stores share the same open path, so direct-I/O
+  resolution, block-cache setup, WBM setup, and fallback behavior cannot drift.
+- Operators tune a curated budget surface instead of raw RocksDB options.
+- Rebuildable derive replay backs off only on non-reclaimable memory pressure.
+  Reclaimable file cache does not pause indexing.
+- Reader processes can start and expose `/readyz` while a secondary catches up.
 
 ## Alternatives considered
 
-- **A single hardcoded fix in `primary_db_options`.** Closes the trap for the canonical store only; leaves the derive plane and any future component vulnerable. Rejected.
-- **A `[rocksdb]` config section exposing every option.** Surfaces too many knobs that operators have no signal to tune; many of them break invariants if mis-set. Rejected in favor of curated role-scoped `[storage.<role>.rocksdb]` budgets plus the locked invariants.
-- **`RocksDbResourceBudget` as a serde-deserializable type directly.** Forced every consuming crate to take a hard dep on serde just to construct one. Rejected; the type is a plain struct, with serde shaping done at the runtime config boundary (`RocksDbResourceBudgetSection`).
-- **Filesystem-scrape `du` for WAL bytes vs RocksDB property API.** `rust-rocksdb` 0.47 does not expose `DB::GetSortedWalFiles` or a per-DB WAL-size property. A filesystem scan of `*.log` is one syscall plus N stat calls per commit; the overhead is negligible. Accepted.
+- **Expose a direct-I/O toggle.** Rejected. The correct operator contract is
+  automatic direct-I/O detection with buffered fallback. A toggle would add a
+  failure mode without changing the invariant.
+- **Use only block-cache and open-file caps.** Rejected. Those bound RocksDB
+  metadata and cached blocks, but do not stop buffered reads from filling the
+  OS page cache.
+- **Use per-column-family write buffers only.** Rejected. The total grows with
+  the number of column families. `WriteBufferManager` is the cross-CF bound.
+- **Keep using working-set pressure.** Rejected. `memory.current -
+  inactive_file` still includes active file cache and can pause derive replay
+  while the kernel could reclaim the memory.
+- **Fail startup when initial catchup is slow.** Rejected. Replica lag is a
+  readiness condition, not a liveness failure.
+
+## Revision: store-size-independent memory invariant (2026-06-06)
+
+This revision replaces the earlier WAL-replay-centered wording with the current
+invariant: RocksDB-owned memory is bounded by `RocksDbResourceBudget`, store
+reads prefer direct I/O with buffered fallback, total memtable memory is bounded
+by `WriteBufferManager`, and memory pressure is based on non-reclaimable
+anonymous memory.

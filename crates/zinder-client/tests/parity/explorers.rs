@@ -14,6 +14,9 @@ use zinder_client::{
     LocalChainIndex, RemoteChainIndex, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact, TransparentOutPoint,
 };
+use zinder_testkit::{
+    open_test_derive_store_for_canonical, seed_transparent_address_transaction_history,
+};
 
 use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
 
@@ -72,6 +75,8 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         .with_address_output_index(utxo.clone())
         .with_transparent_address_tx_index(tx_history);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
     let chain_index = open_local_chain_index(&store_fixture).await?;
 
     let utxos = chain_index
@@ -110,7 +115,7 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     assert!(utxos.next_cursor.is_none());
     assert_eq!(history_item.chain_epoch, utxos.chain_epoch);
     assert_eq!(history_item.artifact, tx_history);
-    assert!(history_item.cursor.is_none());
+    assert!(history_item.cursor.is_some());
     assert!(history.next().await.is_none());
     assert!(matches!(
         chain_index

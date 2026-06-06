@@ -333,6 +333,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       across reader processes.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
+        toml_path: "storage.initial_catchup_timeout_ms",
+        used_by: &[
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum startup RocksDB secondary catchup duration before a reader starts \
+                      with the opened secondary and lets /readyz report replica lag. Defaults to \
+                      30000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.canonical.rocksdb.block_cache_bytes",
         used_by: &[
@@ -403,6 +417,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       buffer count. Defaults to 2.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES",
+        toml_path: "storage.canonical.rocksdb.memtable_budget_bytes",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store total RocksDB memtable budget across column families. \
+                      Defaults to 268435456 for writers and 16777216 for readers.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.derive.rocksdb.block_cache_bytes",
         used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
@@ -446,6 +474,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Derive-store per-column-family mutable plus immutable RocksDB write buffer \
                       count. Defaults to 2.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES",
+        toml_path: "storage.derive.rocksdb.memtable_budget_bytes",
+        used_by: &["zinder-ingest", "zinder-query", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store total RocksDB memtable budget across column families. Defaults \
+                      to 67108864 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__SOURCE",

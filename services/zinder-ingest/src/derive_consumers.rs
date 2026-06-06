@@ -117,9 +117,7 @@ impl DeriveReplayBudget {
             .map(std::num::NonZeroU64::get)
             .or(memory_snapshot.cgroup_high_bytes)
             .or(memory_snapshot.cgroup_max_bytes);
-        let memory_pressure_bytes = memory_snapshot
-            .working_set_bytes()
-            .or(memory_snapshot.cgroup_current_bytes);
+        let memory_pressure_bytes = memory_snapshot.non_reclaimable_bytes();
         let memory_pressure_ratio = memory_pressure_bytes.zip(memory_budget_bytes).and_then(
             |(current_bytes, budget_bytes)| {
                 (budget_bytes > 0).then(|| u64_to_f64(current_bytes) / u64_to_f64(budget_bytes))
@@ -1433,6 +1431,7 @@ mod tests {
     fn memory_snapshot(current_bytes: u64) -> RuntimeMemorySnapshot {
         RuntimeMemorySnapshot {
             cgroup_current_bytes: Some(current_bytes),
+            cgroup_anon_bytes: Some(current_bytes),
             cgroup_max_bytes: Some(1_000),
             ..RuntimeMemorySnapshot::default()
         }
@@ -1482,19 +1481,41 @@ mod tests {
     }
 
     #[test]
-    fn replay_budget_uses_working_set_pressure_when_cgroup_stat_is_available() {
+    fn replay_budget_uses_anon_pressure_when_cgroup_stat_is_available() {
         let mut budget = DeriveReplayBudget::new(replay_config());
         let snapshot = RuntimeMemorySnapshot {
             cgroup_current_bytes: Some(980),
             cgroup_max_bytes: Some(1_000),
+            cgroup_anon_bytes: Some(200),
+            cgroup_active_file_bytes: Some(480),
             cgroup_inactive_file_bytes: Some(300),
             ..RuntimeMemorySnapshot::default()
         };
 
         let limits = budget.evaluate(snapshot);
 
-        assert_eq!(limits.memory_pressure_ratio, Some(0.68));
+        assert_eq!(limits.memory_pressure_ratio, Some(0.2));
         assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
         assert_eq!(limits.batch_blocks, 100);
+    }
+
+    #[test]
+    fn replay_budget_uses_process_rss_anon_when_cgroup_anon_is_absent() {
+        let mut budget = DeriveReplayBudget::new(replay_config());
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(980),
+            cgroup_max_bytes: Some(1_000),
+            cgroup_anon_bytes: None,
+            cgroup_active_file_bytes: Some(480),
+            cgroup_inactive_file_bytes: Some(300),
+            process_rss_anon_bytes: Some(875),
+            ..RuntimeMemorySnapshot::default()
+        };
+
+        let limits = budget.evaluate(snapshot);
+
+        assert_eq!(limits.memory_pressure_ratio, Some(0.875));
+        assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(limits.batch_blocks, 50);
     }
 }

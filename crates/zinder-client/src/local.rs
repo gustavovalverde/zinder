@@ -19,7 +19,7 @@ use zinder_derive::{
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{
     AddressOutputIndexPageRequest, BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions,
-    SecondaryChainStore, StoreError,
+    RocksDbResourceBudget, SecondaryChainStore, StoreError,
 };
 
 use crate::{
@@ -28,6 +28,9 @@ use crate::{
     IndexerError, RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
 };
+
+/// Default maximum time spent on initial secondary catchup during local open.
+pub const DEFAULT_INITIAL_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Options for opening a local chain index over a `RocksDB` secondary.
 #[derive(Clone, Debug)]
@@ -48,6 +51,9 @@ pub struct LocalOpenOptions {
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
     pub catchup_interval: Duration,
+    /// Maximum initial catchup duration before opening with the current
+    /// secondary view.
+    pub initial_catchup_timeout: Duration,
     /// Node-discovered upgrade activations used to fill
     /// `MinedDetails.consensus_branch_id` on `transaction_by_id` responses.
     /// The production binary discovers this via
@@ -73,6 +79,11 @@ impl LocalChainIndex {
                 "catchup_interval must be greater than zero",
             ));
         }
+        if options.initial_catchup_timeout.is_zero() {
+            return Err(IndexerError::invalid_request(
+                "initial_catchup_timeout must be greater than zero",
+            ));
+        }
 
         let storage_path = options.storage_path.clone();
         let secondary_path = options.secondary_path.clone();
@@ -91,37 +102,19 @@ impl LocalChainIndex {
         }))
         .await?;
         let store_for_initial_catchup = store.clone();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            store_for_initial_catchup
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)
-        }))
+        try_catch_up_store_with_timeout(
+            store_for_initial_catchup,
+            options.initial_catchup_timeout,
+            "canonical",
+        )
         .await?;
-        let derive_storage_path = DeriveStore::path_for_canonical(&options.storage_path);
-        let derive_secondary_path = options.secondary_path.join("derive");
-        let derive_rocksdb_budget = options.derive_rocksdb_budget;
-        let derive_store =
-            join_blocking(tokio::task::spawn_blocking(
-                move || match DeriveStore::open_secondary(
-                    derive_storage_path,
-                    derive_secondary_path,
-                    DeriveStoreOptions {
-                        sync_writes: false,
-                        consumer_column_families: DeriveStore::bundled_consumer_column_families(),
-                        rocksdb_resource_budget: derive_rocksdb_budget,
-                    },
-                ) {
-                    Ok(derive_store) => {
-                        derive_store
-                            .try_catch_up()
-                            .map_err(IndexerError::from_derive_store_error)?;
-                        Ok(Some(derive_store))
-                    }
-                    Err(zinder_derive::DeriveStoreError::Open { .. }) => Ok(None),
-                    Err(error) => Err(IndexerError::from_derive_store_error(error)),
-                },
-            ))
-            .await?;
+        let derive_store = open_derive_secondary_with_timeout(
+            options.storage_path.clone(),
+            options.secondary_path.clone(),
+            options.derive_rocksdb_budget,
+            options.initial_catchup_timeout,
+        )
+        .await?;
 
         let remote_index = match options.subscription_endpoint {
             Some(endpoint) => Some(RemoteChainIndex::connect(RemoteOpenOptions {
@@ -753,6 +746,93 @@ async fn join_blocking<Output>(
         Err(error) => Err(IndexerError::BlockingTaskFailed {
             reason: error.to_string(),
         }),
+    }
+}
+
+async fn open_derive_secondary_with_timeout(
+    storage_path: PathBuf,
+    secondary_path: PathBuf,
+    derive_rocksdb_budget: RocksDbResourceBudget,
+    timeout: Duration,
+) -> Result<Option<DeriveStore>, IndexerError> {
+    let derive_storage_path = DeriveStore::path_for_canonical(&storage_path);
+    let derive_secondary_path = secondary_path.join("derive");
+    let derive_store =
+        join_blocking(tokio::task::spawn_blocking(
+            move || match DeriveStore::open_secondary(
+                derive_storage_path,
+                derive_secondary_path,
+                DeriveStoreOptions {
+                    sync_writes: false,
+                    consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+                    rocksdb_resource_budget: derive_rocksdb_budget,
+                },
+            ) {
+                Ok(derive_store) => Ok(Some(derive_store)),
+                Err(zinder_derive::DeriveStoreError::Open { .. }) => Ok(None),
+                Err(error) => Err(IndexerError::from_derive_store_error(error)),
+            },
+        ))
+        .await?;
+    if let Some(derive_store_for_initial_catchup) = derive_store.clone() {
+        try_catch_up_derive_store_with_timeout(derive_store_for_initial_catchup, timeout).await?;
+    }
+    Ok(derive_store)
+}
+
+async fn try_catch_up_store_with_timeout(
+    store: SecondaryChainStore,
+    timeout: Duration,
+    role: &'static str,
+) -> Result<(), IndexerError> {
+    let handle = tokio::task::spawn_blocking(move || {
+        store
+            .try_catch_up()
+            .map(|_| ())
+            .map_err(IndexerError::from_store_error)
+    });
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(catchup_outcome)) => catchup_outcome,
+        Ok(Err(join_error)) => Err(IndexerError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        }),
+        Err(_) => {
+            tracing::warn!(
+                target: "zinder::client",
+                event = "initial_secondary_catchup_timed_out",
+                role,
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "initial secondary catchup timed out; opening with the current secondary view"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn try_catch_up_derive_store_with_timeout(
+    derive_store: DeriveStore,
+    timeout: Duration,
+) -> Result<(), IndexerError> {
+    let handle = tokio::task::spawn_blocking(move || {
+        derive_store
+            .try_catch_up()
+            .map_err(IndexerError::from_derive_store_error)
+    });
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(catchup_outcome)) => catchup_outcome,
+        Ok(Err(join_error)) => Err(IndexerError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        }),
+        Err(_) => {
+            tracing::warn!(
+                target: "zinder::client",
+                event = "initial_secondary_catchup_timed_out",
+                role = "derive",
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "initial derive secondary catchup timed out; opening with the current secondary view"
+            );
+            Ok(())
+        }
     }
 }
 

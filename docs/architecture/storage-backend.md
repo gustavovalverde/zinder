@@ -27,7 +27,7 @@ Direct embedded reads outside that contract are allowed only for `zinder dev` co
 - Storage-control records, including the store network anchor.
 - Schema-version validation on open.
 - Checkpoint creation and fixture capture.
-- The bounded RocksDB resource budget and the shared option-factory functions (`build_primary_db_options`, `build_secondary_db_options`, `build_block_cache`, `build_block_based_table_factory`). [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) records the architectural invariants and the operator-tunable surface; both the canonical store and the derive store route through these factories so the bulk-catchup-OOM trap can only be reopened by changing the factory itself.
+- The bounded RocksDB open path, resource budget, and shared block-table factory. [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) records the architectural invariants and the operator-tunable surface; both the canonical store and the derive store route through the bounded open path so the bulk-catchup-OOM trap can only be reopened by changing that path.
 
 `zinder-store` must not expose RocksDB handles as public API. Public callers use domain contracts.
 

@@ -8,8 +8,9 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, BlockHeightRange, ChainIndex, IndexerError, LocalChainIndex, LocalOpenOptions,
-    Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId, TxStatus,
+    BlockHeight, BlockHeightRange, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, IndexerError,
+    LocalChainIndex, LocalOpenOptions, Network, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionId, TxStatus,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations,
@@ -45,6 +46,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?;

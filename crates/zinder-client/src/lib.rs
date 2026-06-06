@@ -20,7 +20,7 @@ pub use chain_index::{
     TransparentHistoryCursor,
 };
 pub use error::{IndexerError, RetryPolicy};
-pub use local::{LocalChainIndex, LocalOpenOptions};
+pub use local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
 pub use remote::{RemoteChainIndex, RemoteOpenOptions};
 pub use zinder_core::{
     AddressOutputIndexArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,

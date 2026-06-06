@@ -10,10 +10,10 @@ use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::transport::Server;
 use zinder_client::{
-    BlockHeight, ChainEpochId, ChainIndex, IndexerError, LocalChainIndex, LocalOpenOptions,
-    Network, RemoteChainIndex, RemoteOpenOptions, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
-    TransparentHistoryCursor,
+    BlockHeight, ChainEpochId, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, IndexerError,
+    LocalChainIndex, LocalOpenOptions, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
+    TransparentAddressTxIdsStreamItem, TransparentHistoryCursor,
 };
 use zinder_core::TransparentAddressTxIndexArtifact;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
@@ -219,6 +219,7 @@ async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> 
         derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?;

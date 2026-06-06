@@ -1,12 +1,12 @@
 mod rocksdb;
 
+pub use rocksdb::{
+    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, build_block_based_table_factory,
+    open_bounded_rocksdb,
+};
 pub(crate) use rocksdb::{
     PrefixScanControl, RocksChainStore, RocksChainStoreRead, RocksChainStoreReadView,
     StorageDelete, StoragePut,
-};
-pub use rocksdb::{
-    build_block_based_table_factory, build_block_cache, build_primary_db_options,
-    build_secondary_db_options,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

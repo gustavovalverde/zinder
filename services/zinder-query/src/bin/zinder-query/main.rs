@@ -177,15 +177,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             rocksdb_resource_budget: query_config.storage.derive_rocksdb_budget,
         },
     ) {
-        Ok(derive_store) => {
-            if let Err(error) = derive_store.try_catch_up() {
-                let error = QueryConfigError::DeriveStore(error);
-                open_storage_phase.fail(&error);
-                start_api_phase.fail(&error);
-                return Err(error);
-            }
-            derive_store
-        }
+        Ok(derive_store) => derive_store,
         Err(error) => {
             let error = QueryConfigError::DeriveStore(error);
             open_storage_phase.fail(&error);
@@ -193,6 +185,16 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error);
         }
     };
+    if let Err(error) = try_catch_up_derive_store_with_timeout(
+        derive_store.clone(),
+        query_config.storage.initial_catchup_timeout,
+    )
+    .await
+    {
+        open_storage_phase.fail(&error);
+        start_api_phase.fail(&error);
+        return Err(error);
+    }
     open_storage_phase.complete();
     let visible_height = store
         .current_chain_epoch()
@@ -401,6 +403,31 @@ fn spawn_grpc_health_reporter(
             }
         }
     })
+}
+
+async fn try_catch_up_derive_store_with_timeout(
+    derive_store: DeriveStore,
+    timeout: Duration,
+) -> Result<(), QueryConfigError> {
+    let handle = tokio::task::spawn_blocking(move || derive_store.try_catch_up());
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(catchup_outcome)) => catchup_outcome.map_err(QueryConfigError::DeriveStore),
+        Ok(Err(join_error)) => Err(QueryConfigError::Config(
+            zinder_runtime::ConfigError::invalid(format!(
+                "derive initial catchup blocking task failed: {join_error}"
+            )),
+        )),
+        Err(_) => {
+            tracing::warn!(
+                target: "zinder::query",
+                event = "initial_secondary_catchup_timed_out",
+                role = "derive",
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "initial derive secondary catchup timed out; starting with the current secondary view"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn update_grpc_health(

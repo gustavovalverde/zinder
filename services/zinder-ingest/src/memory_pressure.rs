@@ -71,8 +71,7 @@ impl RuntimeMemorySnapshot {
     }
 
     pub(crate) fn pressure_ratio(self) -> Option<f64> {
-        self.working_set_pressure_ratio()
-            .or_else(|| self.current_pressure_ratio())
+        self.non_reclaimable_pressure_ratio()
     }
 
     pub(crate) fn current_pressure_ratio(self) -> Option<f64> {
@@ -89,8 +88,12 @@ impl RuntimeMemorySnapshot {
         Some(current.saturating_sub(self.cgroup_inactive_file_bytes.unwrap_or(0)))
     }
 
-    pub(crate) fn working_set_pressure_ratio(self) -> Option<f64> {
-        let current = self.working_set_bytes()?;
+    pub(crate) fn non_reclaimable_bytes(self) -> Option<u64> {
+        self.cgroup_anon_bytes.or(self.process_rss_anon_bytes)
+    }
+
+    pub(crate) fn non_reclaimable_pressure_ratio(self) -> Option<f64> {
+        let current = self.non_reclaimable_bytes()?;
         let limit = self.cgroup_high_bytes.or(self.cgroup_max_bytes)?;
         if limit == 0 {
             return None;
@@ -169,7 +172,7 @@ pub fn spawn_runtime_memory_metrics_task(
 /// derive replay pressure ratio interpretable from logs alone.
 const RUNTIME_MEMORY_LOG_EVERY_TICKS: u32 = 60;
 
-/// Logs the cgroup memory limit, working set, and pressure ratio at INFO.
+/// Logs the cgroup memory limit, working set, anon memory, and pressure ratio at INFO.
 ///
 /// Without this the container memory budget is only on the (often unscraped)
 /// metrics endpoint, so a paused or memory-throttled derive plane is hard to
@@ -182,6 +185,7 @@ fn log_runtime_memory_observation(snapshot: RuntimeMemorySnapshot) {
         cgroup_limit_bytes = ?container_memory_budget_from_snapshot(snapshot),
         cgroup_current_bytes = ?snapshot.cgroup_current_bytes,
         working_set_bytes = ?snapshot.working_set_bytes(),
+        non_reclaimable_bytes = ?snapshot.non_reclaimable_bytes(),
         inactive_file_bytes = ?snapshot.cgroup_inactive_file_bytes,
         process_rss_anon_bytes = ?snapshot.process_rss_anon_bytes,
         pressure_ratio = ?snapshot.pressure_ratio(),
@@ -385,7 +389,7 @@ mod tests {
         assert_eq!(snapshot.process_rss_bytes, Some(42 * 1024));
         assert_eq!(snapshot.process_rss_anon_bytes, Some(40 * 1024));
         assert_eq!(snapshot.current_pressure_ratio(), Some(0.9));
-        assert_eq!(snapshot.pressure_ratio(), Some(0.6));
+        assert_eq!(snapshot.pressure_ratio(), Some(0.4));
 
         Ok(())
     }
@@ -397,7 +401,7 @@ mod tests {
             cgroup_max_bytes: Some(2000),
             cgroup_high_bytes: Some(1000),
             cgroup_swap_current_bytes: None,
-            cgroup_anon_bytes: None,
+            cgroup_anon_bytes: Some(900),
             cgroup_file_bytes: None,
             cgroup_inactive_file_bytes: None,
             cgroup_active_file_bytes: None,
@@ -411,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_ratio_ignores_inactive_file_cache_when_available() {
+    fn pressure_ratio_ignores_reclaimable_file_cache_when_available() {
         let snapshot = RuntimeMemorySnapshot {
             cgroup_current_bytes: Some(900),
             cgroup_max_bytes: Some(1000),
@@ -429,7 +433,27 @@ mod tests {
 
         assert_eq!(snapshot.working_set_bytes(), Some(400));
         assert_eq!(snapshot.current_pressure_ratio(), Some(0.9));
-        assert_eq!(snapshot.pressure_ratio(), Some(0.4));
+        assert_eq!(snapshot.pressure_ratio(), Some(0.2));
+    }
+
+    #[test]
+    fn pressure_ratio_falls_back_to_process_rss_anon() {
+        let snapshot = RuntimeMemorySnapshot {
+            cgroup_current_bytes: Some(900),
+            cgroup_max_bytes: Some(1000),
+            cgroup_high_bytes: None,
+            cgroup_swap_current_bytes: None,
+            cgroup_anon_bytes: None,
+            cgroup_file_bytes: Some(700),
+            cgroup_inactive_file_bytes: Some(500),
+            cgroup_active_file_bytes: Some(200),
+            cgroup_kernel_bytes: None,
+            cgroup_slab_bytes: None,
+            process_rss_bytes: Some(900),
+            process_rss_anon_bytes: Some(250),
+        };
+
+        assert_eq!(snapshot.pressure_ratio(), Some(0.25));
     }
 
     #[test]

@@ -19,7 +19,10 @@ use zinder_client::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
-use zinder_testkit::{FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    FixtureTransactionRows, StoreFixture, open_test_derive_store_for_canonical,
+    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
+};
 
 use super::{committed_store_fixture, parity_chain_fixture};
 
@@ -49,7 +52,8 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
             fixture.store_fixture.chain_store().clone(),
             (),
             Arc::new(sample_regtest_upgrade_activations()),
-        ),
+        )
+        .with_derive_store(fixture.derive_store.clone()),
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
@@ -117,6 +121,7 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
 
 struct PublicOperatorFixture {
     store_fixture: StoreFixture,
+    derive_store: zinder_derive::DeriveStore,
     address: String,
     script_pub_key: Vec<u8>,
     transaction_id: TransactionId,
@@ -144,6 +149,13 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
         0,
         raw_transaction_bytes.clone(),
     );
+    let tx_history = TransparentAddressTxIndexArtifact::new(
+        address_script_hash,
+        block_height,
+        0,
+        transaction_id,
+        block_hash,
+    );
     let chain_fixture = base_fixture
         .with_transaction_rows(transaction_rows)
         .with_address_output_index(AddressOutputIndexArtifact::new(
@@ -154,16 +166,13 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
             block_height,
             block_hash,
         ))
-        .with_transparent_address_tx_index(TransparentAddressTxIndexArtifact::new(
-            address_script_hash,
-            block_height,
-            0,
-            transaction_id,
-            block_hash,
-        ));
+        .with_transparent_address_tx_index(tx_history);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
     Ok(PublicOperatorFixture {
         store_fixture,
+        derive_store,
         address,
         script_pub_key,
         transaction_id,

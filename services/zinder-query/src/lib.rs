@@ -220,7 +220,10 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
             .field("derive_store", &self.derive_store)
             .field("transaction_broadcaster", &self.transaction_broadcaster)
             .field("options", &self.options)
-            .field("network_upgrade_activations", &self.network_upgrade_activations)
+            .field(
+                "network_upgrade_activations",
+                &self.network_upgrade_activations,
+            )
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
             .finish()
     }

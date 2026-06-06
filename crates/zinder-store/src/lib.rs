@@ -54,8 +54,8 @@ pub use format::{
 };
 pub use grpc_status::status_from_store_error;
 pub use kv::{
-    build_block_based_table_factory, build_block_cache, build_primary_db_options,
-    build_secondary_db_options,
+    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, build_block_based_table_factory,
+    open_bounded_rocksdb,
 };
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope};
 pub use mempool_event_store::{

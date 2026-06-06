@@ -5354,6 +5354,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-types",
+ "tracing",
  "zinder-core",
  "zinder-proto",
 ]

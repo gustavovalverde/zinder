@@ -5,13 +5,13 @@
 //! identifies:
 //!
 //! - **Architectural invariants** (WAL on, point-in-time recovery, atomic
-//!   flush, ordered writes) live in [`crate::kv::build_primary_db_options`]
-//!   and [`crate::kv::build_secondary_db_options`]. They are not tunable;
-//!   touching them breaks the per-epoch commit contract.
+//!   flush, ordered writes, and direct-I/O fallback) live in the bounded
+//!   `RocksDB` open path. They are not tunable; touching them breaks the
+//!   per-epoch commit contract.
 //! - **Bounded resource budget** lives here. The numbers below cap the
-//!   block-cache, table-cache, WAL, and memtable memory surfaces so a
-//!   crash-replay open or bulk write does not OOM the host. The defaults target
-//!   a mainnet-sized store and are documented in
+//!   block-cache, table-cache, WAL, per-column-family write buffers, and total
+//!   memtable memory surfaces so a crash-replay open or bulk write does not
+//!   OOM the host. The defaults target a mainnet-sized store and are documented in
 //!   [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
 //!
 //! Construct one with writer defaults for primary stores and reader defaults
@@ -21,8 +21,8 @@
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
 ///
 /// The fields together cap the resident-memory peak at roughly
-/// `block_cache_bytes + max_wal_bytes + active_memtables` regardless of store
-/// size. Each field has a single concrete effect:
+/// `block_cache_bytes + max_wal_bytes + memtable_budget_bytes` regardless of
+/// store size. Each field has a single concrete effect:
 ///
 /// - `block_cache_bytes` is the size of the bounded LRU cache shared by
 ///   data blocks, index blocks, and bloom filter blocks. Without a bounded
@@ -40,6 +40,8 @@
 ///   rotates to an immutable memtable and flushes to an `SST`.
 /// - `max_write_buffer_count` caps how many mutable plus immutable memtables a
 ///   column family may hold before writes stall.
+/// - `memtable_budget_bytes` caps total memtable memory across column
+///   families via `RocksDB`'s write-buffer manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RocksDbResourceBudget {
     /// Bounded LRU cache size for data, index, and filter blocks.
@@ -53,6 +55,8 @@ pub struct RocksDbResourceBudget {
     pub write_buffer_bytes: u64,
     /// Per-column-family mutable plus immutable memtable count.
     pub max_write_buffer_count: i32,
+    /// Total mutable and immutable memtable memory budget across column families.
+    pub memtable_budget_bytes: u64,
 }
 
 impl RocksDbResourceBudget {
@@ -81,11 +85,16 @@ impl RocksDbResourceBudget {
     /// absorb writes while another buffer flushes.
     pub const MIN_MAX_WRITE_BUFFER_COUNT: i32 = 2;
 
+    /// Smallest accepted [`Self::memtable_budget_bytes`]. Smaller values
+    /// force constant flush churn and do not leave enough room for one
+    /// bounded column-family memtable to rotate cleanly.
+    pub const MIN_MEMTABLE_BUDGET_BYTES: u64 = 4 * MIB;
+
     /// Canonical-store writer defaults sized for a mainnet-shaped deployment.
     ///
     /// `512 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
-    /// and `16 MiB x 2` write buffers per column family. See ADR-0020 for the
-    /// budget derivation.
+    /// `16 MiB x 2` write buffers per column family, and `256 MiB` total
+    /// memtable budget. See ADR-0020 for the budget derivation.
     #[must_use]
     pub const fn canonical_writer_defaults() -> Self {
         Self {
@@ -94,15 +103,16 @@ impl RocksDbResourceBudget {
             max_open_files: 512,
             write_buffer_bytes: 16 * MIB,
             max_write_buffer_count: 2,
+            memtable_budget_bytes: 256 * MIB,
         }
     }
 
     /// Derive-store writer defaults sized for smaller rebuildable artifacts.
     ///
     /// `128 MiB` block cache, `64 MiB` WAL ceiling, `256` open file handles,
-    /// and `8 MiB x 2` write buffers per column family. Derive stores hold
-    /// smaller working sets than the canonical chain store and are rebuildable
-    /// from retained chain events.
+    /// `8 MiB x 2` write buffers per column family, and `64 MiB` total
+    /// memtable budget. Derive stores hold smaller working sets than the
+    /// canonical chain store and are rebuildable from retained chain events.
     #[must_use]
     pub const fn derive_writer_defaults() -> Self {
         Self {
@@ -111,15 +121,17 @@ impl RocksDbResourceBudget {
             max_open_files: 256,
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
+            memtable_budget_bytes: 64 * MIB,
         }
     }
 
     /// Canonical-store reader defaults for secondary processes.
     ///
     /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
-    /// and `8 MiB x 2` write buffers per column family. Secondary readers
-    /// replay the writer's manifest and serve public traffic; their memory
-    /// posture must stay below the writer so readers cannot starve clean sync.
+    /// `8 MiB x 2` write buffers per column family, and `16 MiB` total
+    /// memtable budget. Secondary readers replay the writer's manifest and
+    /// serve public traffic; their memory posture must stay below the writer
+    /// so readers cannot starve clean sync.
     #[must_use]
     pub const fn canonical_reader_defaults() -> Self {
         Self {
@@ -128,14 +140,16 @@ impl RocksDbResourceBudget {
             max_open_files: 128,
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
+            memtable_budget_bytes: 16 * MIB,
         }
     }
 
     /// Derive-store reader defaults for secondary processes.
     ///
     /// `64 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
-    /// and `4 MiB x 2` write buffers per column family. Derive reader stores
-    /// are rebuildable and subordinate to the canonical reader path.
+    /// `4 MiB x 2` write buffers per column family, and `16 MiB` total
+    /// memtable budget. Derive reader stores are rebuildable and subordinate
+    /// to the canonical reader path.
     #[must_use]
     pub const fn derive_reader_defaults() -> Self {
         Self {
@@ -144,14 +158,16 @@ impl RocksDbResourceBudget {
             max_open_files: 64,
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
+            memtable_budget_bytes: 16 * MIB,
         }
     }
 
     /// Defaults for throwaway local test stores.
     ///
-    /// `32 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles, and
-    /// `4 MiB x 2` write buffers per column family. Keeps unit-test memory
-    /// footprint negligible while still exercising the bounded code path.
+    /// `32 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
+    /// `4 MiB x 2` write buffers per column family, and `8 MiB` total
+    /// memtable budget. Keeps unit-test memory footprint negligible while
+    /// still exercising the bounded code path.
     #[must_use]
     pub const fn for_local_tests() -> Self {
         Self {
@@ -160,6 +176,7 @@ impl RocksDbResourceBudget {
             max_open_files: 64,
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
+            memtable_budget_bytes: 8 * MIB,
         }
     }
 
@@ -185,6 +202,9 @@ impl RocksDbResourceBudget {
         if self.max_write_buffer_count < Self::MIN_MAX_WRITE_BUFFER_COUNT {
             return Err("rocksdb_resource_budget.max_write_buffer_count must be at least 2");
         }
+        if self.memtable_budget_bytes < Self::MIN_MEMTABLE_BUDGET_BYTES {
+            return Err("rocksdb_resource_budget.memtable_budget_bytes must be at least 4 MiB");
+        }
         Ok(())
     }
 }
@@ -203,6 +223,7 @@ mod tests {
         assert_eq!(budget.max_open_files, 512);
         assert_eq!(budget.write_buffer_bytes, 16 * MIB);
         assert_eq!(budget.max_write_buffer_count, 2);
+        assert_eq!(budget.memtable_budget_bytes, 256 * MIB);
     }
 
     #[test]
@@ -212,6 +233,10 @@ mod tests {
         assert_eq!(derive.block_cache_bytes * 4, canonical.block_cache_bytes);
         assert_eq!(derive.max_wal_bytes * 4, canonical.max_wal_bytes);
         assert_eq!(derive.write_buffer_bytes * 2, canonical.write_buffer_bytes);
+        assert_eq!(
+            derive.memtable_budget_bytes * 4,
+            canonical.memtable_budget_bytes
+        );
     }
 
     #[test]
@@ -233,6 +258,7 @@ mod tests {
         assert!(budget.max_wal_bytes <= 32 * MIB);
         assert!(budget.max_open_files <= 128);
         assert!(budget.write_buffer_bytes <= 8 * MIB);
+        assert!(budget.memtable_budget_bytes <= 8 * MIB);
     }
 
     #[test]
@@ -262,6 +288,15 @@ mod tests {
         budget.max_write_buffer_count = 1;
         assert!(
             matches!(budget.validate(), Err(reason) if reason.contains("max_write_buffer_count"))
+        );
+    }
+
+    #[test]
+    fn undersized_memtable_budget_is_rejected() {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.memtable_budget_bytes = MIB;
+        assert!(
+            matches!(budget.validate(), Err(reason) if reason.contains("memtable_budget_bytes"))
         );
     }
 }

@@ -137,8 +137,7 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
     let wallet_query =
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
-    let response =
-        tree_state_at_response(&wallet_query, first_tree_state.height, None).await?;
+    let response = tree_state_at_response(&wallet_query, first_tree_state.height, None).await?;
     let response_chain_epoch = response
         .chain_epoch
         .ok_or_else(|| eyre!("missing response chain epoch"))?;

@@ -24,6 +24,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tonic.workspace = true
 tonic-types.workspace = true
+tracing.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 

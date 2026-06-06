@@ -6,7 +6,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use zinder_client::{BlockHeight, ChainEpochId, LocalChainIndex, LocalOpenOptions, Network};
+use zinder_client::{
+    BlockHeight, ChainEpochId, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions,
+    Network,
+};
 use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
@@ -44,6 +47,7 @@ async fn open_local_chain_index(store_fixture: &StoreFixture) -> eyre::Result<Lo
         derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
+        initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
     })
     .await?)
