@@ -54,13 +54,13 @@ pub(crate) fn read_tree_state_checkpoint_at_or_before(
                 return Ok(PrefixScanControl::Continue);
             }
 
-            let replaces_current = checkpoint
-                .as_ref()
-                .is_none_or(|current| tree_state.height > current.height);
-            if replaces_current {
-                checkpoint = Some(tree_state);
-            }
-            Ok(PrefixScanControl::Continue)
+            // The reverse scan visits descending (epoch, height), so the first
+            // entry that clears the epoch/height filters and matches the
+            // canonical block hash is the highest stored checkpoint at-or-below
+            // max_height. Stop there instead of draining the whole column family
+            // (one checkpoint per 100 blocks, plus a block-header read each).
+            checkpoint = Some(tree_state);
+            Ok(PrefixScanControl::Stop)
         },
     )?;
     Ok(checkpoint)
