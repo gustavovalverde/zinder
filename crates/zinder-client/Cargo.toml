@@ -17,7 +17,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
-tonic = { workspace = true, features = ["transport"] }
+tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roots"] }
 tonic-types.workspace = true
 tracing.workspace = true
 zinder-core.workspace = true

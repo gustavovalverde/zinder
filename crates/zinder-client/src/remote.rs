@@ -115,8 +115,16 @@ impl RemoteChainIndex {
     /// established on the first gRPC call, not here. Only URI parsing can
     /// fail at this stage; transport errors surface at first use.
     pub fn connect(options: RemoteOpenOptions) -> Result<Self, IndexerError> {
-        let endpoint = Channel::from_shared(options.endpoint)
-            .map_err(|error| IndexerError::invalid_request(error.to_string()))?
+        // URI scheme is the TLS signal: `https://` negotiates rustls with system roots.
+        let use_tls = options.endpoint.starts_with("https://");
+        let mut endpoint = Channel::from_shared(options.endpoint)
+            .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
+        if use_tls {
+            endpoint = endpoint
+                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+                .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
+        }
+        let endpoint = endpoint
             .keep_alive_while_idle(true)
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
