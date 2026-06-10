@@ -6,17 +6,14 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
-use std::num::NonZeroU32;
-
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
-    BroadcastUnknown, ChainEpoch, CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TxStatus,
+    BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch,
+    CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentUnspentOutput, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::ZINDER_CAPABILITIES;
@@ -29,10 +26,10 @@ use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    AddressOutputIndex, AddressOutputIndexRequest, BlockHeaderResponseValue, BlockIdResponseValue,
-    ChainEvents, CompactBlock, LatestBlock, LatestSafeBlock, QueryError, SubtreeRoots,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest, TreeState,
-    WalletQueryApi,
+    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, LatestBlock,
+    LatestSafeBlock, QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
 use zinder_store::{
@@ -327,117 +324,17 @@ pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized
         .map(build_transparent_outputs_by_outpoint_response)
 }
 
-/// Reads transparent address outputs for `request` and encodes the native
-/// wallet response. The unary RPC and the streaming RPC share this helper.
-pub async fn address_output_index_response<Q: WalletQueryApi + ?Sized>(
+/// Reads the complete unspent transparent output set for `request` at one
+/// pinned chain epoch. The gRPC adapter streams the returned set one
+/// message per output.
+pub async fn transparent_address_unspent_outputs_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    request: AddressOutputIndexRequest,
+    request: TransparentAddressUnspentOutputsRequest,
     at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::AddressOutputIndexResponse, QueryError> {
+) -> Result<TransparentAddressUnspentOutputs, QueryError> {
     query_api
-        .address_output_index(request, at_epoch)
+        .transparent_address_unspent_outputs(request, at_epoch)
         .await
-        .map(build_address_output_index_response)
-}
-
-/// Per-request address cap for [`transparent_address_confirmed_balance_response`].
-///
-/// Mirrors the cap the federated explorer plane enforces in
-/// `services/zinder-explorer/src/grpc/adapter.rs`. Each address fans out into a
-/// paginated output scan; without a cap one request could fan out into thousands
-/// of column-family seeks.
-pub const MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST: u32 = 256;
-
-/// Per-address page size used when draining outputs for balance computation.
-///
-/// The native output RPC pages with cursors. The balance helper drains the
-/// stream for each address; this constant bounds how many outputs the helper
-/// asks for per round-trip. A large page reduces round-trips for whale
-/// addresses; the value mirrors `DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS` in
-/// `crates/zinder-query/src/grpc/adapter.rs`.
-const TRANSPARENT_BALANCE_OUTPUT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-
-/// Aggregates confirmed transparent balance across the requested addresses by
-/// draining canonical outputs at one chain epoch and summing `value_zat`.
-///
-/// Pins the read to `at_epoch` when supplied so the response is reproducible
-/// across pages; otherwise the first page binds the epoch and the loop
-/// reuses it across every subsequent page and address. Returns a
-/// [`wallet::TransparentAddressBalanceResponse`] with `unconfirmed_delta_zat`
-/// fixed at zero; the mempool overlay belongs to the derive plane, not this
-/// path. The accumulator saturates at [`u64::MAX`] in keeping with the rest
-/// of the wallet read surface; Zcash's hardcoded `MAX_MONEY` (21M * 10^8 zat)
-/// fits comfortably inside `u64::MAX` so saturation only triggers on upstream
-/// data corruption.
-///
-/// # Errors
-///
-/// Returns [`QueryError::InvalidAddress`] when the input contains no
-/// addresses, exceeds [`MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST`], or
-/// fails address-network validation. Propagates the underlying
-/// [`QueryError`] from each output page lookup.
-pub async fn transparent_address_confirmed_balance_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    addresses: Vec<wallet::AddressLookup>,
-    network: Network,
-    at_epoch: Option<ChainEpoch>,
-) -> Result<wallet::TransparentAddressBalanceResponse, QueryError> {
-    if addresses.is_empty() {
-        return Err(QueryError::InvalidAddress {
-            reason: "addresses list must not be empty",
-        });
-    }
-    let address_count = u32::try_from(addresses.len())
-        .ok()
-        .filter(|count| *count <= MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST)
-        .ok_or(QueryError::InvalidAddress {
-            reason: "addresses list exceeds the per-request balance cap",
-        })?;
-
-    let mut confirmed_zat: u64 = 0;
-    let mut pinned_epoch = at_epoch;
-    let mut chain_epoch: Option<ChainEpoch> = None;
-    for address in addresses {
-        let address_script_hash = address_lookup_to_script_hash(Some(address), network)?;
-        let mut from_cursor: Option<StreamCursorTokenV1> = None;
-        loop {
-            let request = AddressOutputIndexRequest {
-                address_script_hash,
-                start_height: BlockHeight::new(0),
-                max_entries: TRANSPARENT_BALANCE_OUTPUT_PAGE_SIZE,
-                from_cursor: from_cursor.clone(),
-            };
-            let page = query_api
-                .address_output_index(request, pinned_epoch)
-                .await?;
-            // Pin every subsequent page (and every later address) to the
-            // first observed epoch so the response is reproducible.
-            if pinned_epoch.is_none() {
-                pinned_epoch = Some(page.chain_epoch);
-            }
-            chain_epoch = Some(page.chain_epoch);
-            for output in &page.outputs {
-                confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            from_cursor = Some(next_cursor);
-        }
-    }
-
-    // The non-empty-addresses guard at the top ensures the loop pinned
-    // `chain_epoch`; the `ok_or` surfaces a typed error if a future refactor
-    // ever drops that invariant.
-    let chain_epoch = chain_epoch.ok_or(QueryError::InvalidAddress {
-        reason: "balance scan produced no chain epoch",
-    })?;
-    Ok(wallet::TransparentAddressBalanceResponse {
-        confirmed_zat,
-        unconfirmed_delta_zat: 0,
-        address_count,
-        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
-    })
 }
 
 /// Resolves a `wallet::AddressLookup` oneof to the typed
@@ -515,17 +412,21 @@ pub fn build_transparent_address_tx_ids_chunk(
     }
 }
 
-/// Builds one stream chunk message from a output and the chain epoch.
+/// Builds one streamed unspent-output message bound to the stream's pinned
+/// chain epoch.
 #[must_use]
-pub fn build_address_output_index_stream_chunk(
+pub fn build_transparent_unspent_output_message(
     chain_epoch: ChainEpoch,
-    output: &AddressOutputIndexArtifact,
-    cursor: Vec<u8>,
-) -> wallet::AddressOutputIndexStreamChunk {
-    wallet::AddressOutputIndexStreamChunk {
+    output: &TransparentUnspentOutput,
+) -> wallet::TransparentUnspentOutput {
+    wallet::TransparentUnspentOutput {
         chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
-        output: Some(build_address_output_index_message(output)),
-        cursor,
+        address_script_hash: output.address_script_hash.as_bytes().to_vec(),
+        script_pub_key: output.script_pub_key.clone(),
+        outpoint: Some(outpoint_message(&output.outpoint)),
+        value_zat: output.value_zat,
+        block_height: output.block_height.value(),
+        block_hash: encode_rpc_block_hash_hex(output.block_hash),
     }
 }
 
@@ -539,37 +440,6 @@ fn build_transparent_outputs_by_outpoint_response(
             .into_iter()
             .map(transparent_output_entry_message)
             .collect(),
-    }
-}
-
-fn build_address_output_index_response(
-    response: AddressOutputIndex,
-) -> wallet::AddressOutputIndexResponse {
-    let chain_epoch = build_chain_epoch_message(response.chain_epoch);
-    wallet::AddressOutputIndexResponse {
-        chain_epoch: Some(chain_epoch),
-        outputs: response
-            .outputs
-            .iter()
-            .map(build_address_output_index_message)
-            .collect(),
-        next_cursor: response
-            .next_cursor
-            .map(|cursor| cursor.as_bytes().to_vec())
-            .unwrap_or_default(),
-    }
-}
-
-fn build_address_output_index_message(
-    output: &AddressOutputIndexArtifact,
-) -> wallet::AddressOutputIndex {
-    wallet::AddressOutputIndex {
-        address_script_hash: output.address_script_hash.as_bytes().to_vec(),
-        script_pub_key: output.script_pub_key.clone(),
-        outpoint: Some(outpoint_message(&output.outpoint)),
-        value_zat: output.value_zat,
-        block_height: output.block_height.value(),
-        block_hash: encode_rpc_block_hash_hex(output.block_hash),
     }
 }
 

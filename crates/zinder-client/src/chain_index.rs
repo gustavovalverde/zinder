@@ -5,13 +5,13 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
-    BlockSelector, ChainEpoch, ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry,
-    MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
+    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
+    ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
+    RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
+    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -227,53 +227,19 @@ pub enum MempoolEvent {
 /// Mempool-event stream returned by [`ChainIndex::mempool_events`].
 pub type MempoolEventStream = IndexStream<MempoolEventEnvelope>;
 
-/// Opaque transparent-output cursor.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct AddressOutputCursor(StreamCursorTokenV1);
-
-impl AddressOutputCursor {
-    /// Creates a cursor from bytes previously returned by Zinder.
-    #[must_use]
-    pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
-        Self(StreamCursorTokenV1::from_bytes(cursor_bytes))
-    }
-
-    /// Returns the opaque cursor bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-/// Read parameters for [`ChainIndex::address_output_index`].
+/// Read parameters for [`ChainIndex::transparent_address_unspent_outputs`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndexQuery {
+pub struct TransparentAddressUnspentOutputsQuery {
     /// SHA-256 of the transparent address scriptPubKey.
     pub address_script_hash: TransparentAddressScriptHash,
-    /// Wallet-birthday optimization: minimum mined height to include.
-    /// Ignored when `from_cursor` is `Some`.
+    /// Wallet-birthday floor: minimum mined height to include.
     pub start_height: BlockHeight,
-    /// Server-bounded entry cap. `None` defers to the server default.
-    pub max_entries: Option<NonZeroU32>,
-    /// Optional cursor returned by a previous read.
-    pub from_cursor: Option<AddressOutputCursor>,
 }
 
-/// Page of unspent transparent outputs returned by `ChainIndex`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndexView {
-    /// Chain epoch used to answer the query.
-    pub chain_epoch: ChainEpoch,
-    /// Unspent outputs in ascending `(block_height, outpoint)` order.
-    pub outputs: Vec<AddressOutputIndexArtifact>,
-    /// Resume cursor when more outputs may be available.
-    pub next_cursor: Option<AddressOutputCursor>,
-}
-
-/// Stream of transparent-output chunks returned by
-/// [`ChainIndex::address_output_index_stream`]. Each item carries one
-/// output and the cursor to resume strictly after it.
-pub type AddressOutputIndexStream = IndexStream<AddressOutputIndexStreamItem>;
+/// Stream of unspent transparent outputs returned by
+/// [`ChainIndex::transparent_address_unspent_outputs`]. The stream always
+/// carries the complete unspent set at one pinned chain epoch.
+pub type TransparentAddressUnspentOutputsStream = IndexStream<TransparentUnspentOutputStreamItem>;
 
 /// Opaque transparent-address tx-history cursor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -325,17 +291,13 @@ pub struct TransparentAddressTxIdsStreamItem {
 /// [`ChainIndex::transparent_address_tx_ids_in_range`].
 pub type TransparentAddressTxIdsStream = IndexStream<TransparentAddressTxIdsStreamItem>;
 
-/// One streamed transparent-output chunk.
+/// One streamed unspent transparent output.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndexStreamItem {
-    /// Chain epoch used to answer this chunk.
+pub struct TransparentUnspentOutputStreamItem {
+    /// Chain epoch pinned for the entire stream.
     pub chain_epoch: ChainEpoch,
     /// Single unspent output.
-    pub output: AddressOutputIndexArtifact,
-    /// Resume cursor for this position. `None` on every chunk except the
-    /// last one, where it carries the next-page cursor when more outputs may
-    /// be available.
-    pub cursor: Option<AddressOutputCursor>,
+    pub output: TransparentUnspentOutput,
 }
 
 /// Typed chain-index contract consumed by wallets and applications.
@@ -719,55 +681,32 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// ```
     async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
 
-    /// Reads a bounded page of unspent transparent outputs.
+    /// Streams the complete unspent transparent output set for one
+    /// transparent address at a single pinned chain epoch.
+    ///
+    /// The stream cannot be truncated: there is no cursor and no entry
+    /// cap. Client memory for a drained stream is proportional to the
+    /// address's unspent set.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use zinder_client::{
     /// #     BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash,
-    /// #     AddressOutputIndexQuery,
+    /// #     TransparentAddressUnspentOutputsQuery,
     /// # };
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let query = AddressOutputIndexQuery {
+    /// let query = TransparentAddressUnspentOutputsQuery {
     ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
     ///     start_height: BlockHeight::new(0),
-    ///     max_entries: None,
-    ///     from_cursor: None,
     /// };
-    /// let page = client.address_output_index(query, None).await?;
-    /// # let _ = page; Ok(()) }
-    /// ```
-    async fn address_output_index(
-        &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexView, IndexerError>;
-
-    /// Streams unspent transparent outputs for one transparent address.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{
-    /// #     BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash,
-    /// #     AddressOutputIndexQuery,
-    /// # };
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let query = AddressOutputIndexQuery {
-    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
-    ///     start_height: BlockHeight::new(0),
-    ///     max_entries: None,
-    ///     from_cursor: None,
-    /// };
-    /// let stream = client.address_output_index_stream(query, None).await?;
+    /// let stream = client.transparent_address_unspent_outputs(query).await?;
     /// # let _ = stream; Ok(()) }
     /// ```
-    async fn address_output_index_stream(
+    async fn transparent_address_unspent_outputs(
         &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexStream, IndexerError>;
+        query: TransparentAddressUnspentOutputsQuery,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError>;
 
     /// Streams current transparent-address tx-history index entries.
     ///
@@ -820,22 +759,26 @@ pub trait ChainIndex: Send + Sync + 'static {
         request: TransparentMempoolOutputsRequest,
     ) -> Result<Vec<TransparentMempoolOutput>, IndexerError>;
 
-    /// Returns the mempool spend that consumes `outpoint`, when one is
-    /// present.
+    /// Returns the mempool spends that consume any of `outpoints`.
+    ///
+    /// Outpoints with no unmined spend produce no entry; callers key
+    /// results by `spent_outpoint`. Implementations silently truncate
+    /// requests above
+    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0);
-    /// let spend = client.transparent_mempool_spend_by_outpoint(outpoint).await?;
-    /// # let _ = spend; Ok(()) }
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let spends = client.transparent_mempool_spends_by_outpoint(&outpoints).await?;
+    /// # let _ = spends; Ok(()) }
     /// ```
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<TransparentMempoolSpend>, IndexerError>;
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError>;
 
     /// Returns the transparent-address balance summed across `addresses`.
     ///
@@ -849,13 +792,12 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// # use zinder_client::{ChainIndex, IndexerError, TransparentAddressScriptHash};
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
     /// let addresses = [TransparentAddressScriptHash::from_bytes([0u8; 32])];
-    /// let balance = client.transparent_address_balance(&addresses, None).await?;
+    /// let balance = client.transparent_address_balance(&addresses).await?;
     /// # let _ = balance; Ok(()) }
     /// ```
     async fn transparent_address_balance(
         &self,
         addresses: &[TransparentAddressScriptHash],
-        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressBalance, IndexerError>;
 
     /// Resolves a batch of canonical-chain transparent outpoints to their

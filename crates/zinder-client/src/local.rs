@@ -23,10 +23,11 @@ use zinder_store::{
 };
 
 use crate::{
-    AddressOutputIndexQuery, AddressOutputIndexStream, AddressOutputIndexStreamItem,
-    AddressOutputIndexView, BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream,
-    IndexerError, RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
+    BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream, IndexerError,
+    RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
+    TransparentUnspentOutputStreamItem,
 };
 
 /// Default maximum time spent on initial secondary catchup during local open.
@@ -461,40 +462,34 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn address_output_index(
+    async fn transparent_address_unspent_outputs(
         &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexView, IndexerError> {
-        let max_entries = query
-            .max_entries
-            .unwrap_or(DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS);
+        query: TransparentAddressUnspentOutputsQuery,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
         let store = self.store.clone();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        let (chain_epoch, outputs) = join_blocking(tokio::task::spawn_blocking(move || {
             store
                 .try_catch_up()
                 .map_err(IndexerError::from_store_error)?;
-            let cursor_token = query.from_cursor.map(|cursor| {
-                zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
-            });
             let page = store
                 .address_output_index_page(AddressOutputIndexPageRequest {
-                    at_epoch,
+                    at_epoch: None,
                     address_script_hash: query.address_script_hash,
                     start_height: query.start_height,
-                    max_entries,
-                    from_cursor: cursor_token.as_ref(),
+                    max_entries: NonZeroU32::MAX,
+                    from_cursor: None,
                 })
-                .map_err(map_address_output_store_error)?;
-            Ok(AddressOutputIndexView {
-                chain_epoch: page.chain_epoch,
-                outputs: page.outputs,
-                next_cursor: page.next_cursor.map(|cursor| {
-                    crate::AddressOutputCursor::from_bytes(cursor.as_bytes().to_vec())
-                }),
-            })
+                .map_err(IndexerError::from_store_error)?;
+            Ok((page.chain_epoch, page.outputs))
         }))
-        .await
+        .await?;
+        let items = outputs.into_iter().map(move |output| {
+            Ok(TransparentUnspentOutputStreamItem {
+                chain_epoch,
+                output,
+            })
+        });
+        Ok(Box::pin(stream::iter(items)))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -575,33 +570,6 @@ impl ChainIndex for LocalChainIndex {
         Ok(Box::pin(stream::iter(items)))
     }
 
-    async fn address_output_index_stream(
-        &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexStream, IndexerError> {
-        let view = self.address_output_index(query, at_epoch).await?;
-        let chain_epoch = view.chain_epoch;
-        let next_cursor = view.next_cursor;
-        let last_index = view.outputs.len().saturating_sub(1);
-        let items = view
-            .outputs
-            .into_iter()
-            .enumerate()
-            .map(move |(index, output)| {
-                Ok(AddressOutputIndexStreamItem {
-                    chain_epoch,
-                    output,
-                    cursor: if index == last_index {
-                        next_cursor.clone()
-                    } else {
-                        None
-                    },
-                })
-            });
-        Ok(Box::pin(stream::iter(items)))
-    }
-
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: zinder_core::TransparentMempoolOutputsRequest,
@@ -611,22 +579,21 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        outpoint: zinder_core::TransparentOutPoint,
-    ) -> Result<Option<zinder_core::TransparentMempoolSpend>, IndexerError> {
-        self.remote("transparent_mempool_spend_by_outpoint")?
-            .transparent_mempool_spend_by_outpoint(outpoint)
+        outpoints: &[zinder_core::TransparentOutPoint],
+    ) -> Result<Vec<zinder_core::TransparentMempoolSpend>, IndexerError> {
+        self.remote("transparent_mempool_spends_by_outpoint")?
+            .transparent_mempool_spends_by_outpoint(outpoints)
             .await
     }
 
     async fn transparent_address_balance(
         &self,
         addresses: &[zinder_core::TransparentAddressScriptHash],
-        at_epoch: Option<zinder_core::ChainEpoch>,
     ) -> Result<zinder_core::TransparentAddressBalance, IndexerError> {
         self.remote("transparent_address_balance")?
-            .transparent_address_balance(addresses, at_epoch)
+            .transparent_address_balance(addresses)
             .await
     }
 
@@ -711,19 +678,7 @@ fn spawn_catchup_loop(store: SecondaryChainStore, interval: Duration, cancel: Ca
     });
 }
 
-const DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only the typed transparent-output cursor error becomes a client invalid-request error; every other storage failure preserves its shared mapping."
-)]
-fn map_address_output_store_error(error: StoreError) -> IndexerError {
-    match error {
-        StoreError::AddressOutputCursorInvalid { reason } => IndexerError::invalid_request(reason),
-        _ => IndexerError::from_store_error(error),
-    }
-}
 
 #[allow(
     clippy::wildcard_enum_match_arm,

@@ -241,7 +241,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 |---|---|---|
 | `wallet.read.*` | Canonical block / transaction / tree-state reads | `wallet.read.transaction_by_id_v1` |
 | `wallet.mempool.*` | Live mempool point lookups | `wallet.mempool.transparent_outputs_by_address_v1` |
-| `wallet.address.*` | Transparent-address reads | `wallet.address.output_index_v1` |
+| `wallet.address.*` | Transparent-address reads | `wallet.address.transparent_unspent_outputs_v1` |
 | `wallet.events.*` | Streaming event families | `wallet.events.chain_v1` |
 | `wallet.snapshot.*` | Bounded snapshot reads | `wallet.snapshot.mempool_v1` |
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |

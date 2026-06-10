@@ -36,9 +36,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    AddressOutputIndexQuery, BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex,
-    IndexerError, Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
-    TransparentAddressScriptHash,
+    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, IndexerError, Network,
+    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
+    TransparentAddressUnspentOutputsQuery,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -136,36 +136,25 @@ async fn snapshot_utxos(
     script_hash: TransparentAddressScriptHash,
     address: &str,
 ) -> Result<(), IndexerError> {
-    let mut cursor = None;
     let mut total_zat: u64 = 0;
     let mut utxo_count: u32 = 0;
-    loop {
-        let view = chain_index
-            .address_output_index(
-                AddressOutputIndexQuery {
-                    address_script_hash: script_hash,
-                    start_height: BlockHeight::new(0),
-                    max_entries: None,
-                    from_cursor: cursor.clone(),
-                },
-                None,
-            )
-            .await?;
-        for utxo in &view.outputs {
-            utxo_count += 1;
-            total_zat = total_zat.saturating_add(utxo.value_zat);
-            println!(
-                "snapshot utxo: address={} height={} value_zat={} outpoint={:?}",
-                address,
-                utxo.block_height.value(),
-                utxo.value_zat,
-                utxo.outpoint
-            );
-        }
-        match view.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    let mut unspent_outputs = chain_index
+        .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
+            address_script_hash: script_hash,
+            start_height: BlockHeight::new(0),
+        })
+        .await?;
+    while let Some(unspent_item) = unspent_outputs.next().await {
+        let utxo = unspent_item?.output;
+        utxo_count += 1;
+        total_zat = total_zat.saturating_add(utxo.value_zat);
+        println!(
+            "snapshot utxo: address={} height={} value_zat={} outpoint={:?}",
+            address,
+            utxo.block_height.value(),
+            utxo.value_zat,
+            utxo.outpoint
+        );
     }
     println!("snapshot complete: utxos={utxo_count} total_zat={total_zat}");
     Ok(())

@@ -11,7 +11,7 @@
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the
 //! ingest pipeline uses, and asserts that:
 //!
-//! - `WalletQueryApi::address_output_index` and
+//! - `WalletQueryApi::transparent_address_unspent_outputs` and
 //!   `ExplorerQuery::TransparentAddressBalance` agree on `confirmed_zat` for
 //!   the same address; the federated balance is the sum of the visible UTXO
 //!   values.
@@ -151,13 +151,10 @@ impl FederatedBalanceFixture {
             Arc::new(sample_regtest_upgrade_activations()),
         );
         let utxos = wallet_query
-            .address_output_index(
-                zinder_query::AddressOutputIndexRequest {
+            .transparent_address_unspent_outputs(
+                zinder_query::TransparentAddressUnspentOutputsRequest {
                     address_script_hash: sample.address_script_hash,
                     start_height: sample.bulk_catchup_from_height,
-                    max_entries: NonZeroU32::new(1024)
-                        .ok_or_else(|| eyre!("invalid max entries"))?,
-                    from_cursor: None,
                 },
                 None,
             )
@@ -196,7 +193,6 @@ impl FederatedBalanceFixture {
                     self.address_script_hash.as_bytes().to_vec(),
                 )),
             }],
-            at_epoch: None,
         };
         let response = ExplorerQueryService::transparent_address_balance(
             &self.explorer_adapter,
@@ -449,7 +445,6 @@ impl MempoolOverlayFixture {
                     self.address_script_hash.as_bytes().to_vec(),
                 )),
             }],
-            at_epoch: None,
         };
         let response = ExplorerQueryService::transparent_address_balance(
             &self.explorer_adapter,
@@ -512,6 +507,7 @@ fn zebra_source(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
         ZebraJsonRpcSourceOptions {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
         },
     )?)
 }

@@ -805,13 +805,12 @@ wallet.events.chain_v1
 wallet.snapshot.mempool_v1
 wallet.events.mempool_v1
 wallet.mempool.transparent_outputs_by_address_v1
-wallet.mempool.transparent_spend_by_outpoint_v1
+wallet.mempool.transparent_spends_by_outpoint_v1
 wallet.mempool.transparent_outputs_by_outpoint_v1
 wallet.read.transparent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
-wallet.address.output_index_v1
+wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
-wallet.address.transparent_balance_v1
 explorer.server_info_v1
 explorer.transparent_address.balance_v1
 explorer.transaction.detail_v1

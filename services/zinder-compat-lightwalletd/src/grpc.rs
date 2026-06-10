@@ -26,9 +26,9 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    AddressOutputIndex, AddressOutputIndexRequest, SubtreeRoots,
-    TransparentAddressTxIdsInRangeRequest, TreeState, WalletQueryApi, status_from_query_error,
-    transparent_address_confirmed_balance_response,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::MempoolEvent;
@@ -216,15 +216,14 @@ where
         let mut replies = Vec::new();
 
         for address in request.addresses {
-            let query_request = address_output_index_request(
+            let query_request = transparent_address_unspent_outputs_request(
                 &address,
                 latest_block.chain_epoch.network,
                 BlockHeight::new(start_height),
-                max_entries,
             )?;
             let address_utxos = self
                 .query_api
-                .address_output_index(query_request, Some(latest_block.chain_epoch))
+                .transparent_address_unspent_outputs(query_request, Some(latest_block.chain_epoch))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
@@ -242,38 +241,56 @@ where
     }
 
     /// Returns lightwalletd `Balance { value_zat: int64 }` computed from the
-    /// canonical transparent UTXO column family.
+    /// canonical unspent transparent output projection.
     ///
     /// The compat shim answers `GetTaddressBalance` directly from canonical
     /// artifacts: the legacy proto carries one signed `value_zat`
     /// field that wallets interpret as confirmed balance. The richer native
     /// `WalletQuery.TransparentAddressBalance` adds a mempool overlay through
-    /// the optional derive plane and is the right surface for clients that
+    /// the federated explorer plane and is the right surface for clients that
     /// need pending deltas.
     async fn compat_balance_response(
         &self,
         addresses: Vec<String>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
+        if addresses.is_empty() {
+            return Err(Status::invalid_argument("addresses list must not be empty"));
+        }
+        if addresses.len() > MAX_COMPAT_BALANCE_ADDRESSES {
+            return Err(Status::invalid_argument(
+                "addresses list exceeds the per-request balance cap",
+            ));
+        }
         let latest_block = self
             .query_api
             .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let address_lookups = addresses
-            .into_iter()
-            .map(|address| wallet_proto::AddressLookup {
-                selector: Some(address_lookup::Selector::Address(address)),
-            })
-            .collect();
-        let balance = transparent_address_confirmed_balance_response(
-            &self.query_api,
-            address_lookups,
-            latest_block.chain_epoch.network,
-            Some(latest_block.chain_epoch),
-        )
-        .await
-        .map_err(|error| status_from_query_error(&error))?;
-        let value_zat = i64::try_from(balance.confirmed_zat).map_err(|_| {
+        let mut confirmed_zat: u64 = 0;
+        for address in addresses {
+            let address_script_hash = address_lookup_to_script_hash(
+                Some(wallet_proto::AddressLookup {
+                    selector: Some(address_lookup::Selector::Address(address)),
+                }),
+                latest_block.chain_epoch.network,
+            )
+            .map_err(|error| status_from_query_error(&error))?;
+            let unspent_outputs = self
+                .query_api
+                .transparent_address_unspent_outputs(
+                    TransparentAddressUnspentOutputsRequest {
+                        address_script_hash,
+                        start_height: BlockHeight::new(0),
+                    },
+                    Some(latest_block.chain_epoch),
+                )
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
+            for output in &unspent_outputs.outputs {
+                confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
+            }
+        }
+        let value_zat = i64::try_from(confirmed_zat).map_err(|_| {
             Status::out_of_range(
                 "transparent address confirmed balance exceeds i64::MAX; \
                  use the native WalletQuery.TransparentAddressBalance surface",
@@ -282,6 +299,10 @@ where
         Ok(Response::new(lightwalletd::Balance { value_zat }))
     }
 }
+
+/// Hard cap on the number of addresses one `GetTaddressBalance` request may
+/// sum across. Each address fans out into one full unspent-set read.
+const MAX_COMPAT_BALANCE_ADDRESSES: usize = 256;
 
 #[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
@@ -991,12 +1012,11 @@ fn transparent_address_tx_history_request(
     })
 }
 
-fn address_output_index_request(
+fn transparent_address_unspent_outputs_request(
     address: &str,
     network: Network,
     start_height: BlockHeight,
-    max_entries: NonZeroU32,
-) -> Result<AddressOutputIndexRequest, Status> {
+) -> Result<TransparentAddressUnspentOutputsRequest, Status> {
     let transparent_address = address
         .parse::<ZebraTransparentAddress>()
         .map_err(|source| {
@@ -1015,17 +1035,15 @@ fn address_output_index_request(
         ));
     }
 
-    Ok(AddressOutputIndexRequest {
+    Ok(TransparentAddressUnspentOutputsRequest {
         address_script_hash: TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
         start_height,
-        max_entries,
-        from_cursor: None,
     })
 }
 
 fn lightwalletd_address_utxos(
     address: &str,
-    address_utxos: &AddressOutputIndex,
+    address_utxos: &TransparentAddressUnspentOutputs,
 ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
     address_utxos
         .outputs

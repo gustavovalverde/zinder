@@ -14,12 +14,12 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeight, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown,
-    ChainEpochId, ChainTipMetadata, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentSpendFact,
+    BlockHash, BlockHeight, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
+    BroadcastRejectionReason, BroadcastUnknown, ChainEpochId, ChainTipMetadata, Network,
+    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentSpendFact,
+    TransparentUnspentOutput,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -192,7 +192,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             let spent_outpoint = TransparentOutPoint::new(spent_transaction_id, 1);
             (
                 vec![
-                    AddressOutputIndexArtifact::new(
+                    TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                         script_pub_key.clone(),
                         unspent_outpoint,
@@ -200,7 +200,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
                         block.height,
                         block.hash,
                     ),
-                    AddressOutputIndexArtifact::new(
+                    TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                         script_pub_key.clone(),
                         spent_outpoint,
@@ -294,7 +294,7 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
         },
         |block| {
             (
-                vec![AddressOutputIndexArtifact::new(
+                vec![TransparentUnspentOutput::new(
                     TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                     script_pub_key.clone(),
                     TransparentOutPoint::new(transaction_id, 0),
@@ -362,7 +362,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
         |block| {
             (
                 vec![
-                    AddressOutputIndexArtifact::new(
+                    TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_a),
                         script_pub_key_a.clone(),
                         TransparentOutPoint::new(truncated_transaction_id, 0),
@@ -370,7 +370,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                         block.height,
                         block.hash,
                     ),
-                    AddressOutputIndexArtifact::new(
+                    TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
                         TransparentOutPoint::new(first_transaction_id, 0),
@@ -378,7 +378,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                         block.height,
                         block.hash,
                     ),
-                    AddressOutputIndexArtifact::new(
+                    TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
                         TransparentOutPoint::new(second_transaction_id, 1),
@@ -1108,7 +1108,7 @@ where
     TransactionsFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<FixtureTransactionRows>,
     TransparentFn: FnOnce(
         &zinder_testkit::FixtureBlock,
-    ) -> (Vec<AddressOutputIndexArtifact>, Vec<TransparentSpendFact>),
+    ) -> (Vec<TransparentUnspentOutput>, Vec<TransparentSpendFact>),
 {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(1)

@@ -836,12 +836,12 @@ impl IngestControl for StaticIngestControl {
         ))
     }
 
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        _request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        _request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
         Err(Status::unimplemented(
-            "test scaffold does not stub TransparentMempoolSpendByOutpoint",
+            "test scaffold does not stub TransparentMempoolSpendsByOutpoint",
         ))
     }
 

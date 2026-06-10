@@ -147,11 +147,12 @@ Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the
   with `pruned_suppressed_count` on the retention report. Source-side emission
   is reserved per the §Suppression decision above.
 - `WalletQuery.TransparentMempoolOutputsByAddress` and
-  `WalletQuery.TransparentMempoolSpendByOutpoint` mirror the typed
-  `ChainIndex` mempool point lookups onto the gRPC wire. Both proxy through
-  `IngestControl` so secondary readers continue to share one mempool source.
-  Capabilities `wallet.mempool.transparent_outputs_by_address_v1` and
-  `wallet.mempool.transparent_spend_by_outpoint_v1` advertise the surface.
+  `WalletQuery.TransparentMempoolSpendsByOutpoint` mirror the typed
+  `ChainIndex` mempool lookups onto the gRPC wire (the spend lookup is
+  batched by outpoint). Both proxy through `IngestControl` so secondary
+  readers continue to share one mempool source. Capabilities
+  `wallet.mempool.transparent_outputs_by_address_v1` and
+  `wallet.mempool.transparent_spends_by_outpoint_v1` advertise the surface.
 
 ## Out of Scope
 

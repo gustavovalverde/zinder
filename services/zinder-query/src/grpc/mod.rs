@@ -22,14 +22,13 @@ pub(crate) const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings, UpstreamNodeCapabilities,
-    address_lookup_to_script_hash, address_output_index_response,
+    ServerInfoSettings, UpstreamNodeCapabilities, address_lookup_to_script_hash,
     block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_address_output_index_stream_chunk,
-    build_transparent_address_tx_ids_chunk, build_wallet_server_info, chain_events_response,
+    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
+    build_transparent_unspent_output_message, build_wallet_server_info, chain_events_response,
     compact_block_response, latest_block_response, latest_tree_state_checkpoint_response,
-    subtree_roots_response, transaction_response, transparent_address_confirmed_balance_response,
-    transparent_address_tx_ids_response, transparent_outputs_by_outpoint_response,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
     tree_state_at_response,
 };
 
@@ -49,7 +48,6 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
         QueryError::InvalidBlockRange { .. }
         | QueryError::CompactBlockRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
-        | QueryError::AddressOutputCursorInvalid { .. }
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
         | QueryError::UnsupportedShieldedProtocol { .. } => {
@@ -103,7 +101,6 @@ fn error_reason_for_query_error(error: &QueryError) -> ErrorReason {
         QueryError::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
         QueryError::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
         QueryError::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
-        QueryError::AddressOutputCursorInvalid { .. } => ErrorReason::AddressOutputCursorInvalid,
         QueryError::TransparentHistoryCursorInvalid { .. } => {
             ErrorReason::TransparentHistoryCursorInvalid
         }
@@ -168,7 +165,6 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
             )
         }
         QueryError::ChainEventCursorInvalid { reason }
-        | QueryError::AddressOutputCursorInvalid { reason }
         | QueryError::TransparentHistoryCursorInvalid { reason } => {
             ErrorDetails::with_bad_request_violation("from_cursor", *reason)
         }

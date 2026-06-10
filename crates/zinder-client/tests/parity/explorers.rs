@@ -5,14 +5,14 @@
 //! per-address state. These compile-time assertions ensure the trait surface
 //! they depend on stays intact through future refactors.
 
-use std::num::NonZeroU32;
-
 use eyre::eyre;
+use std::num::NonZeroU32;
 use tokio_stream::StreamExt as _;
+
 use zinder_client::{
-    AddressOutputIndexArtifact, AddressOutputIndexQuery, BlockHeight, ChainIndex, IndexerError,
-    LocalChainIndex, RemoteChainIndex, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    BlockHeight, ChainIndex, IndexerError, LocalChainIndex, RemoteChainIndex, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
+    TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_testkit::{
     open_test_derive_store_for_canonical, seed_transparent_address_transaction_history,
@@ -31,7 +31,7 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
         let _ = T::transaction_by_id;
         // per-address mempool overlays
         let _ = T::transparent_mempool_outputs_by_address;
-        let _ = T::transparent_mempool_spend_by_outpoint;
+        let _ = T::transparent_mempool_spends_by_outpoint;
         // typed TransparentAddressBalance via federated derive
         let _ = T::transparent_address_balance;
         // M6 canonical prevout resolution and live-mempool prevout fallback.
@@ -46,6 +46,10 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "End-to-end fixture covering the unspent stream, tx history, and balance refusal in one flow."
+)]
 async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> {
     let address_script_hash = TransparentAddressScriptHash::from_bytes([0xA7; 32]);
     let transaction_id = TransactionId::from_bytes([0xA8; 32]);
@@ -56,7 +60,7 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     let block_height = block.height;
     let block_hash = block.hash;
     let transparent_outpoint = TransparentOutPoint::new(transaction_id, 0);
-    let utxo = AddressOutputIndexArtifact::new(
+    let utxo = TransparentUnspentOutput::new(
         address_script_hash,
         vec![0x76, 0xA9],
         transparent_outpoint,
@@ -79,20 +83,16 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
     let chain_index = open_local_chain_index(&store_fixture).await?;
 
-    let utxos = chain_index
-        .address_output_index(
-            AddressOutputIndexQuery {
-                address_script_hash,
-                start_height: BlockHeight::new(1),
-                max_entries: Some(
-                    NonZeroU32::new(10)
-                        .ok_or_else(|| eyre::eyre!("test max_entries constant must be non-zero"))?,
-                ),
-                from_cursor: None,
-            },
-            None,
-        )
+    let mut utxo_stream = chain_index
+        .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
+            address_script_hash,
+            start_height: BlockHeight::new(1),
+        })
         .await?;
+    let mut utxo_items = Vec::new();
+    while let Some(stream_item) = utxo_stream.next().await {
+        utxo_items.push(stream_item?);
+    }
     let mut history = chain_index
         .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
             address_script_hash,
@@ -111,15 +111,24 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         .await
         .ok_or_else(|| eyre::eyre!("missing transparent history item"))??;
 
-    assert_eq!(utxos.outputs, vec![utxo]);
-    assert!(utxos.next_cursor.is_none());
-    assert_eq!(history_item.chain_epoch, utxos.chain_epoch);
+    let utxo_chain_epoch = utxo_items
+        .first()
+        .map(|stream_item| stream_item.chain_epoch)
+        .ok_or_else(|| eyre::eyre!("unspent stream must not be empty"))?;
+    assert_eq!(
+        utxo_items
+            .iter()
+            .map(|stream_item| stream_item.output.clone())
+            .collect::<Vec<_>>(),
+        vec![utxo]
+    );
+    assert_eq!(history_item.chain_epoch, utxo_chain_epoch);
     assert_eq!(history_item.artifact, tx_history);
     assert!(history_item.cursor.is_some());
     assert!(history.next().await.is_none());
     assert!(matches!(
         chain_index
-            .transparent_address_balance(&[address_script_hash], Some(utxos.chain_epoch))
+            .transparent_address_balance(&[address_script_hash])
             .await,
         Err(zinder_client::IndexerError::RemoteEndpointUnconfigured {
             operation: "transparent_address_balance"
@@ -139,7 +148,7 @@ async fn serves_explorer_transparent_outputs_by_outpoint_in_input_order() -> eyr
     let block_hash = block.hash;
     let indexed_transaction_id = TransactionId::from_bytes([0xAC; 32]);
     let script_pub_key = vec![0x76, 0xa9, 0x33, 0x88, 0xac];
-    let chain_fixture = base_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+    let chain_fixture = base_fixture.with_address_output_index(TransparentUnspentOutput::new(
         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
         script_pub_key,
         TransparentOutPoint::new(indexed_transaction_id, 0),

@@ -463,6 +463,7 @@ async fn build_broadcaster(
         ZebraJsonRpcSourceOptions {
             request_timeout: target.request_timeout,
             max_response_bytes: target.max_response_bytes,
+            broadcast_timeout: target.broadcast_timeout,
         },
     )
     .map_err(|source| QueryConfigError::Source(Box::new(source)))?;

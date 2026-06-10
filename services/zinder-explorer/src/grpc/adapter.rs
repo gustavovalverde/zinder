@@ -16,6 +16,7 @@
 //! clone-cheap) so the explorer never opens one HTTP/2 connection per
 //! request.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,9 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{Network, wire::encode_zinder_native_chain_name};
+use zinder_core::{
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, wire::encode_zinder_native_chain_name,
+};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
@@ -762,13 +765,20 @@ impl ExplorerQueryGrpcAdapter {
 
 /// Hard cap on the number of addresses one balance request may sum across.
 ///
-/// Shape C reads canonical outputs and the mempool overlay per address, so an
-/// unbounded list would let one request fan out into thousands of
-/// `WalletQuery` round-trips. The cap mirrors the bounded-page rule used by
-/// the rest of the transparent-address surface. `u32` matches the
+/// Each address fans out into one unspent-output stream and one mempool
+/// point lookup, so an unbounded list would let one request fan out into
+/// thousands of `WalletQuery` round-trips. `u32` matches the
 /// `address_count` field on the response so the bound check happens in the
 /// wire type's native width.
 const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
+
+#[derive(Default)]
+struct BalanceAccumulator {
+    confirmed_zat: u64,
+    unconfirmed_delta_zat: i64,
+    chain_epoch: Option<wallet::ChainEpoch>,
+    unspent_value_by_outpoint: HashMap<(String, u32), u64>,
+}
 
 async fn compute_transparent_address_balance(
     client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -784,76 +794,116 @@ async fn compute_transparent_address_balance(
                 MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
             ))
         })?;
-    let at_epoch = request.at_epoch.clone();
 
-    let mut confirmed_zat: u64 = 0;
-    let mut unconfirmed_delta_zat: i64 = 0;
-    let mut chain_epoch: Option<wallet::ChainEpoch> = None;
-
+    let mut accumulator = BalanceAccumulator::default();
     for address_lookup in request.addresses {
-        let outputs_response = client
-            .address_output_index(Request::new(wallet::AddressOutputIndexRequest {
-                address: Some(address_lookup.clone()),
-                max_entries: None,
-                from_cursor: Vec::new(),
-                at_epoch: at_epoch.clone(),
-                start_height: 0,
-            }))
-            .await?
-            .into_inner();
-        if chain_epoch.is_none() {
-            chain_epoch.clone_from(&outputs_response.chain_epoch);
-        }
+        accumulate_address_balance(client, address_lookup, &mut accumulator).await?;
+    }
+    subtract_pending_outflows(client, &mut accumulator).await?;
 
-        let mempool_outputs = client
-            .transparent_mempool_outputs_by_address(Request::new(
-                wallet::TransparentMempoolOutputsByAddressRequest {
-                    address: Some(address_lookup),
-                    max_entries: None,
+    let chain_epoch = accumulator.chain_epoch.ok_or_else(|| {
+        Status::internal("WalletQuery did not return a chain epoch for any address")
+    })?;
+    Ok(TransparentAddressBalanceResponse {
+        confirmed_zat: accumulator.confirmed_zat,
+        unconfirmed_delta_zat: accumulator.unconfirmed_delta_zat,
+        address_count,
+        chain_epoch: Some(chain_epoch),
+    })
+}
+
+/// Drains one address's complete unspent set and its pending mempool
+/// inflows into the accumulator.
+async fn accumulate_address_balance(
+    client: &mut WalletQueryClient<AuthenticatedChannel>,
+    address_lookup: wallet::AddressLookup,
+    accumulator: &mut BalanceAccumulator,
+) -> Result<(), Status> {
+    let mut outputs_stream = client
+        .transparent_address_unspent_outputs(Request::new(
+            wallet::TransparentAddressUnspentOutputsRequest {
+                address: Some(address_lookup.clone()),
+                start_height: 0,
+            },
+        ))
+        .await?
+        .into_inner();
+    while let Some(output) = outputs_stream.message().await? {
+        if accumulator.chain_epoch.is_none() {
+            accumulator.chain_epoch.clone_from(&output.chain_epoch);
+        }
+        accumulator.confirmed_zat = accumulator.confirmed_zat.saturating_add(output.value_zat);
+        let outpoint = output.outpoint.ok_or_else(|| {
+            Status::data_loss("TransparentUnspentOutput.outpoint missing in WalletQuery response")
+        })?;
+        accumulator.unspent_value_by_outpoint.insert(
+            (outpoint.transaction_id, outpoint.output_index),
+            output.value_zat,
+        );
+    }
+
+    let mempool_outputs = client
+        .transparent_mempool_outputs_by_address(Request::new(
+            wallet::TransparentMempoolOutputsByAddressRequest {
+                address: Some(address_lookup),
+                max_entries: None,
+            },
+        ))
+        .await?
+        .into_inner();
+    if accumulator.chain_epoch.is_none() {
+        accumulator
+            .chain_epoch
+            .clone_from(&mempool_outputs.chain_epoch);
+    }
+    for output in &mempool_outputs.outputs {
+        accumulator.unconfirmed_delta_zat = accumulator
+            .unconfirmed_delta_zat
+            .saturating_add(value_zat_to_signed(output.value_zat)?);
+    }
+    Ok(())
+}
+
+/// Subtracts pending mempool spends of the accumulated unspent set using
+/// batched spend lookups, chunked at the server's per-request outpoint cap.
+async fn subtract_pending_outflows(
+    client: &mut WalletQueryClient<AuthenticatedChannel>,
+    accumulator: &mut BalanceAccumulator,
+) -> Result<(), Status> {
+    let unspent_outpoints = accumulator
+        .unspent_value_by_outpoint
+        .keys()
+        .map(|(transaction_id, output_index)| wallet::OutPoint {
+            transaction_id: transaction_id.clone(),
+            output_index: *output_index,
+        })
+        .collect::<Vec<_>>();
+    for outpoint_batch in unspent_outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
+        let spends_response = client
+            .transparent_mempool_spends_by_outpoint(Request::new(
+                wallet::TransparentMempoolSpendsByOutpointRequest {
+                    outpoints: outpoint_batch.to_vec(),
                 },
             ))
             .await?
             .into_inner();
-        if chain_epoch.is_none() {
-            chain_epoch.clone_from(&mempool_outputs.chain_epoch);
-        }
-
-        for output in &outputs_response.outputs {
-            confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
-        }
-        for output in &mempool_outputs.outputs {
-            unconfirmed_delta_zat =
-                unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat)?);
-        }
-
-        for output in &outputs_response.outputs {
-            let outpoint = output.outpoint.clone().ok_or_else(|| {
-                Status::data_loss("AddressOutputIndex.outpoint missing in WalletQuery response")
+        for spend in spends_response.spends {
+            let spent_outpoint = spend.spent_outpoint.ok_or_else(|| {
+                Status::data_loss(
+                    "TransparentMempoolSpend.spent_outpoint missing in WalletQuery response",
+                )
             })?;
-            let spend_response = client
-                .transparent_mempool_spend_by_outpoint(Request::new(
-                    wallet::TransparentMempoolSpendByOutpointRequest {
-                        outpoint: Some(outpoint),
-                    },
-                ))
-                .await?
-                .into_inner();
-            if spend_response.spend.is_some() {
-                unconfirmed_delta_zat =
-                    unconfirmed_delta_zat.saturating_sub(value_zat_to_signed(output.value_zat)?);
+            if let Some(value_zat) = accumulator
+                .unspent_value_by_outpoint
+                .get(&(spent_outpoint.transaction_id, spent_outpoint.output_index))
+            {
+                accumulator.unconfirmed_delta_zat = accumulator
+                    .unconfirmed_delta_zat
+                    .saturating_sub(value_zat_to_signed(*value_zat)?);
             }
         }
     }
-
-    let chain_epoch = chain_epoch.ok_or_else(|| {
-        Status::internal("WalletQuery did not return a chain epoch for any address")
-    })?;
-    Ok(TransparentAddressBalanceResponse {
-        confirmed_zat,
-        unconfirmed_delta_zat,
-        address_count,
-        chain_epoch: Some(chain_epoch),
-    })
+    Ok(())
 }
 
 /// Converts a wire `u64` Zatoshi value to the signed accumulator width.

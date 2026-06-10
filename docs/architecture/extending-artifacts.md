@@ -93,7 +93,7 @@ Re-export the type from `crates/zinder-core/src/lib.rs`:
 
 ```rust
 mod transparent_output;
-pub use transparent_output::AddressOutputIndexArtifact;
+pub use transparent_output::TransparentUnspentOutput;
 ```
 
 Naming check:
@@ -263,13 +263,11 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
 
 The CI `capability-coverage` job will reject the proto change if the capability constant is not updated.
 
-For the lightwalletd compatibility slice, the transparent output family uses the
-reserved `wallet.address.output_index_v1` capability for the native proto
-surface. The lightwalletd `GetAddressUtxos[Stream]` adapter already reads from
-stored transparent output artifacts and can therefore set
-`GetLightdInfo.taddrSupport=true`. Do not advertise
-`wallet.address.output_index_v1` until the native `WalletQuery` proto and
-`zinder-client::ChainIndex` expose the same artifact-backed method.
+For the lightwalletd compatibility slice, the transparent output family is
+served natively by `WalletQuery.TransparentAddressUnspentOutputs` under
+`wallet.address.transparent_unspent_outputs_v1`. The lightwalletd
+`GetAddressUtxos[Stream]` adapter reads from the same stored transparent
+output artifacts and can therefore set `GetLightdInfo.taddrSupport=true`.
 
 ### Step 6 — Adapter wiring
 
@@ -309,9 +307,9 @@ If the artifact changes the on-disk shape of an existing artifact, [ADR-0002](..
 To make the cookbook concrete, here is the path for transparent-address transaction history, the derive-owned projection that backs paginated `GetTaddressTxids`.
 
 The transparent output artifact follows the same seven-step path,
-but its priority and capability are different: it is release-gated by
-`wallet.address.output_index_v1`, while this transaction-history example
-uses `wallet.address.transparent_history_v1`.
+but its priority and capability are different: it is served under
+`wallet.address.transparent_unspent_outputs_v1`, while this
+transaction-history example uses `wallet.address.transparent_history_v1`.
 
 1. **Domain type**: `crates/zinder-core/src/transparent_address_tx_index.rs` exporting `TransparentAddressTxIndexArtifact { address_script_hash, block_height, tx_index_in_block, transaction_id, block_hash }`. One row per `(address, transaction)` pair, regardless of how many transparent inputs or outputs the transaction has for that address.
 

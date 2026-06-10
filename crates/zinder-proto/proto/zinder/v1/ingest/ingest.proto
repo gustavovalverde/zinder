@@ -115,10 +115,10 @@ service IngestControl {
   rpc TransparentMempoolOutputsByAddress(zinder.v1.wallet.TransparentMempoolOutputsByAddressRequest)
       returns (zinder.v1.wallet.TransparentMempoolOutputsByAddressResponse);
 
-  // Returns the unmined spend of a transparent outpoint, when one is
-  // visible in the writer's live mempool index.
-  rpc TransparentMempoolSpendByOutpoint(zinder.v1.wallet.TransparentMempoolSpendByOutpointRequest)
-      returns (zinder.v1.wallet.TransparentMempoolSpendByOutpointResponse);
+  // Returns the unmined spends of a batch of transparent outpoints, when
+  // any are visible in the writer's live mempool index.
+  rpc TransparentMempoolSpendsByOutpoint(zinder.v1.wallet.TransparentMempoolSpendsByOutpointRequest)
+      returns (zinder.v1.wallet.TransparentMempoolSpendsByOutpointResponse);
 
   // Resolves a batch of outpoints against the writer's live mempool index.
   //

@@ -25,7 +25,7 @@ fn parity_chain_index_surface_compiles_for_zashi_use_cases() {
         let _ = T::block_id_by_selector;
         // mempool point lookups for unmined UTXO overlays
         let _ = T::transparent_mempool_outputs_by_address;
-        let _ = T::transparent_mempool_spend_by_outpoint;
+        let _ = T::transparent_mempool_spends_by_outpoint;
         // typed TransparentAddressBalance via federated derive
         let _ = T::transparent_address_balance;
         // typed subtree-root reads for SDK scan

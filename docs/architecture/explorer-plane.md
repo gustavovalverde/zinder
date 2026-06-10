@@ -157,12 +157,11 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
 
-Two capabilities cross planes (dual-capability federation rule per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)):
+One capability crosses planes (federation rule per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)):
 
-- `wallet.address.transparent_balance_v1` — always-on canonical-confirmed-balance path.
-- `explorer.transparent_address.balance_v1` — same RPC carries the live-mempool overlay when the explorer proxy is ready.
+- `explorer.transparent_address.balance_v1` — `WalletQuery.TransparentAddressBalance` forwards to the explorer's single balance implementation (confirmed totals plus the live-mempool overlay) when the explorer proxy is ready; without it the wallet plane rejects the call with `UNAVAILABLE`.
 
-Future federated methods follow the same dual-capability pattern: `wallet.<surface>.<noun>_v{N}` always-on, `explorer.<surface>.<noun>_v{N}` for the richer derive-enriched shape.
+Future federated methods follow the same pattern: the capability lives in the `explorer.*` namespace because the explorer plane owns the data product, and the wallet plane advertises it only while the proxy is ready.
 
 ## Freshness envelope
 

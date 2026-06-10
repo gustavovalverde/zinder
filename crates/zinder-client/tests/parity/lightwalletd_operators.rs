@@ -13,8 +13,8 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    AddressOutputIndexArtifact, ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
@@ -158,7 +158,7 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
     );
     let chain_fixture = base_fixture
         .with_transaction_rows(transaction_rows)
-        .with_address_output_index(AddressOutputIndexArtifact::new(
+        .with_address_output_index(TransparentUnspentOutput::new(
             address_script_hash,
             script_pub_key.clone(),
             TransparentOutPoint::new(transaction_id, 0),

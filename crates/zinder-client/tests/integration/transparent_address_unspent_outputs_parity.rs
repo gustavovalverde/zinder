@@ -3,17 +3,19 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use eyre::eyre;
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use zinder_client::{
-    AddressOutputCursor, AddressOutputIndexArtifact, AddressOutputIndexQuery, BlockHeight,
-    ChainEpochId, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions,
-    Network, RemoteChainIndex, RemoteOpenOptions, TransactionId, TransparentAddressScriptHash,
-    TransparentOutPoint,
+    BlockHeight, ChainEpochId, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex,
+    LocalOpenOptions, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsStream, TransparentOutPoint, TransparentUnspentOutput,
+    TransparentUnspentOutputStreamItem,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
@@ -21,101 +23,84 @@ use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activati
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xCD; 32];
 const SCRIPT_PUB_KEY: &[u8] = &[
     0x76, 0xa9, 0x14, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88,
-    0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac,
+    0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac,
 ];
 
+async fn drain(
+    stream: TransparentAddressUnspentOutputsStream,
+) -> eyre::Result<Vec<TransparentUnspentOutputStreamItem>> {
+    let mut items = Vec::new();
+    let mut stream = stream;
+    while let Some(stream_item) = stream.next().await {
+        items.push(stream_item?);
+    }
+    Ok(items)
+}
+
 #[tokio::test]
-async fn local_and_remote_drained_scan_returns_identical_utxos() -> eyre::Result<()> {
+async fn local_and_remote_streams_return_identical_unspent_sets() -> eyre::Result<()> {
     let fixtures = setup_chain_indexes(3).await?;
-    let drain_query = AddressOutputIndexQuery {
+    let query = TransparentAddressUnspentOutputsQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(0),
-        max_entries: None,
-        from_cursor: None,
     };
-    let local_view = fixtures
-        .local
-        .address_output_index(drain_query.clone(), None)
-        .await?;
-    let remote_view = fixtures
-        .remote
-        .address_output_index(drain_query, None)
-        .await?;
+    let local_items = drain(
+        fixtures
+            .local
+            .transparent_address_unspent_outputs(query.clone())
+            .await?,
+    )
+    .await?;
+    let remote_items = drain(
+        fixtures
+            .remote
+            .transparent_address_unspent_outputs(query)
+            .await?,
+    )
+    .await?;
 
-    assert_eq!(local_view.outputs.len(), 3);
-    assert_eq!(local_view.outputs, remote_view.outputs);
-    assert_eq!(local_view.chain_epoch, remote_view.chain_epoch);
-    assert_eq!(
-        local_view
-            .next_cursor
-            .as_ref()
-            .map(AddressOutputCursor::as_bytes),
-        remote_view
-            .next_cursor
-            .as_ref()
-            .map(AddressOutputCursor::as_bytes),
-        "drained scan must surface identical cursor bytes across local and remote",
+    assert_eq!(local_items.len(), 3);
+    assert_eq!(local_items, remote_items);
+    let first_epoch = local_items
+        .first()
+        .map(|stream_item| stream_item.chain_epoch)
+        .ok_or_else(|| eyre!("stream must not be empty"))?;
+    assert!(
+        local_items
+            .iter()
+            .all(|stream_item| stream_item.chain_epoch == first_epoch),
+        "every item binds to the same pinned chain epoch",
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn local_and_remote_paged_resume_returns_identical_utxos() -> eyre::Result<()> {
+async fn local_and_remote_streams_honor_start_height_floor() -> eyre::Result<()> {
     let fixtures = setup_chain_indexes(3).await?;
-    let first_page_query = AddressOutputIndexQuery {
+    let query = TransparentAddressUnspentOutputsQuery {
         address_script_hash: fixtures.address_script_hash,
-        start_height: BlockHeight::new(0),
-        max_entries: NonZeroU32::new(2),
-        from_cursor: None,
+        start_height: BlockHeight::new(2),
     };
-    let local_first = fixtures
-        .local
-        .address_output_index(first_page_query.clone(), None)
-        .await?;
-    let remote_first = fixtures
-        .remote
-        .address_output_index(first_page_query, None)
-        .await?;
+    let local_items = drain(
+        fixtures
+            .local
+            .transparent_address_unspent_outputs(query.clone())
+            .await?,
+    )
+    .await?;
+    let remote_items = drain(
+        fixtures
+            .remote
+            .transparent_address_unspent_outputs(query)
+            .await?,
+    )
+    .await?;
 
-    assert_eq!(local_first.outputs.len(), 2);
-    assert_eq!(local_first.outputs, remote_first.outputs);
-    assert_eq!(
-        local_first
-            .next_cursor
-            .as_ref()
-            .map(AddressOutputCursor::as_bytes),
-        remote_first
-            .next_cursor
-            .as_ref()
-            .map(AddressOutputCursor::as_bytes),
-        "paged cursor bytes must match between local and remote so resume is interoperable",
+    assert!(
+        local_items.is_empty(),
+        "outputs mined below the wallet-birthday floor are excluded",
     );
-
-    let local_cursor = local_first
-        .next_cursor
-        .clone()
-        .ok_or_else(|| eyre!("local first page must yield a resume cursor"))?;
-    let resume_query = AddressOutputIndexQuery {
-        address_script_hash: fixtures.address_script_hash,
-        start_height: BlockHeight::new(0),
-        max_entries: NonZeroU32::new(10),
-        from_cursor: Some(local_cursor),
-    };
-    let local_resume = fixtures
-        .local
-        .address_output_index(resume_query.clone(), None)
-        .await?;
-    let remote_resume = fixtures
-        .remote
-        .address_output_index(resume_query, None)
-        .await?;
-
-    assert_eq!(local_resume.outputs, remote_resume.outputs);
-    assert_eq!(
-        local_first.outputs.len() + local_resume.outputs.len(),
-        3,
-        "first page plus resume must equal the full drained set",
-    );
+    assert_eq!(local_items, remote_items);
     Ok(())
 }
 
@@ -141,7 +126,7 @@ async fn setup_chain_indexes(utxo_count: u32) -> eyre::Result<ChainIndexFixtures
     for output_index in 0..utxo_count {
         let mut transaction_id_bytes = [0; 32];
         transaction_id_bytes[..4].copy_from_slice(&output_index.to_be_bytes());
-        chain_fixture = chain_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+        chain_fixture = chain_fixture.with_address_output_index(TransparentUnspentOutput::new(
             address_script_hash,
             SCRIPT_PUB_KEY.to_vec(),
             TransparentOutPoint::new(

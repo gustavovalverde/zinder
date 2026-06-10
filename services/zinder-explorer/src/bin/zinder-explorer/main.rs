@@ -241,6 +241,7 @@ fn build_zebra_json_rpc_source(
         ZebraJsonRpcSourceOptions {
             request_timeout: node.request_timeout,
             max_response_bytes: node.max_response_bytes,
+            broadcast_timeout: node.broadcast_timeout,
         },
     )?;
     Ok(source.with_health_config(node.health.clone()))

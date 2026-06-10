@@ -55,7 +55,7 @@ flowchart LR
 
 The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Chain events §Address Filters](../architecture/chain-events.md#address-filters)).
 
-1. **Snapshot phase**: paginate the current state for each tracked account using `WalletQuery.AddressOutputIndexStream` (transparent) plus `WalletQuery.CompactBlockRange` + `WalletQuery.TreeState` (shielded, fed to `zcash_client_backend::scan_cached_blocks`).
+1. **Snapshot phase**: read the current state for each tracked account using `WalletQuery.TransparentAddressUnspentOutputs` (transparent; the stream is always the complete unspent set at one pinned chain epoch) plus `WalletQuery.CompactBlockRange` + `WalletQuery.TreeState` (shielded, fed to `zcash_client_backend::scan_cached_blocks`).
 2. **Subscribe phase**: open a `WalletQuery.ChainEvents` stream with the addresses you care about in `address_filter`. Each envelope tells you a chain epoch advanced (commit) or replaced (reorg); use the height range to re-derive the affected slice from `compact_block_at` and merge the result into `zcash_client_sqlite`.
 3. **Broadcast phase**: build the transaction with `zcash_primitives::transaction::builder::Builder`, prove it with `zcash_proofs`, and post the raw bytes via `WalletQuery.BroadcastTransaction`.
 4. **Cursor persistence**: store the bytes from the latest `ChainEventEnvelope.cursor` durably alongside your wallet state. On restart, replay strictly after that cursor.
@@ -83,21 +83,13 @@ async fn run_server_wallet(
     // 2. Persist the wallet state in zcash_client_sqlite. (Pseudocode.)
     let mut wallet = open_wallet_db("wallet.sqlite")?;
 
-    // 3. Snapshot: paginate transparent outputs for every watched address.
+    // 3. Snapshot: drain the complete unspent set for every watched address.
     for address in &watched_addresses {
-        let mut cursor = None;
-        loop {
-            let page = zinder
-                .address_output_index(
-                    transparent_address_query(address, cursor.clone()),
-                    None,
-                )
-                .await?;
-            wallet.absorb_transparent_outputs(&page.outputs)?;
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        let mut unspent_outputs = zinder
+            .transparent_address_unspent_outputs(transparent_address_query(address))
+            .await?;
+        while let Some(unspent) = unspent_outputs.next().await {
+            wallet.absorb_transparent_output(&unspent?.output)?;
         }
     }
 

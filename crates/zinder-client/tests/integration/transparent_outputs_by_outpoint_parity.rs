@@ -10,10 +10,10 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use zinder_client::{
-    AddressOutputIndexArtifact, BlockHeight, ChainEpochId, ChainIndex,
-    DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions,
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RemoteChainIndex, RemoteOpenOptions,
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    BlockHeight, ChainEpochId, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex,
+    LocalOpenOptions, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RemoteChainIndex,
+    RemoteOpenOptions, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentUnspentOutput,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
@@ -35,7 +35,7 @@ async fn transparent_output_parity_harness() -> eyre::Result<TransparentOutputPa
     let transaction_id = TransactionId::from_bytes([0xCC; 32]);
     let script_pub_key = vec![0x76, 0xa9, 0x42, 0x88, 0xac];
     let outpoint = TransparentOutPoint::new(transaction_id, 0);
-    let chain_fixture = chain_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+    let chain_fixture = chain_fixture.with_address_output_index(TransparentUnspentOutput::new(
         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
         script_pub_key,
         outpoint,

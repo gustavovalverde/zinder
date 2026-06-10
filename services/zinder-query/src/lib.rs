@@ -8,13 +8,13 @@ use std::{fmt, num::NonZeroU32, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
-    BlockSelector, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact, TransactionBroadcastResult,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputEntry,
-    TransparentOutputsByOutpointResponse, TxStatus,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionBroadcastResult, TransactionId, TransactionLocation,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutputEntry, TransparentOutputsByOutpointResponse, TransparentUnspentOutput,
+    TxStatus,
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -37,15 +37,15 @@ pub use derive_proxy::{
 };
 
 pub use grpc::{
-    MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST, ServerInfoSettings, UpstreamNodeCapabilities,
-    WalletQueryGrpcAdapter, address_lookup_to_script_hash, address_output_index_response,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_address_output_index_stream_chunk,
-    build_transparent_address_tx_ids_chunk, build_wallet_server_info, chain_events_response,
-    compact_block_response, latest_block_response, latest_tree_state_checkpoint_response,
-    status_from_query_error, subtree_roots_response, transaction_response,
-    transparent_address_confirmed_balance_response, transparent_address_tx_ids_response,
-    transparent_outputs_by_outpoint_response, tree_state_at_response,
+    ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
+    build_transparent_address_tx_ids_chunk, build_transparent_unspent_output_message,
+    build_wallet_server_info, chain_events_response, compact_block_response, latest_block_response,
+    latest_tree_state_checkpoint_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    tree_state_at_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -146,12 +146,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError>;
 
-    /// Reads unspent transparent outputs for one transparent address script.
-    async fn address_output_index(
+    /// Reads the complete unspent transparent output set for one transparent
+    /// address script at a single pinned chain epoch.
+    async fn transparent_address_unspent_outputs(
         &self,
-        request: AddressOutputIndexRequest,
+        request: TransparentAddressUnspentOutputsRequest,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndex, QueryError>;
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
 
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts.
@@ -653,11 +654,11 @@ where
         query_outcome
     }
 
-    async fn address_output_index(
+    async fn transparent_address_unspent_outputs(
         &self,
-        request: AddressOutputIndexRequest,
+        request: TransparentAddressUnspentOutputsRequest,
         at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndex, QueryError> {
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
@@ -666,19 +667,23 @@ where
                     at_epoch,
                     address_script_hash: request.address_script_hash,
                     start_height: request.start_height,
-                    max_entries: request.max_entries,
-                    from_cursor: request.from_cursor.as_ref(),
+                    max_entries: NonZeroU32::MAX,
+                    from_cursor: None,
                 })
-                .map_err(map_address_output_store_error)?;
+                .map_err(QueryError::Store)?;
 
-            Ok(AddressOutputIndex {
+            Ok(TransparentAddressUnspentOutputs {
                 chain_epoch: page.chain_epoch,
                 outputs: page.outputs,
-                next_cursor: page.next_cursor,
             })
         }))
         .await;
-        record_wallet_query_outcome("address_output_index", started_at, &query_outcome, None);
+        record_wallet_query_outcome(
+            "transparent_address_unspent_outputs",
+            started_at,
+            &query_outcome,
+            None,
+        );
         query_outcome
     }
 
@@ -1073,22 +1078,6 @@ fn map_chain_event_store_error(error: StoreError) -> QueryError {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "Only the typed transparent-address cursor errors become query cursor errors; every other storage failure is preserved."
-)]
-fn map_address_output_store_error(error: StoreError) -> QueryError {
-    match error {
-        StoreError::AddressOutputCursorInvalid { reason } => {
-            QueryError::AddressOutputCursorInvalid { reason }
-        }
-        StoreError::TransparentHistoryCursorInvalid { reason } => {
-            QueryError::TransparentHistoryCursorInvalid { reason }
-        }
-        _ => QueryError::Store(error),
-    }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
     reason = "Only transparent-history cursor decode errors get a query cursor category; unknown future derive-store failures stay derive-store failures."
 )]
 fn map_transparent_history_derive_error(error: zinder_derive::DeriveStoreError) -> QueryError {
@@ -1175,7 +1164,6 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
         Some(QueryError::ChainEventCursorInvalid { .. }) => "chain_event_cursor_invalid",
         Some(QueryError::ChainEventCursorExpired { .. }) => "chain_event_cursor_expired",
-        Some(QueryError::AddressOutputCursorInvalid { .. }) => "address_output_cursor_invalid",
         Some(QueryError::TransparentHistoryCursorInvalid { .. }) => {
             "transparent_history_cursor_invalid"
         }
@@ -1347,37 +1335,27 @@ pub struct TransactionStatus {
     pub status: TxStatus,
 }
 
-/// Transparent address output request.
+/// Transparent-address unspent output request.
 ///
 /// Address inputs are typed: the wire boundary parses string addresses and
 /// SHA-256-hashes them to `address_script_hash` before constructing this
 /// request. The native API never carries a `String` form on the read path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndexRequest {
+pub struct TransparentAddressUnspentOutputsRequest {
     /// SHA-256 of the transparent address scriptPubKey.
     pub address_script_hash: TransparentAddressScriptHash,
-    /// Wallet-birthday optimization: minimum mined height to include.
-    /// `BlockHeight::new(0)` means scan from genesis. Ignored when
-    /// `from_cursor` is `Some`.
+    /// Wallet-birthday floor: minimum mined height to include.
+    /// `BlockHeight::new(0)` means scan from genesis.
     pub start_height: BlockHeight,
-    /// Server-bounded maximum entries per page.
-    pub max_entries: NonZeroU32,
-    /// Optional cursor returned by a previous unary or streaming response.
-    /// When supplied, the scan resumes strictly after that position and
-    /// `start_height` is ignored.
-    pub from_cursor: Option<StreamCursorTokenV1>,
 }
 
-/// Transparent address output response bound to one chain epoch.
+/// Complete unspent transparent output set bound to one chain epoch.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndex {
+pub struct TransparentAddressUnspentOutputs {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
     /// Unspent outputs in ascending `(block_height, outpoint)` order.
-    pub outputs: Vec<AddressOutputIndexArtifact>,
-    /// Resume cursor when more outputs may be available. `None` when the
-    /// scan was fully drained.
-    pub next_cursor: Option<StreamCursorTokenV1>,
+    pub outputs: Vec<TransparentUnspentOutput>,
 }
 
 /// Transparent-address tx-history range request.
@@ -1541,13 +1519,6 @@ pub enum QueryError {
     UnsupportedShieldedProtocol {
         /// Shielded protocol that cannot be encoded.
         protocol: ShieldedProtocol,
-    },
-
-    /// Transparent-output cursor failed validation.
-    #[error("transparent-output cursor is invalid: {reason}")]
-    AddressOutputCursorInvalid {
-        /// Cursor validation failure reason.
-        reason: &'static str,
     },
 
     /// Transparent address tx-history cursor failed validation.

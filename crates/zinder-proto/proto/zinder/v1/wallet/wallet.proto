@@ -785,20 +785,24 @@ message TransparentMempoolOutputsByAddressResponse {
   repeated TransparentMempoolOutput outputs = 2;
 }
 
-// Point-lookup request for the unmined spend of one transparent outpoint.
-message TransparentMempoolSpendByOutpointRequest {
-  // Outpoint whose unmined spend is being looked up.
-  OutPoint outpoint = 1;
+// Batched lookup request for unmined spends of transparent outpoints.
+message TransparentMempoolSpendsByOutpointRequest {
+  // Outpoints whose unmined spends are being looked up. Bounded
+  // server-side to a hard cap; requests above the cap are silently
+  // truncated to the first N entries.
+  repeated OutPoint outpoints = 1;
 }
 
-// Response for [`TransparentMempoolSpendByOutpoint`] bound to the chain
+// Response for [`TransparentMempoolSpendsByOutpoint`] bound to the chain
 // epoch visible at lookup time.
-message TransparentMempoolSpendByOutpointResponse {
+message TransparentMempoolSpendsByOutpointResponse {
   // Chain epoch visible at lookup time.
   ChainEpoch chain_epoch = 1;
 
-  // Mempool spend that consumes the outpoint, when one is present.
-  optional TransparentMempoolSpend spend = 2;
+  // Mempool spends found for the requested outpoints. Outpoints with no
+  // unmined spend emit no entry; consumers key results by
+  // `spent_outpoint`.
+  repeated TransparentMempoolSpend spends = 2;
 }
 
 // Resolved transparent output referenced by an outpoint.
@@ -972,93 +976,59 @@ message AddressLookup {
   }
 }
 
-// Transparent-address output request consumed by both the unary and streaming
-// RPCs. Pagination across both forms uses the same opaque cursor envelope.
-message AddressOutputIndexRequest {
+// Request for the complete unspent transparent output set at one address.
+//
+// The server walks the address-output projection once at a single pinned
+// chain epoch and streams every unspent output. The response stream is
+// always complete: there is no cursor and no entry cap, so a client cannot
+// silently truncate the set by ignoring pagination.
+message TransparentAddressUnspentOutputsRequest {
   // Selector for the transparent address being queried.
   AddressLookup address = 1;
 
-  // Maximum number of outputs returned. Absent means use the server default;
-  // values larger than the server's configured cap are silently clamped.
-  optional uint32 max_entries = 2;
-
-  // Empty starts at start_height. Non-empty resumes strictly after the
-  // supplied opaque cursor, ignoring start_height.
-  bytes from_cursor = 3;
-
-  // Optional chain epoch that must be used to answer the request. When
-  // absent, the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 4;
-
-  // Wallet-birthday optimization: minimum mined height to include. 0 means
+  // Wallet-birthday floor: minimum mined height to include. 0 means
   // scan from genesis.
-  uint32 start_height = 5;
+  uint32 start_height = 2;
 }
 
-// One unspent transparent output.
-message AddressOutputIndex {
+// One unspent transparent output streamed by
+// [`TransparentAddressUnspentOutputs`].
+message TransparentUnspentOutput {
+  // Chain epoch pinned for the entire stream. Identical on every message
+  // of one response stream.
+  ChainEpoch chain_epoch = 1;
+
   // SHA-256 of the transparent address scriptPubKey.
-  bytes address_script_hash = 1;
+  bytes address_script_hash = 2;
 
   // Raw scriptPubKey bytes.
-  bytes script_pub_key = 2;
+  bytes script_pub_key = 3;
 
   // Outpoint of the unspent output, in the transaction that created it.
-  OutPoint outpoint = 3;
+  OutPoint outpoint = 4;
 
   // Output value in zatoshis.
-  uint64 value_zat = 4;
+  uint64 value_zat = 5;
 
   // Height of the block that mined the creating transaction.
-  uint32 block_height = 5;
+  uint32 block_height = 6;
 
   // Canonical block hash in RPC byte order (64 lowercase hex characters)
   // of the block that mined the creating transaction.
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string block_hash = 6;
-}
-
-// Bounded transparent output response bound to one chain epoch.
-message AddressOutputIndexResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
-
-  // Unspent outputs in ascending mined-height order.
-  repeated AddressOutputIndex outputs = 2;
-
-  // Empty when the bounded scan was fully drained. Non-empty carries an
-  // opaque StreamCursorTokenV1 for resuming the next page.
-  bytes next_cursor = 3;
-}
-
-// Streamed transparent output chunk emitted one per output. Streaming is the
-// preferred form for mining and exchange addresses.
-message AddressOutputIndexStreamChunk {
-  // Chain epoch used for this output.
-  ChainEpoch chain_epoch = 1;
-
-  // Single unspent output.
-  AddressOutputIndex output = 2;
-
-  // Cursor for resuming strictly after this output.
-  bytes cursor = 3;
+  string block_hash = 7;
 }
 
 // Bounded transparent-address balance request federated to `zinder-explorer`.
 //
-// The balance read is computed from canonical transparent outputs at the
-// requested addresses plus the live mempool overlay. Mempool live state is
-// not chain-epoch-pinnable, so the response binds to the visible chain epoch
-// at lookup time; callers may pin canonical reads through `at_epoch`. An
-// empty `addresses` list is rejected with `INVALID_ARGUMENT`.
+// The balance read is computed from the complete canonical unspent output
+// set at the requested addresses plus the live mempool overlay. Mempool
+// live state is not chain-epoch-pinnable, so the response binds to the
+// visible chain epoch at lookup time. An empty `addresses` list is
+// rejected with `INVALID_ARGUMENT`.
 message TransparentAddressBalanceRequest {
   // Transparent addresses summed into one balance response.
   repeated AddressLookup addresses = 1;
-
-  // Optional chain epoch that must be used to answer the canonical portion of
-  // the request. When absent, the server uses the visible epoch at request
-  // time. The mempool overlay always observes the live mempool index.
-  optional ChainEpoch at_epoch = 2;
 }
 
 // Transparent-address balance response federated from `zinder-explorer`.
@@ -1221,10 +1191,10 @@ service WalletQuery {
   rpc TransparentMempoolOutputsByAddress(TransparentMempoolOutputsByAddressRequest)
       returns (TransparentMempoolOutputsByAddressResponse);
 
-  // Return the unmined spend of a transparent outpoint, when one is visible
-  // in the live mempool index.
-  rpc TransparentMempoolSpendByOutpoint(TransparentMempoolSpendByOutpointRequest)
-      returns (TransparentMempoolSpendByOutpointResponse);
+  // Return the unmined spends of a batch of transparent outpoints, when
+  // any are visible in the live mempool index.
+  rpc TransparentMempoolSpendsByOutpoint(TransparentMempoolSpendsByOutpointRequest)
+      returns (TransparentMempoolSpendsByOutpointResponse);
 
   // Resolve a batch of canonical-chain transparent outpoints to their
   // referenced outputs. Closes the prevout-resolution gap that forced
@@ -1238,15 +1208,11 @@ service WalletQuery {
   rpc TransparentMempoolOutputsByOutpoint(TransparentMempoolOutputsByOutpointRequest)
       returns (TransparentOutputsByOutpointResponse);
 
-  // Return unspent transparent outputs for one transparent address.
-  rpc AddressOutputIndex(AddressOutputIndexRequest)
-      returns (AddressOutputIndexResponse);
-
-  // Stream unspent transparent outputs for one transparent address. Used by
-  // mining and exchange addresses where a single message would exceed the
-  // gRPC size cap.
-  rpc AddressOutputIndexStream(AddressOutputIndexRequest)
-      returns (stream AddressOutputIndexStreamChunk);
+  // Stream the complete unspent transparent output set for one transparent
+  // address at a single pinned chain epoch. The stream is always complete:
+  // no cursor, no entry cap.
+  rpc TransparentAddressUnspentOutputs(TransparentAddressUnspentOutputsRequest)
+      returns (stream TransparentUnspentOutput);
 
   // Stream the transparent-address tx-history index for an inclusive
   // height range, in ascending or descending mined order.
@@ -1256,8 +1222,8 @@ service WalletQuery {
   // Return the transparent-address balance summed across the requested
   // addresses. Federated by `zinder-query` to `zinder-explorer`'s
   // `ExplorerQuery.TransparentAddressBalance`; deployments without a
-  // configured explorer plane omit the corresponding capability and reject the
-  // call with `UNAVAILABLE`. Capability:
+  // configured explorer plane omit the corresponding capability and reject
+  // the call with `UNAVAILABLE`. Capability:
   // `explorer.transparent_address.balance_v1`.
   rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
       returns (TransparentAddressBalanceResponse);

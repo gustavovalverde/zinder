@@ -15,8 +15,7 @@ use zinder_core::{
     TransactionId, TransparentOutPoint,
 };
 use zinder_proto::capabilities::{
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
-    WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
 };
 use zinder_proto::v1::{
     explorer::explorer_query_client::ExplorerQueryClient,
@@ -33,17 +32,18 @@ use zinder_store::{
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
-use crate::{AddressOutputIndexRequest, TransparentAddressTxIdsInRangeRequest, WalletQueryApi};
+use crate::{
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQueryApi,
+};
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
-    ServerInfoSettings, address_lookup_to_script_hash, address_output_index_response,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_address_output_index_stream_chunk,
-    build_chain_epoch_message, build_compact_block_message, build_transparent_address_tx_ids_chunk,
-    build_wallet_server_info, compact_block_response, latest_block_response,
-    latest_safe_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
-    transaction_response, transparent_address_confirmed_balance_response,
+    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
+    build_compact_block_message, build_transparent_address_tx_ids_chunk,
+    build_transparent_unspent_output_message, build_wallet_server_info, compact_block_response,
+    latest_block_response, latest_safe_block_response, latest_tree_state_checkpoint_response,
+    subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, tree_state_at_response,
 };
 use super::status_from_query_error;
@@ -51,7 +51,7 @@ use super::status_from_query_error;
 type WalletGrpcStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = WalletGrpcStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
-type AddressOutputIndexStream = WalletGrpcStream<wallet::AddressOutputIndexStreamChunk>;
+type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspentOutput>;
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
@@ -165,7 +165,7 @@ where
     type CompactBlockRangeStream = WalletGrpcStream<wallet::CompactBlockRangeChunk>;
     type ChainEventsStream = ChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
-    type AddressOutputIndexStreamStream = AddressOutputIndexStream;
+    type TransparentAddressUnspentOutputsStream = TransparentUnspentOutputsStream;
     type TransparentAddressTxIdsInRangeStream = TransparentAddressTxIdsStream;
 
     async fn latest_block(
@@ -459,23 +459,23 @@ where
         outcome
     }
 
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
         let started_at = Instant::now();
         let outcome = async {
             let mut client = self
                 .ingest_control_client(
-                    "TransparentMempoolSpendByOutpoint requires the ingest-control proxy; \
+                    "TransparentMempoolSpendsByOutpoint requires the ingest-control proxy; \
                      configure the writer endpoint",
                 )
                 .await?;
-            client.transparent_mempool_spend_by_outpoint(request).await
+            client.transparent_mempool_spends_by_outpoint(request).await
         }
         .await;
         record_proxy_outcome(
-            "transparent_mempool_spend_by_outpoint",
+            "transparent_mempool_spends_by_outpoint",
             started_at,
             &outcome,
         );
@@ -542,58 +542,31 @@ where
         outcome
     }
 
-    async fn address_output_index(
+    async fn transparent_address_unspent_outputs(
         &self,
-        request: Request<wallet::AddressOutputIndexRequest>,
-    ) -> Result<Response<wallet::AddressOutputIndexResponse>, Status> {
+        request: Request<wallet::TransparentAddressUnspentOutputsRequest>,
+    ) -> Result<Response<Self::TransparentAddressUnspentOutputsStream>, Status> {
         let request = request.into_inner();
-        let at_epoch = chain_epoch_from_request(request.at_epoch.clone())?;
-        let typed_request =
-            address_output_index_request_from_message(request, self.server_info_network()?)?;
-
-        address_output_index_response(&self.query_api, typed_request, at_epoch)
-            .await
-            .map(Response::new)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn address_output_index_stream(
-        &self,
-        request: Request<wallet::AddressOutputIndexRequest>,
-    ) -> Result<Response<Self::AddressOutputIndexStreamStream>, Status> {
-        let request = request.into_inner();
-        let at_epoch = chain_epoch_from_request(request.at_epoch.clone())?;
-        let typed_request =
-            address_output_index_request_from_message(request, self.server_info_network()?)?;
-        let response = self
-            .query_api
-            .address_output_index(typed_request, at_epoch)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
+        let address_script_hash =
+            address_lookup_to_script_hash(request.address, self.server_info_network()?)
+                .map_err(|error| status_from_query_error(&error))?;
+        let typed_request = TransparentAddressUnspentOutputsRequest {
+            address_script_hash,
+            start_height: BlockHeight::new(request.start_height),
+        };
+        let response =
+            transparent_address_unspent_outputs_response(&self.query_api, typed_request, None)
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
         let chain_epoch = response.chain_epoch;
-        let next_cursor_bytes = response
-            .next_cursor
-            .map(|cursor| cursor.as_bytes().to_vec())
-            .unwrap_or_default();
-        let last_index = response.outputs.len().saturating_sub(1);
-        let chunk_iter = response
-            .outputs
-            .into_iter()
-            .enumerate()
-            .map(move |(index, output)| {
-                let cursor_bytes = if index == last_index {
-                    next_cursor_bytes.clone()
-                } else {
-                    Vec::new()
-                };
-                Ok(build_address_output_index_stream_chunk(
-                    chain_epoch,
-                    &output,
-                    cursor_bytes,
-                ))
-            });
+        let messages = response.outputs.into_iter().map(move |output| {
+            Ok(build_transparent_unspent_output_message(
+                chain_epoch,
+                &output,
+            ))
+        });
 
-        Ok(Response::new(Box::pin(stream::iter(chunk_iter))))
+        Ok(Response::new(Box::pin(stream::iter(messages))))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -639,42 +612,23 @@ where
         &self,
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
-        // Prefer the federated explorer plane when configured and ready: it
-        // adds the mempool overlay that canonical-only compute cannot supply.
-        // Fall back to the always-on canonical-confirmed-balance path otherwise
-        // so the RPC stays answerable without `zinder-explorer`.
         let started_at = Instant::now();
         let outcome = async {
-            if let Some(proxy) = self
+            let Some(proxy) = self
                 .explorer_proxy
                 .as_ref()
                 .filter(|proxy| proxy.is_ready())
-            {
-                return proxy
-                    .forward(request, |mut client, request| async move {
-                        client.transparent_address_balance(request).await
-                    })
-                    .await;
-            }
-
-            let network = self.server_info_network()?;
-            let inner = request.into_inner();
-            let at_epoch = inner
-                .at_epoch
-                .map(|message| {
-                    chain_epoch_from_message(message)
-                        .map_err(|error| Status::invalid_argument(error.to_string()))
+            else {
+                return Err(Status::unavailable(
+                    "TransparentAddressBalance requires the federated explorer plane; \
+                     configure the explorer endpoint",
+                ));
+            };
+            proxy
+                .forward(request, |mut client, request| async move {
+                    client.transparent_address_balance(request).await
                 })
-                .transpose()?;
-            transparent_address_confirmed_balance_response(
-                &self.query_api,
-                inner.addresses,
-                network,
-                at_epoch,
-            )
-            .await
-            .map(Response::new)
-            .map_err(|error| status_from_query_error(&error))
+                .await
         }
         .await;
         record_proxy_outcome("transparent_address_balance", started_at, &outcome);
@@ -685,16 +639,10 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
-        // Two coexisting capabilities advertise the same RPC under different
-        // semantics:
-        //   * `wallet.address.transparent_balance_v1` is always-on. It signals
-        //     the canonical-confirmed-balance compute path that
-        //     `WalletQuery.TransparentAddressBalance` answers when the explorer
-        //     plane is unavailable.
-        //   * `explorer.transparent_address.balance_v1` coexists when the
-        //     explorer plane is configured and ready. It signals that the same
-        //     response additionally carries the live mempool overlay in
-        //     `unconfirmed_delta_zat`.
+        // `explorer.transparent_address.balance_v1` is advertised only when
+        // the explorer plane is configured and ready: the federated balance
+        // response carries the live mempool overlay in
+        // `unconfirmed_delta_zat`.
         let mut wallet_info = build_wallet_server_info(&self.server_info);
         let Some(common) = wallet_info.common.as_mut() else {
             return Err(Status::internal(
@@ -714,15 +662,6 @@ where
             common
                 .capabilities
                 .retain(|advertised| advertised != EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
-        }
-        if !common
-            .capabilities
-            .iter()
-            .any(|advertised| advertised == WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)
-        {
-            common
-                .capabilities
-                .push(WALLET_ADDRESS_TRANSPARENT_BALANCE_V1.to_owned());
         }
         if self.ingest_control_proxy_endpoint.is_none() {
             common
@@ -760,34 +699,6 @@ fn transparent_address_tx_ids_in_range_request_from_message(
 }
 
 const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-
-fn address_output_index_request_from_message(
-    request: wallet::AddressOutputIndexRequest,
-    network: Network,
-) -> Result<AddressOutputIndexRequest, Status> {
-    let address_script_hash = address_lookup_to_script_hash(request.address, network)
-        .map_err(|error| status_from_query_error(&error))?;
-    let max_entries =
-        optional_max_entries_from_u32(request.max_entries, DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS);
-    let from_cursor = if request.from_cursor.is_empty() {
-        None
-    } else {
-        Some(StreamCursorTokenV1::from_bytes(request.from_cursor))
-    };
-
-    Ok(AddressOutputIndexRequest {
-        address_script_hash,
-        start_height: BlockHeight::new(request.start_height),
-        max_entries,
-        from_cursor,
-    })
-}
-
-const DEFAULT_MAX_ADDRESS_OUTPUT_INDEXS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-
-fn optional_max_entries_from_u32(requested: Option<u32>, cap: NonZeroU32) -> NonZeroU32 {
-    requested.map_or(cap, |max_entries| max_entries_from_u32(max_entries, cap))
-}
 
 fn max_entries_from_u32(requested: u32, cap: NonZeroU32) -> NonZeroU32 {
     NonZeroU32::new(requested).map_or(cap, |max_entries| clamp_max_entries(max_entries, cap))

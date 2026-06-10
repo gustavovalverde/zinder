@@ -128,7 +128,6 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
     let outcome = client
         .transparent_address_balance(TransparentAddressBalanceRequest {
             addresses: Vec::new(),
-            at_epoch: None,
         })
         .await;
     let status = outcome

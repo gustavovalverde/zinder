@@ -297,6 +297,7 @@ fn build_broadcaster(
         ZebraJsonRpcSourceOptions {
             request_timeout: broadcaster_target.request_timeout,
             max_response_bytes: broadcaster_target.max_response_bytes,
+            broadcast_timeout: broadcaster_target.broadcast_timeout,
         },
     )
     .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?;

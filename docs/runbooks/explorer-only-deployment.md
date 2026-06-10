@@ -19,7 +19,6 @@ stay on a separate operational footprint (see
     fields on explorer reads when present)
   - `wallet.snapshot.mempool_v1`
   - `wallet.address.transparent_history_v1`
-  - `wallet.address.transparent_balance_v1`
   - `wallet.read.chain_value_pools_at_tip_v1`
 - A storage path the explorer process can write to. The explorer
   derive store is independent from any canonical store; it can live on

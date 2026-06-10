@@ -20,14 +20,15 @@ use zinder_core::wire::{
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange,
-    BlockSelector, ChainEpoch, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
-    ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MempoolEntry,
+    MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
+    TransparentOutputsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
@@ -41,13 +42,13 @@ use zinder_store::{
 
 use crate::error::ZINDER_ERROR_DOMAIN;
 use crate::{
-    AddressOutputCursor, AddressOutputIndexQuery, AddressOutputIndexStream,
-    AddressOutputIndexStreamItem, AddressOutputIndexView, BlockId, ChainEpochCommitted, ChainEvent,
-    ChainEventCursor, ChainEventEnvelope, ChainEventStream, ChainIndex, ChainRangeReverted,
-    IndexStream, IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope,
-    MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
-    TransparentHistoryCursor,
+    BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
+    ChainEventStream, ChainIndex, ChainRangeReverted, IndexStream, IndexerError, MempoolEvent,
+    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
+    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
+    TransparentHistoryCursor, TransparentUnspentOutputStreamItem,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -533,39 +534,30 @@ impl ChainIndex for RemoteChainIndex {
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
 
-    async fn address_output_index(
+    async fn transparent_address_unspent_outputs(
         &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexView, IndexerError> {
-        let request = address_output_index_request_message(&query, at_epoch);
+        query: TransparentAddressUnspentOutputsQuery,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        let request = wallet::TransparentAddressUnspentOutputsRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    query.address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            start_height: query.start_height.value(),
+        };
         let response = self
             .client()
-            .address_output_index(Request::new(request))
+            .transparent_address_unspent_outputs(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
-            .into_inner();
-        let chain_epoch = chain_epoch_from_message_with_network(
-            self.network,
-            response
-                .chain_epoch
-                .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-        )?;
-        let outputs = response
-            .outputs
-            .into_iter()
-            .map(address_output_index_from_message)
-            .collect::<Result<Vec<_>, IndexerError>>()?;
-        let next_cursor = if response.next_cursor.is_empty() {
-            None
-        } else {
-            Some(AddressOutputCursor::from_bytes(response.next_cursor))
-        };
-        Ok(AddressOutputIndexView {
-            chain_epoch,
-            outputs,
-            next_cursor,
-        })
+            .map_err(|status| self.handle_status(status))?;
+        let expected_network = self.network;
+        let recovery = self.clone();
+        let stream = response.into_inner().map(move |message_result| {
+            let message = message_result.map_err(|status| recovery.handle_status(status))?;
+            transparent_unspent_output_item_from_message(expected_network, message)
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -607,26 +599,6 @@ impl ChainIndex for RemoteChainIndex {
         Ok(Box::pin(stream))
     }
 
-    async fn address_output_index_stream(
-        &self,
-        query: AddressOutputIndexQuery,
-        at_epoch: Option<ChainEpoch>,
-    ) -> Result<AddressOutputIndexStream, IndexerError> {
-        let request = address_output_index_request_message(&query, at_epoch);
-        let response = self
-            .client()
-            .address_output_index_stream(Request::new(request))
-            .await
-            .map_err(|status| self.handle_status(status))?;
-        let expected_network = self.network;
-        let recovery = self.clone();
-        let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
-            address_output_index_stream_item_from_message(expected_network, chunk)
-        });
-        Ok(Box::pin(stream))
-    }
-
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: TransparentMempoolOutputsRequest,
@@ -652,29 +624,29 @@ impl ChainIndex for RemoteChainIndex {
             .collect::<Result<Vec<_>, IndexerError>>()
     }
 
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<TransparentMempoolSpend>, IndexerError> {
-        let wire_request = wallet::TransparentMempoolSpendByOutpointRequest {
-            outpoint: Some(outpoint_message(&outpoint)),
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError> {
+        let wire_request = wallet::TransparentMempoolSpendsByOutpointRequest {
+            outpoints: outpoints.iter().map(outpoint_message).collect(),
         };
         let response = self
             .client()
-            .transparent_mempool_spend_by_outpoint(Request::new(wire_request))
+            .transparent_mempool_spends_by_outpoint(Request::new(wire_request))
             .await
             .map_err(|status| self.handle_status(status))?
             .into_inner();
         response
-            .spend
+            .spends
+            .into_iter()
             .map(transparent_mempool_spend_from_message)
-            .transpose()
+            .collect()
     }
 
     async fn transparent_address_balance(
         &self,
         addresses: &[TransparentAddressScriptHash],
-        at_epoch: Option<ChainEpoch>,
     ) -> Result<TransparentAddressBalance, IndexerError> {
         let wire_addresses = addresses
             .iter()
@@ -686,7 +658,6 @@ impl ChainIndex for RemoteChainIndex {
             .collect();
         let request = wallet::TransparentAddressBalanceRequest {
             addresses: wire_addresses,
-            at_epoch: at_epoch.map(chain_epoch_to_message),
         };
         let response = self
             .client()
@@ -971,27 +942,6 @@ fn subtree_root_from_message(
     ))
 }
 
-fn address_output_index_request_message(
-    query: &AddressOutputIndexQuery,
-    at_epoch: Option<ChainEpoch>,
-) -> wallet::AddressOutputIndexRequest {
-    wallet::AddressOutputIndexRequest {
-        address: Some(wallet::AddressLookup {
-            selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                query.address_script_hash.as_bytes().to_vec(),
-            )),
-        }),
-        max_entries: query.max_entries.map(NonZeroU32::get),
-        from_cursor: query
-            .from_cursor
-            .as_ref()
-            .map(|cursor| cursor.as_bytes().to_vec())
-            .unwrap_or_default(),
-        at_epoch: at_epoch.map(chain_epoch_to_message),
-        start_height: query.start_height.value(),
-    }
-}
-
 fn transparent_address_tx_ids_chunk_from_message(
     expected_network: Network,
     address_script_hash: TransparentAddressScriptHash,
@@ -1024,56 +974,40 @@ fn transparent_address_tx_ids_chunk_from_message(
     })
 }
 
-fn address_output_index_from_message(
-    message: wallet::AddressOutputIndex,
-) -> Result<AddressOutputIndexArtifact, IndexerError> {
-    let address_script_hash_bytes = fixed_32_bytes(
-        "address_output_index.address_script_hash",
-        message.address_script_hash,
-    )?;
-    let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed("address_output_index.outpoint", "field is missing")
-    })?;
-    let transaction_id = transaction_id_from_rpc_hex(
-        "address_output_index.outpoint.transaction_id",
-        &outpoint_message.transaction_id,
-    )?;
-    let block_hash =
-        block_hash_from_rpc_hex("address_output_index.block_hash", &message.block_hash)?;
-    Ok(AddressOutputIndexArtifact::new(
-        TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
-        message.script_pub_key,
-        TransparentOutPoint::new(transaction_id, outpoint_message.output_index),
-        message.value_zat,
-        BlockHeight::new(message.block_height),
-        block_hash,
-    ))
-}
-
-fn address_output_index_stream_item_from_message(
+fn transparent_unspent_output_item_from_message(
     expected_network: Network,
-    message: wallet::AddressOutputIndexStreamChunk,
-) -> Result<AddressOutputIndexStreamItem, IndexerError> {
+    message: wallet::TransparentUnspentOutput,
+) -> Result<TransparentUnspentOutputStreamItem, IndexerError> {
     let chain_epoch = chain_epoch_from_message_with_network(
         expected_network,
         message
             .chain_epoch
             .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
     )?;
-    let output = address_output_index_from_message(
-        message
-            .output
-            .ok_or_else(|| IndexerError::malformed("output", "field is missing"))?,
+    let address_script_hash_bytes = fixed_32_bytes(
+        "transparent_unspent_output.address_script_hash",
+        message.address_script_hash,
     )?;
-    let cursor = if message.cursor.is_empty() {
-        None
-    } else {
-        Some(AddressOutputCursor::from_bytes(message.cursor))
-    };
-    Ok(AddressOutputIndexStreamItem {
+    let outpoint_message = message.outpoint.ok_or_else(|| {
+        IndexerError::malformed("transparent_unspent_output.outpoint", "field is missing")
+    })?;
+    let transaction_id = transaction_id_from_rpc_hex(
+        "transparent_unspent_output.outpoint.transaction_id",
+        &outpoint_message.transaction_id,
+    )?;
+    let block_hash =
+        block_hash_from_rpc_hex("transparent_unspent_output.block_hash", &message.block_hash)?;
+    let output = TransparentUnspentOutput::new(
+        TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
+        message.script_pub_key,
+        TransparentOutPoint::new(transaction_id, outpoint_message.output_index),
+        message.value_zat,
+        BlockHeight::new(message.block_height),
+        block_hash,
+    );
+    Ok(TransparentUnspentOutputStreamItem {
         chain_epoch,
         output,
-        cursor,
     })
 }
 

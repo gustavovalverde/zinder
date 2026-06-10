@@ -7,8 +7,8 @@ use eyre::eyre;
 use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch,
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
@@ -37,19 +37,6 @@ fn synthetic_transparent_output_artifact(
     )
 }
 
-fn address_output_index_from_prevout(
-    prevout: &TransparentOutputArtifact,
-) -> AddressOutputIndexArtifact {
-    AddressOutputIndexArtifact::new(
-        prevout.address_script_hash,
-        prevout.script_pub_key.clone(),
-        prevout.outpoint,
-        prevout.value_zat,
-        prevout.block_height,
-        prevout.block_hash,
-    )
-}
-
 #[tokio::test]
 async fn transparent_outputs_by_outpoint_resolves_known_outpoint() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
@@ -60,7 +47,6 @@ async fn transparent_outputs_by_outpoint_resolves_known_outpoint() -> eyre::Resu
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_address_output_index(vec![address_output_index_from_prevout(&prevout)])
             .with_transparent_outputs_by_outpoint(vec![prevout]),
     )?;
 
@@ -126,7 +112,6 @@ async fn transparent_outputs_by_outpoint_returns_none_for_out_of_bounds_index() 
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_address_output_index(vec![address_output_index_from_prevout(&prevout)])
             .with_transparent_outputs_by_outpoint(vec![prevout]),
     )?;
 
@@ -239,7 +224,7 @@ fn commit_two_block_fixture(
         tip_hash: second_hash,
         safe_tip_height: second_height,
         safe_tip_hash: second_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000),
     };
@@ -284,14 +269,8 @@ fn commit_two_block_fixture(
         prevouts[1].outpoint.transaction_id,
         prevouts[2].outpoint.transaction_id,
     ];
-    let utxos = prevouts
-        .iter()
-        .map(address_output_index_from_prevout)
-        .collect::<Vec<_>>();
-
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, blocks, compact_blocks)
-            .with_address_output_index(utxos)
             .with_transparent_outputs_by_outpoint(prevouts)
             .with_reorg_window_change(ReorgWindowChange::Extend {
                 block_range: BlockHeightRange::inclusive(first_height, second_height),
@@ -369,7 +348,6 @@ async fn transparent_outputs_by_outpoint_preserves_input_order_and_dedupes_reads
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_address_output_index(vec![address_output_index_from_prevout(&prevout)])
             .with_transparent_outputs_by_outpoint(vec![prevout]),
     )?;
 

@@ -239,9 +239,10 @@ mirror the `ChainIndex` methods:
 - `WalletQuery.TransparentMempoolOutputsByAddress` (capability
   `wallet.mempool.transparent_outputs_by_address_v1`) returns unmined
   transparent outputs that fund one transparent address.
-- `WalletQuery.TransparentMempoolSpendByOutpoint` (capability
-  `wallet.mempool.transparent_spend_by_outpoint_v1`) returns the unmined spend
-  of one transparent outpoint, when present.
+- `WalletQuery.TransparentMempoolSpendsByOutpoint` (capability
+  `wallet.mempool.transparent_spends_by_outpoint_v1`) returns the unmined
+  spends of a batch of transparent outpoints; outpoints with no unmined
+  spend produce no entry.
 
 The mempool live state is in-memory and not chain-epoch-pinnable; both
 responses bind to `chain_epoch` visible at lookup time and the requests do not
@@ -283,7 +284,8 @@ methods.
 Transparent-address output queries are not shielded scanning. They reveal
 transparent addresses that are already public on chain, but they still must be
 served from epoch-bound indexed artifacts. `GetAddressUtxos` and
-`GetAddressUtxosStream` map over `WalletQueryApi::address_output_index`,
+`GetAddressUtxosStream` map over
+`WalletQueryApi::transparent_address_unspent_outputs`,
 backed by the canonical transparent address output and transparent spend artifact
 families in `zinder-store`.
 
@@ -297,29 +299,38 @@ is not a reason to bypass the wallet data plane.
 transparent output artifacts. It is a product contract for lightwalletd
 clients, not a way to silence Android SDK logs.
 
-The native `WalletQuery` proto exposes the same artifact-backed reads through
-`AddressOutputIndex` (unary, page-bounded) and
-`AddressOutputIndexStream` (server-streamed, page-bounded). Both consume
-a shared `AddressLookup` oneof that accepts either a 32-byte
-`script_hash` (typed clients) or a base58 transparent `address` (CLI, tests,
-debug callers); the native adapter parses string addresses through
-`ZebraTransparentAddress`, validates the network, and SHA-256-hashes the
-`scriptPubKey` before any in-process call. The Rust `ChainIndex` trait carries
-the same surface: `address_output_index(query, at_epoch)` and
-`address_output_index_stream(query, at_epoch)`, both keyed by the typed
-`TransparentAddressScriptHash`. The `at_epoch: Option<ChainEpoch>` parameter
-honors the standard chain-epoch pin contract; cursor-based pagination uses
-`AddressOutputCursor` (`StreamCursorTokenV1` family flag nibble `0x4`).
-Capability `wallet.address.output_index_v1` is advertised on every
-deployment that can serve the read.
+The native `WalletQuery` proto exposes the same artifact-backed read through
+one server-streaming RPC, `TransparentAddressUnspentOutputs`. The server walks
+the address-output projection once at a single pinned chain epoch and emits
+every unspent output as a `TransparentUnspentOutput` message; `start_height`
+is the wallet-birthday floor. There is no cursor and no entry cap on the
+wire: a stream that is always complete cannot be truncated by a client that
+ignores pagination. The request consumes the shared `AddressLookup` oneof
+that accepts either a 32-byte `script_hash` (typed clients) or a base58
+transparent `address` (CLI, tests, debug callers); the native adapter parses
+string addresses through `ZebraTransparentAddress`, validates the network,
+and SHA-256-hashes the `scriptPubKey` before any in-process call. The Rust
+`ChainIndex` trait carries the same surface:
+`transparent_address_unspent_outputs(query)` keyed by the typed
+`TransparentAddressScriptHash`. The in-process `WalletQueryApi` form keeps
+the standard `at_epoch: Option<ChainEpoch>` pin (the compat shim uses it to
+pin multi-address reads to one epoch); the wire request carries no epoch
+pin because the server always pins internally and no consumer pins old
+epochs. Capability `wallet.address.transparent_unspent_outputs_v1` is
+advertised on every deployment that can serve the read.
 
-Cursor cadence on the streaming surfaces: the wire emits the resume cursor only
-on the terminal chunk of a server stream. Non-terminal `AddressOutputIndexStreamChunk`
-and `TransparentAddressTxIdsChunk` envelopes carry empty `cursor` bytes; the
+Server streams hold the materialized unspent set for the stream lifetime,
+and a drained stream costs the client memory proportional to the address's
+unspent set; acceptable for wallet receivers and documented here for future
+consumers.
+
+Cursor cadence on the tx-history streaming surface: the wire emits the resume
+cursor only on the terminal chunk of a server stream. Non-terminal
+`TransparentAddressTxIdsChunk` envelopes carry empty `cursor` bytes; the
 last envelope carries either the next-page cursor (when more entries may be
 available) or empty bytes (stream fully drained). Clients that lose the
 connection mid-stream must restart the page rather than resume from a
-non-terminal envelope; bounded output/history pages keep that restart cost small.
+non-terminal envelope; bounded history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the store was produced with the wallet-serving
@@ -355,9 +366,8 @@ output, and transparent spend facts; the derive tailer materializes one row per
 Capability `wallet.address.transparent_history_v1` is advertised only when the
 query service can open a derive store that has caught up to the canonical tip.
 Cursor-based pagination uses the derive projection's opaque cursor; the
-`descending` bit selects newest-first iteration. Cursor cadence on the streaming
-surface follows the same rule as `AddressOutputIndexStream`: only the terminal
-chunk carries a non-empty resume cursor.
+`descending` bit selects newest-first iteration. Cursor cadence: only the
+terminal chunk carries a non-empty resume cursor.
 
 The full projection path is the canonical worked example in
 [Extending artifacts §A worked example: transparent address transaction history](extending-artifacts.md#a-worked-example-transparent-address-transaction-history).
@@ -371,7 +381,7 @@ Transparent output resolution turns an `OutPoint` (a `(transaction_id, output_in
 
 Every response binds to a `ChainEpoch` (canonical: the read's epoch; mempool: the writer's epoch visible at lookup time), then carries `repeated TransparentOutputEntry entries` in input order. Each entry has the request's `OutPoint` and an `optional TransparentOutput prevout`; absence means the canonical chain at the bound epoch (canonical) or the live mempool index (mempool) does not have the referenced output. The inner `TransparentOutput` carries `value_zat: uint64` and `script_pub_key: bytes`; identifying fields stay on the entry's `outpoint` so the inner payload carries no redundant fields. Duplicate request outpoints emit duplicate entries.
 
-The shared `OutPoint` proto message is the canonical wire-level outpoint shape across every wallet-plane RPC keyed by `(transaction_id, output_index)`. `TransparentMempoolSpendByOutpoint` and the prevout-resolution surfaces use the same message; future outpoint-keyed RPCs reuse it without inventing parallel shapes. The coinbase sentinel outpoint (`transaction_id = 0x00..00`, `output_index = u32::MAX`) is rejected at the wallet adapter rather than carried as a magic value.
+The shared `OutPoint` proto message is the canonical wire-level outpoint shape across every wallet-plane RPC keyed by `(transaction_id, output_index)`. `TransparentMempoolSpendsByOutpoint` and the prevout-resolution surfaces use the same message; future outpoint-keyed RPCs reuse it without inventing parallel shapes. The coinbase sentinel outpoint (`transaction_id = 0x00..00`, `output_index = u32::MAX`) is rejected at the wallet adapter rather than carried as a magic value.
 
 Both methods cap the request at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024` outpoints. Requests above the cap are silently truncated to the first 1024 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary (Zallet's `view_transaction.rs` is the canonical example).
 
@@ -391,16 +401,13 @@ The response binds to the writer-visible `ChainEpoch`, carries the upstream tip 
 
 The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, `address_count: uint32`, and the binding `chain_epoch`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.
 
-Two coexisting capabilities advertise the same RPC under different semantics:
+The balance has exactly one implementation, in `zinder-explorer`, and one capability: `explorer.transparent_address.balance_v1`, present when the derive plane is configured and the proxy's readiness probe reports `explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery)): for each address in the request, the handler drains the complete `WalletQuery.TransparentAddressUnspentOutputs` stream for confirmed outputs and calls `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, then resolves unconfirmed spends of the whole accumulated unspent set through batched `WalletQuery.TransparentMempoolSpendsByOutpoint` calls chunked at the per-request outpoint cap. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends. The address list is hard-capped at 256 per request to bound the compute fanout. Deployments without an explorer plane omit the capability and reject the call with `UNAVAILABLE`.
 
-- `wallet.address.transparent_balance_v1`: always present. The native adapter answers from canonical outputs alone (confirmed totals, `unconfirmed_delta_zat = 0`). The helper is `zinder_query::transparent_address_confirmed_balance_response`. The address list is hard-capped at `MAX_TRANSPARENT_ADDRESSES_PER_BALANCE_REQUEST = 256` to bound the compute fanout.
-- `explorer.transparent_address.balance_v1`: present when the derive plane is configured and the proxy's readiness probe reports `explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery)) which additionally applies the live mempool overlay: for each address in the request, the handler calls `WalletQuery.AddressOutputIndex` for confirmed outputs, `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, and `WalletQuery.TransparentMempoolSpendByOutpoint` per outpoint for unconfirmed spends. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends.
+The mempool live state is not chain-epoch-pinnable, so the request carries no `at_epoch` pin and the response binds to the chain epoch visible at lookup time. Historical balance at an arbitrary height is out of scope.
 
-Clients that only need confirmed totals can rely on the RPC always answering. Clients that depend on the mempool overlay must check for `explorer.transparent_address.balance_v1` and treat `unconfirmed_delta_zat` as authoritative only when the derive capability is advertised. The `at_epoch` field pins the read to a specific chain epoch (per the standard chain-epoch pin contract). Historical balance at an arbitrary height is out of scope. A future read-path optimization does not change the public wire shape or the capability strings.
+The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` in-process by summing each address's complete unspent set pinned to one epoch; the lightwalletd `Balance { value_zat: int64 }` proto carries no overlay slot, so the shim never depends on `zinder-explorer` for these methods. `GetTaddressBalanceStream` is a per-address loop over the unary form for compatibility clients and exists only for the lightwalletd contract.
 
-The lightwalletd compat shim wires `GetTaddressBalance` and `GetTaddressBalanceStream` directly to the canonical-confirmed-balance helper. The lightwalletd `Balance { value_zat: int64 }` proto carries no overlay slot; the shim never depends on `zinder-explorer` for these methods. `GetTaddressBalanceStream` is a per-address loop over the unary form for compatibility clients and exists only for the lightwalletd contract.
-
-The `ChainIndex` Rust API exposes `transparent_address_balance(addresses, at_epoch)` returning `TransparentAddressBalance`. `LocalChainIndex` and `RemoteChainIndex` both implement it; the capability-coverage test asserts the method exists for any consumer that advertises either `wallet.address.transparent_balance_v1` or `explorer.transparent_address.balance_v1`.
+The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` returning `TransparentAddressBalance`. `LocalChainIndex` and `RemoteChainIndex` both implement it; the capability-coverage test asserts the method exists for the consumer-facing `explorer.transparent_address.balance_v1` capability.
 
 ## Capability Discovery
 

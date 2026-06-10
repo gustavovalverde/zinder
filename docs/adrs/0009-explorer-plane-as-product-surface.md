@@ -47,10 +47,9 @@ The explorer plane exposes these baseline capability strings:
 | `explorer.server_info_v1` | Explorer server-info descriptor |
 | `explorer.transparent_address.balance_v1` | Transparent-address balance with explorer enrichment |
 
-The dual-capability pair is symmetric:
+The balance has one implementation and one capability:
 
-- `wallet.address.transparent_balance_v1` — always-on canonical-confirmed path.
-- `explorer.transparent_address.balance_v1` — same RPC carries the live-mempool overlay when the explorer proxy is ready.
+- `explorer.transparent_address.balance_v1` — `WalletQuery.TransparentAddressBalance` forwards to the explorer's balance compute (confirmed totals plus the live-mempool overlay) when the explorer proxy is ready; deployments without an explorer plane reject the call with `UNAVAILABLE`.
 
 ### SDK names stay derive-shaped
 

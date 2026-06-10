@@ -135,7 +135,7 @@ surface is:
 
 Future native slices may add:
 
-- Transparent address artifacts (paginated `TransparentAddressTxIdsInRange`, `AddressOutputIndexAt`, `TransparentAddressBalanceAt`)
+- Transparent address artifacts (paginated `TransparentAddressTxIdsInRange`, streamed `TransparentAddressUnspentOutputs`, federated `TransparentAddressBalance`)
 - Internal `ChainEpochReadApi` over gRPC for multi-process query mode
 
 Every chain-dependent response either binds to one `ChainEpoch` or explicitly says why a field is independent of the epoch. Range and list APIs must have cursors or explicit maximum sizes.

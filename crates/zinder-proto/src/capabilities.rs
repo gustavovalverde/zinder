@@ -52,23 +52,17 @@ pub const WALLET_EVENTS_MEMPOOL_V1: &str = "wallet.events.mempool_v1";
 /// Capability advertised for `WalletQuery.TransparentMempoolOutputsByAddress`.
 pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1: &str =
     "wallet.mempool.transparent_outputs_by_address_v1";
-/// Capability advertised for `WalletQuery.TransparentMempoolSpendByOutpoint`.
-pub const WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1: &str =
-    "wallet.mempool.transparent_spend_by_outpoint_v1";
+/// Capability advertised for `WalletQuery.TransparentMempoolSpendsByOutpoint`.
+pub const WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1: &str =
+    "wallet.mempool.transparent_spends_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentMempoolOutputsByOutpoint`.
 pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1: &str =
     "wallet.mempool.transparent_outputs_by_outpoint_v1";
-/// Capability advertised for `WalletQuery.AddressOutputIndex[Stream]`.
-pub const WALLET_ADDRESS_OUTPUT_INDEX_V1: &str = "wallet.address.output_index_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressUnspentOutputs`.
+pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
+    "wallet.address.transparent_unspent_outputs_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
-/// Always-on canonical-confirmed-balance path for `WalletQuery.TransparentAddressBalance`.
-///
-/// Advertised whenever the deployment exposes the RPC. Clients that need the
-/// mempool overlay must additionally check for
-/// [`EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1`]; the wallet capability alone
-/// signals confirmed totals computed from canonical UTXOs.
-pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
@@ -204,9 +198,9 @@ pub const INGEST_CONTROL_MEMPOOL_EVENTS_V1: &str = "ingest.control.mempool_event
 /// Capability advertised for `IngestControl.TransparentMempoolOutputsByAddress`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1: &str =
     "ingest.control.transparent_mempool_outputs_by_address_v1";
-/// Capability advertised for `IngestControl.TransparentMempoolSpendByOutpoint`.
-pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1: &str =
-    "ingest.control.transparent_mempool_spend_by_outpoint_v1";
+/// Capability advertised for `IngestControl.TransparentMempoolSpendsByOutpoint`.
+pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1: &str =
+    "ingest.control.transparent_mempool_spends_by_outpoint_v1";
 /// Capability advertised for `IngestControl.TransparentMempoolOutputsByOutpoint`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
     "ingest.control.transparent_mempool_outputs_by_outpoint_v1";
@@ -232,7 +226,7 @@ pub const INGEST_CONTROL_ALWAYS_ON_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
     INGEST_CONTROL_MEMPOOL_EVENTS_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
     INGEST_WRITER_PHASE_V1,
 ];
@@ -250,17 +244,17 @@ pub const INGEST_CONTROL_CAPABILITIES: &[&str] = &[
     INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
     INGEST_CONTROL_MEMPOOL_EVENTS_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPEND_BY_OUTPOINT_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
     INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
     INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
     INGEST_WRITER_PHASE_V1,
 ];
-/// Mempool-overlay path for `WalletQuery.TransparentAddressBalance`.
+/// Capability advertised for `WalletQuery.TransparentAddressBalance`.
 ///
-/// Coexists with [`WALLET_ADDRESS_TRANSPARENT_BALANCE_V1`] when the explorer
-/// plane is configured and ready. Signals that the same response carries the
-/// live mempool overlay in `unconfirmed_delta_zat`. This is the federated form
-/// advertised by `zinder-explorer` and proxied through `WalletQuery`; see
+/// Advertised only when the explorer plane is configured and ready: the
+/// balance response (confirmed total plus the live mempool overlay in
+/// `unconfirmed_delta_zat`) is computed by `zinder-explorer` and proxied
+/// through `WalletQuery`; see
 /// [ADR-0009](../../../docs/adrs/0009-explorer-plane-as-product-surface.md).
 pub const EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1: &str = "explorer.transparent_address.balance_v1";
 
@@ -285,13 +279,12 @@ pub const ZINDER_CAPABILITIES: &[&str] = &[
     WALLET_SNAPSHOT_MEMPOOL_V1,
     WALLET_EVENTS_MEMPOOL_V1,
     WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-    WALLET_MEMPOOL_TRANSPARENT_SPEND_BY_OUTPOINT_V1,
+    WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
     WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
     WALLET_READ_TRANSPARENT_OUTPUTS_V1,
     WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-    WALLET_ADDRESS_OUTPUT_INDEX_V1,
+    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
     EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
     EXPLORER_TRANSACTION_DETAIL_V1,
