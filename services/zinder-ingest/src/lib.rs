@@ -42,8 +42,7 @@ pub use ingest_loop::{
     run_ingest_loop,
 };
 pub use memory_pressure::{
-    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, container_memory_budget_bytes,
-    spawn_runtime_memory_metrics_task,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolOrchestratorError,
@@ -60,3 +59,4 @@ pub use tip_follow::{
     tip_follow_with_primary_store,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
+pub use zinder_runtime::container_memory_budget_bytes;

@@ -1,5 +1,6 @@
 //! Chain store facade.
 
+mod schema_migration;
 mod validation;
 
 use std::{
@@ -12,12 +13,12 @@ use std::{
 
 use parking_lot::RwLock;
 use zinder_core::{
-    AddressOutputIndexArtifact, ArtifactSchemaVersion, BlockBlobArtifact, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
+    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
+    CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
     TransactionFactsArtifact, TransactionLocation, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputArtifact,
-    TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
+    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -47,9 +48,13 @@ use crate::{
         StorageTable,
     },
     transparent_output::read_current_transparent_outputs_by_outpoints,
-    transparent_spend_fact::read_visible_transparent_spend_fact_block_outpoints,
+    transparent_spend_fact::{
+        read_current_transparent_spend_facts_by_outpoints,
+        read_visible_transparent_spend_fact_block_outpoints,
+    },
 };
 
+use schema_migration::migrate_primary_store_schema;
 use validation::{
     committed_block_range, validate_chain_epoch_artifacts, validate_chain_store_options,
     validate_reorg_window_change, validate_visible_chain_commit,
@@ -102,25 +107,26 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 10;
+const STORE_SCHEMA_VERSION: u16 = 11;
+/// Store schema version that the v11 startup rebuild accepts and migrates
+/// in place. See [`schema_migration`].
+const REBUILDABLE_STORE_SCHEMA_VERSION: u16 = 10;
 /// Durable artifact schema version written by this binary.
 ///
-/// Version 9 was the fact-first canonical schema: block headers,
-/// transaction locations and facts, transparent outputs, resolved transparent
-/// spend facts, and optional raw blob tables persisted as separate durable
-/// facts.
+/// Version 10 carried the fact-first layout with every hash-shaped proto
+/// field in stored artifacts encoded as `string` in RPC byte order. Its
+/// `address_output_index` rows were append-only history with an epoch
+/// suffix on the key, filtered at read time.
+/// See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
 ///
-/// Version 10 carries the same fact-first layout, but every hash-shaped
-/// proto field in stored artifacts (`BlockHeaderInfo.previous_block_hash`,
-/// `BlockHeaderInfo.merkle_root_hash`, `TransactionLocation.block_hash`,
-/// `OutPoint.transaction_id`, the `block_hash` and `transaction_id`
-/// fields across mempool and transparent-address artifacts) is `string`
-/// in RPC byte order instead of `bytes` in internal byte order. Stores
-/// written under earlier versions hold raw 32-byte sequences that the
-/// running binary would attempt to decode as UTF-8 strings and reject;
-/// the operator must wipe and re-sync the chain store before opening
-/// with this binary. See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(10);
+/// Version 11 keeps every artifact payload from version 10 and converts
+/// `address_output_index` into a reorg-safe current projection: the key
+/// drops the epoch suffix, rows derive from `transparent_outputs_by_outpoint`
+/// at commit, and finalized-spent rows are deleted by the safe-tip
+/// retention sweep. A version-10 store is migrated in place at primary
+/// open by a one-shot streaming rebuild of the projection from
+/// `transparent_output` and `transparent_spend_fact`; no resync is needed.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(11);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 
@@ -202,7 +208,7 @@ pub struct AddressOutputIndexPage {
     /// Chain epoch used to answer this page.
     pub chain_epoch: ChainEpoch,
     /// outputs in ascending `(block_height, outpoint)` order.
-    pub outputs: Vec<AddressOutputIndexArtifact>,
+    pub outputs: Vec<TransparentUnspentOutput>,
     /// Resume cursor when the page reached `max_entries`. `None` when the
     /// scan was fully drained.
     pub next_cursor: Option<StreamCursorTokenV1>,
@@ -353,6 +359,7 @@ impl PrimaryChainStore {
             options.sync_writes,
             options.rocksdb_resource_budget,
         )?);
+        migrate_primary_store_schema(&inner)?;
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
 
@@ -702,13 +709,15 @@ impl ChainStoreInner {
         let current_projection_protected_outpoints = artifacts
             .transparent_outputs_by_outpoint
             .iter()
-            .map(|prevout| prevout.outpoint)
-            .collect::<HashSet<_>>();
+            .map(|prevout| (prevout.outpoint, prevout.block_height))
+            .collect::<HashMap<_, _>>();
         let current_spend_projection_protected_outpoints = artifacts
             .transparent_spend_facts
             .iter()
             .map(|spend| spend.spent_outpoint)
             .collect::<HashSet<_>>();
+        let retention_sweep =
+            build_safe_tip_retention_sweep(self.inner.as_ref(), &artifacts, current_chain_epoch)?;
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(
             event_sequence,
@@ -730,7 +739,6 @@ impl ChainStoreInner {
                 protected_outpoints: &current_projection_protected_outpoints,
             },
         )?;
-        puts.extend(projection_repairs.puts);
         let spend_projection_repairs = build_reorg_window_spend_fact_projection_repairs(
             self.inner.as_ref(),
             TransparentSpendFactProjectionRepairInputs {
@@ -740,11 +748,14 @@ impl ChainStoreInner {
                 protected_outpoints: &current_spend_projection_protected_outpoints,
             },
         )?;
-        puts.extend(spend_projection_repairs.puts);
+        let swept_outpoints = retention_sweep.swept_outpoints;
+        puts.extend(retention_sweep.puts);
         let mut deletes = projection_repairs.deletes;
         deletes.extend(spend_projection_repairs.deletes);
+        deletes.extend(retention_sweep.deletes);
 
         self.inner.write_batch(puts, deletes)?;
+        record_safe_tip_retention_sweep(swept_outpoints);
 
         Ok(ChainEpochCommitOutcome::new(committed, event_envelope))
     }
@@ -1566,7 +1577,7 @@ fn validate_store_metadata(
             key: key.into(),
         });
     };
-    let store_metadata = decode_store_metadata(&key, &metadata_bytes)?;
+    let store_metadata = decode_current_store_metadata(&key, &metadata_bytes)?;
     if store_metadata.network != expected_network {
         return Err(StoreError::ChainEpochNetworkMismatch {
             current: store_metadata.network,
@@ -1605,7 +1616,7 @@ fn validate_store_metadata_for_commit(
 ) -> Result<Option<StoragePut>, StoreError> {
     let key = StoreKey::store_metadata();
     if let Some(metadata_bytes) = inner.get(StorageTable::StorageControl, &key)? {
-        let store_metadata = decode_store_metadata(&key, &metadata_bytes)?;
+        let store_metadata = decode_current_store_metadata(&key, &metadata_bytes)?;
         if store_metadata.network != expected_network {
             return Err(StoreError::ChainEpochNetworkMismatch {
                 current: store_metadata.network,
@@ -1635,6 +1646,7 @@ fn validate_store_metadata_for_commit(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoreMetadata {
+    schema_version: u16,
     network: Network,
 }
 
@@ -1643,6 +1655,21 @@ fn encode_store_metadata(network: Network) -> Vec<u8> {
     metadata.extend_from_slice(&STORE_SCHEMA_VERSION.to_be_bytes());
     metadata.extend_from_slice(&network.id().to_be_bytes());
     metadata
+}
+
+fn decode_current_store_metadata(
+    key: &StoreKey,
+    metadata_bytes: &[u8],
+) -> Result<StoreMetadata, StoreError> {
+    let store_metadata = decode_store_metadata(key, metadata_bytes)?;
+    if store_metadata.schema_version != STORE_SCHEMA_VERSION {
+        return Err(StoreError::SchemaMismatch {
+            persisted_version: store_metadata.schema_version,
+            expected_version: STORE_SCHEMA_VERSION,
+        });
+    }
+
+    Ok(store_metadata)
 }
 
 fn decode_store_metadata(
@@ -1664,12 +1691,6 @@ fn decode_store_metadata(
             reason: "store metadata schema version must be 2 bytes",
         })?;
     let schema_version = u16::from_be_bytes(schema_version_bytes);
-    if schema_version != STORE_SCHEMA_VERSION {
-        return Err(StoreError::SchemaMismatch {
-            persisted_version: schema_version,
-            expected_version: STORE_SCHEMA_VERSION,
-        });
-    }
 
     let network_id_bytes =
         <[u8; 4]>::try_from(&metadata_bytes[2..6]).map_err(|_| StoreError::ArtifactCorrupt {
@@ -1684,7 +1705,10 @@ fn decode_store_metadata(
         reason: "store metadata has an unknown network id",
     })?;
 
-    Ok(StoreMetadata { network })
+    Ok(StoreMetadata {
+        schema_version,
+        network,
+    })
 }
 
 fn build_chain_event(
@@ -1776,7 +1800,6 @@ fn build_chain_epoch_puts(
         transaction_blobs,
         tree_states,
         subtree_roots,
-        address_output_index,
         transparent_outputs_by_outpoint,
         transparent_spend_facts,
         transparent_address_tx_index,
@@ -1798,7 +1821,6 @@ fn build_chain_epoch_puts(
     push_transaction_blob_artifact_puts(&mut puts, chain_epoch, transaction_blobs)?;
     push_tree_state_artifact_puts(&mut puts, chain_epoch, tree_states)?;
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
-    push_address_output_index_artifact_puts(&mut puts, chain_epoch, address_output_index)?;
     push_transparent_output_artifact_puts(&mut puts, chain_epoch, transparent_outputs_by_outpoint)?;
     push_transparent_spend_fact_puts(&mut puts, chain_epoch, transparent_spend_facts)?;
     push_transparent_address_tx_index_artifact_puts(
@@ -1812,7 +1834,6 @@ fn build_chain_epoch_puts(
 }
 
 struct TransparentOutputProjectionRepairs {
-    puts: Vec<StoragePut>,
     deletes: Vec<StorageDelete>,
 }
 
@@ -1821,16 +1842,24 @@ struct TransparentOutputProjectionRepairInputs<'input> {
     previous_chain_epoch: Option<ChainEpoch>,
     chain_epoch: ChainEpoch,
     reorg_window_change: &'input ReorgWindowChange,
-    protected_outpoints: &'input HashSet<TransparentOutPoint>,
+    /// Outpoints re-created by this commit, with their new creation height.
+    protected_outpoints: &'input HashMap<TransparentOutPoint, BlockHeight>,
 }
 
+/// Builds the `Replace` repair for the transparent-output projection and the
+/// address-output projection it derives.
+///
+/// Both projections key creation facts, so both repair from the same set of
+/// reverted creation outpoints. The address row carries the creation height
+/// in its key: a protected outpoint re-created at a different height still
+/// needs its old address row deleted, while the outpoint-keyed
+/// `transparent_output` row is simply overwritten by this commit's put.
 fn build_reorg_window_projection_repairs(
     inner: &impl RocksChainStoreRead,
     inputs: TransparentOutputProjectionRepairInputs<'_>,
 ) -> Result<TransparentOutputProjectionRepairs, StoreError> {
     let ReorgWindowChange::Replace { from_height } = inputs.reorg_window_change else {
         return Ok(TransparentOutputProjectionRepairs {
-            puts: Vec::new(),
             deletes: Vec::new(),
         });
     };
@@ -1844,26 +1873,39 @@ fn build_reorg_window_projection_repairs(
             })?;
     let reverted_outpoints =
         read_reverted_transparent_output_outpoints(inner, previous_chain_epoch, *from_height)?;
+    let reverted_outputs = read_current_transparent_outputs_by_outpoints(
+        inner,
+        previous_chain_epoch,
+        &reverted_outpoints,
+    )?;
     for outpoint in reverted_outpoints {
-        if inputs.protected_outpoints.contains(&outpoint) {
+        if let Some(reverted_output) = reverted_outputs.get(&outpoint)
+            && inputs.protected_outpoints.get(&outpoint) != Some(&reverted_output.block_height)
+        {
+            deletes.push(StorageDelete {
+                table: StorageTable::AddressOutputIndex,
+                key: StoreKey::address_output_index(
+                    inputs.chain_epoch.network,
+                    reverted_output.address_script_hash,
+                    reverted_output.block_height,
+                    outpoint,
+                ),
+            });
+        }
+        if inputs.protected_outpoints.contains_key(&outpoint) {
             continue;
         }
 
-        let current_key = StoreKey::transparent_output(inputs.chain_epoch.network, outpoint);
         deletes.push(StorageDelete {
             table: StorageTable::TransparentOutput,
-            key: current_key,
+            key: StoreKey::transparent_output(inputs.chain_epoch.network, outpoint),
         });
     }
 
-    Ok(TransparentOutputProjectionRepairs {
-        puts: Vec::new(),
-        deletes,
-    })
+    Ok(TransparentOutputProjectionRepairs { deletes })
 }
 
 struct TransparentSpendFactProjectionRepairs {
-    puts: Vec<StoragePut>,
     deletes: Vec<StorageDelete>,
 }
 
@@ -1881,7 +1923,6 @@ fn build_reorg_window_spend_fact_projection_repairs(
 ) -> Result<TransparentSpendFactProjectionRepairs, StoreError> {
     let ReorgWindowChange::Replace { from_height } = inputs.reorg_window_change else {
         return Ok(TransparentSpendFactProjectionRepairs {
-            puts: Vec::new(),
             deletes: Vec::new(),
         });
     };
@@ -1907,10 +1948,173 @@ fn build_reorg_window_spend_fact_projection_repairs(
         });
     }
 
-    Ok(TransparentSpendFactProjectionRepairs {
-        puts: Vec::new(),
+    Ok(TransparentSpendFactProjectionRepairs { deletes })
+}
+
+struct SafeTipRetentionSweep {
+    puts: Vec<StoragePut>,
+    deletes: Vec<StorageDelete>,
+    swept_outpoints: u64,
+}
+
+impl SafeTipRetentionSweep {
+    const fn empty() -> Self {
+        Self {
+            puts: Vec::new(),
+            deletes: Vec::new(),
+            swept_outpoints: 0,
+        }
+    }
+}
+
+/// Builds the safe-tip retention sweep for an `AdvanceSafeTipTo` commit.
+///
+/// A projection row may be physically deleted only when no commit the store
+/// will ever accept can make it live again. `validate_reorg_window_change`
+/// floors every `Replace` at `safe_tip + 1`, so a spend at or below
+/// `safe_tip_height` is irreversible: the spent output's rows are deleted
+/// from `address_output_index`, `transparent_output`, and
+/// `transparent_spend_fact` in the same commit batch.
+///
+/// The sweep covers heights from the persisted swept-through marker up to
+/// `min(new safe tip, previous tip)`. Spend facts committed by this same
+/// batch are not durable yet when the sweep reads, so bulk catchup (which
+/// advances the safe tip to the batch tip) sweeps each batch one commit
+/// later. A non-monotonic `AdvanceSafeTipTo` target leaves the marker and
+/// the projections untouched.
+fn build_safe_tip_retention_sweep(
+    inner: &impl RocksChainStoreRead,
+    artifacts: &ChainEpochArtifacts,
+    previous_chain_epoch: Option<ChainEpoch>,
+) -> Result<SafeTipRetentionSweep, StoreError> {
+    if !matches!(
+        artifacts.reorg_window_change,
+        ReorgWindowChange::AdvanceSafeTipTo { .. }
+    ) {
+        return Ok(SafeTipRetentionSweep::empty());
+    }
+    let chain_epoch = artifacts.chain_epoch;
+    let Some(previous_chain_epoch) = previous_chain_epoch else {
+        // Checkpoint bootstrap: nothing below the operator-supplied safe tip
+        // is stored, so the marker starts at that boundary instead of
+        // walking millions of empty heights on the first follow-up sweep.
+        if artifacts.block_headers.is_empty() {
+            return Ok(SafeTipRetentionSweep {
+                puts: vec![transparent_retention_swept_height_put(
+                    chain_epoch.safe_tip_height,
+                )],
+                deletes: Vec::new(),
+                swept_outpoints: 0,
+            });
+        }
+        return Ok(SafeTipRetentionSweep::empty());
+    };
+
+    let swept_through =
+        read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
+    let sweep_ceiling = chain_epoch
+        .safe_tip_height
+        .min(previous_chain_epoch.tip_height);
+    if sweep_ceiling <= swept_through {
+        return Ok(SafeTipRetentionSweep::empty());
+    }
+
+    let mut deletes = Vec::new();
+    let mut swept_outpoints = 0_u64;
+    let sweep_range = BlockHeightRange::inclusive(
+        BlockHeight::new(swept_through.value().saturating_add(1)),
+        sweep_ceiling,
+    );
+    for height in sweep_range {
+        let outpoints = read_visible_transparent_spend_fact_block_outpoints(
+            inner,
+            previous_chain_epoch,
+            height,
+        )?;
+        if outpoints.is_empty() {
+            continue;
+        }
+        let spends = read_current_transparent_spend_facts_by_outpoints(
+            inner,
+            previous_chain_epoch,
+            &outpoints,
+        )?;
+        for outpoint in outpoints {
+            let Some(spend) = spends.get(&outpoint) else {
+                continue;
+            };
+            if spend.block_height != height {
+                continue;
+            }
+            deletes.push(StorageDelete {
+                table: StorageTable::AddressOutputIndex,
+                key: StoreKey::address_output_index(
+                    chain_epoch.network,
+                    spend.spent_address_script_hash,
+                    spend.spent_block_height,
+                    outpoint,
+                ),
+            });
+            deletes.push(StorageDelete {
+                table: StorageTable::TransparentOutput,
+                key: StoreKey::transparent_output(chain_epoch.network, outpoint),
+            });
+            deletes.push(StorageDelete {
+                table: StorageTable::TransparentSpendFact,
+                key: StoreKey::transparent_spend_fact(chain_epoch.network, outpoint),
+            });
+            swept_outpoints = swept_outpoints.saturating_add(1);
+        }
+    }
+
+    Ok(SafeTipRetentionSweep {
+        puts: vec![transparent_retention_swept_height_put(sweep_ceiling)],
         deletes,
+        swept_outpoints,
     })
+}
+
+fn transparent_retention_swept_height_put(height: BlockHeight) -> StoragePut {
+    StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::transparent_retention_swept_height(),
+        value: height.value().to_be_bytes().to_vec(),
+    }
+}
+
+fn read_transparent_retention_swept_height(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<BlockHeight>, StoreError> {
+    let key = StoreKey::transparent_retention_swept_height();
+    let Some(height_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
+        return Ok(None);
+    };
+
+    let height_bytes =
+        <[u8; 4]>::try_from(height_bytes.as_slice()).map_err(|_| StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransparentSpendFact,
+            key: key.clone().into(),
+            reason: "transparent retention swept height must be 4 bytes",
+        })?;
+    Ok(Some(BlockHeight::new(u32::from_be_bytes(height_bytes))))
+}
+
+fn record_safe_tip_retention_sweep(swept_outpoints: u64) {
+    if swept_outpoints == 0 {
+        return;
+    }
+    metrics::counter!("zinder_store_retention_swept_outpoints_total").increment(swept_outpoints);
+}
+
+fn address_output_row(artifact: &TransparentOutputArtifact) -> TransparentUnspentOutput {
+    TransparentUnspentOutput::new(
+        artifact.address_script_hash,
+        artifact.script_pub_key.clone(),
+        artifact.outpoint,
+        artifact.value_zat,
+        artifact.block_height,
+        artifact.block_hash,
+    )
 }
 
 fn read_reverted_transparent_spend_fact_outpoints(
@@ -2230,30 +2434,6 @@ fn push_subtree_root_artifact_puts(
     Ok(())
 }
 
-fn push_address_output_index_artifact_puts(
-    puts: &mut Vec<StoragePut>,
-    chain_epoch: ChainEpoch,
-    address_output_index: Vec<AddressOutputIndexArtifact>,
-) -> Result<(), StoreError> {
-    for output in address_output_index {
-        let key = StoreKey::address_output_index(
-            chain_epoch.network,
-            output.address_script_hash,
-            output.block_height,
-            output.outpoint,
-            chain_epoch.id,
-        );
-        let encoded_utxo = encode_address_output_index_artifact(output)?;
-        puts.push(StoragePut {
-            table: StorageTable::AddressOutputIndex,
-            key,
-            value: encoded_utxo,
-        });
-    }
-
-    Ok(())
-}
-
 fn push_transparent_output_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
@@ -2266,6 +2446,16 @@ fn push_transparent_output_artifact_puts(
             .entry((artifact.block_height, artifact.block_hash))
             .or_default()
             .push(artifact.outpoint);
+        puts.push(StoragePut {
+            table: StorageTable::AddressOutputIndex,
+            key: StoreKey::address_output_index(
+                chain_epoch.network,
+                artifact.address_script_hash,
+                artifact.block_height,
+                artifact.outpoint,
+            ),
+            value: encode_address_output_index_artifact(address_output_row(&artifact))?,
+        });
         let encoded = encode_transparent_output_artifact(artifact)?;
         puts.push(StoragePut {
             table: StorageTable::TransparentOutput,
@@ -2875,7 +3065,7 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 10);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 11);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

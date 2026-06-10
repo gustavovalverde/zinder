@@ -1,4 +1,3 @@
-mod address_output_index;
 mod bulk_catchup;
 mod cli;
 mod deep_chain;
@@ -10,4 +9,5 @@ mod network_upgrade_boundary;
 mod reorg_sweep;
 mod tip_follow;
 mod transparent_address_surface;
+mod transparent_address_unspent_outputs;
 mod transparent_outputs_by_outpoint;

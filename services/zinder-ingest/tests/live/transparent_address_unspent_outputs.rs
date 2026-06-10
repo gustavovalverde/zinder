@@ -4,8 +4,8 @@
 )]
 
 //! Live regtest assertion that the typed
-//! `WalletQueryApi::address_output_index` surfaces UTXOs paid to the
-//! seed-derived test address after a fresh bulk catchup.
+//! `WalletQueryApi::transparent_address_unspent_outputs` surfaces UTXOs
+//! paid to the seed-derived test address after a fresh bulk catchup.
 //!
 //! # Operator precondition
 //!
@@ -22,7 +22,7 @@ use tempfile::tempdir;
 use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
 use zinder_ingest::run_bulk_catchup;
-use zinder_query::{AddressOutputIndexRequest, WalletQuery, WalletQueryApi};
+use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::TransparentTestKey;
 use zinder_testkit::live::{init, require_live_for};
@@ -36,7 +36,7 @@ const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn address_output_index_surface_through_typed_wallet_query() -> Result<()> {
+async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
@@ -46,7 +46,7 @@ async fn address_output_index_surface_through_typed_wallet_query() -> Result<()>
     let test_address = test_key.address_base58();
     tracing::info!(
         target: "zinder::live",
-        event = "address_output_index_test_address",
+        event = "transparent_address_unspent_outputs_test_address",
         address = %test_address,
         "regtest UTXO query: configure mining.miner_address to this value"
     );
@@ -83,12 +83,10 @@ async fn address_output_index_surface_through_typed_wallet_query() -> Result<()>
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
     let response = wallet_query
-        .address_output_index(
-            AddressOutputIndexRequest {
+        .transparent_address_unspent_outputs(
+            TransparentAddressUnspentOutputsRequest {
                 address_script_hash,
                 start_height: BlockHeight::new(0),
-                max_entries: NonZeroU32::MIN.saturating_add(99),
-                from_cursor: None,
             },
             None,
         )

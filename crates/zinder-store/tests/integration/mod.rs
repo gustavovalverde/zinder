@@ -5,6 +5,7 @@ use zinder_core::{
     UnsupportedSection,
 };
 
+mod address_output_projection;
 mod chain_epoch_reader;
 mod chain_event;
 mod commit_chain_epoch;

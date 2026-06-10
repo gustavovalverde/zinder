@@ -149,6 +149,7 @@ pub(crate) fn zebra_source_from_bulk_catchup(
             ZebraJsonRpcSourceOptions {
                 request_timeout: bulk_catchup_config.node.request_timeout,
                 max_response_bytes: bulk_catchup_config.node.max_response_bytes,
+                broadcast_timeout: None,
             },
         )?),
     }
@@ -165,6 +166,7 @@ pub(crate) fn zebra_source_from_tip_follow(
         ZebraJsonRpcSourceOptions {
             request_timeout: tip_follow_config.node.request_timeout,
             max_response_bytes: tip_follow_config.node.max_response_bytes,
+            broadcast_timeout: None,
         },
     )?)
 }
@@ -178,6 +180,7 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
         ZebraJsonRpcSourceOptions {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
         },
     )?;
     Ok(NodeSource::tip_id(&probe_source).await?.height)
@@ -308,6 +311,7 @@ fn zebra_json_rpc_source_for_env(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource
         ZebraJsonRpcSourceOptions {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
         },
     )?)
 }

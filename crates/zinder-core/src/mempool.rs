@@ -95,9 +95,11 @@ pub struct TransparentMempoolSpend {
 
 /// Bounded request for transparent mempool outputs tied to one address.
 ///
-/// Mirrors the mined `AddressOutputIndexRequest` shape so the call
-/// surface for transparent address queries stays uniform between mined and
-/// mempool reads.
+/// Keyed by the same typed script hash as the mined
+/// `TransparentAddressUnspentOutputsRequest` so the call surface for
+/// transparent address queries stays uniform between mined and mempool
+/// reads; the mempool read stays bounded because the live index is not a
+/// reorg-safe projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransparentMempoolOutputsRequest {
     /// Hash of the transparent address script being queried.

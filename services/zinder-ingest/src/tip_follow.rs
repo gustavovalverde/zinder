@@ -1479,7 +1479,6 @@ mod tests {
             transaction_locations: Vec::new(),
             transaction_facts: Vec::new(),
             transaction_blobs: Vec::new(),
-            address_output_index: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
         })
     }

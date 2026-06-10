@@ -116,6 +116,7 @@ fn json_rpc_source(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
         ZebraJsonRpcSourceOptions {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
         },
     )?)
 }

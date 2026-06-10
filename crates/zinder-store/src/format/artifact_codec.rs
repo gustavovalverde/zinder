@@ -3,16 +3,17 @@
 use bytes::Bytes;
 use prost::Message;
 use zinder_core::{
-    AddressOutputIndexArtifact, ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, ConsensusBranchId, LockTime,
-    MempoolEntry, MempoolEvictionReason, Network, PrivacyShape, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
-    TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
+    ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockHash, BlockHeaderArtifact,
+    BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
+    ChainTipMetadata, CompactBlockArtifact, ConsensusBranchId, LockTime, MempoolEntry,
+    MempoolEvictionReason, Network, PrivacyShape, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact,
+    TransactionComponentCounts, TransactionFactsArtifact, TransactionId, TransactionLocation,
+    TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentInputFact, TransparentMempoolOutput,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
-    TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection, Wtxid,
+    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
+    UnsupportedSection, Wtxid,
 };
 
 use crate::{
@@ -938,11 +939,11 @@ pub(crate) fn decode_subtree_root_artifact(
 }
 
 pub(crate) fn encode_address_output_index_artifact(
-    output: AddressOutputIndexArtifact,
+    output: TransparentUnspentOutput,
 ) -> Result<Vec<u8>, StoreError> {
     encode_artifact_record(
-        PayloadFormat::ZinderAddressOutputIndexArtifactV1,
-        &AddressOutputIndexArtifactRecord {
+        PayloadFormat::ZinderTransparentUnspentOutputV1,
+        &TransparentUnspentOutputRecord {
             address_script_hash: output.address_script_hash.as_bytes().to_vec(),
             script_pub_key: Bytes::from(output.script_pub_key),
             transaction_id: output.outpoint.transaction_id.as_bytes().to_vec(),
@@ -957,14 +958,14 @@ pub(crate) fn encode_address_output_index_artifact(
 pub(crate) fn decode_address_output_index_artifact(
     key: &StoreKey,
     envelope_bytes: &[u8],
-) -> Result<AddressOutputIndexArtifact, StoreError> {
+) -> Result<TransparentUnspentOutput, StoreError> {
     let payload_bytes = decode_artifact_payload(
         ArtifactFamily::AddressOutputIndex,
         key,
         envelope_bytes,
-        PayloadFormat::ZinderAddressOutputIndexArtifactV1,
+        PayloadFormat::ZinderTransparentUnspentOutputV1,
     )?;
-    let record = AddressOutputIndexArtifactRecord::decode(payload_bytes).map_err(|_| {
+    let record = TransparentUnspentOutputRecord::decode(payload_bytes).map_err(|_| {
         StoreError::ArtifactCorrupt {
             family: ArtifactFamily::AddressOutputIndex,
             key: key.clone().into(),
@@ -972,7 +973,7 @@ pub(crate) fn decode_address_output_index_artifact(
         }
     })?;
 
-    Ok(AddressOutputIndexArtifact::new(
+    Ok(TransparentUnspentOutput::new(
         decode_transparent_address_script_hash(key, &record.address_script_hash)?,
         record.script_pub_key.to_vec(),
         TransparentOutPoint::new(
@@ -1899,7 +1900,7 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
         PayloadFormat::ZinderTransactionFactsArtifactV1 => ArtifactFamily::TransactionFacts,
         PayloadFormat::ZinderTreeStateArtifactV1 => ArtifactFamily::TreeState,
         PayloadFormat::ZinderSubtreeRootArtifactV1 => ArtifactFamily::SubtreeRoot,
-        PayloadFormat::ZinderAddressOutputIndexArtifactV1 => ArtifactFamily::AddressOutputIndex,
+        PayloadFormat::ZinderTransparentUnspentOutputV1 => ArtifactFamily::AddressOutputIndex,
         PayloadFormat::ZinderTransparentSpendFactV2
         | PayloadFormat::ZinderTransparentSpendFactBlockIndexV1 => {
             ArtifactFamily::TransparentSpendFact
@@ -2282,7 +2283,7 @@ struct SubtreeRootArtifactRecord {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct AddressOutputIndexArtifactRecord {
+struct TransparentUnspentOutputRecord {
     #[prost(bytes, tag = "1")]
     address_script_hash: Vec<u8>,
     #[prost(bytes = "bytes", tag = "2")]

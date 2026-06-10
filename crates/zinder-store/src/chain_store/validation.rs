@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact, TransactionFactsArtifact,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
+    CompactBlockArtifact, SubtreeRootArtifact, TransactionFactsArtifact, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
 };
 
 use crate::{
@@ -62,14 +62,8 @@ pub(super) fn validate_chain_epoch_artifacts(
     )?;
     validate_tree_state_artifacts(&artifacts.tree_states, tip_height, &block_hash_by_height)?;
     validate_subtree_root_artifacts(&artifacts.subtree_roots, tip_height, &block_hash_by_height)?;
-    validate_address_output_index_artifacts(
-        &artifacts.address_output_index,
-        tip_height,
-        &block_hash_by_height,
-    )?;
     validate_transparent_output_artifacts(
         &artifacts.transparent_outputs_by_outpoint,
-        &artifacts.address_output_index,
         tip_height,
         &block_hash_by_height,
     )?;
@@ -131,7 +125,6 @@ fn safe_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bo
         && artifacts.transaction_facts.is_empty()
         && artifacts.tree_states.is_empty()
         && artifacts.subtree_roots.is_empty()
-        && artifacts.address_output_index.is_empty()
         && artifacts.transparent_outputs_by_outpoint.is_empty()
         && artifacts.transparent_spend_facts.is_empty()
 }
@@ -730,45 +723,12 @@ fn validate_subtree_root_artifacts(
     Ok(())
 }
 
-fn validate_address_output_index_artifacts(
-    address_output_index: &[AddressOutputIndexArtifact],
+fn validate_transparent_output_artifacts(
+    transparent_outputs_by_outpoint: &[TransparentOutputArtifact],
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
     let mut outpoints = HashSet::<TransparentOutPoint>::new();
-    for address_output in address_output_index {
-        if address_output.block_height > tip_height {
-            return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address output height cannot exceed tip height",
-            });
-        }
-
-        if block_hash_by_height.get(&address_output.block_height)
-            != Some(&address_output.block_hash)
-        {
-            return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address output artifact must match a block artifact at the same height",
-            });
-        }
-
-        if !outpoints.insert(address_output.outpoint) {
-            return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address output artifacts cannot repeat an outpoint",
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_transparent_output_artifacts(
-    transparent_outputs_by_outpoint: &[TransparentOutputArtifact],
-    address_output_index: &[AddressOutputIndexArtifact],
-    tip_height: BlockHeight,
-    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
-) -> Result<(), StoreError> {
-    let mut prevouts_by_outpoint =
-        HashMap::<TransparentOutPoint, &TransparentOutputArtifact>::new();
     for prevout in transparent_outputs_by_outpoint {
         if prevout.block_height > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
@@ -782,38 +742,11 @@ fn validate_transparent_output_artifacts(
             });
         }
 
-        if prevouts_by_outpoint
-            .insert(prevout.outpoint, prevout)
-            .is_some()
-        {
+        if !outpoints.insert(prevout.outpoint) {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "transparent output artifacts cannot repeat an outpoint",
             });
         }
-    }
-
-    for address_output in address_output_index {
-        let Some(prevout) = prevouts_by_outpoint.get(&address_output.outpoint) else {
-            return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent address output artifacts require matching transparent output artifacts",
-            });
-        };
-        if prevout.value_zat != address_output.value_zat
-            || prevout.script_pub_key != address_output.script_pub_key
-            || prevout.address_script_hash != address_output.address_script_hash
-            || prevout.block_height != address_output.block_height
-            || prevout.block_hash != address_output.block_hash
-        {
-            return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "transparent output artifact must match its transparent address output artifact",
-            });
-        }
-    }
-
-    if prevouts_by_outpoint.len() != address_output_index.len() {
-        return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "transparent output artifacts require matching transparent address output artifacts",
-        });
     }
 
     Ok(())

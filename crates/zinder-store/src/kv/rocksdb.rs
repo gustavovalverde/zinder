@@ -229,8 +229,7 @@ pub(crate) struct RocksChainStore {
     block_cache: Cache,
     write_buffer_manager: WriteBufferManager,
     io_mode: RocksDbIoMode,
-    block_cache_capacity_bytes: u64,
-    wal_size_limit_bytes: u64,
+    resource_budget: RocksDbResourceBudget,
 }
 
 impl RocksChainStore {
@@ -255,8 +254,7 @@ impl RocksChainStore {
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
-            block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
-            wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
+            resource_budget: rocksdb_resource_budget,
         };
         store.record_rocksdb_properties();
 
@@ -286,8 +284,7 @@ impl RocksChainStore {
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
-            block_cache_capacity_bytes: rocksdb_resource_budget.block_cache_bytes,
-            wal_size_limit_bytes: rocksdb_resource_budget.max_wal_bytes,
+            resource_budget: rocksdb_resource_budget,
         };
         store.record_rocksdb_properties();
 
@@ -550,6 +547,97 @@ impl RocksChainStore {
             .map_err(StoreError::secondary_catchup_failed)
     }
 
+    /// Drops `table`'s column family and recreates it empty with the same
+    /// bounded options, reclaiming its disk space immediately.
+    ///
+    /// Primary-only schema-migration primitive: a secondary cannot replay a
+    /// column-family drop and must reopen after the primary migrates.
+    pub(crate) fn recreate_column_family(&self, table: StorageTable) -> Result<(), StoreError> {
+        let name = table.column_family_name();
+        if self.db.cf_handle(name).is_some() {
+            self.db
+                .drop_cf(name)
+                .map_err(StoreError::storage_unavailable)?;
+        }
+        let options = column_family_options(table, &self.block_cache, self.resource_budget);
+        self.db
+            .create_cf(name, &options)
+            .map_err(StoreError::storage_unavailable)
+    }
+
+    /// Walks two column families in one ordered pass, pairing rows whose
+    /// keys are identical after the two-byte `StoreKey` header.
+    ///
+    /// Both families must share the same post-header key layout. Writes
+    /// issued from inside the visitor are safe: each raw iterator pins its
+    /// own consistent view at creation.
+    pub(crate) fn scan_tables_merged_by_key_suffix(
+        &self,
+        left_table: StorageTable,
+        right_table: StorageTable,
+        visit: &mut dyn FnMut(MergedTableRow<'_>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let left_column_family = self.column_family(left_table)?;
+        let right_column_family = self.column_family(right_table)?;
+        let mut left = self.db.raw_iterator_cf(&left_column_family);
+        let mut right = self.db.raw_iterator_cf(&right_column_family);
+        left.seek_to_first();
+        right.seek_to_first();
+
+        loop {
+            let left_item = if left.valid() { left.item() } else { None };
+            let right_item = if right.valid() { right.item() } else { None };
+            match (left_item, right_item) {
+                (None, None) => break,
+                (Some((left_key, left_value)), None) => {
+                    visit(MergedTableRow::LeftOnly {
+                        key: left_key,
+                        value: left_value,
+                    })?;
+                    left.next();
+                }
+                (None, Some((right_key, right_value))) => {
+                    visit(MergedTableRow::RightOnly {
+                        key: right_key,
+                        value: right_value,
+                    })?;
+                    right.next();
+                }
+                (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                    match key_suffix(left_key).cmp(key_suffix(right_key)) {
+                        std::cmp::Ordering::Less => {
+                            visit(MergedTableRow::LeftOnly {
+                                key: left_key,
+                                value: left_value,
+                            })?;
+                            left.next();
+                        }
+                        std::cmp::Ordering::Greater => {
+                            visit(MergedTableRow::RightOnly {
+                                key: right_key,
+                                value: right_value,
+                            })?;
+                            right.next();
+                        }
+                        std::cmp::Ordering::Equal => {
+                            visit(MergedTableRow::Matched {
+                                left_key,
+                                left_value,
+                                right_value,
+                            })?;
+                            left.next();
+                            right.next();
+                        }
+                    }
+                }
+            }
+        }
+        left.status().map_err(StoreError::storage_unavailable)?;
+        right.status().map_err(StoreError::storage_unavailable)?;
+
+        Ok(())
+    }
+
     /// Forces every column family's active memtable to flush to `SST`
     /// and truncates the WAL.
     ///
@@ -643,9 +731,10 @@ impl RocksChainStore {
         if let Some(wal_bytes) = self.wal_size_bytes() {
             metrics::gauge!("zinder_store_wal_bytes").set(u64_to_f64(wal_bytes));
         }
-        metrics::gauge!("zinder_store_wal_bytes_limit").set(u64_to_f64(self.wal_size_limit_bytes));
+        metrics::gauge!("zinder_store_wal_bytes_limit")
+            .set(u64_to_f64(self.resource_budget.max_wal_bytes));
         metrics::gauge!("zinder_store_block_cache_capacity_bytes")
-            .set(u64_to_f64(self.block_cache_capacity_bytes));
+            .set(u64_to_f64(self.resource_budget.block_cache_bytes));
         metrics::gauge!("zinder_store_block_cache_usage_bytes")
             .set(usize_to_f64(self.block_cache.get_usage()));
         metrics::gauge!("zinder_store_memtable_budget_bytes")
@@ -790,6 +879,25 @@ pub(crate) trait RocksChainStoreRead {
 pub(crate) enum PrefixScanControl {
     Continue,
     Stop,
+}
+
+/// One step of a two-table ordered merge over a shared post-header key layout.
+#[derive(Clone, Copy)]
+pub(crate) enum MergedTableRow<'row> {
+    /// Key present only in the left table.
+    LeftOnly { key: &'row [u8], value: &'row [u8] },
+    /// Key present only in the right table.
+    RightOnly { key: &'row [u8], value: &'row [u8] },
+    /// Key present in both tables.
+    Matched {
+        left_key: &'row [u8],
+        left_value: &'row [u8],
+        right_value: &'row [u8],
+    },
+}
+
+fn key_suffix(key: &[u8]) -> &[u8] {
+    key.get(2..).unwrap_or(key)
 }
 
 impl RocksChainStoreRead for RocksChainStore {

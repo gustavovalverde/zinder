@@ -861,11 +861,11 @@ mod tests {
     use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        AddressOutputIndexArtifact, BlockHash, BlockId, ConsensusBranchId,
-        NetworkUpgradeActivation, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
-        SubtreeRootIndex, TransactionFactsArtifact, TransactionId, TransactionLocation,
-        TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
-        UnixTimestampMillis, wire::encode_internal_block_hash,
+        BlockHash, BlockId, ConsensusBranchId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT,
+        ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionFactsArtifact,
+        TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
+        TransparentOutPoint, TransparentUnspentOutput, UnixTimestampMillis,
+        wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
@@ -1991,7 +1991,7 @@ mod tests {
         let funding_block_hash = funding_block.hash;
         let script_pub_key = vec![0x76, 0xa9, 0x14, 0x88];
         let funding_fixture =
-            funding_fixture.with_address_output_index(AddressOutputIndexArtifact::new(
+            funding_fixture.with_address_output_index(TransparentUnspentOutput::new(
                 TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
                 script_pub_key,
                 spent_outpoint,
@@ -2442,7 +2442,6 @@ mod tests {
             transaction_locations: Vec::new(),
             transaction_facts: Vec::new(),
             transaction_blobs: Vec::new(),
-            address_output_index: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
         }
     }

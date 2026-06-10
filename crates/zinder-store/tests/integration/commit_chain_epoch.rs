@@ -385,7 +385,7 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         tip_hash: bootstrap_hash,
         safe_tip_height: bootstrap_height,
         safe_tip_hash: bootstrap_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: bootstrap_tip_metadata,
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -443,7 +443,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: checkpoint_hash,
         safe_tip_height: checkpoint_height,
         safe_tip_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -472,7 +472,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_hash: replaced_tip_hash,
         safe_tip_height: checkpoint_height,
         safe_tip_hash: replaced_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::new(130_002, 39_758),
         created_at: UnixTimestampMillis::new(1_774_668_000_001),
     };
@@ -538,7 +538,7 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             safe_tip_height: block_height,
             safe_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(10),
+            artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },

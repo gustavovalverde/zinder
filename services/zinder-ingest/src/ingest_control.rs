@@ -314,29 +314,35 @@ impl IngestControl for IngestControlGrpcAdapter {
         ))
     }
 
-    async fn transparent_mempool_spend_by_outpoint(
+    async fn transparent_mempool_spends_by_outpoint(
         &self,
-        request: Request<wallet::TransparentMempoolSpendByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendByOutpointResponse>, Status> {
+        request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
         let mempool_index = self
             .mempool_index
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
         let request = request.into_inner();
-        let outpoint = outpoint_from_request_message(request.outpoint)?;
+        let mut request_outpoints = request.outpoints;
+        request_outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
+        let outpoints = request_outpoints
+            .into_iter()
+            .map(|message| outpoint_from_request_message(Some(message)))
+            .collect::<Result<Vec<_>, _>>()?;
         let chain_epoch = self
             .store
             .current_chain_epoch()
             .map_err(|error| status_from_store_error(&error))?
             .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
-        let spend = mempool_index
-            .transparent_spend_by_outpoint(outpoint)
-            .as_ref()
-            .map(transparent_mempool_spend_message);
+        let spends = outpoints
+            .into_iter()
+            .filter_map(|outpoint| mempool_index.transparent_spend_by_outpoint(outpoint))
+            .map(|spend| transparent_mempool_spend_message(&spend))
+            .collect();
         Ok(Response::new(
-            wallet::TransparentMempoolSpendByOutpointResponse {
+            wallet::TransparentMempoolSpendsByOutpointResponse {
                 chain_epoch: Some(chain_epoch_message(chain_epoch)),
-                spend,
+                spends,
             },
         ))
     }

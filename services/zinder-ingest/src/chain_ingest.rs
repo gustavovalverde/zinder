@@ -15,8 +15,8 @@ use std::{
 use thiserror::Error;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
     TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
     TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
@@ -297,9 +297,8 @@ pub struct BuiltArtifacts {
     pub transaction_facts: Vec<TransactionFactsArtifact>,
     /// Optional raw transaction blobs.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Transparent-output index entries.
-    pub address_output_index: Vec<AddressOutputIndexArtifact>,
-    /// Transparent output artifacts keyed by outpoint.
+    /// Transparent output artifacts keyed by outpoint. The store derives
+    /// the address-output projection rows from these at commit.
     pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     /// Running commitment-tree position after this block is folded in.
     pub tip_metadata: ChainTipMetadata,
@@ -317,7 +316,6 @@ pub(crate) struct CanonicalBatch {
     pub(crate) transaction_blobs: Vec<TransactionBlobArtifact>,
     pub(crate) tree_states: Vec<TreeStateArtifact>,
     pub(crate) subtree_roots: Vec<SubtreeRootArtifact>,
-    pub(crate) address_output_index: Vec<AddressOutputIndexArtifact>,
     pub(crate) transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     pub(crate) transparent_spend_facts: Vec<TransparentSpendFact>,
     pub(crate) prefetched_spent_transparent_outputs: Vec<TransparentOutputArtifact>,
@@ -368,7 +366,6 @@ impl CanonicalBatch {
             .extend(built.transaction_locations);
         self.transaction_facts.extend(built.transaction_facts);
         self.transaction_blobs.extend(built.transaction_blobs);
-        self.address_output_index.extend(built.address_output_index);
         self.transparent_outputs_by_outpoint
             .extend(built.transparent_outputs_by_outpoint);
         self.tip_metadata = Some(built.tip_metadata);
@@ -466,7 +463,7 @@ fn canonical_block_estimated_write_bytes(
         .len()
         .saturating_mul(ESTIMATED_TRANSPARENT_OUTPUT_WRITE_BYTES);
     let address_output_index_bytes = built
-        .address_output_index
+        .transparent_outputs_by_outpoint
         .len()
         .saturating_mul(ESTIMATED_ADDRESS_OUTPUT_INDEX_WRITE_BYTES);
     let transparent_spend_fact_bytes =
@@ -1235,10 +1232,6 @@ fn drain_batch_into_chain_epoch_artifacts(
     }
     if !batch.subtree_roots.is_empty() {
         artifacts = artifacts.with_subtree_roots(std::mem::take(&mut batch.subtree_roots));
-    }
-    if !batch.address_output_index.is_empty() {
-        artifacts =
-            artifacts.with_address_output_index(std::mem::take(&mut batch.address_output_index));
     }
     if !batch.transparent_outputs_by_outpoint.is_empty() {
         artifacts = artifacts.with_transparent_outputs_by_outpoint(std::mem::take(

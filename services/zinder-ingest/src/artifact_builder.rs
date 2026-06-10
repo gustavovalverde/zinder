@@ -12,11 +12,11 @@ use zebra_chain::{
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact,
-    BlockTransactionIndexArtifact, ChainTipMetadata, CompactBlockArtifact,
-    NetworkUpgradeActivations, ShieldedProtocol, TransactionBlobArtifact, TransactionFactsArtifact,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
+    ChainTipMetadata, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
+    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentOutputFact,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 
@@ -283,11 +283,10 @@ pub struct DerivedBlockArtifacts {
     pub transaction_facts: Vec<TransactionFactsArtifact>,
     /// Optional raw transaction blobs.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Transparent-output index entries for this block.
-    pub address_output_index: Vec<AddressOutputIndexArtifact>,
     /// Transparent-output artifacts for this block. One per transparent
     /// output; writer, derive, and query paths resolve spent outputs from
-    /// these rows without re-fetching the producing transaction.
+    /// these rows without re-fetching the producing transaction, and the
+    /// store derives the address-output projection rows from them.
     pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
 }
 
@@ -315,10 +314,8 @@ pub fn derive_block_with_raw_blob_policy(
     let parsed_block = parse_source_block(source_block)?;
     validate_parsed_block_identity(&parsed_block, source_block)?;
     let (compact_transactions, tree_size_additions) = compact_transactions(&parsed_block)?;
-    let TransparentBlockArtifacts {
-        address_outputs: address_output_index,
-        prevouts: transparent_outputs_by_outpoint,
-    } = address_output_artifacts(source_block, &compact_transactions)?;
+    let transparent_outputs_by_outpoint =
+        transparent_output_artifacts(source_block, &compact_transactions)?;
     let transaction_artifacts = derive_transaction_artifacts_from_parsed(
         &parsed_block,
         source_block,
@@ -367,7 +364,6 @@ pub fn derive_block_with_raw_blob_policy(
         transaction_locations: transaction_artifacts.transaction_locations,
         transaction_facts: transaction_artifacts.transaction_facts,
         transaction_blobs: transaction_artifacts.transaction_blobs,
-        address_output_index,
         transparent_outputs_by_outpoint,
     })
 }
@@ -392,7 +388,6 @@ pub fn finalize_derived_block(
         transaction_locations,
         transaction_facts,
         transaction_blobs,
-        address_output_index,
         transparent_outputs_by_outpoint,
     } = derived;
 
@@ -415,7 +410,6 @@ pub fn finalize_derived_block(
         transaction_locations,
         transaction_facts,
         transaction_blobs,
-        address_output_index,
         transparent_outputs_by_outpoint,
         tip_metadata: final_tree_sizes.tip_metadata(),
     })
@@ -716,17 +710,10 @@ fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTxO
         .collect()
 }
 
-/// Aggregated transparent artifacts derived from one block.
-struct TransparentBlockArtifacts {
-    address_outputs: Vec<AddressOutputIndexArtifact>,
-    prevouts: Vec<TransparentOutputArtifact>,
-}
-
-fn address_output_artifacts(
+fn transparent_output_artifacts(
     source_block: &SourceBlock,
     compact_transactions: &[CompactTx],
-) -> Result<TransparentBlockArtifacts, ArtifactDeriveError> {
-    let mut address_output_index = Vec::new();
+) -> Result<Vec<TransparentOutputArtifact>, ArtifactDeriveError> {
     let mut transparent_outputs_by_outpoint = Vec::new();
 
     for transaction in compact_transactions {
@@ -737,14 +724,6 @@ fn address_output_artifacts(
             let address_script_hash =
                 TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
             let outpoint = TransparentOutPoint::new(transaction_id, output_index);
-            address_output_index.push(AddressOutputIndexArtifact::new(
-                address_script_hash,
-                output.script_pub_key.clone(),
-                outpoint,
-                output.value,
-                source_block.height,
-                source_block.hash,
-            ));
             transparent_outputs_by_outpoint.push(TransparentOutputArtifact::new(
                 outpoint,
                 output.value,
@@ -756,10 +735,7 @@ fn address_output_artifacts(
         }
     }
 
-    Ok(TransparentBlockArtifacts {
-        address_outputs: address_output_index,
-        prevouts: transparent_outputs_by_outpoint,
-    })
+    Ok(transparent_outputs_by_outpoint)
 }
 
 fn transaction_id_from_compact_tx(

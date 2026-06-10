@@ -5,8 +5,8 @@ pub use rocksdb::{
     open_bounded_rocksdb,
 };
 pub(crate) use rocksdb::{
-    PrefixScanControl, RocksChainStore, RocksChainStoreRead, RocksChainStoreReadView,
-    StorageDelete, StoragePut,
+    MergedTableRow, PrefixScanControl, RocksChainStore, RocksChainStoreRead,
+    RocksChainStoreReadView, StorageDelete, StoragePut,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

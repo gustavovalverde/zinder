@@ -815,6 +815,7 @@ fn zebra_json_rpc_source_for_target(
             ZebraJsonRpcSourceOptions {
                 request_timeout: target.request_timeout,
                 max_response_bytes: target.max_response_bytes,
+                broadcast_timeout: target.broadcast_timeout,
             },
         )
         .map(|source| source.with_health_config(target.health.clone()))

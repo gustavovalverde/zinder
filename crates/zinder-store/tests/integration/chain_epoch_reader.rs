@@ -13,10 +13,10 @@ use std::{
 use eyre::eyre;
 use tempfile::{TempDir, tempdir};
 use zinder_core::{
-    AddressOutputIndexArtifact, ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-    Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentSpendFact, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
 };
 use zinder_store::{
     BlockHashLookup, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -102,7 +102,7 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         tip_hash: replacement_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -170,7 +170,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: replacement_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -203,7 +203,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         tip_hash: reintroduced_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -262,7 +262,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         tip_hash: replacement_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -280,7 +280,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
 
     let address_script_hash = TransparentAddressScriptHash::from_bytes([17; 32]);
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([23; 32]), 0);
-    let stale_utxo = AddressOutputIndexArtifact::new(
+    let stale_utxo = TransparentUnspentOutput::new(
         address_script_hash,
         b"stale-script".to_vec(),
         outpoint,
@@ -288,7 +288,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         replacement_height,
         initial_block.block_hash,
     );
-    let visible_utxo = AddressOutputIndexArtifact::new(
+    let visible_utxo = TransparentUnspentOutput::new(
         address_script_hash,
         b"visible-script".to_vec(),
         outpoint,
@@ -303,7 +303,6 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
             vec![safe_tip_block, initial_block],
             vec![safe_tip_compact_block, initial_compact_block],
         )
-        .with_address_output_index(vec![stale_utxo.clone()])
         .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&stale_utxo)]),
     )?;
     store.commit_chain_epoch(
@@ -312,7 +311,6 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
             vec![replacement_block],
             vec![replacement_compact_block],
         )
-        .with_address_output_index(vec![visible_utxo.clone()])
         .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&visible_utxo)])
         .with_reorg_window_change(ReorgWindowChange::Replace {
             from_height: replacement_height,
@@ -401,7 +399,7 @@ fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
     let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([31; 32]), 0);
-    let output = AddressOutputIndexArtifact::new(
+    let output = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([32; 32]),
         b"spendable-script".to_vec(),
         spent_outpoint,
@@ -424,7 +422,6 @@ fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
-            .with_address_output_index(vec![output.clone()])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
     store.commit_chain_epoch(
@@ -469,7 +466,7 @@ fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> ey
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
     let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([51; 32]), 0);
-    let output = AddressOutputIndexArtifact::new(
+    let output = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([52; 32]),
         b"spendable-script".to_vec(),
         spent_outpoint,
@@ -492,7 +489,6 @@ fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> ey
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
-            .with_address_output_index(vec![output.clone()])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
     store.commit_chain_epoch(
@@ -531,7 +527,7 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         tip_hash: replacement_hash,
         safe_tip_height: epoch_1.tip_height,
         safe_tip_hash: epoch_1.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -547,7 +543,7 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         b"replacement".to_vec(),
     );
     let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([41; 32]), 0);
-    let output = AddressOutputIndexArtifact::new(
+    let output = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([42; 32]),
         b"reorg-script".to_vec(),
         spent_outpoint,
@@ -570,7 +566,6 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
 
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
-            .with_address_output_index(vec![output.clone()])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
     store.commit_chain_epoch(
@@ -640,7 +635,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         tip_hash: replacement_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -656,7 +651,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         b"replacement-compact-block-2".to_vec(),
     );
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([25; 32]), 0);
-    let stale_utxo = AddressOutputIndexArtifact::new(
+    let stale_utxo = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([19; 32]),
         b"stale-script".to_vec(),
         outpoint,
@@ -677,7 +672,6 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
             vec![initial_block],
             vec![initial_compact_block],
         )
-        .with_address_output_index(vec![stale_utxo])
         .with_transparent_outputs_by_outpoint(vec![stale_prevout]),
     )?;
     store.commit_chain_epoch(
@@ -708,8 +702,6 @@ struct ReorgedOutpointRows {
     outpoint: TransparentOutPoint,
     visible_prevout: TransparentOutputArtifact,
     stale_prevout: TransparentOutputArtifact,
-    visible_utxo: AddressOutputIndexArtifact,
-    stale_utxo: AddressOutputIndexArtifact,
 }
 
 fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
@@ -729,7 +721,7 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         tip_hash: replacement_hash,
         safe_tip_height: safe_tip_epoch.tip_height,
         safe_tip_hash: safe_tip_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -752,7 +744,6 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
             vec![safe_tip_block],
             vec![safe_tip_compact_block],
         )
-        .with_address_output_index(vec![rows.visible_utxo.clone()])
         .with_transparent_outputs_by_outpoint(vec![rows.visible_prevout.clone()]),
     )?;
     store.commit_chain_epoch(
@@ -761,7 +752,6 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
             vec![initial_block],
             vec![initial_compact_block],
         )
-        .with_address_output_index(vec![rows.stale_utxo.clone()])
         .with_transparent_outputs_by_outpoint(vec![rows.stale_prevout.clone()]),
     )?;
     store.commit_chain_epoch(
@@ -791,35 +781,31 @@ fn reorged_outpoint_rows(
     let stale_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([25; 32]), 0);
     let base_address = TransparentAddressScriptHash::from_bytes([18; 32]);
     let stale_address = TransparentAddressScriptHash::from_bytes([19; 32]);
-    let visible_utxo = AddressOutputIndexArtifact::new(
-        base_address,
-        b"visible-script".to_vec(),
+    let visible_prevout = TransparentOutputArtifact::new(
         outpoint,
         75_000,
+        b"visible-script".to_vec(),
+        base_address,
         safe_tip_epoch.tip_height,
         safe_tip_epoch.tip_hash,
     );
-    let stale_utxo = AddressOutputIndexArtifact::new(
-        stale_address,
-        b"stale-script".to_vec(),
+    let stale_prevout = TransparentOutputArtifact::new(
         stale_outpoint,
         50_000,
+        b"stale-script".to_vec(),
+        stale_address,
         replacement_height,
         initial_block.block_hash,
     );
-    let visible_prevout = transparent_output_from_utxo(&visible_utxo);
-    let stale_prevout = transparent_output_from_utxo(&stale_utxo);
 
     ReorgedOutpointRows {
         outpoint,
         visible_prevout,
         stale_prevout,
-        visible_utxo,
-        stale_utxo,
     }
 }
 
-fn transparent_output_from_utxo(utxo: &AddressOutputIndexArtifact) -> TransparentOutputArtifact {
+fn transparent_output_from_utxo(utxo: &TransparentUnspentOutput) -> TransparentOutputArtifact {
     TransparentOutputArtifact::new(
         utxo.outpoint,
         utxo.value_zat,
@@ -1040,7 +1026,7 @@ fn synthetic_epoch(
             tip_hash: source_hash,
             safe_tip_height: block_height,
             safe_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(10),
+            artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
@@ -1122,7 +1108,7 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         tip_hash: replacement_hash,
         safe_tip_height: first_epoch.tip_height,
         safe_tip_hash: first_epoch.tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(10),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };

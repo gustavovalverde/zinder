@@ -175,9 +175,9 @@ impl TransparentOutputArtifact {
     }
 }
 
-/// Address-index row for a mined transparent output.
+/// Unspent transparent output projected for one transparent address.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressOutputIndexArtifact {
+pub struct TransparentUnspentOutput {
     /// Hash of the transparent output script.
     pub address_script_hash: TransparentAddressScriptHash,
     /// Raw `scriptPubKey` bytes for the output.
@@ -192,12 +192,12 @@ pub struct AddressOutputIndexArtifact {
     pub block_hash: BlockHash,
 }
 
-impl AddressOutputIndexArtifact {
-    /// Creates an address-output index row.
+impl TransparentUnspentOutput {
+    /// Creates an unspent transparent output row.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
-        reason = "address-output index rows are immutable persisted facts"
+        reason = "unspent transparent output rows are immutable persisted facts"
     )]
     pub fn new(
         address_script_hash: TransparentAddressScriptHash,

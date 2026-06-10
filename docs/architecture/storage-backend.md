@@ -71,11 +71,11 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
 | `tree_state` | Sapling and Orchard tree state metadata needed by wallet APIs |
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
-| `address_output_index` | Transparent address output rows keyed for address-history and balance reads |
-| `transparent_output` | Exact canonical `(network, outpoint)` projection for transparent-output resolution hot paths |
+| `address_output_index` | Reorg-safe current projection of unspent transparent outputs keyed `(network, address_script_hash, height, outpoint)`. Rows derive from `transparent_outputs_by_outpoint` at commit; spends hide rows at read time inside the reorg window, and the safe-tip retention sweep deletes finalized-spent rows |
+| `transparent_output` | Exact canonical `(network, outpoint)` projection for transparent-output resolution hot paths. Unspent rows are retained forever for prevout resolution; finalized-spent rows are deleted by the safe-tip retention sweep |
 | `transparent_output_block_index` | Block-local transparent outpoint lists used to bound current-projection repair during reorg replacement |
-| `transparent_spend_fact` | Exact canonical `(network, spent_outpoint)` projection for resolved transparent spend facts |
-| `transparent_spend_fact_block_index` | Block-local spent-outpoint lists used to bound current spend-projection repair during reorg replacement |
+| `transparent_spend_fact` | Exact canonical `(network, spent_outpoint)` projection for resolved transparent spend facts. Finalized rows are deleted by the safe-tip retention sweep |
+| `transparent_spend_fact_block_index` | Block-local spent-outpoint lists used to bound current spend-projection repair during reorg replacement and to drive the safe-tip retention sweep |
 | `block_hash_index` | Best-chain `(network, block_hash) -> (height, source_chain_epoch_id)` resolver written on every safe-tip block commit. Monotonic: reorged-out hashes are filtered at read time and never deleted, so the family grows roughly one row per finalized block (~50K rows per year on mainnet). A future retention pass may prune rows older than the reorg window once an active-reader proof exists. |
 | `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable links within the reorg window |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
@@ -101,6 +101,23 @@ Readers must revalidate branch identity before returning data from a visibility 
 
 Production storage needs an explicit lifecycle for stale visibility rows before mainnet-scale ingest. Reorg replacement must not synchronously delete visibility rows for the replaced range within the reorg window, because a secondary reader may have pinned the previous `ChainEpoch` without a RocksDB snapshot. Stale visibility rows are pruned only by an explicit retention pass that can prove no active reader, retained event cursor, or configured replay window can still need them.
 
+The transparent projections (`address_output_index`, `transparent_output`,
+`transparent_spend_fact`) follow one retention invariant: a projection row may
+be physically deleted only when no commit the store will ever accept can make
+it live again. `validate_reorg_window_change` rejects any `Replace` below
+`max(safe_tip + 1, tip - window + 1)`, so a spend at or below
+`safe_tip_height` is irreversible: that is the deletion boundary. The sweep
+runs inside `commit_chain_epoch` on `AdvanceSafeTipTo` commits, covering
+`(previous_safe_tip, new_safe_tip]` via `transparent_spend_fact_block_index`,
+riding the same atomic `WriteBatch` as every other projection mutation.
+In-window reverted spends need no machinery at all: their rows were never
+deleted, and the existing spend-fact repair un-hides them. Bulk catchup
+sweeps with one-batch lag because the spend facts a batch commits are not
+durable when that same commit's sweep reads. Non-monotonic `AdvanceSafeTipTo`
+targets are no-ops. A reader pinned to an epoch older than the reorg window
+can omit rows whose spends finalized after that epoch; this is the same
+fidelity erosion the outpoint-keyed projections already accept.
+
 ## Commit Protocol
 
 The full ingest pipeline lives in [Chain ingestion §Operation Shape](chain-ingestion.md#operation-shape). The storage-level invariant: `commit_chain_epoch` writes every artifact, the event envelope, the event sequence pointer, store metadata, and the visible epoch pointer in one RocksDB `WriteBatch`. Readers observe either the previous epoch or the new epoch; a half-committed epoch is a correctness bug.
@@ -109,7 +126,7 @@ Required steps inside `commit_chain_epoch`:
 
 1. Validate block links, compact block artifacts, transaction references, tree metadata, and reorg-window metadata.
 2. Serialize the read-validate-write window for the visible epoch pointer and event sequence pointer, or use an equivalent compare-and-swap write fence.
-3. Build the single `WriteBatch` covering artifacts, transparent-output current-projection repair, event envelope, sequence pointer, store metadata, and visible-epoch pointer.
+3. Build the single `WriteBatch` covering artifacts (including the address-output projection rows derived from `transparent_outputs_by_outpoint`), transparent current-projection repairs, the safe-tip retention sweep, event envelope, sequence pointer, store metadata, and visible-epoch pointer.
 4. Commit with the configured durability policy.
 5. Return the committed epoch and envelope only after the batch succeeds.
 6. Leave the previous visible epoch intact if the batch fails.
@@ -140,6 +157,16 @@ Reorg semantics and event vocabulary live in [Chain events](chain-events.md). At
 ## Schema Compatibility
 
 Stores validate schema at open. A store written with an `artifact_schema_version` above `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` returns `StoreError::SchemaTooNew`; a network or layout mismatch returns the matching `SchemaMismatch` or `ChainEpochNetworkMismatch` variant. Both surface as `SchemaMismatch` at the service boundary and fail readiness with `schema_mismatch`. `zinder-query` never mutates canonical storage on schema mismatch; the operator recreates the store from a fresh ingest run or an offline checkpoint.
+
+Schema version 11 is the one exception to the wipe-and-resync posture: a
+version-10 store migrates in place at primary open. The writer rebuilds the
+`address_output_index` projection from `transparent_output` joined with
+`transparent_spend_fact`, drops the old column family, and flips the store
+metadata version only after the rebuild completes, so a crash mid-rebuild
+re-runs it on the next open. Secondary readers cannot replay a column-family
+drop; they must restart after the primary migrates, which the rolling-upgrade
+order in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) already
+requires.
 
 ## Checkpoints and Backups
 
@@ -186,6 +213,10 @@ Readiness causes and operational metrics are owned by [Service operations](servi
 - Visibility-index seek count through `zinder_store_visibility_seek_total`,
   labeled by artifact family. This identifies fanout-heavy wallet scans before
   adding new indexes or caches.
+- Safe-tip retention sweep size through
+  `zinder_store_retention_swept_outpoints_total`. Each swept outpoint removes
+  one row from each of `address_output_index`, `transparent_output`, and
+  `transparent_spend_fact`.
 - Checkpoint age.
 - Migration phase.
 - Reorg depth.

@@ -12,12 +12,11 @@
 //! `address_script_hash` with the same `SHA-256(scriptPubKey)` rule the ingest
 //! pipeline uses, and asserts that:
 //!
-//! - `WalletQueryApi::address_output_index` returns a UTXO whose outpoint,
+//! - `WalletQueryApi::transparent_address_unspent_outputs` returns a UTXO whose outpoint,
 //!   `script_pub_key`, value, and block fields match the sampled output;
 //! - `WalletQueryApi::transparent_address_tx_ids_in_range` returns the same
 //!   transaction id in ascending order, and the descending response returns the
 //!   reversed list of the same artifacts;
-//! - cursor pagination resumes strictly after the previous page's last entry.
 //!
 //! Mainnet runs require explicit opt-in via `ZINDER_NETWORK=zcash-mainnet`
 //! and `workflow_dispatch` in CI; the runtime gate is
@@ -32,12 +31,13 @@ use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeight, Network, NetworkUpgradeActivations,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    BlockHash, BlockHeight, Network, NetworkUpgradeActivations, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
 };
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{
-    AddressOutputIndexRequest, TransparentAddressTxIdsInRangeRequest, WalletQuery, WalletQueryApi,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQuery,
+    WalletQueryApi,
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
@@ -76,7 +76,6 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     assert_utxo_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_descending_matches_ascending(&wallet_query, &sample).await?;
-    assert_utxo_cursor_resumes(&wallet_query, &sample).await?;
 
     tracing::info!(
         target: "zinder::live",
@@ -189,12 +188,10 @@ async fn assert_utxo_round_trip(
     sample: &SampledCoinbase,
 ) -> Result<()> {
     let response = wallet_query
-        .address_output_index(
-            AddressOutputIndexRequest {
+        .transparent_address_unspent_outputs(
+            TransparentAddressUnspentOutputsRequest {
                 address_script_hash: sample.address_script_hash,
                 start_height: sample.bulk_catchup_from_height,
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                from_cursor: None,
             },
             None,
         )
@@ -290,66 +287,8 @@ async fn assert_tx_history_descending_matches_ascending(
     Ok(())
 }
 
-async fn assert_utxo_cursor_resumes(
-    wallet_query: &WalletQuery<PrimaryChainStore>,
-    sample: &SampledCoinbase,
-) -> Result<()> {
-    let baseline = wallet_query
-        .address_output_index(
-            AddressOutputIndexRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: sample.bulk_catchup_from_height,
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                from_cursor: None,
-            },
-            None,
-        )
-        .await?;
-    if baseline.outputs.len() < 2 {
-        // Address only paid once in the bulk catchup window: cursor pagination is
-        // covered by the integration tests, no signal to validate here.
-        return Ok(());
-    }
-    let first_page = wallet_query
-        .address_output_index(
-            AddressOutputIndexRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: sample.bulk_catchup_from_height,
-                max_entries: NonZeroU32::MIN,
-                from_cursor: None,
-            },
-            None,
-        )
-        .await?;
-    assert_eq!(first_page.outputs.len(), 1);
-    let cursor = first_page
-        .next_cursor
-        .ok_or_else(|| eyre!("first page must return a resume cursor when more UTXOs exist"))?;
-    let second_page = wallet_query
-        .address_output_index(
-            AddressOutputIndexRequest {
-                address_script_hash: sample.address_script_hash,
-                start_height: BlockHeight::new(0),
-                max_entries: NonZeroU32::new(100).ok_or_else(|| eyre!("invalid max entries"))?,
-                from_cursor: Some(cursor),
-            },
-            None,
-        )
-        .await?;
-    let resumed: Vec<_> = first_page
-        .outputs
-        .iter()
-        .chain(second_page.outputs.iter())
-        .collect();
-    assert_eq!(resumed.len(), baseline.outputs.len());
-    for (joined, expected) in resumed.iter().zip(baseline.outputs.iter()) {
-        assert_eq!(joined.outpoint, expected.outpoint);
-    }
-    Ok(())
-}
-
 fn assert_response_addresses_are_uniform(
-    utxos: &[AddressOutputIndexArtifact],
+    utxos: &[TransparentUnspentOutput],
     expected: TransparentAddressScriptHash,
 ) -> Result<()> {
     for utxo in utxos {

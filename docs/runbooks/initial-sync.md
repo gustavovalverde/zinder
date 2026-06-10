@@ -124,6 +124,28 @@ docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 
 The fresh start runs `BulkCatchup` from the wallet-serving floor (or genesis, depending on `ingest.coverage`) and transitions to `TipFollow` when it catches up. No manual sequencing is needed.
 
+## Schema v11: in-place rebuild at first open
+
+Schema version 11 (the address-output current projection) migrates a
+version-10 store in place; no wipe or resync is needed. On the first
+`zinder-ingest` start with the v11 binary, the writer rebuilds the
+`address_output_index` column family from `transparent_output` and
+`transparent_spend_fact` before serving, emitting
+`address_output_projection_rebuild_started` and
+`address_output_projection_rebuild_completed` log events with row counts and
+duration. Expect minutes, not hours; the rebuild streams the two source
+families once and reclaims the old family's disk space immediately.
+
+The rebuild is crash-safe: the store metadata version flips to 11 only after
+the projection is complete, so a kill or crash mid-rebuild simply re-runs it
+on the next start. Deploy order matters: start the v11 writer first and let
+the rebuild finish, then restart every reader (`zinder-query`,
+`zinder-explorer`, `zinder-compat-lightwalletd`). A reader running against a
+not-yet-migrated store fails closed with `cause=schema_mismatch`, and a
+secondary opened before the migration cannot replay the column-family drop,
+so the restart is required, matching the rolling-upgrade order in
+[ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
+
 ## Migrating from the legacy `zinder-data` volumes
 
 Earlier releases shipped three hardcoded volume names: `zinder-data` (the canonical RocksDB store), `zinder-prometheus-data` (TSDB samples), and `zinder-grafana-data` (Grafana's SQLite DB with user accounts, API keys, and any UI-created alert rules). The compose file now scopes all three per network (`zinder-<network>-data`, `zinder-<network>-prometheus`, `zinder-<network>-grafana`) so two stacks can coexist on one host. Operators with the legacy volumes should rename them before the first `up` against the new compose; otherwise each stack boots against empty volumes, and the canonical store re-syncs from cold.

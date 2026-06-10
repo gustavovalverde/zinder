@@ -1,14 +1,17 @@
 //! Transparent output read traits.
 
-use std::{collections::HashSet, num::NonZeroU32};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+};
 
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockHash, BlockHeight, ChainEpoch, TransparentAddressScriptHash,
-    TransparentOutPoint,
+    BlockHash, BlockHeight, ChainEpoch, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 
 use crate::{
-    ArtifactFamily, StoreError,
+    StoreError,
     block_artifact::read_block_header_artifact,
     format::{AddressOutputCursorPayload, StoreKey, decode_address_output_index_artifact},
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
@@ -23,7 +26,7 @@ pub trait AddressOutputIndexStore {
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         max_entries: NonZeroU32,
-    ) -> Result<Vec<AddressOutputIndexArtifact>, StoreError>;
+    ) -> Result<Vec<TransparentUnspentOutput>, StoreError>;
 }
 
 /// Scan parameters for [`read_address_output_index_rows_paged`].
@@ -42,7 +45,7 @@ pub(crate) fn read_address_output_index(
     address_script_hash: TransparentAddressScriptHash,
     start_height: BlockHeight,
     max_entries: NonZeroU32,
-) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
     read_address_output_index_rows_paged(
         inner,
         AddressOutputIndexRowsScan {
@@ -55,32 +58,25 @@ pub(crate) fn read_address_output_index(
     )
 }
 
+/// Reads unspent transparent outputs from the address-output projection.
+///
+/// Two-phase read: the prefix walk collects candidate rows without any
+/// per-row store reads, then visibility resolves once per distinct creation
+/// height and spend facts resolve in sliced batched reads. The projection
+/// holds unspent rows plus at most one reorg window of recent spends, so
+/// the candidate set stays bounded.
 pub(crate) fn read_address_output_index_rows_paged(
     inner: &impl RocksChainStoreRead,
     scan: AddressOutputIndexRowsScan,
-) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
     let prefix =
         StoreKey::address_output_index_prefix(scan.chain_epoch.network, scan.address_script_hash);
-    let mut outputs = Vec::new();
-    let mut seen_outpoints = HashSet::new();
-    let max_entries = u32_to_usize(scan.max_entries.get());
+    let mut candidates = Vec::new();
 
     inner.scan_prefix(
         StorageTable::AddressOutputIndex,
         &prefix,
-        &mut |key_bytes, envelope_bytes| {
-            let Some(source_epoch) = StoreKey::transparent_artifact_chain_epoch_id(key_bytes)
-            else {
-                return Err(StoreError::ArtifactCorrupt {
-                    family: ArtifactFamily::AddressOutputIndex,
-                    key: prefix.clone().into(),
-                    reason: "transparent address output key is malformed",
-                });
-            };
-            if source_epoch > scan.chain_epoch.id {
-                return Ok(PrefixScanControl::Continue);
-            }
-
+        &mut |_key_bytes, envelope_bytes| {
             let output = decode_address_output_index_artifact(&prefix, envelope_bytes)?;
             if output.address_script_hash != scan.address_script_hash {
                 return Ok(PrefixScanControl::Continue);
@@ -92,31 +88,78 @@ pub(crate) fn read_address_output_index_rows_paged(
             } else if output.block_height < scan.start_height {
                 return Ok(PrefixScanControl::Continue);
             }
-            if !block_is_visible(
-                inner,
-                scan.chain_epoch,
-                output.block_height,
-                output.block_hash,
-            )? || transparent_outpoint_is_spent(inner, scan.chain_epoch, output.outpoint)?
-                || !seen_outpoints.insert(output.outpoint)
-            {
-                return Ok(PrefixScanControl::Continue);
-            }
 
-            outputs.push(output);
-            if outputs.len() >= max_entries {
-                return Ok(PrefixScanControl::Stop);
-            }
-
+            candidates.push(output);
             Ok(PrefixScanControl::Continue)
         },
     )?;
 
+    let visible_block_hash_by_height = resolve_visible_block_hashes(
+        inner,
+        scan.chain_epoch,
+        candidates.iter().map(|output| output.block_height),
+    )?;
+    let spent_outpoints = resolve_visible_spent_outpoints(
+        inner,
+        scan.chain_epoch,
+        candidates.iter().map(|output| output.outpoint),
+    )?;
+
+    let max_entries = u32_to_usize(scan.max_entries.get());
+    let mut outputs = Vec::new();
+    for output in candidates {
+        if visible_block_hash_by_height.get(&output.block_height) != Some(&Some(output.block_hash))
+            || spent_outpoints.contains(&output.outpoint)
+        {
+            continue;
+        }
+
+        outputs.push(output);
+        if outputs.len() >= max_entries {
+            break;
+        }
+    }
+
     Ok(outputs)
 }
 
+fn resolve_visible_block_hashes(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    heights: impl Iterator<Item = BlockHeight>,
+) -> Result<HashMap<BlockHeight, Option<BlockHash>>, StoreError> {
+    let mut visible_block_hash_by_height = HashMap::new();
+    for height in heights {
+        if visible_block_hash_by_height.contains_key(&height) {
+            continue;
+        }
+        let block_hash =
+            read_block_header_artifact(inner, chain_epoch, height)?.map(|block| block.block_hash);
+        visible_block_hash_by_height.insert(height, block_hash);
+    }
+
+    Ok(visible_block_hash_by_height)
+}
+
+fn resolve_visible_spent_outpoints(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    outpoints: impl Iterator<Item = TransparentOutPoint>,
+) -> Result<HashSet<TransparentOutPoint>, StoreError> {
+    let outpoints = outpoints.collect::<Vec<_>>();
+    let mut spent_outpoints = HashSet::new();
+    for outpoint_slice in outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
+        spent_outpoints.extend(
+            read_visible_transparent_spend_facts_by_outpoints(inner, chain_epoch, outpoint_slice)?
+                .into_keys(),
+        );
+    }
+
+    Ok(spent_outpoints)
+}
+
 const fn is_strictly_after_cursor(
-    output: &AddressOutputIndexArtifact,
+    output: &TransparentUnspentOutput,
     cursor: AddressOutputCursorPayload,
 ) -> bool {
     if output.block_height.value() != cursor.last_block_height.value() {
@@ -132,28 +175,6 @@ const fn is_strictly_after_cursor(
         byte_index += 1;
     }
     output.outpoint.output_index > cursor.last_outpoint.output_index
-}
-
-fn transparent_outpoint_is_spent(
-    inner: &impl RocksChainStoreRead,
-    chain_epoch: ChainEpoch,
-    outpoint: TransparentOutPoint,
-) -> Result<bool, StoreError> {
-    read_visible_transparent_spend_facts_by_outpoints(inner, chain_epoch, &[outpoint])
-        .map(|spends| spends.contains_key(&outpoint))
-}
-
-fn block_is_visible(
-    inner: &impl RocksChainStoreRead,
-    chain_epoch: ChainEpoch,
-    height: BlockHeight,
-    expected_hash: BlockHash,
-) -> Result<bool, StoreError> {
-    let Some(block) = read_block_header_artifact(inner, chain_epoch, height)? else {
-        return Ok(false);
-    };
-
-    Ok(block.block_hash == expected_hash)
 }
 
 #[allow(

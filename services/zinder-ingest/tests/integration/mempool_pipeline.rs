@@ -848,12 +848,12 @@ async fn ingest_control_serves_transparent_mempool_outputs_by_address() -> Resul
     Ok(())
 }
 
-/// `IngestControl.TransparentMempoolSpendByOutpoint` returns the mempool
-/// spend that consumes the requested outpoint, and `None` for an outpoint
-/// that is not being spent in the mempool.
+/// `IngestControl.TransparentMempoolSpendsByOutpoint` returns the mempool
+/// spends that consume the requested outpoints and omits entries for
+/// outpoints that are not being spent in the mempool.
 #[tokio::test(flavor = "multi_thread")]
-async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result<()> {
-    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolSpendByOutpointRequest};
+async fn ingest_control_serves_transparent_mempool_spends_by_outpoint() -> Result<()> {
+    use zinder_proto::v1::wallet::{OutPoint, TransparentMempoolSpendsByOutpointRequest};
 
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let chain_epoch = *store_fixture
@@ -871,21 +871,28 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
 
     // Synthetic entry spends outpoint ([0x55; 32], 0); the wire form is the
     // RPC-byte-order hex string of that internal byte pattern (which is
-    // identical for an all-0x55 hash).
+    // identical for an all-0x55 hash). The unknown outpoint in the same
+    // batch must produce no entry.
     let spent_response = client
-        .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
-            outpoint: Some(OutPoint {
-                transaction_id: "55".repeat(32),
-                output_index: 0,
-            }),
+        .transparent_mempool_spends_by_outpoint(TransparentMempoolSpendsByOutpointRequest {
+            outpoints: vec![
+                OutPoint {
+                    transaction_id: "55".repeat(32),
+                    output_index: 0,
+                },
+                OutPoint {
+                    transaction_id: "ff".repeat(32),
+                    output_index: 7,
+                },
+            ],
         })
         .await?
         .into_inner();
-    let spend = spent_response
-        .spend
-        .ok_or_else(|| eyre::eyre!("expected mempool spend"))?;
+    assert_eq!(spent_response.spends.len(), 1);
+    let spend = &spent_response.spends[0];
     let spent_outpoint = spend
         .spent_outpoint
+        .as_ref()
         .ok_or_else(|| eyre::eyre!("expected spent_outpoint on mempool spend"))?;
     assert_eq!(spent_outpoint.transaction_id, "55".repeat(32));
     assert_eq!(spent_outpoint.output_index, 0);
@@ -893,17 +900,6 @@ async fn ingest_control_serves_transparent_mempool_spend_by_outpoint() -> Result
         spend.spending_transaction_id,
         encode_rpc_transaction_id_hex(admitted.transaction_id)
     );
-
-    let unknown_response = client
-        .transparent_mempool_spend_by_outpoint(TransparentMempoolSpendByOutpointRequest {
-            outpoint: Some(OutPoint {
-                transaction_id: "ff".repeat(32),
-                output_index: 7,
-            }),
-        })
-        .await?
-        .into_inner();
-    assert!(unknown_response.spend.is_none());
 
     Ok(())
 }

@@ -508,7 +508,7 @@ fn synthetic_epoch_with_safe_tip(
             tip_hash: source_hash,
             safe_tip_height: BlockHeight::new(safe_tip_height),
             safe_tip_hash: block_hash(safe_tip_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(10),
+            artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },

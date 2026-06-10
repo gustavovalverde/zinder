@@ -102,33 +102,8 @@ impl RuntimeMemorySnapshot {
     }
 }
 
-/// Returns the container memory budget in bytes, derived from cgroup v2.
-///
-/// Prefers `memory.high` (the soft throttle where the kernel starts
-/// reclaiming) over `memory.max` (the hard kill threshold) so the
-/// budget describes the limit Zinder should stay under, not the limit
-/// past which the kernel kills it.
-///
-/// Returns `None` when cgroup v2 is unavailable (dev hosts without
-/// containers, macOS, older Linux) or when the limit is unset (the
-/// kernel exposes the literal string `max`, which the cgroup reader
-/// translates to `None`). Callers in that case fall through to their
-/// hand-tuned fallback constants, matching pre-existing behavior on
-/// dev hosts.
-///
-/// Used by the binary's config layer to size the bulk-catchup pipeline
-/// queue caps so a deploy on Railway, Fly, ECS, or any cgroup-enforcing
-/// container runtime inherits memory-aware defaults without per-deploy
-/// env-var tuning. Existing `ZINDER_INGEST__BULK_CATCHUP__*_BYTES`
-/// overrides still take precedence; this helper only changes the
-/// default.
-#[must_use]
-pub fn container_memory_budget_bytes() -> Option<u64> {
-    container_memory_budget_from_snapshot(RuntimeMemorySnapshot::sample())
-}
-
-/// Pure-function variant of [`container_memory_budget_bytes`] used by
-/// tests and any caller that already holds a snapshot.
+/// Pure-function variant of [`zinder_runtime::container_memory_budget_bytes`]
+/// used by tests and any caller that already holds a snapshot.
 pub(crate) fn container_memory_budget_from_snapshot(
     snapshot: RuntimeMemorySnapshot,
 ) -> Option<u64> {

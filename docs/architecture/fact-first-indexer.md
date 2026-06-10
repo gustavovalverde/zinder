@@ -36,7 +36,7 @@ block bytes, transaction bytes, or compact-block payloads.
 | `transaction_location` | `(network, txid)` | height, tx index, block hash | Direct transaction lookup without compact-block decoding |
 | `transaction_facts` | `(network, txid)` | public transaction facts, component counts, size, auth digest, privacy shape, fee inputs that do not require private data | Transaction detail, search, recent transactions, fee summaries |
 | `transparent_output` | `(network, outpoint)` | value, script pubkey, address script hash, produced height, produced block hash | Single canonical transparent output fact |
-| `address_output_index` | `(network, address_script_hash, height, tx_index, output_index)` | outpoint | Address output history scans |
+| `address_output_index` | `(network, address_script_hash, height, outpoint)` | address output row | Current unspent-output projection per address; finalized-spent rows are deleted by the safe-tip retention sweep |
 | `transparent_spend_fact` | `(network, spent_outpoint)` | spending txid, input index, spending block, spent value, spent address script hash, spent block | Spend lookup, derive replay, and reorg repair |
 | `compact_block` | `(network, height)` | encoded lightwalletd compact block | Wallet sync cache |
 | `tree_state` | `(network, height)` | source tree-state payload or typed tree state | Wallet scan boundary |

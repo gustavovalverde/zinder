@@ -14,13 +14,13 @@
 
 use prost::Message;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, LockTime, Network, PrivacyShape, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionComponentCounts,
-    TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
-    TransactionVersion, TransparentAddressTxIndexArtifact, TransparentOutputArtifact,
-    TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockTransactionIndexArtifact,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, LockTime, Network,
+    PrivacyShape, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
+    TransactionLocation, TransactionPublicFacts, TransactionVersion,
+    TransparentAddressTxIndexArtifact, TransparentOutputArtifact, TransparentSpendFact,
+    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
     wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
@@ -248,7 +248,6 @@ pub struct ChainFixture {
     tip_metadata_override: Option<ChainTipMetadata>,
     sapling_subtree_roots: Vec<SubtreeRootArtifact>,
     transaction_rows: Vec<FixtureTransactionRows>,
-    address_output_index: Vec<AddressOutputIndexArtifact>,
     transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     transparent_spend_facts: Vec<TransparentSpendFact>,
     transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
@@ -265,7 +264,6 @@ impl ChainFixture {
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
-            address_output_index: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
@@ -346,7 +344,6 @@ impl ChainFixture {
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
-            address_output_index: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
@@ -424,24 +421,26 @@ impl ChainFixture {
         self
     }
 
-    /// Attaches a [`AddressOutputIndexArtifact`] to this fixture's
-    /// commit set and mirrors it into the canonical transparent-output index
-    /// so previous-output reads and spend-side history lookups resolve.
+    /// Attaches an [`TransparentUnspentOutput`]-shaped transparent output
+    /// to this fixture's commit set.
+    ///
+    /// The store derives address-output projection rows from the canonical
+    /// transparent-output artifacts at commit, so the fixture stores only
+    /// the [`TransparentOutputArtifact`] form.
     #[must_use]
     pub fn with_address_output_index(
         mut self,
-        address_output_index: AddressOutputIndexArtifact,
+        address_output_index: TransparentUnspentOutput,
     ) -> Self {
         self.transparent_outputs_by_outpoint
             .push(TransparentOutputArtifact::new(
                 address_output_index.outpoint,
                 address_output_index.value_zat,
-                address_output_index.script_pub_key.clone(),
+                address_output_index.script_pub_key,
                 address_output_index.address_script_hash,
                 address_output_index.block_height,
                 address_output_index.block_hash,
             ));
-        self.address_output_index.push(address_output_index);
         self
     }
 
@@ -610,10 +609,6 @@ impl ChainFixture {
                 .with_tree_states(tree_state_checkpoint_artifacts)
                 .with_subtree_roots(subtree_root_artifacts)
                 .with_reorg_window_change(ReorgWindowChange::Extend { block_range });
-        if !self.address_output_index.is_empty() {
-            chain_epoch_artifacts =
-                chain_epoch_artifacts.with_address_output_index(self.address_output_index.clone());
-        }
         if !self.transaction_rows.is_empty() {
             let mut block_transaction_index = Vec::with_capacity(self.transaction_rows.len());
             let mut transaction_locations = Vec::with_capacity(self.transaction_rows.len());

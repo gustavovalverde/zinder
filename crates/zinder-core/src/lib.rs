@@ -61,9 +61,9 @@ pub use transaction_public_facts::{
 pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_output::{
-    AddressOutputIndexArtifact, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, TransparentAddressScriptHash,
-    TransparentInputFact, TransparentOutPoint, TransparentOutput, TransparentOutputArtifact,
-    TransparentOutputEntry, TransparentOutputFact, TransparentOutputsByOutpointResponse,
-    TransparentSpendFact,
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutput, TransparentOutputArtifact, TransparentOutputEntry,
+    TransparentOutputFact, TransparentOutputsByOutpointResponse, TransparentSpendFact,
+    TransparentUnspentOutput,
 };
 pub use tree_state::TreeStateArtifact;

@@ -87,6 +87,10 @@ impl StoreKey {
         Self(vec![KEY_VERSION, 14])
     }
 
+    pub(crate) fn transparent_retention_swept_height() -> Self {
+        Self(vec![KEY_VERSION, 15])
+    }
+
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
@@ -247,13 +251,11 @@ impl StoreKey {
         address_script_hash: TransparentAddressScriptHash,
         height: BlockHeight,
         outpoint: TransparentOutPoint,
-        chain_epoch: ChainEpochId,
     ) -> Self {
         let mut key = Self::address_output_index_prefix(network, address_script_hash).0;
         key.extend_from_slice(&height.value().to_be_bytes());
         key.extend_from_slice(&outpoint.transaction_id.as_bytes());
         key.extend_from_slice(&outpoint.output_index.to_be_bytes());
-        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
         Self(key)
     }
 
@@ -510,14 +512,44 @@ impl StoreKey {
         (key_bytes.len() >= prefix_len).then_some(prefix_len)
     }
 
+    /// Extracts the outpoint from a raw `transparent_output` or
+    /// `transparent_spend_fact` column-family key. Returns `None` when the
+    /// key has the wrong length, version prefix, or kind byte.
+    pub(crate) fn transparent_outpoint_from_key(key_bytes: &[u8]) -> Option<TransparentOutPoint> {
+        const OUTPUT_INDEX_LEN: usize = 4;
+        let expected_len =
+            STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + TRANSACTION_ID_LEN + OUTPUT_INDEX_LEN;
+        if key_bytes.len() != expected_len
+            || key_bytes[0] != KEY_VERSION
+            || !matches!(
+                key_bytes[1],
+                TRANSPARENT_OUTPUT_KEY_KIND | TRANSPARENT_SPEND_FACT_KEY_KIND
+            )
+        {
+            return None;
+        }
+        let transaction_id_start = STORE_KEY_HEADER_LEN + NETWORK_ID_LEN;
+        let output_index_start = transaction_id_start + TRANSACTION_ID_LEN;
+        let transaction_id_bytes = <[u8; TRANSACTION_ID_LEN]>::try_from(
+            &key_bytes[transaction_id_start..output_index_start],
+        )
+        .ok()?;
+        let output_index_bytes =
+            <[u8; OUTPUT_INDEX_LEN]>::try_from(&key_bytes[output_index_start..]).ok()?;
+
+        Some(TransparentOutPoint::new(
+            TransactionId::from_bytes(transaction_id_bytes),
+            u32::from_be_bytes(output_index_bytes),
+        ))
+    }
+
     pub(crate) fn transparent_artifact_chain_epoch_id(key_bytes: &[u8]) -> Option<ChainEpochId> {
         if key_bytes.len() < STORE_KEY_HEADER_LEN || key_bytes[0] != KEY_VERSION {
             return None;
         }
         if !matches!(
             key_bytes[1],
-            ADDRESS_OUTPUT_INDEX_KEY_KIND
-                | TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND
+            TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND
                 | TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND
                 | TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND
         ) {
@@ -599,7 +631,6 @@ mod tests {
                 zinder_core::TransparentAddressScriptHash::from_bytes([0x44; 32]),
                 height,
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
-                chain_epoch,
             ),
             StoreKey::transparent_spend_fact(
                 network,
@@ -656,12 +687,13 @@ mod tests {
             StoreKey::store_metadata(),
             StoreKey::mempool_event_sequence_pointer(),
             StoreKey::oldest_retained_mempool_event_sequence(),
+            StoreKey::transparent_retention_swept_height(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 7);
+        assert_eq!(storage_control_keys.len(), 8);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),

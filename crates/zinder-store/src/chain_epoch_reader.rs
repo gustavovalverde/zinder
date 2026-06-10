@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
-    TransparentSpendFact, TreeStateArtifact,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
+    CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
+    TreeStateArtifact,
 };
 
 use crate::{
@@ -202,7 +202,7 @@ impl<'store> ChainEpochReader<'store> {
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         max_entries: NonZeroU32,
-    ) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+    ) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
         read_address_output_index(
             &self.read_view,
             self.chain_epoch,
@@ -396,7 +396,7 @@ impl AddressOutputIndexStore for ChainEpochReader<'_> {
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         max_entries: NonZeroU32,
-    ) -> Result<Vec<AddressOutputIndexArtifact>, StoreError> {
+    ) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
         self.address_output_index(address_script_hash, start_height, max_entries)
     }
 }

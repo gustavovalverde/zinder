@@ -1,9 +1,9 @@
 //! Chain epoch commit values.
 
 use zinder_core::{
-    AddressOutputIndexArtifact, BlockBlobArtifact, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, CompactBlockArtifact,
-    SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact, TransactionLocation,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockTransactionIndexArtifact, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionLocation,
     TransparentAddressTxIndexArtifact, TransparentOutputArtifact, TransparentSpendFact,
     TreeStateArtifact,
 };
@@ -31,9 +31,8 @@ pub struct ChainEpochArtifacts {
     pub tree_states: Vec<TreeStateArtifact>,
     /// Subtree-root artifacts included in this commit.
     pub subtree_roots: Vec<SubtreeRootArtifact>,
-    /// Transparent address output artifacts included in this commit.
-    pub address_output_index: Vec<AddressOutputIndexArtifact>,
-    /// Transparent output artifacts included in this commit.
+    /// Transparent output artifacts included in this commit. The store
+    /// derives the address-output projection rows from these at commit.
     pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     /// Resolved transparent spend facts included in this commit.
     pub transparent_spend_facts: Vec<TransparentSpendFact>,
@@ -62,7 +61,6 @@ impl ChainEpochArtifacts {
             transaction_blobs: Vec::new(),
             tree_states: Vec::new(),
             subtree_roots: Vec::new(),
-            address_output_index: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
             transparent_address_tx_index: Vec::new(),
@@ -128,16 +126,6 @@ impl ChainEpochArtifacts {
     #[must_use]
     pub fn with_subtree_roots(mut self, subtree_roots: Vec<SubtreeRootArtifact>) -> Self {
         self.subtree_roots = subtree_roots;
-        self
-    }
-
-    /// Adds transparent address output artifacts to this commit value.
-    #[must_use]
-    pub fn with_address_output_index(
-        mut self,
-        address_output_index: Vec<AddressOutputIndexArtifact>,
-    ) -> Self {
-        self.address_output_index = address_output_index;
         self
     }
 
