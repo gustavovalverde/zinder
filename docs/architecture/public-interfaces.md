@@ -525,6 +525,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
+| `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.upstream`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
@@ -637,6 +638,8 @@ Capability strings are exact-match (no version negotiation, no regex). New capab
 
 Capability strings are the deprecation boundary. A wire-shape change lands as a new `_vN` capability; removing an older capability requires the architecture doc for that surface to name the consumer constraint and removal rule.
 
+Pre-1.0, replaced RPCs are deleted rather than aliased: a renamed method removes its old capability string in the same change. Deploy order follows from that: Zinder services deploy before wallet consumers (zally, then fauzec). Between the deploys the old consumer receives `UNIMPLEMENTED` on the removed RPC and must degrade honestly until its own deploy lands.
+
 The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs); a CI test (`zinder-proto::integration::capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities`) fails when this list and the constant diverge, so any drift is caught at build time.
 
 <!-- capability-list:public-interfaces:start -->
@@ -655,13 +658,12 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `wallet.snapshot.mempool_v1`
 - `wallet.events.mempool_v1`
 - `wallet.mempool.transparent_outputs_by_address_v1`
-- `wallet.mempool.transparent_spend_by_outpoint_v1`
+- `wallet.mempool.transparent_spends_by_outpoint_v1`
 - `wallet.mempool.transparent_outputs_by_outpoint_v1`
 - `wallet.read.transparent_outputs_by_outpoint_v1`
 - `wallet.read.chain_value_pools_at_tip_v1`
-- `wallet.address.output_index_v1`
+- `wallet.address.transparent_unspent_outputs_v1`
 - `wallet.address.transparent_history_v1`
-- `wallet.address.transparent_balance_v1`
 - `explorer.server_info_v1`
 - `explorer.transparent_address.balance_v1`
 - `explorer.transaction.detail_v1`
@@ -681,7 +683,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-`WalletQuery.TransparentAddressBalance` is always answered. `wallet.address.transparent_balance_v1` is the always-on canonical-confirmed path (computed at read time from the transparent output column family, no mempool overlay). `explorer.transparent_address.balance_v1` coexists with it when `zinder-explorer` is configured and ready, signalling that the same response carries the live-mempool overlay in `unconfirmed_delta_zat`. Clients that need the overlay must gate on the explorer capability; clients that just need confirmed totals can rely on the wallet capability being present whenever the method itself is exposed. The dual-capability federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`WalletQuery.TransparentAddressBalance` is federation-only. The single balance implementation lives in `zinder-explorer`; `zinder-query` forwards the call and advertises `explorer.transparent_address.balance_v1` only when the explorer plane is configured and ready. Deployments without an explorer plane omit the capability and reject the call with `UNAVAILABLE`. The federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md). Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` sums the unspent projection in-process and never touches the explorer.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are

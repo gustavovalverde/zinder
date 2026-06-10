@@ -129,6 +129,7 @@ pub struct ZebraJsonRpcSource {
     network: Network,
     client: ResilientClient<HttpClient>,
     max_response_bytes: NonZeroU64,
+    broadcast_timeout: Option<Duration>,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
     health_config: Option<NodeHealthConfig>,
     ready_http_client: Option<ZebraReadyClient>,
@@ -141,6 +142,14 @@ pub struct ZebraJsonRpcSourceOptions {
     pub request_timeout: Duration,
     /// Maximum JSON-RPC response body size accepted from the node.
     pub max_response_bytes: NonZeroU64,
+    /// Timeout applied only to `sendrawtransaction` calls.
+    ///
+    /// Zebra can stall for the full 30s `request_timeout` during a block-solve
+    /// spike while a broadcast is queued. A tighter per-broadcast timeout lets
+    /// callers retry sooner without shrinking the global timeout for block
+    /// fetches, which legitimately run long. `None` falls back to
+    /// `request_timeout`.
+    pub broadcast_timeout: Option<Duration>,
 }
 
 impl Default for ZebraJsonRpcSourceOptions {
@@ -148,6 +157,7 @@ impl Default for ZebraJsonRpcSourceOptions {
         Self {
             request_timeout: Duration::from_secs(30),
             max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+            broadcast_timeout: None,
         }
     }
 }
@@ -429,6 +439,7 @@ impl ZebraJsonRpcSource {
         let json_rpc_addr: String = json_rpc_addr.into();
         let request_timeout = options.request_timeout;
         let max_response_bytes = options.max_response_bytes;
+        let broadcast_timeout = options.broadcast_timeout;
 
         let initial_headers = derive_authorization_headers(&node_auth)?;
         let initial_client = crate::transport::build_zebra_json_rpc_client(
@@ -468,6 +479,7 @@ impl ZebraJsonRpcSource {
             network,
             client,
             max_response_bytes,
+            broadcast_timeout,
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
             health_config: None,
             ready_http_client: None,
@@ -1105,11 +1117,23 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
         let started_at = Instant::now();
-        let response = self
-            .client
-            .snapshot()
-            .request::<String, _>("sendrawtransaction", params)
-            .await;
+        let client_snapshot = self.client.snapshot();
+        let broadcast_fut = client_snapshot.request::<String, _>("sendrawtransaction", params);
+
+        let response = if let Some(timeout_duration) = self.broadcast_timeout {
+            match tokio::time::timeout(timeout_duration, broadcast_fut).await {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => Err(ClientError::Transport(
+                    std::io::Error::other(format!(
+                        "sendrawtransaction timed out after {}ms",
+                        timeout_duration.as_millis()
+                    ))
+                    .into(),
+                )),
+            }
+        } else {
+            broadcast_fut.await
+        };
         record_json_rpc_client_result("sendrawtransaction", started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,

@@ -19,7 +19,9 @@ use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenError, Readiness,
     ReadinessCause, ReadinessState, connect_zinder_grpc,
 };
-use zinder_store::{PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, StoreError};
+use zinder_store::{
+    PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, StorageErrorKind, StoreError,
+};
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
@@ -288,7 +290,16 @@ async fn catch_up_secondary(
     writer_status_upstream: Option<&mut WriterStatusUpstream>,
 ) {
     let started_at = Instant::now();
-    let catchup_outcome = catch_up_secondary_store(store);
+    let store_clone = store.clone();
+    let catchup_outcome =
+        tokio::task::spawn_blocking(move || catch_up_secondary_store(&store_clone))
+            .await
+            .unwrap_or_else(|join_error| {
+                Err(StoreError::StorageUnavailable {
+                    kind: StorageErrorKind::RocksDb,
+                    source: Box::new(join_error),
+                })
+            });
     record_secondary_catchup_outcome(started_at, &catchup_outcome);
     match catchup_outcome {
         Ok((catchup, current_chain_epoch)) => {

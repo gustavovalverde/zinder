@@ -15,7 +15,10 @@ use std::{path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 use zinder_store::RocksDbResourceBudget;
 
-use crate::{ConfigError, config::duration_as_millis_u64};
+use crate::{
+    ConfigError, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
+    config::duration_as_millis_u64,
+};
 
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS: u64 = 30_000;
@@ -221,16 +224,20 @@ pub fn resolve_derive_writer_rocksdb_budget(
     )
 }
 
-/// Merges canonical-role overrides onto
-/// [`RocksDbResourceBudget::canonical_reader_defaults`].
+/// Merges canonical-role overrides onto container-aware reader defaults.
+///
+/// The base defaults derive `block_cache_bytes` as `min(container_memory / 8, 512 MiB)`
+/// (floor 128 MiB when no cgroup limit is detectable) and `max_open_files`
+/// proportionally. All other fields come from
+/// [`RocksDbResourceBudget::canonical_reader_defaults`]. Explicit overrides in
+/// `section` win over the derived values.
 pub fn resolve_canonical_reader_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
-    resolve_rocksdb_resource_budget(
-        section,
-        RocksDbResourceBudget::canonical_reader_defaults(),
-        "storage.canonical.rocksdb",
-    )
+    let mut defaults = RocksDbResourceBudget::canonical_reader_defaults();
+    defaults.block_cache_bytes = canonical_reader_block_cache_bytes();
+    defaults.max_open_files = canonical_reader_max_open_files();
+    resolve_rocksdb_resource_budget(section, defaults, "storage.canonical.rocksdb")
 }
 
 /// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_reader_defaults`].
@@ -567,8 +574,12 @@ mod tests {
             DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS
         );
         assert_eq!(
-            resolved.canonical_rocksdb_budget,
-            RocksDbResourceBudget::canonical_reader_defaults()
+            resolved.canonical_rocksdb_budget.block_cache_bytes,
+            crate::canonical_reader_block_cache_bytes()
+        );
+        assert_eq!(
+            resolved.canonical_rocksdb_budget.max_open_files,
+            crate::canonical_reader_max_open_files()
         );
         assert_eq!(
             resolved.derive_rocksdb_budget,
@@ -599,10 +610,12 @@ mod tests {
             resolved.secondary_catchup_interval,
             Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)
         );
+        // max_open_files override (128) wins over the container-derived value.
         assert_eq!(resolved.canonical_rocksdb_budget.max_open_files, 128);
+        // block_cache_bytes has no override, so it takes the container-derived value.
         assert_eq!(
             resolved.canonical_rocksdb_budget.block_cache_bytes,
-            RocksDbResourceBudget::canonical_reader_defaults().block_cache_bytes
+            crate::canonical_reader_block_cache_bytes()
         );
         Ok(())
     }
@@ -648,11 +661,30 @@ mod tests {
     }
 
     #[test]
-    fn canonical_reader_budget_resolution_falls_through_to_reader_defaults()
+    fn canonical_reader_budget_resolution_applies_container_aware_defaults()
     -> Result<(), ConfigError> {
         let resolved =
             resolve_canonical_reader_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        assert_eq!(resolved, RocksDbResourceBudget::canonical_reader_defaults());
+        // block_cache and max_open_files come from the container budget helpers;
+        // other fields fall through to canonical_reader_defaults().
+        assert_eq!(
+            resolved.block_cache_bytes,
+            crate::canonical_reader_block_cache_bytes()
+        );
+        assert_eq!(
+            resolved.max_open_files,
+            crate::canonical_reader_max_open_files()
+        );
+        let static_defaults = RocksDbResourceBudget::canonical_reader_defaults();
+        assert_eq!(resolved.max_wal_bytes, static_defaults.max_wal_bytes);
+        assert_eq!(
+            resolved.write_buffer_bytes,
+            static_defaults.write_buffer_bytes
+        );
+        assert_eq!(
+            resolved.memtable_budget_bytes,
+            static_defaults.memtable_budget_bytes
+        );
         Ok(())
     }
 

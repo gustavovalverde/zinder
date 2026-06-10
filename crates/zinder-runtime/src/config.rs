@@ -565,6 +565,9 @@ pub struct NodeToml {
     pub request_timeout_secs: u64,
     /// Maximum JSON-RPC response body size accepted from the node.
     pub max_response_bytes: u64,
+    /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast_timeout_secs: Option<u64>,
     /// Auth subsection.
     pub auth: NodeAuthToml,
 }
@@ -578,6 +581,7 @@ impl NodeToml {
             indexer_grpc_addr: target.indexer_grpc_addr.clone(),
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
+            broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
             auth: NodeAuthToml::from_node_auth(&target.node_auth),
         }
     }

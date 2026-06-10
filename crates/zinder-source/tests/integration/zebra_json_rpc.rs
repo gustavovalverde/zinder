@@ -291,6 +291,7 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
         zinder_source::ZebraJsonRpcSourceOptions {
             request_timeout: Duration::from_secs(5),
             max_response_bytes: NonZeroU64::MIN,
+            broadcast_timeout: None,
         },
     )?;
 

@@ -10,6 +10,7 @@ name = "zcash-mainnet"
 [node]
 json_rpc_addr = "http://zebra:8232"
 request_timeout_secs = 30
+broadcast_timeout_secs = 7
 
 [node.auth]
 method = "cookie"
@@ -21,11 +22,14 @@ secondary_path = "/var/lib/zinder/secondary"
 secondary_catchup_interval_ms = 1000
 
 # Bounded RocksDB resource budgets for reader secondaries.
+# block_cache_bytes and max_open_files for the canonical reader are derived at
+# startup from the container memory budget (cgroup v2), so they are omitted
+# here. Direct I/O is always on for readers; the ADR-0020 store-size-
+# independence invariant requires it. Override only when Railway's reported
+# limit differs from the actual container limit.
 # See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
 [storage.canonical.rocksdb]
-block_cache_bytes = 134217728
 max_wal_bytes = 33554432
-max_open_files = 128
 write_buffer_bytes = 8388608
 max_write_buffer_count = 2
 

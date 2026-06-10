@@ -72,6 +72,10 @@ pub struct NodeTarget {
     pub request_timeout: Duration,
     /// Maximum JSON-RPC response body size accepted from the node.
     pub max_response_bytes: NonZeroU64,
+    /// Per-broadcast timeout, applied only to `sendrawtransaction`.
+    ///
+    /// `None` falls back to `request_timeout`.
+    pub broadcast_timeout: Option<Duration>,
     /// Resolved upstream-health probe configuration.
     ///
     /// `None` means the operator did not set `[node.health].addr`, so the
@@ -155,8 +159,16 @@ impl NodeTarget {
             node_auth,
             request_timeout,
             max_response_bytes,
+            broadcast_timeout: None,
             health: None,
         }
+    }
+
+    /// Sets the per-broadcast timeout.
+    #[must_use]
+    pub fn with_broadcast_timeout(mut self, broadcast_timeout: Option<Duration>) -> Self {
+        self.broadcast_timeout = broadcast_timeout;
+        self
     }
 
     /// Returns a new [`NodeTarget`] with [`NodeTarget::indexer_grpc_addr`]
@@ -212,6 +224,7 @@ impl NodeTarget {
             NonZeroU64::new(max_response_bytes_value).ok_or(NodeConfigError::Invalid {
                 reason: "node.max_response_bytes must be greater than zero",
             })?;
+        let broadcast_timeout = section.broadcast_timeout_secs.map(Duration::from_secs);
         let node_auth = resolve_node_auth(section.auth)?;
         let health = resolve_node_health(section.health)?;
 
@@ -223,6 +236,7 @@ impl NodeTarget {
             max_response_bytes,
         )
         .with_indexer_grpc_addr(section.indexer_grpc_addr)
+        .with_broadcast_timeout(broadcast_timeout)
         .with_health(health))
     }
 
@@ -250,6 +264,10 @@ impl NodeTarget {
             max_response_bytes: read_optional_parsed::<u64>(
                 "ZINDER_NODE__MAX_RESPONSE_BYTES",
                 "node.max_response_bytes",
+            )?,
+            broadcast_timeout_secs: read_optional_parsed::<u64>(
+                "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
+                "node.broadcast_timeout_secs",
             )?,
             auth: NodeAuthSection {
                 method: read_optional("ZINDER_NODE__AUTH__METHOD"),
@@ -301,6 +319,11 @@ pub struct NodeSection {
     pub request_timeout_secs: Option<u64>,
     /// Maximum JSON-RPC response body size accepted from the node.
     pub max_response_bytes: Option<u64>,
+    /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
+    ///
+    /// Overrides `request_timeout_secs` for broadcast calls only. Omit to
+    /// fall back to `request_timeout_secs`.
+    pub broadcast_timeout_secs: Option<u64>,
     /// Authentication subsection.
     pub auth: NodeAuthSection,
     /// Upstream-readiness probe subsection.
@@ -537,6 +560,7 @@ mod tests {
             indexer_grpc_addr: Some("http://127.0.0.1:8155".to_owned()),
             request_timeout_secs: Some(15),
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
@@ -566,6 +590,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
                 username: None,
@@ -588,6 +613,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
                 username: None,
@@ -623,6 +649,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
@@ -650,6 +677,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -675,6 +703,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -700,6 +729,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -726,6 +756,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -752,6 +783,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection {
                 method: Some("oauth".to_owned()),
                 username: None,
@@ -776,6 +808,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
         };
@@ -791,6 +824,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {
                 addr: Some("http://127.0.0.1:18233/ready".to_owned()),
@@ -827,6 +861,7 @@ mod tests {
             indexer_grpc_addr: None,
             request_timeout_secs: None,
             max_response_bytes: None,
+            broadcast_timeout_secs: None,
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {
                 addr: Some("http://127.0.0.1:18233/ready".to_owned()),
@@ -851,6 +886,7 @@ mod tests {
                 indexer_grpc_addr: None,
                 request_timeout_secs: None,
                 max_response_bytes: None,
+                broadcast_timeout_secs: None,
                 auth: NodeAuthSection::default(),
                 health: NodeHealthSection {
                     addr: Some("http://127.0.0.1:18233/ready".to_owned()),

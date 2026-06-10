@@ -23,6 +23,7 @@ mod auth;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
+mod memory_budget;
 mod metrics;
 mod ops_endpoint;
 mod readiness;
@@ -43,6 +44,10 @@ pub use config::{
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
     render_environment_variable_table,
+};
+pub use memory_budget::{
+    canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
+    container_memory_budget_bytes,
 };
 pub use metrics::{MetricsHandle, MetricsInstallError, install_metrics_recorder};
 pub use ops_endpoint::{

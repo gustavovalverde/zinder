@@ -212,6 +212,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Maximum JSON-RPC response body size (bytes) accepted from the node.",
     },
     EnvVarDoc {
+        name: "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
+        toml_path: "node.broadcast_timeout_secs",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Per-call timeout (seconds) applied only to `sendrawtransaction`. When \
+                      unset, the global `request_timeout_secs` applies instead. Recommended: 7.",
+    },
+    EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ADDR",
         toml_path: "node.health.addr",
         used_by: &["zinder-ingest"],
