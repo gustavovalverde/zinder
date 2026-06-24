@@ -5234,9 +5234,11 @@ dependencies = [
  "eyre",
  "prost",
  "prost-build",
+ "prost-types",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-types",
  "zinder-core",
 ]
 

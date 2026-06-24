@@ -33,6 +33,7 @@ use zinder_proto::v1::{
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -63,7 +64,7 @@ pub(crate) async fn handle_transaction_detail(
     } = context;
     let inner = request.into_inner();
     let transaction_id = decode_rpc_transaction_id_hex(&inner.transaction_id)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        .map_err(|error| ExplorerError::invalid_request(error.to_string()))?;
 
     let status_response = wallet_client
         .transaction(Request::new(wallet::TransactionRequest {
@@ -72,12 +73,12 @@ pub(crate) async fn handle_transaction_detail(
         }))
         .await?
         .into_inner();
-    let chain_epoch = status_response
-        .chain_epoch
-        .ok_or_else(|| Status::internal("WalletQuery.Transaction response missing chain_epoch"))?;
-    let status = status_response
-        .status
-        .ok_or_else(|| Status::internal("WalletQuery.Transaction response missing status"))?;
+    let chain_epoch = status_response.chain_epoch.ok_or_else(|| {
+        ExplorerError::internal("WalletQuery.Transaction response missing chain_epoch")
+    })?;
+    let status = status_response.status.ok_or_else(|| {
+        ExplorerError::internal("WalletQuery.Transaction response missing status")
+    })?;
 
     let (core_facts, location) = match status {
         transaction_status_response::Status::Mined(mined) => {
@@ -92,13 +93,14 @@ pub(crate) async fn handle_transaction_detail(
             let activations = NetworkUpgradeActivations::empty(network);
             let facts =
                 zinder_source::parse_transaction_public_facts(&raw_bytes, None, &activations)
-                    .map_err(|error| Status::internal(error.to_string()))?;
+                    .map_err(|error| ExplorerError::internal(error.to_string()))?;
             (facts, location)
         }
         transaction_status_response::Status::Conflicting(_) => {
-            return Err(Status::failed_precondition(
+            return Err(ExplorerError::unsatisfied_precondition(
                 "transaction is conflicting-chain; ExplorerQuery.TransactionDetail returns mined or mempool only",
-            ));
+            )
+            .into());
         }
     };
 
@@ -140,7 +142,7 @@ fn read_mined_public_facts(
     transaction_id: zinder_core::TransactionId,
 ) -> Result<CoreFacts, Status> {
     let store = chain_store.ok_or_else(|| {
-        Status::unavailable(
+        ExplorerError::dependency_not_configured(
             "TransactionDetail requires the canonical fact store; configure --storage-path",
         )
     })?;
@@ -148,7 +150,7 @@ fn read_mined_public_facts(
         .try_catch_up()
         .map_err(|error| status_from_store_error(&error))?;
     let core_epoch = chain_epoch_from_message(chain_epoch)
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let reader = store
         .chain_epoch_reader_at(core_epoch.id)
         .map_err(|error| status_from_store_error(&error))?;
@@ -156,7 +158,7 @@ fn read_mined_public_facts(
         .transaction_facts_by_id(transaction_id)
         .map_err(|error| status_from_store_error(&error))?
         .ok_or_else(|| {
-            Status::not_found(format!(
+            ExplorerError::not_materialized(format!(
                 "transaction facts are not available for {transaction_id:?}"
             ))
         })?;
@@ -168,10 +170,10 @@ fn extract_mined(
 ) -> Result<(WireTransactionLocation, ConsensusBranchId), Status> {
     let location = mined
         .location
-        .ok_or_else(|| Status::internal("MinedTransaction missing transaction location"))?;
+        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing transaction location"))?;
     let details = mined
         .details
-        .ok_or_else(|| Status::internal("MinedTransaction missing details"))?;
+        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing details"))?;
     let wire_location = WireTransactionLocation {
         kind: Some(wire_location::Kind::Mined(MinedLocation {
             block_height: location.block_height,

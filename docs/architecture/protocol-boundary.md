@@ -263,7 +263,7 @@ Capability strings follow `domain.subdomain.capability_name_v{N}`. The naming sp
 
 Each wire shape pairs with one capability identifier. A shape change lands as a new `_vN` identifier. Removing an older capability requires the owning architecture document to name the consumer constraint and removal rule.
 
-A second CI gate, `capability-coverage`, asserts that every `WalletQuery` RPC has a corresponding entry in `crates/zinder-proto/src/capabilities.rs::ZINDER_CAPABILITIES`. Adding an RPC without a capability string fails the job.
+A second CI gate, `capability_descriptor_drift`, decodes the compiled `FileDescriptorSet` and asserts that every served `WalletQuery`, `ExplorerQuery`, and `IngestControl` RPC maps to exactly one row in the `CAPABILITIES` table at `crates/zinder-proto/src/capabilities.rs`, and that every table row binds a method the descriptor serves. Adding an RPC without a capability row (or naming a non-existent method) fails the job; a method that is intentionally uncapability'd is listed in the guard's explicit allowlist.
 
 ## OpenRPC
 
@@ -298,7 +298,7 @@ A protocol change is not ready unless:
 - The generated Rust type does not leak into `zinder-core` or `zinder-store` public APIs.
 - The method has a clear owner: native, internal, or compat.
 - The change is additive, or `buf breaking` CI passes because maintainers have approved the breaking semver bump.
-- The new method has a corresponding capability string in `ZINDER_CAPABILITIES` (`capability-coverage` CI passes).
+- The new method has a corresponding `CapabilitySpec` row in the `CAPABILITIES` table (`capability_descriptor_drift` CI passes).
 - Tests cover wire compatibility and domain error mapping.
 - The docs name the service that serves the method.
 - Compatibility methods are backed by native artifacts, document their

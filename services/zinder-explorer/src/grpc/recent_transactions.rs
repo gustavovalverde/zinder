@@ -20,6 +20,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -59,7 +60,7 @@ pub(crate) async fn handle_recent_transactions(
                 .from_cursor
                 .as_slice()
                 .try_into()
-                .map_err(|_| Status::invalid_argument("from_cursor must be 8 bytes"))?,
+                .map_err(|_| ExplorerError::invalid_request("from_cursor must be 8 bytes"))?,
         )
     };
     let start_key = cursor_start.unwrap_or([0u8; ROW_KEY_LEN]);
@@ -74,7 +75,7 @@ pub(crate) async fn handle_recent_transactions(
             &end_key,
             scan_cap,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
 
     let mut entries: Vec<RecentTransactionEntry> = Vec::with_capacity(rows.len());
     let mut last_key: Option<[u8; ROW_KEY_LEN]> = None;
@@ -82,12 +83,12 @@ pub(crate) async fn handle_recent_transactions(
         let key_array: [u8; ROW_KEY_LEN] = key
             .as_slice()
             .try_into()
-            .map_err(|_| Status::internal("recent_transactions row key not 8 bytes"))?;
+            .map_err(|_| ExplorerError::internal("recent_transactions row key not 8 bytes"))?;
         if cursor_start.is_some() && key_array == start_key {
             continue;
         }
         let entry = RecentTransactionEntry::decode(payload.as_slice())
-            .map_err(|error| Status::internal(error.to_string()))?;
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
         entries.push(entry);
         last_key = Some(key_array);
         if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
@@ -103,7 +104,7 @@ pub(crate) async fn handle_recent_transactions(
         .into_inner();
     let chain_epoch = latest
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -139,12 +140,12 @@ fn join_paid_fees(
         .filter(|entry| !entry.is_coinbase)
         .map(|entry| decode_rpc_transaction_id_hex(&entry.transaction_id))
         .collect::<Result<_, _>>()
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     if lookup_targets.is_empty() {
         return Ok(());
     }
     let records = TransactionFeesConsumer::read_fees_records_many(derive_store, &lookup_targets)
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     for entry in entries.iter_mut() {
         if entry.is_coinbase {
             continue;

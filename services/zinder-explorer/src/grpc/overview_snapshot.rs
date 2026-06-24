@@ -34,6 +34,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -176,10 +177,10 @@ async fn anchor_to_wallet_tip(
         .into_inner();
     let chain_epoch = response
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
     let tip_height = response
         .latest_block
-        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
         .height;
     Ok(WalletAnchor {
         chain_epoch,
@@ -199,11 +200,11 @@ fn read_block_summary_records(
     let cap = usize::try_from(window).unwrap_or(MAX_FEE_SUMMARY_BLOCK_COUNT as usize);
     let entries = derive_store
         .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key, cap)
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut records = Vec::with_capacity(entries.len());
     for (_, payload) in entries {
         let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
-            Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
+            ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?;
         records.push(record);
     }
@@ -275,11 +276,11 @@ fn read_recent_transactions(
     let cap = usize::try_from(limit).unwrap_or(MAX_RECENT_TRANSACTIONS_LIMIT as usize);
     let rows = derive_store
         .range_iterate_consumer(RECENT_TRANSACTIONS_COLUMN_FAMILY, &start_key, &end_key, cap)
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut entries = Vec::with_capacity(rows.len());
     for (_, payload) in rows {
         let entry = RecentTransactionEntry::decode(payload.as_slice()).map_err(|error| {
-            Status::internal(format!("RecentTransactionEntry decode failed: {error}"))
+            ExplorerError::internal(format!("RecentTransactionEntry decode failed: {error}"))
         })?;
         entries.push(entry);
     }
@@ -302,7 +303,7 @@ fn read_mempool_event_counts(
             &end_key,
             cap,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut added_count: u32 = 0;
     let mut mined_count: u32 = 0;
     let mut invalidated_count: u32 = 0;

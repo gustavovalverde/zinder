@@ -73,8 +73,32 @@ enum ErrorReason {
 
   // INTERNAL family.
   ENTROPY_UNAVAILABLE = 33;
+  EXPLORER_INTERNAL = 37;
+
+  // FAILED_PRECONDITION family (derive-projection and node-capability gates).
+  DERIVE_PROJECTION_UNAVAILABLE = 34;
+  DERIVE_PROJECTION_LAGGING = 35;
+  NODE_CAPABILITY_MISSING = 36;
+  EXPLORER_PRECONDITION_UNSATISFIED = 40;
+
+  // UNAVAILABLE family.
+  NO_VISIBLE_CHAIN_EPOCH = 38;
+
+  // UNIMPLEMENTED family.
+  EXPLORER_METHOD_DISABLED = 39;
+
+  // FAILED_PRECONDITION family (operator must reconfigure the deployment).
+  // A federated dependency the request needs (the canonical fact store, a
+  // derive view, or a wallet-query endpoint) is not wired on this deployment.
+  // Waiting never clears it; the operator must configure the dependency.
+  DEPENDENCY_NOT_CONFIGURED = 41;
+
+  // UNAVAILABLE family.
+  // A configured federated endpoint is temporarily unreachable (cold start,
+  // restart, or transient network fault). Retrying with backoff clears it.
+  UPSTREAM_UNREACHABLE = 42;
 
   // Reserved slots for additive growth. Removing a reserved range is a
   // breaking change.
-  reserved 34 to 63;
+  reserved 43 to 63;
 }

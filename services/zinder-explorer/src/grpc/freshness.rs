@@ -18,6 +18,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+
+use super::error::ExplorerError;
 use zinder_proto::v1::explorer::{
     BlockSummaryRecord, DeriveStatus, ExplorerFreshness, IndexedHead, UpstreamObservation,
 };
@@ -95,14 +97,16 @@ pub(crate) async fn attach_upstream_observation(
 pub(crate) fn read_indexed_head(derive_store: &DeriveStore) -> Result<Option<IndexedHead>, Status> {
     let Some((_, payload)) = derive_store
         .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
         return Ok(None);
     };
     let summary = BlockSummaryRecord::decode(payload.as_slice())
-        .map_err(|error| Status::internal(format!("BlockSummaryRecord decode failed: {error}")))?
+        .map_err(|error| {
+            ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
+        })?
         .summary
-        .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+        .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
     Ok(Some(IndexedHead {
         height: summary.block_height,
         hash: summary.block_hash,
@@ -150,13 +154,15 @@ pub(crate) fn read_derive_status(
     };
     let Some(bytes) = store
         .get_derive_status()
-        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
         return Ok(None);
     };
     DeriveStatus::decode(bytes.as_slice())
         .map(Some)
-        .map_err(|error| Status::internal(format!("DeriveStatus decode failed: {error}")))
+        .map_err(|error| {
+            ExplorerError::internal(format!("DeriveStatus decode failed: {error}")).into()
+        })
 }
 
 /// Spawns the background task that refreshes the

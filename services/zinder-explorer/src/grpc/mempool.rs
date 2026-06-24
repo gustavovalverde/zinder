@@ -28,6 +28,7 @@ use zinder_proto::v1::wallet::{
 use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -106,7 +107,7 @@ pub(crate) async fn handle_mempool_summary(
     let chain_epoch = snapshot
         .chain_epoch
         .clone()
-        .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -203,7 +204,7 @@ pub(crate) async fn handle_mempool_activity(
         .unwrap_or_default();
     let chain_epoch = snapshot
         .chain_epoch
-        .ok_or_else(|| Status::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -239,7 +240,7 @@ fn parse_facts(
     activations: &NetworkUpgradeActivations,
 ) -> Result<CoreFacts, Status> {
     zinder_source::parse_transaction_public_facts(&entry.raw_transaction_bytes, None, activations)
-        .map_err(|error| Status::internal(error.to_string()))
+        .map_err(|error| ExplorerError::internal(error.to_string()).into())
 }
 
 const fn encode_transaction_version_kind(
@@ -301,10 +302,11 @@ fn decode_activity_cursor(cursor: &[u8]) -> Result<Option<(u64, u32)>, Status> {
         return Ok(None);
     }
     if cursor.len() != CURSOR_BYTES {
-        return Err(Status::invalid_argument(format!(
+        return Err(ExplorerError::invalid_request(format!(
             "MempoolActivity cursor must be {CURSOR_BYTES} bytes; got {}",
             cursor.len()
-        )));
+        ))
+        .into());
     }
     let mut millis_bytes = [0_u8; 8];
     millis_bytes.copy_from_slice(&cursor[0..8]);

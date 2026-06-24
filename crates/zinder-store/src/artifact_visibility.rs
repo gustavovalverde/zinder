@@ -17,7 +17,7 @@ pub(crate) fn visible_height_source_epoch(
 ) -> Result<ChainEpochId, StoreError> {
     metrics::counter!(
         "zinder_store_visibility_seek_total",
-        "artifact_family" => artifact_family_label(family)
+        "artifact_family" => family.wire_label()
     )
     .increment(1);
     let prefix = index.prefix_key(chain_epoch.network, height);
@@ -32,28 +32,6 @@ pub(crate) fn visible_height_source_epoch(
     };
 
     decode_visible_source_epoch(family, &seek_key, &source_epoch_bytes)
-}
-
-const fn artifact_family_label(family: ArtifactFamily) -> &'static str {
-    match family {
-        ArtifactFamily::ChainEpoch => "chain_epoch",
-        ArtifactFamily::ChainEvent => "chain_event",
-        ArtifactFamily::BlockHeader => "block_header",
-        ArtifactFamily::BlockBlob => "block_blob",
-        ArtifactFamily::CompactBlock => "compact_block",
-        ArtifactFamily::BlockTransactionIndex => "block_transaction_index",
-        ArtifactFamily::TransactionLocation => "transaction_location",
-        ArtifactFamily::TransactionFacts => "transaction_facts",
-        ArtifactFamily::TransactionBlob => "transaction_blob",
-        ArtifactFamily::TreeState => "tree_state",
-        ArtifactFamily::SubtreeRoot => "subtree_root",
-        ArtifactFamily::AddressOutputIndex => "address_output_index",
-        ArtifactFamily::TransparentOutput => "transparent_output",
-        ArtifactFamily::TransparentSpendFact => "transparent_spend_fact",
-        ArtifactFamily::TransparentAddressTxIndex => "transparent_address_tx_index",
-        ArtifactFamily::BlockHashIndex => "block_hash_index",
-        ArtifactFamily::MempoolEvent => "mempool_event",
-    }
 }
 
 pub(crate) fn decode_visible_source_epoch(

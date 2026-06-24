@@ -785,8 +785,8 @@ grpcurl -plaintext \
 Expected entries (this list is the public contract; treat any drift as a
 breaking change requiring a capability rename). The
 `zinder-proto::integration::capability_docs::testing_runbook_capability_list_mirrors_zinder_capabilities`
-test asserts the list below equals
-[`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs):
+test asserts the list below equals the wallet and explorer rows of the
+[`CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs) table:
 
 <!-- capability-list:testing-runbook:start -->
 ```
@@ -825,6 +825,7 @@ explorer.value_pool.summary_v1
 explorer.mempool.event_counts_v1
 explorer.transaction.fees_v1
 explorer.transaction.recent_v1
+explorer.payment_disclosure.verify_v1
 explorer.overview.snapshot_v1
 ```
 <!-- capability-list:testing-runbook:end -->
@@ -990,7 +991,7 @@ This runbook is operator-facing, dense, and changes often. Three classes
 of drift are easy to introduce and expensive to discover during an
 incident: a typo in a fenced shell command, a profile name that no
 longer matches `.config/nextest.toml`, or a capability list that has
-fallen behind `ZINDER_CAPABILITIES`. Each is caught by a piece of the
+fallen behind the `CAPABILITIES` table. Each is caught by a piece of the
 standard validation gate.
 
 | Drift class | How it's caught | Where |
@@ -998,7 +999,7 @@ standard validation gate.
 | Bash syntax in a fenced `bash` block | `scripts/runbook-lint.sh` runs every block through `bash -n`. Wired into the default validation gate above. | [`scripts/runbook-lint.sh`](../../scripts/runbook-lint.sh) |
 | Profile-name drift between this runbook and `.config/nextest.toml` | `testing_runbook_profile_names_exist_in_nextest_toml` asserts every `--profile=<name>` quoted in this file resolves to a real `[profile.<name>]` section. | [`crates/zinder-proto/tests/integration/capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs) |
 | Default-filter drift between this runbook and `.config/nextest.toml` | `testing_runbook_default_filter_mirrors_nextest_toml` asserts the quoted expression matches the canonical one. | Same file. |
-| Capability-list drift between this runbook and `ZINDER_CAPABILITIES` | `testing_runbook_capability_list_mirrors_zinder_capabilities` asserts the list under the `<!-- capability-list:testing-runbook -->` markers matches the constant. | Same file. |
+| Capability-list drift between this runbook and the `CAPABILITIES` table | `testing_runbook_capability_list_mirrors_zinder_capabilities` asserts the list under the `<!-- capability-list:testing-runbook -->` markers matches the wallet and explorer rows of the table. | Same file. |
 
 All four checks ship with the default `cargo nextest run --profile=ci`
 invocation; no separate runbook-self-test profile is needed. When you

@@ -6,7 +6,19 @@
 use std::collections::BTreeSet;
 
 use eyre::{Result, eyre};
-use zinder_proto::ZINDER_CAPABILITIES;
+use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
+
+/// Deployment-wide capability strings the docs mirror.
+///
+/// The doc marker blocks list the consumer-facing wallet and explorer
+/// capabilities; the private `ingest.*` control surface is not part of the
+/// published capability list.
+fn documented_capabilities() -> BTreeSet<String> {
+    capabilities_for_surface(CapabilitySurface::Wallet)
+        .chain(capabilities_for_surface(CapabilitySurface::Explorer))
+        .map(|spec| spec.string.to_owned())
+        .collect()
+}
 
 const PUBLIC_INTERFACES_DOC: &str =
     include_str!("../../../../docs/architecture/public-interfaces.md");
@@ -104,21 +116,17 @@ fn assert_capability_list_matches(
     end_marker: &str,
 ) -> Result<()> {
     let parsed = parse_capability_list(doc, start_marker, end_marker)?;
-    let expected: BTreeSet<String> = ZINDER_CAPABILITIES
-        .iter()
-        .copied()
-        .map(String::from)
-        .collect();
+    let expected = documented_capabilities();
 
     let missing_from_doc: Vec<&String> = expected.difference(&parsed).collect();
     let extra_in_doc: Vec<&String> = parsed.difference(&expected).collect();
 
     assert!(
         missing_from_doc.is_empty() && extra_in_doc.is_empty(),
-        "{doc_path} capability list has drifted from ZINDER_CAPABILITIES.\n\
+        "{doc_path} capability list has drifted from the CAPABILITIES table.\n\
          Missing from doc: {missing_from_doc:?}\n\
          Extra in doc:    {extra_in_doc:?}\n\
-         Update the doc list (or update ZINDER_CAPABILITIES if a capability \
+         Update the doc list (or update the CAPABILITIES table if a capability \
          was added/removed) so the two stay in sync."
     );
     Ok(())

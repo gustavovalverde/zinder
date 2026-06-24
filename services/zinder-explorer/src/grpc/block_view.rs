@@ -23,6 +23,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -45,16 +46,15 @@ pub(crate) async fn handle_block_summaries_in_range(
     let start_height = inner.start_height;
     let end_height = inner.end_height;
     if end_height < start_height {
-        return Err(Status::invalid_argument(
-            "end_height must be >= start_height",
-        ));
+        return Err(ExplorerError::invalid_request("end_height must be >= start_height").into());
     }
     let span = u64::from(end_height) - u64::from(start_height) + 1;
     if span > u64::from(MAX_BLOCK_SUMMARIES_PER_REQUEST) {
-        return Err(Status::invalid_argument(format!(
+        return Err(ExplorerError::invalid_request(format!(
             "requested span {span} blocks exceeds the per-request cap of \
              {MAX_BLOCK_SUMMARIES_PER_REQUEST}",
-        )));
+        ))
+        .into());
     }
 
     let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
@@ -66,17 +66,17 @@ pub(crate) async fn handle_block_summaries_in_range(
             &end_key,
             MAX_BLOCK_SUMMARIES_PER_REQUEST as usize,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
 
     let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
     let mut summaries = Vec::with_capacity(entries.len());
     for (_, payload) in entries {
         let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
-            Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
+            ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?;
         let mut summary = record
             .summary
-            .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+            .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
         annotate_request_time_fields(&mut summary, canonical_tip);
         summaries.push(summary);
     }
@@ -109,17 +109,18 @@ pub(crate) async fn handle_block_detail(
     let key = encode_height_key_ascending(BlockHeight::new(height));
     let payload = derive_store
         .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &key)
-        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
-            Status::not_found(format!(
+            ExplorerError::not_materialized(format!(
                 "BlockSummary is not materialized for height {height}"
             ))
         })?;
-    let record = BlockSummaryRecord::decode(payload.as_slice())
-        .map_err(|error| Status::internal(format!("BlockSummaryRecord decode failed: {error}")))?;
+    let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+        ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
+    })?;
     let mut summary = record
         .summary
-        .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+        .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
     let transaction_ids = record.transaction_ids;
 
     let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
@@ -160,7 +161,7 @@ async fn resolve_block_height(
     match request
         .selector
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("BlockDetailRequest.selector is required"))?
+        .ok_or_else(|| ExplorerError::invalid_request("BlockDetailRequest.selector is required"))?
     {
         block_detail_request::Selector::BlockHeight(height) => Ok(*height),
         block_detail_request::Selector::BlockHash(hash) => {
@@ -176,7 +177,7 @@ async fn resolve_block_height(
                 .into_inner();
             let block_id = response
                 .block_id
-                .ok_or_else(|| Status::internal("BlockIdResponse.block_id missing"))?;
+                .ok_or_else(|| ExplorerError::internal("BlockIdResponse.block_id missing"))?;
             Ok(block_id.height)
         }
     }
@@ -191,10 +192,10 @@ async fn read_canonical_tip(
         .into_inner();
     let chain_epoch = latest
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
     let canonical_tip = latest
         .latest_block
-        .ok_or_else(|| Status::internal("LatestBlockResponse.latest_block missing"))?
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
         .height;
     Ok((chain_epoch, canonical_tip))
 }

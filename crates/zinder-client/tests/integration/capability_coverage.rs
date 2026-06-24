@@ -1,180 +1,57 @@
 //! Capability-coverage contract test.
 //!
-//! Every capability string advertised in [`ZINDER_CAPABILITIES`] must map to
-//! a documented method (`ChainIndex` for `wallet.*`, `ExplorerQuery` for
-//! `derive.*`). Adding a new capability without a method is a contract
-//! violation: clients that gate on the string would see it advertised yet
-//! have no way to call the underlying read.
+//! The single source of truth is the [`CAPABILITIES`] table in
+//! `zinder-proto`. Each row binds a capability string to its surface, the
+//! proto method it gates, and an advertise policy. The
+//! `capability-table-vs-descriptor` guard in `zinder-proto` cross-checks the
+//! table's proto-method bindings against the compiled `FileDescriptorSet`;
+//! this test guards the client-facing trait surface those wallet capabilities
+//! map onto.
 //!
-//! The mapping is maintained alongside this test. Adding a new capability
-//! requires extending both `ZINDER_CAPABILITIES` and `EXPECTED_METHOD_NAMES`
-//! in the same change. Adding a new method without a capability is a softer
-//! warning (the test doesn't enforce that direction) because some methods
-//! are private to development tooling and not part of the public capability
-//! spine.
-//!
-//! `assert_wallet_chain_index_methods_compile` below takes a function-item
-//! reference to each `ChainIndex` method named in `EXPECTED_METHOD_NAMES`.
-//! Renaming or removing any of those methods on the trait makes this test
-//! file fail to compile, so the table is bound to the trait at build time
-//! instead of only at string-comparison time. Capabilities under the
-//! `explorer.*` namespace target `ExplorerQuery` server types and are checked
-//! by the consuming explorer crate; this test treats them as opaque table
-//! entries.
+//! `assert_wallet_chain_index_methods_compile` takes a function-item
+//! reference to each `ChainIndex` method a wallet capability calls. Renaming
+//! or removing any of those trait methods makes this file fail to compile, so
+//! the wallet capability surface stays bound to the trait at build time.
 
 use zinder_client::{
-    ChainIndex, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
-    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SEARCH_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_RECENT_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-    EXPLORER_VALUE_POOL_SUMMARY_V1, INGEST_CONTROL_ALWAYS_ON_CAPABILITIES, INGEST_WRITER_PHASE_V1,
-    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1, WALLET_EVENTS_MEMPOOL_V1,
-    WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1, WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
-    WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-    WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-    WALLET_READ_COMPACT_BLOCK_AT_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V1,
-    WALLET_READ_LATEST_BLOCK_V1, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
-    WALLET_READ_SERVER_INFO_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V1, WALLET_SNAPSHOT_MEMPOOL_V1, ZINDER_CAPABILITIES,
+    CAPABILITIES, CapabilitySurface, ChainIndex, INGEST_WRITER_PHASE_V1,
+    always_on_capability_strings,
 };
 
-/// Capability-to-method coverage table. The `ChainIndex` trait surface is
-/// reflected by name; the test walks `ZINDER_CAPABILITIES` and asserts every
-/// entry has a corresponding row here.
-const EXPECTED_METHOD_NAMES: &[(&str, &str)] = &[
-    (WALLET_READ_LATEST_BLOCK_V1, "latest_block"),
-    (WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, "block_id_by_selector"),
-    (
-        WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-        "block_header_by_selector",
-    ),
-    (WALLET_READ_COMPACT_BLOCK_AT_V1, "compact_block_at"),
-    (
-        WALLET_READ_COMPACT_BLOCK_RANGE_V1,
-        "compact_blocks_in_range",
-    ),
-    (WALLET_READ_TREE_STATE_AT_HEIGHT_V1, "tree_state_at"),
-    (
-        WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
-        "latest_tree_state_checkpoint",
-    ),
-    (
-        WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-        "subtree_roots_in_range",
-    ),
-    (WALLET_READ_TRANSACTION_BY_ID_V1, "transaction_by_id"),
-    (WALLET_READ_SERVER_INFO_V1, "server_info"),
-    (WALLET_BROADCAST_TRANSACTION_V1, "broadcast_transaction"),
-    (WALLET_EVENTS_CHAIN_V1, "chain_events"),
-    (WALLET_SNAPSHOT_MEMPOOL_V1, "mempool_snapshot"),
-    (WALLET_EVENTS_MEMPOOL_V1, "mempool_events"),
-    (
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-        "transparent_mempool_outputs_by_address",
-    ),
-    (
-        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
-        "transparent_mempool_spends_by_outpoint",
-    ),
-    (
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
-        "transparent_mempool_outputs_by_outpoint",
-    ),
-    (
-        WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-        "transparent_outputs_by_outpoint",
-    ),
-    (
-        WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-        "transparent_address_unspent_outputs",
-    ),
-    (
-        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-        "transparent_address_tx_ids_in_range",
-    ),
-    (
-        WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-        "chain_value_pools_at_tip",
-    ),
-    (EXPLORER_SERVER_INFO_V1, "explorer_server_info"),
-    (
-        EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-        "transparent_address_balance",
-    ),
-    (EXPLORER_TRANSACTION_DETAIL_V1, "transaction_detail"),
-    (EXPLORER_BLOCK_SUMMARY_V1, "block_summaries_in_range"),
-    (EXPLORER_BLOCK_DETAIL_V1, "block_detail"),
-    (EXPLORER_SEARCH_V1, "search"),
-    (EXPLORER_MEMPOOL_SUMMARY_V1, "mempool_summary"),
-    (EXPLORER_MEMPOOL_ACTIVITY_V1, "mempool_activity"),
-    (
-        EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
-        "transparent_address_activity",
-    ),
-    (EXPLORER_FEE_SUMMARY_V1, "fee_summary"),
-    (EXPLORER_VALUE_POOL_SUMMARY_V1, "value_pool_summary"),
-    (EXPLORER_MEMPOOL_EVENT_COUNTS_V1, "mempool_event_counts"),
-    (EXPLORER_TRANSACTION_FEES_V1, "transaction_detail"),
-    (EXPLORER_TRANSACTION_RECENT_V1, "recent_transactions"),
-    (EXPLORER_OVERVIEW_SNAPSHOT_V1, "overview_snapshot"),
-];
-
 #[test]
-fn every_advertised_capability_has_a_documented_method_mapping() {
-    for capability in ZINDER_CAPABILITIES {
-        let mapping = EXPECTED_METHOD_NAMES
-            .iter()
-            .find(|(advertised, _)| advertised == capability);
-
+fn every_capability_row_has_a_non_empty_string() {
+    for spec in CAPABILITIES {
         assert!(
-            mapping.is_some(),
-            "capability {capability} is advertised in ZINDER_CAPABILITIES but has no \
-             ChainIndex method mapping in EXPECTED_METHOD_NAMES; add a row to \
-             crates/zinder-client/tests/integration/capability_coverage.rs in the same \
-             change as the capability string."
-        );
-    }
-}
-
-#[test]
-fn capability_coverage_table_does_not_reference_retired_capabilities() {
-    for (capability, method_name) in EXPECTED_METHOD_NAMES {
-        assert!(
-            ZINDER_CAPABILITIES.contains(capability),
-            "EXPECTED_METHOD_NAMES references capability {capability} (method \
-             {method_name}) that is no longer in ZINDER_CAPABILITIES; remove the row \
-             when retiring a capability."
+            !spec.string.is_empty(),
+            "a {:?} capability row has an empty capability string",
+            spec.surface
         );
     }
 }
 
 /// Regression guard for the unified-ingest wire surface.
 ///
-/// `ingest.writer.phase_v1` must stay in the always-on list so federated
-/// clients can rely on the writer-phase vocabulary advertised by every
-/// Zinder deployment. ADR-0015.
+/// `ingest.writer.phase_v1` must stay always-on so federated clients can rely
+/// on the writer-phase vocabulary advertised by every Zinder deployment.
+/// ADR-0015.
 #[test]
-fn unified_ingest_capabilities_are_always_on() {
+fn unified_ingest_writer_phase_is_always_on() {
     assert!(
-        INGEST_CONTROL_ALWAYS_ON_CAPABILITIES.contains(&INGEST_WRITER_PHASE_V1),
-        "{INGEST_WRITER_PHASE_V1} must stay in INGEST_CONTROL_ALWAYS_ON_CAPABILITIES so every \
-         ingest deployment advertises it; the unified-ingest wire surface depends on this \
-         invariant."
+        always_on_capability_strings(CapabilitySurface::Ingest).contains(&INGEST_WRITER_PHASE_V1),
+        "{INGEST_WRITER_PHASE_V1} must stay always-on so every ingest deployment advertises it; \
+         the unified-ingest wire surface depends on this invariant."
     );
 }
 
-/// Compile-time existence check for [`ChainIndex`] methods.
+/// Compile-time existence check for the [`ChainIndex`] methods that back the
+/// wallet capability surface.
 ///
-/// The function body references each trait method named in
-/// `EXPECTED_METHOD_NAMES`; renaming or removing any of them breaks the
-/// build, so the table is bound to the trait at compile time. The function
-/// itself is never called.
+/// The function body references each trait method a wallet capability calls;
+/// renaming or removing any of them breaks the build. The function itself is
+/// never called.
 #[allow(
     dead_code,
-    reason = "compile-time existence check for ChainIndex methods named in EXPECTED_METHOD_NAMES"
+    reason = "compile-time existence check for ChainIndex methods backing wallet capabilities"
 )]
 fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::latest_block;

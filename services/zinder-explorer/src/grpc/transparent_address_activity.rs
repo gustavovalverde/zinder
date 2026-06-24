@@ -25,6 +25,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -53,7 +54,7 @@ pub(crate) async fn handle_transparent_address_activity(
     let inner = request.into_inner();
     let address = inner
         .address
-        .ok_or_else(|| Status::invalid_argument("address selector is required"))?;
+        .ok_or_else(|| ExplorerError::invalid_request("address selector is required"))?;
     let script_hash = address_lookup_to_script_hash(&address, network)?;
     let max_entries = clamp_max_entries(
         inner.max_entries,
@@ -76,7 +77,7 @@ pub(crate) async fn handle_transparent_address_activity(
         .into_inner();
     let chain_epoch = latest
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -123,7 +124,7 @@ fn scan_address_activity(
             &end_key,
             scan_cap,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
 
     let mut entries: Vec<TransparentAddressActivityEntry> = Vec::with_capacity(rows.len());
     let mut last_key: Option<RowKey> = None;
@@ -131,12 +132,12 @@ fn scan_address_activity(
         let key_array: RowKey = key
             .as_slice()
             .try_into()
-            .map_err(|_| Status::internal("activity row key not 40 bytes"))?;
+            .map_err(|_| ExplorerError::internal("activity row key not 40 bytes"))?;
         if resume_cursor.is_some_and(|cursor| key_array == cursor) {
             continue;
         }
         let key_address = decode_address_script_hash(&key_array[0..ADDRESS_HASH_LEN])
-            .map_err(|error| Status::internal(error.to_string()))?;
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
         if key_address != parameters.script_hash {
             break;
         }
@@ -145,7 +146,7 @@ fn scan_address_activity(
             continue;
         }
         let record = TransparentAddressActivityRecord::decode(payload.as_slice())
-            .map_err(|error| Status::internal(error.to_string()))?;
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
         entries.push(TransparentAddressActivityEntry {
             transaction_id: record.transaction_id,
             block_height: height,
@@ -195,11 +196,12 @@ fn build_scan_keys(prefix: [u8; ADDRESS_HASH_LEN], from_cursor: &[u8]) -> Result
     }
     let bytes: [u8; TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN] = from_cursor
         .try_into()
-        .map_err(|_| Status::invalid_argument("from_cursor must be 40 bytes"))?;
+        .map_err(|_| ExplorerError::invalid_request("from_cursor must be 40 bytes"))?;
     if bytes[0..ADDRESS_HASH_LEN] != prefix {
-        return Err(Status::invalid_argument(
+        return Err(ExplorerError::invalid_request(
             "from_cursor address prefix does not match request address",
-        ));
+        )
+        .into());
     }
     start_key = bytes;
     Ok(ScanKeys {
@@ -212,10 +214,10 @@ fn build_scan_keys(prefix: [u8; ADDRESS_HASH_LEN], from_cursor: &[u8]) -> Result
 fn decode_row_height(key: &RowKey) -> Result<u32, Status> {
     let height_bytes: [u8; 4] = key[HEIGHT_KEY_OFFSET..HEIGHT_KEY_END]
         .try_into()
-        .map_err(|_| Status::internal("height segment not 4 bytes"))?;
+        .map_err(|_| ExplorerError::internal("height segment not 4 bytes"))?;
     decode_height_key_descending(&height_bytes)
         .map(zinder_core::BlockHeight::value)
-        .map_err(|error| Status::internal(error.to_string()))
+        .map_err(|error| ExplorerError::internal(error.to_string()).into())
 }
 
 fn address_lookup_to_script_hash(
@@ -225,29 +227,31 @@ fn address_lookup_to_script_hash(
     let selector = address
         .selector
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("address selector arm is required"))?;
+        .ok_or_else(|| ExplorerError::invalid_request("address selector arm is required"))?;
     match selector {
         AddressSelector::ScriptHash(bytes) => {
             let hash_bytes: [u8; 32] = bytes
                 .as_slice()
                 .try_into()
-                .map_err(|_| Status::invalid_argument("script_hash must be 32 bytes"))?;
+                .map_err(|_| ExplorerError::invalid_request("script_hash must be 32 bytes"))?;
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         AddressSelector::Address(text) => {
-            let parsed = text
-                .parse::<ZebraTransparentAddress>()
-                .map_err(|_| Status::invalid_argument("transparent address could not be parsed"))?;
+            let parsed = text.parse::<ZebraTransparentAddress>().map_err(|_| {
+                ExplorerError::invalid_request("transparent address could not be parsed")
+            })?;
             if !network_matches(parsed.network_kind(), network) {
-                return Err(Status::invalid_argument(
+                return Err(ExplorerError::invalid_request(
                     "transparent address network does not match server network",
-                ));
+                )
+                .into());
             }
             let script_pub_key = parsed.script().as_raw_bytes().to_vec();
             if script_pub_key.is_empty() {
-                return Err(Status::invalid_argument(
+                return Err(ExplorerError::invalid_request(
                     "transparent address resolved to empty scriptPubKey",
-                ));
+                )
+                .into());
             }
             Ok(TransparentAddressScriptHash::of_script_pub_key(
                 &script_pub_key,

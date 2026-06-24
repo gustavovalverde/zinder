@@ -59,6 +59,39 @@ pub enum ArtifactFamily {
     MempoolEvent,
 }
 
+impl ArtifactFamily {
+    /// Returns the canonical on-wire family label.
+    ///
+    /// The label is the value emitted in `google.rpc.ResourceInfo.resource_type`
+    /// for [`StoreError::ArtifactMissing`] and the matching query error, and the
+    /// value a client reads back. Labels come from
+    /// [`zinder_core::artifact_family`] so producers and consumers share one
+    /// string per family.
+    #[must_use]
+    pub const fn wire_label(self) -> &'static str {
+        use zinder_core::artifact_family as family;
+        match self {
+            Self::ChainEpoch => family::CHAIN_EPOCH,
+            Self::ChainEvent => family::CHAIN_EVENT,
+            Self::BlockHeader => family::BLOCK_HEADER_ARTIFACT,
+            Self::BlockBlob => family::BLOCK_BLOB,
+            Self::CompactBlock => family::COMPACT_BLOCK,
+            Self::BlockTransactionIndex => family::BLOCK_TRANSACTION_INDEX,
+            Self::TransactionLocation => family::TRANSACTION_LOCATION,
+            Self::TransactionFacts => family::TRANSACTION_FACTS,
+            Self::TransactionBlob => family::TRANSACTION_BLOB,
+            Self::TreeState => family::TREE_STATE,
+            Self::SubtreeRoot => family::SUBTREE_ROOT,
+            Self::AddressOutputIndex => family::ADDRESS_OUTPUT_INDEX,
+            Self::TransparentOutput => family::TRANSPARENT_OUTPUT,
+            Self::TransparentSpendFact => family::TRANSPARENT_SPEND_FACT,
+            Self::TransparentAddressTxIndex => family::TRANSPARENT_ADDRESS_TX_INDEX,
+            Self::BlockHashIndex => family::BLOCK_HASH_INDEX,
+            Self::MempoolEvent => family::MEMPOOL_EVENT,
+        }
+    }
+}
+
 /// Opaque storage-key bytes included in diagnostic storage errors.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct StorageKey(Vec<u8>);

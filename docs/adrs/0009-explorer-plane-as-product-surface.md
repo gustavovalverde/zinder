@@ -115,7 +115,7 @@ This rule is structural: it keeps canonical artifacts as the single source of tr
 - `crates/zinder-proto/src/capabilities.rs` exposes the `EXPLORER_*` constants.
 - `services/zinder-query/src/grpc/adapter.rs` gates federation on `explorer.transparent_address.balance_v1`.
 - `derive-plane.md` documents the SDK boundary. `explorer-plane.md` documents the product surface. Both reference each other.
-- The capability docs tests enforce that `ZINDER_CAPABILITIES` matches the public-interfaces capability list.
+- The capability docs tests enforce that the wallet and explorer rows of the `CAPABILITIES` table match the public-interfaces capability list.
 
 ### Testing
 

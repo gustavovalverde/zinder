@@ -43,6 +43,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
 prost = "0.14.3"
 prost-build = "0.14.3"
+prost-types = "0.14.3"
 rust-rocksdb = { version = "0.47.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"
 serde = "1.0.228"

@@ -4,8 +4,16 @@
 //! do not hand-write protocol-shaped payload structs.
 
 pub mod capabilities;
+pub mod error_policy;
 pub mod wire;
-pub use capabilities::{CapabilityDescriptor, INGEST_CONTROL_CAPABILITIES, ZINDER_CAPABILITIES};
+pub use capabilities::{
+    AdvertisePolicy, CAPABILITIES, CapabilityDescriptor, CapabilitySpec, CapabilitySurface,
+    ExplorerReadiness, always_on_capability_strings, capabilities_for_surface,
+};
+pub use error_policy::{
+    BoundaryError, ReasonPolicy, RetryDisposition, ZINDER_ERROR_DOMAIN, reason_policy,
+    status_for_reason, status_with_reason,
+};
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///

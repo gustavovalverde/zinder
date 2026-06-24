@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eyre::{Result, eyre};
-use zinder_proto::ZINDER_CAPABILITIES;
+use zinder_proto::CAPABILITIES;
 
 const CAPABILITIES_SOURCE_PATH: &str = "crates/zinder-proto/src/capabilities.rs";
 const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
@@ -16,7 +16,7 @@ const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
 /// Source files allowed to contain capability literal strings.
 ///
 /// The single source of truth is `capabilities.rs`. The doc-mirror test
-/// (`capability_docs.rs`) and this file consume `ZINDER_CAPABILITIES`
+/// (`capability_docs.rs`) and this file consume the `CAPABILITIES` table
 /// directly; they never embed the literal strings themselves, so they are
 /// not allow-listed.
 const LITERAL_ALLOWLIST: &[&str] = &[CAPABILITIES_SOURCE_PATH];
@@ -29,10 +29,10 @@ fn capability_literals_are_imported_not_duplicated() -> Result<()> {
         .map(|path| root.join(path))
         .collect();
 
-    let capability_strings: BTreeSet<&str> = ZINDER_CAPABILITIES.iter().copied().collect();
+    let capability_strings: BTreeSet<&str> = CAPABILITIES.iter().map(|spec| spec.string).collect();
     if capability_strings.is_empty() {
         return Err(eyre!(
-            "ZINDER_CAPABILITIES must contain at least one entry for this guard \
+            "the CAPABILITIES table must contain at least one entry for this guard \
              to mean anything; refusing to silently pass."
         ));
     }

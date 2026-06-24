@@ -40,6 +40,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -394,6 +395,6 @@ async fn build_freshness(
         .await?
         .into_inner()
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
     build_explorer_freshness(derive_store, EXPLORER_SEARCH_V1, Some(chain_epoch), 0)
 }

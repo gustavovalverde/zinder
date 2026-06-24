@@ -143,11 +143,9 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(query_config.network),
         readiness.clone(),
-        zinder_proto::capabilities::ZINDER_CAPABILITIES
-            .iter()
-            .copied()
-            .filter(|capability| capability.starts_with("wallet."))
-            .collect(),
+        zinder_proto::capabilities::always_on_capability_strings(
+            zinder_proto::capabilities::CapabilitySurface::Wallet,
+        ),
     );
     zinder_query::describe_request_metrics();
 

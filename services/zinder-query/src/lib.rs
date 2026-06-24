@@ -20,6 +20,7 @@ use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
     TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
 };
+use zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1;
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
@@ -708,7 +709,7 @@ where
 
         let Some(derive_store) = self.derive_store.clone() else {
             let outcome = Err(QueryError::DeriveUnavailable {
-                capability: "wallet.read.transparent_address_tx_ids_v1",
+                capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             });
             record_wallet_query_outcome(
                 "transparent_address_tx_ids_in_range",
@@ -734,7 +735,7 @@ where
                 .map_err(QueryError::DeriveStore)?;
             if derive_height.is_none_or(|height| height < chain_epoch.tip_height) {
                 return Err(QueryError::DeriveLag {
-                    capability: "wallet.read.transparent_address_tx_ids_v1",
+                    capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
                     chain_tip_height: chain_epoch.tip_height,
                     derive_height,
                 });
@@ -1638,6 +1639,48 @@ pub enum QueryError {
     Node(#[from] SourceError),
 }
 
+impl zinder_proto::BoundaryError for QueryError {
+    /// Maps each [`QueryError`] variant to its stable
+    /// [`ErrorReason`](zinder_proto::v1::ops::ErrorReason).
+    ///
+    /// `Store` failures route through `StoreError::error_reason` at the gRPC
+    /// adapter and never reach this match in practice; the arm keeps the match
+    /// total and fails closed as storage-unavailable.
+    fn error_reason(&self) -> zinder_proto::v1::ops::ErrorReason {
+        use zinder_proto::v1::ops::ErrorReason;
+        match self {
+            Self::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
+            Self::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
+            Self::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
+            Self::TransparentHistoryCursorInvalid { .. } => {
+                ErrorReason::TransparentHistoryCursorInvalid
+            }
+            Self::InvalidAddress { .. } => ErrorReason::InvalidAddress,
+            Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
+            Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
+            Self::DeriveUnavailable { .. } => ErrorReason::DeriveProjectionUnavailable,
+            Self::DeriveLag { .. } => ErrorReason::DeriveProjectionLagging,
+            Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
+            Self::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
+            Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
+            Self::ChainEpochPinMismatch { .. } => ErrorReason::ChainEpochPinMismatch,
+            Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
+            Self::CompactBlockPayloadMalformed { .. } => ErrorReason::CompactBlockPayloadMalformed,
+            Self::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
+            Self::BlockNotInBestChain => ErrorReason::BlockNotInBestChain,
+            Self::UnsupportedChainEvent { .. } => ErrorReason::UnsupportedChainEvent,
+            Self::UnsupportedBlockSelector { .. } => ErrorReason::UnsupportedBlockSelector,
+            Self::UnsupportedTransactionStatus { .. } => ErrorReason::UnsupportedTransactionStatus,
+            Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
+            Self::Node(source_error) if source_error.is_node_capability_missing() => {
+                ErrorReason::NodeCapabilityMissing
+            }
+            Self::Node(_) => ErrorReason::NodeUnavailable,
+            Self::DeriveStore(_) | Self::Store(_) => ErrorReason::StorageUnavailable,
+        }
+    }
+}
+
 fn block_height_artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryError {
     artifact_unavailable(family, ArtifactKey::BlockHeight(height))
 }
@@ -1717,4 +1760,97 @@ fn completed_subtree_count(chain_epoch: ChainEpoch, protocol: ShieldedProtocol) 
 )]
 const fn u32_to_usize(count: u32) -> usize {
     count as usize
+}
+
+#[cfg(test)]
+mod error_reason_tests {
+    use zinder_proto::{BoundaryError, v1::ops::ErrorReason};
+
+    use super::*;
+
+    /// One representative of every [`QueryError`] variant.
+    ///
+    /// The list is exhaustive, so a new variant fails to compile until it is
+    /// listed; [`no_query_error_variant_maps_to_unspecified`] then asserts the
+    /// new variant carries a real reason.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One literal per QueryError variant; the length tracks the enum, not branching complexity."
+    )]
+    fn one_of_each_variant() -> Vec<QueryError> {
+        vec![
+            QueryError::InvalidBlockRange {
+                start_height: BlockHeight::new(2),
+                end_height: BlockHeight::new(1),
+            },
+            QueryError::CompactBlockRangeTooLarge {
+                requested: 2,
+                maximum: 1,
+            },
+            QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::CompactBlock,
+                key: ArtifactKey::BlockHeight(BlockHeight::new(1)),
+            },
+            QueryError::CompactBlockPayloadMalformed {
+                height: BlockHeight::new(1),
+                reason: "probe".to_owned(),
+            },
+            QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: "probe".to_owned(),
+            },
+            QueryError::BlockNotInBestChain,
+            QueryError::UnsupportedShieldedProtocol {
+                protocol: ShieldedProtocol::Sapling,
+            },
+            QueryError::TransparentHistoryCursorInvalid { reason: "probe" },
+            QueryError::InvalidAddress { reason: "probe" },
+            QueryError::ChainEventCursorInvalid { reason: "probe" },
+            QueryError::ChainEventCursorExpired {
+                event_sequence: 1,
+                oldest_retained_sequence: 2,
+            },
+            QueryError::ChainEpochPinUnsupported,
+            QueryError::ChainEpochPinUnavailable {
+                chain_epoch_id: ChainEpochId::new(1),
+            },
+            QueryError::ChainEpochPinMismatch {
+                chain_epoch_id: ChainEpochId::new(1),
+                reason: "probe",
+            },
+            QueryError::UnsupportedChainEvent { event: "probe" },
+            QueryError::UnsupportedBlockSelector { reason: "probe" },
+            QueryError::UnsupportedTransactionStatus { reason: "probe" },
+            QueryError::TransactionBroadcastDisabled,
+            QueryError::DeriveUnavailable {
+                capability: "probe",
+            },
+            QueryError::DeriveLag {
+                capability: "probe",
+                chain_tip_height: BlockHeight::new(2),
+                derive_height: Some(BlockHeight::new(1)),
+            },
+            QueryError::BlockingTaskFailed {
+                reason: "probe".to_owned(),
+            },
+            QueryError::Store(StoreError::NoVisibleChainEpoch),
+            QueryError::DeriveStore(zinder_derive::DeriveStoreError::InvalidOptions {
+                reason: "probe",
+            }),
+            QueryError::Node(SourceError::InvalidBlockHashHex {
+                reason: "probe".to_owned(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn no_query_error_variant_maps_to_unspecified() {
+        for error in one_of_each_variant() {
+            assert_ne!(
+                error.error_reason(),
+                ErrorReason::Unspecified,
+                "QueryError variant {error:?} mapped to ERROR_REASON_UNSPECIFIED"
+            );
+        }
+    }
 }

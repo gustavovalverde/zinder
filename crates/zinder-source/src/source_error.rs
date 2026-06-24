@@ -367,6 +367,13 @@ impl SourceFailureClass {
 }
 
 impl SourceError {
+    /// Returns true when the upstream node lacks a capability the request
+    /// requires, a condition operator reconfiguration must clear.
+    #[must_use]
+    pub const fn is_node_capability_missing(&self) -> bool {
+        matches!(self, Self::NodeCapabilityMissing { .. })
+    }
+
     /// Returns the operator-facing class describing what the upstream did.
     ///
     /// Classification is descriptive: the class names a kind of failure, not

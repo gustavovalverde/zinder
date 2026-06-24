@@ -3,10 +3,10 @@
 use thiserror::Error;
 use tonic::Code;
 use tonic_types::StatusExt;
-use zinder_core::{Network, artifact_family};
+use zinder_core::Network;
 use zinder_derive::DeriveStoreError;
 use zinder_proto::v1::ops::ErrorReason;
-use zinder_store::{ArtifactFamily, StoreError};
+use zinder_store::StoreError;
 
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
@@ -53,13 +53,13 @@ pub enum IndexerError {
     ///
     /// This is the canonical per-artifact unavailability signal; future
     /// per-artifact "not present" cases use this variant rather than adding
-    /// a new top-level variant. Constants for `family` live in
-    /// [`zinder_core::artifact_family`].
-    ///
+    /// a new top-level variant. `family` is the on-wire family label the
+    /// server emits in `google.rpc.ResourceInfo.resource_type`; its values are
+    /// the [`zinder_core::artifact_family`] constants.
     #[error("artifact unavailable in family {family}: key {key}")]
     ArtifactUnavailable {
-        /// Canonical family label (see [`zinder_core::artifact_family`]).
-        family: &'static str,
+        /// On-wire family label (see [`zinder_core::artifact_family`]).
+        family: String,
         /// Diagnostic representation of the missing key.
         key: String,
     },
@@ -142,7 +142,7 @@ impl IndexerError {
         match error {
             StoreError::NoVisibleChainEpoch => Self::NoVisibleChainEpoch,
             StoreError::ArtifactMissing { family, key } => Self::ArtifactUnavailable {
-                family: artifact_family_label(family),
+                family: family.wire_label().to_owned(),
                 key: format!("{key:?}"),
             },
             StoreError::ChainEpochMissing { .. } => Self::NotFound {
@@ -239,7 +239,7 @@ impl IndexerError {
             && let Some(resource_info) = details.resource_info()
         {
             return Self::ArtifactUnavailable {
-                family: artifact_family_for_label(&resource_info.resource_type),
+                family: resource_info.resource_type.clone(),
                 key: resource_info.resource_name.clone(),
             };
         }
@@ -329,61 +329,5 @@ impl IndexerError {
         Self::InvalidRequest {
             reason: reason.into(),
         }
-    }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "ArtifactFamily is #[non_exhaustive]; the wildcard handles future variants without a compile break, and unknown families surface as the literal \"unknown_artifact\" so consumers can detect drift."
-)]
-fn artifact_family_label(family: ArtifactFamily) -> &'static str {
-    match family {
-        ArtifactFamily::ChainEpoch => artifact_family::CHAIN_EPOCH,
-        ArtifactFamily::ChainEvent => artifact_family::CHAIN_EVENT,
-        ArtifactFamily::BlockHeader => artifact_family::BLOCK_HEADER_ARTIFACT,
-        ArtifactFamily::BlockBlob => artifact_family::BLOCK_BLOB,
-        ArtifactFamily::CompactBlock => artifact_family::COMPACT_BLOCK,
-        ArtifactFamily::BlockTransactionIndex => artifact_family::BLOCK_TRANSACTION_INDEX,
-        ArtifactFamily::TransactionLocation => artifact_family::TRANSACTION_LOCATION,
-        ArtifactFamily::TransactionFacts => artifact_family::TRANSACTION_FACTS,
-        ArtifactFamily::TransactionBlob => artifact_family::TRANSACTION_BLOB,
-        ArtifactFamily::TreeState => artifact_family::TREE_STATE,
-        ArtifactFamily::SubtreeRoot => artifact_family::SUBTREE_ROOT,
-        ArtifactFamily::TransparentOutput => artifact_family::TRANSPARENT_OUTPUT,
-        ArtifactFamily::AddressOutputIndex => artifact_family::ADDRESS_OUTPUT_INDEX,
-        ArtifactFamily::TransparentSpendFact => artifact_family::TRANSPARENT_SPEND_FACT,
-        ArtifactFamily::TransparentAddressTxIndex => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
-        ArtifactFamily::BlockHashIndex => artifact_family::BLOCK_HASH_INDEX,
-        ArtifactFamily::MempoolEvent => artifact_family::MEMPOOL_EVENT,
-        _ => "unknown_artifact",
-    }
-}
-
-/// Inverse of [`artifact_family_label`].
-///
-/// Maps a `ResourceInfo.resource_type` string back to the canonical static
-/// `family` label exposed by [`IndexerError::ArtifactUnavailable`]. The
-/// server emits the family via `format!("{family:?}")`, so the matching is
-/// on the Rust `Debug` form.
-fn artifact_family_for_label(resource_type: &str) -> &'static str {
-    match resource_type {
-        "ChainEpoch" => artifact_family::CHAIN_EPOCH,
-        "ChainEvent" => artifact_family::CHAIN_EVENT,
-        "BlockHeader" => artifact_family::BLOCK_HEADER_ARTIFACT,
-        "BlockBlob" => artifact_family::BLOCK_BLOB,
-        "CompactBlock" => artifact_family::COMPACT_BLOCK,
-        "BlockTransactionIndex" => artifact_family::BLOCK_TRANSACTION_INDEX,
-        "TransactionLocation" => artifact_family::TRANSACTION_LOCATION,
-        "TransactionFacts" => artifact_family::TRANSACTION_FACTS,
-        "TransactionBlob" => artifact_family::TRANSACTION_BLOB,
-        "TreeState" => artifact_family::TREE_STATE,
-        "SubtreeRoot" => artifact_family::SUBTREE_ROOT,
-        "TransparentOutput" => artifact_family::TRANSPARENT_OUTPUT,
-        "AddressOutputIndex" => artifact_family::ADDRESS_OUTPUT_INDEX,
-        "TransparentSpendFact" => artifact_family::TRANSPARENT_SPEND_FACT,
-        "TransparentAddressTxIndex" => artifact_family::TRANSPARENT_ADDRESS_TX_INDEX,
-        "BlockHashIndex" => artifact_family::BLOCK_HASH_INDEX,
-        "MempoolEvent" => artifact_family::MEMPOOL_EVENT,
-        _ => "unknown_artifact",
     }
 }

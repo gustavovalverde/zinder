@@ -4,21 +4,13 @@ mod adapter;
 mod chain_events;
 mod native;
 
-use std::collections::HashMap;
-
-use tonic::{Code, Status};
-use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation, StatusExt};
-use zinder_core::BlockHeight;
+use tonic::Status;
+use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
-use zinder_proto::v1::ops::ErrorReason;
+use zinder_proto::{BoundaryError, status_with_reason};
 use zinder_store::status_from_store_error;
 
 use crate::QueryError;
-
-/// Domain attached to every `google.rpc.ErrorInfo` returned by a Zinder
-/// service. The Rust client matches on this domain to know an [`ErrorInfo`]
-/// originated from Zinder before trusting its `reason` field.
-pub(crate) const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
@@ -38,96 +30,46 @@ pub use native::{
 /// This is the single source of truth for `QueryError` to gRPC translation.
 /// Both [`WalletQueryGrpcAdapter`] (native surface) and the lightwalletd
 /// compatibility adapter call into this function instead of duplicating the
-/// mapping. Adding a new `QueryError` variant requires extending this match
-/// arm exactly once.
+/// mapping. The reason comes from [`QueryError::error_reason`] and the code
+/// from the shared reason policy; this function attaches the typed
+/// `BadRequest`/`PreconditionFailure`/`ResourceInfo` detail per variant.
 #[must_use]
 pub fn status_from_query_error(error: &QueryError) -> Status {
-    let message = error.to_string();
+    if let QueryError::Store(store_error) = error {
+        return status_from_store_error(store_error);
+    }
+    status_with_reason(
+        error.error_reason(),
+        error.to_string(),
+        typed_detail_for(error),
+    )
+}
 
-    let (code, mut details) = match error {
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only request-validation and precondition variants carry structured detail; every other query error rides its reason via ErrorInfo with an empty detail set."
+)]
+fn typed_detail_for(error: &QueryError) -> ErrorDetails {
+    match error {
         QueryError::InvalidBlockRange { .. }
         | QueryError::CompactBlockRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
-        | QueryError::UnsupportedShieldedProtocol { .. } => {
-            (Code::InvalidArgument, bad_request_details(error))
-        }
+        | QueryError::UnsupportedShieldedProtocol { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
         | QueryError::DeriveUnavailable { .. }
-        | QueryError::DeriveLag { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnsupported
         | QueryError::ChainEpochPinUnavailable { .. }
-        | QueryError::ChainEpochPinMismatch { .. } => (
-            Code::FailedPrecondition,
-            precondition_failure_details(error),
+        | QueryError::ChainEpochPinMismatch { .. } => precondition_failure_details(error),
+        QueryError::ArtifactUnavailable { family, key } => ErrorDetails::with_resource_info(
+            family.wire_label(),
+            key.to_string(),
+            "zinder-query",
+            "artifact is not available in the selected chain epoch",
         ),
-        QueryError::ArtifactUnavailable { family, key } => (
-            Code::NotFound,
-            ErrorDetails::with_resource_info(
-                format!("{family:?}"),
-                key.to_string(),
-                "zinder-query",
-                "artifact is not available in the selected chain epoch",
-            ),
-        ),
-        QueryError::CompactBlockPayloadMalformed { .. } | QueryError::ArtifactCorrupt { .. } => {
-            (Code::DataLoss, ErrorDetails::new())
-        }
-        QueryError::BlockNotInBestChain => (Code::NotFound, ErrorDetails::new()),
-        QueryError::UnsupportedChainEvent { .. }
-        | QueryError::UnsupportedBlockSelector { .. }
-        | QueryError::UnsupportedTransactionStatus { .. }
-        | QueryError::BlockingTaskFailed { .. }
-        | QueryError::Node(_)
-        | QueryError::DeriveStore(_) => (Code::Unavailable, ErrorDetails::new()),
-        QueryError::Store(error) => return status_from_store_error(error),
-    };
-
-    let reason = error_reason_for_query_error(error);
-    details.set_error_info(reason.as_str_name(), ZINDER_ERROR_DOMAIN, HashMap::new());
-    Status::with_error_details(code, message, details)
-}
-
-/// Maps each [`QueryError`] variant to its stable [`ErrorReason`].
-///
-/// The reason code is the typed key clients pin to. Pair with the gRPC
-/// `Status::code()` for the retry semantics and with the existing structured
-/// detail types (`BadRequest`, `PreconditionFailure`, `ResourceInfo`) for the
-/// failure-shape detail.
-fn error_reason_for_query_error(error: &QueryError) -> ErrorReason {
-    match error {
-        QueryError::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
-        QueryError::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
-        QueryError::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
-        QueryError::TransparentHistoryCursorInvalid { .. } => {
-            ErrorReason::TransparentHistoryCursorInvalid
-        }
-        QueryError::InvalidAddress { .. } => ErrorReason::InvalidAddress,
-        QueryError::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
-        QueryError::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
-        QueryError::DeriveUnavailable { .. } | QueryError::DeriveLag { .. } => {
-            ErrorReason::Unspecified
-        }
-        QueryError::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
-        QueryError::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
-        QueryError::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
-        QueryError::ChainEpochPinMismatch { .. } => ErrorReason::ChainEpochPinMismatch,
-        QueryError::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
-        QueryError::CompactBlockPayloadMalformed { .. } => {
-            ErrorReason::CompactBlockPayloadMalformed
-        }
-        QueryError::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
-        QueryError::BlockNotInBestChain => ErrorReason::BlockNotInBestChain,
-        QueryError::UnsupportedChainEvent { .. } => ErrorReason::UnsupportedChainEvent,
-        QueryError::UnsupportedBlockSelector { .. } => ErrorReason::UnsupportedBlockSelector,
-        QueryError::UnsupportedTransactionStatus { .. } => {
-            ErrorReason::UnsupportedTransactionStatus
-        }
-        QueryError::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
-        QueryError::Node(_) => ErrorReason::NodeUnavailable,
-        QueryError::Store(_) | QueryError::DeriveStore(_) => ErrorReason::Unspecified,
+        _ => ErrorDetails::new(),
     }
 }
 
@@ -201,19 +143,6 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "derive projection is not configured for this deployment",
             )
         }
-        QueryError::DeriveLag {
-            capability,
-            chain_tip_height,
-            derive_height,
-        } => ErrorDetails::with_precondition_failure_violation(
-            "DERIVE_PROJECTION_LAGGING",
-            *capability,
-            format!(
-                "canonical height {} is ahead of derive height {:?}",
-                chain_tip_height.value(),
-                derive_height.map(BlockHeight::value)
-            ),
-        ),
         QueryError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence,
@@ -248,6 +177,8 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
 
 #[cfg(test)]
 mod tests {
+    use tonic::Code;
+    use tonic_types::StatusExt as _;
     use zinder_core::BlockHeight;
 
     use super::*;

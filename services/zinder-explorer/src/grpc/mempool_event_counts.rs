@@ -12,6 +12,7 @@ use zinder_proto::v1::explorer::{MempoolEventCountsRequest, MempoolEventCountsRe
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -50,7 +51,7 @@ pub(crate) async fn handle_mempool_event_counts(
             &end_key,
             MAX_ROWS_PER_REQUEST,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
 
     let mut added_count = 0u32;
     let mut mined_count = 0u32;
@@ -73,7 +74,7 @@ pub(crate) async fn handle_mempool_event_counts(
         .into_inner();
     let chain_epoch = latest
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

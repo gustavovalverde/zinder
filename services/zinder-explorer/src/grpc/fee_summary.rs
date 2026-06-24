@@ -21,6 +21,7 @@ use zinder_proto::v1::explorer::{BlockSummaryRecord, FeeSummaryRequest, FeeSumma
 use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -52,16 +53,15 @@ pub(crate) async fn handle_fee_summary(
 
 fn validate_range(start_height: u32, end_height: u32) -> Result<(), Status> {
     if end_height < start_height {
-        return Err(Status::invalid_argument(
-            "end_height must be >= start_height",
-        ));
+        return Err(ExplorerError::invalid_request("end_height must be >= start_height").into());
     }
     let span = u64::from(end_height) - u64::from(start_height) + 1;
     if span > u64::from(MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST) {
-        return Err(Status::invalid_argument(format!(
+        return Err(ExplorerError::invalid_request(format!(
             "requested span {span} blocks exceeds the per-request cap of \
              {MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST}",
-        )));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -89,16 +89,16 @@ fn aggregate_block_summaries(
             &end_key,
             MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST as usize,
         )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
 
     let mut aggregate = FeeAggregate::default();
     for (_, payload) in entries {
         let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
-            Status::internal(format!("BlockSummaryRecord decode failed: {error}"))
+            ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?;
         let summary = record
             .summary
-            .ok_or_else(|| Status::internal("BlockSummaryRecord.summary missing"))?;
+            .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
         aggregate.block_count = aggregate.block_count.saturating_add(1);
         aggregate.transaction_count = aggregate
             .transaction_count
@@ -155,5 +155,5 @@ async fn fetch_latest_chain_epoch(
         .await?
         .into_inner()
         .chain_epoch
-        .ok_or_else(|| Status::internal("LatestBlockResponse.chain_epoch missing"))
+        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing").into())
 }

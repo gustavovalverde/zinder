@@ -123,7 +123,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 
 | Term | Meaning |
 |------|---------|
-| `StreamCursorTokenV1` | Opaque cursor body for chain-event subscriptions; fork-aware, encodes epoch id, last visible block hash, in-epoch offset, and stream-family tag |
+| `StreamCursorTokenV1` | Opaque cursor body for chain-event subscriptions; fork-aware, encodes the event sequence, a back-spaced `(height, hash)` locator, and a stream-family tag |
 | `MempoolStreamCursorV1` | Opaque cursor body for mempool-event subscriptions |
 | `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Safe`; `Mempool` is a reserved family code, not an active chain-event family) |
 | `ArtifactFamily` | Open-ended enum naming an artifact family in storage and query errors |
@@ -215,17 +215,17 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 
 ### Body shape
 
-`StreamCursorTokenV1` (chain events) is the canonical cursor body. The body is encoded as a `postcard`-serialized internal struct, then base-64 over the wire, never parsed by clients. The body fields are:
+`StreamCursorTokenV1` (chain events) is the canonical cursor body. It is a fixed-prefix byte layout, base64url over the wire, never parsed by clients. The body fields are:
 
-- `network`: target network (mainnet / testnet / regtest)
-- `family`: `ChainEventStreamFamily` tag (`Tip`, `Safe`, `Mempool`, `Derive`)
-- `epoch_id`: `ChainEpochId` of the most recently delivered envelope
-- `last_visible_block_hash`: block hash at the tip of that epoch (used to detect forks across reconnect)
-- `in_epoch_offset`: position within the epoch's emitted events
-- `event_sequence`: monotonic per-store sequence (also surfaced on the envelope for diagnostics)
-- HMAC over the body so a tampered cursor returns `EventCursorInvalid` rather than serving wrong data.
+- schema version (1 byte) and target network id (4 bytes).
+- `event_sequence`: monotonic per-store sequence (8 bytes), also surfaced on the envelope for diagnostics.
+- a fork-aware locator: a tip-first, exponentially back-spaced set of `(height, hash)` pairs. The tip pair occupies the fixed body (4-byte height, 32-byte hash); a one-byte count and the back-spaced ancestor pairs follow. The locator carries at least the tip and at most `CHAIN_EVENT_LOCATOR_MAX = 32` entries.
+- `family`: the `ChainEventStreamFamily` nibble at byte offset 49 (`Tip`, `Safe`; `Mempool` is a reserved family code).
+- a 32-byte HMAC over the whole body so a tampered cursor (including a tampered locator entry) returns `EventCursorInvalid` rather than serving wrong data.
 
-A cursor whose `last_visible_block_hash` is no longer present at its `epoch_id`'s tip indicates the client missed a reorg. The server emits a synthetic `ChainReorged` envelope describing the divergence before resuming the stream. Clients never see "silent" branch changes.
+The chain-event cursor is variable-length because the locator grows with its entry count; the mempool, transparent-history, and address-output families keep a fixed-length body. Hash bytes inside the cursor are storage-internal byte order (ADR-0024); the cursor is server-internal material, distinct from the RPC-byte-order hashes on the wire.
+
+On reconnect the server resolves the fork point as the most recent locator entry whose hash equals the canonical block hash at that height. The block index outlives the pruned event-log window, so the fork point resolves even when the divergence base is no longer in retained history. If the cursor's branch was reorged out and the real reorg event was pruned, the server delivers a synthetic `ChainReorged` envelope describing the divergence before resuming; clients never see "silent" branch changes. A divergence deeper than the cap, or an unresolvable fork-point block, degrades to `EventCursorExpired` with re-derive guidance. The `Safe` family never receives a synthesized reorg. See [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md).
 
 `MempoolStreamCursorV1` uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
 
@@ -286,38 +286,23 @@ Adding a new artifact family means adding one `ArtifactFamily` variant and (if t
 
 ### Canonical error vocabulary
 
-Errors named here are the contract. Internal modules may carry richer detail types, but every public-boundary error maps to one of these names with stable gRPC `Status` codes:
+The reason vocabulary is the `zinder.v1.ops.ErrorReason` proto enum, and the single authoritative reason-to-(`Status` code, retry) table is the [Error Vocabulary reference](../reference/error-vocabulary.md). Every value, its gRPC code, its retry disposition, and its auxiliary detail live there; do not maintain a second copy here.
 
-| Variant | gRPC `Status` | Metadata `reason` |
-|---------|---------------|-------------------|
-| `NodeUnavailable` | `Unavailable` | `node_unavailable` |
-| `NodeCapabilityMissing { capability }` | `FailedPrecondition` | `node_capability_missing` |
-| `StorageUnavailable { kind: StorageErrorKind }` | `Unavailable` | `storage_unavailable` |
-| `EntropyUnavailable` | `Internal` | `entropy_unavailable` |
-| `SchemaMismatch { persisted, expected }` | `FailedPrecondition` | `schema_mismatch` |
-| `ReorgWindowExceeded { depth, configured }` | `FailedPrecondition` | `reorg_window_exceeded` |
-| `EventCursorExpired { oldest_retained }` | `FailedPrecondition` | `event_cursor_expired` |
-| `EventCursorInvalid { reason: CursorInvalidReason }` | `InvalidArgument` | `event_cursor_invalid` |
-| `MempoolCursorExpired { oldest_retained }` | `FailedPrecondition` | `mempool_cursor_expired` |
-| `MempoolCursorInvalid` | `InvalidArgument` | `mempool_cursor_invalid` |
-| `ArtifactUnavailable { family, key }` | `NotFound` | `artifact_unavailable` |
-| `EpochNotFound` | `NotFound` | `epoch_not_found` |
-| `NoVisibleChainEpoch` | `Unavailable` | `no_visible_chain_epoch` |
-| `InvalidChainStoreOptions { detail }` | `InvalidArgument` | `invalid_chain_store_options` |
-| `CompactBlockRangeTooLarge { requested, max }` | `InvalidArgument` | `compact_block_range_too_large` |
-| `BroadcastInvalidEncoding` | `InvalidArgument` | `broadcast_invalid_encoding` |
-| `BroadcastRejected { reason: BroadcastRejectReason }` | `FailedPrecondition` | `broadcast_rejected` |
-| `BroadcastDisabled` | `FailedPrecondition` | `broadcast_disabled` |
+The mapping is authored once in `crates/zinder-proto/src/error_policy.rs` as `reason_policy`, and every surface builds its `Status` through `status_with_reason`/`status_for_reason`. Each library boundary error enum implements `BoundaryError::error_reason` next to its own definition:
 
-This table is the single source of truth. The mapping function lives in `services/zinder-query/src/grpc/mod.rs::status_from_query_error` and is used by both `WalletQueryGrpcAdapter` (native) and `LightwalletdGrpcAdapter` (compat). No service has its own copy.
+- `zinder-store`: `StoreError`.
+- `services/zinder-query`: `QueryError` (reused by `LightwalletdGrpcAdapter` through `status_from_query_error`).
+- `services/zinder-explorer`: `ExplorerError`.
+
+The outer `Status` code stays the canonical gRPC retry signal; the reason rides as `google.rpc.ErrorInfo{domain = "zinder.dev", reason = NAME}`. `ERROR_REASON_UNSPECIFIED` is never produced by a boundary enum; the `error_reason_policy_drift` guard and the per-boundary "no variant maps to unspecified" tests enforce this. `BroadcastRejectionReason` stays a separate payload verdict (ADR-0023) and is never folded into `ErrorReason`.
 
 ### Richer Error Model
 
 gRPC error responses carry structured detail via `tonic-types`:
 
-- `PreconditionFailure` for `EventCursorExpired` (with `suggested_resume_height`), `ReorgWindowExceeded`, `BroadcastRejected`.
-- `BadRequest` for `EventCursorInvalid`, `CompactBlockRangeTooLarge` (with `field` and `description`).
-- `ResourceInfo` for `ArtifactUnavailable` (with `resource_type = "block"` etc., `resource_name = key`).
+- `PreconditionFailure` for cursor-expiry and epoch-pin reasons, `BROADCAST_DISABLED`, and the derive-projection reasons (typed `type` + `subject` + `description`).
+- `BadRequest` for cursor-invalid, range, and address reasons (`field` + `description`).
+- `ResourceInfo` for `ARTIFACT_UNAVAILABLE` and `CHAIN_EPOCH_MISSING`, with `resource_type` set to the on-wire artifact-family label from `zinder_core::artifact_family` and `resource_name` set to the missing key.
 
 Clients (and LLM agents) can extract a structured remediation from any error without parsing prose.
 
@@ -640,7 +625,7 @@ Capability strings are the deprecation boundary. A wire-shape change lands as a 
 
 Pre-1.0, replaced RPCs are deleted rather than aliased: a renamed method removes its old capability string in the same change. Deploy order follows from that: Zinder services deploy before wallet consumers (zally, then fauzec). Between the deploys the old consumer receives `UNIMPLEMENTED` on the removed RPC and must degrade honestly until its own deploy lands.
 
-The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs); a CI test (`zinder-proto::integration::capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities`) fails when this list and the constant diverge, so any drift is caught at build time.
+The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs). Each row binds a capability string to its surface (`Wallet`, `Explorer`, `Ingest`), the proto method it gates, and a declarative advertise policy. The three `ServerInfo` builders fold over the table filtered by surface and evaluate each row's policy against their own readiness; no service hand-maintains a parallel capability array. Two CI guards keep the table honest: `capability_descriptor_drift` cross-checks every row's proto-method binding against the compiled `FileDescriptorSet`, and `capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities` fails when the list below diverges from the wallet and explorer rows of the table.
 
 <!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
@@ -678,6 +663,7 @@ The active list mirrors [`ZINDER_CAPABILITIES`](../../crates/zinder-proto/src/ca
 - `explorer.mempool.event_counts_v1`
 - `explorer.transaction.fees_v1`
 - `explorer.transaction.recent_v1`
+- `explorer.payment_disclosure.verify_v1`
 - `explorer.overview.snapshot_v1`
 <!-- capability-list:public-interfaces:end -->
 

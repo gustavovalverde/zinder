@@ -11,9 +11,7 @@ use zinder_core::{
     ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
-use zinder_proto::capabilities::{
-    INGEST_CONTROL_ALWAYS_ON_CAPABILITIES, INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
-};
+use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
 use zinder_proto::v1::{
     ingest::{
         ServerInfoRequest, ServerInfoResponse, WriterPhase, WriterStatusRequest,
@@ -131,18 +129,15 @@ impl IngestControlGrpcAdapter {
     }
 
     fn advertised_capabilities(&self) -> Vec<String> {
-        let mut capabilities: Vec<String> = INGEST_CONTROL_ALWAYS_ON_CAPABILITIES
-            .iter()
-            .map(|capability| (*capability).to_owned())
-            .collect();
-        if self.node_source.as_ref().is_some_and(|source| {
+        let chain_value_pools_supported = self.node_source.as_ref().is_some_and(|source| {
             source
                 .capabilities()
                 .supports(NodeCapability::ChainValuePools)
-        }) {
-            capabilities.push(INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1.to_owned());
-        }
-        capabilities
+        });
+        capabilities_for_surface(CapabilitySurface::Ingest)
+            .filter(|spec| spec.policy.ingest_satisfied(chain_value_pools_supported))
+            .map(|spec| spec.string.to_owned())
+            .collect()
     }
 }
 

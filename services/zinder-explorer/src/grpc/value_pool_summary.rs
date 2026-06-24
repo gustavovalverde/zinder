@@ -12,6 +12,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
@@ -28,9 +29,9 @@ pub(crate) async fn handle_value_pool_summary(
         .chain_value_pools_at_tip(Request::new(ChainValuePoolsAtTipRequest {}))
         .await?
         .into_inner();
-    let chain_epoch = response
-        .chain_epoch
-        .ok_or_else(|| Status::internal("ChainValuePoolsAtTipResponse.chain_epoch missing"))?;
+    let chain_epoch = response.chain_epoch.ok_or_else(|| {
+        ExplorerError::internal("ChainValuePoolsAtTipResponse.chain_epoch missing")
+    })?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

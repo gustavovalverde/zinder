@@ -28,12 +28,7 @@ use zinder_core::{
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, wire::encode_zinder_native_chain_name,
 };
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1,
-    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1, EXPLORER_SEARCH_V1,
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
-    EXPLORER_TRANSACTION_RECENT_V1, EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, EXPLORER_VALUE_POOL_SUMMARY_V1,
+    CapabilitySurface, EXPLORER_SERVER_INFO_V1, ExplorerReadiness, capabilities_for_surface,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -67,6 +62,7 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 );
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
+use super::error::ExplorerError;
 use super::fee_summary::handle_fee_summary;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -256,47 +252,17 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
         let wallet_query_online = self.wallet_query_endpoint.is_some();
-        let derive_store_online = self.derive_store.is_some();
-        let canonical_store_online = self.canonical_store.is_some();
-        let prevout_resolution_online = self.prevout_resolution_online && wallet_query_online;
-        let payment_disclosure_verifier_online = self.payment_disclosure_verifier_online;
-
-        let mut capabilities = vec![EXPLORER_SERVER_INFO_V1];
-        if wallet_query_online {
-            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
-            capabilities.push(EXPLORER_SEARCH_V1);
-            capabilities.push(EXPLORER_MEMPOOL_SUMMARY_V1);
-            capabilities.push(EXPLORER_MEMPOOL_ACTIVITY_V1);
-            capabilities.push(EXPLORER_VALUE_POOL_SUMMARY_V1);
-        }
-        if wallet_query_online && canonical_store_online {
-            capabilities.push(EXPLORER_TRANSACTION_DETAIL_V1);
-        }
-        if derive_store_online && wallet_query_online {
-            capabilities.push(EXPLORER_BLOCK_SUMMARY_V1);
-            capabilities.push(EXPLORER_BLOCK_DETAIL_V1);
-            capabilities.push(EXPLORER_FEE_SUMMARY_V1);
-            capabilities.push(EXPLORER_MEMPOOL_EVENT_COUNTS_V1);
-            capabilities.push(EXPLORER_TRANSACTION_RECENT_V1);
-            capabilities.push(EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1);
-            // OverviewSnapshot composes block summaries, recent
-            // transactions, mempool event counts, fee summary, value
-            // pools, and the wallet mempool snapshot into one coherent
-            // bundle. Its preconditions are the union of every
-            // derive-backed card it composes.
-            capabilities.push(EXPLORER_OVERVIEW_SNAPSHOT_V1);
-            // ADR-0018: TRANSACTION_FEES_V1 surfaces paid_fee_zat on
-            // TransactionDetail / RecentTransactions / MempoolActivity,
-            // all of which need the transparent-output upstream to be
-            // online. Advertise only when both gates are satisfied.
-            if prevout_resolution_online {
-                capabilities.push(EXPLORER_TRANSACTION_FEES_V1);
-            }
-        }
-        if payment_disclosure_verifier_online {
-            capabilities.push(EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1);
-        }
-        capabilities
+        let readiness = ExplorerReadiness {
+            wallet_query_online,
+            canonical_store_online: self.canonical_store.is_some(),
+            derive_store_online: self.derive_store.is_some(),
+            prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
+            payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
+        };
+        capabilities_for_surface(CapabilitySurface::Explorer)
+            .filter(|spec| spec.policy.explorer_satisfied(readiness))
+            .map(|spec| spec.string)
+            .collect()
     }
 }
 
@@ -365,7 +331,9 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             self.require_wallet_endpoint(OP.method)?;
             let request_inner = request.into_inner();
             if request_inner.addresses.is_empty() {
-                return Err(Status::invalid_argument("addresses list must not be empty"));
+                return Err(
+                    ExplorerError::invalid_request("addresses list must not be empty").into(),
+                );
             }
             let mut client = self.wallet_client(OP.method).await?;
             compute_transparent_address_balance(&mut client, request_inner)
@@ -541,7 +509,9 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                Status::unavailable("TransparentAddressActivity requires a derive store")
+                ExplorerError::dependency_not_configured(
+                    "TransparentAddressActivity requires a derive store",
+                )
             })?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_transparent_address_activity(
@@ -617,10 +587,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self
-                .derive_store
-                .as_ref()
-                .ok_or_else(|| Status::unavailable("MempoolEventCounts requires a derive store"))?;
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "MempoolEventCounts requires a derive store",
+                )
+            })?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_mempool_event_counts(
                 derive_store,
@@ -647,10 +618,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self
-                .derive_store
-                .as_ref()
-                .ok_or_else(|| Status::unavailable("RecentTransactions requires a derive store"))?;
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "RecentTransactions requires a derive store",
+                )
+            })?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_recent_transactions(
                 derive_store,
@@ -707,13 +679,15 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome: Result<Response<VerifyPaymentDisclosureResponse>, Status> = if self
             .payment_disclosure_verifier_online
         {
-            Err(Status::failed_precondition(
+            Err(ExplorerError::unsatisfied_precondition(
                 "VerifyPaymentDisclosure is wired but no ZIP-311 verifier is bundled in this build",
-            ))
+            )
+            .into())
         } else {
-            Err(Status::unimplemented(
+            Err(ExplorerError::unsupported(
                 "VerifyPaymentDisclosure is disabled on this server; consumer must fall back to local verification",
-            ))
+            )
+            .into())
         };
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
@@ -723,19 +697,21 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 impl ExplorerQueryGrpcAdapter {
     fn require_derive_store(&self, method: &'static str) -> Result<&DeriveStore, Status> {
         self.derive_store.as_ref().ok_or_else(|| {
-            Status::unavailable(format!(
+            ExplorerError::dependency_not_configured(format!(
                 "{method} requires the BlockSummary derive view; configure \
                  --storage-path and start the explorer with the consumer wired"
             ))
+            .into()
         })
     }
 
     fn require_wallet_endpoint(&self, method: &'static str) -> Result<&str, Status> {
         self.wallet_query_endpoint.as_deref().ok_or_else(|| {
-            Status::unavailable(format!(
+            ExplorerError::dependency_not_configured(format!(
                 "{method} requires a wallet_query_endpoint; configure \
                  --wallet-query-endpoint"
             ))
+            .into()
         })
     }
 
@@ -788,7 +764,7 @@ async fn compute_transparent_address_balance(
         .ok()
         .filter(|count| *count <= MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES)
         .ok_or_else(|| {
-            Status::invalid_argument(format!(
+            ExplorerError::invalid_request(format!(
                 "addresses list of {} exceeds the per-request cap of {}",
                 request.addresses.len(),
                 MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
@@ -802,7 +778,7 @@ async fn compute_transparent_address_balance(
     subtract_pending_outflows(client, &mut accumulator).await?;
 
     let chain_epoch = accumulator.chain_epoch.ok_or_else(|| {
-        Status::internal("WalletQuery did not return a chain epoch for any address")
+        ExplorerError::internal("WalletQuery did not return a chain epoch for any address")
     })?;
     Ok(TransparentAddressBalanceResponse {
         confirmed_zat: accumulator.confirmed_zat,
@@ -834,7 +810,9 @@ async fn accumulate_address_balance(
         }
         accumulator.confirmed_zat = accumulator.confirmed_zat.saturating_add(output.value_zat);
         let outpoint = output.outpoint.ok_or_else(|| {
-            Status::data_loss("TransparentUnspentOutput.outpoint missing in WalletQuery response")
+            ExplorerError::malformed_upstream(
+                "TransparentUnspentOutput.outpoint missing in WalletQuery response",
+            )
         })?;
         accumulator.unspent_value_by_outpoint.insert(
             (outpoint.transaction_id, outpoint.output_index),
@@ -889,7 +867,7 @@ async fn subtract_pending_outflows(
             .into_inner();
         for spend in spends_response.spends {
             let spent_outpoint = spend.spent_outpoint.ok_or_else(|| {
-                Status::data_loss(
+                ExplorerError::malformed_upstream(
                     "TransparentMempoolSpend.spent_outpoint missing in WalletQuery response",
                 )
             })?;
@@ -913,9 +891,10 @@ async fn subtract_pending_outflows(
 /// data corruption and surfaces as `data_loss` rather than silent saturation.
 fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
     i64::try_from(value_zat).map_err(|_| {
-        Status::data_loss(format!(
+        ExplorerError::malformed_upstream(format!(
             "WalletQuery returned value_zat {value_zat} exceeding i64::MAX"
         ))
+        .into()
     })
 }
 
@@ -924,7 +903,7 @@ fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
     reason = "BearerTokenConnectError is moved out of the Result by the caller; the helper takes ownership"
 )]
 fn connect_error_to_status(error: BearerTokenConnectError) -> Status {
-    Status::unavailable(format!("WalletQuery endpoint unreachable: {error}"))
+    ExplorerError::upstream_unreachable(format!("WalletQuery endpoint unreachable: {error}")).into()
 }
 
 /// Registers `# HELP` and `# TYPE` text for every metric this module emits.

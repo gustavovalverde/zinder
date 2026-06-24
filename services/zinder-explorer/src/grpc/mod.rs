@@ -2,6 +2,7 @@
 
 mod adapter;
 mod block_view;
+mod error;
 mod fee_summary;
 mod freshness;
 mod mempool;

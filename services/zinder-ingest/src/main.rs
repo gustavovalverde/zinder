@@ -354,7 +354,9 @@ async fn run_ingest(
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(command_config.loop_config.node.network),
         readiness.clone(),
-        zinder_proto::capabilities::INGEST_CONTROL_ALWAYS_ON_CAPABILITIES.to_vec(),
+        zinder_proto::capabilities::always_on_capability_strings(
+            zinder_proto::capabilities::CapabilitySurface::Ingest,
+        ),
     );
 
     let connect_node_phase = StartupPhase::ConnectNode.start();

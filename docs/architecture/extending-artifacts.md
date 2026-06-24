@@ -251,17 +251,24 @@ The native gRPC adapter accepts either form on the wire, parses the string varia
 
 Do not invent new cursor types for non-streaming methods. If the response is bounded, return a single message. If it is a range read with a server stream, follow the cursor conventions in [Public Interfaces §Cursor Conventions](public-interfaces.md#cursor-conventions).
 
-Add a capability string. New methods require a new capability per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery):
+Add a capability string. New methods require a new capability per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Declare the `pub const` string, then add a `CapabilitySpec` row to the `CAPABILITIES` table binding it to its surface, proto method, and advertise policy:
 
 ```rust
 // crates/zinder-proto/src/capabilities.rs
-pub const ZINDER_CAPABILITIES: &[&str] = &[
-    // existing
-    "wallet.address.transparent_history_v1",
+pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
+
+pub const CAPABILITIES: &[CapabilitySpec] = &[
+    // existing rows
+    CapabilitySpec::new(
+        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressTxIdsInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
 ];
 ```
 
-The CI `capability-coverage` job will reject the proto change if the capability constant is not updated.
+The `capability_descriptor_drift` CI guard rejects the change if the proto method has no table row or the row's method does not match the descriptor.
 
 For the lightwalletd compatibility slice, the transparent output family is
 served natively by `WalletQuery.TransparentAddressUnspentOutputs` under
@@ -289,7 +296,7 @@ For both adapters, the error mapping function is **shared, not duplicated**. If 
 
 **Live tests** under `services/zinder-ingest/tests/live/`, gated per the [Testing Runbook](../runbooks/testing.md): `#[ignore = LIVE_TEST_IGNORE_REASON]` plus `require_live()`, with the unified `ZINDER_NETWORK` and `ZINDER_NODE__*` env-var schema. Add a test that exercises the artifact against a live regtest stack.
 
-**Capability advertisement**. Add the capability string to `crates/zinder-proto/src/capabilities.rs::ZINDER_CAPABILITIES`. The `capability-coverage` CI job verifies this.
+**Capability advertisement**. Add a `CapabilitySpec` row to the `CAPABILITIES` table in `crates/zinder-proto/src/capabilities.rs`. The `capability_descriptor_drift` CI guard verifies the row against the compiled `FileDescriptorSet`.
 
 **Doc updates**. The change is incomplete until at least these are updated:
 
@@ -368,7 +375,7 @@ The DX/AX audit and code review have surfaced a recurring set of errors. Each is
 | Inventing a new cursor type for a one-off paginated read | The cursor section is long; skipping seems efficient | Use `StreamCursorTokenV1` or `MempoolStreamCursorV1` with the appropriate family tag |
 | Naming the method `get_*` or `fetch_*` | These verbs are common in other codebases | Use the bare-noun convention: `transparent_address_tx_ids_in_range`, not `get_transparent_address_tx_ids` or `fetch_*` |
 | Mixing `_secs` and `_ms` for the new feature's config knobs | Duration units become inconsistent across services | Use `_ms` for durations; see [Public Interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions) |
-| Skipping the capability string update | The CI job will catch it, so why be careful upfront | Add `ZINDER_CAPABILITIES` in the same commit as the proto method; treat it as part of the proto change |
+| Skipping the capability string update | The CI job will catch it, so why be careful upfront | Add the `CapabilitySpec` row to `CAPABILITIES` in the same commit as the proto method; treat it as part of the proto change |
 | Adding the artifact to the compat shim because "wallets need it" | The compat shim is a translation layer, not a feature surface | If the lightwalletd protocol does not name the method, the compat shim does not implement it; native-only is fine |
 
 ## Cross-references

@@ -116,6 +116,15 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         ErrorReason::NodeUnavailable,
         ErrorReason::StorageUnavailable,
         ErrorReason::EntropyUnavailable,
+        ErrorReason::DeriveProjectionUnavailable,
+        ErrorReason::DeriveProjectionLagging,
+        ErrorReason::NodeCapabilityMissing,
+        ErrorReason::NoVisibleChainEpoch,
+        ErrorReason::ExplorerInternal,
+        ErrorReason::ExplorerMethodDisabled,
+        ErrorReason::ExplorerPreconditionUnsatisfied,
+        ErrorReason::DependencyNotConfigured,
+        ErrorReason::UpstreamUnreachable,
     ];
 
     for reason in reasons {
@@ -162,7 +171,7 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
         && let Some(resource_info) = details.resource_info()
     {
         return IndexerError::ArtifactUnavailable {
-            family: artifact_family_label(&resource_info.resource_type),
+            family: resource_info.resource_type.clone(),
             key: resource_info.resource_name.clone(),
         };
     }
@@ -187,14 +196,5 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
         | Code::Internal
         | Code::Unavailable
         | Code::Unauthenticated => IndexerError::ServiceUnavailable { reason: message },
-    }
-}
-
-fn artifact_family_label(resource_type: &str) -> &'static str {
-    match resource_type {
-        "ChainEpoch" => "chain_epoch",
-        "ChainEvent" => "chain_event",
-        "CompactBlock" => "compact_block",
-        _ => "unknown_artifact",
     }
 }

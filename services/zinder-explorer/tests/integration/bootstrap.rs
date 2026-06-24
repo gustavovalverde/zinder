@@ -85,12 +85,12 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
 
 /// Without a configured `wallet_query_endpoint`, the explorer-balance
 /// capability is omitted from `ServerInfo` and the federated method returns
-/// `UNAVAILABLE`.
+/// `FAILED_PRECONDITION`.
 ///
 /// This pins the operational contract that capability advertisement gates on
 /// a wired federation, not on the binary's mere presence.
 #[tokio::test]
-async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> Result<()> {
+async fn explorer_query_balance_failed_precondition_without_wallet_query_endpoint() -> Result<()> {
     use zinder_proto::v1::wallet::TransparentAddressBalanceRequest;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -132,8 +132,8 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .await;
     let status = outcome
         .err()
-        .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
-    assert_eq!(status.code(), tonic::Code::Unavailable);
+        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without wallet_query_endpoint"))?;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 
     assert!(
         !common
@@ -150,8 +150,8 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .await;
     let detail_status = detail_outcome
         .err()
-        .ok_or_else(|| eyre!("expected UNAVAILABLE without wallet_query_endpoint"))?;
-    assert_eq!(detail_status.code(), tonic::Code::Unavailable);
+        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without wallet_query_endpoint"))?;
+    assert_eq!(detail_status.code(), tonic::Code::FailedPrecondition);
 
     assert!(
         !common
@@ -170,8 +170,8 @@ async fn explorer_query_balance_unavailable_without_wallet_query_endpoint() -> R
         .await;
     let overview_status = overview_outcome
         .err()
-        .ok_or_else(|| eyre!("expected UNAVAILABLE without derive store"))?;
-    assert_eq!(overview_status.code(), tonic::Code::Unavailable);
+        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without derive store"))?;
+    assert_eq!(overview_status.code(), tonic::Code::FailedPrecondition);
 
     server_handle.abort();
     let _ = server_handle.await;

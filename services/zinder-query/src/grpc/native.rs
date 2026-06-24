@@ -16,11 +16,7 @@ use zinder_core::{
     TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentUnspentOutput, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_proto::ZINDER_CAPABILITIES;
-use zinder_proto::capabilities::{
-    WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
-    WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-};
+use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
@@ -114,8 +110,8 @@ impl Default for ServerInfoSettings {
 /// Builds the `WalletServerInfo` descriptor from operator settings.
 ///
 /// Embeds the cross-service [`ops::ServerInfo`] shape every Zinder gRPC
-/// surface returns, with capabilities sourced from [`ZINDER_CAPABILITIES`]
-/// filtered against the operator settings.
+/// surface returns, with capabilities folded from the shared capability table
+/// and filtered against the operator settings.
 #[must_use]
 pub fn build_wallet_server_info(settings: &ServerInfoSettings) -> wallet::WalletServerInfo {
     wallet::WalletServerInfo {
@@ -142,10 +138,15 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
         network: settings.network.clone(),
         service_name: env!("CARGO_PKG_NAME").to_owned(),
         service_version: settings.service_version.clone(),
-        capabilities: ZINDER_CAPABILITIES
-            .iter()
-            .filter(|capability| capability_enabled(capability, settings))
-            .map(|capability| (*capability).to_owned())
+        capabilities: capabilities_for_surface(CapabilitySurface::Wallet)
+            .filter(|spec| {
+                spec.policy.wallet_satisfied(
+                    settings.transaction_broadcast_enabled,
+                    settings.chain_events_enabled,
+                    settings.chain_value_pools_enabled,
+                )
+            })
+            .map(|spec| spec.string.to_owned())
             .collect(),
     }
 }
@@ -163,15 +164,6 @@ fn build_node_capabilities_descriptor(
             capabilities: capabilities.capabilities.clone(),
         },
     )
-}
-
-fn capability_enabled(capability: &&str, settings: &ServerInfoSettings) -> bool {
-    match *capability {
-        WALLET_BROADCAST_TRANSACTION_V1 => settings.transaction_broadcast_enabled,
-        WALLET_EVENTS_CHAIN_V1 => settings.chain_events_enabled,
-        WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1 => settings.chain_value_pools_enabled,
-        _ => true,
-    }
 }
 
 /// Reads the latest visible block and encodes the native wallet response.
