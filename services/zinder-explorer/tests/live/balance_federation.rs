@@ -107,8 +107,9 @@ async fn federated_balance_matches_utxo_sum_for_sampled_coinbase_address() -> Re
     );
     assert_eq!(response.address_count, 1);
     let chain_epoch = response
-        .chain_epoch
-        .ok_or_else(|| eyre!("federated balance response missing chain_epoch"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre!("federated balance response missing chain_view.chain_epoch"))?;
     assert_eq!(
         chain_epoch.chain_epoch_id,
         fixture.expected_chain_epoch_id.value(),
@@ -481,8 +482,9 @@ async fn assert_baseline_then_overlay(fixture: &MempoolOverlayFixture) -> Result
          being spent in mempool",
     );
     let chain_epoch = response
-        .chain_epoch
-        .ok_or_else(|| eyre!("federated overlay response missing chain_epoch"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre!("federated overlay response missing chain_view.chain_epoch"))?;
     assert_eq!(
         chain_epoch.chain_epoch_id,
         fixture.visible_chain_epoch.id.value(),

@@ -67,11 +67,11 @@ async fn transparent_address_unspent_outputs_streams_complete_set() -> eyre::Res
     let outputs = drain_unspent_outputs(&grpc_adapter, 0).await?;
 
     assert_eq!(outputs.len(), stored_utxos.len());
-    let first_epoch = outputs[0].chain_epoch.clone();
-    assert!(first_epoch.is_some(), "every message carries a chain epoch");
+    let first_epoch = outputs[0].chain_view.clone();
+    assert!(first_epoch.is_some(), "every message carries a chain view");
     for (message, stored) in outputs.iter().zip(&stored_utxos) {
         assert_eq!(
-            message.chain_epoch, first_epoch,
+            message.chain_view, first_epoch,
             "the whole stream binds to one pinned chain epoch"
         );
         assert_eq!(message.value_zat, stored.value_zat);

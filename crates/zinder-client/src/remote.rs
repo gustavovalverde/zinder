@@ -17,7 +17,6 @@ use tracing::warn;
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_merkle_root_hex, decode_rpc_transaction_id_hex,
     decode_zinder_native_chain_name, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
-    encode_zinder_native_chain_name,
 };
 use zinder_core::{
     BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
@@ -33,7 +32,7 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
-    mempool_entry_from_message,
+    chain_epoch_message, mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
     outpoint_message,
     transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
@@ -210,12 +209,7 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.handle_status(status))?
             .into_inner();
 
-        chain_epoch_from_message_with_network(
-            self.network,
-            response
-                .chain_epoch
-                .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-        )
+        chain_epoch_from_chain_view_with_network(self.network, response.chain_view)
     }
 
     async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError> {
@@ -709,12 +703,8 @@ fn transparent_outputs_by_outpoint_response_from_message(
     expected_network: Network,
     message: wallet::TransparentOutputsByOutpointResponse,
 ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     let entries = message
         .entries
         .into_iter()
@@ -730,12 +720,8 @@ fn chain_value_pools_at_tip_from_message(
     expected_network: Network,
     message: wallet::ChainValuePoolsAtTipResponse,
 ) -> Result<ChainValuePoolsAtTip, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     let pools = message
         .pools
         .into_iter()
@@ -775,12 +761,8 @@ fn transparent_address_balance_from_message(
     expected_network: Network,
     message: wallet::TransparentAddressBalanceResponse,
 ) -> Result<TransparentAddressBalance, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     Ok(TransparentAddressBalance {
         confirmed_zat: message.confirmed_zat,
         unconfirmed_delta_zat: message.unconfirmed_delta_zat,
@@ -883,6 +865,20 @@ fn chain_epoch_from_message_with_network(
     chain_epoch_from_message(message).map_err(decode_error_to_indexer_error)
 }
 
+/// Decodes the chain epoch from a response's [`wallet::ChainView`] envelope,
+/// asserting the network matches the endpoint the client opened against.
+fn chain_epoch_from_chain_view_with_network(
+    expected_network: Network,
+    chain_view: Option<wallet::ChainView>,
+) -> Result<ChainEpoch, IndexerError> {
+    let chain_view =
+        chain_view.ok_or_else(|| IndexerError::malformed("chain_view", "field is missing"))?;
+    let chain_epoch = chain_view
+        .chain_epoch
+        .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
+    chain_epoch_from_message_with_network(expected_network, chain_epoch)
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Used as a Result::map_err callback so the value-passing signature is required."
@@ -892,18 +888,7 @@ fn decode_error_to_indexer_error(error: MempoolDecodeError) -> IndexerError {
 }
 
 fn chain_epoch_to_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
-    wallet::ChainEpoch {
-        chain_epoch_id: chain_epoch.id.value(),
-        network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-        tip_height: chain_epoch.tip_height.value(),
-        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-        safe_tip_height: chain_epoch.safe_tip_height.value(),
-        safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
-        artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
-        created_at_millis: chain_epoch.created_at.value(),
-        sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
-        orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
-    }
+    chain_epoch_message(chain_epoch)
 }
 
 fn compact_block_from_message(
@@ -947,12 +932,8 @@ fn transparent_address_tx_ids_chunk_from_message(
     address_script_hash: TransparentAddressScriptHash,
     message: wallet::TransparentAddressTxIdsChunk,
 ) -> Result<TransparentAddressTxIdsStreamItem, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     let transaction_id = transaction_id_from_rpc_hex("transaction_id", &message.transaction_id)?;
     let block_hash = block_hash_from_rpc_hex("block_hash", &message.block_hash)?;
     let artifact = TransparentAddressTxIndexArtifact::new(
@@ -978,12 +959,8 @@ fn transparent_unspent_output_item_from_message(
     expected_network: Network,
     message: wallet::TransparentUnspentOutput,
 ) -> Result<TransparentUnspentOutputStreamItem, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     let address_script_hash_bytes = fixed_32_bytes(
         "transparent_unspent_output.address_script_hash",
         message.address_script_hash,
@@ -1259,9 +1236,9 @@ fn tx_status_from_message(
     response: wallet::TransactionStatusResponse,
 ) -> Result<TxStatus, IndexerError> {
     let chain_epoch_message = response
-        .chain_epoch
-        .as_ref()
-        .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
     let status = response
         .status
         .ok_or_else(|| IndexerError::malformed("status", "field is missing"))?;
@@ -1282,7 +1259,7 @@ fn tx_status_from_message(
             Ok(TxStatus::Mined(MinedTransaction::new(location, details)))
         }
         wallet::transaction_status_response::Status::InMempool(in_mempool) => {
-            let chain_epoch = chain_epoch_from_message(chain_epoch_message.clone())
+            let chain_epoch = chain_epoch_from_message(chain_epoch_message)
                 .map_err(decode_error_to_indexer_error)?;
             let entry = MempoolEntry {
                 transaction_id: TransactionId::from_bytes([0; 32]),
@@ -1372,8 +1349,9 @@ fn mempool_snapshot_view_from_message(
     message: wallet::MempoolSnapshotResponse,
 ) -> Result<MempoolSnapshotView, IndexerError> {
     let chain_epoch_message = message
-        .chain_epoch
-        .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
     let chain_epoch =
         chain_epoch_from_message(chain_epoch_message).map_err(decode_error_to_indexer_error)?;
     let entries = message

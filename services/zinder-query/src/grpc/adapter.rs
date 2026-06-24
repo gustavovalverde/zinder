@@ -39,7 +39,7 @@ use crate::{
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
     ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response, build_chain_epoch_message,
+    block_id_by_selector_response, broadcast_transaction_response, build_chain_view_message,
     build_compact_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_unspent_output_message, build_wallet_server_info, compact_block_response,
     latest_block_response, latest_safe_block_response, latest_tree_state_checkpoint_response,
@@ -271,14 +271,14 @@ where
             .compact_block_range(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chain_epoch = build_chain_epoch_message(compact_block_range.chain_epoch);
+        let chain_view = build_chain_view_message(compact_block_range.chain_epoch);
         let compact_block_chunks =
             compact_block_range
                 .compact_blocks
                 .into_iter()
                 .map(move |compact_block| {
                     Ok(wallet::CompactBlockRangeChunk {
-                        chain_epoch: Some(chain_epoch.clone()),
+                        chain_view: Some(chain_view.clone()),
                         compact_block: Some(build_compact_block_message(compact_block)),
                     })
                 });

@@ -105,9 +105,12 @@ pub(crate) async fn handle_mempool_summary(
     }
 
     let chain_epoch = snapshot
-        .chain_epoch
+        .chain_view
         .clone()
-        .ok_or_else(|| ExplorerError::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
+        })?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -203,8 +206,11 @@ pub(crate) async fn handle_mempool_activity(
         .map(|(millis, tail)| encode_activity_cursor(millis, tail))
         .unwrap_or_default();
     let chain_epoch = snapshot
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("MempoolSnapshotResponse.chain_epoch missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
+        })?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(

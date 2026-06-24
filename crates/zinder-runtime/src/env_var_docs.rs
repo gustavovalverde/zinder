@@ -107,7 +107,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Upstream Zebra JSON-RPC URL the service connects to. Optional for \
                       `zinder-explorer`: without it the upstream-observation probe stays \
-                      off and `ExplorerFreshness.upstream` is always unset.",
+                      off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
@@ -245,7 +245,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
                       Must be greater than zero. `zinder-explorer` reuses the same cadence for \
                       its upstream-observation probe (the one that populates \
-                      `ExplorerFreshness.upstream`).",
+                      `ExplorerFreshness.chain_view.upstream_tip`).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",

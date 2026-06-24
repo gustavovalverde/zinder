@@ -21,8 +21,8 @@ message ExplorerServerInfo {
   // canonical tip, catching up, or paused. Lets an operator distinguish a
   // transient catch-up from a stalled derive plane without scraping metrics.
   // Absent until the ingest plane writes its first status record. See
-  // `DeriveStatus`.
-  optional DeriveStatus derive_status = 3;
+  // `zinder.v1.wallet.DeriveStatus`.
+  optional zinder.v1.wallet.DeriveStatus derive_status = 3;
 }
 
 // Server descriptor request.
@@ -32,13 +32,12 @@ message ServerInfoRequest {}
 //
 // Carries the standard `ExplorerFreshness` envelope per
 // [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md)
-// so consumers can read upstream-node observations and capability
-// versions from any explorer response, including the bootstrap call.
-// Without this, the upstream observation (which rides on
-// `ExplorerFreshness.upstream`) would only be reachable through
-// derive-backed endpoints that are capability-gated and unavailable
-// during `bulk_catchup`, leaving sync-progress UIs unable to compute
-// an honest denominator at exactly the moment they most need it.
+// so consumers can read the upstream tip and capability versions from any
+// explorer response, including the bootstrap call. Without this, the upstream
+// tip (which rides on `ExplorerFreshness.chain_view.upstream_tip`) would only
+// be reachable through derive-backed endpoints that are capability-gated and
+// unavailable during `bulk_catchup`, leaving sync-progress UIs unable to
+// compute an honest denominator at exactly the moment they most need it.
 message ServerInfoResponse {
   ExplorerFreshness freshness = 1;
   ExplorerServerInfo info = 2;
@@ -86,45 +85,18 @@ enum UnavailableReason {
   UNAVAILABLE_PARSER_VERSION_UNSUPPORTED = 6;
 }
 
-// Upstream node's view of the chain, copied verbatim from the source plane.
+// Explorer response metadata that varies per call, carried at field tag 1 on
+// every `ExplorerQuery` response.
 //
-// Source: `UpstreamHealthSnapshot` produced by
-// `zinder_source::NodeSource::poll_upstream_health`. Lets explorer
-// consumers render honest sync-progress UI against the real chain tip
-// without reinventing protocol invariants (block-time math) in their
-// code.
-//
-// Optional because the source-plane probe is async; a response that
-// fires before the first probe has the field unset. Consumers MUST
-// treat an absent value as "unknown", not zero.
-//
-// Field names mirror `UpstreamNotReadyDetail` in
-// `zinder/v1/ops/readiness.proto` so an operator skimming the ops
-// surface and the explorer surface sees the same vocabulary for the
-// same upstream-node facts.
-message UpstreamObservation {
-  // Highest block height the upstream node has locally verified
-  // (Zebra's `blocks` from `getblockchaininfo`).
-  optional uint32 upstream_committed_tip_height = 1;
-  // Highest block height the upstream node estimates exists on the
-  // network (Zebra's `estimatedheight` from `getblockchaininfo`).
-  // Always `>= upstream_committed_tip_height`. Use this as the
-  // denominator for sync-progress UI.
-  optional uint32 upstream_estimated_tip_height = 2;
-  // Zebra's `verificationprogress` in `[0.0, 1.0]`. Useful for showing
-  // upstream's own catch-up state alongside the explorer's derive lag.
-  optional double upstream_verification_progress = 3;
-}
-
-// Cross-cutting freshness envelope embedded on every explorer response
-// (`field tag 1` by convention).
-//
-// Defined in [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
+// The chain-state axes (epoch, tips, upstream, derive) live on
+// `chain_view`; this message keeps only the metadata that genuinely varies
+// per call. Defined in
+// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
 // every `ExplorerQuery` RPC's response carries this field tag 1 first so
 // consumers can read `response.freshness` unconditionally.
 message ExplorerFreshness {
-  // Chain epoch the response was produced from.
-  zinder.v1.wallet.ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope the response was produced from.
+  zinder.v1.wallet.ChainView chain_view = 1;
 
   // Age of the mempool snapshot in milliseconds; zero for responses that
   // do not touch mempool state.
@@ -140,62 +112,8 @@ message ExplorerFreshness {
   // Field-path-keyed unavailability entries.
   repeated UnavailableField unavailable = 6;
 
-  // Upstream node's view of the chain at response-construction time.
-  // Optional because the source-plane probe is async; an early response
-  // may fire before the first probe completes. See `UpstreamObservation`.
-  optional UpstreamObservation upstream = 7;
-
-  // Highest block the derive projections have fully materialized and can
-  // answer queries about. The block every read response actually reflects;
-  // it trails `chain_epoch` while the derive plane catches up. Index lag is
-  // `chain_epoch.tip_height - indexed_head.height`. Optional because
-  // responses that do not read the derive store (ServerInfo) and cold starts
-  // before the first materialized block leave it unset; consumers MUST treat
-  // an absent value as "unknown", not "at tip". See `IndexedHead`.
-  optional IndexedHead indexed_head = 8;
-}
-
-// Highest block the explorer's derive projections have fully materialized.
-//
-// Distinct from the canonical chain tip (`ExplorerFreshness.chain_epoch`): the
-// derive plane replays canonical chain events asynchronously and trails the
-// canonical tip while catching up. This is the height every read response can
-// actually answer for. All chain-event derive consumers advance under a single
-// shared cursor, so one indexed head is accurate for every capability.
-message IndexedHead {
-  // Materialized block height.
-  uint32 height = 1;
-  // Materialized block hash, RPC byte order, 64 lowercase hex (as
-  // `ChainEpoch.tip_hash`).
-  string hash = 2;
-  // Header time of the materialized block; lets consumers show the real age
-  // of the data without a second lookup.
-  int64 block_time_unix_seconds = 3;
-}
-
-// Derive-plane lifecycle. Separates a derive plane that is healthily catching
-// up from one that has stalled, which a block-count lag alone cannot express.
-enum DeriveHealth {
-  DERIVE_HEALTH_UNSPECIFIED = 0;
-  // Indexed head is at the canonical tip; reads reflect the latest block.
-  DERIVE_HEALTH_LIVE = 1;
-  // Replay is advancing but the indexed head is behind the canonical tip.
-  DERIVE_HEALTH_CATCHING_UP = 2;
-  // Replay is paused (e.g. memory pressure); the indexed head is frozen and
-  // will not advance until the pause clears. Reads serve historical data.
-  DERIVE_HEALTH_PAUSED = 3;
-}
-
-// Operator-facing derive-plane summary.
-//
-// Written by the ingest plane and surfaced on `ExplorerServerInfo`. The
-// `observed_at_millis` stamp lets a consumer detect a status record that has
-// itself gone stale (ingest stopped writing it).
-message DeriveStatus {
-  DeriveHealth health = 1;
-  uint32 indexed_height = 2;
-  uint64 lag_blocks = 3;
-  uint64 observed_at_millis = 4;
+  reserved 7, 8;
+  reserved "upstream", "indexed_head";
 }
 
 // Coarse transaction-format identifier.

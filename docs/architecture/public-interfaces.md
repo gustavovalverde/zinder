@@ -15,6 +15,21 @@ Optimization order:
 
 Use these names consistently across modules, RPCs, errors, and configuration.
 
+### Chain-view envelope and the `{role}_tip` taxonomy
+
+Every `WalletQuery`, `ExplorerQuery`, and `IngestControl` read response carries `ChainView chain_view = 1` as its first field (on `ExplorerQuery` it rides one level down, on `ExplorerFreshness.chain_view`). Consumers read chain state the same way on every surface through `response.chain_view`. Each plane fills the subset it owns: wallet responses fill `chain_view.chain_epoch` and leave the derive-plane axes unset; explorer and ingest-control responses fill the axes their plane owns. The chain-view family (`ChainView`, `ChainEpoch`, `BlockTip`, `IndexedTip`, `UpstreamTip`, `DeriveStatus`) is defined in `wallet.proto`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md).
+
+The four chain heights share one naming axis so the reorg-vs-replay distinction is self-evident:
+
+| Role | Field | Meaning |
+|------|-------|---------|
+| `visible_tip` | `ChainEpoch.visible_tip` | Best visible block in the epoch. |
+| `settled_tip` | `ChainEpoch.settled_tip` | Reorg-window ceiling and the wallet scan ceiling. Keeps the exact reorg-window semantics the former `safe_tip` fields carried. |
+| `indexed_tip` | `ChainView.indexed_tip` | Derive-replay ceiling. Absent means "unknown", never "at tip". |
+| `upstream_tip` | `ChainView.upstream_tip` | The upstream node's view (heights only; the probe has no single hash). |
+
+"Finalized" stays forbidden as a tip name (it collides with NU7/Crosslink). Index lag is `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
+
 ### Product and runtimes
 
 | Term | Meaning |
@@ -32,7 +47,11 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 
 | Term | Meaning |
 |------|---------|
-| `ChainEpoch` | A consistent visible chain snapshot |
+| `ChainView` | Cross-plane chain-state envelope carried at field tag 1 on every `WalletQuery`, `ExplorerQuery`, and `IngestControl` read response. Folds the chain epoch and the `{role}_tip` axes (`indexed_tip`, `upstream_tip`) plus the derive status into one shape. Defined in `wallet.proto`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
+| `ChainEpoch` | A consistent visible chain snapshot. Carries `visible_tip` and `settled_tip` as `BlockTip` values plus the epoch id, network name, artifact schema version, and the visible-tip commitment-tree sizes. |
+| `BlockTip` | One named chain height with its block hash (`{ height, hash }`, hash in RPC byte order). Reused for `visible_tip`, `settled_tip`, and `indexed_tip`. |
+| `IndexedTip` | Derive-replay ceiling: the highest block the derive projections have materialized (`{ tip: BlockTip, block_time_unix_seconds }`). Absent on `ChainView` means "derive head unknown", never "at tip". |
+| `UpstreamTip` | The upstream node's view of the chain (`{ committed_height, estimated_height }`, heights only; the probe has no single hash). Absent means the source-plane probe has not fired yet. |
 | `ChainEpochReader` | In-process read view pinned to one `ChainEpoch` |
 | `ChainEpochReadApi` | Internal read API for epoch-bound canonical reads |
 | `ChainEvent` | Post-commit canonical transition emitted by `zinder-ingest` |
@@ -100,8 +119,7 @@ Use these names consistently across modules, RPCs, errors, and configuration.
 | `ExplorerQuery` | Native protobuf service for explorer-shaped reads served by `zinder-explorer`. See [Explorer plane](explorer-plane.md) and [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md). |
 | `ExplorerQueryGrpcAdapter` | Tonic adapter for `ExplorerQuery`; carries the optional `WalletQuery` endpoint that backs the Shape C federated balance compute path |
 | `TransactionPublicFacts` | Single typed transaction-fact value parsed once at ingest/mempool/explorer-read time. See [ADR-0010](../adrs/0010-transaction-public-facts.md). |
-| `ExplorerFreshness` | Cross-cutting freshness envelope embedded on every explorer response. Carries an optional `UpstreamObservation` (the upstream node's committed/estimated tips and verification progress, copied from the source-plane `UpstreamHealthSnapshot`) so consumers render honest sync-progress UI without reinventing block-time math. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
-| `UpstreamObservation` | Optional sub-message of `ExplorerFreshness` exposing the upstream node's `upstream_committed_tip_height`, `upstream_estimated_tip_height`, and `upstream_verification_progress`. Field names mirror `UpstreamNotReadyDetail` on the ops readiness surface so operators see the same vocabulary on both planes. Absence means "the source-plane probe has not fired yet"; consumers treat it as unknown, not zero. |
+| `ExplorerFreshness` | Explorer response envelope at field tag 1. Wraps the cross-plane `ChainView` (chain-state axes) and keeps only the metadata that varies per explorer call: `snapshot_age_millis`, `unavailable[]`, and `capability_version`. The upstream tip rides on `chain_view.upstream_tip`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
 | `SearchCandidate` | Typed search-result oneof distinguishing every classifiable input class, including the `NotPubliclyIndexable` arm for shielded receivers. See [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). |
 
 ### Derive-plane SDK
@@ -501,7 +519,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
-| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.upstream` is always unset. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source and chain-tip wakeups. Falls back to JSON-RPC polling when unset. |
 | `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
 | `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
@@ -512,7 +530,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
-| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.upstream`). |
+| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
 | `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9106` query, `9107` compat, `9069` explorer). Set to an empty string to disable the endpoint entirely. |
@@ -712,7 +730,7 @@ Zcash 32-byte hashes have two byte orders. Both are spec-defined terms; both app
 - **Internal byte order**: the raw SHA-256d output. Used in consensus serialization (`hashPrevBlock`, `hashMerkleRoot` per Zcash protocol spec `protocol.tex:13560-13564`), stored verbatim in the `[u8; 32]` newtypes (`TransactionId`, `BlockHash`, `AuthDigest`, `MerkleRoot`) and the `[u8; 64]` `Wtxid` newtype, and used as RocksDB keys.
 - **RPC byte order**: the byte-reversed form (per Zcash protocol spec `\rpcByteOrder`, `protocol.tex:1127`, defining sentence at `:4036`). The form `zcash-cli`, every wallet UI, every block explorer URL, and ZIP 308 (`zip-0308.rst:389`) use to present a hash to a human or an RPC client.
 
-The public proto contract uses **RPC byte order** for every hash-shaped field (`transaction_id`, `block_hash`, `previous_block_hash`, `merkle_root_hash`, `auth_digest`, `wtxid`, `tip_hash`, `mined_block_hash`, `completing_block_hash`, `spending_transaction_id`, etc.), conveyed as a lowercase ASCII hex `string`. The two forms convert via the `encode_rpc_*_hex` / `decode_rpc_*_hex` pair in `wire/`; the storage-facing `encode_internal_*` / `decode_internal_*` pair is the identity for `[u8; 32]` <-> `[u8; 32]` and exists so storage code never names raw byte slices. See [ADR-0024](../adrs/0024-wire-format-rpc-byte-order.md).
+The public proto contract uses **RPC byte order** for every hash-shaped field (`transaction_id`, `block_hash`, `previous_block_hash`, `merkle_root_hash`, `auth_digest`, `wtxid`, `BlockTip.hash`, `mined_block_hash`, `completing_block_hash`, `spending_transaction_id`, etc.), conveyed as a lowercase ASCII hex `string`. The two forms convert via the `encode_rpc_*_hex` / `decode_rpc_*_hex` pair in `wire/`; the storage-facing `encode_internal_*` / `decode_internal_*` pair is the identity for `[u8; 32]` <-> `[u8; 32]` and exists so storage code never names raw byte slices. See [ADR-0024](../adrs/0024-wire-format-rpc-byte-order.md).
 
 ### Forbidden inline forms
 

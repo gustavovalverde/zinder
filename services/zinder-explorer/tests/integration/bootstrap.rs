@@ -259,15 +259,12 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_derive_store() -> R
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    let first_epoch = first_freshness
-        .chain_epoch
-        .as_ref()
-        .ok_or_else(|| eyre!("freshness missing chain_epoch"))?;
+    let first_visible_tip = freshness_visible_tip(first_freshness)?;
     assert_eq!(
         first_freshness.capability_version,
         EXPLORER_OVERVIEW_SNAPSHOT_V1
     );
-    assert_eq!(first_epoch.tip_height, 1);
+    assert_eq!(first_visible_tip.height, 1);
     assert_eq!(first.recent_blocks.len(), 1);
     assert_eq!(first.recent_blocks[0].block_height, 1);
     assert_eq!(first.recent_blocks[0].confirmations, 1);
@@ -295,13 +292,13 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_derive_store() -> R
         })
         .await?
         .into_inner();
-    let second_epoch = second
+    let second_freshness = second
         .freshness
         .as_ref()
-        .and_then(|freshness| freshness.chain_epoch.as_ref())
-        .ok_or_else(|| eyre!("second response missing chain_epoch"))?;
-    assert_eq!(second_epoch.tip_hash, first_epoch.tip_hash);
-    assert_eq!(second_epoch.tip_height, first_epoch.tip_height);
+        .ok_or_else(|| eyre!("second response missing freshness"))?;
+    let second_visible_tip = freshness_visible_tip(second_freshness)?;
+    assert_eq!(second_visible_tip.hash, first_visible_tip.hash);
+    assert_eq!(second_visible_tip.height, first_visible_tip.height);
 
     explorer_handle.abort();
     let _ = explorer_handle.await;
@@ -360,10 +357,11 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
             })
             .await?
             .into_inner();
-        let freshness = response
+        let upstream_tip = response
             .freshness
-            .ok_or_else(|| eyre!("overview response missing freshness"))?;
-        if let Some(upstream) = freshness.upstream {
+            .and_then(|freshness| freshness.chain_view)
+            .and_then(|chain_view| chain_view.upstream_tip);
+        if let Some(upstream) = upstream_tip {
             observed_upstream = Some(upstream);
             break;
         }
@@ -371,9 +369,8 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
     }
     let upstream = observed_upstream
         .ok_or_else(|| eyre!("upstream observation probe never refreshed the cached snapshot"))?;
-    assert_eq!(upstream.upstream_committed_tip_height, Some(2_530_000));
-    assert_eq!(upstream.upstream_estimated_tip_height, Some(2_544_375));
-    assert_eq!(upstream.upstream_verification_progress, Some(0.9943));
+    assert_eq!(upstream.committed_height, Some(2_530_000));
+    assert_eq!(upstream.estimated_height, Some(2_544_375));
 
     probe_cancel.cancel();
     let _ = probe_handle.await;
@@ -627,4 +624,17 @@ async fn await_with_retry(addr: std::net::SocketAddr) -> Result<Channel> {
     Err(eyre!(
         "explorer query gRPC server did not accept connections"
     ))
+}
+
+/// Extracts the visible tip from a freshness envelope's chain view, the common
+/// path the overview-snapshot coherence assertions read.
+fn freshness_visible_tip(
+    freshness: &zinder_proto::v1::explorer::ExplorerFreshness,
+) -> Result<zinder_proto::v1::wallet::BlockTip> {
+    freshness
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .and_then(|chain_epoch| chain_epoch.visible_tip.clone())
+        .ok_or_else(|| eyre!("freshness missing chain_view.chain_epoch.visible_tip"))
 }

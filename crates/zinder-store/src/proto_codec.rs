@@ -270,20 +270,49 @@ const fn mempool_eviction_reason_message(
     }
 }
 
+/// Encodes one named chain tip (height plus RPC-form block hash) into the
+/// wallet protocol message.
+#[must_use]
+pub fn block_tip_message(height: BlockHeight, hash: BlockHash) -> wallet::BlockTip {
+    wallet::BlockTip {
+        height: height.value(),
+        hash: encode_rpc_block_hash_hex(hash),
+    }
+}
+
 /// Encodes chain-epoch metadata into the wallet protocol message.
 #[must_use]
 pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-        tip_height: chain_epoch.tip_height.value(),
-        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-        safe_tip_height: chain_epoch.safe_tip_height.value(),
-        safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
+        visible_tip: Some(block_tip_message(
+            chain_epoch.tip_height,
+            chain_epoch.tip_hash,
+        )),
+        settled_tip: Some(block_tip_message(
+            chain_epoch.safe_tip_height,
+            chain_epoch.safe_tip_hash,
+        )),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+    }
+}
+
+/// Wraps chain-epoch metadata in the cross-plane [`wallet::ChainView`] envelope.
+///
+/// Leaves the derive-plane axes (`indexed_tip`, `upstream_tip`, `derive`)
+/// absent. The wallet plane owns the epoch; the explorer and ingest planes fill
+/// the remaining axes from their own state.
+#[must_use]
+pub fn chain_view_message(chain_epoch: ChainEpoch) -> wallet::ChainView {
+    wallet::ChainView {
+        chain_epoch: Some(chain_epoch_message(chain_epoch)),
+        indexed_tip: None,
+        upstream_tip: None,
+        derive: None,
     }
 }
 
@@ -379,16 +408,23 @@ pub fn chain_epoch_from_message(
             target: "u16",
         }
     })?;
+    let visible_tip = message
+        .visible_tip
+        .ok_or(MempoolDecodeError::MissingField {
+            field: "chain_epoch.visible_tip",
+        })?;
+    let settled_tip = message
+        .settled_tip
+        .ok_or(MempoolDecodeError::MissingField {
+            field: "chain_epoch.settled_tip",
+        })?;
     Ok(ChainEpoch {
         id: ChainEpochId::new(message.chain_epoch_id),
         network,
-        tip_height: BlockHeight::new(message.tip_height),
-        tip_hash: block_hash_from_rpc_hex("chain_epoch.tip_hash", &message.tip_hash)?,
-        safe_tip_height: BlockHeight::new(message.safe_tip_height),
-        safe_tip_hash: block_hash_from_rpc_hex(
-            "chain_epoch.safe_tip_hash",
-            &message.safe_tip_hash,
-        )?,
+        tip_height: BlockHeight::new(visible_tip.height),
+        tip_hash: block_hash_from_rpc_hex("chain_epoch.visible_tip.hash", &visible_tip.hash)?,
+        safe_tip_height: BlockHeight::new(settled_tip.height),
+        safe_tip_hash: block_hash_from_rpc_hex("chain_epoch.settled_tip.hash", &settled_tip.hash)?,
         artifact_schema_version: ArtifactSchemaVersion::new(artifact_schema_version),
         tip_metadata: ChainTipMetadata::new(
             message.sapling_commitment_tree_size,

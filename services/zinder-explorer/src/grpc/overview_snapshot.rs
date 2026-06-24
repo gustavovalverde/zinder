@@ -176,8 +176,12 @@ async fn anchor_to_wallet_tip(
         .await?
         .into_inner();
     let chain_epoch = response
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .chain_view
+        .clone()
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+        })?;
     let tip_height = response
         .latest_block
         .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?

@@ -154,6 +154,9 @@ async fn fetch_latest_chain_epoch(
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
         .into_inner()
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing").into())
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+        })
 }

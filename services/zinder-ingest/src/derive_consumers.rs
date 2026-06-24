@@ -31,7 +31,7 @@ use zinder_derive::{
     TransactionFeesConsumer, TransparentAddressActivityConsumer,
     TransparentAddressTransactionHistoryConsumer, TransparentSpendFacts,
 };
-use zinder_proto::v1::explorer::{DeriveHealth, DeriveStatus};
+use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
     PrimaryChainStore, RocksDbResourceBudget, StreamCursorTokenV1,

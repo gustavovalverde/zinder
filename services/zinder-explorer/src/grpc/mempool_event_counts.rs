@@ -73,8 +73,11 @@ pub(crate) async fn handle_mempool_event_counts(
         .await?
         .into_inner();
     let chain_epoch = latest
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+        })?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

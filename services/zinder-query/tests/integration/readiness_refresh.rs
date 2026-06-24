@@ -127,13 +127,7 @@ async fn secondary_catchup_marks_replica_lagging_from_writer_status() -> eyre::R
     )?;
     secondary.try_catch_up()?;
 
-    let writer_status = SharedWriterStatus::new(WriterStatusResponse {
-        network_name: "zcash-regtest".to_owned(),
-        latest_writer_chain_epoch_id: Some(7),
-        latest_writer_tip_height: Some(7),
-        latest_writer_safe_tip_height: Some(7),
-        ..Default::default()
-    });
+    let writer_status = SharedWriterStatus::new(writer_status_response(7));
     let (writer_status_addr, writer_status_cancel, writer_status_handle) =
         spawn_writer_status_server(writer_status.clone()).await?;
     let readiness = Readiness::new(ReadinessState::ready(Some(1)));
@@ -154,13 +148,7 @@ async fn secondary_catchup_marks_replica_lagging_from_writer_status() -> eyre::R
     );
 
     wait_for_replica_lagging(&readiness, 6).await?;
-    writer_status.set(WriterStatusResponse {
-        network_name: "zcash-regtest".to_owned(),
-        latest_writer_chain_epoch_id: Some(1),
-        latest_writer_tip_height: Some(1),
-        latest_writer_safe_tip_height: Some(1),
-        ..Default::default()
-    });
+    writer_status.set(writer_status_response(1));
     wait_for_ready_height(&readiness, Some(1)).await?;
 
     cancel.cancel();
@@ -290,6 +278,34 @@ async fn wait_for_writer_status_unavailable(readiness: &Readiness) -> eyre::Resu
             ));
         }
         tokio::time::sleep(REFRESH_INTERVAL).await;
+    }
+}
+
+fn writer_status_response(epoch: u32) -> WriterStatusResponse {
+    WriterStatusResponse {
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(wallet::ChainEpoch {
+                chain_epoch_id: u64::from(epoch),
+                network_name: "zcash-regtest".to_owned(),
+                artifact_schema_version: 1,
+                created_at_millis: 0,
+                visible_tip: Some(wallet::BlockTip {
+                    height: epoch,
+                    hash: "11".repeat(32),
+                }),
+                settled_tip: Some(wallet::BlockTip {
+                    height: epoch,
+                    hash: "22".repeat(32),
+                }),
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+            }),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }),
+        network_name: "zcash-regtest".to_owned(),
+        ..Default::default()
     }
 }
 

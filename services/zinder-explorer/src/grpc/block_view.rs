@@ -191,8 +191,11 @@ async fn read_canonical_tip(
         .await?
         .into_inner();
     let chain_epoch = latest
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+        })?;
     let canonical_tip = latest
         .latest_block
         .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?

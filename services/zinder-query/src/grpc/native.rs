@@ -27,7 +27,7 @@ use crate::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
 };
-pub(crate) use zinder_store::chain_epoch_message as build_chain_epoch_message;
+pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
     chain_event_envelope_message, outpoint_message, transparent_output_entry_message,
@@ -395,7 +395,7 @@ pub fn build_transparent_address_tx_ids_chunk(
     cursor: Vec<u8>,
 ) -> wallet::TransparentAddressTxIdsChunk {
     wallet::TransparentAddressTxIdsChunk {
-        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        chain_view: Some(build_chain_view_message(chain_epoch)),
         transaction_id: encode_rpc_transaction_id_hex(artifact.transaction_id),
         block_height: artifact.block_height.value(),
         tx_index_in_block: artifact.tx_index_in_block,
@@ -412,7 +412,7 @@ pub fn build_transparent_unspent_output_message(
     output: &TransparentUnspentOutput,
 ) -> wallet::TransparentUnspentOutput {
     wallet::TransparentUnspentOutput {
-        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        chain_view: Some(build_chain_view_message(chain_epoch)),
         address_script_hash: output.address_script_hash.as_bytes().to_vec(),
         script_pub_key: output.script_pub_key.clone(),
         outpoint: Some(outpoint_message(&output.outpoint)),
@@ -426,7 +426,7 @@ fn build_transparent_outputs_by_outpoint_response(
     response: TransparentOutputsByOutpointResponse,
 ) -> wallet::TransparentOutputsByOutpointResponse {
     wallet::TransparentOutputsByOutpointResponse {
-        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
         entries: response
             .entries
             .into_iter()
@@ -437,7 +437,7 @@ fn build_transparent_outputs_by_outpoint_response(
 
 fn build_latest_block_response(latest_block: LatestBlock) -> wallet::LatestBlockResponse {
     wallet::LatestBlockResponse {
-        chain_epoch: Some(build_chain_epoch_message(latest_block.chain_epoch)),
+        chain_view: Some(build_chain_view_message(latest_block.chain_epoch)),
         latest_block: Some(build_block_metadata_message(
             latest_block.height,
             latest_block.block_hash,
@@ -449,7 +449,7 @@ fn build_latest_safe_block_response(
     safe_block: LatestSafeBlock,
 ) -> wallet::LatestSafeBlockResponse {
     wallet::LatestSafeBlockResponse {
-        chain_epoch: Some(build_chain_epoch_message(safe_block.chain_epoch)),
+        chain_view: Some(build_chain_view_message(safe_block.chain_epoch)),
         safe_tip_block: Some(build_block_metadata_message(
             safe_block.height,
             safe_block.block_hash,
@@ -459,7 +459,7 @@ fn build_latest_safe_block_response(
 
 fn build_block_id_response(response: BlockIdResponseValue) -> wallet::BlockIdResponse {
     wallet::BlockIdResponse {
-        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
         block_id: Some(build_block_metadata_message(
             response.block_id.height,
             response.block_id.hash,
@@ -470,7 +470,7 @@ fn build_block_id_response(response: BlockIdResponseValue) -> wallet::BlockIdRes
 fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::BlockHeaderResponse {
     let header = &response.block_header;
     wallet::BlockHeaderResponse {
-        chain_epoch: Some(build_chain_epoch_message(response.chain_epoch)),
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
         block_header: Some(wallet::BlockHeaderInfo {
             block_id: Some(build_block_metadata_message(
                 header.block_id.height,
@@ -489,7 +489,7 @@ fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::B
 
 fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactBlockResponse {
     wallet::CompactBlockResponse {
-        chain_epoch: Some(build_chain_epoch_message(compact_block.chain_epoch)),
+        chain_view: Some(build_chain_view_message(compact_block.chain_epoch)),
         compact_block: Some(build_compact_block_message(compact_block.compact_block)),
     }
 }
@@ -527,7 +527,7 @@ fn build_transaction_status_response(
         }
     };
     Ok(Some(wallet::TransactionStatusResponse {
-        chain_epoch: Some(build_chain_epoch_message(chain_epoch)),
+        chain_view: Some(build_chain_view_message(chain_epoch)),
         status: Some(oneof),
     }))
 }
@@ -553,7 +553,7 @@ fn build_transaction_location_message(
 
 fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse {
     wallet::TreeStateResponse {
-        chain_epoch: Some(build_chain_epoch_message(tree_state.chain_epoch)),
+        chain_view: Some(build_chain_view_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),
         block_hash: encode_rpc_block_hash_hex(tree_state.block_hash),
         payload_bytes: tree_state.payload_bytes,
@@ -564,7 +564,7 @@ fn build_subtree_roots_response(
     subtree_roots: &SubtreeRoots,
 ) -> Result<wallet::SubtreeRootsResponse, QueryError> {
     Ok(wallet::SubtreeRootsResponse {
-        chain_epoch: Some(build_chain_epoch_message(subtree_roots.chain_epoch)),
+        chain_view: Some(build_chain_view_message(subtree_roots.chain_epoch)),
         shielded_protocol: native_shielded_protocol(subtree_roots.protocol)? as i32,
         start_index: subtree_roots.start_index.value(),
         subtree_roots: subtree_roots

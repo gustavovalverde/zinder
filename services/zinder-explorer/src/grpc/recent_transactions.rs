@@ -103,8 +103,11 @@ pub(crate) async fn handle_recent_transactions(
         .await?
         .into_inner();
     let chain_epoch = latest
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+        })?;
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

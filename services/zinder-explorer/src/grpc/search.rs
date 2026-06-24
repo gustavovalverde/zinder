@@ -394,7 +394,10 @@ async fn build_freshness(
         .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
         .await?
         .into_inner()
-        .chain_epoch
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.chain_epoch missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+        })?;
     build_explorer_freshness(derive_store, EXPLORER_SEARCH_V1, Some(chain_epoch), 0)
 }

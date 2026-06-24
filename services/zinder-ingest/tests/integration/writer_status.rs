@@ -48,17 +48,27 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
         .into_inner();
 
     assert_eq!(response.network_name, "zcash-regtest");
+    let response_chain_epoch = response
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre::eyre!("writer status response missing chain epoch"))?;
     assert_eq!(
-        response.latest_writer_chain_epoch_id,
-        Some(expected_chain_epoch.id.value())
+        response_chain_epoch.chain_epoch_id,
+        expected_chain_epoch.id.value()
     );
     assert_eq!(
-        response.latest_writer_tip_height,
-        Some(expected_chain_epoch.tip_height.value())
+        response_chain_epoch
+            .visible_tip
+            .ok_or_else(|| eyre::eyre!("writer status response missing visible tip"))?
+            .height,
+        expected_chain_epoch.tip_height.value()
     );
     assert_eq!(
-        response.latest_writer_safe_tip_height,
-        Some(expected_chain_epoch.safe_tip_height.value())
+        response_chain_epoch
+            .settled_tip
+            .ok_or_else(|| eyre::eyre!("writer status response missing settled tip"))?
+            .height,
+        expected_chain_epoch.safe_tip_height.value()
     );
 
     cancel.cancel();

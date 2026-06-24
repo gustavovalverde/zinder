@@ -88,9 +88,18 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     let encoded_chunk = chunk.encode_to_vec();
     let decoded_chunk = wallet::CompactBlockRangeChunk::decode(encoded_chunk.as_slice())?;
     let response_chain_epoch = decoded_chunk
-        .chain_epoch
+        .chain_view
         .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| eyre!("missing chunk chain epoch"))?;
+    let response_visible_tip = response_chain_epoch
+        .visible_tip
+        .as_ref()
+        .ok_or_else(|| eyre!("missing chunk visible tip"))?;
+    let response_settled_tip = response_chain_epoch
+        .settled_tip
+        .as_ref()
+        .ok_or_else(|| eyre!("missing chunk settled tip"))?;
     let response_compact_block = decoded_chunk
         .compact_block
         .as_ref()
@@ -101,20 +110,17 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         response_chain_epoch.network_name,
         encode_zinder_native_chain_name(chain_epoch.network)
     );
+    assert_eq!(response_visible_tip.height, chain_epoch.tip_height.value());
     assert_eq!(
-        response_chain_epoch.tip_height,
-        chain_epoch.tip_height.value()
-    );
-    assert_eq!(
-        response_chain_epoch.tip_hash,
+        response_visible_tip.hash,
         encode_rpc_block_hash_hex(chain_epoch.tip_hash)
     );
     assert_eq!(
-        response_chain_epoch.safe_tip_height,
+        response_settled_tip.height,
         chain_epoch.safe_tip_height.value()
     );
     assert_eq!(
-        response_chain_epoch.safe_tip_hash,
+        response_settled_tip.hash,
         encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash)
     );
     assert_eq!(
@@ -155,8 +161,9 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::LatestBlockResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
         .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
     let latest_block = decoded_response
         .latest_block
@@ -194,8 +201,9 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
         .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
@@ -352,8 +360,9 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
         .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
     let response_subtree_root = decoded_response
         .subtree_roots
@@ -562,17 +571,26 @@ fn compact_block_range_chunk(
     compact_block: CompactBlockArtifact,
 ) -> wallet::CompactBlockRangeChunk {
     wallet::CompactBlockRangeChunk {
-        chain_epoch: Some(wallet::ChainEpoch {
-            chain_epoch_id: chain_epoch.id.value(),
-            network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-            tip_height: chain_epoch.tip_height.value(),
-            tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-            safe_tip_height: chain_epoch.safe_tip_height.value(),
-            safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
-            artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
-            created_at_millis: chain_epoch.created_at.value(),
-            sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(wallet::ChainEpoch {
+                chain_epoch_id: chain_epoch.id.value(),
+                network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
+                artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
+                created_at_millis: chain_epoch.created_at.value(),
+                visible_tip: Some(wallet::BlockTip {
+                    height: chain_epoch.tip_height.value(),
+                    hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
+                }),
+                settled_tip: Some(wallet::BlockTip {
+                    height: chain_epoch.safe_tip_height.value(),
+                    hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
+                }),
+                sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
+                orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+            }),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
         }),
         compact_block: Some(wallet::CompactBlock {
             height: compact_block.height.value(),

@@ -51,18 +51,18 @@ enum WriterPhase {
 // Private ingest control-plane response used by colocated secondary readers
 // to compute RocksDB-secondary replica lag.
 message WriterStatusResponse {
-  // Stable public network name, such as "zcash-regtest".
-  string network_name = 1;
+  // Cross-plane chain-state envelope. The writer's latest committed chain
+  // epoch (with its visible and settled tips) rides on
+  // `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the upstream
+  // observation. Absent when the writer has not committed a chain epoch yet.
+  optional zinder.v1.wallet.ChainView chain_view = 1;
 
-  // Latest chain epoch committed by the primary writer, when one is visible.
-  optional uint64 latest_writer_chain_epoch_id = 2;
+  // Stable public network name, such as "zcash-regtest". Carried outside
+  // `chain_view` because it is known before the first commit.
+  string network_name = 2;
 
-  // Writer's visible tip height for latest_writer_chain_epoch_id.
-  optional uint32 latest_writer_tip_height = 3;
-
-  // Writer's safe tip height for latest_writer_chain_epoch_id (the height at
-  // which the writer's commitments are past the reorg window).
-  optional uint32 latest_writer_safe_tip_height = 4;
+  reserved 3, 4;
+  reserved "latest_writer_tip_height", "latest_writer_safe_tip_height";
 
   // Current phase of the unified ingest loop. ADR-0015.
   WriterPhase phase = 5;

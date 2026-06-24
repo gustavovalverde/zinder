@@ -41,13 +41,13 @@ const TXID_BLOCK_HASH_AS_BYTES_ALLOWLIST: &[&str] = &[
 /// Identifier substrings that name a Zcash 32-byte little-endian hash field at a wire boundary.
 ///
 /// The list intentionally over-includes synonyms used in concrete struct
-/// fields (`tip_hash`, `safe_tip_hash`, ...) so a wire boundary that names
-/// the field one of these ways still routes through `encode_internal_*`.
+/// fields (`block_hash`, `previous_block_hash`, ...) so a wire boundary that
+/// names the field one of these ways still routes through `encode_internal_*`.
+/// The chain-view tips (`visible_tip`, `settled_tip`, `indexed_tip`) carry the
+/// hash on their `BlockTip.hash` field, encoded through `encode_rpc_block_hash_hex`.
 const WIRE_HASH_FIELD_NAMES: &[&str] = &[
     "transaction_id",
     "block_hash",
-    "tip_hash",
-    "safe_tip_hash",
     "previous_block_hash",
     "completing_block_hash",
     "parent_hash",

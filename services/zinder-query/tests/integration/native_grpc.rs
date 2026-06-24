@@ -369,7 +369,9 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
     .await?
     .into_inner();
     let response_epoch = response
-        .chain_epoch
+        .chain_view
+        .clone()
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
     let latest_block = response
         .latest_block
@@ -389,12 +391,16 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
         chain_epoch: Some(wallet::ChainEpoch {
             chain_epoch_id: 11,
             network_name: "zcash-regtest".to_owned(),
-            tip_height: 5,
-            tip_hash: "05".repeat(32),
-            safe_tip_height: 4,
-            safe_tip_hash: "04".repeat(32),
             artifact_schema_version: 1,
             created_at_millis: 123,
+            visible_tip: Some(wallet::BlockTip {
+                height: 5,
+                hash: "05".repeat(32),
+            }),
+            settled_tip: Some(wallet::BlockTip {
+                height: 4,
+                hash: "04".repeat(32),
+            }),
             sapling_commitment_tree_size: 0,
             orchard_commitment_tree_size: 0,
         }),
@@ -405,12 +411,16 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
                     chain_epoch: Some(wallet::ChainEpoch {
                         chain_epoch_id: 11,
                         network_name: "zcash-regtest".to_owned(),
-                        tip_height: 5,
-                        tip_hash: "05".repeat(32),
-                        safe_tip_height: 4,
-                        safe_tip_hash: "04".repeat(32),
                         artifact_schema_version: 1,
                         created_at_millis: 123,
+                        visible_tip: Some(wallet::BlockTip {
+                            height: 5,
+                            hash: "05".repeat(32),
+                        }),
+                        settled_tip: Some(wallet::BlockTip {
+                            height: 4,
+                            hash: "04".repeat(32),
+                        }),
                         sapling_commitment_tree_size: 0,
                         orchard_commitment_tree_size: 0,
                     }),
@@ -693,25 +703,33 @@ trait HasChainEpoch {
 
 impl HasChainEpoch for wallet::LatestBlockResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasChainEpoch for wallet::CompactBlockRangeChunk {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasChainEpoch for wallet::TreeStateResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasChainEpoch for wallet::SubtreeRootsResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
@@ -744,12 +762,16 @@ fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: chain_epoch.id.value(),
         network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-        tip_height: chain_epoch.tip_height.value(),
-        tip_hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
-        safe_tip_height: chain_epoch.safe_tip_height.value(),
-        safe_tip_hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
+        visible_tip: Some(wallet::BlockTip {
+            height: chain_epoch.tip_height.value(),
+            hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
+        }),
+        settled_tip: Some(wallet::BlockTip {
+            height: chain_epoch.safe_tip_height.value(),
+            hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
+        }),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
     }
@@ -790,10 +812,28 @@ impl IngestControl for StaticIngestControl {
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
         Ok(Response::new(WriterStatusResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet::ChainEpoch {
+                    chain_epoch_id: 11,
+                    network_name: "zcash-regtest".to_owned(),
+                    artifact_schema_version: 1,
+                    created_at_millis: 123,
+                    visible_tip: Some(wallet::BlockTip {
+                        height: 5,
+                        hash: "05".repeat(32),
+                    }),
+                    settled_tip: Some(wallet::BlockTip {
+                        height: 4,
+                        hash: "04".repeat(32),
+                    }),
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                }),
+                indexed_tip: None,
+                upstream_tip: None,
+                derive: None,
+            }),
             network_name: "zcash-regtest".to_owned(),
-            latest_writer_chain_epoch_id: Some(11),
-            latest_writer_tip_height: Some(5),
-            latest_writer_safe_tip_height: Some(4),
             phase: WriterPhase::FollowingTip.into(),
             gap_blocks: Some(0),
             upstream_not_ready: None,

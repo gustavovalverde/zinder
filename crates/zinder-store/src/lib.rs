@@ -63,11 +63,11 @@ pub use mempool_event_store::{
     MempoolEventRetentionConfig, MempoolEventRetentionReport,
 };
 pub use proto_codec::{
-    ChainEventEncodeError, MempoolDecodeError, chain_epoch_from_message, chain_epoch_message,
-    chain_event_envelope_message, chain_event_stream_family_from_message,
-    mempool_entry_from_message, mempool_entry_message, mempool_event_envelope_from_message,
-    mempool_event_envelope_message, outpoint_from_message, outpoint_message,
-    stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
+    ChainEventEncodeError, MempoolDecodeError, block_tip_message, chain_epoch_from_message,
+    chain_epoch_message, chain_event_envelope_message, chain_event_stream_family_from_message,
+    chain_view_message, mempool_entry_from_message, mempool_entry_message,
+    mempool_event_envelope_from_message, mempool_event_envelope_message, outpoint_from_message,
+    outpoint_message, stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
     transparent_mempool_output_message, transparent_mempool_spend_from_message,
     transparent_mempool_spend_message, transparent_output_entry_message,
     transparent_output_message,

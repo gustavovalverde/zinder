@@ -73,9 +73,10 @@ pub(crate) async fn handle_transaction_detail(
         }))
         .await?
         .into_inner();
-    let chain_epoch = status_response.chain_epoch.ok_or_else(|| {
-        ExplorerError::internal("WalletQuery.Transaction response missing chain_epoch")
-    })?;
+    let chain_epoch = status_response
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| ExplorerError::internal("WalletQuery.Transaction missing chain_epoch"))?;
     let status = status_response.status.ok_or_else(|| {
         ExplorerError::internal("WalletQuery.Transaction response missing status")
     })?;

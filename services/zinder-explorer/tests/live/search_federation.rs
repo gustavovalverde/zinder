@@ -355,7 +355,11 @@ fn assert_freshness(response: &SearchResponse) -> Result<()> {
         .ok_or_else(|| eyre!("search response missing freshness"))?;
     assert_eq!(freshness.capability_version, EXPLORER_SEARCH_V1);
     assert!(
-        freshness.chain_epoch.is_some(),
+        freshness
+            .chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+            .is_some(),
         "search freshness must carry a chain epoch",
     );
     Ok(())

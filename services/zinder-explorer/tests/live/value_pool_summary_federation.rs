@@ -60,7 +60,11 @@ async fn value_pool_summary_returns_upstream_pools_through_federation() -> Resul
         .ok_or_else(|| eyre!("ValuePoolSummary response missing freshness"))?;
     assert_eq!(freshness.capability_version, EXPLORER_VALUE_POOL_SUMMARY_V1);
     assert!(
-        freshness.chain_epoch.is_some(),
+        freshness
+            .chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+            .is_some(),
         "value pool summary freshness must carry a chain epoch",
     );
     assert!(

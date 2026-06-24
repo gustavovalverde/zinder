@@ -167,11 +167,10 @@ Future federated methods follow the same pattern: the capability lives in the `e
 
 Every explorer response embeds `ExplorerFreshness` at field tag 1. The shape and rationale live in [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). The key fields:
 
-- `chain_epoch` — wallet-plane primitive, identifies the snapshot the response was produced from.
-- `snapshot_age_millis` — age of the mempool snapshot, when the response touches mempool state.
-- `derive_cursor_lag_blocks` and `derive_cursor_lag_millis` — how far behind canonical the explorer derive view is.
-- `capability_version` — exact capability string that produced the response.
-- `unavailable` — repeated `UnavailableField` entries declaring specific field paths absent with structured reasons.
+- `chain_view`: the cross-plane chain-state envelope (chain epoch, the `{role}_tip` axes, derive status). Identifies the snapshot the response was produced from. The upstream tip rides on `chain_view.upstream_tip`; the derive-replay ceiling on `chain_view.indexed_tip`. Index lag is `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
+- `snapshot_age_millis`: age of the mempool snapshot, when the response touches mempool state.
+- `capability_version`: exact capability string that produced the response.
+- `unavailable`: repeated `UnavailableField` entries declaring specific field paths absent with structured reasons.
 
 `UnavailableField` carries a `field_path` (dotted-path matching the response shape), a structured `reason` (enum), and a `human_reason` string from the canonical registry in `crates/zinder-core/src/explorer_reasons.rs`. Frontends can branch on `reason` or render `human_reason` verbatim; both come from the same source so the words match across surfaces.
 

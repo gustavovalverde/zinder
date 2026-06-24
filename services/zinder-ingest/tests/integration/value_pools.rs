@@ -93,8 +93,10 @@ async fn ingest_control_chain_value_pools_at_tip_uses_node_source() -> Result<()
     .into_inner();
 
     let chain_epoch = response
-        .chain_epoch
-        .ok_or_else(|| eyre::eyre!("chain_epoch missing"))?;
+        .chain_view
+        .clone()
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre::eyre!("chain_view.chain_epoch missing"))?;
     assert_eq!(chain_epoch.chain_epoch_id, expected_epoch.id.value());
     assert_eq!(response.tip_height, 1_234);
     assert_eq!(response.pools.len(), 2);

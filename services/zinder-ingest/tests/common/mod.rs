@@ -699,25 +699,33 @@ trait HasNativeGrpcChainEpoch {
 
 impl HasNativeGrpcChainEpoch for wallet::LatestBlockResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasNativeGrpcChainEpoch for wallet::CompactBlockRangeChunk {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasNativeGrpcChainEpoch for wallet::TreeStateResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
 impl HasNativeGrpcChainEpoch for wallet::SubtreeRootsResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_epoch.as_ref()
+        self.chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
     }
 }
 
@@ -734,7 +742,14 @@ fn assert_native_grpc_response_epoch(
         chain_epoch.network_name,
         encode_zinder_native_chain_name(network)
     );
-    assert_eq!(chain_epoch.tip_height, end_height);
+    assert_eq!(
+        chain_epoch
+            .visible_tip
+            .as_ref()
+            .ok_or_else(|| eyre!("native gRPC response missing visible tip"))?
+            .height,
+        end_height
+    );
     Ok(())
 }
 
@@ -765,24 +780,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
         (start_height..=end_height).zip(compact_block_range.compact_blocks)
     {
         let chunk = wallet::CompactBlockRangeChunk {
-            chain_epoch: Some(wallet::ChainEpoch {
-                chain_epoch_id: range_chain_epoch.id.value(),
-                network_name: encode_zinder_native_chain_name(range_chain_epoch.network).to_owned(),
-                tip_height: range_chain_epoch.tip_height.value(),
-                tip_hash: encode_rpc_block_hash_hex(range_chain_epoch.tip_hash),
-                safe_tip_height: range_chain_epoch.safe_tip_height.value(),
-                safe_tip_hash: encode_rpc_block_hash_hex(range_chain_epoch.safe_tip_hash),
-                artifact_schema_version: u32::from(
-                    range_chain_epoch.artifact_schema_version.value(),
-                ),
-                created_at_millis: range_chain_epoch.created_at.value(),
-                sapling_commitment_tree_size: range_chain_epoch
-                    .tip_metadata
-                    .sapling_commitment_tree_size,
-                orchard_commitment_tree_size: range_chain_epoch
-                    .tip_metadata
-                    .orchard_commitment_tree_size,
-            }),
+            chain_view: Some(zinder_store::chain_view_message(range_chain_epoch)),
             compact_block: Some(wallet::CompactBlock {
                 height: compact_block.height.value(),
                 block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
@@ -792,7 +790,8 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
         let encoded_chunk = chunk.encode_to_vec();
         let decoded_chunk = wallet::CompactBlockRangeChunk::decode(encoded_chunk.as_slice())?;
         let chunk_chain_epoch = decoded_chunk
-            .chain_epoch
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
             .ok_or_else(|| eyre!("native compact-block chunk missing chain epoch"))?;
         let compact_block = decoded_chunk
             .compact_block
@@ -802,7 +801,13 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
             chunk_chain_epoch.network_name,
             encode_zinder_native_chain_name(network)
         );
-        assert_eq!(chunk_chain_epoch.tip_height, end_height);
+        assert_eq!(
+            chunk_chain_epoch
+                .visible_tip
+                .ok_or_else(|| eyre!("native compact-block chunk missing visible tip"))?
+                .height,
+            end_height
+        );
         assert_eq!(compact_block.height, height);
         assert!(!compact_block.payload_bytes.is_empty());
         let expected_block_hash_internal =
@@ -854,7 +859,8 @@ async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::LatestBlockResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("native response missing chain epoch"))?;
     let latest_block = decoded_response
         .latest_block
@@ -864,7 +870,13 @@ async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
         response_chain_epoch.network_name,
         encode_zinder_native_chain_name(network)
     );
-    assert_eq!(response_chain_epoch.tip_height, end_height);
+    assert_eq!(
+        response_chain_epoch
+            .visible_tip
+            .ok_or_else(|| eyre!("native response missing visible tip"))?
+            .height,
+        end_height
+    );
     assert_eq!(latest_block.height, end_height);
     assert!(!latest_block.block_hash.is_empty());
     Ok(())
@@ -879,14 +891,21 @@ async fn assert_native_tree_state_checkpoint_response<QueryApi: WalletQueryApi>(
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("native response missing chain epoch"))?;
 
     assert_eq!(
         response_chain_epoch.network_name,
         encode_zinder_native_chain_name(network)
     );
-    assert_eq!(response_chain_epoch.tip_height, end_height);
+    assert_eq!(
+        response_chain_epoch
+            .visible_tip
+            .ok_or_else(|| eyre!("native response missing visible tip"))?
+            .height,
+        end_height
+    );
     assert_eq!(decoded_response.height, end_height);
     assert!(!decoded_response.block_hash.is_empty());
     assert!(!decoded_response.payload_bytes.is_empty());
@@ -902,14 +921,21 @@ async fn assert_native_latest_tree_state_checkpoint_response<QueryApi: WalletQue
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("native latest tree-state response missing chain epoch"))?;
 
     assert_eq!(
         response_chain_epoch.network_name,
         encode_zinder_native_chain_name(network)
     );
-    assert_eq!(response_chain_epoch.tip_height, end_height);
+    assert_eq!(
+        response_chain_epoch
+            .visible_tip
+            .ok_or_else(|| eyre!("native response missing visible tip"))?
+            .height,
+        end_height
+    );
     assert_eq!(decoded_response.height, end_height);
     assert!(!decoded_response.block_hash.is_empty());
     assert!(!decoded_response.payload_bytes.is_empty());
@@ -934,7 +960,8 @@ async fn assert_native_subtree_roots_response<QueryApi: WalletQueryApi>(
         let encoded_response = response.encode_to_vec();
         let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
         let response_chain_epoch = decoded_response
-            .chain_epoch
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
             .ok_or_else(|| eyre!("native subtree-roots response missing chain epoch"))?;
 
         assert_eq!(

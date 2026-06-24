@@ -10,7 +10,7 @@
 //! response binds the [`zinder_core::TransactionPublicFacts`] shape consumers
 //! depend on:
 //!
-//! - `freshness.chain_epoch` is populated by the wallet-plane read.
+//! - `freshness.chain_view.chain_epoch` is populated by the wallet-plane read.
 //! - `facts.transaction_id` matches the txid we asked for.
 //! - `facts.is_coinbase` is `true` and `facts.privacy_shape` is the
 //!   coinbase classifier output.
@@ -87,9 +87,10 @@ fn assert_response_invariants(
         .as_ref()
         .ok_or_else(|| eyre!("response missing freshness envelope"))?;
     freshness
-        .chain_epoch
+        .chain_view
         .as_ref()
-        .ok_or_else(|| eyre!("freshness envelope missing chain_epoch"))?;
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or_else(|| eyre!("freshness envelope missing chain_view.chain_epoch"))?;
     let facts = response
         .facts
         .as_ref()

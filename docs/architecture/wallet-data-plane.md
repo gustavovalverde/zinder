@@ -62,7 +62,7 @@ This avoids two problems:
 
 If a compact block artifact is missing, `zinder-query` should return a typed unavailable error or readiness failure. It should not fetch the block from the upstream node and build a one-off response.
 
-The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the `chain_epoch` used to answer the read when the response depends on chain state. Native gRPC streams compact block ranges as `CompactBlockRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
+The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the derive-plane axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlockRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
 Tree-state storage preserves upstream node JSON at canonical checkpoints and the
 latest committed tip. The native read surface is
@@ -104,7 +104,7 @@ request's chain epoch via the existing height-visibility index. Reorged-out
 hashes return `BlockHashLookup::NotInBestChain` without an eager delete.
 
 The native surface is `WalletQuery.BlockIdBySelector` (capability
-`wallet.read.block_id_by_selector_v1`) returning `BlockIdResponse { chain_epoch,
+`wallet.read.block_id_by_selector_v1`) returning `BlockIdResponse { chain_view,
 block_id }`. Compat hash-only requests (`GetBlock`, `GetTreeState`,
 `GetTransaction`-by-block-hash) call the resolver before reaching the existing
 height-keyed read; height-only callers get a normalized `BlockId` with the
@@ -114,7 +114,7 @@ resolved hash. Both the gRPC adapter and `zinder-client::ChainIndex` expose
 The same resolver backs the typed block-header read model:
 `WalletQuery.BlockHeaderBySelector` (capability
 `wallet.read.block_header_by_selector_v1`) returns `BlockHeaderResponse {
-chain_epoch, block_header }` where `BlockHeaderInfo` is the Zinder-native
+chain_view, block_header }` where `BlockHeaderInfo` is the Zinder-native
 header shape (block identity, previous hash, merkle root, commitment bytes,
 block time, bits, nonce, version). The shape does not re-export Zebra's
 JSON-RPC `getblockheader` object or the lightwalletd compact block header. The
@@ -354,8 +354,8 @@ address within an inclusive height range. The native surface is
 `WalletQuery.TransparentAddressTxIdsInRange`, a server-streamed page-bounded
 read; the matching Rust API is
 `ChainIndex::transparent_address_tx_ids_in_range`. The derive projection is a
-current read model, so callers use the `chain_epoch` returned with each chunk
-as the response binding instead of supplying an `at_epoch` pin. The
+current read model, so callers use the `chain_view.chain_epoch` returned with
+each chunk as the response binding instead of supplying an `at_epoch` pin. The
 compatibility adapter implements `GetTaddressTxids` and
 `GetTaddressTransactions` over the same native method.
 
@@ -399,7 +399,7 @@ The response binds to the writer-visible `ChainEpoch`, carries the upstream tip 
 
 ## Transparent Address Balance
 
-The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, `address_count: uint32`, and the binding `chain_epoch`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.
+The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`; the response carries the binding `chain_view` at field tag 1, then `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, and `address_count: uint32`. The same RPC is exposed directly on `ExplorerQuery.TransparentAddressBalance` for clients that want to call the derive plane without going through the wallet boundary; both surfaces share the request and response messages.
 
 The balance has exactly one implementation, in `zinder-explorer`, and one capability: `explorer.transparent_address.balance_v1`, present when the derive plane is configured and the proxy's readiness probe reports `explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery)): for each address in the request, the handler drains the complete `WalletQuery.TransparentAddressUnspentOutputs` stream for confirmed outputs and calls `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, then resolves unconfirmed spends of the whole accumulated unspent set through batched `WalletQuery.TransparentMempoolSpendsByOutpoint` calls chunked at the per-request outpoint cap. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends. The address list is hard-capped at 256 per request to bound the compute fanout. Deployments without an explorer plane omit the capability and reject the call with `UNAVAILABLE`.
 

@@ -1,13 +1,14 @@
 //! Shared builders for the cross-cutting [`ExplorerFreshness`] envelope.
 //!
-//! Every explorer handler folds the same `UpstreamObservation` into its
-//! freshness envelope before responding. The adapter owns one cached
-//! [`UpstreamHealthSnapshot`] (refreshed by a background probe) and shares
-//! it with every handler through an [`UpstreamObservationCache`] handle.
+//! Every explorer handler folds the same upstream tip into the
+//! `chain_view.upstream_tip` axis of its freshness envelope before
+//! responding. The adapter owns one cached [`UpstreamHealthSnapshot`]
+//! (refreshed by a background probe) and shares it with every handler through
+//! an [`UpstreamObservationCache`] handle.
 //!
-//! Per ADR-0011 the field is optional: a response that fires before the
-//! first probe completes carries `freshness.upstream = None`. Consumers
-//! treat absence as "unknown", not zero.
+//! Per ADR-0011 the axis is optional: a response that fires before the first
+//! probe completes carries `chain_view.upstream_tip = None`. Consumers treat
+//! absence as "unknown", not zero.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,10 +21,8 @@ use tonic::Status;
 use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
 
 use super::error::ExplorerError;
-use zinder_proto::v1::explorer::{
-    BlockSummaryRecord, DeriveStatus, ExplorerFreshness, IndexedHead, UpstreamObservation,
-};
-use zinder_proto::v1::wallet;
+use zinder_proto::v1::explorer::{BlockSummaryRecord, ExplorerFreshness};
+use zinder_proto::v1::wallet::{self, ChainView, DeriveStatus, IndexedTip, UpstreamTip};
 use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 
 /// Shared, lock-protected handle to the most recent
@@ -57,44 +56,43 @@ impl UpstreamObservationCache {
     }
 }
 
-/// Builds an [`UpstreamObservation`] proto from a cached snapshot.
+/// Builds an [`UpstreamTip`] proto from a cached snapshot.
 ///
-/// Returns `None` when the probe has not fired yet so the freshness
-/// envelope can leave `upstream` unset.
-pub(crate) fn upstream_observation_from_snapshot(
-    snapshot: &UpstreamHealthSnapshot,
-) -> UpstreamObservation {
-    UpstreamObservation {
-        upstream_committed_tip_height: snapshot.upstream_committed_height,
-        upstream_estimated_tip_height: snapshot.upstream_estimated_height,
-        upstream_verification_progress: snapshot.upstream_verification_progress,
+/// Carries heights only; the upstream probe has no single block hash.
+pub(crate) fn upstream_tip_from_snapshot(snapshot: &UpstreamHealthSnapshot) -> UpstreamTip {
+    UpstreamTip {
+        committed_height: snapshot.upstream_committed_height,
+        estimated_height: snapshot.upstream_estimated_height,
     }
 }
 
-/// Folds the cached upstream observation into an already-built
-/// [`ExplorerFreshness`] body.
+/// Folds the cached upstream tip into the `chain_view.upstream_tip` axis of an
+/// already-built [`ExplorerFreshness`] body.
 ///
 /// Every handler builds its own freshness (the chain epoch, snapshot age,
-/// derive-cursor lag, capability version, and per-field unavailability
-/// vary per RPC). The shared upstream observation is overlaid here so
-/// no handler reaches into the cache directly.
+/// capability version, and per-field unavailability vary per RPC). The shared
+/// upstream tip is overlaid here so no handler reaches into the cache directly.
+/// A response without a `chain_view` (no chain epoch resolved) cannot carry an
+/// upstream tip and is returned unchanged.
 pub(crate) async fn attach_upstream_observation(
     cache: &UpstreamObservationCache,
     mut freshness: ExplorerFreshness,
 ) -> ExplorerFreshness {
-    if let Some(snapshot) = cache.observe().await {
-        freshness.upstream = Some(upstream_observation_from_snapshot(&snapshot));
+    if let (Some(snapshot), Some(chain_view)) =
+        (cache.observe().await, freshness.chain_view.as_mut())
+    {
+        chain_view.upstream_tip = Some(upstream_tip_from_snapshot(&snapshot));
     }
     freshness
 }
 
-/// Reads the explorer's indexed head: the highest block the derive
-/// projections have fully materialized, decoded from the newest
-/// `BlockSummaryRecord`. Returns `None` when no block is materialized yet.
+/// Reads the explorer's indexed tip: the highest block the derive projections
+/// have fully materialized, decoded from the newest `BlockSummaryRecord`.
+/// Returns `None` when no block is materialized yet.
 ///
 /// All chain-event derive consumers advance under one shared cursor, so the
-/// block-summary head is an accurate indexed head for every capability.
-pub(crate) fn read_indexed_head(derive_store: &DeriveStore) -> Result<Option<IndexedHead>, Status> {
+/// block-summary head is an accurate indexed tip for every capability.
+pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<IndexedTip>, Status> {
     let Some((_, payload)) = derive_store
         .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
@@ -107,9 +105,11 @@ pub(crate) fn read_indexed_head(derive_store: &DeriveStore) -> Result<Option<Ind
         })?
         .summary
         .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
-    Ok(Some(IndexedHead {
-        height: summary.block_height,
-        hash: summary.block_hash,
+    Ok(Some(IndexedTip {
+        tip: Some(wallet::BlockTip {
+            height: summary.block_height,
+            hash: summary.block_hash,
+        }),
         block_time_unix_seconds: summary.block_time_unix_seconds,
     }))
 }
@@ -117,29 +117,41 @@ pub(crate) fn read_indexed_head(derive_store: &DeriveStore) -> Result<Option<Ind
 /// Builds the per-response [`ExplorerFreshness`] body shared by every read
 /// handler.
 ///
-/// Carries the canonical follower tip (`chain_epoch`) and the derive plane's
-/// indexed head (the block the response actually reflects); consumers read
-/// index lag as `chain_epoch.tip_height - indexed_head.height`. `derive_store`
-/// is optional so the bootstrap `ServerInfo` call and any response built
-/// before a derive store is wired leave `indexed_head` unset. The upstream
-/// observation is overlaid separately by [`attach_upstream_observation`].
+/// Assembles the cross-plane `chain_view` from the canonical follower tip
+/// (`chain_epoch`), the derive plane's indexed tip (the block the response
+/// actually reflects), and the persisted derive status. Consumers read index
+/// lag as `chain_view.chain_epoch.visible_tip.height -
+/// chain_view.indexed_tip.tip.height`. `derive_store` is optional so the
+/// bootstrap `ServerInfo` call and any response built before a derive store is
+/// wired leave `indexed_tip` and `derive` unset. The upstream tip is overlaid
+/// separately by [`attach_upstream_observation`]. A response with no resolved
+/// chain epoch leaves `chain_view` unset entirely.
 pub(crate) fn build_explorer_freshness(
     derive_store: Option<&DeriveStore>,
     capability_version: &str,
     chain_epoch: Option<wallet::ChainEpoch>,
     snapshot_age_millis: u64,
 ) -> Result<ExplorerFreshness, Status> {
-    let indexed_head = match derive_store {
-        Some(store) => read_indexed_head(store)?,
+    let chain_view = match chain_epoch {
+        Some(chain_epoch) => {
+            let (indexed_tip, derive) = match derive_store {
+                Some(store) => (read_indexed_tip(store)?, read_derive_status(Some(store))?),
+                None => (None, None),
+            };
+            Some(ChainView {
+                chain_epoch: Some(chain_epoch),
+                indexed_tip,
+                upstream_tip: None,
+                derive,
+            })
+        }
         None => None,
     };
     Ok(ExplorerFreshness {
-        chain_epoch,
+        chain_view,
         snapshot_age_millis,
         capability_version: capability_version.to_owned(),
         unavailable: Vec::new(),
-        upstream: None,
-        indexed_head,
     })
 }
 
@@ -225,23 +237,35 @@ mod tests {
     use super::*;
     use zinder_source::UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT;
 
-    fn synthetic_freshness() -> ExplorerFreshness {
+    fn synthetic_freshness(chain_view: Option<ChainView>) -> ExplorerFreshness {
         ExplorerFreshness {
-            chain_epoch: None,
+            chain_view,
             snapshot_age_millis: 0,
             capability_version: zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1
                 .to_owned(),
             unavailable: Vec::new(),
-            upstream: None,
-            indexed_head: None,
+        }
+    }
+
+    fn synthetic_chain_view() -> ChainView {
+        ChainView {
+            chain_epoch: Some(wallet::ChainEpoch::default()),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
         }
     }
 
     #[tokio::test]
     async fn attach_leaves_upstream_unset_when_probe_never_fired() {
         let cache = UpstreamObservationCache::empty();
-        let freshness = attach_upstream_observation(&cache, synthetic_freshness()).await;
-        assert!(freshness.upstream.is_none());
+        let freshness =
+            attach_upstream_observation(&cache, synthetic_freshness(Some(synthetic_chain_view())))
+                .await;
+        let upstream_tip = freshness
+            .chain_view
+            .and_then(|chain_view| chain_view.upstream_tip);
+        assert!(upstream_tip.is_none());
     }
 
     #[tokio::test]
@@ -255,13 +279,17 @@ mod tests {
                 Some(0.9943),
             ))
             .await;
-        let freshness = attach_upstream_observation(&cache, synthetic_freshness()).await;
-        let Some(upstream) = freshness.upstream else {
-            return Err("expected upstream observation");
+        let freshness =
+            attach_upstream_observation(&cache, synthetic_freshness(Some(synthetic_chain_view())))
+                .await;
+        let Some(upstream) = freshness
+            .chain_view
+            .and_then(|chain_view| chain_view.upstream_tip)
+        else {
+            return Err("expected upstream tip");
         };
-        assert_eq!(upstream.upstream_committed_tip_height, Some(2_530_000));
-        assert_eq!(upstream.upstream_estimated_tip_height, Some(2_544_375));
-        assert_eq!(upstream.upstream_verification_progress, Some(0.9943));
+        assert_eq!(upstream.committed_height, Some(2_530_000));
+        assert_eq!(upstream.estimated_height, Some(2_544_375));
         Ok(())
     }
 }

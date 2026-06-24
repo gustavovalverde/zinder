@@ -25,8 +25,8 @@ use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
-    StreamCursorTokenV1, chain_epoch_message, chain_event_envelope_message,
-    chain_event_stream_family_from_message, mempool_entry_message, mempool_event_envelope_message,
+    StreamCursorTokenV1, chain_event_envelope_message, chain_event_stream_family_from_message,
+    chain_view_message, mempool_entry_message, mempool_event_envelope_message,
     run_chain_event_stream, status_from_store_error, stream_cursor_from_message_bytes,
     transparent_mempool_output_message, transparent_mempool_spend_message,
     transparent_output_entry_message,
@@ -177,11 +177,8 @@ impl IngestControl for IngestControlGrpcAdapter {
                 // exposed through readiness, so the ingest-control proto keeps
                 // `WriterPhase::Unspecified` for this response.
                 Ok(Response::new(WriterStatusResponse {
+                    chain_view: chain_epoch.map(chain_view_message),
                     network_name: encode_zinder_native_chain_name(self.network).to_owned(),
-                    latest_writer_chain_epoch_id: chain_epoch.map(|epoch| epoch.id.value()),
-                    latest_writer_tip_height: chain_epoch.map(|epoch| epoch.tip_height.value()),
-                    latest_writer_safe_tip_height: chain_epoch
-                        .map(|epoch| epoch.safe_tip_height.value()),
                     phase: WriterPhase::Unspecified.into(),
                     gap_blocks: None,
                     upstream_not_ready: None,
@@ -257,7 +254,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             });
         record_mempool_snapshot_age_seconds(snapshot_age_millis);
         Ok(Response::new(wallet::MempoolSnapshotResponse {
-            chain_epoch: Some(zinder_store::chain_epoch_message(chain_epoch)),
+            chain_view: Some(zinder_store::chain_view_message(chain_epoch)),
             snapshot_sequence,
             snapshot_age_millis,
             entries,
@@ -303,7 +300,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             .collect();
         Ok(Response::new(
             wallet::TransparentMempoolOutputsByAddressResponse {
-                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                chain_view: Some(chain_view_message(chain_epoch)),
                 outputs,
             },
         ))
@@ -336,7 +333,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             .collect();
         Ok(Response::new(
             wallet::TransparentMempoolSpendsByOutpointResponse {
-                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                chain_view: Some(chain_view_message(chain_epoch)),
                 spends,
             },
         ))
@@ -369,7 +366,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             .collect();
         Ok(Response::new(
             wallet::TransparentOutputsByOutpointResponse {
-                chain_epoch: Some(chain_epoch_message(chain_epoch)),
+                chain_view: Some(chain_view_message(chain_epoch)),
                 entries,
             },
         ))
@@ -418,7 +415,7 @@ fn chain_value_pools_response(
     value_pools: ChainValuePools,
 ) -> wallet::ChainValuePoolsAtTipResponse {
     wallet::ChainValuePoolsAtTipResponse {
-        chain_epoch: Some(chain_epoch_message(chain_epoch)),
+        chain_view: Some(chain_view_message(chain_epoch)),
         pools: value_pools
             .pools
             .into_iter()

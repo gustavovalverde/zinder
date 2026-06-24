@@ -187,10 +187,21 @@ impl WriterStatusUpstream {
             });
         }
 
+        let chain_epoch = response
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch);
         let snapshot = WriterStatusSnapshot {
-            chain_epoch_id: response.latest_writer_chain_epoch_id.map(ChainEpochId::new),
-            tip_height: response.latest_writer_tip_height.map(BlockHeight::new),
-            safe_tip_height: response.latest_writer_safe_tip_height.map(BlockHeight::new),
+            chain_epoch_id: chain_epoch
+                .as_ref()
+                .map(|epoch| ChainEpochId::new(epoch.chain_epoch_id)),
+            tip_height: chain_epoch
+                .as_ref()
+                .and_then(|epoch| epoch.visible_tip.as_ref())
+                .map(|tip| BlockHeight::new(tip.height)),
+            safe_tip_height: chain_epoch
+                .as_ref()
+                .and_then(|epoch| epoch.settled_tip.as_ref())
+                .map(|tip| BlockHeight::new(tip.height)),
         };
         self.last_snapshot = Some(snapshot);
         self.last_fetched_at = Some(Instant::now());

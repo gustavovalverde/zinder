@@ -30,7 +30,7 @@ pub(crate) struct ExplorerConfig {
     pub(crate) wallet_query_endpoint: Option<String>,
     /// Resolved upstream node target. `None` when the operator did not
     /// configure `[node]`; the upstream-observation probe stays unspawned
-    /// and every `ExplorerFreshness.upstream` field is unset.
+    /// and every `ExplorerFreshness.chain_view.upstream_tip` field is unset.
     pub(crate) node: Option<NodeTarget>,
 }
 

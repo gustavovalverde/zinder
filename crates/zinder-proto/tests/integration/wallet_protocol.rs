@@ -19,8 +19,67 @@ fn chain_epoch_round_trips_through_prost() -> eyre::Result<()> {
 
     assert_eq!(decoded_chain_epoch.chain_epoch_id, 7);
     assert_eq!(decoded_chain_epoch.network_name, "zcash-regtest");
-    assert_eq!(decoded_chain_epoch.tip_hash, "11".repeat(32));
-    assert_eq!(decoded_chain_epoch.safe_tip_hash, "22".repeat(32));
+    let visible_tip = decoded_chain_epoch
+        .visible_tip
+        .ok_or_else(|| eyre!("visible_tip missing"))?;
+    let settled_tip = decoded_chain_epoch
+        .settled_tip
+        .ok_or_else(|| eyre!("settled_tip missing"))?;
+    assert_eq!(visible_tip.height, 42);
+    assert_eq!(visible_tip.hash, "11".repeat(32));
+    assert_eq!(settled_tip.height, 40);
+    assert_eq!(settled_tip.hash, "22".repeat(32));
+
+    Ok(())
+}
+
+#[test]
+fn chain_view_round_trips_through_prost() -> eyre::Result<()> {
+    let chain_view = wallet::ChainView {
+        chain_epoch: Some(synthetic_chain_epoch()),
+        indexed_tip: Some(wallet::IndexedTip {
+            tip: Some(wallet::BlockTip {
+                height: 41,
+                hash: "33".repeat(32),
+            }),
+            block_time_unix_seconds: 1_774_670_000,
+        }),
+        upstream_tip: Some(wallet::UpstreamTip {
+            committed_height: Some(42),
+            estimated_height: Some(44),
+        }),
+        derive: Some(wallet::DeriveStatus {
+            health: wallet::DeriveHealth::CatchingUp as i32,
+            indexed_height: 41,
+            lag_blocks: 1,
+            observed_at_millis: 1_774_670_400_000,
+        }),
+    };
+    let decoded = round_trip(&chain_view)?;
+
+    assert!(decoded.chain_epoch.is_some());
+    let indexed_tip = decoded
+        .indexed_tip
+        .ok_or_else(|| eyre!("indexed_tip missing"))?;
+    assert_eq!(
+        indexed_tip
+            .tip
+            .ok_or_else(|| eyre!("indexed tip missing"))?
+            .height,
+        41
+    );
+    let upstream_tip = decoded
+        .upstream_tip
+        .ok_or_else(|| eyre!("upstream_tip missing"))?;
+    assert_eq!(upstream_tip.committed_height, Some(42));
+    assert_eq!(upstream_tip.estimated_height, Some(44));
+    assert_eq!(
+        decoded
+            .derive
+            .ok_or_else(|| eyre!("derive missing"))?
+            .indexed_height,
+        41
+    );
 
     Ok(())
 }
@@ -62,7 +121,7 @@ fn subtree_root_round_trips_through_prost() -> eyre::Result<()> {
 #[test]
 fn latest_block_response_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::LatestBlockResponse {
-        chain_epoch: Some(synthetic_chain_epoch()),
+        chain_view: Some(synthetic_chain_view()),
         latest_block: Some(wallet::BlockMetadata {
             height: 42,
             block_hash: "55".repeat(32),
@@ -75,7 +134,7 @@ fn latest_block_response_round_trips_through_prost() -> eyre::Result<()> {
 
     assert_eq!(latest_block.height, 42);
     assert_eq!(latest_block.block_hash, "55".repeat(32));
-    assert!(decoded_response.chain_epoch.is_some());
+    assert!(decoded_response.chain_view.is_some());
 
     Ok(())
 }
@@ -160,10 +219,8 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 #[test]
 fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
     let response = ingest::WriterStatusResponse {
+        chain_view: Some(synthetic_chain_view()),
         network_name: "zcash-regtest".to_owned(),
-        latest_writer_chain_epoch_id: Some(9),
-        latest_writer_tip_height: Some(42),
-        latest_writer_safe_tip_height: Some(40),
         phase: ingest::WriterPhase::FollowingTip.into(),
         gap_blocks: Some(1),
         upstream_not_ready: Some(ops::UpstreamNotReadyDetail {
@@ -177,9 +234,26 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
     let decoded_response = round_trip(&response)?;
 
     assert_eq!(decoded_response.network_name, "zcash-regtest");
-    assert_eq!(decoded_response.latest_writer_chain_epoch_id, Some(9));
-    assert_eq!(decoded_response.latest_writer_tip_height, Some(42));
-    assert_eq!(decoded_response.latest_writer_safe_tip_height, Some(40));
+    let decoded_chain_epoch = decoded_response
+        .chain_view
+        .clone()
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre!("chain_view.chain_epoch missing"))?;
+    assert_eq!(decoded_chain_epoch.chain_epoch_id, 7);
+    assert_eq!(
+        decoded_chain_epoch
+            .visible_tip
+            .ok_or_else(|| eyre!("visible_tip missing"))?
+            .height,
+        42
+    );
+    assert_eq!(
+        decoded_chain_epoch
+            .settled_tip
+            .ok_or_else(|| eyre!("settled_tip missing"))?
+            .height,
+        40
+    );
     assert_eq!(decoded_response.phase(), ingest::WriterPhase::FollowingTip);
     assert_eq!(decoded_response.gap_blocks, Some(1));
     let detail = decoded_response
@@ -200,10 +274,8 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
         ingest::WriterPhase::FollowingTip,
     ] {
         let response = ingest::WriterStatusResponse {
+            chain_view: None,
             network_name: "zcash-regtest".to_owned(),
-            latest_writer_chain_epoch_id: None,
-            latest_writer_tip_height: None,
-            latest_writer_safe_tip_height: None,
             phase: phase.into(),
             gap_blocks: None,
             upstream_not_ready: None,
@@ -218,7 +290,7 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
 #[test]
 fn tree_state_checkpoint_response_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::TreeStateResponse {
-        chain_epoch: Some(synthetic_chain_epoch()),
+        chain_view: Some(synthetic_chain_view()),
         height: 42,
         block_hash: "66".repeat(32),
         payload_bytes: br#"{"hash":"block"}"#.to_vec(),
@@ -228,7 +300,7 @@ fn tree_state_checkpoint_response_round_trips_through_prost() -> eyre::Result<()
     assert_eq!(decoded_response.height, 42);
     assert_eq!(decoded_response.block_hash, "66".repeat(32));
     assert_eq!(decoded_response.payload_bytes, br#"{"hash":"block"}"#);
-    assert!(decoded_response.chain_epoch.is_some());
+    assert!(decoded_response.chain_view.is_some());
 
     Ok(())
 }
@@ -275,7 +347,7 @@ fn transaction_id_wire_field_carries_rpc_form_hex() -> eyre::Result<()> {
 /// Locks the wallet-plane block-hash wire-shape contract.
 ///
 /// Two responses carry block hashes on different wire shapes
-/// (`ChainEpoch.tip_hash` and `BlockMetadata.block_hash`); both must
+/// (`ChainEpoch.visible_tip.hash` and `BlockMetadata.block_hash`); both must
 /// encode the canonical RPC form so the consumer can compare strings
 /// byte-for-byte without knowing which response produced the field.
 #[test]
@@ -305,14 +377,27 @@ fn synthetic_chain_epoch() -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: 7,
         network_name: "zcash-regtest".to_owned(),
-        tip_height: 42,
-        tip_hash: "11".repeat(32),
-        safe_tip_height: 40,
-        safe_tip_hash: "22".repeat(32),
         artifact_schema_version: 1,
         created_at_millis: 1_774_670_400_000,
+        visible_tip: Some(wallet::BlockTip {
+            height: 42,
+            hash: "11".repeat(32),
+        }),
+        settled_tip: Some(wallet::BlockTip {
+            height: 40,
+            hash: "22".repeat(32),
+        }),
         sapling_commitment_tree_size: 0,
         orchard_commitment_tree_size: 0,
+    }
+}
+
+fn synthetic_chain_view() -> wallet::ChainView {
+    wallet::ChainView {
+        chain_epoch: Some(synthetic_chain_epoch()),
+        indexed_tip: None,
+        upstream_tip: None,
+        derive: None,
     }
 }
 

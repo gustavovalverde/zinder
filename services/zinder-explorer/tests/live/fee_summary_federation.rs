@@ -194,7 +194,11 @@ fn assert_fee_summary_shape(response: &FeeSummaryResponse, requested_blocks: u32
         .ok_or_else(|| eyre!("FeeSummary response missing freshness"))?;
     assert_eq!(freshness.capability_version, EXPLORER_FEE_SUMMARY_V1);
     assert!(
-        freshness.chain_epoch.is_some(),
+        freshness
+            .chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+            .is_some(),
         "fee summary freshness must carry a chain epoch",
     );
     assert!(

@@ -206,7 +206,7 @@ fn spawn_upstream_observation_probe(
         tracing::info!(
             target: "zinder::explorer",
             event = "upstream_observation_probe_skipped",
-            reason = "no [node] section configured; ExplorerFreshness.upstream stays unset",
+            reason = "no [node] section configured; ExplorerFreshness.chain_view.upstream_tip stays unset",
         );
         return Ok(None);
     };

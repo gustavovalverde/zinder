@@ -112,8 +112,9 @@ async fn ingest_control_serves_mempool_snapshot_and_events() -> Result<()> {
         .await?
         .into_inner();
     let chain_epoch_in_response = snapshot
-        .chain_epoch
-        .ok_or_else(|| eyre::eyre!("snapshot.chain_epoch is missing"))?;
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre::eyre!("snapshot.chain_view.chain_epoch is missing"))?;
     assert_eq!(chain_epoch_in_response.network_name, "zcash-regtest");
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.snapshot_sequence, 2);
@@ -951,7 +952,7 @@ async fn ingest_control_serves_transparent_mempool_outputs_by_outpoint() -> Resu
         .await?
         .into_inner();
 
-    assert!(response.chain_epoch.is_some());
+    assert!(response.chain_view.is_some());
     assert_eq!(response.entries.len(), 3);
     let known_prevout = response.entries[0]
         .output

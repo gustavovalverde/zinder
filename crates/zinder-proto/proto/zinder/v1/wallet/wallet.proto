@@ -4,6 +4,19 @@ package zinder.v1.wallet;
 
 import "zinder/v1/ops/server_info.proto";
 
+// One named chain height with the block hash at that height.
+//
+// Reused for every `{role}_tip` in the chain-view family (`visible_tip`,
+// `settled_tip`, `indexed_tip`) so the height/hash pairing has one shape.
+message BlockTip {
+  // Block height for this tip.
+  uint32 height = 1;
+
+  // Block hash at `height` in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string hash = 2;
+}
+
 // A visible, internally consistent chain snapshot used to answer a wallet
 // query.
 message ChainEpoch {
@@ -13,34 +26,108 @@ message ChainEpoch {
   // Stable public network name, such as "zcash-regtest".
   string network_name = 2;
 
-  // Best visible tip height for this chain epoch.
-  uint32 tip_height = 3;
-
-  // Best visible tip block hash in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string tip_hash = 4;
-
-  // Highest block height in this chain epoch for which both compact-block
-  // and commitment-tree artifacts are coherent past the reorg window. The
-  // wallet uses this as its scan ceiling; see ADR-0005 in the zally repo.
-  uint32 safe_tip_height = 5;
-
-  // Block hash at safe_tip_height in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string safe_tip_hash = 6;
-
   // Durable artifact schema version used by artifacts in this chain epoch.
-  uint32 artifact_schema_version = 7;
+  uint32 artifact_schema_version = 3;
 
   // Zinder wall-clock creation time for this chain epoch.
-  uint64 created_at_millis = 8;
+  uint64 created_at_millis = 4;
+
+  // Best visible block in this chain epoch.
+  BlockTip visible_tip = 5;
+
+  // Highest block in this chain epoch for which both compact-block and
+  // commitment-tree artifacts are coherent past the reorg window. The wallet
+  // uses this as its scan ceiling; see ADR-0005 in the zally repo. Carries the
+  // exact reorg-window semantics the prior `safe_tip_*` fields did.
+  BlockTip settled_tip = 6;
 
   // Sapling note commitment tree size at the visible tip. Wallets use this to
   // derive completed subtree counts without decoding compact-block payloads.
-  uint32 sapling_commitment_tree_size = 9;
+  uint32 sapling_commitment_tree_size = 7;
 
   // Orchard note commitment tree size at the visible tip.
-  uint32 orchard_commitment_tree_size = 10;
+  uint32 orchard_commitment_tree_size = 8;
+}
+
+// Highest block the derive projections have fully materialized.
+//
+// Distinct from the canonical chain tip on `ChainEpoch`: the derive plane
+// replays canonical chain events asynchronously and trails the canonical tip
+// while catching up. This is the height every derive-backed read response can
+// actually answer for.
+message IndexedTip {
+  // Materialized block tip.
+  BlockTip tip = 1;
+
+  // Header time of the materialized block; lets consumers show the real age
+  // of the data without a second lookup.
+  int64 block_time_unix_seconds = 2;
+}
+
+// The upstream node's view of the chain.
+//
+// The upstream probe has no single block hash, so this carries heights only.
+// Both fields are optional because the source-plane probe is async; a response
+// that fires before the first probe leaves them unset. Consumers MUST treat an
+// absent value as "unknown", not zero.
+message UpstreamTip {
+  // Highest block height the upstream node has locally committed (Zebra's
+  // `blocks` from `getblockchaininfo`).
+  optional uint32 committed_height = 1;
+
+  // Highest block height the upstream node estimates exists on the network
+  // (Zebra's `estimatedheight`). Always `>= committed_height`. Use this as the
+  // denominator for sync-progress UI.
+  optional uint32 estimated_height = 2;
+}
+
+// Cross-plane chain-state envelope carried at field tag 1 on every
+// `WalletQuery`, `ExplorerQuery`, and `IngestControl` read response.
+//
+// Folds the epoch identity, the reorg-vs-replay tips, the upstream view, and
+// the derive-plane status into one shape so a consumer reads chain state the
+// same way on every surface. See ADR-0011.
+message ChainView {
+  // Chain epoch this response was produced from.
+  ChainEpoch chain_epoch = 1;
+
+  // Derive-replay ceiling. Optional because responses that do not read the
+  // derive store, and cold starts before the first materialized block, leave
+  // it unset. Absent means "unknown", never "at tip".
+  optional IndexedTip indexed_tip = 2;
+
+  // Upstream node's view of the chain at response-construction time. Optional
+  // because the source-plane probe is async; an early response may fire before
+  // the first probe completes.
+  optional UpstreamTip upstream_tip = 3;
+
+  // Derive-plane status. Absent on responses that are not derive-backed.
+  optional DeriveStatus derive = 4;
+}
+
+// Derive-plane lifecycle. Separates a derive plane that is healthily catching
+// up from one that has stalled, which a block-count lag alone cannot express.
+enum DeriveHealth {
+  DERIVE_HEALTH_UNSPECIFIED = 0;
+  // Indexed tip is at the canonical tip; reads reflect the latest block.
+  DERIVE_HEALTH_LIVE = 1;
+  // Replay is advancing but the indexed tip is behind the canonical tip.
+  DERIVE_HEALTH_CATCHING_UP = 2;
+  // Replay is paused (e.g. memory pressure); the indexed tip is frozen and
+  // will not advance until the pause clears. Reads serve historical data.
+  DERIVE_HEALTH_PAUSED = 3;
+}
+
+// Operator-facing derive-plane summary.
+//
+// Written by the ingest plane and surfaced on `ChainView.derive` and
+// `ExplorerServerInfo`. The `observed_at_millis` stamp lets a consumer detect a
+// status record that has itself gone stale (ingest stopped writing it).
+message DeriveStatus {
+  DeriveHealth health = 1;
+  uint32 indexed_height = 2;
+  uint64 lag_blocks = 3;
+  uint64 observed_at_millis = 4;
 }
 
 // Metadata for one block.
@@ -55,8 +142,8 @@ message BlockMetadata {
 
 // Latest visible block metadata response bound to one chain epoch.
 message LatestBlockResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Latest visible block in this chain epoch.
   BlockMetadata latest_block = 2;
@@ -69,14 +156,14 @@ message LatestBlockRequest {
   optional ChainEpoch at_epoch = 1;
 }
 
-// Safe-tip block metadata response bound to one chain epoch. Returns the
-// block at the chain epoch's safe_tip_height, which the wallet uses as its
-// scan ceiling.
+// Settled-tip block metadata response bound to one chain epoch. Returns the
+// block at the chain epoch's settled_tip, which the wallet uses as its scan
+// ceiling.
 message LatestSafeBlockResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
-  // Block at chain_epoch.safe_tip_height.
+  // Block at chain_view.chain_epoch.settled_tip.height.
   BlockMetadata safe_tip_block = 2;
 }
 
@@ -116,8 +203,8 @@ message BlockIdBySelectorRequest {
 
 // Block-identity resolver response bound to one chain epoch.
 message BlockIdResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Resolved block identity in the canonical best chain.
   BlockMetadata block_id = 2;
@@ -157,8 +244,8 @@ message BlockHeaderInfo {
 
 // Block-header read response bound to one chain epoch.
 message BlockHeaderResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Block-header read-model value at the resolved selector.
   BlockHeaderInfo block_header = 2;
@@ -206,8 +293,8 @@ message CompactBlockRequest {
 
 // Single compact block response bound to one chain epoch.
 message CompactBlockResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Compact block at the requested height.
   CompactBlock compact_block = 2;
@@ -244,10 +331,11 @@ message TransactionLocation {
 // Mined-transaction enrichment bound to a response's chain epoch.
 //
 // `MinedDetails` is response-shape, not artifact-shape. `confirmations`
-// MUST be computed from the response's `chain_epoch.tip_height` and the
-// transaction's mined height; `consensus_branch_id` and `block_time` are
-// derived from the source-aware layer that owns Zcash consensus
-// parameters and block-header parsing.
+// MUST be computed from the response's
+// `chain_view.chain_epoch.visible_tip.height` and the transaction's mined
+// height; `consensus_branch_id` and `block_time` are derived from the
+// source-aware layer that owns Zcash consensus parameters and block-header
+// parsing.
 message MinedDetails {
   // Consensus branch identifier in effect at the mined height.
   uint32 consensus_branch_id = 1;
@@ -255,8 +343,8 @@ message MinedDetails {
   // Block-time as Unix seconds, taken from the mined block header.
   int64 block_time = 2;
 
-  // Confirmations: tip_height - mined_height + 1, bound to the
-  // response's chain_epoch.
+  // Confirmations: visible_tip.height - mined_height + 1, bound to the
+  // response's chain epoch.
   uint32 confirmations = 3;
 }
 
@@ -292,7 +380,7 @@ message ConflictingChainTransaction {
 // because typed errors do not consume oneof slots.
 message TransactionStatusResponse {
   // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  ChainView chain_view = 1;
 
   // Typed transaction status.
   oneof status {
@@ -309,8 +397,8 @@ message TransactionStatusResponse {
 
 // Streamed compact block range chunk bound to one chain epoch.
 message CompactBlockRangeChunk {
-  // Chain epoch used for this compact block.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Compact block at the next requested height.
   CompactBlock compact_block = 2;
@@ -337,8 +425,8 @@ message LatestTreeStateCheckpointRequest {
 
 // Checkpoint tree-state response bound to one chain epoch.
 message TreeStateResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Height this tree state belongs to.
   uint32 height = 2;
@@ -401,8 +489,8 @@ message SubtreeRoot {
 
 // Subtree-root range response bound to one chain epoch.
 message SubtreeRootsResponse {
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Shielded protocol returned.
   ShieldedProtocol shielded_protocol = 2;
@@ -745,8 +833,8 @@ message MempoolSnapshotRequest {
 
 // Snapshot response bound to one chain epoch.
 message MempoolSnapshotResponse {
-  // Chain epoch visible at snapshot time.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Monotonic snapshot sequence reported by the server.
   uint64 snapshot_sequence = 2;
@@ -777,8 +865,8 @@ message TransparentMempoolOutputsByAddressRequest {
 // Response for [`TransparentMempoolOutputsByAddress`] bound to the chain
 // epoch visible at lookup time.
 message TransparentMempoolOutputsByAddressResponse {
-  // Chain epoch visible at lookup time.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Unmined transparent outputs that fund the queried address, in
   // canonical `(transaction_id, output_index)` order.
@@ -796,8 +884,8 @@ message TransparentMempoolSpendsByOutpointRequest {
 // Response for [`TransparentMempoolSpendsByOutpoint`] bound to the chain
 // epoch visible at lookup time.
 message TransparentMempoolSpendsByOutpointResponse {
-  // Chain epoch visible at lookup time.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Mempool spends found for the requested outpoints. Outpoints with no
   // unmined spend emit no entry; consumers key results by
@@ -846,9 +934,9 @@ message TransparentOutputsByOutpointRequest {
 
 // Response for [`TransparentOutputsByOutpoint`] bound to one chain epoch.
 message TransparentOutputsByOutpointResponse {
-  // Chain epoch the response binds to. Every entry's `prevout` (when
-  // present) is visible at this epoch.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Every entry's `prevout` (when present) is visible at this epoch.
+  ChainView chain_view = 1;
 
   // Per-outpoint resolution result, in input order. Length matches the
   // request's `outpoints` length after server-side truncation.
@@ -994,9 +1082,9 @@ message TransparentAddressUnspentOutputsRequest {
 // One unspent transparent output streamed by
 // [`TransparentAddressUnspentOutputs`].
 message TransparentUnspentOutput {
-  // Chain epoch pinned for the entire stream. Identical on every message
-  // of one response stream.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope pinned for the entire stream (ADR-0011,
+  // field tag 1). Identical on every message of one response stream.
+  ChainView chain_view = 1;
 
   // SHA-256 of the transparent address scriptPubKey.
   bytes address_script_hash = 2;
@@ -1039,18 +1127,18 @@ message TransparentAddressBalanceRequest {
 // the compatibility boundary. Named `*Response` to match the rest of
 // `wallet.proto` and avoid a name collision with the same-named RPC.
 message TransparentAddressBalanceResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
+
   // Sum of unspent canonical outputs at the requested addresses.
-  uint64 confirmed_zat = 1;
+  uint64 confirmed_zat = 2;
 
   // Signed mempool delta: pending inflows minus pending outflows. Negative
   // when pending outflows exceed pending inflows.
-  int64 unconfirmed_delta_zat = 2;
+  int64 unconfirmed_delta_zat = 3;
 
   // Number of transparent addresses summarized by this response.
-  uint32 address_count = 3;
-
-  // Chain epoch used to answer this response.
-  ChainEpoch chain_epoch = 4;
+  uint32 address_count = 4;
 }
 
 // One upstream `getblockchaininfo.valuePools` entry.
@@ -1073,9 +1161,9 @@ message ChainValuePoolsAtTipRequest {}
 
 // Wallet-plane response for chain-wide value-pool totals.
 message ChainValuePoolsAtTipResponse {
-  // Chain epoch visible to Zinder when the upstream value-pool read was
-  // answered.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Visible to Zinder when the upstream value-pool read was answered.
+  ChainView chain_view = 1;
 
   // Upstream value-pool entries, preserved in upstream order so unknown
   // future pools can flow through without a wire-shape change.
@@ -1113,8 +1201,8 @@ message TransparentAddressTxIdsInRangeRequest {
 
 // One streamed transparent-address tx-history chunk.
 message TransparentAddressTxIdsChunk {
-  // Chain epoch used for this chunk.
-  ChainEpoch chain_epoch = 1;
+  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
 
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.

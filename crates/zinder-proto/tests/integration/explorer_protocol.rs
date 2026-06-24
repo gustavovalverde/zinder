@@ -6,70 +6,103 @@
 use eyre::eyre;
 use prost::Message;
 use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
-use zinder_proto::v1::explorer;
+use zinder_proto::v1::{explorer, wallet};
 
 #[test]
-fn upstream_observation_round_trips_through_prost() -> eyre::Result<()> {
-    let observation = explorer::UpstreamObservation {
-        upstream_committed_tip_height: Some(2_530_000),
-        upstream_estimated_tip_height: Some(2_544_375),
-        upstream_verification_progress: Some(0.9943),
+fn upstream_tip_round_trips_through_prost() -> eyre::Result<()> {
+    let upstream_tip = wallet::UpstreamTip {
+        committed_height: Some(2_530_000),
+        estimated_height: Some(2_544_375),
     };
-    let decoded = round_trip(&observation)?;
+    let decoded = round_trip(&upstream_tip)?;
 
-    assert_eq!(decoded.upstream_committed_tip_height, Some(2_530_000));
-    assert_eq!(decoded.upstream_estimated_tip_height, Some(2_544_375));
-    assert_eq!(decoded.upstream_verification_progress, Some(0.9943));
+    assert_eq!(decoded.committed_height, Some(2_530_000));
+    assert_eq!(decoded.estimated_height, Some(2_544_375));
     Ok(())
 }
 
 #[test]
-fn upstream_observation_optional_fields_default_to_none() -> eyre::Result<()> {
-    let observation = explorer::UpstreamObservation::default();
-    let decoded = round_trip(&observation)?;
+fn upstream_tip_optional_fields_default_to_none() -> eyre::Result<()> {
+    let upstream_tip = wallet::UpstreamTip::default();
+    let decoded = round_trip(&upstream_tip)?;
 
-    assert!(decoded.upstream_committed_tip_height.is_none());
-    assert!(decoded.upstream_estimated_tip_height.is_none());
-    assert!(decoded.upstream_verification_progress.is_none());
+    assert!(decoded.committed_height.is_none());
+    assert!(decoded.estimated_height.is_none());
     Ok(())
 }
 
 #[test]
-fn explorer_freshness_carries_optional_upstream_observation() -> eyre::Result<()> {
+fn explorer_freshness_carries_chain_view_with_every_axis() -> eyre::Result<()> {
     let freshness = explorer::ExplorerFreshness {
-        chain_epoch: None,
-        snapshot_age_millis: 0,
-        capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
-        unavailable: Vec::new(),
-        indexed_head: None,
-        upstream: Some(explorer::UpstreamObservation {
-            upstream_committed_tip_height: Some(2_530_000),
-            upstream_estimated_tip_height: Some(2_544_375),
-            upstream_verification_progress: Some(0.9943),
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(wallet::ChainEpoch::default()),
+            indexed_tip: Some(wallet::IndexedTip {
+                tip: Some(wallet::BlockTip {
+                    height: 2_529_999,
+                    hash: "11".repeat(32),
+                }),
+                block_time_unix_seconds: 1_774_670_000,
+            }),
+            upstream_tip: Some(wallet::UpstreamTip {
+                committed_height: Some(2_530_000),
+                estimated_height: Some(2_544_375),
+            }),
+            derive: Some(wallet::DeriveStatus {
+                health: wallet::DeriveHealth::CatchingUp as i32,
+                indexed_height: 2_529_999,
+                lag_blocks: 1,
+                observed_at_millis: 1_774_670_400_000,
+            }),
         }),
-    };
-    let decoded = round_trip(&freshness)?;
-
-    let upstream = decoded.upstream.ok_or_else(|| eyre!("upstream not set"))?;
-    assert_eq!(upstream.upstream_committed_tip_height, Some(2_530_000));
-    assert_eq!(upstream.upstream_estimated_tip_height, Some(2_544_375));
-    assert_eq!(upstream.upstream_verification_progress, Some(0.9943));
-    Ok(())
-}
-
-#[test]
-fn explorer_freshness_omits_upstream_when_probe_has_not_fired() -> eyre::Result<()> {
-    let freshness = explorer::ExplorerFreshness {
-        chain_epoch: None,
         snapshot_age_millis: 0,
         capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
         unavailable: Vec::new(),
-        indexed_head: None,
-        upstream: None,
     };
     let decoded = round_trip(&freshness)?;
 
-    assert!(decoded.upstream.is_none());
+    let chain_view = decoded
+        .chain_view
+        .ok_or_else(|| eyre!("chain_view not set"))?;
+    let upstream = chain_view
+        .upstream_tip
+        .ok_or_else(|| eyre!("upstream_tip not set"))?;
+    assert_eq!(upstream.committed_height, Some(2_530_000));
+    assert_eq!(upstream.estimated_height, Some(2_544_375));
+    let indexed_tip = chain_view
+        .indexed_tip
+        .ok_or_else(|| eyre!("indexed_tip not set"))?;
+    assert_eq!(
+        indexed_tip
+            .tip
+            .ok_or_else(|| eyre!("indexed tip missing"))?
+            .height,
+        2_529_999
+    );
+    Ok(())
+}
+
+/// An absent `indexed_tip` means "derive head unknown", never "at tip"; the
+/// proto3 optional message survives the round trip as `None`.
+#[test]
+fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
+    let freshness = explorer::ExplorerFreshness {
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(wallet::ChainEpoch::default()),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }),
+        snapshot_age_millis: 0,
+        capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
+        unavailable: Vec::new(),
+    };
+    let decoded = round_trip(&freshness)?;
+
+    let chain_view = decoded
+        .chain_view
+        .ok_or_else(|| eyre!("chain_view not set"))?;
+    assert!(chain_view.indexed_tip.is_none());
+    assert!(chain_view.upstream_tip.is_none());
     Ok(())
 }
 

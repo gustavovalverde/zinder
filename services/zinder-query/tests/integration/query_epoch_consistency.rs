@@ -92,7 +92,8 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
 
     let response = latest_block_response(&wallet_query, None).await?;
     let response_chain_epoch = response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
     let latest_block = response
         .latest_block
@@ -139,7 +140,8 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
 
     let response = tree_state_at_response(&wallet_query, first_tree_state.height, None).await?;
     let response_chain_epoch = response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
@@ -184,7 +186,8 @@ async fn latest_tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_cu
 
     let response = latest_tree_state_checkpoint_response(&wallet_query, None).await?;
     let response_chain_epoch = response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
@@ -238,7 +241,8 @@ async fn subtree_roots_response_stays_bound_to_reader_epoch_if_current_epoch_adv
     )
     .await?;
     let response_chain_epoch = response
-        .chain_epoch
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());

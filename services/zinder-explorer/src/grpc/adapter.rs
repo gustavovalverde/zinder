@@ -210,7 +210,7 @@ impl ExplorerQueryGrpcAdapter {
     ///
     /// Returns the spawned [`JoinHandle`]: the caller (binary entry point)
     /// awaits or drops it during shutdown. Without this call the cache
-    /// stays empty and every `ExplorerFreshness.upstream` field is `None`;
+    /// stays empty and every `chain_view.upstream_tip` axis is `None`;
     /// that is the documented "probe has not fired yet" state per
     /// ADR-0011.
     #[must_use]
@@ -285,7 +285,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
         // ServerInfo carries the standard ExplorerFreshness envelope per
-        // ADR-0011 so consumers can read `freshness.upstream` from the
+        // ADR-0011 so consumers can read `chain_view.upstream_tip` from the
         // bootstrap call, before any derive-backed capability is up.
         // During `bulk_catchup` this is the only explorer response that
         // is guaranteed to succeed; sync-progress UIs depend on it for
@@ -781,10 +781,15 @@ async fn compute_transparent_address_balance(
         ExplorerError::internal("WalletQuery did not return a chain epoch for any address")
     })?;
     Ok(TransparentAddressBalanceResponse {
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(chain_epoch),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }),
         confirmed_zat: accumulator.confirmed_zat,
         unconfirmed_delta_zat: accumulator.unconfirmed_delta_zat,
         address_count,
-        chain_epoch: Some(chain_epoch),
     })
 }
 
@@ -806,7 +811,9 @@ async fn accumulate_address_balance(
         .into_inner();
     while let Some(output) = outputs_stream.message().await? {
         if accumulator.chain_epoch.is_none() {
-            accumulator.chain_epoch.clone_from(&output.chain_epoch);
+            accumulator.chain_epoch = output
+                .chain_view
+                .and_then(|chain_view| chain_view.chain_epoch);
         }
         accumulator.confirmed_zat = accumulator.confirmed_zat.saturating_add(output.value_zat);
         let outpoint = output.outpoint.ok_or_else(|| {
@@ -830,9 +837,10 @@ async fn accumulate_address_balance(
         .await?
         .into_inner();
     if accumulator.chain_epoch.is_none() {
-        accumulator
-            .chain_epoch
-            .clone_from(&mempool_outputs.chain_epoch);
+        accumulator.chain_epoch = mempool_outputs
+            .chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.clone());
     }
     for output in &mempool_outputs.outputs {
         accumulator.unconfirmed_delta_zat = accumulator

@@ -196,7 +196,11 @@ fn assert_summary_freshness(response: &MempoolSummaryResponse) -> Result<()> {
         .ok_or_else(|| eyre!("MempoolSummary response missing freshness"))?;
     assert_eq!(freshness.capability_version, EXPLORER_MEMPOOL_SUMMARY_V1);
     assert!(
-        freshness.chain_epoch.is_some(),
+        freshness
+            .chain_view
+            .as_ref()
+            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+            .is_some(),
         "summary freshness must carry a chain epoch",
     );
     // When the snapshot is empty the totals are zero and the privacy
