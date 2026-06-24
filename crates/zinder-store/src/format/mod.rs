@@ -25,10 +25,12 @@ pub(crate) use artifact_envelope::{
     ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, PayloadFormat,
 };
 pub(crate) use store_key::StoreKey;
-pub(crate) use stream_cursor::ChainEventCursorAnchor;
 pub use stream_cursor::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
     StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
     TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
+};
+pub(crate) use stream_cursor::{
+    CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator,
 };

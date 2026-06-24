@@ -408,6 +408,128 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Commits a two-block initial chain as separate epochs and returns the
+/// height-2 cursor.
+///
+/// Heights 1 and 2 commit under safe tip 1. The returned read-path cursor at
+/// height 2 carries an enriched locator over heights 2 and 1, so a reorg of
+/// height 2 resolves the fork at height 1.
+fn commit_reorgable_chain_and_cursor(
+    store: &PrimaryChainStore,
+) -> eyre::Result<StreamCursorTokenV1> {
+    let (first_epoch, first_block, first_compact_block) =
+        synthetic_epoch_with_safe_tip(1, 1, 1, block_hash(1));
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        first_epoch,
+        vec![first_block],
+        vec![first_compact_block],
+    ))?;
+    let (second_epoch, second_block, second_compact_block) =
+        synthetic_epoch_with_safe_tip(2, 2, 1, block_hash(2));
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        second_epoch,
+        vec![second_block],
+        vec![second_compact_block],
+    ))?;
+
+    let page = store.chain_event_history(ChainEventHistoryRequest::new(
+        None,
+        NonZeroU32::new(2).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    Ok(page
+        .get(1)
+        .ok_or_else(|| eyre!("expected a height-2 event"))?
+        .cursor
+        .clone())
+}
+
+/// Commits the reorg that replaces height 2, optionally stamping the
+/// replacement epoch with a distinct creation time for retention separation.
+fn commit_height_two_reorg(
+    store: &PrimaryChainStore,
+    created_at: UnixTimestampMillis,
+) -> eyre::Result<()> {
+    let (mut replacement_epoch, replacement_block, replacement_compact_block) =
+        synthetic_epoch_with_safe_tip(3, 2, 1, block_hash(20));
+    replacement_epoch.created_at = created_at;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            replacement_epoch,
+            vec![replacement_block],
+            vec![replacement_compact_block],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(2),
+        }),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn within_retention_reorg_reconnect_replays_the_real_reorg() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let cursor = commit_reorgable_chain_and_cursor(&store)?;
+    commit_height_two_reorg(&store, UnixTimestampMillis::new(1_774_668_300_000))?;
+
+    // Resume from the pre-reorg cursor while its event row is still retained:
+    // the real ChainReorged at the next sequence replays, with no synthesis.
+    let resumed = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    assert_eq!(resumed.len(), 1);
+    let reorg = resumed.first().ok_or_else(|| eyre!("expected one event"))?;
+    assert_eq!(reorg.event_sequence, 3);
+    assert!(matches!(reorg.event, ChainEvent::ChainReorged { .. }));
+
+    Ok(())
+}
+
+#[test]
+fn past_retention_reorg_reconnect_synthesizes_a_reorg() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let cursor = commit_reorgable_chain_and_cursor(&store)?;
+    commit_height_two_reorg(&store, UnixTimestampMillis::new(1_774_668_300_000))?;
+
+    // Prune every event older than the reorg so the pre-reorg events are gone
+    // and only the reorg event at sequence 3 remains retained.
+    let report = store.prune_chain_events_before(UnixTimestampMillis::new(1_774_668_300_000))?;
+    assert_eq!(report.oldest_retained_sequence, Some(3));
+
+    // The pre-reorg cursor's branch is reorged out and its event row is gone.
+    // The locator resolves the fork point at height 1, so the server injects a
+    // synthetic ChainReorged ahead of the retained reorg event.
+    let resumed = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+
+    let synthetic = resumed.first().ok_or_else(|| eyre!("expected events"))?;
+    let ChainEvent::ChainReorged { reverted, .. } = &synthetic.event else {
+        return Err(eyre!(
+            "expected a synthetic ChainReorged first, got {synthetic:?}"
+        ));
+    };
+    assert_eq!(reverted.block_range.start, BlockHeight::new(2));
+    assert_eq!(reverted.block_range.end, BlockHeight::new(2));
+
+    // The synthetic envelope carries the consumer's own cursor, so a reconnect
+    // that has not yet applied the reorg recomputes the identical recovery.
+    let replayed = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&synthetic.cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    let replayed_first = replayed.first().ok_or_else(|| eyre!("expected events"))?;
+    assert!(matches!(
+        replayed_first.event,
+        ChainEvent::ChainReorged { .. }
+    ));
+
+    Ok(())
+}
+
 fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: ChainEpoch) {
     assert_eq!(event_envelope.event_sequence, 1);
     assert_eq!(event_envelope.chain_epoch, chain_epoch);

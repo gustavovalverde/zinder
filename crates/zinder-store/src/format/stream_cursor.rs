@@ -6,7 +6,11 @@ use sha2::Sha256;
 use thiserror::Error;
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
-/// Fixed byte length of a [`StreamCursorTokenV1`].
+/// Fixed byte length of a fixed-body [`StreamCursorTokenV1`].
+///
+/// Mempool, transparent-history, and address-output cursors are exactly this
+/// long. Chain-event cursors append a variable-length locator after the fixed
+/// body, so their length grows with the number of locator entries.
 pub const STREAM_CURSOR_TOKEN_V1_LEN: usize = 82;
 
 const STREAM_CURSOR_SCHEMA_VERSION: u8 = 1;
@@ -14,6 +18,17 @@ const STREAM_FAMILY_MASK: u8 = 0x0f;
 const STREAM_RESERVED_FLAGS_MASK: u8 = 0xf0;
 const CURSOR_BODY_LEN: usize = 50;
 const AUTH_TAG_LEN: usize = 32;
+
+/// Maximum number of `(height, hash)` entries a chain-event cursor locator carries.
+///
+/// The cap bounds both the recoverable reorg depth and the cursor size:
+/// entries are exponentially back-spaced from the tip, so 32 entries reach
+/// roughly 2^31 blocks of fork depth.
+pub(crate) const CHAIN_EVENT_LOCATOR_MAX: usize = 32;
+
+/// Byte length of one locator entry: a big-endian `u32` height followed by a
+/// 32-byte block hash.
+const CHAIN_EVENT_LOCATOR_ENTRY_LEN: usize = 36;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -204,19 +219,64 @@ pub struct AddressOutputCursorPayload {
     pub last_outpoint: TransparentOutPoint,
 }
 
-/// Cursor payload decoded from a chain-event stream cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChainEventCursorPayload {
-    pub(crate) family: ChainEventStreamFamily,
-    pub(crate) event_sequence: u64,
-    pub(crate) last_height: BlockHeight,
-    pub(crate) last_hash: BlockHash,
-}
-
+/// One `(height, hash)` pair in a chain-event cursor locator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChainEventCursorAnchor {
     pub(crate) height: BlockHeight,
     pub(crate) hash: BlockHash,
+}
+
+/// Back-spaced `(height, hash)` pairs that let the server resolve a fork point
+/// against the block index even after the event log pruned the divergence.
+///
+/// Entries are ordered tip-first: the first entry is the cursor's own tip and
+/// later entries reach exponentially further back. Always carries at least the
+/// tip entry and at most [`CHAIN_EVENT_LOCATOR_MAX`] entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChainEventLocator {
+    entries: Vec<ChainEventCursorAnchor>,
+}
+
+impl ChainEventLocator {
+    /// Builds a locator from tip-first `(height, hash)` entries.
+    ///
+    /// The first entry is the tip; callers supply the back-spaced ancestors in
+    /// descending-height order after it. Rejects an empty list or one that
+    /// exceeds [`CHAIN_EVENT_LOCATOR_MAX`].
+    pub(crate) fn new(entries: Vec<ChainEventCursorAnchor>) -> Result<Self, StreamCursorError> {
+        if entries.is_empty() || entries.len() > CHAIN_EVENT_LOCATOR_MAX {
+            return Err(StreamCursorError::InvalidLocatorLength {
+                entry_count: entries.len(),
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Returns the locator's tip entry, the most recent position it bookmarks.
+    pub(crate) fn tip(&self) -> ChainEventCursorAnchor {
+        // The constructor rejects an empty entry list, so the first entry is
+        // always present.
+        self.entries
+            .first()
+            .copied()
+            .unwrap_or(ChainEventCursorAnchor {
+                height: BlockHeight::new(0),
+                hash: BlockHash::from_bytes([0; 32]),
+            })
+    }
+
+    /// Returns the locator entries, ordered tip-first.
+    pub(crate) fn entries(&self) -> &[ChainEventCursorAnchor] {
+        &self.entries
+    }
+}
+
+/// Cursor payload decoded from a chain-event stream cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChainEventCursorPayload {
+    pub(crate) family: ChainEventStreamFamily,
+    pub(crate) event_sequence: u64,
+    pub(crate) locator: ChainEventLocator,
 }
 
 /// Fixed-layout cursor token for resumable streams.
@@ -228,16 +288,35 @@ impl StreamCursorTokenV1 {
         network: Network,
         family: ChainEventStreamFamily,
         event_sequence: u64,
-        anchor: ChainEventCursorAnchor,
+        locator: &ChainEventLocator,
         cursor_auth_key: [u8; 32],
     ) -> Result<Self, StreamCursorError> {
-        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
+        let tip = locator.tip();
+        let additional_entries = &locator.entries()[1..];
+        let mut cursor_bytes = Vec::with_capacity(
+            CURSOR_BODY_LEN
+                + 1
+                + additional_entries.len() * CHAIN_EVENT_LOCATOR_ENTRY_LEN
+                + AUTH_TAG_LEN,
+        );
         cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
         cursor_bytes.extend_from_slice(&network.id().to_be_bytes());
         cursor_bytes.extend_from_slice(&event_sequence.to_be_bytes());
-        cursor_bytes.extend_from_slice(&anchor.height.value().to_be_bytes());
-        cursor_bytes.extend_from_slice(&anchor.hash.as_bytes());
+        cursor_bytes.extend_from_slice(&tip.height.value().to_be_bytes());
+        cursor_bytes.extend_from_slice(&tip.hash.as_bytes());
         cursor_bytes.push(family.flags());
+        // The tip entry is encoded inline above; the count byte covers only the
+        // back-spaced ancestors that follow it.
+        let additional_count = u8::try_from(additional_entries.len()).map_err(|_| {
+            StreamCursorError::InvalidLocatorLength {
+                entry_count: locator.entries().len(),
+            }
+        })?;
+        cursor_bytes.push(additional_count);
+        for entry in additional_entries {
+            cursor_bytes.extend_from_slice(&entry.height.value().to_be_bytes());
+            cursor_bytes.extend_from_slice(&entry.hash.as_bytes());
+        }
 
         let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
         cursor_bytes.extend_from_slice(&auth_tag);
@@ -250,7 +329,10 @@ impl StreamCursorTokenV1 {
         expected_network: Network,
         cursor_auth_key: [u8; 32],
     ) -> Result<ChainEventCursorPayload, StreamCursorError> {
-        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
+        // Fixed body (50 bytes) + locator count (1 byte) + auth tag (32 bytes)
+        // is the shortest a chain-event cursor can be (zero ancestor entries).
+        let min_len = CURSOR_BODY_LEN + 1 + AUTH_TAG_LEN;
+        if self.0.len() < min_len {
             return Err(StreamCursorError::InvalidLength {
                 byte_count: self.0.len(),
             });
@@ -280,23 +362,40 @@ impl StreamCursorTokenV1 {
             return Err(StreamCursorError::StreamFamilyMismatch { flags });
         }
 
-        verify_auth_tag(
-            cursor_auth_key,
-            &self.0[..CURSOR_BODY_LEN],
-            &self.0[CURSOR_BODY_LEN..],
-        )?;
-
-        let hash_bytes = <[u8; 32]>::try_from(&self.0[17..49]).map_err(|_| {
-            StreamCursorError::InvalidLength {
+        let additional_count = usize::from(self.0[CURSOR_BODY_LEN]);
+        if additional_count >= CHAIN_EVENT_LOCATOR_MAX {
+            return Err(StreamCursorError::InvalidLocatorLength {
+                entry_count: additional_count.saturating_add(1),
+            });
+        }
+        let body_len = CURSOR_BODY_LEN + 1 + additional_count * CHAIN_EVENT_LOCATOR_ENTRY_LEN;
+        let expected_len = body_len + AUTH_TAG_LEN;
+        if self.0.len() != expected_len {
+            return Err(StreamCursorError::InvalidLength {
                 byte_count: self.0.len(),
-            }
-        })?;
+            });
+        }
+
+        verify_auth_tag(cursor_auth_key, &self.0[..body_len], &self.0[body_len..])?;
+
+        let mut entries = Vec::with_capacity(additional_count.saturating_add(1));
+        entries.push(ChainEventCursorAnchor {
+            height: BlockHeight::new(read_u32_be(&self.0, 13)?),
+            hash: read_block_hash(&self.0, 17)?,
+        });
+        let mut offset = CURSOR_BODY_LEN + 1;
+        for _ in 0..additional_count {
+            entries.push(ChainEventCursorAnchor {
+                height: BlockHeight::new(read_u32_be(&self.0, offset)?),
+                hash: read_block_hash(&self.0, offset + 4)?,
+            });
+            offset += CHAIN_EVENT_LOCATOR_ENTRY_LEN;
+        }
 
         Ok(ChainEventCursorPayload {
             family,
             event_sequence: read_u64_be(&self.0, 5)?,
-            last_height: BlockHeight::new(read_u32_be(&self.0, 13)?),
-            last_hash: BlockHash::from_bytes(hash_bytes),
+            locator: ChainEventLocator::new(entries)?,
         })
     }
 
@@ -609,14 +708,39 @@ fn read_u64_be(bytes: &[u8], offset: usize) -> Result<u64, StreamCursorError> {
     Ok(u64::from_be_bytes(number_bytes))
 }
 
+fn read_block_hash(bytes: &[u8], offset: usize) -> Result<BlockHash, StreamCursorError> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(StreamCursorError::InvalidLength {
+            byte_count: bytes.len(),
+        })?;
+    let hash_bytes = bytes
+        .get(offset..end)
+        .ok_or(StreamCursorError::InvalidLength {
+            byte_count: bytes.len(),
+        })?;
+    let hash_bytes =
+        <[u8; 32]>::try_from(hash_bytes).map_err(|_| StreamCursorError::InvalidLength {
+            byte_count: bytes.len(),
+        })?;
+    Ok(BlockHash::from_bytes(hash_bytes))
+}
+
 /// Error returned while decoding a stream cursor token.
 #[derive(Debug, Error)]
 pub enum StreamCursorError {
-    /// Cursor byte length is not the fixed v1 length.
+    /// Cursor byte length does not match its declared shape.
     #[error("stream cursor has invalid length: {byte_count} bytes")]
     InvalidLength {
         /// Cursor byte length.
         byte_count: usize,
+    },
+
+    /// Chain-event cursor locator carries an out-of-range entry count.
+    #[error("stream cursor locator has invalid entry count: {entry_count}")]
+    InvalidLocatorLength {
+        /// Number of locator entries that failed the bound check.
+        entry_count: usize,
     },
 
     /// Cursor schema version is not supported.
@@ -667,8 +791,9 @@ mod tests {
     use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
     use super::{
-        AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventCursorAnchor,
-        ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
+        AddressOutputCursorPayload, AddressOutputStreamFamily, CHAIN_EVENT_LOCATOR_MAX,
+        ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
+        STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -686,11 +811,13 @@ mod tests {
     }
 
     #[test]
-    fn chain_event_cursor_keeps_v1_byte_offsets() -> Result<(), StreamCursorError> {
+    fn single_entry_locator_keeps_v1_byte_offsets() -> Result<(), StreamCursorError> {
         let cursor = test_cursor()?;
         let cursor_bytes = cursor.as_bytes();
 
-        assert_eq!(cursor_bytes.len(), STREAM_CURSOR_TOKEN_V1_LEN);
+        // A one-entry locator carries no ancestors, so the cursor is the fixed
+        // body, the zero count byte, and the auth tag.
+        assert_eq!(cursor_bytes.len(), STREAM_CURSOR_TOKEN_V1_LEN + 1);
         assert_eq!(cursor_bytes[0], 1);
         assert_eq!(
             &cursor_bytes[1..5],
@@ -700,9 +827,124 @@ mod tests {
         assert_eq!(&cursor_bytes[13..17], &7_u32.to_be_bytes());
         assert_eq!(&cursor_bytes[17..49], &[9; 32]);
         assert_eq!(cursor_bytes[49], ChainEventStreamFamily::Tip.flags());
-        assert_eq!(cursor_bytes[50..].len(), 32);
+        assert_eq!(cursor_bytes[50], 0);
+        assert_eq!(cursor_bytes[51..].len(), 32);
 
         Ok(())
+    }
+
+    #[test]
+    fn multi_entry_locator_round_trips() -> Result<(), StreamCursorError> {
+        let locator = ChainEventLocator::new(vec![
+            ChainEventCursorAnchor {
+                height: BlockHeight::new(100),
+                hash: BlockHash::from_bytes([1; 32]),
+            },
+            ChainEventCursorAnchor {
+                height: BlockHeight::new(99),
+                hash: BlockHash::from_bytes([2; 32]),
+            },
+            ChainEventCursorAnchor {
+                height: BlockHeight::new(96),
+                hash: BlockHash::from_bytes([3; 32]),
+            },
+        ])?;
+        let cursor = StreamCursorTokenV1::chain_event(
+            Network::ZcashRegtest,
+            ChainEventStreamFamily::Tip,
+            7,
+            &locator,
+            CURSOR_AUTH_KEY,
+        )?;
+
+        let decoded = cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
+        assert_eq!(decoded.event_sequence, 7);
+        assert_eq!(decoded.family, ChainEventStreamFamily::Tip);
+        assert_eq!(decoded.locator, locator);
+
+        Ok(())
+    }
+
+    #[test]
+    fn full_depth_locator_round_trips() -> Result<(), StreamCursorError> {
+        let entries = (0..CHAIN_EVENT_LOCATOR_MAX)
+            .map(|index| {
+                let offset = u32::try_from(index).unwrap_or(u32::MAX);
+                ChainEventCursorAnchor {
+                    height: BlockHeight::new(1_000_000u32.saturating_sub(offset)),
+                    hash: BlockHash::from_bytes([u8::try_from(index % 256).unwrap_or(0); 32]),
+                }
+            })
+            .collect::<Vec<_>>();
+        let locator = ChainEventLocator::new(entries)?;
+        let cursor = StreamCursorTokenV1::chain_event(
+            Network::ZcashRegtest,
+            ChainEventStreamFamily::Safe,
+            123,
+            &locator,
+            CURSOR_AUTH_KEY,
+        )?;
+
+        let decoded = cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
+        assert_eq!(decoded.locator, locator);
+        assert_eq!(decoded.family, ChainEventStreamFamily::Safe);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_locator_entry_fails_auth() -> Result<(), StreamCursorError> {
+        let locator = ChainEventLocator::new(vec![
+            ChainEventCursorAnchor {
+                height: BlockHeight::new(100),
+                hash: BlockHash::from_bytes([1; 32]),
+            },
+            ChainEventCursorAnchor {
+                height: BlockHeight::new(99),
+                hash: BlockHash::from_bytes([2; 32]),
+            },
+        ])?;
+        let cursor = StreamCursorTokenV1::chain_event(
+            Network::ZcashRegtest,
+            ChainEventStreamFamily::Tip,
+            7,
+            &locator,
+            CURSOR_AUTH_KEY,
+        )?;
+        let mut cursor_bytes = cursor.as_bytes().to_vec();
+        // Flip a byte inside the appended ancestor entry, past the fixed body.
+        cursor_bytes[55] ^= 1;
+        let tampered = StreamCursorTokenV1::from_bytes(cursor_bytes);
+
+        assert!(matches!(
+            tampered.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::InvalidAuthTag)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn locator_with_too_many_entries_is_rejected() {
+        let entries = (0..=CHAIN_EVENT_LOCATOR_MAX)
+            .map(|index| ChainEventCursorAnchor {
+                height: BlockHeight::new(u32::try_from(index).unwrap_or(u32::MAX)),
+                hash: BlockHash::from_bytes([0; 32]),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            ChainEventLocator::new(entries),
+            Err(StreamCursorError::InvalidLocatorLength { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_locator_is_rejected() {
+        assert!(matches!(
+            ChainEventLocator::new(Vec::new()),
+            Err(StreamCursorError::InvalidLocatorLength { entry_count: 0 })
+        ));
     }
 
     #[test]
@@ -793,14 +1035,15 @@ mod tests {
     }
 
     fn test_cursor() -> Result<StreamCursorTokenV1, StreamCursorError> {
+        let locator = ChainEventLocator::new(vec![ChainEventCursorAnchor {
+            height: BlockHeight::new(7),
+            hash: BlockHash::from_bytes([9; 32]),
+        }])?;
         StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
             ChainEventStreamFamily::Tip,
             42,
-            ChainEventCursorAnchor {
-                height: BlockHeight::new(7),
-                hash: BlockHash::from_bytes([9; 32]),
-            },
+            &locator,
             CURSOR_AUTH_KEY,
         )
     }
@@ -840,11 +1083,14 @@ mod tests {
     }
 
     #[test]
-    fn address_output_cursor_rejects_chain_event_flags() -> Result<(), StreamCursorError> {
+    fn address_output_cursor_rejects_chain_event_cursor() -> Result<(), StreamCursorError> {
+        // A chain-event cursor carries a variable-length locator body, so the
+        // fixed-length address-output decoder rejects it on length before it
+        // ever inspects the family nibble.
         let chain_event_cursor = test_cursor()?;
         assert!(matches!(
             chain_event_cursor.decode_address_output(Network::ZcashRegtest, CURSOR_AUTH_KEY),
-            Err(StreamCursorError::StreamFamilyMismatch { .. })
+            Err(StreamCursorError::InvalidLength { .. })
         ));
         Ok(())
     }

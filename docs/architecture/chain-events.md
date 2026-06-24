@@ -83,11 +83,11 @@ ChainEventEnvelope
 
 The Substreams last-irreversible-block pattern maps to Zinder`s `safe_tip_height`. Every envelope carries the safe tip height that was true for that event. Consumers may discard undo state at or below that height.
 
-`StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). It carries the event sequence, last height, and last hash for one chain-event stream. Adding a second cursor format for chain events requires updating this contract and the boundary-specific serialization ADR.
+`StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). It carries the event sequence and a fork-aware locator (a tip-first, exponentially back-spaced set of `(height, hash)` pairs, capped at `CHAIN_EVENT_LOCATOR_MAX = 32`) for one chain-event stream, per [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md). Adding a second cursor format for chain events requires updating this contract and the boundary-specific serialization ADR.
 
 The wallet-facing exposure of this envelope is settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription): the same `ChainEventEnvelope` shape is published as a `zinder.v1.wallet` proto message and streamed by `WalletQuery.ChainEvents`. The cursor crosses the wire as opaque bytes so wallet clients persist the exact bytes they received and replay strictly after them on reconnect.
 
-The cursor body is not decorative state. `event_sequence` is the resume key, and `last_height` plus `last_hash` are position checks for the event that produced the cursor. If future stream families add cursor fields that are not immediately consumed, the field must be documented as reserved in the stream-specific contract before it is serialized.
+The cursor body is not decorative state. `event_sequence` is the resume key, and the locator's `(height, hash)` pairs resolve the fork point against the canonical block index across reconnect. If future stream families add cursor fields that are not immediately consumed, the field must be documented as reserved in the stream-specific contract before it is serialized.
 
 ## Address Filters
 
@@ -119,10 +119,9 @@ Rules:
 - Every history read has a non-zero `max_events` page bound. Consumers that need
   more events resume with the last cursor returned by the previous page.
 - Consumers persist the cursor only after their sink has durably applied the event.
-- If the cursor is older than retained history, the API returns `EventCursorExpired`. It must not silently start from the current tip.
-- If the cursor belongs to another network, store identity, or stream family, the API returns a typed cursor error.
-- If a cursor names an event sequence that does not exist yet, the API returns a typed cursor error. A pre-history cursor must not be treated as an empty stream.
-- If the cursor's `last_hash` no longer matches the canonical block hash at `last_height`, the cursor's branch was reorged out. The server emits a synthetic `ChainReorged` envelope before resuming, per [Chain events §Cursor varieties](chain-events.md#cursor-varieties). The synthetic envelope occupies a real `event_sequence` slot and is persisted for idempotent recovery.
+- If the cursor's events are pruned and no reorg bridges the gap, the API returns `EventCursorExpired`. It must not silently start from the current tip.
+- If the cursor fails authentication or belongs to another network, store identity, or stream family, the API returns `EventCursorInvalid`. A zero or ahead-of-history sequence is also `EventCursorInvalid`; a reorg never produces it.
+- If the cursor's branch was reorged out, the server resolves the fork point from the locator against the canonical block index. When the real reorg event is still retained at or after the cursor, that event replays. When it has been pruned, the server delivers a synthetic `ChainReorged` reverted from the fork point ahead of the resumed page, per [Chain events §Cursor varieties](chain-events.md#cursor-varieties). Recovery is idempotent: the synthetic envelope's cursor bookmarks the on-chain fork point, so a reconnect that has not yet applied the reorg recomputes the identical recovery. A divergence deeper than the locator cap, or an unresolvable fork-point block, degrades to `EventCursorExpired`.
 - If a consumer falls behind retention, it must recover from a checkpoint or rebuild from canonical artifacts.
 
 ### Cursor varieties
@@ -130,7 +129,7 @@ Rules:
 `StreamCursorTokenV1`'s `flags` byte carries a family code in the lower nibble (per [Chain events §Cursor varieties](chain-events.md#cursor-varieties)). Two `ChainEvents` family codes are active:
 
 - **`0x0` `ChainEventTip`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
-- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= safe_tip_height`. Never receives `ChainReorged`. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and an empty `from_cursor`.
+- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= safe_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and an empty `from_cursor`.
 
 Future stream families (`Mempool`, `Derive`) are reserved in the family-code table but use parallel cursor body types under their own contracts.
 

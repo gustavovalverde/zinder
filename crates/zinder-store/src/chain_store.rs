@@ -30,18 +30,18 @@ use crate::{
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     format::{
-        ChainEventCursorAnchor, ChainEventStreamFamily, MempoolEventKind, MempoolEventStreamFamily,
-        StoreKey, decode_chain_epoch, decode_chain_event_envelope, decode_mempool_event_envelope,
-        decode_mempool_event_kind, decode_mempool_event_observed_at,
-        decode_transparent_output_block_index, encode_address_output_index_artifact,
-        encode_block_blob_artifact, encode_block_header_artifact,
-        encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
-        encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
-        encode_transaction_blob_artifact, encode_transaction_facts_artifact,
-        encode_transaction_location_artifact, encode_transparent_address_tx_index_artifact,
-        encode_transparent_output_artifact, encode_transparent_output_block_index,
-        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
-        encode_tree_state_artifact,
+        CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
+        MempoolEventKind, MempoolEventStreamFamily, StoreKey, decode_chain_epoch,
+        decode_chain_event_envelope, decode_mempool_event_envelope, decode_mempool_event_kind,
+        decode_mempool_event_observed_at, decode_transparent_output_block_index,
+        encode_address_output_index_artifact, encode_block_blob_artifact,
+        encode_block_header_artifact, encode_block_transaction_index_artifact, encode_chain_epoch,
+        encode_chain_event_envelope, encode_compact_block_artifact, encode_mempool_event_envelope,
+        encode_subtree_root_artifact, encode_transaction_blob_artifact,
+        encode_transaction_facts_artifact, encode_transaction_location_artifact,
+        encode_transparent_address_tx_index_artifact, encode_transparent_output_artifact,
+        encode_transparent_output_block_index, encode_transparent_spend_fact,
+        encode_transparent_spend_fact_block_index, encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
@@ -311,6 +311,29 @@ struct ChainStoreInner {
 struct ChainEventHistoryBounds {
     current_event_sequence: u64,
     oldest_retained_sequence: u64,
+}
+
+/// Resolved resume position for a chain-event history read.
+struct ChainEventResume {
+    /// First retained event sequence to read forward from.
+    start_sequence: u64,
+    /// Stream family the page reads under.
+    family: ChainEventStreamFamily,
+    /// Synthetic `ChainReorged` envelope to deliver ahead of the page when the
+    /// cursor's branch was reorged out and the real reorg event was pruned.
+    synthetic_reorg: Option<ChainEventEnvelope>,
+}
+
+/// Inputs for resolving the resume position of a reorged-out cursor.
+#[derive(Clone, Copy)]
+struct ReorgedCursorResume {
+    current_chain_epoch: ChainEpoch,
+    family: ChainEventStreamFamily,
+    fork_point: ChainEventCursorAnchor,
+    reverted_tip_height: BlockHeight,
+    event_sequence: u64,
+    cursor_auth_key: [u8; 32],
+    bounds: ChainEventHistoryBounds,
 }
 
 /// Public Rust API used by `zinder-query` to read epoch-bound canonical data.
@@ -719,13 +742,14 @@ impl ChainStoreInner {
         let retention_sweep =
             build_safe_tip_retention_sweep(self.inner.as_ref(), &artifacts, current_chain_epoch)?;
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
-        let event_envelope = build_chain_event_envelope(
+        let event_envelope = build_chain_event_envelope(&ChainEventEnvelopeInputs {
+            inner: self.inner.as_ref(),
             event_sequence,
             committed,
-            current_chain_epoch,
-            &reorg_window_change,
-            self.cursor_auth_key,
-        )?;
+            previous_chain_epoch: current_chain_epoch,
+            reorg_window_change: &reorg_window_change,
+            cursor_auth_key: self.cursor_auth_key,
+        })?;
         let mut puts = build_chain_epoch_puts(artifacts, &event_envelope)?;
         if let Some(store_metadata_put) = store_metadata_put {
             puts.push(store_metadata_put);
@@ -781,7 +805,7 @@ impl ChainStoreInner {
         let oldest_retained_sequence =
             read_oldest_retained_chain_event_sequence(&read_view, current_event_sequence)?
                 .unwrap_or(1);
-        let (start_sequence, family) = self.chain_event_history_start_sequence(
+        let resume = self.chain_event_history_start_sequence(
             &read_view,
             request,
             &current_chain_epoch,
@@ -790,14 +814,19 @@ impl ChainStoreInner {
                 oldest_retained_sequence,
             },
         )?;
-
-        if start_sequence > current_event_sequence {
-            return Ok(Vec::new());
-        }
+        let ChainEventResume {
+            start_sequence,
+            family,
+            synthetic_reorg,
+        } = resume;
 
         let max_events = u64::from(request.max_events.get());
-        let mut event_sequence = start_sequence;
         let mut event_envelopes = Vec::with_capacity(u32_to_usize(request.max_events.get()));
+        if let Some(synthetic_reorg) = synthetic_reorg {
+            event_envelopes.push(synthetic_reorg);
+        }
+
+        let mut event_sequence = start_sequence;
         while event_sequence <= current_event_sequence
             && u64::try_from(event_envelopes.len()).map_or(true, |count| count < max_events)
         {
@@ -808,9 +837,15 @@ impl ChainStoreInner {
                     oldest_retained_sequence: event_sequence,
                 });
             };
-            let event_envelope =
+            let mut event_envelope =
                 decode_chain_event_envelope(&key, &record_bytes, family, self.cursor_auth_key)?;
             if chain_event_matches_family(&event_envelope, family) {
+                enrich_chain_event_cursor(
+                    &read_view,
+                    &mut event_envelope,
+                    family,
+                    self.cursor_auth_key,
+                )?;
                 event_envelopes.push(event_envelope);
             }
             event_sequence = event_sequence
@@ -979,9 +1014,13 @@ impl ChainStoreInner {
         request: ChainEventHistoryRequest<'_>,
         current_chain_epoch: &ChainEpoch,
         bounds: ChainEventHistoryBounds,
-    ) -> Result<(u64, ChainEventStreamFamily), StoreError> {
+    ) -> Result<ChainEventResume, StoreError> {
         let Some(cursor) = request.from_cursor else {
-            return Ok((bounds.oldest_retained_sequence, request.family));
+            return Ok(ChainEventResume {
+                start_sequence: bounds.oldest_retained_sequence,
+                family: request.family,
+                synthetic_reorg: None,
+            });
         };
 
         let cursor_payload = cursor
@@ -989,56 +1028,72 @@ impl ChainStoreInner {
             .map_err(|_| StoreError::ChainEventCursorInvalid {
                 reason: "cursor token failed validation",
             })?;
+        let family = cursor_payload.family;
 
+        // Genuine forgery: a zero or ahead-of-history sequence cannot name a
+        // real delivered event.
+        if cursor_payload.event_sequence == 0 {
+            return Err(StoreError::ChainEventCursorInvalid {
+                reason: "cursor sequence is before retained history",
+            });
+        }
         if cursor_payload.event_sequence > bounds.current_event_sequence {
             return Err(StoreError::ChainEventCursorInvalid {
                 reason: "cursor sequence is ahead of retained history",
             });
         }
 
-        if cursor_payload.event_sequence == 0 {
-            return Err(StoreError::ChainEventCursorInvalid {
-                reason: "cursor sequence is before retained history",
-            });
-        }
-
-        if cursor_payload.event_sequence < bounds.oldest_retained_sequence {
+        let Some(fork_point) =
+            resolve_locator_fork_point(inner, *current_chain_epoch, &cursor_payload.locator)?
+        else {
+            // No locator entry sits on the canonical chain: the divergence is
+            // deeper than the cap or its block is unresolvable. The consumer
+            // must re-derive from canonical artifacts.
             return Err(StoreError::ChainEventCursorExpired {
                 event_sequence: cursor_payload.event_sequence,
                 oldest_retained_sequence: bounds.oldest_retained_sequence,
             });
-        }
-
-        let cursor_event_key = StoreKey::chain_event(cursor_payload.event_sequence);
-        let Some(cursor_event_bytes) = inner.get(StorageTable::ChainEvent, &cursor_event_key)?
-        else {
-            return Err(StoreError::ChainEventCursorExpired {
-                event_sequence: cursor_payload.event_sequence,
-                oldest_retained_sequence: cursor_payload.event_sequence.saturating_add(1),
-            });
         };
-        let cursor_event_envelope = decode_chain_event_envelope(
-            &cursor_event_key,
-            &cursor_event_bytes,
-            cursor_payload.family,
-            self.cursor_auth_key,
-        )?;
-        let retained_position = (
-            cursor_event_envelope.chain_epoch.tip_height,
-            cursor_event_envelope.chain_epoch.tip_hash,
-        );
-        let cursor_position = (cursor_payload.last_height, cursor_payload.last_hash);
-        if retained_position != cursor_position {
-            return Err(StoreError::ChainEventCursorInvalid {
-                reason: "cursor position does not match retained event",
+
+        let locator_tip = cursor_payload.locator.tip();
+        let cursor_branch_on_chain =
+            fork_point.height == locator_tip.height && fork_point.hash == locator_tip.hash;
+
+        if cursor_branch_on_chain {
+            // No reorg. The cursor's tip is still canonical. Resume from the
+            // next event; expire only when that next event is itself below the
+            // retention floor, which means events between the cursor and the
+            // floor were pruned.
+            let next_sequence = cursor_payload
+                .event_sequence
+                .checked_add(1)
+                .ok_or(StoreError::ChainEventSequenceOverflow)?;
+            if next_sequence < bounds.oldest_retained_sequence {
+                return Err(StoreError::ChainEventCursorExpired {
+                    event_sequence: cursor_payload.event_sequence,
+                    oldest_retained_sequence: bounds.oldest_retained_sequence,
+                });
+            }
+            return Ok(ChainEventResume {
+                start_sequence: next_sequence.max(bounds.oldest_retained_sequence),
+                family,
+                synthetic_reorg: None,
             });
         }
 
-        cursor_payload
-            .event_sequence
-            .checked_add(1)
-            .map(|start_sequence| (start_sequence, cursor_payload.family))
-            .ok_or(StoreError::ChainEventSequenceOverflow)
+        // The cursor's branch was reorged out below its tip.
+        resolve_reorged_cursor_resume(
+            inner,
+            ReorgedCursorResume {
+                current_chain_epoch: *current_chain_epoch,
+                family,
+                fork_point,
+                reverted_tip_height: locator_tip.height,
+                event_sequence: cursor_payload.event_sequence,
+                cursor_auth_key: self.cursor_auth_key,
+                bounds,
+            },
+        )
     }
 
     fn prune_chain_events_before(
@@ -1711,6 +1766,241 @@ fn decode_store_metadata(
     })
 }
 
+/// Heights a locator bookmarks, tip-first and exponentially back-spaced.
+///
+/// Yields `tip`, `tip-1`, `tip-2`, `tip-4`, `tip-8`, ... doubling the gap each
+/// step, deduplicated and clamped at genesis, capped at
+/// [`CHAIN_EVENT_LOCATOR_MAX`] entries.
+fn locator_heights(tip_height: BlockHeight) -> Vec<BlockHeight> {
+    let mut heights = Vec::with_capacity(CHAIN_EVENT_LOCATOR_MAX);
+    let mut current = tip_height.value();
+    let mut step = 1u32;
+    loop {
+        heights.push(BlockHeight::new(current));
+        if heights.len() >= CHAIN_EVENT_LOCATOR_MAX || current == 0 {
+            break;
+        }
+        current = current.saturating_sub(step);
+        step = step.saturating_mul(2);
+    }
+    heights
+}
+
+/// Builds a chain-event locator by resolving the canonical block hash at each
+/// back-spaced height from the block index.
+///
+/// The block index outlives the pruned event-log window, so the locator
+/// resolves a fork point even when the divergence is no longer in retained
+/// event history. Always returns at least the tip entry.
+fn build_chain_event_locator(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    tip: ChainEventCursorAnchor,
+) -> Result<ChainEventLocator, StoreError> {
+    let mut entries = vec![tip];
+    for height in locator_heights(tip.height).into_iter().skip(1) {
+        match read_block_header_artifact(inner, chain_epoch, height) {
+            Ok(Some(block)) => entries.push(ChainEventCursorAnchor {
+                height,
+                hash: block.block_hash,
+            }),
+            Ok(None) | Err(StoreError::ArtifactMissing { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    ChainEventLocator::new(entries).map_err(|_| StoreError::InvalidChainEpochArtifacts {
+        reason: "chain-event locator exceeded its bound",
+    })
+}
+
+/// Finds the fork point: the most recent locator entry whose hash equals the
+/// canonical block hash at that height.
+///
+/// Returns `None` when no locator entry is on the canonical chain, which means
+/// the divergence is deeper than the cap or the entry's block is unresolvable.
+fn resolve_locator_fork_point(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    locator: &ChainEventLocator,
+) -> Result<Option<ChainEventCursorAnchor>, StoreError> {
+    for entry in locator.entries() {
+        let canonical_hash = match read_block_header_artifact(inner, chain_epoch, entry.height) {
+            Ok(Some(block)) => block.block_hash,
+            Ok(None) | Err(StoreError::ArtifactMissing { .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        if canonical_hash == entry.hash {
+            return Ok(Some(*entry));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolves the resume position for a cursor whose branch was reorged out below
+/// its tip, following the reconnect-reorg rule.
+fn resolve_reorged_cursor_resume(
+    inner: &impl RocksChainStoreRead,
+    resume: ReorgedCursorResume,
+) -> Result<ChainEventResume, StoreError> {
+    let ReorgedCursorResume {
+        current_chain_epoch,
+        family,
+        fork_point,
+        reverted_tip_height,
+        event_sequence,
+        cursor_auth_key,
+        bounds,
+    } = resume;
+
+    if matches!(family, ChainEventStreamFamily::Safe) {
+        // A Safe cursor cannot be reorged out below the settled tip by
+        // definition; a locator miss is an expiry, never a synthesized reorg,
+        // and the Safe family never carries ChainReorged.
+        return Err(StoreError::ChainEventCursorExpired {
+            event_sequence,
+            oldest_retained_sequence: bounds.oldest_retained_sequence,
+        });
+    }
+
+    let cursor_event_retained = event_sequence >= bounds.oldest_retained_sequence
+        && inner
+            .get(
+                StorageTable::ChainEvent,
+                &StoreKey::chain_event(event_sequence),
+            )?
+            .is_some();
+    if cursor_event_retained {
+        // The real ChainReorged event still sits at or after the cursor;
+        // replaying it from the next sequence delivers the reorg.
+        let start_sequence = event_sequence
+            .checked_add(1)
+            .ok_or(StoreError::ChainEventSequenceOverflow)?;
+        return Ok(ChainEventResume {
+            start_sequence,
+            family,
+            synthetic_reorg: None,
+        });
+    }
+
+    // The reorg event was pruned. Synthesize a ChainReorged reverted from the
+    // locator-resolved fork point, then resume from the retention floor so the
+    // retained events re-commit the post-fork canonical chain.
+    let synthetic_reorg = build_synthetic_reorg_envelope(
+        inner,
+        SyntheticReorgInputs {
+            current_chain_epoch,
+            family,
+            fork_point,
+            reverted_tip_height,
+            cursor_auth_key,
+            oldest_retained_sequence: bounds.oldest_retained_sequence,
+        },
+    )?;
+    Ok(ChainEventResume {
+        start_sequence: bounds.oldest_retained_sequence,
+        family,
+        synthetic_reorg: Some(synthetic_reorg),
+    })
+}
+
+/// Inputs for [`build_synthetic_reorg_envelope`].
+#[derive(Clone, Copy)]
+struct SyntheticReorgInputs {
+    current_chain_epoch: ChainEpoch,
+    family: ChainEventStreamFamily,
+    fork_point: ChainEventCursorAnchor,
+    reverted_tip_height: BlockHeight,
+    cursor_auth_key: [u8; 32],
+    oldest_retained_sequence: u64,
+}
+
+/// Builds the synthetic `ChainReorged` envelope delivered ahead of the page
+/// when a reconnecting cursor's branch was reorged out and the real reorg event
+/// has been pruned.
+///
+/// The envelope reverts `(fork_point, reverted_tip_height]` and re-commits the
+/// canonical range above the fork point. Its cursor bookmarks the on-chain fork
+/// point one sequence below the retention floor, so a reconnect that has not
+/// yet applied the reorg resumes from the retained events that re-commit the
+/// canonical chain: recovery is idempotent and always makes forward progress.
+fn build_synthetic_reorg_envelope(
+    inner: &impl RocksChainStoreRead,
+    inputs: SyntheticReorgInputs,
+) -> Result<ChainEventEnvelope, StoreError> {
+    let SyntheticReorgInputs {
+        current_chain_epoch,
+        family,
+        fork_point,
+        reverted_tip_height,
+        cursor_auth_key,
+        oldest_retained_sequence,
+    } = inputs;
+    let reverted_start = fork_point
+        .height
+        .next()
+        .ok_or(StoreError::ChainEventSequenceOverflow)?;
+    let reverted = ChainRangeReverted::new(
+        current_chain_epoch,
+        BlockHeightRange::inclusive(reverted_start, reverted_tip_height),
+    );
+    let committed = ChainEpochCommitted::new(
+        current_chain_epoch,
+        BlockHeightRange::inclusive(reverted_start, current_chain_epoch.tip_height),
+    );
+    let fork_locator = build_chain_event_locator(inner, current_chain_epoch, fork_point)?;
+    let cursor_event_sequence = oldest_retained_sequence.saturating_sub(1);
+    let cursor = StreamCursorTokenV1::chain_event(
+        current_chain_epoch.network,
+        family,
+        cursor_event_sequence,
+        &fork_locator,
+        cursor_auth_key,
+    )
+    .map_err(|_| StoreError::InvalidChainEpochArtifacts {
+        reason: "cursor authentication key could not initialize the MAC",
+    })?;
+    Ok(ChainEventEnvelope::new(
+        cursor,
+        cursor_event_sequence,
+        current_chain_epoch,
+        current_chain_epoch.safe_tip_height,
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        },
+    ))
+}
+
+/// Rebuilds an envelope's resume cursor so it carries the full back-spaced
+/// locator rather than the tip-only locator the pure decoder reconstructs.
+fn enrich_chain_event_cursor(
+    inner: &impl RocksChainStoreRead,
+    event_envelope: &mut ChainEventEnvelope,
+    family: ChainEventStreamFamily,
+    cursor_auth_key: [u8; 32],
+) -> Result<(), StoreError> {
+    let chain_epoch = event_envelope.chain_epoch;
+    let locator = build_chain_event_locator(
+        inner,
+        chain_epoch,
+        ChainEventCursorAnchor {
+            height: chain_epoch.tip_height,
+            hash: chain_epoch.tip_hash,
+        },
+    )?;
+    event_envelope.cursor = StreamCursorTokenV1::chain_event(
+        chain_epoch.network,
+        family,
+        event_envelope.event_sequence,
+        &locator,
+        cursor_auth_key,
+    )
+    .map_err(|_| StoreError::InvalidChainEpochArtifacts {
+        reason: "cursor authentication key could not initialize the MAC",
+    })?;
+    Ok(())
+}
+
 fn build_chain_event(
     committed: ChainEpochCommitted,
     previous_chain_epoch: Option<ChainEpoch>,
@@ -1740,23 +2030,45 @@ fn build_chain_event(
     Ok(event)
 }
 
-fn build_chain_event_envelope(
+/// Inputs for [`build_chain_event_envelope`].
+struct ChainEventEnvelopeInputs<'change, R> {
+    inner: &'change R,
     event_sequence: u64,
     committed: ChainEpochCommitted,
     previous_chain_epoch: Option<ChainEpoch>,
-    reorg_window_change: &ReorgWindowChange,
+    reorg_window_change: &'change ReorgWindowChange,
     cursor_auth_key: [u8; 32],
+}
+
+fn build_chain_event_envelope<R: RocksChainStoreRead>(
+    inputs: &ChainEventEnvelopeInputs<'_, R>,
 ) -> Result<ChainEventEnvelope, StoreError> {
+    let &ChainEventEnvelopeInputs {
+        inner,
+        event_sequence,
+        committed,
+        previous_chain_epoch,
+        reorg_window_change,
+        cursor_auth_key,
+    } = inputs;
     let event = build_chain_event(committed, previous_chain_epoch, reorg_window_change)?;
     let chain_epoch = committed.chain_epoch;
-    let cursor = StreamCursorTokenV1::chain_event(
-        chain_epoch.network,
-        ChainEventStreamFamily::Tip,
-        event_sequence,
+    // The just-committed tip block is not yet readable through the index, so
+    // the tip entry is taken from the epoch directly; the back-spaced
+    // ancestors resolve against already-committed blocks.
+    let locator = build_chain_event_locator(
+        inner,
+        chain_epoch,
         ChainEventCursorAnchor {
             height: chain_epoch.tip_height,
             hash: chain_epoch.tip_hash,
         },
+    )?;
+    let cursor = StreamCursorTokenV1::chain_event(
+        chain_epoch.network,
+        ChainEventStreamFamily::Tip,
+        event_sequence,
+        &locator,
         cursor_auth_key,
     )
     .map_err(|_| StoreError::InvalidChainEpochArtifacts {
@@ -3112,6 +3424,46 @@ mod tests {
                 oldest_retained_sequence: 2,
             }
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn unresolvable_locator_fork_point_expires_the_cursor() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block],
+            vec![compact_block],
+        ))?;
+
+        // A well-authenticated cursor whose locator entries name a branch with
+        // no canonical block at any of its heights (a divergence past the
+        // recoverable cap). The fork point is unresolvable, so the cursor
+        // expires with re-derive guidance rather than synthesizing a reorg.
+        let locator = ChainEventLocator::new(vec![ChainEventCursorAnchor {
+            height: BlockHeight::new(1),
+            hash: block_hash(900),
+        }])?;
+        let cursor = StreamCursorTokenV1::chain_event(
+            Network::ZcashRegtest,
+            ChainEventStreamFamily::Tip,
+            1,
+            &locator,
+            store.store.cursor_auth_key,
+        )?;
+
+        let error = match store
+            .chain_event_history(ChainEventHistoryRequest::with_default_limit(Some(&cursor)))
+        {
+            Ok(event_history) => {
+                return Err(format!("expected expired cursor, got {event_history:?}").into());
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::ChainEventCursorExpired { .. }));
 
         Ok(())
     }

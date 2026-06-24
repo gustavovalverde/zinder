@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, ChainEventCursorAnchor,
+    ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, ChainEventCursorAnchor, ChainEventLocator,
     ChainEventStreamFamily, MempoolEventStreamFamily, PayloadFormat, StoreKey,
 };
 
@@ -83,14 +83,23 @@ pub(crate) fn decode_chain_event_envelope(
         reason: "chain event envelope is missing event",
     })?;
     let event = decode_chain_event_record(key, event_record)?;
+    // The decoder stays pure over `record_bytes`, so the reconstructed cursor
+    // carries only the event's own tip. `chain_event_history` enriches it with
+    // the back-spaced locator entries it reads from the block index.
+    let tip_only_locator = ChainEventLocator::new(vec![ChainEventCursorAnchor {
+        height: chain_epoch.tip_height,
+        hash: chain_epoch.tip_hash,
+    }])
+    .map_err(|_| StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::ChainEvent,
+        key: key.clone().into(),
+        reason: "chain event locator could not be reconstructed",
+    })?;
     let cursor = StreamCursorTokenV1::chain_event(
         chain_epoch.network,
         family,
         record.event_sequence,
-        ChainEventCursorAnchor {
-            height: chain_epoch.tip_height,
-            hash: chain_epoch.tip_hash,
-        },
+        &tip_only_locator,
         cursor_auth_key,
     )
     .map_err(|_| StoreError::ArtifactCorrupt {

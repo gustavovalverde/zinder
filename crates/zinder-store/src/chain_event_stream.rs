@@ -11,6 +11,11 @@ use crate::StreamCursorTokenV1;
 const CHAIN_EVENT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Repeatedly reads chain-event pages and sends them to a gRPC stream sink.
+///
+/// A page may lead with a server-injected synthetic `ChainReorged` envelope
+/// (reconnect-reorg recovery); the runner forwards it like any other envelope
+/// and advances the cursor from the envelope it just sent, so the next page
+/// always makes forward progress.
 pub async fn run_chain_event_stream<ReadPage, ReadPageFuture>(
     mut cursor: Option<StreamCursorTokenV1>,
     mut read_page: ReadPage,
