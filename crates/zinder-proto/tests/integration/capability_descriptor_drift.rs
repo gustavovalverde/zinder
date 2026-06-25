@@ -26,14 +26,7 @@ use zinder_proto::capabilities::{CAPABILITIES, CapabilitySurface};
 ///
 /// - `LatestSafeBlock` is the safe-tip companion of `LatestBlock`; it shares
 ///   the always-on read contract and never carries a capability.
-/// - `WalletQuery.TransparentAddressBalance` is the federated proxy of the
-///   explorer-native balance method. It shares
-///   `explorer.transparent_address.balance_v1`, advertised by the explorer
-///   surface, rather than carrying a wallet-surface capability of its own.
-const UNCAPABILITIED_METHODS: &[&str] = &[
-    "zinder.v1.wallet.WalletQuery.LatestSafeBlock",
-    "zinder.v1.wallet.WalletQuery.TransparentAddressBalance",
-];
+const UNCAPABILITIED_METHODS: &[&str] = &["zinder.v1.wallet.WalletQuery.LatestSafeBlock"];
 
 /// Proto service names that back each capability surface.
 const SURFACE_SERVICES: &[(CapabilitySurface, &str)] = &[

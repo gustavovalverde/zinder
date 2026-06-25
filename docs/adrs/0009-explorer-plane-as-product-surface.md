@@ -7,6 +7,10 @@
 | Domain | Service topology, explorer wire surface, capability namespace, federation contract |
 | Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0005](0005-consumer-neutral-wallet-data-plane.md), [ADR-0006](0006-ingest-control-transport-security.md), [ADR-0007](0007-mempool-topology-and-retention.md), [Explorer plane](../architecture/explorer-plane.md), [Derive plane](../architecture/derive-plane.md), [Service boundaries](../architecture/service-boundaries.md), [Public interfaces](../architecture/public-interfaces.md) |
 
+## Revision history
+
+- 2026-06: Transparent-address balance is computed in the wallet plane behind one native primitive (`WalletQuery.TransparentAddressBalance`, capability `wallet.address.transparent_balance_v1`), not federated through the explorer. The wallet handler sums the confirmed total in-process from the canonical unspent-output index and overlays the live mempool delta through the colocated ingest-control endpoint. The explorer plane no longer serves a balance RPC, and the wallet plane no longer dials the explorer. The dual-capability federation rule remains the contract for any future federated explorer method on `WalletQuery`; balance is no longer one of them.
+
 ## Context
 
 Explorer support is a product surface, not an implementation pattern. The
@@ -40,16 +44,13 @@ Production processes, config keys, capability strings, and Prometheus metrics us
 | Prometheus metric prefix | `zinder_explorer_*` |
 | CLI flag namespace | `--explorer-*` |
 
-The explorer plane exposes these baseline capability strings:
+The explorer plane exposes this baseline capability string:
 
 | Capability | Meaning |
 | ------ | ----- |
 | `explorer.server_info_v1` | Explorer server-info descriptor |
-| `explorer.transparent_address.balance_v1` | Transparent-address balance with explorer enrichment |
 
-The balance has one implementation and one capability:
-
-- `explorer.transparent_address.balance_v1` — `WalletQuery.TransparentAddressBalance` forwards to the explorer's balance compute (confirmed totals plus the live-mempool overlay) when the explorer proxy is ready; deployments without an explorer plane reject the call with `UNAVAILABLE`.
+Transparent-address balance is a wallet-plane primitive, not an explorer capability: `WalletQuery.TransparentAddressBalance` advertises `wallet.address.transparent_balance_v1` and is documented in [Wallet data plane](../architecture/wallet-data-plane.md).
 
 ### SDK names stay derive-shaped
 
@@ -58,8 +59,6 @@ The reusable SDK abstractions keep their `Derive*` names because they describe t
 - `DeriveConsumer` (trait), `DeriveMempoolConsumer` (trait)
 - `DeriveStore` (RocksDB wrapper), `DeriveStoreTable`, `DeriveConsumerName`
 - `DeriveConsumerCtx` (per-event context with `&DeriveStore` + `&mut WriteBatch`)
-- `DeriveProxy<Client>` (federation primitive in `services/zinder-query/src/derive_proxy.rs`)
-- `DeriveReadinessGauge`, `spawn_derive_readiness_probe`
 - `DeriveStore::write_chain_event`, `DeriveStore::write_mempool_event`
 
 The boundary is "Zinder process or library entity belonging to the running explorer service" -> `explorer` namespace; "reusable SDK abstraction representing the derive pattern" -> `Derive*` name.
@@ -73,7 +72,7 @@ Every federated method on `WalletQuery` that piggybacks on the explorer plane ad
 
 Clients that only need the canonical answer gate on the wallet capability. Clients that need the enrichment gate on the explorer capability. The wire response shape is identical between the two paths; only the semantic content (overlay present vs absent) differs.
 
-This rule applies to `TransparentAddressBalance` and every federated method.
+This rule governs any future federated explorer method on `WalletQuery`. It has no current instance: transparent-address balance, which originally motivated the rule, is now a wallet-plane primitive that computes its own mempool overlay in-process.
 
 ### Capability namespace structure
 
@@ -106,21 +105,20 @@ This rule is structural: it keeps canonical artifacts as the single source of tr
 
 - Operators configure the explorer through `[explorer]` and `ZINDER_EXPLORER__*`.
 - Prometheus scrapes use the `zinder_explorer_*` metric prefix.
-- `WalletQuery.ServerInfo` advertises `explorer.*` capabilities only when the explorer proxy is configured and ready.
-- A deployment that does not run `zinder-explorer` continues to advertise only the `wallet.*` capabilities. The wallet plane's federated method (`TransparentAddressBalance`) continues to answer from canonical UTXOs.
+- A deployment that does not run `zinder-explorer` continues to advertise only the `wallet.*` capabilities, including `wallet.address.transparent_balance_v1`. The wallet plane answers balance from canonical UTXOs and degrades the mempool overlay to a zero delta when no ingest-control endpoint is wired.
 
 ### Implementation
 
 - `services/zinder-explorer/` owns the explorer binary and gRPC service.
 - `crates/zinder-proto/src/capabilities.rs` exposes the `EXPLORER_*` constants.
-- `services/zinder-query/src/grpc/adapter.rs` gates federation on `explorer.transparent_address.balance_v1`.
+- `services/zinder-query/src/grpc/adapter.rs` computes `TransparentAddressBalance` in-process and overlays the mempool delta through the ingest-control endpoint.
 - `derive-plane.md` documents the SDK boundary. `explorer-plane.md` documents the product surface. Both reference each other.
 - The capability docs tests enforce that the wallet and explorer rows of the `CAPABILITIES` table match the public-interfaces capability list.
 
 ### Testing
 
 - The validation gate covers capability strings and env-var docs. The `capability_coverage.rs` test in `zinder-client` references the explorer capability strings; the env-var docs mirror test in `zinder-runtime` references the explorer env-var names.
-- One additional integration test in `services/zinder-explorer/tests/integration/` asserts that `ExplorerServerInfo.common.capabilities` contains both `explorer.server_info_v1` and (when the wallet endpoint is configured) `explorer.transparent_address.balance_v1`.
+- The balance overflow, saturation, and per-request address-cap unit tests live in the wallet plane (`zinder-core` and `services/zinder-query/tests/integration/transparent_address_balance.rs`).
 - Live tests under `services/zinder-explorer/tests/live/` retain their previous coverage and adjust env-var names.
 
 ## Alternatives Considered

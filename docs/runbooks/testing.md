@@ -223,8 +223,8 @@ ZINDER_TEST_LIVE=1 \
 Currently-mainnet-only tests are:
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the federated balance
-read-only confirmations under `services/zinder-explorer/tests/live/`.
+`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the transparent-address
+balance read-only confirmations under `services/zinder-explorer/tests/live/`.
 
 ## T3: Parity against a reference lightwalletd
 
@@ -752,11 +752,10 @@ scripts/native-grpc-smoke.sh 127.0.0.1:9069
 The script verifies the standalone `WalletQuery` capability baseline, exercises
 `LatestBlock`, both `BlockIdBySelector` arms (height + hash round-trip),
 `BlockHeaderBySelector`, and asserts the `Transaction` NotFound mapping. Exit
-code zero is the contract; any drift fails CI. The
-`explorer.transparent_address.balance_v1` capability is conditional on a fresh
-explorer proxy. Set `ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE=1` when the query
-process is started with `zinder-explorer` and the smoke should require that
-capability too.
+code zero is the contract; any drift fails CI.
+`wallet.address.transparent_balance_v1` is always advertised: the confirmed
+total reads the canonical unspent index, and the mempool overlay degrades to a
+zero delta when no ingest-control endpoint is wired.
 
 ### Bring up `zinder-query`
 
@@ -811,8 +810,8 @@ wallet.read.transparent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
+wallet.address.transparent_balance_v1
 explorer.server_info_v1
-explorer.transparent_address.balance_v1
 explorer.transaction.detail_v1
 explorer.block.summary_v1
 explorer.block.detail_v1
@@ -830,9 +829,8 @@ explorer.overview.snapshot_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 
-Standalone `zinder-query` processes advertise the list above minus
-`explorer.transparent_address.balance_v1` until the configured explorer proxy is
-reachable and fresh.
+Standalone `zinder-query` processes advertise the wallet rows above; the
+`explorer.*` rows belong to a separately deployed `zinder-explorer`.
 
 ### `BlockSelector` smoke
 

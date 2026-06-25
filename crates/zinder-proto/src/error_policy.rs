@@ -80,7 +80,8 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::UnsupportedShieldedProtocol
         | ErrorReason::InvalidChainStoreOptions
         | ErrorReason::ArtifactPayloadTooLarge
-        | ErrorReason::InvalidChainEpochArtifacts => {
+        | ErrorReason::InvalidChainEpochArtifacts
+        | ErrorReason::TransparentBalanceAddressCountExceeded => {
             ReasonPolicy::new(Code::InvalidArgument, NonRetryable)
         }
 

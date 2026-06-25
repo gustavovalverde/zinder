@@ -243,15 +243,15 @@ where
         Ok(replies)
     }
 
-    /// Returns lightwalletd `Balance { value_zat: int64 }` computed from the
-    /// canonical unspent transparent output projection.
+    /// Returns lightwalletd `Balance { value_zat: int64 }` from the wallet
+    /// plane's transparent-address balance primitive.
     ///
-    /// The compat shim answers `GetTaddressBalance` directly from canonical
-    /// artifacts: the legacy proto carries one signed `value_zat`
-    /// field that wallets interpret as confirmed balance. The richer native
-    /// `WalletQuery.TransparentAddressBalance` adds a mempool overlay through
-    /// the federated explorer plane and is the right surface for clients that
-    /// need pending deltas.
+    /// The legacy proto carries one signed `value_zat` field that wallets
+    /// interpret as confirmed balance. The compat shim projects the native
+    /// balance (confirmed total minus pending mempool outflows, saturating to
+    /// zero) into that single field via
+    /// [`TransparentAddressBalance::projected_total_zat`], capping at the
+    /// `int64` wire ceiling.
     async fn compat_balance_response(
         &self,
         addresses: Vec<String>,
@@ -259,17 +259,12 @@ where
         if addresses.is_empty() {
             return Err(Status::invalid_argument("addresses list must not be empty"));
         }
-        if addresses.len() > MAX_COMPAT_BALANCE_ADDRESSES {
-            return Err(Status::invalid_argument(
-                "addresses list exceeds the per-request balance cap",
-            ));
-        }
         let latest_block = self
             .query_api
             .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let mut confirmed_zat: u64 = 0;
+        let mut script_hashes = Vec::with_capacity(addresses.len());
         for address in addresses {
             let address_script_hash = address_lookup_to_script_hash(
                 Some(wallet_proto::AddressLookup {
@@ -278,34 +273,22 @@ where
                 latest_block.chain_epoch.network,
             )
             .map_err(|error| status_from_query_error(&error))?;
-            let unspent_outputs = self
-                .query_api
-                .transparent_address_unspent_outputs(
-                    TransparentAddressUnspentOutputsRequest {
-                        address_script_hash,
-                        start_height: BlockHeight::new(0),
-                    },
-                    Some(latest_block.chain_epoch.id),
-                )
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
-            for output in &unspent_outputs.outputs {
-                confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
-            }
+            script_hashes.push(address_script_hash);
         }
-        let value_zat = i64::try_from(confirmed_zat).map_err(|_| {
+        let balance = self
+            .query_api
+            .transparent_address_balance(script_hashes, Some(latest_block.chain_epoch.id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let value_zat = i64::try_from(balance.projected_total_zat()).map_err(|_| {
             Status::out_of_range(
-                "transparent address confirmed balance exceeds i64::MAX; \
+                "transparent address balance exceeds i64::MAX; \
                  use the native WalletQuery.TransparentAddressBalance surface",
             )
         })?;
         Ok(Response::new(lightwalletd::Balance { value_zat }))
     }
 }
-
-/// Hard cap on the number of addresses one `GetTaddressBalance` request may
-/// sum across. Each address fans out into one full unspent-set read.
-const MAX_COMPAT_BALANCE_ADDRESSES: usize = 256;
 
 #[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>

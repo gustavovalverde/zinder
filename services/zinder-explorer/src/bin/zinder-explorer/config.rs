@@ -24,9 +24,10 @@ pub(crate) struct ExplorerConfig {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) bearer_token_path: Option<PathBuf>,
     pub(crate) bearer_token: Option<BearerToken>,
-    /// Wallet-query endpoint that backs the Shape C balance read path.
-    /// Empty string means the federated balance method is unavailable; the
-    /// `explorer.transparent_address.balance_v1` capability is omitted.
+    /// Wallet-query endpoint that backs the explorer's wallet-composed reads
+    /// (transaction detail, block views, search, mempool activity). Empty
+    /// string omits the explorer capabilities that compose canonical wallet
+    /// reads.
     pub(crate) wallet_query_endpoint: Option<String>,
     /// Resolved upstream node target. `None` when the operator did not
     /// configure `[node]`; the upstream-observation probe stays unspawned

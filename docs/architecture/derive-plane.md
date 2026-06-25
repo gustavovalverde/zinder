@@ -110,13 +110,11 @@ operator-facing namespace per
 
 ### Shape 2 — Federated under `WalletQuery`
 
-For derive views close enough to wallet semantics to belong in the same client surface, the derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in the consumer's service crate (`services/zinder-explorer/` today) and is composed into `WalletQueryGrpcAdapter` at startup. The federation primitive (`DeriveProxy<Client>`, the readiness gauge, and the readiness probe loop) lives in `services/zinder-query/src/derive_proxy.rs`; every federated method on `WalletQueryGrpcAdapter` is one closure passed to `DeriveProxy::forward`, so the four concerns each consumer would otherwise duplicate (client construction, error mapping, capability gating, readiness probing) stay in one place.
+For derive views close enough to wallet semantics to belong in the same client surface, a derive consumer can be exposed as additional methods on `WalletQuery`, advertised under their own capability strings. The implementation lives in the consumer's service crate (`services/zinder-explorer/` today) and is composed into `WalletQueryGrpcAdapter` at startup. `zinder-query` opens a readiness-gated client to the derive service, maps its errors, and gates the federated capability on a readiness probe so the wallet plane advertises the method only while the consumer is reachable.
 
-The first shipped consumer of Shape 2 is `WalletQuery.TransparentAddressBalance`, which proxies to `ExplorerQuery.TransparentAddressBalance` in `services/zinder-explorer/` when the explorer plane is configured and ready. The explorer owns the single balance implementation (confirmed totals plus the live mempool overlay in `unconfirmed_delta_zat`); when the explorer plane is unavailable the wallet plane rejects the call with `UNAVAILABLE`. `WalletQuery.ServerInfo` advertises `explorer.transparent_address.balance_v1` only when the proxy is configured AND the most recent `ExplorerQuery.ServerInfo` probe reported `explorer.server_info_v1` ready inside the configured window.
+Shape 2 is the reserved pattern for views that wallets and applications consume *as if* they were canonical. No method ships under it today. The consumer's product capability prefix still applies; clients that gate on `wallet.*` capabilities never see a derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
 
-This shape is reserved for views that wallets and applications consume *as if* they were canonical. The consumer's product capability prefix still applies; clients that gate on `wallet.*` capabilities never see the derive view by accident, and a CI assertion in `services/zinder-query/tests/integration/` enforces the namespace rule against any future federated method.
-
-The step-by-step file list for adding a new Shape 2 consumer (the `DeriveProxy<C>` field, the readiness probe wiring, the two capability strings, and the compat-shim federation) is documented in [Extending the wallet data plane §Federation extension](extending-the-wallet-data-plane.md#federation-extension).
+The step-by-step file list for adding a Shape 2 consumer (the readiness-gated client field, the probe wiring, the two capability strings, and the compat-shim federation) is documented in [Extending the wallet data plane §Federation extension](extending-the-wallet-data-plane.md#federation-extension).
 
 ### Shape 3 — Sink-only (no Zinder-served queries)
 
@@ -195,7 +193,7 @@ wallet_query_endpoint = "https://zinder.example:9101"   # zinder-query gRPC
 view_retention_days = 365
 ```
 
-When `explorer.bearer_token_path` is set, `zinder-explorer` enforces the same shared-secret bearer-token interceptor used by private Zinder control planes ([ADR-0006](../adrs/0006-ingest-control-transport-security.md)). The matching `zinder-query` process must point its `[explorer] bearer_token_path` at the same secret before it advertises federated explorer capabilities.
+When `explorer.bearer_token_path` is set, `zinder-explorer` enforces the same shared-secret bearer-token interceptor used by private Zinder control planes ([ADR-0006](../adrs/0006-ingest-control-transport-security.md)). The explorer's `wallet_query_endpoint` points back at `zinder-query` for its wallet-composed reads.
 
 Sensitive upstream node credentials never reach reader gateways. The derive writer runs inside `zinder-ingest`, which already owns upstream node access; derive consumers do not create their own upstream clients.
 
@@ -221,6 +219,6 @@ Sensitive upstream node credentials never reach reader gateways. The derive writ
 - [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) — retention windows that bound derive-consumer downtime tolerance.
 - [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) — the second event stream available to the derive plane.
 - [Extending the wallet data plane §Federation extension](extending-the-wallet-data-plane.md#federation-extension) — the concrete extension checklist for federated derive methods.
-- [Wallet data plane §Transparent Address Balance](wallet-data-plane.md#transparent-address-balance) — the first shipped federated derive consumer and its capability contract.
+- [Wallet data plane §Transparent Address Balance](wallet-data-plane.md#transparent-address-balance) — a wallet-plane read that composes a canonical sum with a live-mempool overlay.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — the capability protocol derive consumers must implement.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions that derive consumers inherit.

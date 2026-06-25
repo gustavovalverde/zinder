@@ -60,3 +60,59 @@ impl TransparentAddressBalance {
         u64::try_from(signed_total.max(0)).unwrap_or(u64::MAX)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, ChainTipMetadata, Network,
+        UnixTimestampMillis,
+    };
+
+    fn sample_chain_epoch() -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(10),
+            visible_tip_hash: BlockHash::from_bytes([0u8; 32]),
+            settled_tip_height: BlockHeight::new(10),
+            settled_tip_hash: BlockHash::from_bytes([0u8; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(0),
+        }
+    }
+
+    #[test]
+    fn projected_total_adds_a_positive_delta_to_the_confirmed_total() {
+        let balance = TransparentAddressBalance {
+            confirmed_zat: 100,
+            unconfirmed_delta_zat: 25,
+            address_count: 1,
+            chain_epoch: sample_chain_epoch(),
+        };
+        assert_eq!(balance.projected_total_zat(), 125);
+    }
+
+    #[test]
+    fn projected_total_saturates_to_zero_when_outflows_exceed_confirmed() {
+        let balance = TransparentAddressBalance {
+            confirmed_zat: 100,
+            unconfirmed_delta_zat: -250,
+            address_count: 1,
+            chain_epoch: sample_chain_epoch(),
+        };
+        assert_eq!(balance.projected_total_zat(), 0);
+    }
+
+    #[test]
+    fn projected_total_does_not_overflow_at_the_confirmed_ceiling() {
+        let balance = TransparentAddressBalance {
+            confirmed_zat: u64::MAX,
+            unconfirmed_delta_zat: i64::MAX,
+            address_count: 2,
+            chain_epoch: sample_chain_epoch(),
+        };
+        assert_eq!(balance.projected_total_zat(), u64::MAX);
+    }
+}

@@ -17,9 +17,9 @@ use zinder_proto::{BoundaryError, status_for_reason};
 /// Each variant maps to one [`ErrorReason`] (and thus one gRPC code) through
 /// the shared reason policy: `InvalidRequest` to `INVALID_ARGUMENT`,
 /// `DependencyNotConfigured` to `FAILED_PRECONDITION`, `UpstreamUnreachable`
-/// to `UNAVAILABLE`, `NotMaterialized` to `NOT_FOUND`, `MalformedUpstream` to
-/// `DATA_LOSS`, `UnsatisfiedPrecondition` to `FAILED_PRECONDITION`,
-/// `Unsupported` to `UNIMPLEMENTED`, and `Internal` to `INTERNAL`.
+/// to `UNAVAILABLE`, `NotMaterialized` to `NOT_FOUND`,
+/// `UnsatisfiedPrecondition` to `FAILED_PRECONDITION`, `Unsupported` to
+/// `UNIMPLEMENTED`, and `Internal` to `INTERNAL`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub(crate) enum ExplorerError {
@@ -40,10 +40,6 @@ pub(crate) enum ExplorerError {
     /// The requested resource is not materialized in the explorer's derive view.
     #[error("{0}")]
     NotMaterialized(String),
-
-    /// An upstream Zinder response or stored record was unusable.
-    #[error("{0}")]
-    MalformedUpstream(String),
 
     /// The deployment state cannot serve the request without reconfiguration.
     #[error("{0}")]
@@ -80,11 +76,6 @@ impl ExplorerError {
         Self::NotMaterialized(message.into())
     }
 
-    /// Constructs an [`ExplorerError::MalformedUpstream`].
-    pub(crate) fn malformed_upstream(message: impl Into<String>) -> Self {
-        Self::MalformedUpstream(message.into())
-    }
-
     /// Constructs an [`ExplorerError::UnsatisfiedPrecondition`].
     pub(crate) fn unsatisfied_precondition(message: impl Into<String>) -> Self {
         Self::UnsatisfiedPrecondition(message.into())
@@ -108,7 +99,6 @@ impl BoundaryError for ExplorerError {
             Self::DependencyNotConfigured(_) => ErrorReason::DependencyNotConfigured,
             Self::UpstreamUnreachable(_) => ErrorReason::UpstreamUnreachable,
             Self::NotMaterialized(_) => ErrorReason::ArtifactUnavailable,
-            Self::MalformedUpstream(_) => ErrorReason::ArtifactCorrupt,
             Self::UnsatisfiedPrecondition(_) => ErrorReason::ExplorerPreconditionUnsatisfied,
             Self::Unsupported(_) => ErrorReason::ExplorerMethodDisabled,
             Self::Internal(_) => ErrorReason::ExplorerInternal,
@@ -137,7 +127,6 @@ mod tests {
             ExplorerError::dependency_not_configured("probe"),
             ExplorerError::upstream_unreachable("probe"),
             ExplorerError::not_materialized("probe"),
-            ExplorerError::malformed_upstream("probe"),
             ExplorerError::unsatisfied_precondition("probe"),
             ExplorerError::unsupported("probe"),
             ExplorerError::internal("probe"),

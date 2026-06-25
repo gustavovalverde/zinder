@@ -13,7 +13,7 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 - **Subtree-root reads**: shielded subtree roots for batched scanning (`WalletQuery.SubtreeRootsInRange`).
 - **Transparent-address output reads**: the complete current unspent set per address, streamed at one pinned chain epoch (`WalletQuery.TransparentAddressUnspentOutputs`).
 - **Transparent-address tx-history reads**: paginated tx-ids per address in a height range (`WalletQuery.TransparentAddressTxIdsInRange`).
-- **Transparent-address balance**: confirmed balance from canonical outputs plus an optional derive-plane mempool overlay (`WalletQuery.TransparentAddressBalance`).
+- **Transparent-address balance**: confirmed balance summed from the canonical unspent-output index plus a live-mempool overlay (`WalletQuery.TransparentAddressBalance`).
 - **Mempool reads**: snapshot + change-event subscription (`WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`).
 - **Transparent prevout resolution**: canonical and live-mempool spend lookups.
 - **Transaction broadcast**: forwards raw transactions to the upstream node.

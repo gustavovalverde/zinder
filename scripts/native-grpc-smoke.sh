@@ -12,7 +12,6 @@
 # Defaults: query-addr=127.0.0.1:9069. Override per env:
 #   ZINDER_QUERY_GRPC_ADDR                     (host:port for the native gRPC endpoint)
 #   ZINDER_QUERY_HEIGHT                        (block height to probe; default latest visible block)
-#   ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE   (require derive balance capability when set to 1)
 #
 # Exit codes:
 #   0  all probes passed
@@ -28,7 +27,6 @@ CAPABILITIES_RS="${ROOT_DIR}/crates/zinder-proto/src/capabilities.rs"
 
 QUERY_ADDR="${1:-${ZINDER_QUERY_GRPC_ADDR:-127.0.0.1:9069}}"
 HEIGHT="${ZINDER_QUERY_HEIGHT:-}"
-EXPECT_DERIVE_BALANCE="${ZINDER_NATIVE_GRPC_EXPECT_DERIVE_BALANCE:-0}"
 
 log() {
   printf '[native-grpc-smoke] %s\n' "$*"
@@ -70,12 +68,7 @@ server_info=$(grpc_call "zinder.v1.wallet.WalletQuery/ServerInfo" || die "Server
 advertised=$(jq -r '.capabilities.capabilities[]?' <<<"${server_info}" | sort)
 expected=$(grep -E '^[[:space:]]*"[a-z][^"]+",' "${CAPABILITIES_RS}" \
   | sed -E 's/^[[:space:]]*"([^"]+)".*$/\1/' \
-  | grep -vx 'explorer.transparent_address.balance_v1' \
   | sort)
-
-if [[ "${EXPECT_DERIVE_BALANCE}" == "1" ]]; then
-  expected=$(printf '%s\n%s\n' "${expected}" "explorer.transparent_address.balance_v1" | sort)
-fi
 
 if [[ -z "${expected}" ]]; then
   die "could not parse expected capability list from ${CAPABILITIES_RS}"

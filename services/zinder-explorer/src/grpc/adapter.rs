@@ -1,13 +1,9 @@
 //! `ExplorerQuery` gRPC adapter.
 //!
-//! Serves [`ExplorerQuery::ServerInfo`] (advertising
-//! [`EXPLORER_SERVER_INFO_V1`]) and
-//! [`ExplorerQuery::TransparentAddressBalance`]. Balance reads compute at
-//! request time: confirmed totals are summed from canonical
-//! transparent output facts (via `WalletQuery`) and the mempool overlay is
-//! composed from the live mempool point lookups (also via `WalletQuery`).
-//! The explorer plane owns no balance column family; the wire shape is the
-//! durable contract.
+//! Serves [`ExplorerQuery::ServerInfo`] (advertising [`EXPLORER_SERVER_INFO_V1`])
+//! and the derive-backed explorer surfaces. Handlers that need canonical
+//! wallet-plane reads (transaction detail, block views, search, mempool
+//! activity, value pools) compose them through a `WalletQuery` channel.
 //!
 //! The adapter holds a single cached `WalletQuery` channel and reuses it
 //! across requests. The first request that needs the channel pays the
@@ -16,7 +12,6 @@
 //! clone-cheap) so the explorer never opens one HTTP/2 connection per
 //! request.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,9 +19,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, wire::encode_zinder_native_chain_name,
-};
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     CapabilitySurface, EXPLORER_SERVER_INFO_V1, ExplorerReadiness, capabilities_for_surface,
 };
@@ -44,10 +37,7 @@ use zinder_proto::v1::{
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
-    wallet::{
-        self, TransparentAddressBalanceRequest, TransparentAddressBalanceResponse,
-        wallet_query_client::WalletQueryClient,
-    },
+    wallet::wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
@@ -316,33 +306,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 derive_status,
             }),
         }))
-    }
-
-    async fn transparent_address_balance(
-        &self,
-        request: Request<TransparentAddressBalanceRequest>,
-    ) -> Result<Response<TransparentAddressBalanceResponse>, Status> {
-        const OP: OperationNames = OperationNames {
-            method: "TransparentAddressBalance",
-            metric: "transparent_address_balance",
-        };
-        let started = Instant::now();
-        let outcome = async {
-            self.require_wallet_endpoint(OP.method)?;
-            let request_inner = request.into_inner();
-            if request_inner.addresses.is_empty() {
-                return Err(
-                    ExplorerError::invalid_request("addresses list must not be empty").into(),
-                );
-            }
-            let mut client = self.wallet_client(OP.method).await?;
-            compute_transparent_address_balance(&mut client, request_inner)
-                .await
-                .map(Response::new)
-        }
-        .await;
-        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
-        outcome
     }
 
     async fn transaction_detail(
@@ -737,173 +700,6 @@ impl ExplorerQueryGrpcAdapter {
             .await?;
         Ok(WalletQueryClient::new(channel.clone()))
     }
-}
-
-/// Hard cap on the number of addresses one balance request may sum across.
-///
-/// Each address fans out into one unspent-output stream and one mempool
-/// point lookup, so an unbounded list would let one request fan out into
-/// thousands of `WalletQuery` round-trips. `u32` matches the
-/// `address_count` field on the response so the bound check happens in the
-/// wire type's native width.
-const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
-
-#[derive(Default)]
-struct BalanceAccumulator {
-    confirmed_zat: u64,
-    unconfirmed_delta_zat: i64,
-    chain_epoch: Option<wallet::ChainEpoch>,
-    unspent_value_by_outpoint: HashMap<(String, u32), u64>,
-}
-
-async fn compute_transparent_address_balance(
-    client: &mut WalletQueryClient<AuthenticatedChannel>,
-    request: TransparentAddressBalanceRequest,
-) -> Result<TransparentAddressBalanceResponse, Status> {
-    let address_count = u32::try_from(request.addresses.len())
-        .ok()
-        .filter(|count| *count <= MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES)
-        .ok_or_else(|| {
-            ExplorerError::invalid_request(format!(
-                "addresses list of {} exceeds the per-request cap of {}",
-                request.addresses.len(),
-                MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-            ))
-        })?;
-
-    let mut accumulator = BalanceAccumulator::default();
-    for address_lookup in request.addresses {
-        accumulate_address_balance(client, address_lookup, &mut accumulator).await?;
-    }
-    subtract_pending_outflows(client, &mut accumulator).await?;
-
-    let chain_epoch = accumulator.chain_epoch.ok_or_else(|| {
-        ExplorerError::internal("WalletQuery did not return a chain epoch for any address")
-    })?;
-    Ok(TransparentAddressBalanceResponse {
-        chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(chain_epoch),
-            indexed_tip: None,
-            upstream_tip: None,
-            derive: None,
-        }),
-        confirmed_zat: accumulator.confirmed_zat,
-        unconfirmed_delta_zat: accumulator.unconfirmed_delta_zat,
-        address_count,
-    })
-}
-
-/// Drains one address's complete unspent set and its pending mempool
-/// inflows into the accumulator.
-async fn accumulate_address_balance(
-    client: &mut WalletQueryClient<AuthenticatedChannel>,
-    address_lookup: wallet::AddressLookup,
-    accumulator: &mut BalanceAccumulator,
-) -> Result<(), Status> {
-    let mut outputs_stream = client
-        .transparent_address_unspent_outputs(Request::new(
-            wallet::TransparentAddressUnspentOutputsRequest {
-                address: Some(address_lookup.clone()),
-                start_height: 0,
-            },
-        ))
-        .await?
-        .into_inner();
-    while let Some(output) = outputs_stream.message().await? {
-        if accumulator.chain_epoch.is_none() {
-            accumulator.chain_epoch = output
-                .chain_view
-                .and_then(|chain_view| chain_view.chain_epoch);
-        }
-        accumulator.confirmed_zat = accumulator.confirmed_zat.saturating_add(output.value_zat);
-        let outpoint = output.outpoint.ok_or_else(|| {
-            ExplorerError::malformed_upstream(
-                "TransparentUnspentOutput.outpoint missing in WalletQuery response",
-            )
-        })?;
-        accumulator.unspent_value_by_outpoint.insert(
-            (outpoint.transaction_id, outpoint.output_index),
-            output.value_zat,
-        );
-    }
-
-    let mempool_outputs = client
-        .transparent_mempool_outputs_by_address(Request::new(
-            wallet::TransparentMempoolOutputsByAddressRequest {
-                address: Some(address_lookup),
-                max_entries: None,
-            },
-        ))
-        .await?
-        .into_inner();
-    if accumulator.chain_epoch.is_none() {
-        accumulator.chain_epoch = mempool_outputs
-            .chain_view
-            .as_ref()
-            .and_then(|chain_view| chain_view.chain_epoch.clone());
-    }
-    for output in &mempool_outputs.outputs {
-        accumulator.unconfirmed_delta_zat = accumulator
-            .unconfirmed_delta_zat
-            .saturating_add(value_zat_to_signed(output.value_zat)?);
-    }
-    Ok(())
-}
-
-/// Subtracts pending mempool spends of the accumulated unspent set using
-/// batched spend lookups, chunked at the server's per-request outpoint cap.
-async fn subtract_pending_outflows(
-    client: &mut WalletQueryClient<AuthenticatedChannel>,
-    accumulator: &mut BalanceAccumulator,
-) -> Result<(), Status> {
-    let unspent_outpoints = accumulator
-        .unspent_value_by_outpoint
-        .keys()
-        .map(|(transaction_id, output_index)| wallet::OutPoint {
-            transaction_id: transaction_id.clone(),
-            output_index: *output_index,
-        })
-        .collect::<Vec<_>>();
-    for outpoint_batch in unspent_outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
-        let spends_response = client
-            .transparent_mempool_spends_by_outpoint(Request::new(
-                wallet::TransparentMempoolSpendsByOutpointRequest {
-                    outpoints: outpoint_batch.to_vec(),
-                },
-            ))
-            .await?
-            .into_inner();
-        for spend in spends_response.spends {
-            let spent_outpoint = spend.spent_outpoint.ok_or_else(|| {
-                ExplorerError::malformed_upstream(
-                    "TransparentMempoolSpend.spent_outpoint missing in WalletQuery response",
-                )
-            })?;
-            if let Some(value_zat) = accumulator
-                .unspent_value_by_outpoint
-                .get(&(spent_outpoint.transaction_id, spent_outpoint.output_index))
-            {
-                accumulator.unconfirmed_delta_zat = accumulator
-                    .unconfirmed_delta_zat
-                    .saturating_sub(value_zat_to_signed(*value_zat)?);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Converts a wire `u64` Zatoshi value to the signed accumulator width.
-///
-/// Zcash's hardcoded supply cap (`MAX_MONEY = 21,000,000 * 10^8` zat) fits
-/// well inside `i64::MAX`, so a `u64` value that does not fit is upstream
-/// data corruption and surfaces as `data_loss` rather than silent saturation.
-fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
-    i64::try_from(value_zat).map_err(|_| {
-        ExplorerError::malformed_upstream(format!(
-            "WalletQuery returned value_zat {value_zat} exceeding i64::MAX"
-        ))
-        .into()
-    })
 }
 
 #[allow(

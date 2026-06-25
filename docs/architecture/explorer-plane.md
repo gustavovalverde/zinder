@@ -23,12 +23,12 @@ The decisions that govern this plane:
 
 - **Consumes** the writer-owned derive store as a RocksDB secondary under `storage.path`, plus `WalletQuery` over gRPC for federated read paths.
 - **Owns** no primary RocksDB. `storage.path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
-- **Produces** the `ExplorerQuery` gRPC service plus federated additions to `WalletQuery` (currently `TransparentAddressBalance`'s mempool overlay).
-- **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret.
+- **Produces** the `ExplorerQuery` gRPC service.
+- **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret; does not serve any balance RPC.
 
 The boundary rules:
 
-- A `zinder-explorer` crash does not stop ingest or wallet sync. `WalletQuery.TransparentAddressBalance` falls back to the canonical-confirmed compute path.
+- A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive, including `WalletQuery.TransparentAddressBalance`.
 - The explorer plane never extends canonical artifact schemas. When a view needs a fact the canonical surface does not carry, the source boundary extends first, the canonical artifact or event gains the field, the explorer subscribes.
 - Server-side shielded address scanning, persisted viewing keys, and memo decryption are out of scope by product invariant.
 
@@ -42,9 +42,6 @@ service ExplorerQuery {
 
   rpc TransactionDetail(TransactionDetailRequest)
       returns (TransactionDetailResponse);
-
-  rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
-      returns (TransparentAddressBalanceResponse);
 }
 ```
 
@@ -145,7 +142,6 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | ---------- | ------------ | ---------- |
 | `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
 | `explorer.transaction.detail_v1` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint is configured |
-| `explorer.transparent_address.balance_v1` | `ExplorerQuery.TransparentAddressBalance` (and federated `WalletQuery.TransparentAddressBalance`) | When the wallet endpoint is configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
@@ -157,11 +153,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
 
-One capability crosses planes (federation rule per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)):
-
-- `explorer.transparent_address.balance_v1` — `WalletQuery.TransparentAddressBalance` forwards to the explorer's single balance implementation (confirmed totals plus the live-mempool overlay) when the explorer proxy is ready; without it the wallet plane rejects the call with `UNAVAILABLE`.
-
-Future federated methods follow the same pattern: the capability lives in the `explorer.*` namespace because the explorer plane owns the data product, and the wallet plane advertises it only while the proxy is ready.
+Every `explorer.*` capability is served by the explorer plane itself; clients reach these methods on `ExplorerQuery`, never through `WalletQuery`. A future derive consumer that wants its view surfaced on the wallet client follows the federation rule in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md): the capability lives in the consumer's product namespace, and the wallet plane advertises it only while the consumer's proxy is ready.
 
 ## Freshness envelope
 
@@ -209,7 +201,7 @@ max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond thi
 warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
 
-When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The matching `zinder-query` process points its `[explorer]` config at the same secret before advertising the federated `explorer.transparent_address.balance_v1` capability.
+When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's own `wallet_query_endpoint` config points back at `zinder-query` for its wallet-composed reads (transaction detail, block views, search, mempool activity, value pools).
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
@@ -225,7 +217,7 @@ Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-s
 The explorer plane fails independently from canonical state.
 
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
-- An explorer service crash does not stop `zinder-query`. `WalletQuery` continues serving wallet primitives. `WalletQuery.TransparentAddressBalance` falls back to the canonical-confirmed compute path; the `explorer.transparent_address.balance_v1` capability disappears from `WalletQuery.ServerInfo` until the explorer proxy returns to readiness.
+- An explorer service crash does not stop `zinder-query`. `WalletQuery` continues serving wallet primitives. `WalletQuery.TransparentAddressBalance` is wallet-plane and unaffected by explorer state: it sums the canonical unspent-output index in-process and overlays the live mempool through the colocated `IngestControl` endpoint.
 - An explorer derive view becoming inconsistent does not corrupt canonical state. Operators drop the explorer store and rebuild from `WalletQuery.ChainEvents` at `cursor = None`.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
@@ -272,7 +264,7 @@ Explorer-derived views use the derive-plane SDK and capability-gated optional fi
 
 - [Service boundaries](service-boundaries.md) — names `zinder-explorer` in the workspace inventory.
 - [Derive plane](derive-plane.md) — the reusable SDK pattern the explorer plane exercises.
-- [Wallet data plane](wallet-data-plane.md) — sibling boundary; canonical wallet read surface and federated dual-capability methods.
+- [Wallet data plane](wallet-data-plane.md) — sibling boundary; the canonical wallet read surface.
 - [Public interfaces](public-interfaces.md) — naming spine, capability discovery, error vocabulary, configuration conventions.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions the explorer service inherits.
 - [Reference: error vocabulary](../reference/error-vocabulary.md) — explorer-specific `ErrorReason` variants and retry semantics.

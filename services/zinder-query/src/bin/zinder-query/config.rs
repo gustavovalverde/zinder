@@ -1,6 +1,6 @@
 //! Configuration loading for the `zinder-query` binary.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,9 +11,8 @@ use zinder_runtime::{
     IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     ResolvedIngestControlReader, ResolvedRetention, ResolvedSecondaryStorage, RetentionSection,
     RetentionToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
-    duration_as_millis_u64, load_bearer_token, parse_socket_addr, require_field,
-    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_retention,
-    resolve_secondary_storage, validate_zinder_grpc_endpoint,
+    parse_socket_addr, require_field, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_retention, resolve_secondary_storage,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
@@ -30,7 +29,6 @@ pub(crate) struct QueryConfig {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) grpc: QueryGrpcConfig,
-    pub(crate) explorer_proxy: Option<ExplorerProxyConfig>,
     /// Optional node broadcaster. Network must match `QueryConfig.network`
     /// when present; the resolver enforces this.
     pub(crate) broadcaster: Option<NodeTarget>,
@@ -56,15 +54,6 @@ impl QueryConfig {
     }
 }
 
-/// Resolved explorer-plane proxy configuration consumed by `zinder-query`.
-#[derive(Clone, Debug)]
-pub(crate) struct ExplorerProxyConfig {
-    pub(crate) endpoint: String,
-    pub(crate) bearer_token_path: Option<PathBuf>,
-    pub(crate) bearer_token: Option<BearerToken>,
-    pub(crate) probe_interval: Duration,
-}
-
 /// Resolved gRPC runtime options.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueryGrpcConfig {
@@ -86,9 +75,6 @@ pub(crate) struct QueryConfigOverrides {
     pub(crate) listen_addr: Option<SocketAddr>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) node_json_rpc_addr: Option<String>,
-    pub(crate) explorer_endpoint: Option<String>,
-    pub(crate) explorer_bearer_token_path: Option<PathBuf>,
-    pub(crate) explorer_probe_interval_ms: Option<u64>,
 }
 
 /// Error returned while resolving query configuration or running the gRPC server.
@@ -170,15 +156,6 @@ pub(crate) fn load_query_config(
             overrides.ops_listen_addr.map(|addr| addr.to_string()),
         )?
         .with_override_if("node.json_rpc_addr", overrides.node_json_rpc_addr)?
-        .with_override_if("explorer.endpoint", overrides.explorer_endpoint)?
-        .with_override_path_if(
-            "explorer.bearer_token_path",
-            overrides.explorer_bearer_token_path,
-        )?
-        .with_override_if(
-            "explorer.probe_interval_ms",
-            overrides.explorer_probe_interval_ms,
-        )?
         .load()?;
 
     resolve_query_config(raw_config)
@@ -201,7 +178,6 @@ struct QueryRawConfig {
     ingest_control: IngestControlSection,
     query: QuerySection,
     node: NodeSection,
-    explorer: QueryExplorerSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,14 +192,6 @@ struct QuerySection {
 struct QueryGrpcSection {
     enable_reflection: Option<bool>,
     enable_health: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct QueryExplorerSection {
-    endpoint: Option<String>,
-    bearer_token_path: Option<PathBuf>,
-    probe_interval_ms: Option<u64>,
 }
 
 fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
@@ -245,7 +213,6 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let broadcaster =
         NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
-    let explorer_proxy = resolve_explorer_proxy_config(config.explorer)?;
 
     Ok(QueryConfig {
         network,
@@ -260,39 +227,8 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
             enable_reflection,
             enable_health,
         },
-        explorer_proxy,
         broadcaster,
     })
-}
-
-fn resolve_explorer_proxy_config(
-    config: QueryExplorerSection,
-) -> Result<Option<ExplorerProxyConfig>, QueryConfigError> {
-    let Some(endpoint) = config.endpoint else {
-        return Ok(None);
-    };
-    validate_zinder_grpc_endpoint(&endpoint).map_err(|source| {
-        ConfigError::invalid(format!(
-            "explorer.endpoint {endpoint} is not a valid endpoint: {source}"
-        ))
-    })?;
-    let probe_interval_ms = config.probe_interval_ms.unwrap_or_else(|| {
-        u64::try_from(zinder_query::DEFAULT_DERIVE_PROBE_INTERVAL.as_millis()).unwrap_or(u64::MAX)
-    });
-    if probe_interval_ms == 0 {
-        return Err(
-            ConfigError::invalid("explorer.probe_interval_ms must be greater than zero").into(),
-        );
-    }
-    let bearer_token_path = config.bearer_token_path;
-    let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
-
-    Ok(Some(ExplorerProxyConfig {
-        endpoint,
-        bearer_token_path,
-        bearer_token,
-        probe_interval: Duration::from_millis(probe_interval_ms),
-    }))
 }
 
 #[derive(Serialize)]
@@ -303,8 +239,6 @@ struct QueryConfigToml {
     retention: RetentionToml,
     ingest_control: IngestControlReaderToml,
     query: QueryToml,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    explorer: Option<QueryExplorerToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<NodeToml>,
 }
@@ -327,10 +261,6 @@ impl QueryConfigToml {
                     enable_health: config.grpc.enable_health,
                 },
             },
-            explorer: config
-                .explorer_proxy
-                .as_ref()
-                .map(QueryExplorerToml::from_explorer_proxy_config),
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
         }
     }
@@ -346,25 +276,4 @@ struct QueryToml {
 struct QueryGrpcToml {
     enable_reflection: bool,
     enable_health: bool,
-}
-
-#[derive(Serialize)]
-struct QueryExplorerToml {
-    endpoint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bearer_token_path: Option<String>,
-    probe_interval_ms: u64,
-}
-
-impl QueryExplorerToml {
-    fn from_explorer_proxy_config(config: &ExplorerProxyConfig) -> Self {
-        Self {
-            endpoint: config.endpoint.clone(),
-            bearer_token_path: config
-                .bearer_token_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            probe_interval_ms: duration_as_millis_u64(config.probe_interval),
-        }
-    }
 }

@@ -67,6 +67,14 @@ pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.address.transparent_unspent_outputs_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressBalance`.
+///
+/// The confirmed total is summed in-process from the canonical
+/// unspent-output index; the signed `unconfirmed_delta_zat` overlays the live
+/// mempool when an ingest-control endpoint is wired and is zero otherwise.
+/// Always advertised: the canonical unspent index the confirmed sum reads is
+/// present on every wallet-plane deployment.
+pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
@@ -189,14 +197,6 @@ pub const EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1: &str = "explorer.payment_disclo
 /// `wallet_query_endpoint` both being online (same precondition as the
 /// derive-backed cards the bundle composes).
 pub const EXPLORER_OVERVIEW_SNAPSHOT_V1: &str = "explorer.overview.snapshot_v1";
-/// Capability advertised for `WalletQuery.TransparentAddressBalance`.
-///
-/// Advertised only when the explorer plane is configured and ready: the
-/// balance response (confirmed total plus the live mempool overlay in
-/// `unconfirmed_delta_zat`) is computed by `zinder-explorer` and proxied
-/// through `WalletQuery`; see
-/// [ADR-0009](../../../docs/adrs/0009-explorer-plane-as-product-surface.md).
-pub const EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1: &str = "explorer.transparent_address.balance_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -547,10 +547,10 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-        CapabilitySurface::Explorer,
-        Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressBalance"),
-        AdvertisePolicy::RequiresWalletQuery,
+        WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressBalance"),
+        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,

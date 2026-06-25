@@ -40,6 +40,7 @@ enum ErrorReason {
   INVALID_CHAIN_STORE_OPTIONS = 8;
   ARTIFACT_PAYLOAD_TOO_LARGE = 9;
   INVALID_CHAIN_EPOCH_ARTIFACTS = 10;
+  TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED = 43;
 
   // FAILED_PRECONDITION family.
   BROADCAST_DISABLED = 11;
@@ -100,5 +101,5 @@ enum ErrorReason {
 
   // Reserved slots for additive growth. Removing a reserved range is a
   // breaking change.
-  reserved 43 to 63;
+  reserved 44 to 63;
 }

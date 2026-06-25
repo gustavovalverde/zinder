@@ -1,6 +1,6 @@
 //! Native gRPC adapter for wallet query reads.
 
-use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Instant};
+use std::{collections::HashMap, num::NonZeroU32, pin::Pin, sync::Arc, time::Instant};
 
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
@@ -14,17 +14,14 @@ use zinder_core::{
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
-use zinder_proto::capabilities::{
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-};
+use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_proto::v1::{
-    explorer::explorer_query_client::ExplorerQueryClient,
     ingest::ingest_control_client::IngestControlClient,
     wallet::{self, wallet_query_server},
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
-use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge, record_proxy_outcome};
+use crate::record_proxy_outcome;
 use zinder_store::{
     StreamCursorTokenV1, chain_event_stream_family_from_message, stream_cursor_from_message_bytes,
 };
@@ -67,7 +64,6 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     server_info: ServerInfoSettings,
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
-    explorer_proxy: Option<DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>>,
     /// One cached HTTP/2 channel to the ingest-control writer, dialed lazily
     /// on the first proxied request. Clones of the adapter share the cache
     /// through `Arc<OnceCell<_>>` so concurrent RPCs never race to open
@@ -85,7 +81,6 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             server_info,
             ingest_control_proxy_endpoint: None,
             ingest_control_bearer_token: None,
-            explorer_proxy: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
         }
     }
@@ -93,9 +88,10 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// Creates a gRPC adapter that proxies in-process ingest-owned reads
     /// through `IngestControl`.
     ///
-    /// The same endpoint serves `ChainEvents`, `MempoolSnapshot`, and
-    /// `MempoolEvents`; secondary readers cannot observe the live writer
-    /// state otherwise.
+    /// The same endpoint serves `ChainEvents`, `MempoolSnapshot`,
+    /// `MempoolEvents`, and the live mempool overlay on
+    /// `TransparentAddressBalance`; secondary readers cannot observe the
+    /// live writer state otherwise.
     #[must_use]
     pub fn with_ingest_control_proxy(
         query_api: QueryApi,
@@ -107,34 +103,8 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             server_info,
             ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
             ingest_control_bearer_token: None,
-            explorer_proxy: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
         }
-    }
-
-    /// Wires the explorer-plane proxy that federates
-    /// `WalletQuery.TransparentAddressBalance` to
-    /// `zinder-explorer`'s `ExplorerQuery`.
-    ///
-    /// Without an explorer proxy the federated balance method returns
-    /// `UNAVAILABLE` and `ServerInfo` omits the corresponding capability
-    /// string.
-    #[must_use]
-    pub fn with_explorer_proxy(
-        mut self,
-        explorer_proxy: DeriveProxy<ExplorerQueryClient<AuthenticatedChannel>>,
-    ) -> Self {
-        self.explorer_proxy = Some(explorer_proxy);
-        self
-    }
-
-    /// Returns the readiness gauge of the configured explorer proxy.
-    ///
-    /// Operators wire the gauge into a [`crate::spawn_derive_readiness_probe`]
-    /// task so the federated capability is gated on a live readiness probe.
-    #[must_use]
-    pub fn explorer_proxy_readiness(&self) -> Option<DeriveReadinessGauge> {
-        self.explorer_proxy.as_ref().map(DeriveProxy::readiness)
     }
 
     /// Attaches a shared-secret bearer token to every proxied request.
@@ -612,24 +582,7 @@ where
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
         let started_at = Instant::now();
-        let outcome = async {
-            let Some(proxy) = self
-                .explorer_proxy
-                .as_ref()
-                .filter(|proxy| proxy.is_ready())
-            else {
-                return Err(Status::unavailable(
-                    "TransparentAddressBalance requires the federated explorer plane; \
-                     configure the explorer endpoint",
-                ));
-            };
-            proxy
-                .forward(request, |mut client, request| async move {
-                    client.transparent_address_balance(request).await
-                })
-                .await
-        }
-        .await;
+        let outcome = self.compute_transparent_address_balance(request).await;
         record_proxy_outcome("transparent_address_balance", started_at, &outcome);
         outcome
     }
@@ -638,30 +591,12 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
-        // `explorer.transparent_address.balance_v1` is advertised only when
-        // the explorer plane is configured and ready: the federated balance
-        // response carries the live mempool overlay in
-        // `unconfirmed_delta_zat`.
         let mut wallet_info = build_wallet_server_info(&self.server_info);
         let Some(common) = wallet_info.common.as_mut() else {
             return Err(Status::internal(
                 "build_wallet_server_info must populate ops.ServerInfo",
             ));
         };
-        let federated_capability = self
-            .explorer_proxy
-            .as_ref()
-            .filter(|proxy| proxy.is_ready())
-            .map(|proxy| proxy.capability().to_owned());
-        if let Some(capability) = federated_capability {
-            if !common.capabilities.contains(&capability) {
-                common.capabilities.push(capability);
-            }
-        } else {
-            common
-                .capabilities
-                .retain(|advertised| advertised != EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1);
-        }
         if self.ingest_control_proxy_endpoint.is_none() {
             common
                 .capabilities
@@ -759,6 +694,163 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             .await?;
         Ok(IngestControlClient::new(channel.clone()))
     }
+
+    /// Computes the transparent-address balance: the canonical confirmed total
+    /// summed in-process plus the live mempool overlay.
+    ///
+    /// The confirmed total, address cap, and chain-epoch pin are owned by
+    /// [`WalletQueryApi::transparent_address_balance`]. The signed
+    /// `unconfirmed_delta_zat` overlay is composed here from the live mempool
+    /// surfaces reached through the ingest-control proxy; deployments without
+    /// an ingest-control endpoint leave the delta at zero.
+    async fn compute_transparent_address_balance(
+        &self,
+        request: Request<wallet::TransparentAddressBalanceRequest>,
+    ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status>
+    where
+        QueryApi: Clone + WalletQueryApi + Send + Sync + 'static,
+    {
+        let request = request.into_inner();
+        if request.addresses.is_empty() {
+            return Err(Status::invalid_argument("addresses list must not be empty"));
+        }
+        let network = self.server_info_network()?;
+        let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
+        let mut script_hashes = Vec::with_capacity(request.addresses.len());
+        for address_lookup in request.addresses {
+            let address_script_hash = address_lookup_to_script_hash(Some(address_lookup), network)
+                .map_err(|error| status_from_query_error(&error))?;
+            script_hashes.push(address_script_hash);
+        }
+
+        let confirmed = self
+            .query_api
+            .transparent_address_balance(script_hashes.clone(), at_epoch_id)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+
+        let unconfirmed_delta_zat = self
+            .mempool_balance_overlay(&script_hashes, confirmed.chain_epoch.id)
+            .await?;
+
+        Ok(Response::new(wallet::TransparentAddressBalanceResponse {
+            chain_view: Some(build_chain_view_message(confirmed.chain_epoch)),
+            confirmed_zat: confirmed.confirmed_zat,
+            unconfirmed_delta_zat,
+            address_count: confirmed.address_count,
+        }))
+    }
+
+    /// Sums the signed mempool delta for the requested addresses.
+    ///
+    /// Returns zero when no ingest-control endpoint is wired: the canonical
+    /// confirmed total is the whole answer for storage-only deployments.
+    /// Otherwise adds pending inflows (mempool outputs paid to the addresses)
+    /// and subtracts pending outflows (mempool spends of the addresses'
+    /// confirmed unspent set), both read from the live mempool index.
+    async fn mempool_balance_overlay(
+        &self,
+        script_hashes: &[zinder_core::TransparentAddressScriptHash],
+        chain_epoch_id: ChainEpochId,
+    ) -> Result<i64, Status>
+    where
+        QueryApi: Clone + WalletQueryApi + Send + Sync + 'static,
+    {
+        if self.ingest_control_proxy_endpoint.is_none() {
+            return Ok(0);
+        }
+        let mut client = self
+            .ingest_control_client(
+                "TransparentAddressBalance mempool overlay requires the ingest-control proxy; \
+                 configure the writer endpoint",
+            )
+            .await?;
+
+        let mut unconfirmed_delta_zat: i64 = 0;
+        let mut spendable_value_by_outpoint: HashMap<(String, u32), u64> = HashMap::new();
+        for address_script_hash in script_hashes {
+            let mempool_outputs = client
+                .transparent_mempool_outputs_by_address(Request::new(
+                    wallet::TransparentMempoolOutputsByAddressRequest {
+                        address: Some(typed_script_hash_address_lookup(
+                            &address_script_hash.as_bytes(),
+                        )),
+                        max_entries: None,
+                    },
+                ))
+                .await?
+                .into_inner();
+            for output in &mempool_outputs.outputs {
+                unconfirmed_delta_zat =
+                    unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat)?);
+            }
+
+            let unspent_outputs = self
+                .query_api
+                .transparent_address_unspent_outputs(
+                    TransparentAddressUnspentOutputsRequest {
+                        address_script_hash: *address_script_hash,
+                        start_height: BlockHeight::new(0),
+                    },
+                    Some(chain_epoch_id),
+                )
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
+            for output in &unspent_outputs.outputs {
+                spendable_value_by_outpoint.insert(
+                    (
+                        encode_rpc_transaction_id_hex(output.outpoint.transaction_id),
+                        output.outpoint.output_index,
+                    ),
+                    output.value_zat,
+                );
+            }
+        }
+
+        let pending_outflow_zat =
+            mempool_pending_outflow_zat(&mut client, &spendable_value_by_outpoint).await?;
+        Ok(unconfirmed_delta_zat.saturating_sub(pending_outflow_zat))
+    }
+}
+
+/// Sums the value of confirmed unspent outputs that the live mempool already
+/// spends, batched at the per-request outpoint cap.
+async fn mempool_pending_outflow_zat(
+    client: &mut AuthenticatedIngestControlClient,
+    spendable_value_by_outpoint: &HashMap<(String, u32), u64>,
+) -> Result<i64, Status> {
+    let spendable_outpoints = spendable_value_by_outpoint
+        .keys()
+        .map(|(transaction_id, output_index)| wallet::OutPoint {
+            transaction_id: transaction_id.clone(),
+            output_index: *output_index,
+        })
+        .collect::<Vec<_>>();
+    let mut pending_outflow_zat: i64 = 0;
+    for outpoint_batch in spendable_outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
+        let spends = client
+            .transparent_mempool_spends_by_outpoint(Request::new(
+                wallet::TransparentMempoolSpendsByOutpointRequest {
+                    outpoints: outpoint_batch.to_vec(),
+                },
+            ))
+            .await?
+            .into_inner();
+        for spend in spends.spends {
+            let spent_outpoint = spend.spent_outpoint.ok_or_else(|| {
+                Status::data_loss(
+                    "TransparentMempoolSpend.spent_outpoint missing in IngestControl response",
+                )
+            })?;
+            if let Some(value_zat) = spendable_value_by_outpoint
+                .get(&(spent_outpoint.transaction_id, spent_outpoint.output_index))
+            {
+                pending_outflow_zat =
+                    pending_outflow_zat.saturating_add(value_zat_to_signed(*value_zat)?);
+            }
+        }
+    }
+    Ok(pending_outflow_zat)
 }
 
 /// Builds an `AddressLookup` whose only populated arm is the typed
@@ -820,6 +912,19 @@ fn transparent_outpoints_from_request(
 
 fn chain_epoch_id_from_request(at_epoch_id: Option<u64>) -> Option<ChainEpochId> {
     at_epoch_id.map(ChainEpochId::new)
+}
+
+/// Converts a wire `u64` Zatoshi value to the signed delta-accumulator width.
+///
+/// Zcash's hardcoded supply cap (`MAX_MONEY = 21,000,000 * 10^8` zat) fits
+/// well inside `i64::MAX`, so a `u64` value that does not fit is upstream data
+/// corruption and surfaces as `data_loss` rather than silent saturation.
+fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
+    i64::try_from(value_zat).map_err(|_| {
+        Status::data_loss(format!(
+            "mempool overlay value_zat {value_zat} exceeds i64::MAX"
+        ))
+    })
 }
 
 fn block_selector_from_request(

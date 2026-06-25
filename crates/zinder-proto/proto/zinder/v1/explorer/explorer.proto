@@ -954,13 +954,6 @@ service ExplorerQuery {
   // for the requested block. Capability: `explorer.block.detail_v1`.
   rpc BlockDetail(BlockDetailRequest) returns (BlockDetailResponse);
 
-  // Returns the transparent-address balance summed across the requested
-  // addresses. Capability: `explorer.transparent_address.balance_v1`.
-  // Federated to consumers under `WalletQuery.TransparentAddressBalance`;
-  // the wire shape and compute path are identical between the two surfaces.
-  rpc TransparentAddressBalance(zinder.v1.wallet.TransparentAddressBalanceRequest)
-      returns (zinder.v1.wallet.TransparentAddressBalanceResponse);
-
   // Classifies a raw user input string into typed search candidates per
   // [ADR-0012](../../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
   // Shielded receivers, viewing keys, and shielded receivers inside

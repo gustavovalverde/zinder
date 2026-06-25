@@ -7,11 +7,9 @@ use clap::Parser;
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 use zinder_derive::{DeriveStore, DeriveStoreOptions};
-use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1;
-use zinder_proto::v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient};
 use zinder_runtime::{
-    BearerToken, Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
-    connect_zinder_grpc, install_tracing_subscriber, spawn_ops_endpoint_for,
+    Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -69,16 +67,6 @@ struct Cli {
     /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
-    /// `zinder-explorer` `ExplorerQuery` endpoint used for federated balance reads.
-    #[arg(long = "explorer-endpoint")]
-    explorer_endpoint: Option<String>,
-    /// Path to a file containing the shared-secret bearer token used by the
-    /// `ExplorerQuery` endpoint. Required when `zinder-explorer` enforces auth.
-    #[arg(long = "explorer-bearer-token-path")]
-    explorer_bearer_token_path: Option<PathBuf>,
-    /// Cadence for probing the `ExplorerQuery` capability descriptor.
-    #[arg(long = "explorer-probe-interval-ms")]
-    explorer_probe_interval_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -262,34 +250,6 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             server_info,
             query_config.ingest_control_addr.clone(),
         );
-        if let Some(explorer_config) = query_config.explorer_proxy.clone() {
-            let explorer_proxy = zinder_query::DeriveProxy::new(
-                zinder_query::DeriveProxyConfig {
-                    endpoint: explorer_config.endpoint.clone(),
-                    bearer_token: explorer_config.bearer_token.clone(),
-                    capability: EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
-                },
-                ExplorerQueryClient::new,
-            );
-            let readiness = explorer_proxy.readiness();
-            let endpoint = explorer_config.endpoint.clone();
-            let bearer_token = explorer_config.bearer_token.clone();
-            let _explorer_probe_handle = zinder_query::spawn_derive_readiness_probe(
-                readiness,
-                move || probe_explorer_capability(endpoint.clone(), bearer_token.clone()),
-                zinder_query::DeriveReadinessProbeConfig {
-                    probe_interval: explorer_config.probe_interval,
-                },
-                cancel.clone(),
-            );
-            tracing::info!(
-                target: "zinder::query",
-                event = "explorer_proxy_configured",
-                endpoint = %explorer_config.endpoint,
-                "explorer-plane proxy configured"
-            );
-            adapter = adapter.with_explorer_proxy(explorer_proxy);
-        }
         if let Some(token) = query_config.ingest_control_bearer_token.clone() {
             adapter = adapter.with_ingest_control_bearer_token(token);
         }
@@ -363,27 +323,6 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     }
 
     server_result.map_err(QueryConfigError::Transport)
-}
-
-async fn probe_explorer_capability(endpoint: String, bearer_token: Option<BearerToken>) -> bool {
-    let Ok(channel) = connect_zinder_grpc(&endpoint, bearer_token.as_ref()).await else {
-        return false;
-    };
-    let mut client = ExplorerQueryClient::new(channel);
-    let Ok(response) = client.server_info(ServerInfoRequest {}).await else {
-        return false;
-    };
-    response
-        .into_inner()
-        .info
-        .as_ref()
-        .and_then(|explorer_info| explorer_info.common.as_ref())
-        .is_some_and(|common| {
-            common
-                .capabilities
-                .iter()
-                .any(|capability| capability == EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1)
-        })
 }
 
 fn spawn_grpc_health_reporter(
@@ -539,9 +478,6 @@ impl From<Cli> for QueryConfigOverrides {
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
-            explorer_endpoint: cli.explorer_endpoint,
-            explorer_bearer_token_path: cli.explorer_bearer_token_path,
-            explorer_probe_interval_ms: cli.explorer_probe_interval_ms,
         }
     }
 }

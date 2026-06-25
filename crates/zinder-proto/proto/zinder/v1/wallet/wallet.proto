@@ -1107,19 +1107,27 @@ message TransparentUnspentOutput {
   string block_hash = 7;
 }
 
-// Bounded transparent-address balance request federated to `zinder-explorer`.
+// Bounded transparent-address balance request computed in the wallet plane.
 //
-// The balance read is computed from the complete canonical unspent output
-// set at the requested addresses plus the live mempool overlay. Mempool
-// live state is not chain-epoch-pinnable, so the response binds to the
-// visible chain epoch at lookup time. An empty `addresses` list is
-// rejected with `INVALID_ARGUMENT`.
+// The confirmed total is summed from the complete canonical unspent output
+// set at the requested addresses; the live mempool overlay produces the
+// signed `unconfirmed_delta_zat`. `at_epoch_id` pins the canonical confirmed
+// read. Mempool live state is not chain-epoch-pinnable, so the response binds
+// to the chain epoch the confirmed read answered against. An empty
+// `addresses` list is rejected with `INVALID_ARGUMENT`; an `addresses` list
+// over the per-request cap is rejected with `INVALID_ARGUMENT` carrying
+// `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`.
 message TransparentAddressBalanceRequest {
   // Transparent addresses summed into one balance response.
   repeated AddressLookup addresses = 1;
+
+  // Optional chain-epoch id pin for the canonical confirmed read. Absent
+  // resolves against the visible tip; present pins the confirmed read to a
+  // specific epoch. The mempool overlay always reads live state.
+  optional uint64 at_epoch_id = 2;
 }
 
-// Transparent-address balance response federated from `zinder-explorer`.
+// Transparent-address balance response computed in the wallet plane.
 //
 // Splits the canonical confirmed total from the signed mempool delta so
 // explorer-shaped clients can render `confirmed`/`unconfirmed` separately;
@@ -1308,11 +1316,10 @@ service WalletQuery {
       returns (stream TransparentAddressTxIdsChunk);
 
   // Return the transparent-address balance summed across the requested
-  // addresses. Federated by `zinder-query` to `zinder-explorer`'s
-  // `ExplorerQuery.TransparentAddressBalance`; deployments without a
-  // configured explorer plane omit the corresponding capability and reject
-  // the call with `UNAVAILABLE`. Capability:
-  // `explorer.transparent_address.balance_v1`.
+  // addresses. The confirmed total is summed in-process from the canonical
+  // unspent-output index; the signed `unconfirmed_delta_zat` overlays the
+  // live mempool when an ingest-control endpoint is wired and is zero
+  // otherwise. Capability: `wallet.address.transparent_balance_v1`.
   rpc TransparentAddressBalance(TransparentAddressBalanceRequest)
       returns (TransparentAddressBalanceResponse);
 

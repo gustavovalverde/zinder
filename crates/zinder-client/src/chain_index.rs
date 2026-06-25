@@ -785,9 +785,9 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the transparent-address balance summed across `addresses`.
     ///
-    /// Federated to the explorer plane: deployments without `zinder-explorer`
-    /// reachable surface this as
-    /// [`IndexerError::ServiceUnavailable`]/explorer-unavailable.
+    /// Served by the wallet plane on `WalletQuery.TransparentAddressBalance`:
+    /// the confirmed total plus the signed mempool overlay in
+    /// `unconfirmed_delta_zat`.
     ///
     /// # Examples
     ///

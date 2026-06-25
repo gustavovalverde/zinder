@@ -12,9 +12,9 @@ use zinder_core::{
     ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeActivations,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastResult, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentOutputEntry, TransparentOutputsByOutpointResponse, TransparentUnspentOutput,
-    TxStatus,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
+    TransparentUnspentOutput, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -28,14 +28,8 @@ use zinder_store::{
     DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, StoreError, StreamCursorTokenV1,
 };
 
-mod derive_proxy;
 mod grpc;
 mod readiness_refresh;
-
-pub use derive_proxy::{
-    DEFAULT_DERIVE_PROBE_INTERVAL, DeriveProxy, DeriveProxyConfig, DeriveReadinessGauge,
-    DeriveReadinessProbeConfig, MIN_DERIVE_PROBE_INTERVAL, spawn_derive_readiness_probe,
-};
 
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
@@ -165,6 +159,26 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError>;
 
+    /// Sums the canonical confirmed balance across one or more transparent
+    /// addresses at a single pinned chain epoch.
+    ///
+    /// Folds the complete unspent transparent output set of every requested
+    /// address into one saturating `confirmed_zat` total. The returned
+    /// [`TransparentAddressBalance`] carries `unconfirmed_delta_zat = 0`: the
+    /// canonical read knows nothing about live mempool state. The wallet-side
+    /// gRPC adapter overlays the signed mempool delta on top of this total
+    /// when an ingest-control endpoint is wired.
+    ///
+    /// Rejects an empty address list and any list above
+    /// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`] with
+    /// [`QueryError::TransparentBalanceAddressCountExceeded`] so one request
+    /// cannot fan out into an unbounded number of unspent-set reads.
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError>;
+
     /// Reads the tree state at exactly `height`.
     ///
     /// Served from a stored checkpoint when one exists at `height`, otherwise
@@ -236,6 +250,14 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
 
 /// Default maximum compact-block count returned by one range call.
 pub const DEFAULT_MAX_COMPACT_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Hard cap on the number of addresses one balance request may sum across.
+///
+/// Each address fans out into one complete unspent-output read (and, in the
+/// gRPC adapter, one mempool point lookup), so an unbounded list would let one
+/// request issue thousands of reads. `u32` matches the `address_count` field
+/// on the response so the bound check happens in the wire type's native width.
+pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
 
 /// Runtime options for [`WalletQuery`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,6 +801,60 @@ where
         query_outcome
     }
 
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError> {
+        let started_at = Instant::now();
+        let address_count = u32::try_from(addresses.len())
+            .ok()
+            .filter(|count| (1..=MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count));
+        let Some(address_count) = address_count else {
+            let outcome = Err(QueryError::TransparentBalanceAddressCountExceeded {
+                requested: addresses.len(),
+                maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+            });
+            record_wallet_query_outcome("transparent_address_balance", started_at, &outcome, None);
+            return outcome;
+        };
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            let chain_epoch = reader.chain_epoch();
+            let at_epoch = at_epoch_id.is_some().then_some(chain_epoch);
+            let mut confirmed_zat: u64 = 0;
+            for address_script_hash in addresses {
+                let page = read_api
+                    .address_output_index_page(AddressOutputIndexPageRequest {
+                        at_epoch,
+                        address_script_hash,
+                        start_height: BlockHeight::new(0),
+                        max_entries: NonZeroU32::MAX,
+                        from_cursor: None,
+                    })
+                    .map_err(QueryError::Store)?;
+                for output in &page.outputs {
+                    confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
+                }
+            }
+            Ok(TransparentAddressBalance {
+                confirmed_zat,
+                unconfirmed_delta_zat: 0,
+                address_count,
+                chain_epoch,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_address_balance",
+            started_at,
+            &query_outcome,
+            None,
+        );
+        query_outcome
+    }
+
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -1161,6 +1237,9 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         None => "none",
         Some(QueryError::InvalidBlockRange { .. }) => "invalid_block_range",
         Some(QueryError::CompactBlockRangeTooLarge { .. }) => "compact_block_range_too_large",
+        Some(QueryError::TransparentBalanceAddressCountExceeded { .. }) => {
+            "transparent_balance_address_count_exceeded"
+        }
         Some(QueryError::ArtifactUnavailable { .. }) => "artifact_unavailable",
         Some(QueryError::CompactBlockPayloadMalformed { .. }) => "compact_block_payload_malformed",
         Some(QueryError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
@@ -1192,8 +1271,7 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
 }
 
 /// Records duration + outcome for a `WalletQuery` RPC that the gRPC adapter
-/// proxies to another service (ingest-control or the federated explorer
-/// plane).
+/// proxies to the colocated ingest-control writer.
 ///
 /// Shares the `zinder_query_request_*` metric names with
 /// [`record_wallet_query_outcome`] so dashboards see one series per
@@ -1484,6 +1562,18 @@ pub enum QueryError {
         maximum: usize,
     },
 
+    /// Balance request named an empty address list or more addresses than the
+    /// per-request cap.
+    #[error(
+        "transparent balance address count is out of range: requested {requested}, maximum {maximum}"
+    )]
+    TransparentBalanceAddressCountExceeded {
+        /// Requested address count.
+        requested: usize,
+        /// Maximum allowed address count.
+        maximum: u32,
+    },
+
     /// Indexed artifact is unavailable for the requested key.
     #[error("{family:?} artifact is unavailable for {key}")]
     ArtifactUnavailable {
@@ -1642,6 +1732,9 @@ impl zinder_proto::BoundaryError for QueryError {
         match self {
             Self::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
             Self::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
+            Self::TransparentBalanceAddressCountExceeded { .. } => {
+                ErrorReason::TransparentBalanceAddressCountExceeded
+            }
             Self::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
             Self::TransparentHistoryCursorInvalid { .. } => {
                 ErrorReason::TransparentHistoryCursorInvalid
@@ -1776,6 +1869,10 @@ mod error_reason_tests {
             QueryError::CompactBlockRangeTooLarge {
                 requested: 2,
                 maximum: 1,
+            },
+            QueryError::TransparentBalanceAddressCountExceeded {
+                requested: 257,
+                maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
             },
             QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::CompactBlock,

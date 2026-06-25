@@ -657,6 +657,7 @@ impl ChainIndex for RemoteChainIndex {
             .collect();
         let request = wallet::TransparentAddressBalanceRequest {
             addresses: wire_addresses,
+            at_epoch_id: None,
         };
         let response = self
             .client()

@@ -24,7 +24,6 @@ use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, OverviewSnapshotRequest,
@@ -83,16 +82,14 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
     Ok(())
 }
 
-/// Without a configured `wallet_query_endpoint`, the explorer-balance
-/// capability is omitted from `ServerInfo` and the federated method returns
-/// `FAILED_PRECONDITION`.
+/// Without a configured `wallet_query_endpoint`, the wallet-backed explorer
+/// capabilities are omitted from `ServerInfo` and the corresponding methods
+/// return `FAILED_PRECONDITION`.
 ///
 /// This pins the operational contract that capability advertisement gates on
 /// a wired federation, not on the binary's mere presence.
 #[tokio::test]
-async fn explorer_query_balance_failed_precondition_without_wallet_query_endpoint() -> Result<()> {
-    use zinder_proto::v1::wallet::TransparentAddressBalanceRequest;
-
+async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
@@ -117,23 +114,6 @@ async fn explorer_query_balance_failed_precondition_without_wallet_query_endpoin
         .common
         .as_ref()
         .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|advertised| { advertised == EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1 }),
-        "balance capability must not advertise without a wallet_query_endpoint",
-    );
-
-    let outcome = client
-        .transparent_address_balance(TransparentAddressBalanceRequest {
-            addresses: Vec::new(),
-        })
-        .await;
-    let status = outcome
-        .err()
-        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without wallet_query_endpoint"))?;
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 
     assert!(
         !common

@@ -855,8 +855,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. \
-                      Empty/unset disables the `explorer.transparent_address.balance_v1` capability.",
+        description: "WalletQuery gRPC endpoint backing the explorer's wallet-composed reads \
+                      (transaction detail, block views, search, mempool activity). Empty/unset \
+                      disables the explorer capabilities that compose canonical wallet reads.",
     },
 ];
 

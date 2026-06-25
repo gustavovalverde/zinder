@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-//! Network-agnostic acceptance for the federated transparent-address
+//! Network-agnostic acceptance for the wallet-plane transparent-address
 //! balance read path.
 //!
 //! The test bulk-catches-up a small window ending at the upstream tip, samples one
@@ -12,15 +12,12 @@
 //! ingest pipeline uses, and asserts that:
 //!
 //! - `WalletQueryApi::transparent_address_unspent_outputs` and
-//!   `ExplorerQuery::TransparentAddressBalance` agree on `confirmed_zat` for
-//!   the same address; the federated balance is the sum of the visible UTXO
-//!   values.
-//! - The federated response binds the same `chain_epoch` the wallet read
+//!   `WalletQuery::TransparentAddressBalance` agree on `confirmed_zat` for
+//!   the same address; the balance is the sum of the visible UTXO values.
+//! - The balance response binds the same `chain_epoch` the wallet read
 //!   answered against.
-//! - With no mempool federation wired (no `IngestControl` proxy on the
-//!   `WalletQuery` adapter), `unconfirmed_delta_zat` is zero. The Shape C
-//!   compute path falls through cleanly when the mempool point lookups are
-//!   unavailable.
+//! - The wallet adapter is wired with an `IngestControl` proxy, so the mempool
+//!   overlay computes; with an empty mempool, `unconfirmed_delta_zat` is zero.
 //!
 //! Mainnet is opt-in: the test reads `ZINDER_NETWORK` and dispatches via
 //! `require_live_for(...)`. Operators set `ZINDER_NETWORK=zcash-mainnet`
@@ -47,15 +44,13 @@ use zinder_core::{
     BlockHeight, BroadcastAccepted, ChainEpoch, ChainEpochId, Network, RawTransactionBytes,
     TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash, UnixTimestampMillis,
 };
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{
     IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex, build_mempool_entry,
     run_bulk_catchup,
 };
-use zinder_proto::v1::explorer::explorer_query_server::ExplorerQuery as ExplorerQueryService;
 use zinder_proto::v1::wallet::{
     AddressLookup, TransparentAddressBalanceRequest, TransparentAddressBalanceResponse,
-    address_lookup,
+    address_lookup, wallet_query_client::WalletQueryClient,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
 use zinder_source::{
@@ -102,8 +97,7 @@ async fn federated_balance_matches_utxo_sum_for_sampled_coinbase_address() -> Re
     );
     assert_eq!(
         response.unconfirmed_delta_zat, 0,
-        "no IngestControl proxy is wired on this WalletQuery adapter; \
-         the Shape C mempool overlay must fall through to zero",
+        "the mempool index is empty; the overlay must contribute no delta",
     );
     assert_eq!(response.address_count, 1);
     let chain_epoch = response
@@ -136,7 +130,7 @@ struct FederatedBalanceFixture {
     sample_block_height: BlockHeight,
     expected_confirmed_zat: u64,
     expected_chain_epoch_id: ChainEpochId,
-    explorer_adapter: ExplorerQueryGrpcAdapter,
+    wallet_client: WalletQueryClient<Channel>,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     _tempdir: TempDir,
@@ -171,16 +165,14 @@ impl FederatedBalanceFixture {
             serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
-        let explorer_adapter =
-            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
+        let wallet_client = wallet_query_client(wallet_grpc_addr).await?;
         Ok(Self {
             network,
             address_script_hash: sample.address_script_hash,
             sample_block_height: sample.block_height,
             expected_confirmed_zat,
             expected_chain_epoch_id,
-            explorer_adapter,
+            wallet_client,
             wallet_server_handle,
             ingest_control_handle,
             _tempdir: tempdir,
@@ -194,13 +186,14 @@ impl FederatedBalanceFixture {
                     self.address_script_hash.as_bytes().to_vec(),
                 )),
             }],
+            at_epoch_id: None,
         };
-        let response = ExplorerQueryService::transparent_address_balance(
-            &self.explorer_adapter,
-            Request::new(request),
-        )
-        .await?
-        .into_inner();
+        let response = self
+            .wallet_client
+            .clone()
+            .transparent_address_balance(Request::new(request))
+            .await?
+            .into_inner();
         Ok(response)
     }
 
@@ -210,6 +203,13 @@ impl FederatedBalanceFixture {
         let _ = (&mut self.wallet_server_handle).await;
         let _ = (&mut self.ingest_control_handle).await;
     }
+}
+
+async fn wallet_query_client(addr: SocketAddr) -> Result<WalletQueryClient<Channel>> {
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    Ok(WalletQueryClient::new(channel))
 }
 
 async fn serve_wallet_query_grpc(
@@ -376,7 +376,7 @@ async fn federated_balance_subtracts_pending_spend_overlay() -> Result<()> {
 struct MempoolOverlayFixture {
     address_script_hash: TransparentAddressScriptHash,
     funded_value_zat: u64,
-    explorer_adapter: ExplorerQueryGrpcAdapter,
+    wallet_client: WalletQueryClient<Channel>,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     visible_chain_epoch: ChainEpoch,
@@ -423,14 +423,11 @@ impl MempoolOverlayFixture {
             serve_ingest_control_grpc(env.network(), store, mempool_index.clone()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
-        let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-            network: env.network(),
-        })
-        .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
+        let wallet_client = wallet_query_client(wallet_grpc_addr).await?;
         Ok(Self {
             address_script_hash,
             funded_value_zat: coinbase.value_zats,
-            explorer_adapter,
+            wallet_client,
             wallet_server_handle,
             ingest_control_handle,
             visible_chain_epoch,
@@ -446,13 +443,14 @@ impl MempoolOverlayFixture {
                     self.address_script_hash.as_bytes().to_vec(),
                 )),
             }],
+            at_epoch_id: None,
         };
-        let response = ExplorerQueryService::transparent_address_balance(
-            &self.explorer_adapter,
-            Request::new(request),
-        )
-        .await?
-        .into_inner();
+        let response = self
+            .wallet_client
+            .clone()
+            .transparent_address_balance(Request::new(request))
+            .await?
+            .into_inner();
         Ok(response)
     }
 

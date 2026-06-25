@@ -117,7 +117,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | Term | Meaning |
 |------|---------|
 | `ExplorerQuery` | Native protobuf service for explorer-shaped reads served by `zinder-explorer`. See [Explorer plane](explorer-plane.md) and [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md). |
-| `ExplorerQueryGrpcAdapter` | Tonic adapter for `ExplorerQuery`; carries the optional `WalletQuery` endpoint that backs the Shape C federated balance compute path |
+| `ExplorerQueryGrpcAdapter` | Tonic adapter for `ExplorerQuery`; carries the optional `WalletQuery` endpoint that backs its wallet-composed reads (transaction detail, block views, search, mempool activity, value pools) |
 | `TransactionPublicFacts` | Single typed transaction-fact value parsed once at ingest/mempool/explorer-read time. See [ADR-0010](../adrs/0010-transaction-public-facts.md). |
 | `ExplorerFreshness` | Explorer response envelope at field tag 1. Wraps the cross-plane `ChainView` (chain-state axes) and keeps only the metadata that varies per explorer call: `snapshot_age_millis`, `unavailable[]`, and `capability_version`. The upstream tip rides on `chain_view.upstream_tip`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
 | `SearchCandidate` | Typed search-result oneof distinguishing every classifiable input class, including the `NotPubliclyIndexable` arm for shielded receivers. See [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). |
@@ -590,7 +590,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES` | zinder-ingest | Optional | `retention.mempool_cursor_at_risk_warning_minutes` | Mempool cursor-at-risk warning lead time in minutes. Must be ≤ the shortest configured mempool retention window. Defaults to 12. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
-| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the federated `TransparentAddressBalance` compute path. Empty/unset disables the `explorer.transparent_address.balance_v1` capability. |
+| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
 
 <!-- env-var-table:public-interfaces:end -->
 
@@ -667,8 +667,8 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `wallet.read.chain_value_pools_at_tip_v1`
 - `wallet.address.transparent_unspent_outputs_v1`
 - `wallet.address.transparent_history_v1`
+- `wallet.address.transparent_balance_v1`
 - `explorer.server_info_v1`
-- `explorer.transparent_address.balance_v1`
 - `explorer.transaction.detail_v1`
 - `explorer.block.summary_v1`
 - `explorer.block.detail_v1`
@@ -687,7 +687,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
-`WalletQuery.TransparentAddressBalance` is federation-only. The single balance implementation lives in `zinder-explorer`; `zinder-query` forwards the call and advertises `explorer.transparent_address.balance_v1` only when the explorer plane is configured and ready. Deployments without an explorer plane omit the capability and reject the call with `UNAVAILABLE`. The federation rule generalizes to every future federated explorer method per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md). Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` sums the unspent projection in-process and never touches the explorer.
+`WalletQuery.TransparentAddressBalance` is served in the wallet plane and advertises `wallet.address.transparent_balance_v1` on every deployment. The handler sums the confirmed total in-process from the canonical unspent-output index, then overlays the signed mempool delta (`unconfirmed_delta_zat`) through the colocated ingest-control endpoint; deployments without that endpoint return a zero delta rather than failing. Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` projects the same wallet primitive into one `value_zat`.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are

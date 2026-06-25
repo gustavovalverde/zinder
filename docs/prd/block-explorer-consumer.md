@@ -228,7 +228,7 @@ Public surfaces: `/address/:t`, transparent-address activity tab.
 
 #### R-ADDR-1. Transparent-address activity derive view
 
-Now: `WalletQuery.TransparentAddressBalance` returns the confirmed balance and (when the explorer is online) a mempool overlay. There is no paginated activity surface; the consumer cannot show "transactions involving this address" without a full canonical scan.
+Now: `WalletQuery.TransparentAddressBalance` returns the confirmed balance and, when an ingest-control endpoint is wired, a live-mempool overlay. There is no paginated activity surface; the consumer cannot show "transactions involving this address" without a full canonical scan.
 
 Why this belongs upstream: the workload is read-heavy and very skewed (a small set of addresses generates almost all queries). A derive consumer keyed by address can serve activity in `O(page_size)`; without it the consumer either scans canonical artifacts per request or builds the same index downstream, duplicating storage.
 
@@ -268,7 +268,7 @@ message TransparentAddressActivityEntry {
 
 A new `transparent_address_activity` column family keyed by `(address_bytes, reverse_height, in_block_position)` indexes each transparent input and output by the address it touches. The derive consumer writes during block-finalize and rewinds on reorg.
 
-Capability: `explorer.transparent_address.activity_v1` (the existing `_balance_v1` capability is unchanged).
+Capability: `explorer.transparent_address.activity_v1`.
 
 Privacy note: this surface is the public history of a transparent address. The consumer must reject shielded inputs at the parameter boundary (Sapling `zs*`, Orchard `zo*`, unified `u*/utest*`); zinder's `Search` already does this, and the input validator on this RPC must mirror that vocabulary. Otherwise an attacker can request `/address/:zs...` and learn that the input was syntactically valid even if it returns empty.
 
@@ -446,8 +446,7 @@ Proposed change: extend `/healthz` JSON:
     "explorer.mempool.activity_v1",
     "explorer.search_v1",
     "explorer.fee.summary_v1",
-    "explorer.value_pool.summary_v1",
-    "explorer.transparent_address.balance_v1"
+    "explorer.value_pool.summary_v1"
   ]
 }
 ```

@@ -32,7 +32,7 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
         // per-address mempool overlays
         let _ = T::transparent_mempool_outputs_by_address;
         let _ = T::transparent_mempool_spends_by_outpoint;
-        // typed TransparentAddressBalance via federated derive
+        // typed TransparentAddressBalance from the wallet plane
         let _ = T::transparent_address_balance;
         // M6 canonical prevout resolution and live-mempool prevout fallback.
         // Explorers and SDKs that decode transaction inputs depend on this

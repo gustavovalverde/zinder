@@ -150,7 +150,7 @@ File: `services/zinder-compat-lightwalletd/src/grpc.rs`
 Add the arm only if the lightwalletd `CompactTxStreamer` proto names a corresponding method.
 
 - The compat shim reads only through `self.query_api.method_name(...)` on `WalletQueryApi`; it never touches RocksDB or gRPC directly.
-- The compat shim builds lightwalletd-shaped types directly, projecting confirmed/unconfirmed splits onto single-field lightwalletd shapes (e.g. `Balance { value_zat }` is the confirmed total; `unconfirmed_delta_zat` is silently dropped at the lightwalletd boundary).
+- The compat shim builds lightwalletd-shaped types directly, projecting confirmed/unconfirmed splits onto single-field lightwalletd shapes (e.g. `Balance { value_zat }` is the confirmed total minus pending outflows, saturating to zero and capped at `i64::MAX`).
 - Inventing surfaces absent from the vendored `CompactTxStreamer` proto is forbidden per [Service boundaries](service-boundaries.md).
 
 ### Step 13 — Integration tests
@@ -175,15 +175,15 @@ File: `crates/zinder-proto/proto/zinder/v1/explorer/explorer.proto`
 
 Add the RPC mirroring the WalletQuery shape.
 
-### F2. DeriveProxy<C> field on the adapter
+### F2. Readiness-gated client field on the adapter
 
 File: `services/zinder-query/src/grpc/adapter.rs`
 
-Add an `Option<DeriveProxy<ConsumerQueryClient<AuthenticatedChannel>>>` field to `WalletQueryGrpcAdapter`. Add a `with_<consumer>_proxy(mut self, proxy: DeriveProxy<...>) -> Self` builder and a `<consumer>_proxy_readiness(&self) -> Option<DeriveReadinessGauge>` getter.
+Add an optional readiness-gated client to the derive service onto `WalletQueryGrpcAdapter`, with a `with_<consumer>_proxy(...) -> Self` builder and a getter exposing the consumer's readiness gauge.
 
 ### F3. Federated handler
 
-In the WalletQuery server impl arm:
+In the WalletQuery server impl arm, forward the request to the consumer's readiness-gated client:
 
 ```rust
 async fn rpc_name(
@@ -202,7 +202,7 @@ async fn rpc_name(
 }
 ```
 
-No translation logic: proto messages flow through unchanged. `DeriveProxy::forward` gates on `is_ready()` before opening the channel.
+No translation logic: proto messages flow through unchanged. The forward gates on readiness before opening the channel.
 
 ### F4. ServerInfo capability gating
 
@@ -210,7 +210,7 @@ In the `server_info` handler on `WalletQueryGrpcAdapter`: include the federated 
 
 ### F5. Readiness probe
 
-In the binary's startup (`services/zinder-query/src/bin/zinder-query/main.rs`): construct `DeriveProxy::new(DeriveProxyConfig { endpoint, bearer_token, capability }, ConsumerQueryClient::new)`, extract its readiness gauge via `.readiness()`, and pass both to `spawn_derive_readiness_probe(gauge, probe_fn, config, cancel)`.
+In the binary's startup (`services/zinder-query/src/bin/zinder-query/main.rs`): construct the readiness-gated client from its endpoint, bearer token, and target capability, then spawn a background probe that polls the derive service's `ServerInfo` and flips the readiness gauge.
 
 ### F6. Two capability strings per consumer
 
@@ -245,7 +245,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 | `wallet.events.*` | Streaming event families | `wallet.events.chain_v1` |
 | `wallet.snapshot.*` | Bounded snapshot reads | `wallet.snapshot.mempool_v1` |
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
-| `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transparent_address.balance_v1` |
+| `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transaction.detail_v1` |
 
 Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests.
 
@@ -294,15 +294,14 @@ Wire envelope plus response enrichment. The path adds the `chain_epoch`-bound `M
 
 ### Example 3 — `TransparentAddressBalance` (Primitive D)
 
-A federated derive-plane method. Adds the 14 baseline steps plus the 7 federation sub-steps:
+A wallet-plane read that composes a canonical sum with a live-mempool overlay; it follows the 14 baseline steps with no federation sub-steps.
 
-- F1: `ExplorerQuery.TransparentAddressBalance` proto.
-- F2-F4: `DeriveProxy<ExplorerQueryClient<...>>` field on `WalletQueryGrpcAdapter`, builder, ServerInfo capability gating.
-- F5: `spawn_derive_readiness_probe` in `zinder-query` startup.
-- F6: capabilities `explorer.server_info_v1` (probe target) and `explorer.transparent_address.balance_v1` (federated method).
-- F7: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream` over the federated path.
+- Step 1: `WalletQuery.TransparentAddressBalance` proto with `repeated AddressLookup addresses` and `optional uint64 at_epoch_id`.
+- Steps 2-8: the `TransparentAddressBalance` core type, `ChainIndex::transparent_address_balance`, the native encoder, and the adapter handler.
+- Step 9: capability `wallet.address.transparent_balance_v1`, always on.
+- Step 12: compat shim `GetTaddressBalance` + per-address-loop `GetTaddressBalanceStream`, each projecting the primitive into a single `int64 value_zat`.
 
-The compute shape is compute at read time: canonical confirmed totals are summed from transparent outputs, and the derive plane adds the live mempool overlay. An accumulator-backed read optimization may land later without changing the public wire shape or capability strings.
+The compute shape is compute at read time: the confirmed total is a saturating sum over the canonical unspent-output index pinned to `at_epoch_id`, and the live mempool overlay (read through the colocated `IngestControl` endpoint) supplies the signed `unconfirmed_delta_zat`. When no ingest-control endpoint is wired, the delta is zero. The address list is capped at 256 (`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`); over-cap requests return `INVALID_ARGUMENT` with `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`. An accumulator-backed read optimization may land later without changing the public wire shape or capability string.
 
 ### Example 4 — `TransparentOutputsByOutpoint` and `TransparentMempoolOutputsByOutpoint`
 

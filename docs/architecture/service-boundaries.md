@@ -42,7 +42,7 @@ The services must not share:
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
-`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`, `DeriveProxy`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ## Development Profile
 
