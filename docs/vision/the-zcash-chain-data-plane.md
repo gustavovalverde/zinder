@@ -109,4 +109,4 @@ A modern Zcash indexer is a chain data plane. The shape is buildable, it stays c
 
 ---
 
-*Reference implementation: [Zinder](https://github.com/gustavovalverde/zinder). Feature-level comparison against the current Zaino release: [`docs/investigations/zaino-feature-comparison.md`](../investigations/zaino-feature-comparison.md).*
+*Reference implementation: [Zinder](https://github.com/gustavovalverde/zinder).*
