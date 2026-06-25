@@ -791,9 +791,9 @@ mod tests {
     use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
     use super::{
-        AddressOutputCursorPayload, AddressOutputStreamFamily, CHAIN_EVENT_LOCATOR_MAX,
-        ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
-        STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
+        AUTH_TAG_LEN, AddressOutputCursorPayload, AddressOutputStreamFamily,
+        CHAIN_EVENT_LOCATOR_MAX, CURSOR_BODY_LEN, ChainEventCursorAnchor, ChainEventLocator,
+        ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -962,6 +962,19 @@ mod tests {
         assert!(matches!(
             cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY),
             Err(StreamCursorError::InvalidLength { byte_count: 1 })
+        ));
+    }
+
+    #[test]
+    fn cursor_one_byte_below_chain_event_minimum_is_rejected() {
+        // The shortest chain-event cursor is the body, the locator-count byte,
+        // and the auth tag; dropping the count byte must fail the length check.
+        let too_short = CURSOR_BODY_LEN + AUTH_TAG_LEN;
+        let cursor = StreamCursorTokenV1::from_bytes(vec![0u8; too_short]);
+
+        assert!(matches!(
+            cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::InvalidLength { byte_count }) if byte_count == too_short
         ));
     }
 

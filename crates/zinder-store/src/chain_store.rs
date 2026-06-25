@@ -1056,8 +1056,7 @@ impl ChainStoreInner {
         };
 
         let locator_tip = cursor_payload.locator.tip();
-        let cursor_branch_on_chain =
-            fork_point.height == locator_tip.height && fork_point.hash == locator_tip.hash;
+        let cursor_branch_on_chain = fork_point == locator_tip;
 
         if cursor_branch_on_chain {
             // No reorg. The cursor's tip is still canonical. Resume from the
