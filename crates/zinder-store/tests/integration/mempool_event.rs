@@ -160,6 +160,30 @@ fn mempool_event_history_resume_from_latest_event_is_empty() -> eyre::Result<()>
     Ok(())
 }
 
+/// A snapshot-page cursor at the current snapshot sequence is valid; a cursor
+/// for a newer snapshot is rejected as expired.
+#[test]
+fn snapshot_page_cursor_at_current_is_valid_and_future_is_expired() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+    let after = TransactionId::from_bytes([0xA0; 32]);
+
+    let at_current = store.encode_snapshot_page_cursor(5, after)?;
+    let payload = store.decode_snapshot_page_cursor(&at_current, 5)?;
+    assert_eq!(payload.snapshot_sequence, 5);
+
+    let future = store.encode_snapshot_page_cursor(6, after)?;
+    let error = match store.decode_snapshot_page_cursor(&future, 5) {
+        Ok(payload) => return Err(eyre!("expected expired cursor, got {payload:?}")),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::SnapshotPageCursorExpired { .. }
+    ));
+    Ok(())
+}
+
 /// Atomicity: idempotent floor advancement on resumed prune.
 ///
 /// When a prune pass observes that the floor must advance but no physical
