@@ -14,7 +14,7 @@ use zinder_core::{
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TxStatus,
+    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
@@ -332,6 +332,19 @@ pub async fn transparent_spends_by_outpoint_response<Q: WalletQueryApi + ?Sized>
         .map(|response| build_transparent_spends_by_outpoint_response(&response))
 }
 
+/// Resolves a batch of canonical-chain transparent outpoints to their unspent
+/// referenced outputs (null-if-spent) and encodes the native wallet response.
+pub async fn transparent_unspent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    outpoints: Vec<TransparentOutPoint>,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<wallet::TransparentUnspentOutputsByOutpointResponse, QueryError> {
+    query_api
+        .transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)
+        .await
+        .map(build_transparent_unspent_outputs_by_outpoint_response)
+}
+
 /// Reads the complete unspent transparent output set for `request` at one
 /// pinned chain epoch. The gRPC adapter streams the returned set one
 /// message per output.
@@ -489,6 +502,19 @@ fn build_transparent_spends_by_outpoint_response(
             .spends
             .iter()
             .map(transparent_spend_message)
+            .collect(),
+    }
+}
+
+fn build_transparent_unspent_outputs_by_outpoint_response(
+    response: TransparentUnspentOutputsByOutpointResponse,
+) -> wallet::TransparentUnspentOutputsByOutpointResponse {
+    wallet::TransparentUnspentOutputsByOutpointResponse {
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
+        entries: response
+            .entries
+            .into_iter()
+            .map(transparent_output_entry_message)
             .collect(),
     }
 }

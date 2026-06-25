@@ -55,6 +55,14 @@ pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
 /// deployment. The unmined half is
 /// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
 pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spends_by_outpoint_v1";
+/// Capability advertised for `WalletQuery.TransparentUnspentOutputsByOutpoint`.
+///
+/// The canonical single-outpoint unspent probe (gettxout-equivalent). It
+/// composes the always-present canonical output and spend-fact indexes, so it
+/// is advertised by every wallet-plane deployment. Mempool-aware unspent-ness
+/// composes with [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
+pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
+    "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
@@ -502,6 +510,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_TRANSPARENT_SPENDS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentSpendsByOutpoint"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentUnspentOutputsByOutpoint"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

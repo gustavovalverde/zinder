@@ -374,3 +374,19 @@ pub struct TransparentSpendsByOutpointResponse {
     /// entry; consumers key results by `spent_outpoint`.
     pub spends: Vec<TransparentSpendEntry>,
 }
+
+/// Canonical unspent-output probe response bound to one chain epoch.
+///
+/// The gettxout-equivalent surface: each entry is an outpoint that the
+/// canonical chain has and that carries no canonical spend at the bound epoch
+/// (null-if-spent). Spent or never-existed outpoints produce no entry, so every
+/// entry's [`TransparentOutputEntry::output`] is present. Mempool-aware
+/// unspent-ness composes with the mempool spend resolver: a caller subtracts
+/// those spends from this canonical result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentUnspentOutputsByOutpointResponse {
+    /// Chain epoch the response binds to.
+    pub chain_epoch: ChainEpoch,
+    /// Unspent outputs found for the requested outpoints, keyed by `outpoint`.
+    pub entries: Vec<TransparentOutputEntry>,
+}

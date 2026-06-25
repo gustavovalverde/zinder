@@ -24,6 +24,7 @@ use zinder_core::{
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -398,6 +399,17 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.record(at_epoch_id);
         self.inner
             .transparent_spends_by_outpoint(outpoints, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)
             .await
     }
 

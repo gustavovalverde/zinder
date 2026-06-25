@@ -14,7 +14,8 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionBroadcastResult, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
-    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TxStatus,
+    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -41,7 +42,8 @@ pub use grpc::{
     latest_tree_state_checkpoint_response, status_from_query_error, subtree_roots_response,
     transaction_response, transparent_address_tx_ids_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, tree_state_at_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -156,6 +158,23 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         outpoints: Vec<TransparentOutPoint>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError>;
+
+    /// Resolves a batch of transparent outpoints to their referenced output,
+    /// keeping each only while it is unspent on the canonical chain at the
+    /// response's [`ChainEpoch`] (gettxout-equivalent, null-if-spent).
+    ///
+    /// Composes the canonical output resolver and the canonical spend-fact
+    /// reader at one pinned epoch. An outpoint emits an entry only when the
+    /// output is present and carries no canonical spend; spent or never-existed
+    /// outpoints produce no entry, so every entry's `output` is present.
+    /// Consumers key results by `outpoint`; duplicate outpoints collapse to one
+    /// entry. The read is canonical-only: mempool-aware unspent-ness composes
+    /// with [`Self::transparent_spends_by_outpoint`]'s mempool counterpart.
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError>;
 
     /// Reads the complete unspent transparent output set for one transparent
     /// address script at a single pinned chain epoch.
@@ -683,6 +702,51 @@ where
         .await;
         record_wallet_query_outcome(
             "transparent_spends_by_outpoint",
+            started_at,
+            &query_outcome,
+            None,
+        );
+        query_outcome
+    }
+
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            let chain_epoch = reader.chain_epoch();
+
+            let outputs_by_outpoint = reader.transparent_outputs_by_outpoints(&outpoints)?;
+            let spends_by_outpoint = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+
+            let mut entries = Vec::with_capacity(outputs_by_outpoint.len());
+            let mut seen = HashSet::with_capacity(outputs_by_outpoint.len());
+            for outpoint in outpoints {
+                if spends_by_outpoint.contains_key(&outpoint) {
+                    continue;
+                }
+                if let Some(output) = outputs_by_outpoint.get(&outpoint)
+                    && seen.insert(outpoint)
+                {
+                    entries.push(TransparentOutputEntry {
+                        outpoint,
+                        output: Some(output.clone().into_output()),
+                    });
+                }
+            }
+
+            Ok(TransparentUnspentOutputsByOutpointResponse {
+                chain_epoch,
+                entries,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_unspent_outputs_by_outpoint",
             started_at,
             &query_outcome,
             None,

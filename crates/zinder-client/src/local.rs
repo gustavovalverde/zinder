@@ -616,6 +616,43 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: &[zinder_core::TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<zinder_core::TransparentUnspentOutputsByOutpointResponse, IndexerError> {
+        let outpoints = normalize_transparent_outpoints(outpoints)?;
+        self.read_at_epoch(at_epoch_id, move |reader| {
+            let chain_epoch = reader.chain_epoch();
+            let outputs_by_outpoint = reader
+                .transparent_outputs_by_outpoints(&outpoints)
+                .map_err(IndexerError::from_store_error)?;
+            let spends_by_outpoint = reader
+                .transparent_spend_facts_by_outpoints(&outpoints)
+                .map_err(IndexerError::from_store_error)?;
+            let mut entries = Vec::with_capacity(outputs_by_outpoint.len());
+            let mut seen = std::collections::HashSet::with_capacity(outputs_by_outpoint.len());
+            for outpoint in outpoints {
+                if spends_by_outpoint.contains_key(&outpoint) {
+                    continue;
+                }
+                if let Some(output) = outputs_by_outpoint.get(&outpoint)
+                    && seen.insert(outpoint)
+                {
+                    entries.push(zinder_core::TransparentOutputEntry {
+                        outpoint,
+                        output: Some(output.clone().into_output()),
+                    });
+                }
+            }
+            Ok(zinder_core::TransparentUnspentOutputsByOutpointResponse {
+                chain_epoch,
+                entries,
+            })
+        })
+        .await
+    }
+
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
     }

@@ -27,8 +27,8 @@ use zinder_core::{
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendEntry,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
-    UnixTimestampMillis,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
@@ -554,6 +554,25 @@ impl ChainIndex for RemoteChainIndex {
             .into_inner();
         transparent_spends_by_outpoint_response_from_message(self.network, response)
     }
+
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
+        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
+        let request = wallet::TransparentUnspentOutputsByOutpointRequest {
+            outpoints: wire_outpoints,
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+        };
+        let response = self
+            .client()
+            .transparent_unspent_outputs_by_outpoint(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        transparent_unspent_outputs_by_outpoint_response_from_message(self.network, response)
+    }
 }
 
 #[async_trait]
@@ -759,6 +778,23 @@ fn transparent_outputs_by_outpoint_response_from_message(
         .map(transparent_output_entry_from_message)
         .collect::<Result<Vec<_>, IndexerError>>()?;
     Ok(TransparentOutputsByOutpointResponse {
+        chain_epoch,
+        entries,
+    })
+}
+
+fn transparent_unspent_outputs_by_outpoint_response_from_message(
+    expected_network: Network,
+    message: wallet::TransparentUnspentOutputsByOutpointResponse,
+) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
+    let entries = message
+        .entries
+        .into_iter()
+        .map(transparent_output_entry_from_message)
+        .collect::<Result<Vec<_>, IndexerError>>()?;
+    Ok(TransparentUnspentOutputsByOutpointResponse {
         chain_epoch,
         entries,
     })

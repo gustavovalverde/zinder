@@ -682,6 +682,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `wallet.mempool.transparent_outputs_by_outpoint_v1`
 - `wallet.read.transparent_outputs_by_outpoint_v1`
 - `wallet.read.transparent_spends_by_outpoint_v1`
+- `wallet.read.transparent_unspent_outputs_by_outpoint_v1`
 - `wallet.read.chain_value_pools_at_tip_v1`
 - `wallet.address.transparent_unspent_outputs_v1`
 - `wallet.address.transparent_history_v1`

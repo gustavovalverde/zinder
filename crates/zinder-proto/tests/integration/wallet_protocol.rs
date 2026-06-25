@@ -634,6 +634,46 @@ fn transparent_spends_by_outpoint_response_round_trips_through_prost() -> eyre::
     Ok(())
 }
 
+#[test]
+fn transparent_unspent_outputs_by_outpoint_response_round_trips_through_prost() -> eyre::Result<()>
+{
+    let response = wallet::TransparentUnspentOutputsByOutpointResponse {
+        chain_view: Some(synthetic_chain_view()),
+        entries: vec![wallet::TransparentOutputEntry {
+            outpoint: Some(wallet::OutPoint {
+                transaction_id: "22".repeat(32),
+                output_index: 4,
+            }),
+            output: Some(wallet::TransparentOutput {
+                value_zat: 9_999,
+                script_pub_key: vec![0x76, 0xa9, 0x14, 0x88, 0xac],
+            }),
+        }],
+    };
+
+    let decoded = round_trip(&response)?;
+
+    assert!(decoded.chain_view.is_some());
+    assert_eq!(decoded.entries.len(), 1);
+    let entry = decoded
+        .entries
+        .first()
+        .ok_or_else(|| eyre!("decoded response is missing the entry"))?;
+    let outpoint = entry
+        .outpoint
+        .as_ref()
+        .ok_or_else(|| eyre!("decoded entry is missing its outpoint"))?;
+    assert_eq!(outpoint.transaction_id, "22".repeat(32));
+    assert_eq!(outpoint.output_index, 4);
+    let output = entry
+        .output
+        .as_ref()
+        .ok_or_else(|| eyre!("decoded entry is missing its output"))?;
+    assert_eq!(output.value_zat, 9_999);
+    assert_eq!(output.script_pub_key, vec![0x76, 0xa9, 0x14, 0x88, 0xac]);
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

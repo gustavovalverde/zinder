@@ -1019,6 +1019,43 @@ message TransparentOutputsByOutpointResponse {
   repeated TransparentOutputEntry entries = 2;
 }
 
+// Batched request for canonical-chain unspent-output resolution.
+//
+// Given transparent outpoints, return each output only while it is unspent on
+// the canonical chain at the response epoch. This is the gettxout-equivalent
+// surface: it composes the canonical output resolver with the canonical
+// reverse-spend reader server-side, so a consumer needs one round-trip rather
+// than an output lookup plus a spend lookup plus a client-side join. The read
+// is canonical-only; mempool-aware unspent-ness composes with the separate
+// `TransparentMempoolSpendsByOutpoint` RPC (subtract those spends).
+message TransparentUnspentOutputsByOutpointRequest {
+  // Outpoints to probe. Bounded server-side to a hard cap; requests above
+  // the cap are silently truncated to the first N entries. The coinbase
+  // sentinel `(transaction_id = [0u8; 32], output_index = 0xFFFFFFFF)` is
+  // rejected with `INVALID_ARGUMENT`; coinbase inputs spend no prevout.
+  repeated OutPoint outpoints = 1;
+
+  // Optional chain-epoch id pin. Absent resolves against the visible tip;
+  // present pins both the output and the spend read to one epoch.
+  optional uint64 at_epoch_id = 2;
+}
+
+// Response for [`TransparentUnspentOutputsByOutpoint`] bound to one chain
+// epoch.
+message TransparentUnspentOutputsByOutpointResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Every entry is present and unspent at this epoch.
+  ChainView chain_view = 1;
+
+  // Unspent outputs found for the requested outpoints. An outpoint emits an
+  // entry only when the canonical chain at this epoch has the referenced
+  // output and it carries no canonical spend; spent or never-existed
+  // outpoints emit no entry (null-if-spent). Each entry's `output` is always
+  // populated. Consumers key results by `outpoint`. Duplicate request
+  // outpoints collapse to one entry.
+  repeated TransparentOutputEntry entries = 2;
+}
+
 // Batched request for live mempool transparent prevout resolution.
 //
 // Mempool reads are not chain-epoch-pinnable; the request omits
@@ -1409,6 +1446,15 @@ service WalletQuery {
   // surface; the unmined half is `TransparentMempoolSpendsByOutpoint`.
   rpc TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest)
       returns (TransparentSpendsByOutpointResponse);
+
+  // Resolve a batch of canonical-chain transparent outpoints to their
+  // referenced output, returning each only while it is unspent on the
+  // canonical chain at the response epoch (null-if-spent, gettxout-equivalent).
+  // Composes the output resolver and the canonical reverse-spend reader
+  // server-side. Canonical-only: a mempool-aware caller subtracts the spends
+  // from `TransparentMempoolSpendsByOutpoint`.
+  rpc TransparentUnspentOutputsByOutpoint(TransparentUnspentOutputsByOutpointRequest)
+      returns (TransparentUnspentOutputsByOutpointResponse);
 
   // Resolve a batch of live-mempool transparent outpoints to their
   // referenced outputs. Used by chained-mempool-tx flows where the

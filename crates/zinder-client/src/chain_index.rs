@@ -11,7 +11,8 @@ use zinder_core::{
     TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -657,6 +658,34 @@ pub trait ChainIndex: Send + Sync + 'static {
         outpoints: &[TransparentOutPoint],
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentSpendsByOutpointResponse, IndexerError>;
+
+    /// Resolves a batch of transparent outpoints to their referenced output,
+    /// returning each only while it is unspent on the canonical chain at the
+    /// response's epoch (gettxout-equivalent, null-if-spent).
+    ///
+    /// An outpoint produces an entry only when the canonical chain at that
+    /// epoch has the output and it carries no canonical spend; spent or
+    /// never-existed outpoints produce no entry, so every entry's `output` is
+    /// present. Consumers key results by `outpoint`. Implementations reject the
+    /// coinbase sentinel and silently truncate requests above
+    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. The read is
+    /// canonical-only: a mempool-aware caller subtracts the spends returned by
+    /// [`EndpointBackedIndex::transparent_mempool_spends_by_outpoint`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let unspent = client.transparent_unspent_outputs_by_outpoint(&outpoints, None).await?;
+    /// # let _ = unspent; Ok(()) }
+    /// ```
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

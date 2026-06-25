@@ -435,6 +435,16 @@ The canonical response binds to a `ChainEpoch`, then carries `repeated Transpare
 
 The `ChainIndex` Rust API exposes `transparent_spends_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentSpendsByOutpointResponse`. `LocalChainIndex` reads it directly from the secondary store; `RemoteChainIndex` calls the gRPC method. The accessor a consumer uses for confirmed reverse-spend is this single base-trait method; both colocated and cross-process readers serve it and both honor the `at_epoch_id` pin. The reverse-spend surface is native-only for the same reason as prevout resolution.
 
+## Transparent Unspent-Output Probe
+
+The unspent-output probe is the gettxout-equivalent surface: given an `OutPoint`, it returns the referenced output only while that output is unspent on the canonical chain, and nothing if the output has been spent or never existed (null-if-spent). It composes the output resolver and the canonical reverse-spend reader on the server so a transparent-flow explorer issues one round-trip rather than an output lookup, a spend lookup, and a client-side join per outpoint.
+
+- `WalletQuery.TransparentUnspentOutputsByOutpoint(TransparentUnspentOutputsByOutpointRequest) returns (TransparentUnspentOutputsByOutpointResponse)`. Capability `wallet.read.transparent_unspent_outputs_by_outpoint_v1`, always advertised because both the canonical output index and the canonical spend-fact index are present on every wallet-plane deployment.
+
+The handler opens one epoch-bound reader and reads both `transparent_outputs_by_outpoints` and `transparent_spend_facts_by_outpoints` at that single pinned epoch. An outpoint emits an entry only when the output is present and carries no canonical spend at the epoch; spent or never-existed outpoints emit no entry, so every entry's `output` is populated. The response binds to a `ChainEpoch` at field tag 1, then carries `repeated TransparentOutputEntry entries`, the same entry shape as `TransparentOutputsByOutpoint` so consumers share one decoder. Consumers key results by `outpoint`; duplicate request outpoints collapse to one entry. The coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter and the request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout and reverse-spend surfaces.
+
+The read is canonical-only. The mempool overlay is intentionally absent: a mempool-aware caller composes this canonical probe with `TransparentMempoolSpendsByOutpoint` and subtracts those unmined spends from the result. Keeping the overlay out of this RPC keeps it a clean base-trait read that both colocated and cross-process readers serve and that honors the `at_epoch_id` pin. The `ChainIndex` Rust API exposes `transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentUnspentOutputsByOutpointResponse`; `LocalChainIndex` reads it directly from the secondary store and `RemoteChainIndex` calls the gRPC method. The surface is native-only for the same reason as prevout resolution.
+
 ## Chain Value Pools
 
 The native surface is `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest) returns (ChainValuePoolsAtTipResponse)`. Capability `wallet.read.chain_value_pools_at_tip_v1` is advertised when the query deployment can proxy to an ingest writer whose source probe reported `chain_value_pools`.

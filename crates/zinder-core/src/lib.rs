@@ -65,5 +65,6 @@ pub use transparent_output::{
     TransparentOutPoint, TransparentOutput, TransparentOutputArtifact, TransparentOutputEntry,
     TransparentOutputFact, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendFact, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse,
 };
 pub use tree_state::TreeStateArtifact;

@@ -42,7 +42,7 @@ use super::native::{
     latest_block_response, latest_safe_block_response, latest_tree_state_checkpoint_response,
     subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    tree_state_at_response,
+    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
 };
 use super::status_from_query_error;
 
@@ -477,6 +477,20 @@ where
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
         transparent_spends_by_outpoint_response(&self.query_api, outpoints, at_epoch)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        request: Request<wallet::TransparentUnspentOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentUnspentOutputsByOutpointResponse>, Status> {
+        let request = request.into_inner();
+        reject_coinbase_sentinels(&request.outpoints)?;
+        let outpoints = transparent_outpoints_from_request(request.outpoints)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
+        transparent_unspent_outputs_by_outpoint_response(&self.query_api, outpoints, at_epoch)
             .await
             .map(Response::new)
             .map_err(|error| status_from_query_error(&error))

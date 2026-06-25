@@ -22,7 +22,8 @@ pub use native::{
     compact_block_response, latest_block_response, latest_tree_state_checkpoint_response,
     subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, tree_state_at_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
