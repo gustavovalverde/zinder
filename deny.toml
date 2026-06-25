@@ -6,7 +6,11 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # Unmaintained, reached only transitively through zebra-chain -> getset with
+    # no safe upgrade available.
+    "RUSTSEC-2026-0173",
+]
 
 [licenses]
 allow = [
