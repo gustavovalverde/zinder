@@ -8,9 +8,9 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, BlockHeightRange, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, IndexerError,
-    LocalChainIndex, LocalOpenOptions, Network, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionId, TxStatus,
+    BlockHeight, BlockHeightRange, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex,
+    LocalOpenOptions, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    TxStatus,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations,
@@ -105,12 +105,6 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
     assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(missing_transaction, TxStatus::NotFound);
     assert_eq!(compact_block_count, 2);
-    assert!(matches!(
-        chain_index.chain_events(None).await,
-        Err(IndexerError::RemoteEndpointUnconfigured {
-            operation: "chain_events"
-        })
-    ));
 
     Ok(())
 }

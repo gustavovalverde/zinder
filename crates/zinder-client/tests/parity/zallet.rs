@@ -1,13 +1,16 @@
 //! Zallet parity assertions.
 //!
-//! Zallet (the desktop wallet) is the primary `zinder-client::ChainIndex` Rust
-//! consumer. These compile-time assertions ensure the `ChainIndex` methods
-//! Zallet depends on stay present on the trait surface.
-//! Renaming or removing any referenced method makes this module fail to compile.
+//! Zallet (the desktop wallet) is the primary `zinder-client` Rust consumer.
+//! These compile-time assertions ensure the trait methods Zallet depends on
+//! stay present. Base canonical reads live on `ChainIndex`; broadcast,
+//! standalone mempool presence, and the chain-event stream need a live
+//! endpoint, so they live on `EndpointBackedIndex` and a consumer that calls
+//! them bounds its handle `T: ChainIndex + EndpointBackedIndex`. Renaming or
+//! removing any referenced method makes this module fail to compile.
 
 use eyre::eyre;
 use zinder_client::{
-    BlockHeight, BlockSelector, ChainIndex, LocalChainIndex, RawTransactionBytes, RemoteChainIndex,
+    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TxStatus,
 };
 use zinder_testkit::FixtureTransactionRows;
@@ -16,7 +19,7 @@ use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixtur
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
-    fn assert_compiles<T: ChainIndex>() {
+    fn assert_base_compiles<T: ChainIndex>() {
         // typed BlockId from latest_block
         let _ = T::latest_block;
         // typed BlockSelector resolver
@@ -25,19 +28,24 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
         let _ = T::block_header_by_selector;
         // typed TxStatus envelope (mined / mempool / conflicting)
         let _ = T::transaction_by_id;
-        // standalone is_in_mempool boolean check
-        let _ = T::is_in_mempool;
         // tree_state_at with Option<ChainEpoch>
         let _ = T::tree_state_at;
         // typed SubtreeRootHash + ShieldedProtocol enum
         let _ = T::subtree_roots_in_range;
+    }
+    fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
+        // standalone is_in_mempool boolean check
+        let _ = T::is_in_mempool;
         // typed RawTransactionBytes
         let _ = T::broadcast_transaction;
         // ChainCommitted as a typed signal in chain_events
         let _ = T::chain_events;
     }
-    assert_compiles::<LocalChainIndex>();
-    assert_compiles::<RemoteChainIndex>();
+    assert_base_compiles::<LocalChainIndex>();
+    assert_base_compiles::<RemoteChainIndex>();
+    // Only the endpoint-backed adapter implements EndpointBackedIndex; a
+    // LocalChainIndex handle is rejected here at compile time.
+    assert_endpoint_compiles::<RemoteChainIndex>();
 }
 
 #[tokio::test]
@@ -110,14 +118,6 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(mined.details.confirmations, 1);
     assert_eq!(missing_status, TxStatus::NotFound);
-    assert!(matches!(
-        chain_index
-            .broadcast_transaction(RawTransactionBytes::new(vec![0x00]))
-            .await,
-        Err(zinder_client::IndexerError::RemoteEndpointUnconfigured {
-            operation: "broadcast_transaction"
-        })
-    ));
 
     Ok(())
 }

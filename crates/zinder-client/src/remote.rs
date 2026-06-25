@@ -42,10 +42,10 @@ use zinder_store::{
 use crate::error::ZINDER_ERROR_DOMAIN;
 use crate::{
     BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
-    ChainEventStream, ChainIndex, ChainRangeReverted, IndexStream, IndexerError, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    ChainEventStream, ChainIndex, ChainRangeReverted, EndpointBackedIndex, IndexStream,
+    IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
+    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
     TransparentHistoryCursor, TransparentUnspentOutputStreamItem,
 };
@@ -183,24 +183,6 @@ impl RemoteChainIndex {
 
 #[async_trait]
 impl ChainIndex for RemoteChainIndex {
-    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
-        let response = self
-            .client()
-            .server_info(Request::new(wallet::ServerInfoRequest {}))
-            .await
-            .map_err(|status| self.handle_status(status))?
-            .into_inner();
-        let wallet_info = response
-            .info
-            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
-        let common = wallet_info
-            .common
-            .as_ref()
-            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
-        ensure_network_name(self.network, &common.network)?;
-        Ok(wallet_info)
-    }
-
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         let response = self
             .client()
@@ -400,16 +382,6 @@ impl ChainIndex for RemoteChainIndex {
             .collect()
     }
 
-    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
-        let response = self
-            .client()
-            .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
-            .await
-            .map_err(|status| self.handle_status(status))?
-            .into_inner();
-        chain_value_pools_at_tip_from_message(self.network, response)
-    }
-
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -433,6 +405,146 @@ impl ChainIndex for RemoteChainIndex {
             Err(status) => return Err(self.handle_status(status)),
         };
         tx_status_from_message(response)
+    }
+
+    async fn transparent_address_unspent_outputs(
+        &self,
+        query: TransparentAddressUnspentOutputsQuery,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        let request = wallet::TransparentAddressUnspentOutputsRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    query.address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            start_height: query.start_height.value(),
+        };
+        let response = self
+            .client()
+            .transparent_address_unspent_outputs(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?;
+        let expected_network = self.network;
+        let recovery = self.clone();
+        let stream = response.into_inner().map(move |message_result| {
+            let message = message_result.map_err(|status| recovery.handle_status(status))?;
+            transparent_unspent_output_item_from_message(expected_network, message)
+        });
+        Ok(Box::pin(stream))
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        let address_script_hash = query.address_script_hash;
+        let request = wallet::TransparentAddressTxIdsInRangeRequest {
+            address: Some(wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    address_script_hash.as_bytes().to_vec(),
+                )),
+            }),
+            start_height: query.start_height.value(),
+            end_height: query.end_height.value(),
+            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
+            from_cursor: query
+                .from_cursor
+                .as_ref()
+                .map(|cursor| cursor.as_bytes().to_vec())
+                .unwrap_or_default(),
+            descending: query.descending,
+        };
+        let response = self
+            .client()
+            .transparent_address_tx_ids_in_range(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?;
+        let expected_network = self.network;
+        let recovery = self.clone();
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
+            transparent_address_tx_ids_chunk_from_message(
+                expected_network,
+                address_script_hash,
+                chunk,
+            )
+        });
+        Ok(Box::pin(stream))
+    }
+
+    async fn transparent_address_balance(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        let wire_addresses = addresses
+            .iter()
+            .map(|script_hash| wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    script_hash.as_bytes().to_vec(),
+                )),
+            })
+            .collect();
+        let request = wallet::TransparentAddressBalanceRequest {
+            addresses: wire_addresses,
+            at_epoch_id: None,
+        };
+        let response = self
+            .client()
+            .transparent_address_balance(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        transparent_address_balance_from_message(self.network, response)
+    }
+
+    async fn transparent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
+        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
+        let request = wallet::TransparentOutputsByOutpointRequest {
+            outpoints: wire_outpoints,
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+        };
+        let response = self
+            .client()
+            .transparent_outputs_by_outpoint(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        transparent_outputs_by_outpoint_response_from_message(self.network, response)
+    }
+}
+
+#[async_trait]
+impl EndpointBackedIndex for RemoteChainIndex {
+    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
+        let response = self
+            .client()
+            .server_info(Request::new(wallet::ServerInfoRequest {}))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        let wallet_info = response
+            .info
+            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
+        let common = wallet_info
+            .common
+            .as_ref()
+            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
+        ensure_network_name(self.network, &common.network)?;
+        Ok(wallet_info)
+    }
+
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
+        let response = self
+            .client()
+            .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        chain_value_pools_at_tip_from_message(self.network, response)
     }
 
     async fn broadcast_transaction(
@@ -533,71 +645,6 @@ impl ChainIndex for RemoteChainIndex {
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
 
-    async fn transparent_address_unspent_outputs(
-        &self,
-        query: TransparentAddressUnspentOutputsQuery,
-    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
-        let request = wallet::TransparentAddressUnspentOutputsRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    query.address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
-            start_height: query.start_height.value(),
-        };
-        let response = self
-            .client()
-            .transparent_address_unspent_outputs(Request::new(request))
-            .await
-            .map_err(|status| self.handle_status(status))?;
-        let expected_network = self.network;
-        let recovery = self.clone();
-        let stream = response.into_inner().map(move |message_result| {
-            let message = message_result.map_err(|status| recovery.handle_status(status))?;
-            transparent_unspent_output_item_from_message(expected_network, message)
-        });
-        Ok(Box::pin(stream))
-    }
-
-    async fn transparent_address_tx_ids_in_range(
-        &self,
-        query: TransparentAddressTxIdsQuery,
-    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
-        let address_script_hash = query.address_script_hash;
-        let request = wallet::TransparentAddressTxIdsInRangeRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
-            start_height: query.start_height.value(),
-            end_height: query.end_height.value(),
-            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
-            from_cursor: query
-                .from_cursor
-                .as_ref()
-                .map(|cursor| cursor.as_bytes().to_vec())
-                .unwrap_or_default(),
-            descending: query.descending,
-        };
-        let response = self
-            .client()
-            .transparent_address_tx_ids_in_range(Request::new(request))
-            .await
-            .map_err(|status| self.handle_status(status))?;
-        let expected_network = self.network;
-        let recovery = self.clone();
-        let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
-            transparent_address_tx_ids_chunk_from_message(
-                expected_network,
-                address_script_hash,
-                chunk,
-            )
-        });
-        Ok(Box::pin(stream))
-    }
-
     async fn transparent_mempool_outputs_by_address(
         &self,
         request: TransparentMempoolOutputsRequest,
@@ -641,50 +688,6 @@ impl ChainIndex for RemoteChainIndex {
             .into_iter()
             .map(transparent_mempool_spend_from_message)
             .collect()
-    }
-
-    async fn transparent_address_balance(
-        &self,
-        addresses: &[TransparentAddressScriptHash],
-    ) -> Result<TransparentAddressBalance, IndexerError> {
-        let wire_addresses = addresses
-            .iter()
-            .map(|script_hash| wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    script_hash.as_bytes().to_vec(),
-                )),
-            })
-            .collect();
-        let request = wallet::TransparentAddressBalanceRequest {
-            addresses: wire_addresses,
-            at_epoch_id: None,
-        };
-        let response = self
-            .client()
-            .transparent_address_balance(Request::new(request))
-            .await
-            .map_err(|status| self.handle_status(status))?
-            .into_inner();
-        transparent_address_balance_from_message(self.network, response)
-    }
-
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentOutputsByOutpointRequest {
-            outpoints: wire_outpoints,
-            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-        };
-        let response = self
-            .client()
-            .transparent_outputs_by_outpoint(Request::new(request))
-            .await
-            .map_err(|status| self.handle_status(status))?
-            .into_inner();
-        transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
 
     async fn transparent_mempool_outputs_by_outpoint(

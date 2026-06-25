@@ -21,7 +21,7 @@ use crate::IndexerError;
 /// Typed stream returned by chain-index methods.
 pub type IndexStream<T> = Pin<Box<dyn Stream<Item = Result<T, IndexerError>> + Send + 'static>>;
 
-/// Chain-event stream returned by [`ChainIndex::chain_events`].
+/// Chain-event stream returned by [`EndpointBackedIndex::chain_events`].
 pub type ChainEventStream = IndexStream<ChainEventEnvelope>;
 
 /// Opaque chain-event cursor.
@@ -123,7 +123,7 @@ impl MempoolEventCursor {
     }
 }
 
-/// Bounded snapshot request for [`ChainIndex::mempool_snapshot`].
+/// Bounded snapshot request for [`EndpointBackedIndex::mempool_snapshot`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MempoolSnapshotRequest {
     /// Server-enforced maximum entry count.
@@ -154,7 +154,7 @@ impl MempoolSnapshotCursor {
     }
 }
 
-/// Snapshot view returned by [`ChainIndex::mempool_snapshot`].
+/// Snapshot view returned by [`EndpointBackedIndex::mempool_snapshot`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MempoolSnapshotView {
     /// Chain epoch visible at snapshot time.
@@ -224,7 +224,7 @@ pub enum MempoolEvent {
     },
 }
 
-/// Mempool-event stream returned by [`ChainIndex::mempool_events`].
+/// Mempool-event stream returned by [`EndpointBackedIndex::mempool_events`].
 pub type MempoolEventStream = IndexStream<MempoolEventEnvelope>;
 
 /// Read parameters for [`ChainIndex::transparent_address_unspent_outputs`].
@@ -300,7 +300,22 @@ pub struct TransparentUnspentOutputStreamItem {
     pub output: TransparentUnspentOutput,
 }
 
-/// Typed chain-index contract consumed by wallets and applications.
+/// Canonical and derive-store reads served identically by every chain-index
+/// handle.
+///
+/// Both [`crate::LocalChainIndex`] (a colocated `RocksDB`-secondary reader) and
+/// [`crate::RemoteChainIndex`] (a `WalletQuery` gRPC client) implement this
+/// trait with identical semantics. Every method here answers from the
+/// canonical chain store or the derive projection, so a handle that cannot
+/// reach a live ingest-control endpoint still honors the full contract.
+///
+/// Methods that require a live ingest-control/broadcast endpoint (broadcast,
+/// live-mempool reads, the chain-event stream, chain value-pools, the
+/// wallet-plane server descriptor) live on the separate
+/// [`EndpointBackedIndex`] trait, which only [`crate::RemoteChainIndex`]
+/// implements. A caller that needs one of those methods adds an
+/// `EndpointBackedIndex` bound, so a handle without an endpoint fails to
+/// compile instead of failing at runtime.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves
 /// to the visible chain epoch at call time; `Some(id)` pins the read to that
@@ -310,22 +325,8 @@ pub struct TransparentUnspentOutputStreamItem {
 /// All trait methods take and return `zinder-core` types; generated
 /// `zinder_proto::*` types appear only in adapter modules, never on this
 /// public Rust API.
-///
 #[async_trait]
 pub trait ChainIndex: Send + Sync + 'static {
-    /// Returns the wallet-plane server descriptor when the implementation has a
-    /// service endpoint.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let descriptor = client.server_info().await?;
-    /// # let _ = descriptor; Ok(()) }
-    /// ```
-    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError>;
-
     /// Returns the current visible chain epoch.
     ///
     /// # Examples
@@ -509,22 +510,6 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError>;
 
-    /// Reads chain-wide value-pool totals at the upstream node's current tip.
-    ///
-    /// The response is bound to the Zinder chain epoch visible when the writer
-    /// answered the proxied source read. The upstream value-pool list is
-    /// preserved as entries rather than projected into fixed pool names.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let pools = client.chain_value_pools_at_tip().await?;
-    /// # let _ = pools; Ok(()) }
-    /// ```
-    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError>;
-
     /// Looks up a transaction by id.
     ///
     /// `None` for `at_epoch_id` consults the live mempool when the canonical
@@ -546,143 +531,6 @@ pub trait ChainIndex: Send + Sync + 'static {
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError>;
-
-    /// Broadcasts raw transaction bytes without mutating canonical storage.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, RawTransactionBytes};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outcome = client
-    ///     .broadcast_transaction(RawTransactionBytes::new(Vec::<u8>::new()))
-    ///     .await?;
-    /// # let _ = outcome; Ok(()) }
-    /// ```
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, IndexerError>;
-
-    /// Streams tip-family chain events.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client.chain_events(None).await?;
-    /// # let _ = stream; Ok(()) }
-    /// ```
-    async fn chain_events(
-        &self,
-        from_cursor: Option<ChainEventCursor>,
-    ) -> Result<ChainEventStream, IndexerError> {
-        self.chain_events_for_family(from_cursor, ChainEventStreamFamily::Tip)
-            .await
-    }
-
-    /// Streams chain events for the requested family.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainEventStreamFamily, ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client
-    ///     .chain_events_for_family(None, ChainEventStreamFamily::Tip)
-    ///     .await?;
-    /// # let _ = stream; Ok(()) }
-    /// ```
-    async fn chain_events_for_family(
-        &self,
-        from_cursor: Option<ChainEventCursor>,
-        family: ChainEventStreamFamily,
-    ) -> Result<ChainEventStream, IndexerError>;
-
-    /// Streams chain events with a server-side address invalidation filter
-    /// applied.
-    ///
-    /// `address_filter` is a list of transparent t-addresses (canonical
-    /// Base58 form). An empty list disables filtering and delivers every
-    /// envelope. A non-empty list narrows commit envelopes to those whose
-    /// block range touches at least one of the supplied addresses; reorgs
-    /// always pass through regardless of filter. The cursor remains opaque;
-    /// clients re-derive per-address state from `compact_block_at` after
-    /// each received envelope.
-    ///
-    /// The default implementation falls back to
-    /// [`Self::chain_events_for_family`] (filter ignored) so backends like
-    /// `LocalChainIndex` that talk to storage directly continue to work;
-    /// remote backends that talk to a Zinder server push the filter
-    /// through to the wire.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainEventStreamFamily, ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client
-    ///     .chain_events_with_filter(None, ChainEventStreamFamily::Tip, Vec::new())
-    ///     .await?;
-    /// # let _ = stream; Ok(()) }
-    /// ```
-    async fn chain_events_with_filter(
-        &self,
-        from_cursor: Option<ChainEventCursor>,
-        family: ChainEventStreamFamily,
-        address_filter: Vec<String>,
-    ) -> Result<ChainEventStream, IndexerError> {
-        let _ = address_filter;
-        self.chain_events_for_family(from_cursor, family).await
-    }
-
-    /// Returns a bounded snapshot of the live mempool index.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, MempoolSnapshotRequest};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let snapshot = client
-    ///     .mempool_snapshot(MempoolSnapshotRequest::default())
-    ///     .await?;
-    /// # let _ = snapshot; Ok(()) }
-    /// ```
-    async fn mempool_snapshot(
-        &self,
-        request: MempoolSnapshotRequest,
-    ) -> Result<MempoolSnapshotView, IndexerError>;
-
-    /// Streams replayable mempool events.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client.mempool_events(None).await?;
-    /// # let _ = stream; Ok(()) }
-    /// ```
-    async fn mempool_events(
-        &self,
-        from_cursor: Option<MempoolEventCursor>,
-    ) -> Result<MempoolEventStream, IndexerError>;
-
-    /// Returns whether `transaction_id` is currently visible in the live
-    /// mempool index.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let present = client
-    ///     .is_in_mempool(TransactionId::from_bytes([0u8; 32]))
-    ///     .await?;
-    /// # let _ = present; Ok(()) }
-    /// ```
-    async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
 
     /// Streams the complete unspent transparent output set for one
     /// transparent address at a single pinned chain epoch.
@@ -737,57 +585,14 @@ pub trait ChainIndex: Send + Sync + 'static {
         query: TransparentAddressTxIdsQuery,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError>;
 
-    /// Returns transparent mempool outputs tied to one address.
-    ///
-    /// Bounded by the request's `max_entries`; values larger than the
-    /// server's configured cap are silently clamped to that cap.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{
-    /// #     ChainIndex, IndexerError, TransparentAddressScriptHash,
-    /// #     TransparentMempoolOutputsRequest,
-    /// # };
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let request = TransparentMempoolOutputsRequest {
-    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
-    ///     max_entries: 64,
-    /// };
-    /// let outputs = client.transparent_mempool_outputs_by_address(request).await?;
-    /// # let _ = outputs; Ok(()) }
-    /// ```
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: TransparentMempoolOutputsRequest,
-    ) -> Result<Vec<TransparentMempoolOutput>, IndexerError>;
-
-    /// Returns the mempool spends that consume any of `outpoints`.
-    ///
-    /// Outpoints with no unmined spend produce no entry; callers key
-    /// results by `spent_outpoint`. Implementations silently truncate
-    /// requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let spends = client.transparent_mempool_spends_by_outpoint(&outpoints).await?;
-    /// # let _ = spends; Ok(()) }
-    /// ```
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError>;
-
     /// Returns the transparent-address balance summed across `addresses`.
     ///
-    /// Served by the wallet plane on `WalletQuery.TransparentAddressBalance`:
-    /// the confirmed total plus the signed mempool overlay in
-    /// `unconfirmed_delta_zat`.
+    /// The confirmed total is summed from the canonical unspent-output index,
+    /// so both adapters answer it from the store. The signed
+    /// `unconfirmed_delta_zat` overlays the live mempool only when an
+    /// ingest-control endpoint is reachable; a local handle without an
+    /// endpoint reports `unconfirmed_delta_zat = 0`, matching the always-on
+    /// `wallet.address.transparent_balance_v1` capability semantics.
     ///
     /// # Examples
     ///
@@ -827,24 +632,6 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
 
-    /// Resolves a batch of outpoints against the live mempool index. Used
-    /// when an outpoint references an output of an unconfirmed mempool
-    /// transaction (chained-mempool flows).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let prevouts = client.transparent_mempool_outputs_by_outpoint(&outpoints).await?;
-    /// # let _ = prevouts; Ok(()) }
-    /// ```
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
-
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.
     ///
@@ -859,4 +646,251 @@ pub trait ChainIndex: Send + Sync + 'static {
     fn local_catchup_interval(&self) -> Option<Duration> {
         None
     }
+}
+
+/// Live ingest-control reads layered on top of [`ChainIndex`].
+///
+/// Only [`crate::RemoteChainIndex`] implements this trait: every method needs a
+/// reachable ingest-control/broadcast endpoint that the canonical and derive
+/// stores cannot stand in for. Broadcast forwards bytes to the upstream node;
+/// the mempool reads observe the writer's in-process mempool index; the
+/// chain-event stream and chain value-pools are produced by the writer at the
+/// safe tip; the wallet-plane server descriptor is the endpoint's own
+/// advertisement.
+///
+/// A consumer that needs any of these methods bounds its handle as
+/// `T: ChainIndex + EndpointBackedIndex`, so a colocated local reader without
+/// an endpoint is rejected at compile time rather than at call time.
+#[async_trait]
+pub trait EndpointBackedIndex: ChainIndex {
+    /// Returns the wallet-plane server descriptor advertised by the endpoint.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let descriptor = client.server_info().await?;
+    /// # let _ = descriptor; Ok(()) }
+    /// ```
+    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError>;
+
+    /// Reads chain-wide value-pool totals at the upstream node's current tip.
+    ///
+    /// The response is bound to the Zinder chain epoch visible when the writer
+    /// answered the proxied source read. The upstream value-pool list is
+    /// preserved as entries rather than projected into fixed pool names.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let pools = client.chain_value_pools_at_tip().await?;
+    /// # let _ = pools; Ok(()) }
+    /// ```
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError>;
+
+    /// Broadcasts raw transaction bytes without mutating canonical storage.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError, RawTransactionBytes};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outcome = client
+    ///     .broadcast_transaction(RawTransactionBytes::new(Vec::<u8>::new()))
+    ///     .await?;
+    /// # let _ = outcome; Ok(()) }
+    /// ```
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastResult, IndexerError>;
+
+    /// Streams tip-family chain events.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client.chain_events(None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn chain_events(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+    ) -> Result<ChainEventStream, IndexerError> {
+        self.chain_events_for_family(from_cursor, ChainEventStreamFamily::Tip)
+            .await
+    }
+
+    /// Streams chain events for the requested family.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainEventStreamFamily, EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client
+    ///     .chain_events_for_family(None, ChainEventStreamFamily::Tip)
+    ///     .await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn chain_events_for_family(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+        family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStream, IndexerError>;
+
+    /// Streams chain events with a server-side address invalidation filter
+    /// applied.
+    ///
+    /// `address_filter` is a list of transparent t-addresses (canonical
+    /// Base58 form). An empty list disables filtering and delivers every
+    /// envelope. A non-empty list narrows commit envelopes to those whose
+    /// block range touches at least one of the supplied addresses; reorgs
+    /// always pass through regardless of filter. The cursor remains opaque;
+    /// clients re-derive per-address state from `compact_block_at` after
+    /// each received envelope.
+    ///
+    /// The default implementation falls back to
+    /// [`Self::chain_events_for_family`] (filter ignored); the remote backend
+    /// overrides it to push the filter through to the wire.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainEventStreamFamily, EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client
+    ///     .chain_events_with_filter(None, ChainEventStreamFamily::Tip, Vec::new())
+    ///     .await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn chain_events_with_filter(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+        family: ChainEventStreamFamily,
+        address_filter: Vec<String>,
+    ) -> Result<ChainEventStream, IndexerError> {
+        let _ = address_filter;
+        self.chain_events_for_family(from_cursor, family).await
+    }
+
+    /// Returns a bounded snapshot of the live mempool index.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError, MempoolSnapshotRequest};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let snapshot = client
+    ///     .mempool_snapshot(MempoolSnapshotRequest::default())
+    ///     .await?;
+    /// # let _ = snapshot; Ok(()) }
+    /// ```
+    async fn mempool_snapshot(
+        &self,
+        request: MempoolSnapshotRequest,
+    ) -> Result<MempoolSnapshotView, IndexerError>;
+
+    /// Streams replayable mempool events.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let stream = client.mempool_events(None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn mempool_events(
+        &self,
+        from_cursor: Option<MempoolEventCursor>,
+    ) -> Result<MempoolEventStream, IndexerError>;
+
+    /// Returns whether `transaction_id` is currently visible in the live
+    /// mempool index.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError, TransactionId};
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let present = client
+    ///     .is_in_mempool(TransactionId::from_bytes([0u8; 32]))
+    ///     .await?;
+    /// # let _ = present; Ok(()) }
+    /// ```
+    async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
+
+    /// Returns transparent mempool outputs tied to one address.
+    ///
+    /// Bounded by the request's `max_entries`; values larger than the
+    /// server's configured cap are silently clamped to that cap.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     EndpointBackedIndex, IndexerError, TransparentAddressScriptHash,
+    /// #     TransparentMempoolOutputsRequest,
+    /// # };
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let request = TransparentMempoolOutputsRequest {
+    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
+    ///     max_entries: 64,
+    /// };
+    /// let outputs = client.transparent_mempool_outputs_by_address(request).await?;
+    /// # let _ = outputs; Ok(()) }
+    /// ```
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        request: TransparentMempoolOutputsRequest,
+    ) -> Result<Vec<TransparentMempoolOutput>, IndexerError>;
+
+    /// Returns the mempool spends that consume any of `outpoints`.
+    ///
+    /// Outpoints with no unmined spend produce no entry; callers key
+    /// results by `spent_outpoint`. Implementations silently truncate
+    /// requests above
+    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     EndpointBackedIndex, IndexerError, TransactionId, TransparentOutPoint,
+    /// # };
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let spends = client.transparent_mempool_spends_by_outpoint(&outpoints).await?;
+    /// # let _ = spends; Ok(()) }
+    /// ```
+    async fn transparent_mempool_spends_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError>;
+
+    /// Resolves a batch of outpoints against the live mempool index. Used
+    /// when an outpoint references an output of an unconfirmed mempool
+    /// transaction (chained-mempool flows).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     EndpointBackedIndex, IndexerError, TransactionId, TransparentOutPoint,
+    /// # };
+    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let prevouts = client.transparent_mempool_outputs_by_outpoint(&outpoints).await?;
+    /// # let _ = prevouts; Ok(()) }
+    /// ```
+    async fn transparent_mempool_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
 }

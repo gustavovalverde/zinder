@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use tokio_stream::StreamExt as _;
 
 use zinder_client::{
-    BlockHeight, ChainIndex, IndexerError, LocalChainIndex, RemoteChainIndex, TransactionId,
+    BlockHeight, ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
     TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
 };
@@ -22,27 +22,30 @@ use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixtur
 
 #[test]
 fn parity_chain_index_surface_compiles_for_block_explorers() {
-    fn assert_compiles<T: ChainIndex>() {
+    fn assert_base_compiles<T: ChainIndex>() {
         // hash-or-height lookup via BlockSelector
         let _ = T::block_id_by_selector;
         // typed block-header read model
         let _ = T::block_header_by_selector;
         // typed TxStatus with mined / mempool / conflicting
         let _ = T::transaction_by_id;
+        // typed TransparentAddressBalance from the canonical unspent index
+        let _ = T::transparent_address_balance;
+        // M6 canonical prevout resolution. Explorers and SDKs that decode
+        // transaction inputs depend on this staying in the base contract;
+        // renaming or removing it is a breaking change.
+        let _ = T::transparent_outputs_by_outpoint;
+    }
+    fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
         // per-address mempool overlays
         let _ = T::transparent_mempool_outputs_by_address;
         let _ = T::transparent_mempool_spends_by_outpoint;
-        // typed TransparentAddressBalance from the wallet plane
-        let _ = T::transparent_address_balance;
-        // M6 canonical prevout resolution and live-mempool prevout fallback.
-        // Explorers and SDKs that decode transaction inputs depend on this
-        // pair staying in the contract; renaming or removing either is a
-        // breaking change.
-        let _ = T::transparent_outputs_by_outpoint;
+        // live-mempool prevout fallback for chained-mempool input decode
         let _ = T::transparent_mempool_outputs_by_outpoint;
     }
-    assert_compiles::<LocalChainIndex>();
-    assert_compiles::<RemoteChainIndex>();
+    assert_base_compiles::<LocalChainIndex>();
+    assert_base_compiles::<RemoteChainIndex>();
+    assert_endpoint_compiles::<RemoteChainIndex>();
 }
 
 #[tokio::test]
@@ -126,14 +129,14 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     assert_eq!(history_item.artifact, tx_history);
     assert!(history_item.cursor.is_some());
     assert!(history.next().await.is_none());
-    assert!(matches!(
-        chain_index
-            .transparent_address_balance(&[address_script_hash])
-            .await,
-        Err(zinder_client::IndexerError::RemoteEndpointUnconfigured {
-            operation: "transparent_address_balance"
-        })
-    ));
+
+    let balance = chain_index
+        .transparent_address_balance(&[address_script_hash])
+        .await?;
+    assert_eq!(balance.confirmed_zat, 321);
+    assert_eq!(balance.unconfirmed_delta_zat, 0);
+    assert_eq!(balance.address_count, 1);
+    assert_eq!(balance.chain_epoch, utxo_chain_epoch);
 
     Ok(())
 }
@@ -209,26 +212,6 @@ async fn rejects_coinbase_sentinel_in_explorer_transparent_outputs_by_outpoint()
     assert!(
         canonical_error.to_string().contains("coinbase sentinel"),
         "canonical prevout error must name the coinbase sentinel anti-pattern; got {canonical_error}"
-    );
-
-    let mempool_error = match chain_index
-        .transparent_mempool_outputs_by_outpoint(&outpoints)
-        .await
-    {
-        Ok(response) => {
-            return Err(eyre!(
-                "expected coinbase-sentinel rejection from mempool prevouts, got {response:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-    assert!(
-        matches!(
-            &mempool_error,
-            IndexerError::RemoteEndpointUnconfigured { .. }
-        ) || mempool_error.to_string().contains("coinbase sentinel"),
-        "mempool prevout error must either reject the coinbase sentinel or report \
-         a missing remote-proxy endpoint when no IngestControl is wired; got {mempool_error}"
     );
     Ok(())
 }

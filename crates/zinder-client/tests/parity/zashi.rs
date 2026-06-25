@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
-use zinder_client::{ChainIndex, LocalChainIndex, RemoteChainIndex};
+use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
@@ -20,21 +20,24 @@ use super::{committed_store_fixture, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zashi_use_cases() {
-    fn assert_compiles<T: ChainIndex>() {
+    fn assert_base_compiles<T: ChainIndex>() {
         // typed BlockSelector resolver (compact-block hash-only paths)
         let _ = T::block_id_by_selector;
-        // mempool point lookups for unmined UTXO overlays
-        let _ = T::transparent_mempool_outputs_by_address;
-        let _ = T::transparent_mempool_spends_by_outpoint;
-        // typed TransparentAddressBalance from the wallet plane
+        // typed TransparentAddressBalance from the canonical unspent index
         let _ = T::transparent_address_balance;
         // typed subtree-root reads for SDK scan
         let _ = T::subtree_roots_in_range;
         // typed TxStatus envelope (raw decode + status disambiguation)
         let _ = T::transaction_by_id;
     }
-    assert_compiles::<LocalChainIndex>();
-    assert_compiles::<RemoteChainIndex>();
+    fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
+        // mempool point lookups for unmined UTXO overlays
+        let _ = T::transparent_mempool_outputs_by_address;
+        let _ = T::transparent_mempool_spends_by_outpoint;
+    }
+    assert_base_compiles::<LocalChainIndex>();
+    assert_base_compiles::<RemoteChainIndex>();
+    assert_endpoint_compiles::<RemoteChainIndex>();
 }
 
 #[tokio::test]

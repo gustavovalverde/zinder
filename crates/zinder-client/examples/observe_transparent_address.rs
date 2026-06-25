@@ -36,8 +36,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, IndexerError, Network,
-    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
+    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex, IndexerError,
+    Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
     TransparentAddressUnspentOutputsQuery,
 };
 

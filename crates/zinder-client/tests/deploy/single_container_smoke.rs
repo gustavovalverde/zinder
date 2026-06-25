@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use eyre::{Result, eyre};
 use tokio::process::Command;
-use zinder_client::{ChainIndex, Network, RemoteChainIndex, RemoteOpenOptions};
+use zinder_client::{EndpointBackedIndex, Network, RemoteChainIndex, RemoteOpenOptions};
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_testkit::deploy::require_docker;
 use zinder_testkit::live::{init, require_live_for};

@@ -13,8 +13,9 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    ChainIndex, LocalChainIndex, RemoteChainIndex, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentUnspentOutput,
+    ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
@@ -28,20 +29,23 @@ use super::{committed_store_fixture, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
-    fn assert_compiles<T: ChainIndex>() {
+    fn assert_base_compiles<T: ChainIndex>() {
         // GetTaddressBalance backed by typed TransparentAddressBalance
         let _ = T::transparent_address_balance;
         // GetBlock and GetTreeState hash-only paths via BlockSelector
         let _ = T::block_id_by_selector;
         // GetSubtreeRoots typed bytes + typed pool enum
         let _ = T::subtree_roots_in_range;
+    }
+    fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
         // SendTransaction typed bytes path
         let _ = T::broadcast_transaction;
         // ChainCommitted typed signal for the live chain-event stream
         let _ = T::chain_events;
     }
-    assert_compiles::<LocalChainIndex>();
-    assert_compiles::<RemoteChainIndex>();
+    assert_base_compiles::<LocalChainIndex>();
+    assert_base_compiles::<RemoteChainIndex>();
+    assert_endpoint_compiles::<RemoteChainIndex>();
 }
 
 #[tokio::test]

@@ -11,9 +11,9 @@ use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::transport::Server;
 use zinder_client::{
-    BlockHeight, BlockHeightRange, ChainEvent, ChainIndex, Network, RawTransactionBytes,
-    RemoteChainIndex, RemoteOpenOptions, TransactionBroadcastResult, TransactionId,
-    WALLET_BROADCAST_TRANSACTION_V1,
+    BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
+    EndpointBackedIndex, Network, RawTransactionBytes, RemoteChainIndex, RemoteOpenOptions,
+    TransactionBroadcastResult, TransactionId,
 };
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
@@ -78,12 +78,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         server_common.network,
         encode_zinder_native_chain_name(Network::ZcashRegtest)
     );
-    assert!(
-        server_common
-            .capabilities
-            .iter()
-            .any(|capability| capability == WALLET_BROADCAST_TRANSACTION_V1)
-    );
+    assert!(server_info.supports(Capability::Broadcast));
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height, BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);

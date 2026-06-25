@@ -4,9 +4,10 @@
 //! mempool-to-confirmed handoff:
 //!
 //! 1. Snapshot the live mempool outputs for the watched address through
-//!    [`ChainIndex::transparent_mempool_outputs_by_address`].
-//! 2. Subscribe to the mempool event log via [`ChainIndex::mempool_events`]
-//!    to receive `Added`/`Mined`/`Invalidated`/`Suppressed` transitions.
+//!    [`EndpointBackedIndex::transparent_mempool_outputs_by_address`].
+//! 2. Subscribe to the mempool event log via
+//!    [`EndpointBackedIndex::mempool_events`] to receive
+//!    `Added`/`Mined`/`Invalidated`/`Suppressed` transitions.
 //! 3. Track each unconfirmed transaction id observed for the address until
 //!    one of those transitions resolves it; emit one line per state change.
 //!
@@ -37,7 +38,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    ChainIndex, IndexerError, MempoolEvent, Network, RemoteChainIndex, RemoteOpenOptions,
+    EndpointBackedIndex, IndexerError, MempoolEvent, Network, RemoteChainIndex, RemoteOpenOptions,
     RetryPolicy, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutputsRequest,
 };
 

@@ -730,6 +730,47 @@ pub fn always_on_capability_strings(surface: CapabilitySurface) -> Vec<&'static 
         .collect()
 }
 
+/// A typed wallet-plane capability a client probes before issuing a call.
+///
+/// Each variant names one advertised capability on the `WalletQuery` surface
+/// whose presence a consumer checks to decide whether a feature is reachable.
+/// [`Self::as_str`] returns the exact wire string, which is the same constant
+/// the [`CAPABILITIES`] table advertises, so a typed probe and the wire stay
+/// in lockstep. Prefer [`CapabilityDescriptor::supports`] over comparing raw
+/// capability strings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum Capability {
+    /// Raw transaction broadcast (`wallet.broadcast.transaction_v1`).
+    Broadcast,
+    /// Cursor-resumable chain-event stream (`wallet.events.chain_v1`).
+    ChainEvents,
+    /// Bounded mempool snapshot (`wallet.snapshot.mempool_v1`).
+    MempoolSnapshot,
+    /// Replayable mempool-event stream (`wallet.events.mempool_v1`).
+    MempoolEvents,
+    /// Chain value-pool totals at the upstream tip
+    /// (`wallet.read.chain_value_pools_at_tip_v1`).
+    ChainValuePools,
+    /// Transparent-address balance (`wallet.address.transparent_balance_v1`).
+    TransparentAddressBalance,
+}
+
+impl Capability {
+    /// Returns the exact capability string this variant advertises.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Broadcast => WALLET_BROADCAST_TRANSACTION_V1,
+            Self::ChainEvents => WALLET_EVENTS_CHAIN_V1,
+            Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V1,
+            Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V1,
+            Self::ChainValuePools => WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+            Self::TransparentAddressBalance => WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+        }
+    }
+}
+
 /// Helpers for client-side capability discovery.
 ///
 /// Implemented by every per-service descriptor (`WalletServerInfo`,
@@ -739,6 +780,15 @@ pub fn always_on_capability_strings(surface: CapabilitySurface) -> Vec<&'static 
 pub trait CapabilityDescriptor {
     /// Returns true if the descriptor advertises `capability`.
     fn has(&self, capability: &str) -> bool;
+
+    /// Returns true if the descriptor advertises the typed [`Capability`].
+    ///
+    /// Prefer this over [`Self::has`] with a raw string: the compiler checks
+    /// the variant against the typed set, so a consumer cannot probe a
+    /// capability string that no longer exists.
+    fn supports(&self, capability: Capability) -> bool {
+        self.has(capability.as_str())
+    }
 }
 
 impl CapabilityDescriptor for OpsServerInfo {

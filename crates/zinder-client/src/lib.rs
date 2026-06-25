@@ -12,12 +12,12 @@ mod remote;
 
 pub use chain_index::{
     ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventStream,
-    ChainIndex, ChainRangeReverted, IndexStream, MempoolEvent, MempoolEventCursor,
-    MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest,
-    MempoolSnapshotView, TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
-    TransparentAddressTxIdsStreamItem, TransparentAddressUnspentOutputsQuery,
-    TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
-    TransparentUnspentOutputStreamItem,
+    ChainIndex, ChainRangeReverted, EndpointBackedIndex, IndexStream, MempoolEvent,
+    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
+    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
+    TransparentHistoryCursor, TransparentUnspentOutputStreamItem,
 };
 pub use error::{IndexerError, RetryPolicy};
 pub use local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
@@ -35,9 +35,10 @@ pub use zinder_core::{
     TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 pub use zinder_proto::capabilities::{
-    AdvertisePolicy, CAPABILITIES, CapabilitySpec, CapabilitySurface, EXPLORER_BLOCK_DETAIL_V1,
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_FEE_SUMMARY_V1, EXPLORER_MEMPOOL_ACTIVITY_V1,
-    EXPLORER_MEMPOOL_EVENT_COUNTS_V1, EXPLORER_MEMPOOL_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
+    AdvertisePolicy, CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySpec,
+    CapabilitySurface, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_FEE_SUMMARY_V1, EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+    EXPLORER_MEMPOOL_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
     EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1, EXPLORER_SEARCH_V1, EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_RECENT_V1,
     EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1, EXPLORER_VALUE_POOL_SUMMARY_V1,
@@ -57,3 +58,12 @@ pub use zinder_proto::capabilities::{
 pub use zinder_proto::v1::ops::ErrorReason;
 pub use zinder_proto::v1::wallet::WalletServerInfo;
 pub use zinder_store::ChainEventStreamFamily;
+
+/// The server-side wallet recipe, compiled as a doctest so its worked skeleton
+/// cannot drift from the real `connect` and stream API.
+#[allow(
+    clippy::doc_markdown,
+    reason = "Reader-facing recipe prose names product and crate identifiers without backticks by design."
+)]
+#[doc = include_str!("../../../docs/reference/server-side-wallet-pattern.md")]
+mod server_side_wallet_recipe {}

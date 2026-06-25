@@ -21,6 +21,8 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 - **Capability discovery**: `ServerInfo` advertises which RPCs and features the deployment serves.
 - **Lightwalletd compatibility**: the `zinder-compat-lightwalletd` binary speaks the vendored lightwalletd protocol so Zashi/Zodl and the Android SDK integrate without changes.
 
+The native Rust client (`zinder-client`) splits this list across two traits. The canonical and derive-store reads (compact blocks, tree state, subtree roots, transparent-address outputs and tx-history, prevout resolution, the confirmed transparent-address balance) live on `ChainIndex`, which both the gRPC `RemoteChainIndex` and the colocated RocksDB-secondary `LocalChainIndex` serve identically. Broadcast, the chain-event stream, live-mempool reads, and chain value-pools need a live ingest-control endpoint, so they live on the `EndpointBackedIndex` extension that only `RemoteChainIndex` implements. A colocated reader without an endpoint is rejected at compile time, not at the call. This makes the two-RocksDB-secondary reader topology explicit in the type system without changing the [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) ChainEpoch-token model.
+
 ## Zinder does NOT do this
 
 - **Hold keys.** No spending keys, viewing keys, or seed phrases ever touch the indexer. [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md).

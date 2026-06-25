@@ -8,24 +8,22 @@ use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId,
-    ChainValuePoolsAtTip, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
-    NetworkUpgradeActivations, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TreeStateArtifact, TxStatus,
+    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, NetworkUpgradeActivations,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TreeStateArtifact, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
     TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
 };
-use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{
-    AddressOutputIndexPageRequest, BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions,
-    RocksDbResourceBudget, SecondaryChainStore, StoreError,
+    AddressOutputIndexPageRequest, BlockHashLookup, ChainStoreOptions, RocksDbResourceBudget,
+    SecondaryChainStore, StoreError,
 };
 
 use crate::{
-    BlockId, ChainEventCursor, ChainEventStream, ChainIndex, IndexStream, IndexerError,
-    RemoteChainIndex, RemoteOpenOptions, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    BlockId, ChainIndex, IndexStream, IndexerError, RemoteChainIndex, RemoteOpenOptions,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
     TransparentUnspentOutputStreamItem,
 };
@@ -168,12 +166,6 @@ impl LocalChainIndex {
         }))
         .await
     }
-
-    fn remote(&self, operation: &'static str) -> Result<&RemoteChainIndex, IndexerError> {
-        self.remote_index
-            .as_ref()
-            .ok_or(IndexerError::RemoteEndpointUnconfigured { operation })
-    }
 }
 
 impl Drop for LocalChainIndex {
@@ -188,10 +180,6 @@ impl Drop for LocalChainIndex {
 )]
 #[async_trait]
 impl ChainIndex for LocalChainIndex {
-    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
-        self.remote("server_info")?.server_info().await
-    }
-
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         self.read_at_epoch(None, |reader| Ok(reader.chain_epoch()))
             .await
@@ -356,12 +344,6 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
-    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
-        self.remote("chain_value_pools_at_tip")?
-            .chain_value_pools_at_tip()
-            .await
-    }
-
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -404,59 +386,14 @@ impl ChainIndex for LocalChainIndex {
             return Ok(mined_outcome);
         }
 
-        // Canonical chain has no record. Delegate to the remote endpoint
-        // to consult the live mempool index. Local secondary readers
-        // cannot observe the writer's in-process mempool state, so this
-        // path is skipped (NotFound is returned) when no remote endpoint
-        // is wired.
-        match self.remote("transaction_by_id_mempool_fallback") {
-            Ok(remote) => remote.transaction_by_id(transaction_id, None).await,
-            Err(IndexerError::RemoteEndpointUnconfigured { .. }) => Ok(TxStatus::NotFound),
-            Err(error) => Err(error),
+        // Canonical chain has no record. A colocated secondary reader cannot
+        // observe the writer's in-process mempool state, so consult the live
+        // mempool only when an ingest-control endpoint is wired; otherwise the
+        // answer is NotFound.
+        match &self.remote_index {
+            Some(remote) => remote.transaction_by_id(transaction_id, None).await,
+            None => Ok(TxStatus::NotFound),
         }
-    }
-
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, IndexerError> {
-        self.remote("broadcast_transaction")?
-            .broadcast_transaction(raw_transaction)
-            .await
-    }
-
-    async fn chain_events_for_family(
-        &self,
-        from_cursor: Option<ChainEventCursor>,
-        family: ChainEventStreamFamily,
-    ) -> Result<ChainEventStream, IndexerError> {
-        self.remote("chain_events")?
-            .chain_events_for_family(from_cursor, family)
-            .await
-    }
-
-    async fn mempool_snapshot(
-        &self,
-        request: crate::MempoolSnapshotRequest,
-    ) -> Result<crate::MempoolSnapshotView, IndexerError> {
-        self.remote("mempool_snapshot")?
-            .mempool_snapshot(request)
-            .await
-    }
-
-    async fn mempool_events(
-        &self,
-        from_cursor: Option<crate::MempoolEventCursor>,
-    ) -> Result<crate::MempoolEventStream, IndexerError> {
-        self.remote("mempool_events")?
-            .mempool_events(from_cursor)
-            .await
-    }
-
-    async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError> {
-        self.remote("is_in_mempool")?
-            .is_in_mempool(transaction_id)
-            .await
     }
 
     async fn transparent_address_unspent_outputs(
@@ -567,40 +504,52 @@ impl ChainIndex for LocalChainIndex {
         Ok(Box::pin(stream::iter(items)))
     }
 
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: zinder_core::TransparentMempoolOutputsRequest,
-    ) -> Result<Vec<zinder_core::TransparentMempoolOutput>, IndexerError> {
-        self.remote("transparent_mempool_outputs_by_address")?
-            .transparent_mempool_outputs_by_address(request)
-            .await
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        outpoints: &[zinder_core::TransparentOutPoint],
-    ) -> Result<Vec<zinder_core::TransparentMempoolSpend>, IndexerError> {
-        self.remote("transparent_mempool_spends_by_outpoint")?
-            .transparent_mempool_spends_by_outpoint(outpoints)
-            .await
-    }
-
     async fn transparent_address_balance(
         &self,
-        addresses: &[zinder_core::TransparentAddressScriptHash],
-    ) -> Result<zinder_core::TransparentAddressBalance, IndexerError> {
-        self.remote("transparent_address_balance")?
-            .transparent_address_balance(addresses)
-            .await
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        outpoints: &[zinder_core::TransparentOutPoint],
-    ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, IndexerError> {
-        self.remote("transparent_mempool_outputs_by_outpoint")?
-            .transparent_mempool_outputs_by_outpoint(outpoints)
-            .await
+        addresses: &[TransparentAddressScriptHash],
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        let address_count = u32::try_from(addresses.len())
+            .ok()
+            .filter(|count| (1..=MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count))
+            .ok_or_else(|| IndexerError::InvalidRequest {
+                reason: format!(
+                    "transparent address balance accepts 1..={MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES} addresses, got {}",
+                    addresses.len()
+                ),
+            })?;
+        let addresses = addresses.to_vec();
+        let store = self.store.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let chain_epoch = store
+                .current_chain_epoch_reader()
+                .map_err(IndexerError::from_store_error)?
+                .chain_epoch();
+            let mut confirmed_zat: u64 = 0;
+            for address_script_hash in addresses {
+                let page = store
+                    .address_output_index_page(AddressOutputIndexPageRequest {
+                        at_epoch: None,
+                        address_script_hash,
+                        start_height: BlockHeight::new(0),
+                        max_entries: NonZeroU32::MAX,
+                        from_cursor: None,
+                    })
+                    .map_err(IndexerError::from_store_error)?;
+                for output in &page.outputs {
+                    confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
+                }
+            }
+            Ok(TransparentAddressBalance {
+                confirmed_zat,
+                unconfirmed_delta_zat: 0,
+                address_count,
+                chain_epoch,
+            })
+        }))
+        .await
     }
 
     async fn transparent_outputs_by_outpoint(
@@ -676,6 +625,10 @@ fn spawn_catchup_loop(store: SecondaryChainStore, interval: Duration, cancel: Ca
 }
 
 const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Upper bound on the address count accepted by a single transparent-address
+/// balance read, matching the wallet plane's `WalletQuery` bound.
+const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
 
 #[allow(
     clippy::wildcard_enum_match_arm,

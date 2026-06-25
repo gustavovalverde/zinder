@@ -99,14 +99,6 @@ pub enum IndexerError {
         reason: String,
     },
 
-    /// A method requiring a service endpoint was called on a local index that
-    /// was opened without one.
-    #[error("remote endpoint is not configured for {operation}")]
-    RemoteEndpointUnconfigured {
-        /// Operation that needs a service endpoint.
-        operation: &'static str,
-    },
-
     /// A response was missing a required field or carried invalid bytes.
     #[error("malformed response field {field}: {reason}")]
     MalformedResponse {
@@ -289,7 +281,6 @@ impl IndexerError {
             | Self::InvalidRequest { .. }
             | Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
-            | Self::RemoteEndpointUnconfigured { .. }
             | Self::MalformedResponse { .. }
             | Self::NetworkMismatch { .. } => None,
         }
@@ -312,9 +303,9 @@ impl IndexerError {
             Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
             | Self::NetworkMismatch { .. } => RetryPolicy::OperatorActionRequired,
-            Self::InvalidRequest { .. }
-            | Self::RemoteEndpointUnconfigured { .. }
-            | Self::MalformedResponse { .. } => RetryPolicy::ClientError,
+            Self::InvalidRequest { .. } | Self::MalformedResponse { .. } => {
+                RetryPolicy::ClientError
+            }
         }
     }
 

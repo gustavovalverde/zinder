@@ -60,65 +60,97 @@ The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Cha
 3. **Broadcast phase**: build the transaction with `zcash_primitives::transaction::builder::Builder`, prove it with `zcash_proofs`, and post the raw bytes via `WalletQuery.BroadcastTransaction`.
 4. **Cursor persistence**: store the bytes from the latest `ChainEventEnvelope.cursor` durably alongside your wallet state. On restart, replay strictly after that cursor.
 
+## Two client traits
+
+`zinder-client` splits the chain-index contract in two so the compiler tells you which calls a handle can serve:
+
+- `ChainIndex` carries the canonical and derive-store reads. Both `RemoteChainIndex` (a `WalletQuery` gRPC client) and `LocalChainIndex` (a colocated RocksDB-secondary reader) implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
+
+A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`. A `LocalChainIndex` passed where `EndpointBackedIndex` is required fails to compile, so the missing-endpoint case is a build error rather than a runtime error.
+
 ## Worked skeleton
 
-The code below uses pseudocode for the consumer-side crates and the real `zinder-client::ChainIndex` trait for the chain-read calls. It demonstrates the shape; it is not a complete wallet.
+The block below is a compiled doctest. It uses the real `zinder-client` connect and stream API; the consumer-side persistence is a small in-test stub so the example stays self-contained without pulling in `zcash_client_sqlite`.
 
-```rust
-use std::time::Duration;
+```rust,no_run
+use tokio_stream::StreamExt as _;
 use zinder_client::{
-    ChainEventStreamFamily, ChainIndex, RemoteChainIndex, RemoteOpenOptions,
+    ChainEventCursor, ChainEventEnvelope, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
+    IndexerError, Network, RawTransactionBytes, RemoteChainIndex, RemoteOpenOptions,
+    TransactionBroadcastResult, TransparentAddressScriptHash,
+    TransparentAddressUnspentOutputsQuery,
 };
 
-async fn run_server_wallet(
-    endpoint: String,
-    watched_addresses: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Connect to Zinder.
-    let zinder = RemoteChainIndex::connect(
-        RemoteOpenOptions::new(endpoint).request_timeout(Duration::from_secs(30)),
-    )
-    .await?;
+// Stand-in for the consumer's zcash_client_sqlite-backed state.
+struct WalletDb;
+impl WalletDb {
+    fn open(_path: &str) -> Self {
+        Self
+    }
+    fn watched_script_hashes(&self) -> Vec<TransparentAddressScriptHash> {
+        Vec::new()
+    }
+    fn load_last_chain_event_cursor(&self) -> Option<ChainEventCursor> {
+        None
+    }
+    fn save_chain_event_cursor(&mut self, _cursor: &ChainEventCursor) {}
+    fn absorb_transparent_output(&mut self, _output: &zinder_client::TransparentUnspentOutput) {}
+    fn apply_chain_event(&mut self, _envelope: &ChainEventEnvelope) {}
+}
 
-    // 2. Persist the wallet state in zcash_client_sqlite. (Pseudocode.)
-    let mut wallet = open_wallet_db("wallet.sqlite")?;
+async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
+    // 1. Connect to Zinder. `connect` is synchronous and only parses the URI;
+    //    the channel dials lazily on the first call.
+    let zinder = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashMainnet,
+    })?;
 
-    // 3. Snapshot: drain the complete unspent set for every watched address.
-    for address in &watched_addresses {
+    let mut wallet = WalletDb::open("wallet.sqlite");
+
+    // 2. Snapshot: drain the complete unspent set for every watched address.
+    //    `transparent_address_unspent_outputs` is a base `ChainIndex` read, so
+    //    a colocated `LocalChainIndex` could serve it too.
+    for address_script_hash in wallet.watched_script_hashes() {
         let mut unspent_outputs = zinder
-            .transparent_address_unspent_outputs(transparent_address_query(address))
+            .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
+                address_script_hash,
+                start_height: zinder_client::BlockHeight::new(0),
+            })
             .await?;
         while let Some(unspent) = unspent_outputs.next().await {
-            wallet.absorb_transparent_output(&unspent?.output)?;
+            wallet.absorb_transparent_output(&unspent?.output);
         }
     }
 
-    // 4. Snapshot: walk compact blocks + tree state for shielded sync.
-    //    (zcash_client_backend::scan_cached_blocks fed by `compact_blocks_in_range`)
-    //    Persist the resulting note set into wallet.
+    // 3. Snapshot shielded state with `compact_blocks_in_range` + `tree_state_at`
+    //    (also base `ChainIndex` reads), fed to
+    //    `zcash_client_backend::scan_cached_blocks`. Persist the note set.
 
-    // 5. Subscribe forever with the address filter.
-    let cursor = wallet.load_last_chain_event_cursor()?;
+    // 4. Subscribe forever. `chain_events_for_family` needs a live endpoint, so
+    //    it is an `EndpointBackedIndex` method: a handle without an endpoint
+    //    would not compile here.
     let mut stream = zinder
-        .chain_events_for_family(cursor, ChainEventStreamFamily::Tip)
+        .chain_events_for_family(wallet.load_last_chain_event_cursor(), ChainEventStreamFamily::Tip)
         .await?;
-    while let Some(envelope) = stream.recv().await? {
-        // Persist the cursor BEFORE applying the event so a crash resumes from
+    while let Some(envelope) = stream.next().await {
+        let envelope = envelope?;
+        // Persist the cursor before applying the event so a crash resumes from
         // the next event after the last fully-applied one.
-        wallet.save_chain_event_cursor(&envelope.cursor)?;
-        wallet.apply_chain_event(&envelope, &zinder).await?;
+        wallet.save_chain_event_cursor(&envelope.cursor);
+        wallet.apply_chain_event(&envelope);
     }
     Ok(())
 }
 
-// Building and broadcasting a transparent transaction:
-async fn send_transparent(
-    zinder: &impl ChainIndex,
-    raw_transaction: zinder_client::RawTransactionBytes,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = zinder.broadcast_transaction(raw_transaction).await?;
-    println!("broadcast result: {result:?}");
-    Ok(())
+// Broadcasting a transparent transaction needs an endpoint, so the bound is
+// `ChainIndex + EndpointBackedIndex`.
+async fn send_transparent<T: ChainIndex + EndpointBackedIndex>(
+    zinder: &T,
+    raw_transaction: RawTransactionBytes,
+) -> Result<TransactionBroadcastResult, IndexerError> {
+    zinder.broadcast_transaction(raw_transaction).await
 }
 ```
 
@@ -126,16 +158,24 @@ async fn send_transparent(
 
 Every `zinder-client` call returns `Result<_, IndexerError>`. The typed `IndexerError::reason()` and `IndexerError::retry_policy()` accessors give you a deterministic decision rule:
 
-```rust
+```rust,no_run
 use zinder_client::{IndexerError, RetryPolicy};
 
-match wallet_call_result {
-    Err(error) => match error.retry_policy() {
-        RetryPolicy::RetryWithBackoff => /* sleep, then retry */,
-        RetryPolicy::OperatorActionRequired => /* page on-call */,
-        RetryPolicy::ClientError => /* fix the request, do not retry */,
-    },
-    Ok(value) => /* use value */,
+fn classify<T>(outcome: Result<T, IndexerError>) -> Option<T> {
+    match outcome {
+        Err(error) => {
+            match error.retry_policy() {
+                RetryPolicy::RetryWithBackoff => { /* sleep, then retry */ }
+                RetryPolicy::OperatorActionRequired => { /* page on-call */ }
+                RetryPolicy::ClientError => { /* fix the request, do not retry */ }
+                // RetryPolicy is non_exhaustive; treat unknown policies as a
+                // client error and surface them to the operator.
+                _ => { /* fail closed */ }
+            }
+            None
+        }
+        Ok(ready) => Some(ready),
+    }
 }
 ```
 

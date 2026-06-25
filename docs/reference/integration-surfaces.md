@@ -20,7 +20,13 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 
 - `RemoteChainIndex` connects to a `WalletQuery` gRPC endpoint.
 - `LocalChainIndex` opens a local RocksDB secondary when colocated with the writer.
-- `ChainIndex` is the async trait shared by both implementations.
+
+The contract is split across two async traits so the compiler expresses which calls a handle can serve:
+
+- `ChainIndex` carries the canonical and derive-store reads. Both adapters implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
+
+A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing a `LocalChainIndex` there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
 Native clients get typed errors, capability discovery, epoch-pinned reads, chain-event cursors, transaction broadcast results, mempool reads, and transparent-address artifacts without depending on the lightwalletd compatibility layer.
 
