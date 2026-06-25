@@ -246,6 +246,18 @@ enum PrevoutResolutionStatus {
   PREVOUT_RESOLUTION_STATUS_UNAVAILABLE = 3;
 }
 
+// Whether a transparent-address value event credits or debits the address.
+//
+// `RECEIVED` is a transparent output paying the address: the signed
+// `value_zat` is positive and `index` is the output index. `SPENT` is a
+// transparent input consuming one of the address's prior outputs: the
+// signed `value_zat` is negative and `index` is the input index.
+enum TransparentDeltaKind {
+  TRANSPARENT_DELTA_KIND_UNSPECIFIED = 0;
+  TRANSPARENT_DELTA_KIND_RECEIVED = 1;
+  TRANSPARENT_DELTA_KIND_SPENT = 2;
+}
+
 // Per-input transparent prevout value carried on `TransactionDetail`.
 //
 // `input_index` is the zero-based position of the input in the
@@ -871,6 +883,96 @@ message TransparentAddressActivityResponse {
   bytes next_cursor = 3;
 }
 
+// `ExplorerQuery.TransparentAddressDeltas` request.
+//
+// Returns the per-event signed value series for one transparent address
+// over an inclusive height range, ordered ascending. One entry per received
+// output and per resolved spend, so the series is strictly finer than
+// `TransparentAddressActivity`, which folds the same events into one net row
+// per transaction. The mempool view is served separately through
+// `MempoolActivity`.
+message TransparentAddressDeltasRequest {
+  // Selector for the transparent address being queried.
+  zinder.v1.wallet.AddressLookup address = 1;
+
+  // Inclusive minimum block height. Zero means start from genesis.
+  uint32 start_height = 2;
+
+  // Inclusive maximum block height.
+  uint32 end_height = 3;
+
+  // Server-bounded maximum entries per page. Zero means use the server
+  // default; values larger than the server's configured cap are silently
+  // clamped.
+  uint32 max_entries = 4;
+
+  // Empty resumes from the oldest event in range. Non-empty resumes
+  // strictly after the prior page's last entry.
+  //
+  // Ordering: events are always emitted ascending (oldest first), matching
+  // the zcashd `getaddressdeltas` order. The sibling
+  // `TransparentAddressActivity` is deliberately newest-first; this surface
+  // is the ascending per-event counterpart.
+  bytes from_cursor = 5;
+
+  // Optional chain-epoch id pin.
+  optional uint64 at_epoch_id = 6;
+}
+
+// One signed transparent-address value event.
+//
+// Materialized by `TransparentAddressDeltasConsumer` at commit time. A
+// received output carries a positive `value_zat` and the output index; a
+// spent prevout carries a negative `value_zat` and the input index. Spend
+// events use `spent_value_zat` recorded on the canonical spend fact, so they
+// need no prevout re-resolution at read time. A spend whose prevout cannot
+// be resolved produces no event rather than a wrong number.
+message TransparentAddressDeltasEntry {
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
+
+  // Canonical block height of the confirming block.
+  uint32 block_height = 2;
+
+  // `nTime` from the confirming block header.
+  int64 block_time_unix_seconds = 3;
+
+  // Output index for a received output, input index for a spent prevout.
+  uint32 index = 4;
+
+  // Signed value, in zatoshis, the event moved for the address. Positive
+  // for a received output, negative for a spent prevout.
+  sint64 value_zat = 5;
+
+  // Whether the event credits (`RECEIVED`) or debits (`SPENT`) the address.
+  TransparentDeltaKind kind = 6;
+}
+
+// `ExplorerQuery.TransparentAddressDeltas` response.
+message TransparentAddressDeltasResponse {
+  ExplorerFreshness freshness = 1;
+  repeated TransparentAddressDeltasEntry entries = 2;
+  bytes next_cursor = 3;
+}
+
+// Per-event record materialized by `TransparentAddressDeltasConsumer`.
+//
+// Storage-only: never returned directly on the wire. Encoded into the
+// `transparent_address_deltas` column family value bytes; the key carries
+// `(address_script_hash, ascending_height, in_block_position, kind, index)`.
+// The handler projects this onto `TransparentAddressDeltasEntry`, pulling
+// the height from the key.
+message TransparentAddressDeltasRecord {
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 1;
+  int64 block_time_unix_seconds = 2;
+  // Signed value the event moved for the address; positive for a received
+  // output, negative for a spent prevout.
+  sint64 value_zat = 3;
+}
+
 // `ExplorerQuery.FeeSummary` request.
 //
 // Aggregates per-transaction ZIP-317 conventional fee floors over the
@@ -956,6 +1058,15 @@ service ExplorerQuery {
   // `explorer.transparent_address.activity_v1`.
   rpc TransparentAddressActivity(TransparentAddressActivityRequest)
       returns (TransparentAddressActivityResponse);
+
+  // Returns the per-event signed value series for one transparent address
+  // over an inclusive height range, ordered ascending (oldest first).
+  // Materialized by `TransparentAddressDeltasConsumer`. The per-transaction
+  // net folds these same events; this surface emits each received output and
+  // each resolved spend individually. Capability:
+  // `explorer.transparent_address.deltas_v1`.
+  rpc TransparentAddressDeltas(TransparentAddressDeltasRequest)
+      returns (TransparentAddressDeltasResponse);
 
   // Aggregates ZIP-317 conventional fee floors over the inclusive block
   // range `[start_height, end_height]`. Capability:

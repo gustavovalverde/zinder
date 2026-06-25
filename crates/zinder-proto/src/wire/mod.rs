@@ -12,5 +12,10 @@
 //! generated `zinder_proto::v1::*` enums.
 
 mod privacy_shape;
+mod transparent_delta_kind;
 
 pub use privacy_shape::encode_privacy_shape;
+pub use transparent_delta_kind::{
+    TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,
+    UnknownTransparentDeltaKindByte, decode_transparent_delta_kind,
+};

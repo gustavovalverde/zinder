@@ -5,7 +5,9 @@
 
 use eyre::eyre;
 use prost::Message;
-use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
+use zinder_proto::capabilities::{
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+};
 use zinder_proto::v1::{explorer, wallet};
 
 #[test]
@@ -178,6 +180,65 @@ fn transaction_detail_response_carries_conflicting_location() -> eyre::Result<()
         wallet::transaction_location::Location::Conflicting(_)
     ));
 
+    Ok(())
+}
+
+#[test]
+fn transparent_address_deltas_entry_round_trips_signed_values() -> eyre::Result<()> {
+    let received = explorer::TransparentAddressDeltasEntry {
+        transaction_id: "a".repeat(64),
+        block_height: 2_530_000,
+        block_time_unix_seconds: 1_700_000_000,
+        index: 1,
+        value_zat: 5_000_000,
+        kind: explorer::TransparentDeltaKind::Received as i32,
+    };
+    let spent = explorer::TransparentAddressDeltasEntry {
+        transaction_id: "b".repeat(64),
+        block_height: 2_530_005,
+        block_time_unix_seconds: 1_700_000_900,
+        index: 0,
+        value_zat: -3_000_000,
+        kind: explorer::TransparentDeltaKind::Spent as i32,
+    };
+
+    let decoded_received = round_trip(&received)?;
+    let decoded_spent = round_trip(&spent)?;
+
+    assert_eq!(decoded_received.value_zat, 5_000_000);
+    assert_eq!(
+        decoded_received.kind,
+        explorer::TransparentDeltaKind::Received as i32
+    );
+    assert_eq!(decoded_spent.value_zat, -3_000_000);
+    assert_eq!(
+        decoded_spent.kind,
+        explorer::TransparentDeltaKind::Spent as i32
+    );
+    Ok(())
+}
+
+#[test]
+fn transparent_address_deltas_response_carries_freshness_and_cursor() -> eyre::Result<()> {
+    let response = explorer::TransparentAddressDeltasResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1.to_owned(),
+            ..Default::default()
+        }),
+        entries: vec![explorer::TransparentAddressDeltasEntry::default()],
+        next_cursor: vec![1, 2, 3, 4],
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.entries.len(), 1);
+    assert_eq!(decoded.next_cursor, vec![1, 2, 3, 4]);
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1
+    );
     Ok(())
 }
 

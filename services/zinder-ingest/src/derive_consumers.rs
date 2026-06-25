@@ -28,7 +28,7 @@ use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
     ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, MempoolConsumerEvent,
     MempoolConsumerEventVariant, MempoolEventCountsConsumer, RecentTransactionsConsumer,
-    TransactionFeesConsumer, TransparentAddressActivityConsumer,
+    TransactionFeesConsumer, TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
     TransparentAddressTransactionHistoryConsumer, TransparentSpendFacts,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
@@ -933,12 +933,14 @@ pub(crate) fn dispatch_chain_event(
     let mut transaction_fees = TransactionFeesConsumer::new();
     let mut recent_transactions = RecentTransactionsConsumer::new();
     let mut transparent_activity = TransparentAddressActivityConsumer::new();
+    let mut transparent_deltas = TransparentAddressDeltasConsumer::new();
     let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
-    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 5] = [
+    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 6] = [
         &mut block_summary,
         &mut transaction_fees,
         &mut recent_transactions,
         &mut transparent_activity,
+        &mut transparent_deltas,
         &mut transparent_transaction_history,
     ];
     derive_store

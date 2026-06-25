@@ -124,6 +124,14 @@ The mempool overlay is emitted only on the first page (`from_cursor` empty and `
 
 The handler dedupes against the mempool overlay's transaction ids when streaming the confirmed slice so a transaction that mines between the two reads never appears twice in one response.
 
+## Transparent-address deltas
+
+`ExplorerQuery.TransparentAddressDeltas` is the per-event counterpart of the activity feed. Where the activity surface returns one net row per transaction, the deltas surface returns one row per received output and per resolved spend, ordered ascending by height for `getaddressdeltas` parity. Each entry carries `transaction_id`, `block_height`, `block_time_unix_seconds`, an `index` (the output index for a received output, the input index for a spent prevout), a signed `value_zat` (positive for a receive, negative for a spend), and an explicit `kind` (`RECEIVED` or `SPENT`) so a reader never infers direction from the sign alone.
+
+Both surfaces fold the same per-event attribution. `TransparentAddressDeltasConsumer` and `TransparentAddressActivityConsumer` each call one shared decomposition that turns a block into per-address value events; the deltas consumer persists every event while the activity consumer sums the events for one `(address, transaction)` into `net_value_zat`. The net activity for any address and range therefore equals the sum of the deltas over the same range.
+
+Received-output events are always exact. Spend events carry `spent_value_zat` from the canonical spend fact, so they need no prevout re-resolution at read time. A spend whose prevout cannot be resolved (or when transparent-spend hydration is off) produces no delta event rather than a wrong number; the activity surface's `prevout_resolution_status` reports the same partial state for that transaction. The range read is paged with the standard opaque cursor and capped at 256 rows per page.
+
 ## Fee summary
 
 `ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires resolving every transparent input via `WalletQuery.TransparentOutputsByOutpoint`, and that fan-out is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
@@ -145,6 +153,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
+| `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
@@ -258,7 +267,7 @@ Chain value pools (the `ValuePoolSummary` view) is the first source-boundary ext
 
 ## Derived views
 
-Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, and `RecentTransactionsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
+Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, and `RecentTransactionsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
 
 ## Cross-references
 

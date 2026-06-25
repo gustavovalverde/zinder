@@ -166,6 +166,14 @@ pub const EXPLORER_MEMPOOL_ACTIVITY_V1: &str = "explorer.mempool.activity_v1";
 /// deterministic.
 pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
     "explorer.transparent_address.activity_v1";
+/// Capability advertised for `ExplorerQuery.TransparentAddressDeltas`.
+///
+/// Signals that the explorer plane serves the per-event signed value series
+/// for one transparent address over a height range, ordered ascending. The
+/// rows are materialized by `TransparentAddressDeltasConsumer` from the same
+/// per-event attribution the activity surface folds into one net row per
+/// transaction.
+pub const EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1: &str = "explorer.transparent_address.deltas_v1";
 /// Capability advertised for `ExplorerQuery.FeeSummary`.
 ///
 /// Signals that the explorer plane aggregates per-transaction
@@ -656,6 +664,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressActivity"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressDeltas"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(

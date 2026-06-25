@@ -15,20 +15,29 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
-use zinder_core::{BlockHeight, BlockId, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{
+    BlockHeight, BlockId, ChainEpochId, Network, TransparentAddressScriptHash,
+    wire::encode_rpc_block_hash_hex,
+};
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
-    DeriveStoreOptions,
+    DeriveStoreOptions, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TransparentAddressDeltasConsumer,
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
     EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, OverviewSnapshotRequest,
-    ServerInfoRequest, TransactionDetailRequest, explorer_query_client::ExplorerQueryClient,
+    ServerInfoRequest, TransactionDetailRequest, TransparentAddressDeltasRecord,
+    TransparentAddressDeltasRequest, TransparentDeltaKind,
+    explorer_query_client::ExplorerQueryClient,
 };
+use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
+use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
@@ -617,4 +626,238 @@ fn freshness_visible_tip(
         .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .and_then(|chain_epoch| chain_epoch.visible_tip.clone())
         .ok_or_else(|| eyre!("freshness missing chain_view.chain_epoch.visible_tip"))
+}
+
+/// One value event the deltas seeder writes into the derive store.
+struct SeedDelta {
+    height: u32,
+    in_block_position: u32,
+    kind_byte: u8,
+    event_index: u32,
+    transaction_id: String,
+    value_zat: i64,
+}
+
+/// Seeds the `transparent_address_deltas` column family for one address with
+/// the given events, mirroring what `TransparentAddressDeltasConsumer` writes
+/// at commit time.
+fn seed_transparent_address_deltas(
+    derive_store: &DeriveStore,
+    address: TransparentAddressScriptHash,
+    deltas: &[SeedDelta],
+) -> Result<()> {
+    for delta in deltas {
+        let key = TransparentAddressDeltasConsumer::key_for_event(
+            address,
+            BlockHeight::new(delta.height),
+            delta.in_block_position,
+            delta.kind_byte,
+            delta.event_index,
+        );
+        let record = TransparentAddressDeltasRecord {
+            transaction_id: delta.transaction_id.clone(),
+            block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
+            value_zat: delta.value_zat,
+        };
+        derive_store.put_consumer(
+            TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+            &key,
+            &record.encode_to_vec(),
+        )?;
+    }
+    derive_store.put_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, &[1])?;
+    Ok(())
+}
+
+/// Opens a primary derive store seeded with the given address deltas, then
+/// returns a caught-up secondary handle for the explorer to read.
+fn seeded_deltas_derive_store(
+    address: TransparentAddressScriptHash,
+    deltas: &[SeedDelta],
+) -> Result<SeededDeriveStore> {
+    let tempdir = tempfile::tempdir()?;
+    let primary_path = tempdir.path().join("derive-primary");
+    let secondary_path = tempdir.path().join("derive-secondary");
+    let primary_store = DeriveStore::open(
+        &primary_path,
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    seed_transparent_address_deltas(&primary_store, address, deltas)?;
+
+    let secondary_store = DeriveStore::open_secondary(
+        &primary_path,
+        &secondary_path,
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    secondary_store.try_catch_up()?;
+    Ok(SeededDeriveStore {
+        _tempdir: tempdir,
+        secondary_store,
+    })
+}
+
+fn deltas_request(
+    address: TransparentAddressScriptHash,
+    start_height: u32,
+    end_height: u32,
+    max_entries: u32,
+    from_cursor: Vec<u8>,
+) -> TransparentAddressDeltasRequest {
+    TransparentAddressDeltasRequest {
+        address: Some(AddressLookup {
+            selector: Some(AddressSelector::ScriptHash(address.as_bytes().to_vec())),
+        }),
+        start_height,
+        end_height,
+        max_entries,
+        from_cursor,
+        at_epoch_id: None,
+    }
+}
+
+const DELTAS_TEST_ADDRESS: TransparentAddressScriptHash =
+    TransparentAddressScriptHash::from_bytes([42; 32]);
+
+/// The fixture seeds two receives and one spend; the spend at height 12 nets
+/// the second receive to zero so the activity sum is unambiguous.
+fn seeded_deltas() -> [SeedDelta; 3] {
+    [
+        SeedDelta {
+            height: 10,
+            in_block_position: 1,
+            kind_byte: TRANSPARENT_DELTA_KIND_RECEIVED_BYTE,
+            event_index: 0,
+            transaction_id: "a".repeat(64),
+            value_zat: 9_000,
+        },
+        SeedDelta {
+            height: 12,
+            in_block_position: 2,
+            kind_byte: TRANSPARENT_DELTA_KIND_RECEIVED_BYTE,
+            event_index: 3,
+            transaction_id: "b".repeat(64),
+            value_zat: 5_000,
+        },
+        SeedDelta {
+            height: 12,
+            in_block_position: 2,
+            kind_byte: TRANSPARENT_DELTA_KIND_SPENT_BYTE,
+            event_index: 1,
+            transaction_id: "b".repeat(64),
+            value_zat: -9_000,
+        },
+    ]
+}
+
+async fn spawn_deltas_explorer(
+    deltas: &[SeedDelta],
+) -> Result<(ExplorerQueryClient<Channel>, ServerHandle, ServerHandle)> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let seeded = seeded_deltas_derive_store(DELTAS_TEST_ADDRESS, deltas)?;
+    let (client, explorer_handle) =
+        spawn_explorer_query_server(seeded.secondary_store, wallet_addr).await?;
+    Ok((client, explorer_handle, wallet_handle))
+}
+
+/// Per-event rows arrive ascending by height with correct signs and indices,
+/// the advertised capability is present, and the net equals the delta sum.
+#[tokio::test]
+async fn explorer_query_serves_transparent_address_deltas_ascending() -> Result<()> {
+    let deltas = seeded_deltas();
+    let (mut client, explorer_handle, wallet_handle) = spawn_deltas_explorer(&deltas).await?;
+
+    let common = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .and_then(|info| info.common)
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1);
+
+    let entries = client
+        .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 0, 100, 0, Vec::new()))
+        .await?
+        .into_inner()
+        .entries;
+    assert_eq!(entries.len(), 3);
+
+    let heights: Vec<u32> = entries.iter().map(|entry| entry.block_height).collect();
+    assert_eq!(heights, vec![10, 12, 12]);
+    assert_eq!(entries[0].kind, TransparentDeltaKind::Received as i32);
+    assert_eq!(entries[0].index, 0);
+    assert_eq!(entries[0].value_zat, 9_000);
+    assert_eq!(entries[1].index, 3);
+    assert_eq!(entries[1].value_zat, 5_000);
+    assert_eq!(entries[2].kind, TransparentDeltaKind::Spent as i32);
+    assert_eq!(entries[2].index, 1);
+    assert_eq!(entries[2].value_zat, -9_000);
+
+    let net: i64 = entries.iter().map(|entry| entry.value_zat).sum();
+    assert_eq!(net, 9_000 + 5_000 - 9_000);
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+/// The height range filters the series, an out-of-range window returns no rows
+/// and no cursor, and the page cursor resumes strictly after the prior page.
+#[tokio::test]
+async fn explorer_query_pages_transparent_address_deltas() -> Result<()> {
+    let deltas = seeded_deltas();
+    let (mut client, explorer_handle, wallet_handle) = spawn_deltas_explorer(&deltas).await?;
+
+    let ranged = client
+        .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 11, 100, 0, Vec::new()))
+        .await?
+        .into_inner();
+    assert_eq!(ranged.entries.len(), 2);
+    assert!(ranged.entries.iter().all(|entry| entry.block_height == 12));
+
+    let empty = client
+        .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 200, 300, 0, Vec::new()))
+        .await?
+        .into_inner();
+    assert!(empty.entries.is_empty());
+    assert!(empty.next_cursor.is_empty());
+
+    let first_page = client
+        .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 0, 100, 1, Vec::new()))
+        .await?
+        .into_inner();
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].block_height, 10);
+    assert!(!first_page.next_cursor.is_empty());
+
+    let second_page = client
+        .transparent_address_deltas(deltas_request(
+            DELTAS_TEST_ADDRESS,
+            0,
+            100,
+            1,
+            first_page.next_cursor,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].block_height, 12);
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
 }

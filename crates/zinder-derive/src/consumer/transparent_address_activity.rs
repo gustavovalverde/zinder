@@ -38,6 +38,7 @@ use zinder_core::{
 };
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
+use crate::consumer::address_value_event::{AddressValueEventKind, address_value_events};
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
@@ -242,48 +243,30 @@ fn aggregate_address_rows(
     let mut accumulators: HashMap<(TransparentAddressScriptHash, u32), RowAccumulator> =
         HashMap::new();
     let block_time_unix_seconds = block.block_time_unix_seconds;
+    let transaction_ids = transaction_ids_by_position(block);
 
-    for transaction in &block.transactions {
-        let in_block_position = transaction.location.tx_index_in_block;
-        let is_coinbase = transaction.public_facts.is_coinbase;
-        let transaction_id_rpc_hex =
-            encode_rpc_transaction_id_hex(transaction.location.transaction_id);
-
-        // Output side: every transaction (including coinbase) contributes.
-        for output in &transaction.transparent_outputs {
-            let address = output.address_script_hash;
-            let entry = accumulators
-                .entry((address, in_block_position))
-                .or_insert_with(|| RowAccumulator::new(transaction_id_rpc_hex.clone()));
-            entry.output_count = entry.output_count.saturating_add(1);
-            entry.output_value_zat = entry
-                .output_value_zat
-                .saturating_add(i128::from(output.value_zat));
-        }
-
-        if is_coinbase {
-            continue;
-        }
-
-        // Input side: only when hydrated spends are available. Coinbase has no
-        // resolvable inputs and is already skipped above.
-        if let Some(spends_by_outpoint) = transparent_spends {
-            for input in &transaction.transparent_inputs {
-                let Some(spend) = spends_by_outpoint.get(&input.spent_outpoint) else {
-                    // We don't know which address this input belonged to without the hydrated spend,
-                    // so we cannot attribute it. The row(s) for this transaction stay with
-                    // `every_input_resolved = false` on the address(es) it DOES touch via outputs,
-                    // and `prevout_resolution_status` rolls up as Partial when any row is incomplete.
-                    continue;
-                };
-                let address = spend.spent_address_script_hash;
-                let entry = accumulators
-                    .entry((address, in_block_position))
-                    .or_insert_with(|| RowAccumulator::new(transaction_id_rpc_hex.clone()));
+    let value_events = address_value_events(block, transparent_spends);
+    for event in &value_events {
+        let key = (event.address_script_hash, event.in_block_position);
+        let entry = accumulators.entry(key).or_insert_with(|| {
+            let transaction_id = transaction_ids
+                .get(&event.in_block_position)
+                .cloned()
+                .unwrap_or_default();
+            RowAccumulator::new(transaction_id)
+        });
+        match event.kind {
+            AddressValueEventKind::Received => {
+                entry.output_count = entry.output_count.saturating_add(1);
+                entry.output_value_zat = entry
+                    .output_value_zat
+                    .saturating_add(i128::from(event.value_zat));
+            }
+            AddressValueEventKind::Spent => {
                 entry.input_count = entry.input_count.saturating_add(1);
                 entry.input_value_zat = entry
                     .input_value_zat
-                    .saturating_add(i128::from(spend.spent_value_zat));
+                    .saturating_add(i128::from(event.value_zat));
             }
         }
     }
@@ -302,6 +285,19 @@ fn aggregate_address_rows(
             };
             let record = accumulator.into_record(block_time_unix_seconds, row_status);
             (key, record)
+        })
+        .collect()
+}
+
+fn transaction_ids_by_position(block: &BlockCommitContext) -> HashMap<u32, String> {
+    block
+        .transactions
+        .iter()
+        .map(|transaction| {
+            (
+                transaction.location.tx_index_in_block,
+                encode_rpc_transaction_id_hex(transaction.location.transaction_id),
+            )
         })
         .collect()
 }

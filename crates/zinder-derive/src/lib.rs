@@ -46,6 +46,12 @@ pub use consumer::transparent_address_activity::{
     TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressActivityConsumer,
     TransparentAddressActivityConsumerError,
 };
+pub use consumer::transparent_address_deltas::{
+    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILIES, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_KEY_LEN, TransparentAddressDeltasConsumer,
+    TransparentAddressDeltasConsumerError,
+};
 pub use consumer::transparent_address_transaction_history::{
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,

@@ -42,6 +42,10 @@ use crate::{
         TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
         TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
     },
+    consumer::transparent_address_deltas::{
+        TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+        TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
+    },
     consumer::transparent_address_transaction_history::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
@@ -80,7 +84,12 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 /// would attempt to decode as UTF-8 strings and reject; the operator
 /// must wipe the derive store directory before opening with this binary.
 /// See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-pub const DERIVE_SCHEMA_VERSION: u16 = 5;
+///
+/// Version 6 adds the `transparent_address_deltas` column families holding
+/// the per-event signed value series. Stores written under version 5 lack
+/// those rows for already-replayed heights, so the operator must wipe the
+/// derive store directory before opening with this binary.
+pub const DERIVE_SCHEMA_VERSION: u16 = 6;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const DERIVE_STATUS_KEY: &[u8] = b"\x00\x02derive_status";
@@ -92,6 +101,8 @@ const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
     TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -101,6 +112,7 @@ const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     TRANSACTION_FEES_CONSUMER_NAME,
     RECENT_TRANSACTIONS_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
 ];
 

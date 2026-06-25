@@ -699,6 +699,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `explorer.mempool.summary_v1`
 - `explorer.mempool.activity_v1`
 - `explorer.transparent_address.activity_v1`
+- `explorer.transparent_address.deltas_v1`
 - `explorer.fee.summary_v1`
 - `explorer.value_pool.summary_v1`
 - `explorer.mempool.event_counts_v1`

@@ -32,7 +32,8 @@ use zinder_proto::v1::{
         OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionsRequest,
         SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
         TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
-        TransparentAddressActivityResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
+        TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
+        TransparentAddressDeltasResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
         VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
@@ -65,6 +66,7 @@ use super::recent_transactions::{RecentTransactionsStream, handle_recent_transac
 use super::search::handle_search;
 use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
 use super::transparent_address_activity::handle_transparent_address_activity;
+use super::transparent_address_deltas::handle_transparent_address_deltas;
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::DeriveStore;
 use zinder_store::SecondaryChainStore;
@@ -478,6 +480,36 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             })?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_transparent_address_activity(
+                derive_store,
+                &mut client,
+                self.settings.network,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn transparent_address_deltas(
+        &self,
+        request: Request<TransparentAddressDeltasRequest>,
+    ) -> Result<Response<TransparentAddressDeltasResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "TransparentAddressDeltas",
+            metric: "transparent_address_deltas",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "TransparentAddressDeltas requires a derive store",
+                )
+            })?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_transparent_address_deltas(
                 derive_store,
                 &mut client,
                 self.settings.network,
