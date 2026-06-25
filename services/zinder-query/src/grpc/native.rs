@@ -536,6 +536,7 @@ fn build_transaction_status_response(
             wallet::transaction_location::Location::Mined(wallet::MinedTransaction {
                 location: Some(build_mined_block_location_message(mined.location)),
                 details: Some(build_mined_details_message(mined.details)),
+                raw_transaction_bytes: mined.raw_transaction_bytes,
             })
         }
         TxStatus::InMempool(entry) => {

@@ -112,7 +112,9 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         .transaction(coinbase_transaction_id, None)
         .await?;
     let TransactionStatus {
-        status: TxStatus::Mined(MinedTransaction { location, details }),
+        status: TxStatus::Mined(MinedTransaction {
+            location, details, ..
+        }),
         ..
     } = status
     else {

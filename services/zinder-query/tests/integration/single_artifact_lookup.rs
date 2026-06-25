@@ -144,6 +144,50 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
     );
     assert_eq!(mined.location.block_hash, transaction_location.block_hash);
     assert_eq!(mined.location.tx_index_in_block, 0);
+    assert_eq!(
+        mined.raw_transaction_bytes,
+        b"raw-transaction-bytes".to_vec(),
+        "the mined arm must carry the serialized transaction bytes alongside the location",
+    );
+    assert!(
+        mined.details.confirmations >= 1,
+        "a mined transaction at the visible tip has at least one confirmation",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_omits_bytes_when_blob_is_not_retained() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        block.height,
+        block.block_hash,
+        0,
+        b"raw-transaction-bytes".to_vec(),
+    );
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+            .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
+            .with_transaction_locations(vec![transaction_rows.location])
+            .with_transaction_facts(vec![transaction_rows.facts]),
+    )?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let response = wallet_query.transaction(transaction_id, None).await?;
+
+    let TxStatus::Mined(mined) = response.status else {
+        return Err(eyre!("expected mined transaction status, got {response:?}"));
+    };
+    assert!(
+        mined.raw_transaction_bytes.is_empty(),
+        "raw bytes are empty when the deployment does not retain transaction blobs",
+    );
 
     Ok(())
 }

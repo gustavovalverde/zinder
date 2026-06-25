@@ -321,13 +321,29 @@ pub struct MinedTransaction {
     pub location: TransactionLocation,
     /// Response-bound enrichment fields.
     pub details: MinedDetails,
+    /// Serialized consensus transaction bytes.
+    ///
+    /// Empty when the deployment does not retain raw transaction blobs
+    /// (ingest `raw_blob_policy` is `none`); populated when the policy is
+    /// `transactions` or `all`. Symmetric with the mempool arm's
+    /// hydrated bytes so a verbose mined-transaction read carries the
+    /// serialized form alongside the location and confirmations.
+    pub raw_transaction_bytes: Vec<u8>,
 }
 
 impl MinedTransaction {
     /// Creates a mined-transaction read-model record.
     #[must_use]
-    pub const fn new(location: TransactionLocation, details: MinedDetails) -> Self {
-        Self { location, details }
+    pub fn new(
+        location: TransactionLocation,
+        details: MinedDetails,
+        raw_transaction_bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            location,
+            details,
+            raw_transaction_bytes: raw_transaction_bytes.into(),
+        }
     }
 }
 

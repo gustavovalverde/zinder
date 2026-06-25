@@ -504,9 +504,17 @@ where
                 consensus_branch_id,
                 block_time,
             );
+            let raw_transaction_bytes = reader
+                .transaction_blob_by_id(transaction_id)?
+                .map(|blob| blob.raw_transaction_bytes)
+                .unwrap_or_default();
             Ok(TransactionStatus {
                 chain_epoch,
-                status: TxStatus::Mined(MinedTransaction::new(artifact.location, details)),
+                status: TxStatus::Mined(MinedTransaction::new(
+                    artifact.location,
+                    details,
+                    raw_transaction_bytes,
+                )),
             })
         }))
         .await;

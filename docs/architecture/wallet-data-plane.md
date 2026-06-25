@@ -141,7 +141,7 @@ under capability `wallet.read.transaction_by_id_v1`. The response carries the
 shared `TransactionLocation` oneof on its `location` field; the oneof has three
 arms. `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
 
-- `mined`: `MinedTransaction { MinedBlockLocation location; MinedDetails details }`.
+- `mined`: `MinedTransaction { MinedBlockLocation location; MinedDetails details; bytes raw_transaction_bytes }`.
 - `in_mempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
 - `conflicting`: `ConflictingChainTransaction {}` (reserved shape; status
   is the signal, fields are reserved for future non-best-chain lookup).
@@ -168,6 +168,21 @@ field always reflects a real node-discovered table at request time; see
 [ADR-0008](../adrs/0008-network-parameter-discovery.md). `block_time` is
 read from the stored `BlockHeaderArtifact` and falls back to `0` only when the
 typed header row is unavailable.
+
+The mined arm also carries `raw_transaction_bytes`: the serialized consensus
+transaction bytes, symmetric with the mempool arm's `payload_bytes`. This makes
+`WalletQuery.Transaction` a verbose mined-transaction read that returns the
+serialized bytes, the mined block hash and height, the block time, and
+epoch-bound confirmations in one response, which is the shape a
+`getrawtransaction verbose` consumer needs. The bytes are filled from the same
+`TransactionBlobArtifact` the canonical reader resolves; they are not a separate
+RPC. The field rides on the existing `wallet.read.transaction_by_id_v1`
+capability rather than a new one, because the bytes are not unconditionally
+present: ingest writes transaction blobs only when `raw_blob_policy` is
+`transactions` or `all`. When the policy is `none`, the field is empty and the
+location plus enrichment fields are still returned. A consumer that requires the
+serialized form runs against a deployment configured to retain transaction
+blobs.
 
 A response builder must not call the upstream node or latest tip again during
 response construction.

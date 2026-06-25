@@ -1341,7 +1341,11 @@ fn tx_status_from_message(
                 block_time: details_message.block_time,
                 confirmations: details_message.confirmations,
             };
-            Ok(TxStatus::Mined(MinedTransaction::new(location, details)))
+            Ok(TxStatus::Mined(MinedTransaction::new(
+                location,
+                details,
+                mined.raw_transaction_bytes,
+            )))
         }
         wallet::transaction_location::Location::InMempool(in_mempool) => {
             let chain_epoch = chain_epoch_from_message(chain_epoch_message)

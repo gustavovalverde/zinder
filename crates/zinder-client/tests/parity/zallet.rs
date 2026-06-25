@@ -117,6 +117,12 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(mined.location.block_hash, transaction_location.block_hash);
     assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(mined.details.confirmations, 1);
+    assert_eq!(
+        mined.raw_transaction_bytes,
+        b"zallet-transaction-payload".to_vec(),
+        "the mined arm carries serialized bytes; a getrawtransaction-verbose \
+         consumer reads bytes, location, and confirmations from one response",
+    );
     assert_eq!(missing_status, TxStatus::NotFound);
 
     Ok(())

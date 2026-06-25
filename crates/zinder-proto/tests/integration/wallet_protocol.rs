@@ -201,6 +201,7 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
                         block_time: 1_774_670_000,
                         confirmations: 6,
                     }),
+                    raw_transaction_bytes: vec![0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef],
                 },
             )),
         }),
@@ -225,6 +226,11 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
             .ok_or_else(|| eyre!("details missing"))?
             .confirmations,
         6
+    );
+    assert_eq!(
+        mined.raw_transaction_bytes,
+        vec![0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef],
+        "the mined arm must round-trip its serialized transaction bytes",
     );
 
     Ok(())

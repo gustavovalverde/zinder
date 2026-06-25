@@ -37,6 +37,11 @@ pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
 /// Capability advertised for `WalletQuery.SubtreeRoots`.
 pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
 /// Capability advertised for `WalletQuery.Transaction`.
+///
+/// Covers the typed transaction-status response, including the mined arm's
+/// `raw_transaction_bytes`. The serialized bytes ride on this capability
+/// rather than a separate one; they are empty when the deployment does not
+/// retain transaction blobs (ingest `raw_blob_policy` is `none`).
 pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_id_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
 pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
