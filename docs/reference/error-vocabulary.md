@@ -68,9 +68,9 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `BROADCAST_DISABLED` | The `broadcaster` is the no-op `()` implementation; deployment is read-only | `type=TRANSACTION_BROADCAST_DISABLED, subject=wallet.broadcast.transaction_v1` |
 | `CHAIN_EVENT_CURSOR_EXPIRED` | Cursor sequence is older than retained history (consumer fell behind) | `type=CHAIN_EVENT_CURSOR_EXPIRED, subject=chain_event:<seq>` |
 | `MEMPOOL_EVENT_CURSOR_EXPIRED` | Same as above for the mempool event stream | `type=MEMPOOL_EVENT_CURSOR_EXPIRED, subject=mempool_event:<seq>` |
-| `CHAIN_EPOCH_PIN_UNSUPPORTED` | Request pinned `at_epoch` but the query implementation does not support it | `subject=at_epoch` |
+| `CHAIN_EPOCH_PIN_UNSUPPORTED` | Request pinned `at_epoch_id` but the query implementation does not support it | `subject=at_epoch` |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | Pinned chain epoch is no longer retained | `subject=chain_epoch:<id>` |
-| `CHAIN_EPOCH_PIN_MISMATCH` | Pinned chain epoch resolves to incompatible storage state | `subject=chain_epoch:<id>` |
+| `CHAIN_EPOCH_PIN_MISMATCH` | Wire-reserved and not produced. Requests pin by bare epoch id, so there is no echoed epoch body to mismatch. | — |
 | `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
 | `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
 | `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window; operator must reconcile | — |

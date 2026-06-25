@@ -171,7 +171,7 @@ async fn resolve_block_height(
             let response = wallet_client
                 .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
                     selector: Some(selector),
-                    at_epoch: request.at_epoch.clone(),
+                    at_epoch_id: request.at_epoch_id,
                 }))
                 .await?
                 .into_inner();
@@ -187,7 +187,7 @@ async fn read_canonical_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<(wallet::ChainEpoch, u32), Status> {
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest

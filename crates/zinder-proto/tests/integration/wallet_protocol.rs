@@ -326,7 +326,7 @@ fn transaction_id_wire_field_carries_rpc_form_hex() -> eyre::Result<()> {
 
     let request = wallet::TransactionRequest {
         transaction_id: encode_rpc_transaction_id_hex(internal_txid),
-        at_epoch: None,
+        at_epoch_id: None,
     };
     let decoded_request = round_trip(&request)?;
     assert_eq!(decoded_request.transaction_id, canonical_rpc_form);

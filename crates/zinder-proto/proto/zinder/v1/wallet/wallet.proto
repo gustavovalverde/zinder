@@ -151,9 +151,9 @@ message LatestBlockResponse {
 
 // Latest visible block metadata request.
 message LatestBlockRequest {
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 1;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 1;
 }
 
 // Settled-tip block metadata response bound to one chain epoch. Returns the
@@ -169,9 +169,9 @@ message LatestSafeBlockResponse {
 
 // Safe-tip block metadata request.
 message LatestSafeBlockRequest {
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 1;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 1;
 }
 
 // Typed selector for a block in the canonical best chain.
@@ -196,9 +196,9 @@ message BlockIdBySelectorRequest {
   // Typed selector for the requested block.
   BlockSelector selector = 1;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 2;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 2;
 }
 
 // Block-identity resolver response bound to one chain epoch.
@@ -276,9 +276,9 @@ message CompactBlockRangeRequest {
   // Last requested block height.
   uint32 end_height = 2;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 3;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 3;
 }
 
 // Single compact block request.
@@ -286,9 +286,9 @@ message CompactBlockRequest {
   // Requested block height.
   uint32 height = 1;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 2;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 2;
 }
 
 // Single compact block response bound to one chain epoch.
@@ -306,9 +306,9 @@ message TransactionRequest {
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
   string transaction_id = 1;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 2;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 2;
 }
 
 // Indexed transaction location.
@@ -411,16 +411,16 @@ message TreeStateAtHeightRequest {
   // exists at this height, otherwise it fills from the configured upstream node.
   uint32 height = 1;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 2;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 2;
 }
 
 // Latest checkpoint tree-state request.
 message LatestTreeStateCheckpointRequest {
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 1;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 1;
 }
 
 // Checkpoint tree-state response bound to one chain epoch.
@@ -463,9 +463,9 @@ message SubtreeRootsRequest {
   // Maximum number of subtree-root entries to return.
   uint32 max_entries = 3;
 
-  // Optional chain epoch that must be used to answer the request. When absent,
-  // the server uses the visible epoch at request time.
-  optional ChainEpoch at_epoch = 4;
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 4;
 }
 
 // A complete shielded subtree root.
@@ -927,9 +927,9 @@ message TransparentOutputsByOutpointRequest {
   // coinbase inputs at construction time.
   repeated OutPoint outpoints = 1;
 
-  // Optional chain epoch pin. Absent resolves against the visible tip;
+  // Optional chain-epoch id pin. Absent resolves against the visible tip;
   // present pins the read to a specific epoch.
-  optional ChainEpoch at_epoch = 2;
+  optional uint64 at_epoch_id = 2;
 }
 
 // Response for [`TransparentOutputsByOutpoint`] bound to one chain epoch.
@@ -946,7 +946,7 @@ message TransparentOutputsByOutpointResponse {
 // Batched request for live mempool transparent prevout resolution.
 //
 // Mempool reads are not chain-epoch-pinnable; the request omits
-// `at_epoch` and the response binds to the chain epoch visible at
+// `at_epoch_id` and the response binds to the chain epoch visible at
 // lookup time. The reply uses the same [`TransparentOutputsByOutpointResponse`]
 // shape as the canonical surface so consumers share one decoder.
 message TransparentMempoolOutputsByOutpointRequest {

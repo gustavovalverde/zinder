@@ -99,7 +99,7 @@ pub(crate) async fn handle_recent_transactions(
     join_paid_fees(derive_store, &mut entries)?;
 
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest

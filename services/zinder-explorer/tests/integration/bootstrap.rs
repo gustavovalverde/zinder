@@ -145,7 +145,7 @@ async fn explorer_query_balance_failed_precondition_without_wallet_query_endpoin
     let detail_outcome = client
         .transaction_detail(TransactionDetailRequest {
             transaction_id: "00".repeat(32),
-            at_epoch: None,
+            at_epoch_id: None,
         })
         .await;
     let detail_status = detail_outcome
@@ -204,7 +204,7 @@ async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Re
         .block_summaries_in_range(BlockSummariesInRangeRequest {
             start_height: 1,
             end_height: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         })
         .await?
         .into_inner();

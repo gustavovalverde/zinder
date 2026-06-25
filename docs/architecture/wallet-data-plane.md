@@ -64,9 +64,11 @@ If a compact block artifact is missing, `zinder-query` should return a typed una
 
 The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the derive-plane axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlockRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
+A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
+
 Tree-state storage preserves upstream node JSON at canonical checkpoints and the
 latest committed tip. The native read surface is
-`tree_state_at(height, at_epoch)` and `latest_tree_state_checkpoint(at_epoch)`.
+`tree_state_at(height, at_epoch_id)` and `latest_tree_state_checkpoint(at_epoch_id)`.
 `tree_state_at` serves the tree state at exactly `height`: a stored checkpoint
 when one exists there, otherwise a cache-fill from the configured upstream node
 (mirroring lightwalletd's `GetTreeState`), so the returned height always equals
@@ -163,7 +165,7 @@ typed header row is unavailable.
 A response builder must not call the upstream node or latest tip again during
 response construction.
 
-The epoch rule is stricter for mempool. An `at_epoch` transaction lookup is a
+The epoch rule is stricter for mempool. An `at_epoch_id` transaction lookup is a
 canonical chain read and never consults live mempool state. A non-epoch-pinned
 lookup may fall through to the writer-owned mempool index after the canonical
 chain returns `NotFound`.
@@ -246,7 +248,7 @@ mirror the `ChainIndex` methods:
 
 The mempool live state is in-memory and not chain-epoch-pinnable; both
 responses bind to `chain_epoch` visible at lookup time and the requests do not
-take an `at_epoch` field. Cap rules: `optional max_entries` defaults to a
+take an `at_epoch_id` field. Cap rules: `optional max_entries` defaults to a
 server constant, and values larger than the server's hard cap are silently
 clamped.
 
@@ -313,8 +315,8 @@ and SHA-256-hashes the `scriptPubKey` before any in-process call. The Rust
 `ChainIndex` trait carries the same surface:
 `transparent_address_unspent_outputs(query)` keyed by the typed
 `TransparentAddressScriptHash`. The in-process `WalletQueryApi` form keeps
-the standard `at_epoch: Option<ChainEpoch>` pin (the compat shim uses it to
-pin multi-address reads to one epoch); the wire request carries no epoch
+the standard `at_epoch_id: Option<ChainEpochId>` pin (the compat shim uses it
+to pin multi-address reads to one epoch); the wire request carries no epoch
 pin because the server always pins internally and no consumer pins old
 epochs. Capability `wallet.address.transparent_unspent_outputs_v1` is
 advertised on every deployment that can serve the read.
@@ -355,7 +357,7 @@ address within an inclusive height range. The native surface is
 read; the matching Rust API is
 `ChainIndex::transparent_address_tx_ids_in_range`. The derive projection is a
 current read model, so callers use the `chain_view.chain_epoch` returned with
-each chunk as the response binding instead of supplying an `at_epoch` pin. The
+each chunk as the response binding instead of supplying an `at_epoch_id` pin. The
 compatibility adapter implements `GetTaddressTxids` and
 `GetTaddressTransactions` over the same native method.
 
@@ -385,7 +387,7 @@ The shared `OutPoint` proto message is the canonical wire-level outpoint shape a
 
 Both methods cap the request at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024` outpoints. Requests above the cap are silently truncated to the first 1024 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary (Zallet's `view_transaction.rs` is the canonical example).
 
-The `ChainIndex` Rust API exposes two methods: `transparent_outputs_by_outpoint(outpoints, at_epoch)` and `transparent_mempool_outputs_by_outpoint(outpoints)` (no epoch pin, per the live-state convention). Both return `TransparentOutputsByOutpointResponse`. `LocalChainIndex` reads the canonical method directly from the secondary store; the mempool method delegates to `RemoteChainIndex`. The capability-coverage test asserts both methods exist for any consumer advertising the corresponding capability strings.
+The `ChainIndex` Rust API exposes two methods: `transparent_outputs_by_outpoint(outpoints, at_epoch_id)` and `transparent_mempool_outputs_by_outpoint(outpoints)` (no epoch pin, per the live-state convention). Both return `TransparentOutputsByOutpointResponse`. `LocalChainIndex` reads the canonical method directly from the secondary store; the mempool method delegates to `RemoteChainIndex`. The capability-coverage test asserts both methods exist for any consumer advertising the corresponding capability strings.
 
 The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevout endpoint, and inventing a parallel surface is forbidden by [Service boundaries §Anti-Patterns](service-boundaries.md#anti-patterns).
 
@@ -403,7 +405,7 @@ The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressB
 
 The balance has exactly one implementation, in `zinder-explorer`, and one capability: `explorer.transparent_address.balance_v1`, present when the derive plane is configured and the proxy's readiness probe reports `explorer.server_info_v1` fresh within the probe interval. The federated call lands on `ExplorerQuery.TransparentAddressBalance` ([Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery)): for each address in the request, the handler drains the complete `WalletQuery.TransparentAddressUnspentOutputs` stream for confirmed outputs and calls `WalletQuery.TransparentMempoolOutputsByAddress` for unconfirmed funding, then resolves unconfirmed spends of the whole accumulated unspent set through batched `WalletQuery.TransparentMempoolSpendsByOutpoint` calls chunked at the per-request outpoint cap. `unconfirmed_delta_zat` is the signed sum of mempool funds minus mempool spends. The address list is hard-capped at 256 per request to bound the compute fanout. Deployments without an explorer plane omit the capability and reject the call with `UNAVAILABLE`.
 
-The mempool live state is not chain-epoch-pinnable, so the request carries no `at_epoch` pin and the response binds to the chain epoch visible at lookup time. Historical balance at an arbitrary height is out of scope.
+The mempool live state is not chain-epoch-pinnable, so the request carries no `at_epoch_id` pin and the response binds to the chain epoch visible at lookup time. Historical balance at an arbitrary height is out of scope.
 
 The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` in-process by summing each address's complete unspent set pinned to one epoch; the lightwalletd `Balance { value_zat: int64 }` proto carries no overlay slot, so the shim never depends on `zinder-explorer` for these methods. `GetTaddressBalanceStream` is a per-address loop over the unary form for compatibility clients and exists only for the lightwalletd contract.
 

@@ -151,7 +151,7 @@ async fn fetch_latest_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view

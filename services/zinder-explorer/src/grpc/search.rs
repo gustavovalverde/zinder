@@ -163,7 +163,7 @@ async fn probe_block_height(
             selector: Some(BlockSelector {
                 selector: Some(block_selector::Selector::Height(height)),
             }),
-            at_epoch: None,
+            at_epoch_id: None,
         }))
         .await;
     match response {
@@ -221,7 +221,7 @@ async fn resolve_block_by_hash(
             selector: Some(BlockSelector {
                 selector: Some(block_selector::Selector::Hash(rpc_hex.to_owned())),
             }),
-            at_epoch: None,
+            at_epoch_id: None,
         }))
         .await
     {
@@ -238,7 +238,7 @@ async fn resolve_transaction_by_hash(
     let response = wallet_client
         .transaction(Request::new(wallet::TransactionRequest {
             transaction_id: rpc_hex.clone(),
-            at_epoch: None,
+            at_epoch_id: None,
         }))
         .await;
     match response {
@@ -391,7 +391,7 @@ async fn build_freshness(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<ExplorerFreshness, Status> {
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view

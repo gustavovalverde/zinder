@@ -61,7 +61,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
         .compact_block_range(wallet::CompactBlockRangeRequest {
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
-            at_epoch: None,
+            at_epoch_id: None,
         })
         .await?
         .into_inner();
@@ -82,7 +82,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
         .compact_block_range(wallet::CompactBlockRangeRequest {
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
-            at_epoch: None,
+            at_epoch_id: None,
         })
         .await?
         .into_inner();
@@ -115,7 +115,7 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
                     .compact_block_range(wallet::CompactBlockRangeRequest {
                         start_height: 1,
                         end_height: COMMITTED_BLOCK_COUNT,
-                        at_epoch: None,
+                        at_epoch_id: None,
                     })
                     .await?
                     .into_inner();

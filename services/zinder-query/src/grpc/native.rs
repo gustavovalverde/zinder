@@ -9,7 +9,7 @@
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch,
+    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
@@ -169,10 +169,10 @@ fn build_node_capabilities_descriptor(
 /// Reads the latest visible block and encodes the native wallet response.
 pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::LatestBlockResponse, QueryError> {
     query_api
-        .latest_block(at_epoch)
+        .latest_block(at_epoch_id)
         .await
         .map(build_latest_block_response)
 }
@@ -181,10 +181,10 @@ pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
 /// wallet response.
 pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::LatestSafeBlockResponse, QueryError> {
     query_api
-        .latest_safe_block(at_epoch)
+        .latest_safe_block(at_epoch_id)
         .await
         .map(build_latest_safe_block_response)
 }
@@ -193,10 +193,10 @@ pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
 pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     height: BlockHeight,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::CompactBlockResponse, QueryError> {
     query_api
-        .compact_block_at(height, at_epoch)
+        .compact_block_at(height, at_epoch_id)
         .await
         .map(build_compact_block_response)
 }
@@ -205,10 +205,10 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
 pub async fn block_id_by_selector_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     selector: zinder_core::BlockSelector,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::BlockIdResponse, QueryError> {
     query_api
-        .block_id_by_selector(selector, at_epoch)
+        .block_id_by_selector(selector, at_epoch_id)
         .await
         .map(build_block_id_response)
 }
@@ -218,10 +218,10 @@ pub async fn block_id_by_selector_response<Q: WalletQueryApi + ?Sized>(
 pub async fn block_header_by_selector_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     selector: zinder_core::BlockSelector,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::BlockHeaderResponse, QueryError> {
     query_api
-        .block_header_by_selector(selector, at_epoch)
+        .block_header_by_selector(selector, at_epoch_id)
         .await
         .map(|response| build_block_header_response(&response))
 }
@@ -238,9 +238,9 @@ pub async fn block_header_by_selector_response<Q: WalletQueryApi + ?Sized>(
 pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     transaction_id: TransactionId,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
-    let status = query_api.transaction(transaction_id, at_epoch).await?;
+    let status = query_api.transaction(transaction_id, at_epoch_id).await?;
     build_transaction_status_response(status)
 }
 
@@ -248,10 +248,10 @@ pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
 pub async fn tree_state_at_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     height: BlockHeight,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .tree_state_at(height, at_epoch)
+        .tree_state_at(height, at_epoch_id)
         .await
         .map(build_tree_state_response)
 }
@@ -259,10 +259,10 @@ pub async fn tree_state_at_response<Q: WalletQueryApi + ?Sized>(
 /// Reads the latest tree-state and encodes the native wallet response.
 pub async fn latest_tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::TreeStateResponse, QueryError> {
     query_api
-        .latest_tree_state_checkpoint(at_epoch)
+        .latest_tree_state_checkpoint(at_epoch_id)
         .await
         .map(build_tree_state_response)
 }
@@ -271,10 +271,10 @@ pub async fn latest_tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
 pub async fn subtree_roots_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     subtree_root_range: SubtreeRootRange,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::SubtreeRootsResponse, QueryError> {
     query_api
-        .subtree_roots(subtree_root_range, at_epoch)
+        .subtree_roots(subtree_root_range, at_epoch_id)
         .await
         .and_then(|subtree_roots| build_subtree_roots_response(&subtree_roots))
 }
@@ -308,10 +308,10 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
 pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     outpoints: Vec<TransparentOutPoint>,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<wallet::TransparentOutputsByOutpointResponse, QueryError> {
     query_api
-        .transparent_outputs_by_outpoint(outpoints, at_epoch)
+        .transparent_outputs_by_outpoint(outpoints, at_epoch_id)
         .await
         .map(build_transparent_outputs_by_outpoint_response)
 }
@@ -322,10 +322,10 @@ pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized
 pub async fn transparent_address_unspent_outputs_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     request: TransparentAddressUnspentOutputsRequest,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
     query_api
-        .transparent_address_unspent_outputs(request, at_epoch)
+        .transparent_address_unspent_outputs(request, at_epoch_id)
         .await
 }
 

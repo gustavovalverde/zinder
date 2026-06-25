@@ -12,9 +12,7 @@ use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
-use zinder_core::wire::{
-    encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
-};
+use zinder_core::wire::encode_rpc_transaction_id_hex;
 use zinder_core::{
     ChainEpoch, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
@@ -113,7 +111,7 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
         Request::new(wallet::CompactBlockRangeRequest {
             start_height: 1,
             end_height: 2,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await
@@ -148,7 +146,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
         &grpc_adapter,
         Request::new(wallet::TreeStateAtHeightRequest {
             height: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await
@@ -162,7 +160,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
             shielded_protocol: wallet::ShieldedProtocol::Sapling as i32,
             start_index: 0,
             max_entries: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await
@@ -190,7 +188,7 @@ async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyr
         &grpc_adapter,
         Request::new(wallet::TransactionRequest {
             transaction_id: encode_rpc_transaction_id_hex(requested_transaction_id),
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await
@@ -363,7 +361,7 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
     let response = WalletQueryService::latest_block(
         &grpc_adapter,
         Request::new(wallet::LatestBlockRequest {
-            at_epoch: Some(chain_epoch_message(first_epoch)),
+            at_epoch_id: Some(first_epoch.id.value()),
         }),
     )
     .await?
@@ -621,7 +619,7 @@ async fn read_wallet_grpc_responses(
 ) -> Result<WalletGrpcResponses, tonic::Status> {
     let latest_block = WalletQueryService::latest_block(
         grpc_adapter,
-        Request::new(wallet::LatestBlockRequest { at_epoch: None }),
+        Request::new(wallet::LatestBlockRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -630,7 +628,7 @@ async fn read_wallet_grpc_responses(
         Request::new(wallet::CompactBlockRangeRequest {
             start_height: 1,
             end_height: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await?
@@ -643,14 +641,14 @@ async fn read_wallet_grpc_responses(
         grpc_adapter,
         Request::new(wallet::TreeStateAtHeightRequest {
             height: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await?
     .into_inner();
     let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         grpc_adapter,
-        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch: None }),
+        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -660,7 +658,7 @@ async fn read_wallet_grpc_responses(
             shielded_protocol: wallet::ShieldedProtocol::Sapling as i32,
             start_index: 0,
             max_entries: 1,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await?
@@ -756,25 +754,6 @@ async fn wallet_server_info(
         .into_inner()
         .info
         .ok_or_else(|| eyre!("missing wallet server info"))
-}
-
-fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
-    wallet::ChainEpoch {
-        chain_epoch_id: chain_epoch.id.value(),
-        network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-        artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
-        created_at_millis: chain_epoch.created_at.value(),
-        visible_tip: Some(wallet::BlockTip {
-            height: chain_epoch.visible_tip_height.value(),
-            hash: encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash),
-        }),
-        settled_tip: Some(wallet::BlockTip {
-            height: chain_epoch.settled_tip_height.value(),
-            hash: encode_rpc_block_hash_hex(chain_epoch.settled_tip_hash),
-        }),
-        sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
-        orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
-    }
 }
 
 type StaticChainEventsStream =

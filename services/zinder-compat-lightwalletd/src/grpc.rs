@@ -11,7 +11,7 @@ use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpoch,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
     CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
@@ -223,7 +223,10 @@ where
             )?;
             let address_utxos = self
                 .query_api
-                .transparent_address_unspent_outputs(query_request, Some(latest_block.chain_epoch))
+                .transparent_address_unspent_outputs(
+                    query_request,
+                    Some(latest_block.chain_epoch.id),
+                )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
@@ -282,7 +285,7 @@ where
                         address_script_hash,
                         start_height: BlockHeight::new(0),
                     },
-                    Some(latest_block.chain_epoch),
+                    Some(latest_block.chain_epoch.id),
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
@@ -431,7 +434,7 @@ where
         };
 
         Ok(Response::new(
-            raw_transaction_from_location(&self.query_api, chain_epoch, location).await?,
+            raw_transaction_from_location(&self.query_api, chain_epoch.id, location).await?,
         ))
     }
 
@@ -493,12 +496,12 @@ where
         for artifact in history {
             let response = self
                 .query_api
-                .transaction(artifact.transaction_id, Some(latest_block.chain_epoch))
+                .transaction(artifact.transaction_id, Some(latest_block.chain_epoch.id))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             let location = mined_location_from_status(response.status)?;
             raw_transactions.push(
-                raw_transaction_from_location(&self.query_api, response.chain_epoch, location)
+                raw_transaction_from_location(&self.query_api, response.chain_epoch.id, location)
                     .await,
             );
         }
@@ -911,11 +914,11 @@ fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, S
 
 async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
-    chain_epoch: ChainEpoch,
+    chain_epoch_id: ChainEpochId,
     location: TransactionLocation,
 ) -> Result<lightwalletd::RawTransaction, Status> {
     let raw_transaction = query_api
-        .raw_transaction(location.transaction_id, Some(chain_epoch))
+        .raw_transaction(location.transaction_id, Some(chain_epoch_id))
         .await
         .map_err(|error| status_from_query_error(&error))?;
     if raw_transaction.transaction.location != location {

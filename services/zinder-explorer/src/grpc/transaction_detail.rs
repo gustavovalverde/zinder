@@ -69,7 +69,7 @@ pub(crate) async fn handle_transaction_detail(
     let status_response = wallet_client
         .transaction(Request::new(wallet::TransactionRequest {
             transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            at_epoch: inner.at_epoch,
+            at_epoch_id: inner.at_epoch_id,
         }))
         .await?
         .into_inner();

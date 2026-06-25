@@ -291,14 +291,14 @@ message MempoolLocation {
 
 // `ExplorerQuery.TransactionDetail` request.
 //
-// `at_epoch` optionally pins the read to a specific chain epoch so the
+// `at_epoch_id` optionally pins the read to a specific chain epoch so the
 // response stays consistent with a concurrent caller's other reads.
 message TransactionDetailRequest {
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters; the form callers paste from a wallet or block explorer).
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
   string transaction_id = 1;
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 2;
+  optional uint64 at_epoch_id = 2;
 }
 
 // `ExplorerQuery.TransactionDetail` response.
@@ -422,8 +422,8 @@ message BlockSummariesInRangeRequest {
   // Last block height to return (inclusive).
   uint32 end_height = 2;
 
-  // Optional chain-epoch pin for snapshot consistency with concurrent reads.
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
+  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
+  optional uint64 at_epoch_id = 3;
 }
 
 // `ExplorerQuery.BlockSummariesInRange` response.
@@ -446,8 +446,8 @@ message BlockDetailRequest {
     string block_hash = 2;
   }
 
-  // Optional chain-epoch pin for snapshot consistency with concurrent reads.
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 3;
+  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
+  optional uint64 at_epoch_id = 3;
 }
 
 // `ExplorerQuery.BlockDetail` response.
@@ -724,7 +724,7 @@ message TransactionVersionCount {
 // Optionally pins the read to a specific chain epoch so the response
 // stays consistent with concurrent reads.
 message MempoolSummaryRequest {
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 1;
+  optional uint64 at_epoch_id = 1;
 }
 
 // `ExplorerQuery.MempoolSummary` response.
@@ -848,8 +848,8 @@ message TransparentAddressActivityRequest {
   reserved 6;
   reserved "descending";
 
-  // Optional chain epoch pin.
-  optional zinder.v1.wallet.ChainEpoch at_epoch = 7;
+  // Optional chain-epoch id pin.
+  optional uint64 at_epoch_id = 7;
 }
 
 // One transparent-address confirmed-activity row.

@@ -172,7 +172,7 @@ async fn anchor_to_wallet_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<WalletAnchor, Status> {
     let response = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch: None }))
+        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = response

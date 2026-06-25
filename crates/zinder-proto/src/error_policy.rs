@@ -89,6 +89,8 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::MempoolEventCursorExpired
         | ErrorReason::ChainEpochPinUnsupported
         | ErrorReason::ChainEpochPinUnavailable
+        // CHAIN_EPOCH_PIN_MISMATCH is wire-reserved and unproduced: requests pin
+        // by bare epoch id, so there is no echoed body to mismatch.
         | ErrorReason::ChainEpochPinMismatch
         | ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew

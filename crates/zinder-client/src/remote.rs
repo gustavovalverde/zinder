@@ -20,8 +20,8 @@ use zinder_core::wire::{
 };
 use zinder_core::{
     BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MempoolEntry,
-    MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
+    ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
+    MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
@@ -32,7 +32,7 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
-    chain_epoch_message, mempool_entry_from_message,
+    mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
     outpoint_message,
     transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
@@ -204,7 +204,9 @@ impl ChainIndex for RemoteChainIndex {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         let response = self
             .client()
-            .latest_block(Request::new(wallet::LatestBlockRequest { at_epoch: None }))
+            .latest_block(Request::new(wallet::LatestBlockRequest {
+                at_epoch_id: None,
+            }))
             .await
             .map_err(|status| self.handle_status(status))?
             .into_inner();
@@ -212,11 +214,14 @@ impl ChainIndex for RemoteChainIndex {
         chain_epoch_from_chain_view_with_network(self.network, response.chain_view)
     }
 
-    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError> {
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
             .latest_block(Request::new(wallet::LatestBlockRequest {
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -233,12 +238,12 @@ impl ChainIndex for RemoteChainIndex {
 
     async fn latest_safe_block(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
             .latest_safe_block(Request::new(wallet::LatestSafeBlockRequest {
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -256,13 +261,13 @@ impl ChainIndex for RemoteChainIndex {
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
             .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
                 selector: Some(block_selector_to_message(selector)?),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -273,13 +278,13 @@ impl ChainIndex for RemoteChainIndex {
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderInfo, IndexerError> {
         let response = self
             .client()
             .block_header_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
                 selector: Some(block_selector_to_message(selector)?),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -293,13 +298,13 @@ impl ChainIndex for RemoteChainIndex {
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
         let response = self
             .client()
             .compact_block(Request::new(wallet::CompactBlockRequest {
                 height: height.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -314,14 +319,14 @@ impl ChainIndex for RemoteChainIndex {
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
         let response = self
             .client()
             .compact_block_range(Request::new(wallet::CompactBlockRangeRequest {
                 start_height: block_range.start.value(),
                 end_height: block_range.end.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?;
@@ -341,13 +346,13 @@ impl ChainIndex for RemoteChainIndex {
     async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
             .client()
             .tree_state_at_height(Request::new(wallet::TreeStateAtHeightRequest {
                 height: height.value(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -357,12 +362,12 @@ impl ChainIndex for RemoteChainIndex {
 
     async fn latest_tree_state_checkpoint(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
             .client()
             .latest_tree_state_checkpoint(Request::new(wallet::LatestTreeStateCheckpointRequest {
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -373,7 +378,7 @@ impl ChainIndex for RemoteChainIndex {
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
         let response = self
             .client()
@@ -382,7 +387,7 @@ impl ChainIndex for RemoteChainIndex {
                     as i32,
                 start_index: subtree_root_range.start_index.value(),
                 max_entries: subtree_root_range.max_entries.get(),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
             .map_err(|status| self.handle_status(status))?
@@ -408,19 +413,19 @@ impl ChainIndex for RemoteChainIndex {
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let response = match self
             .client()
             .transaction(Request::new(wallet::TransactionRequest {
                 transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-                at_epoch: at_epoch.map(chain_epoch_to_message),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
         {
             Ok(response) => response.into_inner(),
             Err(status) if status.code() == tonic::Code::NotFound => {
-                if at_epoch.is_some() {
+                if at_epoch_id.is_some() {
                     return Ok(TxStatus::NotFound);
                 }
                 return self.lookup_in_mempool(transaction_id).await;
@@ -665,12 +670,12 @@ impl ChainIndex for RemoteChainIndex {
     async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
         let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
         let request = wallet::TransparentOutputsByOutpointRequest {
             outpoints: wire_outpoints,
-            at_epoch: at_epoch.map(chain_epoch_to_message),
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
         };
         let response = self
             .client()
@@ -885,10 +890,6 @@ fn chain_epoch_from_chain_view_with_network(
 )]
 fn decode_error_to_indexer_error(error: MempoolDecodeError) -> IndexerError {
     IndexerError::malformed(error.field(), error.to_string())
-}
-
-fn chain_epoch_to_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
-    chain_epoch_message(chain_epoch)
 }
 
 fn compact_block_from_message(

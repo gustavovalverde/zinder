@@ -55,49 +55,52 @@ pub use readiness_refresh::{
 
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
-/// Canonical reads take `at_epoch: Option<ChainEpoch>`. `None` resolves to the
-/// visible chain epoch at call time; `Some(epoch)` pins the read to that epoch.
+/// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
+/// the visible chain epoch at call time; `Some(id)` pins the read to that epoch.
 /// Current-projection derive reads expose their chain epoch in the response
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads latest visible block metadata.
-    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<LatestBlock, QueryError>;
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestBlock, QueryError>;
 
     /// Reads the block at the chain epoch's safe tip (the wallet's scan
     /// ceiling). Mirrors `latest_block` but resolves to
     /// `chain_epoch.safe_tip_height` rather than `chain_epoch.tip_height`.
     async fn latest_safe_block(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<LatestSafeBlock, QueryError>;
 
     /// Resolves a typed block selector against the canonical best chain.
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdResponseValue, QueryError>;
 
     /// Reads the typed block-header read model at a typed block selector.
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderResponseValue, QueryError>;
 
     /// Reads one compact block artifact at a given height.
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError>;
 
     /// Reads compact block artifacts for an inclusive height range.
     async fn compact_block_range(
         &self,
         block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
 
     /// Reads typed transaction status by transaction id.
@@ -105,13 +108,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Returns [`TxStatus::Mined`] for mined transactions, with epoch-bound
     /// [`MinedDetails`] enrichment, [`TxStatus::NotFound`] when the
     /// transaction is not visible in the canonical chain, and
-    /// [`QueryError`] for storage/upstream failures. An `at_epoch` pin is
+    /// [`QueryError`] for storage/upstream failures. An `at_epoch_id` pin is
     /// a canonical-chain read and never consults live mempool state;
     /// mempool fall-through is the caller's responsibility on this trait.
     async fn transaction(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError>;
 
     /// Reads the indexed transaction at `(height, tx_index)`.
@@ -123,14 +126,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         height: BlockHeight,
         tx_index: u64,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Transaction, QueryError>;
 
     /// Reads an optional raw transaction blob by transaction id.
     async fn raw_transaction(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError>;
 
     /// Resolves a batch of canonical-chain transparent outpoints to their
@@ -144,7 +147,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: Vec<TransparentOutPoint>,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError>;
 
     /// Reads the complete unspent transparent output set for one transparent
@@ -152,7 +155,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
 
     /// Reads a bounded page of transparent-address tx-history index
@@ -170,20 +173,20 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
 
     /// Reads the latest tree-state checkpoint at the visible chain epoch tip.
     async fn latest_tree_state_checkpoint(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
 
     /// Reads subtree-root artifacts for a bounded subtree range.
     async fn subtree_roots(
         &self,
         subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError>;
 
     /// Reads a bounded page of replayable chain events.
@@ -329,11 +332,14 @@ where
     ReadApi: ChainEpochReadApi + Clone + Send + Sync + 'static,
     Broadcaster: TransactionBroadcaster + Clone,
 {
-    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<LatestBlock, QueryError> {
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             Ok(LatestBlock {
                 chain_epoch,
@@ -348,12 +354,12 @@ where
 
     async fn latest_safe_block(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<LatestSafeBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             Ok(LatestSafeBlock {
                 chain_epoch,
@@ -369,12 +375,12 @@ where
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdResponseValue, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let block_id = resolve_block_selector(&reader, selector)?;
             Ok(BlockIdResponseValue {
@@ -390,12 +396,12 @@ where
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderResponseValue, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let block_id = resolve_block_selector(&reader, selector)?;
             let block = reader.block_header_at(block_id.height)?.ok_or_else(|| {
@@ -414,12 +420,12 @@ where
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let compact_block = match reader.compact_block_at(height) {
                 Ok(Some(compact_block)) => compact_block,
@@ -449,13 +455,13 @@ where
     async fn transaction(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let activations = self.network_upgrade_activations.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let Some(artifact) = reader.transaction_facts_by_id(transaction_id)? else {
                 return Ok(TransactionStatus {
@@ -489,12 +495,12 @@ where
         &self,
         height: BlockHeight,
         tx_index: u64,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Transaction, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let tx_index_in_block = u32::try_from(tx_index).map_err(|_| {
                 artifact_unavailable(
@@ -537,12 +543,12 @@ where
     async fn raw_transaction(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let transaction = reader
                 .transaction_blob_by_id(transaction_id)?
@@ -566,12 +572,12 @@ where
     async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: Vec<TransparentOutPoint>,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
 
             let prevouts_by_outpoint = reader.transparent_outputs_by_outpoints(&outpoints)?;
@@ -606,7 +612,7 @@ where
     async fn compact_block_range(
         &self,
         block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
         let started_at = Instant::now();
         let requested_blocks = block_range.into_iter().len();
@@ -623,7 +629,7 @@ where
 
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let compact_blocks = reader.compact_blocks_in_range(block_range)?;
             let mut available_compact_blocks = Vec::with_capacity(compact_blocks.len());
@@ -658,11 +664,15 @@ where
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let at_epoch = match at_epoch_id {
+                Some(_) => Some(open_chain_epoch_reader(&read_api, at_epoch_id)?.chain_epoch()),
+                None => None,
+            };
             let page = read_api
                 .address_output_index_page(AddressOutputIndexPageRequest {
                     at_epoch,
@@ -772,12 +782,12 @@ where
     async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let probe = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             if height > chain_epoch.visible_tip_height {
                 return Err(block_height_artifact_unavailable(
@@ -851,12 +861,12 @@ where
 
     async fn latest_tree_state_checkpoint(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
 
             let tree_state = match reader.latest_tree_state_checkpoint() {
@@ -894,12 +904,12 @@ where
     async fn subtree_roots(
         &self,
         subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let completed_subtree_count =
                 completed_subtree_count(chain_epoch, subtree_root_range.protocol);
@@ -998,29 +1008,20 @@ where
 
 fn open_chain_epoch_reader<ReadApi>(
     read_api: &ReadApi,
-    at_epoch: Option<ChainEpoch>,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> Result<zinder_store::ChainEpochReader<'_>, QueryError>
 where
     ReadApi: ChainEpochReadApi,
 {
-    let Some(requested_epoch) = at_epoch else {
+    let Some(requested_epoch_id) = at_epoch_id else {
         return read_api
             .current_chain_epoch_reader()
             .map_err(QueryError::Store);
     };
 
-    let reader = read_api
-        .chain_epoch_reader_at(requested_epoch.id)
-        .map_err(|error| map_epoch_pin_store_error(error, requested_epoch.id))?;
-    let stored_epoch = reader.chain_epoch();
-    if stored_epoch != requested_epoch {
-        return Err(QueryError::ChainEpochPinMismatch {
-            chain_epoch_id: requested_epoch.id,
-            reason: "stored chain epoch does not match at_epoch",
-        });
-    }
-
-    Ok(reader)
+    read_api
+        .chain_epoch_reader_at(requested_epoch_id)
+        .map_err(|error| map_epoch_pin_store_error(error, requested_epoch_id))
 }
 
 #[allow(
@@ -1171,7 +1172,6 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::InvalidAddress { .. }) => "invalid_address",
         Some(QueryError::ChainEpochPinUnsupported) => "chain_epoch_pin_unsupported",
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
-        Some(QueryError::ChainEpochPinMismatch { .. }) => "chain_epoch_pin_mismatch",
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
@@ -1565,15 +1565,6 @@ pub enum QueryError {
         chain_epoch_id: ChainEpochId,
     },
 
-    /// Requested chain epoch id exists but the supplied epoch body does not match.
-    #[error("chain-epoch pin mismatch for {chain_epoch_id:?}: {reason}")]
-    ChainEpochPinMismatch {
-        /// Requested chain epoch id.
-        chain_epoch_id: ChainEpochId,
-        /// Stable diagnostic reason.
-        reason: &'static str,
-    },
-
     /// Store returned a chain-event variant unsupported by the native protocol.
     #[error("unsupported chain event: {event}")]
     UnsupportedChainEvent {
@@ -1663,7 +1654,6 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
-            Self::ChainEpochPinMismatch { .. } => ErrorReason::ChainEpochPinMismatch,
             Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
             Self::CompactBlockPayloadMalformed { .. } => ErrorReason::CompactBlockPayloadMalformed,
             Self::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
@@ -1813,10 +1803,6 @@ mod error_reason_tests {
             QueryError::ChainEpochPinUnsupported,
             QueryError::ChainEpochPinUnavailable {
                 chain_epoch_id: ChainEpochId::new(1),
-            },
-            QueryError::ChainEpochPinMismatch {
-                chain_epoch_id: ChainEpochId::new(1),
-                reason: "probe",
             },
             QueryError::UnsupportedChainEvent { event: "probe" },
             QueryError::UnsupportedBlockSelector { reason: "probe" },

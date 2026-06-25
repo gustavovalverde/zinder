@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId,
     ChainValuePoolsAtTip, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
     NetworkUpgradeActivations, RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBroadcastResult, TransactionId, TreeStateArtifact, TxStatus,
@@ -143,7 +143,7 @@ impl LocalChainIndex {
 
     async fn read_at_epoch<Output>(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
         read: impl FnOnce(&zinder_store::ChainEpochReader<'_>) -> Result<Output, IndexerError>
         + Send
         + 'static,
@@ -156,18 +156,10 @@ impl LocalChainIndex {
             store
                 .try_catch_up()
                 .map_err(IndexerError::from_store_error)?;
-            let reader = match at_epoch {
-                Some(at_epoch) => {
-                    let reader = store
-                        .chain_epoch_reader_at(at_epoch.id)
-                        .map_err(|error| map_epoch_pin_store_error(error, at_epoch))?;
-                    if reader.chain_epoch() != at_epoch {
-                        return Err(IndexerError::FailedPrecondition {
-                            reason: "stored chain epoch does not match at_epoch".to_owned(),
-                        });
-                    }
-                    reader
-                }
+            let reader = match at_epoch_id {
+                Some(at_epoch_id) => store
+                    .chain_epoch_reader_at(at_epoch_id)
+                    .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?,
                 None => store
                     .current_chain_epoch_reader()
                     .map_err(IndexerError::from_store_error)?,
@@ -205,8 +197,11 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError> {
-        self.read_at_epoch(at_epoch, |reader| {
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockId, IndexerError> {
+        self.read_at_epoch(at_epoch_id, |reader| {
             let chain_epoch = reader.chain_epoch();
             Ok(BlockId {
                 height: chain_epoch.visible_tip_height,
@@ -218,9 +213,9 @@ impl ChainIndex for LocalChainIndex {
 
     async fn latest_safe_block(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
-        self.read_at_epoch(at_epoch, |reader| {
+        self.read_at_epoch(at_epoch_id, |reader| {
             let chain_epoch = reader.chain_epoch();
             Ok(BlockId {
                 height: chain_epoch.settled_tip_height,
@@ -233,18 +228,20 @@ impl ChainIndex for LocalChainIndex {
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| resolve_block_id(reader, selector))
-            .await
+        self.read_at_epoch(at_epoch_id, move |reader| {
+            resolve_block_id(reader, selector)
+        })
+        .await
     }
 
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderInfo, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| {
+        self.read_at_epoch(at_epoch_id, move |reader| {
             let block_id = resolve_block_id(reader, selector)?;
             let block = reader
                 .block_header_at(block_id.height)
@@ -258,9 +255,9 @@ impl ChainIndex for LocalChainIndex {
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| {
+        self.read_at_epoch(at_epoch_id, move |reader| {
             reader
                 .compact_block_at(height)
                 .map_err(IndexerError::from_store_error)?
@@ -274,7 +271,7 @@ impl ChainIndex for LocalChainIndex {
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
         if block_range.start > block_range.end {
             return Err(IndexerError::invalid_request(
@@ -283,7 +280,7 @@ impl ChainIndex for LocalChainIndex {
         }
 
         let compact_blocks = self
-            .read_at_epoch(at_epoch, move |reader| {
+            .read_at_epoch(at_epoch_id, move |reader| {
                 let maybe_blocks = reader
                     .compact_blocks_in_range(block_range)
                     .map_err(IndexerError::from_store_error)?;
@@ -310,9 +307,9 @@ impl ChainIndex for LocalChainIndex {
     async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| {
+        self.read_at_epoch(at_epoch_id, move |reader| {
             reader
                 .tree_state_checkpoint_at_or_before(height)
                 .map_err(IndexerError::from_store_error)?
@@ -326,9 +323,9 @@ impl ChainIndex for LocalChainIndex {
 
     async fn latest_tree_state_checkpoint(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
-        self.read_at_epoch(at_epoch, |reader| {
+        self.read_at_epoch(at_epoch_id, |reader| {
             reader
                 .latest_tree_state_checkpoint()
                 .map_err(IndexerError::from_store_error)?
@@ -342,9 +339,9 @@ impl ChainIndex for LocalChainIndex {
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
-        self.read_at_epoch(at_epoch, move |reader| {
+        self.read_at_epoch(at_epoch_id, move |reader| {
             let maybe_roots = reader
                 .subtree_roots(subtree_root_range)
                 .map_err(IndexerError::from_store_error)?;
@@ -368,11 +365,11 @@ impl ChainIndex for LocalChainIndex {
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let activations = self.network_upgrade_activations.clone();
         let mined_outcome = self
-            .read_at_epoch(at_epoch, move |reader| {
+            .read_at_epoch(at_epoch_id, move |reader| {
                 let Some(artifact) = reader
                     .transaction_facts_by_id(transaction_id)
                     .map_err(IndexerError::from_store_error)?
@@ -400,7 +397,7 @@ impl ChainIndex for LocalChainIndex {
             })
             .await?;
 
-        if !matches!(mined_outcome, TxStatus::NotFound) || at_epoch.is_some() {
+        if !matches!(mined_outcome, TxStatus::NotFound) || at_epoch_id.is_some() {
             // Found mined, OR caller bound the read to a specific epoch
             // (mempool state is non-canonical and is not part of any
             // chain epoch). Either way, return the canonical answer.
@@ -609,10 +606,10 @@ impl ChainIndex for LocalChainIndex {
     async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[zinder_core::TransparentOutPoint],
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, IndexerError> {
         let outpoints = normalize_transparent_output_outpoints(outpoints)?;
-        self.read_at_epoch(at_epoch, move |reader| {
+        self.read_at_epoch(at_epoch_id, move |reader| {
             let chain_epoch = reader.chain_epoch();
             let prevouts_by_outpoint = reader
                 .transparent_outputs_by_outpoints(&outpoints)
@@ -684,10 +681,10 @@ const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.satu
     clippy::wildcard_enum_match_arm,
     reason = "Only a missing pinned epoch becomes a client precondition error; all other storage failures keep the shared storage mapping."
 )]
-fn map_epoch_pin_store_error(error: StoreError, at_epoch: ChainEpoch) -> IndexerError {
+fn map_epoch_pin_store_error(error: StoreError, at_epoch_id: ChainEpochId) -> IndexerError {
     match error {
         StoreError::ChainEpochMissing { .. } => IndexerError::FailedPrecondition {
-            reason: format!("chain epoch {} is not retained", at_epoch.id.value()),
+            reason: format!("chain epoch {} is not retained", at_epoch_id.value()),
         },
         error => IndexerError::from_store_error(error),
     }

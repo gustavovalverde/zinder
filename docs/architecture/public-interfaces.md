@@ -48,7 +48,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | Term | Meaning |
 |------|---------|
 | `ChainView` | Cross-plane chain-state envelope carried at field tag 1 on every `WalletQuery`, `ExplorerQuery`, and `IngestControl` read response. Folds the chain epoch and the `{role}_tip` axes (`indexed_tip`, `upstream_tip`) plus the derive status into one shape. Defined in `wallet.proto`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
-| `ChainEpoch` | A consistent visible chain snapshot. Carries `visible_tip` and `settled_tip` as `BlockTip` values plus the epoch id, network name, artifact schema version, and the visible-tip commitment-tree sizes. |
+| `ChainEpoch` | A consistent visible chain snapshot. Carries `visible_tip` and `settled_tip` as `BlockTip` values plus the epoch id, network name, artifact schema version, and the visible-tip commitment-tree sizes. Response-only: it appears nested in `ChainView`, never in a request. A request that pins a snapshot carries the bare `optional uint64 at_epoch_id` instead. |
 | `BlockTip` | One named chain height with its block hash (`{ height, hash }`, hash in RPC byte order). Reused for `visible_tip`, `settled_tip`, and `indexed_tip`. |
 | `IndexedTip` | Derive-replay ceiling: the highest block the derive projections have materialized (`{ tip: BlockTip, block_time_unix_seconds }`). Absent on `ChainView` means "derive head unknown", never "at tip". |
 | `UpstreamTip` | The upstream node's view of the chain (`{ committed_height, estimated_height }`, heights only; the probe has no single hash). Absent means the source-plane probe has not fired yet. |

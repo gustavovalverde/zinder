@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
     BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
+    ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
     RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
     TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
@@ -302,8 +302,8 @@ pub struct TransparentUnspentOutputStreamItem {
 
 /// Typed chain-index contract consumed by wallets and applications.
 ///
-/// Canonical reads take `at_epoch: Option<ChainEpoch>`. `None` resolves to
-/// the visible chain epoch at call time; `Some(epoch)` pins the read to that
+/// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves
+/// to the visible chain epoch at call time; `Some(id)` pins the read to that
 /// epoch. Current-projection derive reads expose their chain epoch in stream
 /// items instead of accepting a pin.
 ///
@@ -348,7 +348,10 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// let block = client.latest_block(None).await?;
     /// # let _ = block; Ok(()) }
     /// ```
-    async fn latest_block(&self, at_epoch: Option<ChainEpoch>) -> Result<BlockId, IndexerError>;
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockId, IndexerError>;
 
     /// Resolves the block at the chain epoch's safe tip (the height a
     /// wallet may safely use as its scan ceiling: both a compact block and
@@ -365,7 +368,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// ```
     async fn latest_safe_block(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
 
     /// Resolves a block selector against the canonical best chain.
@@ -388,7 +391,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
 
     /// Returns the typed block-header read model for a block selector.
@@ -408,7 +411,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderInfo, IndexerError>;
 
     /// Reads one compact block artifact.
@@ -424,7 +427,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn compact_block_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockArtifact, IndexerError>;
 
     /// Streams compact block artifacts for an inclusive range.
@@ -441,12 +444,12 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError>;
 
     /// Reads the tree-state artifact at exactly `height`.
     ///
-    /// `at_epoch = None` resolves to the live tip; `Some(epoch)` pins the
+    /// `at_epoch_id = None` resolves to the live tip; `Some(id)` pins the
     /// read to that chain epoch. The returned artifact's height always equals
     /// `height`: remote clients fill non-checkpoint heights from the query
     /// plane's upstream node, while local clients serve only stored heights and
@@ -463,7 +466,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn tree_state_at(
         &self,
         height: BlockHeight,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads the tree-state artifact at the visible tip.
@@ -478,7 +481,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// ```
     async fn latest_tree_state_checkpoint(
         &self,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads subtree roots for a bounded range.
@@ -503,7 +506,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn subtree_roots_in_range(
         &self,
         subtree_root_range: SubtreeRootRange,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError>;
 
     /// Reads chain-wide value-pool totals at the upstream node's current tip.
@@ -524,8 +527,8 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Looks up a transaction by id.
     ///
-    /// `None` for `at_epoch` consults the live mempool when the canonical
-    /// chain has no record. `Some(epoch)` pins the read to that epoch and
+    /// `None` for `at_epoch_id` consults the live mempool when the canonical
+    /// chain has no record. `Some(id)` pins the read to that epoch and
     /// never consults mempool state.
     ///
     /// # Examples
@@ -541,7 +544,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError>;
 
     /// Broadcasts raw transaction bytes without mutating canonical storage.
@@ -821,7 +824,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
-        at_epoch: Option<ChainEpoch>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
 
     /// Resolves a batch of outpoints against the live mempool index. Used

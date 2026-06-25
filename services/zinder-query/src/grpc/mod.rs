@@ -61,8 +61,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::DeriveUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnsupported
-        | QueryError::ChainEpochPinUnavailable { .. }
-        | QueryError::ChainEpochPinMismatch { .. } => precondition_failure_details(error),
+        | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
         QueryError::ArtifactUnavailable { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
             key.to_string(),
@@ -163,14 +162,6 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "requested chain epoch is not retained",
             )
         }
-        QueryError::ChainEpochPinMismatch {
-            chain_epoch_id,
-            reason,
-        } => ErrorDetails::with_precondition_failure_violation(
-            "CHAIN_EPOCH_PIN_MISMATCH",
-            format!("chain_epoch:{}", chain_epoch_id.value()),
-            *reason,
-        ),
         _ => ErrorDetails::new(),
     }
 }

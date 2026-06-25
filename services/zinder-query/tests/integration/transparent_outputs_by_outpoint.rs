@@ -7,7 +7,7 @@ use eyre::eyre;
 use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, TransactionId,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
@@ -52,7 +52,7 @@ async fn transparent_outputs_by_outpoint_resolves_known_outpoint() -> eyre::Resu
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
-        .transparent_outputs_by_outpoint(vec![outpoint], None::<ChainEpoch>)
+        .transparent_outputs_by_outpoint(vec![outpoint], None::<ChainEpochId>)
         .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
@@ -89,7 +89,7 @@ async fn transparent_outputs_by_outpoint_returns_none_for_unknown_transaction() 
                 TransactionId::from_bytes([0xFE; 32]),
                 0,
             )],
-            None::<ChainEpoch>,
+            None::<ChainEpochId>,
         )
         .await?;
 
@@ -119,7 +119,7 @@ async fn transparent_outputs_by_outpoint_returns_none_for_out_of_bounds_index() 
     let response = wallet_query
         .transparent_outputs_by_outpoint(
             vec![TransparentOutPoint::new(transaction_id, 99)],
-            None::<ChainEpoch>,
+            None::<ChainEpochId>,
         )
         .await?;
 
@@ -185,7 +185,7 @@ async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyr
             transaction_id: "00".repeat(32),
             output_index: u32::MAX,
         }],
-        at_epoch: None,
+        at_epoch_id: None,
     });
     let outcome = grpc_adapter.transparent_outputs_by_outpoint(request).await;
     let status = match outcome {
@@ -208,7 +208,7 @@ fn commit_two_block_fixture(
     store: &zinder_store::PrimaryChainStore,
 ) -> eyre::Result<(ChainEpoch, [TransactionId; 3])> {
     use zinder_core::{
-        ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, ChainEpochId, ChainTipMetadata,
+        ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, ChainTipMetadata,
         CompactBlockArtifact, Network, UnixTimestampMillis,
     };
 
@@ -302,7 +302,7 @@ async fn transparent_outputs_by_outpoint_resolves_outpoints_across_multiple_bloc
         TransparentOutPoint::new(txid_second_block, 0),
     ];
     let response = wallet_query
-        .transparent_outputs_by_outpoint(outpoints.clone(), None::<ChainEpoch>)
+        .transparent_outputs_by_outpoint(outpoints.clone(), None::<ChainEpochId>)
         .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
@@ -358,7 +358,7 @@ async fn transparent_outputs_by_outpoint_preserves_input_order_and_dedupes_reads
         TransparentOutPoint::new(transaction_id, 0),
     ];
     let response = wallet_query
-        .transparent_outputs_by_outpoint(outpoints.clone(), None::<ChainEpoch>)
+        .transparent_outputs_by_outpoint(outpoints.clone(), None::<ChainEpochId>)
         .await?;
 
     assert_eq!(response.entries.len(), 3);

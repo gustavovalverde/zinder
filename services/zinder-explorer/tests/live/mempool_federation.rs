@@ -153,7 +153,7 @@ impl MempoolFixture {
     async fn summary(&self) -> Result<MempoolSummaryResponse> {
         let response = ExplorerQueryService::mempool_summary(
             &self.explorer_adapter,
-            Request::new(MempoolSummaryRequest { at_epoch: None }),
+            Request::new(MempoolSummaryRequest { at_epoch_id: None }),
         )
         .await?
         .into_inner();

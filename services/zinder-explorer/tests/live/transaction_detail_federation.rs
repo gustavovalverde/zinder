@@ -211,7 +211,7 @@ impl TransactionDetailFixture {
     ) -> Result<zinder_proto::v1::explorer::TransactionDetailResponse> {
         let request = TransactionDetailRequest {
             transaction_id: encode_rpc_transaction_id_hex(self.coinbase_transaction_id),
-            at_epoch: None,
+            at_epoch_id: None,
         };
         let response =
             ExplorerQueryService::transaction_detail(&self.explorer_adapter, Request::new(request))

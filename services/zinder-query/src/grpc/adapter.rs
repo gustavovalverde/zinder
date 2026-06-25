@@ -10,9 +10,9 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
-    Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
-    TransactionId, TransparentOutPoint,
+    BlockHeight, BlockHeightRange, BlockSelector, ChainEpochId,
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
 use zinder_proto::capabilities::{
     EXPLORER_TRANSPARENT_ADDRESS_BALANCE_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -26,8 +26,7 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::{DeriveProxy, derive_proxy::DeriveReadinessGauge, record_proxy_outcome};
 use zinder_store::{
-    StreamCursorTokenV1, chain_epoch_from_message, chain_event_stream_family_from_message,
-    stream_cursor_from_message_bytes,
+    StreamCursorTokenV1, chain_event_stream_family_from_message, stream_cursor_from_message_bytes,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -174,7 +173,7 @@ where
     ) -> Result<Response<wallet::LatestBlockResponse>, Status> {
         latest_block_response(
             &self.query_api,
-            chain_epoch_from_request(request.into_inner().at_epoch)?,
+            chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
         .await
         .map(Response::new)
@@ -187,7 +186,7 @@ where
     ) -> Result<Response<wallet::LatestSafeBlockResponse>, Status> {
         latest_safe_block_response(
             &self.query_api,
-            chain_epoch_from_request(request.into_inner().at_epoch)?,
+            chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
         .await
         .map(Response::new)
@@ -202,7 +201,7 @@ where
         compact_block_response(
             &self.query_api,
             BlockHeight::new(request.height),
-            chain_epoch_from_request(request.at_epoch)?,
+            chain_epoch_id_from_request(request.at_epoch_id),
         )
         .await
         .map(Response::new)
@@ -215,7 +214,7 @@ where
     ) -> Result<Response<wallet::BlockIdResponse>, Status> {
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
-        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
         block_id_by_selector_response(&self.query_api, selector, at_epoch)
             .await
             .map(Response::new)
@@ -228,7 +227,7 @@ where
     ) -> Result<Response<wallet::BlockHeaderResponse>, Status> {
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
-        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
         block_header_by_selector_response(&self.query_api, selector, at_epoch)
             .await
             .map(Response::new)
@@ -245,7 +244,7 @@ where
         transaction_response(
             &self.query_api,
             transaction_id,
-            chain_epoch_from_request(request.at_epoch)?,
+            chain_epoch_id_from_request(request.at_epoch_id),
         )
         .await
         .map_err(|error| status_from_query_error(&error))?
@@ -264,7 +263,7 @@ where
             BlockHeight::new(request.start_height),
             BlockHeight::new(request.end_height),
         );
-        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
 
         let compact_block_range = self
             .query_api
@@ -294,7 +293,7 @@ where
         tree_state_at_response(
             &self.query_api,
             BlockHeight::new(request.height),
-            chain_epoch_from_request(request.at_epoch)?,
+            chain_epoch_id_from_request(request.at_epoch_id),
         )
         .await
         .map(Response::new)
@@ -307,7 +306,7 @@ where
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
         latest_tree_state_checkpoint_response(
             &self.query_api,
-            chain_epoch_from_request(request.into_inner().at_epoch)?,
+            chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
         .await
         .map(Response::new)
@@ -327,7 +326,7 @@ where
             SubtreeRootIndex::new(request.start_index),
             max_entries,
         );
-        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
 
         subtree_roots_response(&self.query_api, subtree_root_range, at_epoch)
             .await
@@ -489,7 +488,7 @@ where
         let request = request.into_inner();
         reject_coinbase_sentinels(&request.outpoints)?;
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
-        let at_epoch = chain_epoch_from_request(request.at_epoch)?;
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
         transparent_outputs_by_outpoint_response(&self.query_api, outpoints, at_epoch)
             .await
             .map(Response::new)
@@ -819,15 +818,8 @@ fn transparent_outpoints_from_request(
         .collect()
 }
 
-fn chain_epoch_from_request(
-    at_epoch: Option<wallet::ChainEpoch>,
-) -> Result<Option<ChainEpoch>, Status> {
-    at_epoch
-        .map(|message| {
-            chain_epoch_from_message(message)
-                .map_err(|error| Status::invalid_argument(error.to_string()))
-        })
-        .transpose()
+fn chain_epoch_id_from_request(at_epoch_id: Option<u64>) -> Option<ChainEpochId> {
+    at_epoch_id.map(ChainEpochId::new)
 }
 
 fn block_selector_from_request(

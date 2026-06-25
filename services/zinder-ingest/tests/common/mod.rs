@@ -587,7 +587,7 @@ async fn assert_native_wallet_grpc_responses(
 
     let latest_block = WalletQueryService::latest_block(
         &grpc_adapter,
-        Request::new(wallet::LatestBlockRequest { at_epoch: None }),
+        Request::new(wallet::LatestBlockRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -596,7 +596,7 @@ async fn assert_native_wallet_grpc_responses(
         Request::new(wallet::CompactBlockRangeRequest {
             start_height,
             end_height,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await?
@@ -609,14 +609,14 @@ async fn assert_native_wallet_grpc_responses(
         &grpc_adapter,
         Request::new(wallet::TreeStateAtHeightRequest {
             height: end_height,
-            at_epoch: None,
+            at_epoch_id: None,
         }),
     )
     .await?
     .into_inner();
     let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         &grpc_adapter,
-        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch: None }),
+        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -664,7 +664,7 @@ async fn assert_native_wallet_grpc_responses(
                 shielded_protocol: protocol as i32,
                 start_index: 0,
                 max_entries: 8,
-                at_epoch: None,
+                at_epoch_id: None,
             }),
         )
         .await?
