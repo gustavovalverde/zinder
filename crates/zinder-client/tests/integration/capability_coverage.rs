@@ -64,6 +64,7 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::subtree_roots_in_range;
     let _ = T::transaction_by_id;
     let _ = T::transparent_outputs_by_outpoint;
+    let _ = T::transparent_spends_by_outpoint;
     let _ = T::transparent_address_unspent_outputs;
     let _ = T::transparent_address_tx_ids_in_range;
     let _ = T::transparent_address_balance;

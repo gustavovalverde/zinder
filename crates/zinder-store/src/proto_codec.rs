@@ -10,7 +10,8 @@ use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, MempoolEntry, MempoolEvictionReason, RawTransactionBytes, TransactionId,
     TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentOutput, TransparentOutputEntry, UnixTimestampMillis,
+    TransparentOutPoint, TransparentOutput, TransparentOutputEntry, TransparentSpendEntry,
+    UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
 
@@ -192,6 +193,25 @@ pub fn transparent_output_entry_message(
     wallet::TransparentOutputEntry {
         outpoint: Some(outpoint_message(&entry.outpoint)),
         output: entry.output.map(transparent_output_message),
+    }
+}
+
+/// Encodes a [`TransparentSpendEntry`] into the wallet protocol message.
+///
+/// The canonical reverse-spend resolver `WalletQuery.TransparentSpendsByOutpoint`
+/// projects each found spend through this one encoder so the outpoint, spending
+/// transaction id, input index, and spending-block hash all route through the
+/// shared wire helpers.
+#[must_use]
+pub fn transparent_spend_message(entry: &TransparentSpendEntry) -> wallet::TransparentSpend {
+    wallet::TransparentSpend {
+        spent_outpoint: Some(outpoint_message(&entry.spent_outpoint)),
+        spending_transaction_id: encode_rpc_transaction_id_hex(entry.spending_transaction_id),
+        input_index: entry.input_index,
+        spending_block: Some(block_tip_message(
+            entry.spending_block_height,
+            entry.spending_block_hash,
+        )),
     }
 }
 

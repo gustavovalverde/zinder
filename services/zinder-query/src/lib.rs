@@ -3,7 +3,7 @@
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
 //! calling upstream node sources or mutating canonical storage.
 
-use std::{fmt, num::NonZeroU32, sync::Arc, time::Instant};
+use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -14,7 +14,7 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionBroadcastResult, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
-    TransparentUnspentOutput, TxStatus,
+    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -41,7 +41,7 @@ pub use grpc::{
     latest_tree_state_checkpoint_response, status_from_query_error, subtree_roots_response,
     transaction_response, transparent_address_tx_ids_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    tree_state_at_response,
+    transparent_spends_by_outpoint_response, tree_state_at_response,
 };
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
@@ -144,6 +144,18 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         outpoints: Vec<TransparentOutPoint>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError>;
+
+    /// Resolves a batch of canonical-chain transparent outpoints to where each
+    /// was spent on the canonical chain.
+    ///
+    /// Reads the canonical spend-fact index. Outpoints unspent at the
+    /// response's [`ChainEpoch`] produce no entry; consumers key results by
+    /// `spent_outpoint`. Coinbase inputs spend no prevout and never appear.
+    async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentSpendsByOutpointResponse, QueryError>;
 
     /// Reads the complete unspent transparent output set for one transparent
     /// address script at a single pinned chain epoch.
@@ -633,6 +645,44 @@ where
         .await;
         record_wallet_query_outcome(
             "transparent_outputs_by_outpoint",
+            started_at,
+            &query_outcome,
+            None,
+        );
+        query_outcome
+    }
+
+    async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            let chain_epoch = reader.chain_epoch();
+
+            let spends_by_outpoint = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+
+            let mut spends = Vec::with_capacity(spends_by_outpoint.len());
+            let mut seen = HashSet::with_capacity(spends_by_outpoint.len());
+            for outpoint in outpoints {
+                if let Some(fact) = spends_by_outpoint.get(&outpoint)
+                    && seen.insert(outpoint)
+                {
+                    spends.push(TransparentSpendEntry::from_spend_fact(fact));
+                }
+            }
+
+            Ok(TransparentSpendsByOutpointResponse {
+                chain_epoch,
+                spends,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_spends_by_outpoint",
             started_at,
             &query_outcome,
             None,

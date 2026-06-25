@@ -11,3 +11,4 @@ mod transparent_address_balance;
 mod transparent_address_tx_history;
 mod transparent_address_unspent_outputs;
 mod transparent_outputs_by_outpoint;
+mod transparent_spends_by_outpoint;

@@ -13,7 +13,8 @@ use zinder_core::{
     CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentUnspentOutput, TxStatus,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
+    TransparentUnspentOutput, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
@@ -31,6 +32,7 @@ pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
     chain_event_envelope_message, outpoint_message, transparent_output_entry_message,
+    transparent_spend_message,
 };
 
 /// Operator-configured snapshot used to build the `WalletServerInfo` descriptor.
@@ -316,6 +318,20 @@ pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized
         .map(build_transparent_outputs_by_outpoint_response)
 }
 
+/// Resolves a batch of canonical-chain transparent outpoints to their spends
+/// and encodes the native wallet response.
+///
+pub async fn transparent_spends_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    outpoints: Vec<TransparentOutPoint>,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<wallet::TransparentSpendsByOutpointResponse, QueryError> {
+    query_api
+        .transparent_spends_by_outpoint(outpoints, at_epoch_id)
+        .await
+        .map(|response| build_transparent_spends_by_outpoint_response(&response))
+}
+
 /// Reads the complete unspent transparent output set for `request` at one
 /// pinned chain epoch. The gRPC adapter streams the returned set one
 /// message per output.
@@ -460,6 +476,19 @@ fn build_transparent_outputs_by_outpoint_response(
             .entries
             .into_iter()
             .map(transparent_output_entry_message)
+            .collect(),
+    }
+}
+
+fn build_transparent_spends_by_outpoint_response(
+    response: &TransparentSpendsByOutpointResponse,
+) -> wallet::TransparentSpendsByOutpointResponse {
+    wallet::TransparentSpendsByOutpointResponse {
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
+        spends: response
+            .spends
+            .iter()
+            .map(transparent_spend_message)
             .collect(),
     }
 }

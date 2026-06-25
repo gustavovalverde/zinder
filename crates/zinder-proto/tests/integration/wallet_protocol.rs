@@ -583,6 +583,57 @@ fn synthetic_chain_view() -> wallet::ChainView {
     }
 }
 
+#[test]
+fn transparent_spends_by_outpoint_response_round_trips_through_prost() -> eyre::Result<()> {
+    let spending_transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let spending_block_hash = BlockHash::from_bytes([0xCD; 32]);
+    let response = wallet::TransparentSpendsByOutpointResponse {
+        chain_view: Some(synthetic_chain_view()),
+        spends: vec![wallet::TransparentSpend {
+            spent_outpoint: Some(wallet::OutPoint {
+                transaction_id: "11".repeat(32),
+                output_index: 3,
+            }),
+            spending_transaction_id: encode_rpc_transaction_id_hex(spending_transaction_id),
+            input_index: 2,
+            spending_block: Some(wallet::BlockTip {
+                height: 808,
+                hash: encode_rpc_block_hash_hex(spending_block_hash),
+            }),
+        }],
+    };
+
+    let decoded = round_trip(&response)?;
+
+    assert!(decoded.chain_view.is_some());
+    assert_eq!(decoded.spends.len(), 1);
+    let spend = decoded
+        .spends
+        .first()
+        .ok_or_else(|| eyre!("decoded response is missing the spend entry"))?;
+    let spent_outpoint = spend
+        .spent_outpoint
+        .as_ref()
+        .ok_or_else(|| eyre!("decoded spend is missing its spent outpoint"))?;
+    assert_eq!(spent_outpoint.transaction_id, "11".repeat(32));
+    assert_eq!(spent_outpoint.output_index, 3);
+    assert_eq!(spend.input_index, 2);
+    assert_eq!(
+        decode_rpc_transaction_id_hex(&spend.spending_transaction_id)?,
+        spending_transaction_id
+    );
+    let spending_block = spend
+        .spending_block
+        .as_ref()
+        .ok_or_else(|| eyre!("decoded spend is missing its spending block"))?;
+    assert_eq!(spending_block.height, 808);
+    assert_eq!(
+        decode_rpc_block_hash_hex(&spending_block.hash)?,
+        spending_block_hash
+    );
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

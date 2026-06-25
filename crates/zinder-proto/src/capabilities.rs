@@ -48,6 +48,13 @@ pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
 /// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
 pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_outputs_by_outpoint_v1";
+/// Capability advertised for `WalletQuery.TransparentSpendsByOutpoint`.
+///
+/// The canonical (confirmed) reverse-spend resolver; reads the always-present
+/// canonical spend-fact index, so it is advertised by every wallet-plane
+/// deployment. The unmined half is
+/// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
+pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spends_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
@@ -489,6 +496,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_TRANSPARENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentOutputsByOutpoint"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_TRANSPARENT_SPENDS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentSpendsByOutpoint"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

@@ -914,6 +914,61 @@ message TransparentMempoolSpendsByOutpointResponse {
   repeated TransparentMempoolSpend spends = 2;
 }
 
+// Canonical-chain spend of a transparent outpoint.
+//
+// Carries where the outpoint was spent on the canonical chain: the spending
+// transaction, the input index within it, and the block that mined the spend.
+// The intrinsic value and owning script of the spent output stay on the
+// canonical output resolver `TransparentOutputsByOutpoint`; this message is the
+// reverse-spend half of the getspentinfo-equivalent surface.
+message TransparentSpend {
+  // Outpoint that was spent. Mirrors the request entry so consumers key
+  // results by `spent_outpoint`.
+  OutPoint spent_outpoint = 1;
+
+  // Canonical transaction id in RPC byte order (64 lowercase hex
+  // characters) of the transaction that spends the outpoint.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string spending_transaction_id = 2;
+
+  // Transparent input index of the spend within the spending transaction.
+  uint32 input_index = 3;
+
+  // Block that mined the spending transaction (height plus RPC-form hash).
+  BlockTip spending_block = 4;
+}
+
+// Batched request for canonical-chain reverse-spend resolution.
+//
+// Given transparent outpoints, return where each was spent on the canonical
+// chain. The unmined half is the separate `TransparentMempoolSpendsByOutpoint`
+// RPC; a full getspentinfo-equivalent composes both.
+message TransparentSpendsByOutpointRequest {
+  // Outpoints whose canonical spend is being looked up. Bounded server-side
+  // to a hard cap; requests above the cap are silently truncated to the
+  // first N entries. The coinbase sentinel
+  // `(transaction_id = [0u8; 32], output_index = 0xFFFFFFFF)` is rejected
+  // with `INVALID_ARGUMENT`; coinbase inputs spend no prevout and never
+  // appear in the canonical spend-fact index.
+  repeated OutPoint outpoints = 1;
+
+  // Optional chain-epoch id pin. Absent resolves against the visible tip;
+  // present pins the read to a specific epoch.
+  optional uint64 at_epoch_id = 2;
+}
+
+// Response for [`TransparentSpendsByOutpoint`] bound to one chain epoch.
+message TransparentSpendsByOutpointResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Every entry's spend is visible at this epoch.
+  ChainView chain_view = 1;
+
+  // Canonical spends found for the requested outpoints. Outpoints unspent on
+  // the canonical chain at this epoch emit no entry; consumers key results by
+  // `spent_outpoint`.
+  repeated TransparentSpend spends = 2;
+}
+
 // Resolved transparent output referenced by an outpoint.
 //
 // Carries the intrinsic fields a consumer needs to compute input value and
@@ -1347,6 +1402,13 @@ service WalletQuery {
   // consumers to fetch one full transaction per input.
   rpc TransparentOutputsByOutpoint(TransparentOutputsByOutpointRequest)
       returns (TransparentOutputsByOutpointResponse);
+
+  // Resolve a batch of canonical-chain transparent outpoints to where each was
+  // spent: the spending transaction, input index, and block that mined the
+  // spend. The canonical (confirmed) half of the getspentinfo-equivalent
+  // surface; the unmined half is `TransparentMempoolSpendsByOutpoint`.
+  rpc TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest)
+      returns (TransparentSpendsByOutpointResponse);
 
   // Resolve a batch of live-mempool transparent outpoints to their
   // referenced outputs. Used by chained-mempool-tx flows where the

@@ -563,7 +563,7 @@ impl ChainIndex for LocalChainIndex {
         outpoints: &[zinder_core::TransparentOutPoint],
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, IndexerError> {
-        let outpoints = normalize_transparent_output_outpoints(outpoints)?;
+        let outpoints = normalize_transparent_outpoints(outpoints)?;
         self.read_at_epoch(at_epoch_id, move |reader| {
             let chain_epoch = reader.chain_epoch();
             let prevouts_by_outpoint = reader
@@ -588,12 +588,45 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
+    async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: &[zinder_core::TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, IndexerError> {
+        let outpoints = normalize_transparent_outpoints(outpoints)?;
+        self.read_at_epoch(at_epoch_id, move |reader| {
+            let chain_epoch = reader.chain_epoch();
+            let spends_by_outpoint = reader
+                .transparent_spend_facts_by_outpoints(&outpoints)
+                .map_err(IndexerError::from_store_error)?;
+            let mut spends = Vec::with_capacity(spends_by_outpoint.len());
+            let mut seen = std::collections::HashSet::with_capacity(spends_by_outpoint.len());
+            for outpoint in outpoints {
+                if let Some(fact) = spends_by_outpoint.get(&outpoint)
+                    && seen.insert(outpoint)
+                {
+                    spends.push(zinder_core::TransparentSpendEntry::from_spend_fact(fact));
+                }
+            }
+            Ok(zinder_core::TransparentSpendsByOutpointResponse {
+                chain_epoch,
+                spends,
+            })
+        })
+        .await
+    }
+
     fn local_catchup_interval(&self) -> Option<Duration> {
         Some(self.catchup_interval)
     }
 }
 
-fn normalize_transparent_output_outpoints(
+/// Rejects the coinbase sentinel and caps an outpoint batch.
+///
+/// Caps at [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. Shared by the
+/// canonical output resolver and the canonical reverse-spend resolver, which
+/// apply the same coinbase-rejection and cap rules.
+fn normalize_transparent_outpoints(
     outpoints: &[zinder_core::TransparentOutPoint],
 ) -> Result<Vec<zinder_core::TransparentOutPoint>, IndexerError> {
     for (request_index, outpoint) in outpoints.iter().enumerate() {

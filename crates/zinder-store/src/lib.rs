@@ -71,7 +71,7 @@ pub use proto_codec::{
     outpoint_message, stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
     transparent_mempool_output_message, transparent_mempool_spend_from_message,
     transparent_mempool_spend_message, transparent_output_entry_message,
-    transparent_output_message,
+    transparent_output_message, transparent_spend_message,
 };
 pub use rocksdb_resource_budget::RocksDbResourceBudget;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};

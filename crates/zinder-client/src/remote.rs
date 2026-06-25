@@ -26,7 +26,8 @@ use zinder_core::{
     TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
     UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
@@ -534,6 +535,25 @@ impl ChainIndex for RemoteChainIndex {
             .into_inner();
         transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
+
+    async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
+        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
+        let request = wallet::TransparentSpendsByOutpointRequest {
+            outpoints: wire_outpoints,
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+        };
+        let response = self
+            .client()
+            .transparent_spends_by_outpoint(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        transparent_spends_by_outpoint_response_from_message(self.network, response)
+    }
 }
 
 #[async_trait]
@@ -741,6 +761,55 @@ fn transparent_outputs_by_outpoint_response_from_message(
     Ok(TransparentOutputsByOutpointResponse {
         chain_epoch,
         entries,
+    })
+}
+
+fn transparent_spends_by_outpoint_response_from_message(
+    expected_network: Network,
+    message: wallet::TransparentSpendsByOutpointResponse,
+) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
+    let spends = message
+        .spends
+        .into_iter()
+        .map(transparent_spend_from_message)
+        .collect::<Result<Vec<_>, IndexerError>>()?;
+    Ok(TransparentSpendsByOutpointResponse {
+        chain_epoch,
+        spends,
+    })
+}
+
+fn transparent_spend_from_message(
+    message: wallet::TransparentSpend,
+) -> Result<TransparentSpendEntry, IndexerError> {
+    let outpoint_message = message.spent_outpoint.ok_or_else(|| {
+        IndexerError::malformed("transparent_spend.spent_outpoint", "field is missing")
+    })?;
+    let spent_transaction_id = transaction_id_from_rpc_hex(
+        "transparent_spend.spent_outpoint.transaction_id",
+        &outpoint_message.transaction_id,
+    )?;
+    let spent_outpoint =
+        TransparentOutPoint::new(spent_transaction_id, outpoint_message.output_index);
+    let spending_transaction_id = transaction_id_from_rpc_hex(
+        "transparent_spend.spending_transaction_id",
+        &message.spending_transaction_id,
+    )?;
+    let spending_block = message.spending_block.ok_or_else(|| {
+        IndexerError::malformed("transparent_spend.spending_block", "field is missing")
+    })?;
+    let spending_block_hash = block_hash_from_rpc_hex(
+        "transparent_spend.spending_block.hash",
+        &spending_block.hash,
+    )?;
+    Ok(TransparentSpendEntry {
+        spent_outpoint,
+        spending_transaction_id,
+        input_index: message.input_index,
+        spending_block_height: BlockHeight::new(spending_block.height),
+        spending_block_hash,
     })
 }
 

@@ -63,7 +63,7 @@ pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_output::{
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, TransparentAddressScriptHash, TransparentInputFact,
     TransparentOutPoint, TransparentOutput, TransparentOutputArtifact, TransparentOutputEntry,
-    TransparentOutputFact, TransparentOutputsByOutpointResponse, TransparentSpendFact,
-    TransparentUnspentOutput,
+    TransparentOutputFact, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    TransparentSpendFact, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
 };
 pub use tree_state::TreeStateArtifact;

@@ -11,7 +11,7 @@ use zinder_core::{
     TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -631,6 +631,32 @@ pub trait ChainIndex: Send + Sync + 'static {
         outpoints: &[TransparentOutPoint],
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
+
+    /// Resolves a batch of canonical-chain transparent outpoints to where each
+    /// was spent: the spending transaction, input index, and the block that
+    /// mined the spend.
+    ///
+    /// Outpoints unspent on the canonical chain at the response's epoch produce
+    /// no entry; consumers key results by `spent_outpoint`. Implementations
+    /// reject the coinbase sentinel and silently truncate requests above
+    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is the
+    /// canonical half of a getspentinfo-equivalent lookup; the unmined half is
+    /// [`EndpointBackedIndex::transparent_mempool_spends_by_outpoint`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let spends = client.transparent_spends_by_outpoint(&outpoints, None).await?;
+    /// # let _ = spends; Ok(()) }
+    /// ```
+    async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

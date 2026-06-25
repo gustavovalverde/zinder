@@ -329,3 +329,48 @@ pub struct TransparentOutputsByOutpointResponse {
     /// Per-outpoint resolution result, in input order.
     pub entries: Vec<TransparentOutputEntry>,
 }
+
+/// Canonical-chain spend of one transparent outpoint, projected to the
+/// reverse-spend fields a getspentinfo-equivalent consumer needs.
+///
+/// Derived from a [`TransparentSpendFact`] by keeping the spending-side
+/// identity (transaction, input index, mining block) and dropping the
+/// spent-output value and script, which the canonical output resolver already
+/// serves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentSpendEntry {
+    /// Outpoint that was spent.
+    pub spent_outpoint: TransparentOutPoint,
+    /// Transaction that spends the outpoint.
+    pub spending_transaction_id: TransactionId,
+    /// Transparent input index of the spend within the spending transaction.
+    pub input_index: u32,
+    /// Height of the block that mined the spending transaction.
+    pub spending_block_height: BlockHeight,
+    /// Hash of the block that mined the spending transaction.
+    pub spending_block_hash: BlockHash,
+}
+
+impl TransparentSpendEntry {
+    /// Projects a [`TransparentSpendFact`] onto the reverse-spend entry.
+    #[must_use]
+    pub fn from_spend_fact(fact: &TransparentSpendFact) -> Self {
+        Self {
+            spent_outpoint: fact.spent_outpoint,
+            spending_transaction_id: fact.spending_transaction_id,
+            input_index: fact.input_index,
+            spending_block_height: fact.block_height,
+            spending_block_hash: fact.block_hash,
+        }
+    }
+}
+
+/// Canonical reverse-spend resolution response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentSpendsByOutpointResponse {
+    /// Chain epoch the response binds to.
+    pub chain_epoch: ChainEpoch,
+    /// Spends found for the requested outpoints. Unspent outpoints produce no
+    /// entry; consumers key results by `spent_outpoint`.
+    pub spends: Vec<TransparentSpendEntry>,
+}
