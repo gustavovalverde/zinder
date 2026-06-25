@@ -1372,6 +1372,40 @@ message ChainValuePoolsAtTipResponse {
   uint32 tip_height = 3;
 }
 
+// Wallet-plane request for the chain-wide transparent UTXO-set summary.
+//
+// `at_epoch_id` pins the canonical read. Absent resolves against the visible
+// tip. The aggregate is always taken at the resolved epoch's settled tip,
+// where the current-UTXO projection is the irreversible unspent set.
+message TransparentUtxoSetSummaryRequest {
+  // Optional chain-epoch id pin for the canonical read. Absent resolves
+  // against the visible tip; present pins the read to a specific epoch.
+  optional uint64 at_epoch_id = 1;
+}
+
+// Wallet-plane response for the chain-wide transparent UTXO-set summary.
+//
+// A request-time full scan of the current-UTXO projection: rarely called and
+// linear in the unspent-set size. `hash_serialized` and `bytes_serialized`
+// (gettxoutsetinfo's serialized-set digest and byte size) are intentionally
+// omitted: both depend on a defined UTXO-set serialization ordering that
+// Zinder does not commit to. Only the order-independent count and value totals
+// are reported.
+message TransparentUtxoSetSummaryResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
+
+  // Number of unspent transparent outputs at the summarized settled tip.
+  uint64 utxo_count = 2;
+
+  // Sum of the values of every unspent transparent output, in zatoshi.
+  uint64 total_value_zat = 3;
+
+  // Settled tip height the aggregate was taken at. Below this height the
+  // projection is the irreversible unspent set.
+  uint32 summarized_height = 4;
+}
+
 // Transparent-address tx-history range request, server-streamed.
 message TransparentAddressTxIdsInRangeRequest {
   // Selector for the transparent address being queried.
@@ -1561,6 +1595,14 @@ service WalletQuery {
   // ingest-control endpoint.
   rpc ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest)
       returns (ChainValuePoolsAtTipResponse);
+
+  // Return the chain-wide transparent UTXO-set summary: the count and total
+  // value of unspent transparent outputs at the settled tip. A request-time
+  // full scan of the canonical current-UTXO projection (gettxoutsetinfo-
+  // equivalent, minus the format-dependent serialized hash and byte size).
+  // Capability: `wallet.read.transparent_utxo_set_summary_v1`.
+  rpc TransparentUtxoSetSummary(TransparentUtxoSetSummaryRequest)
+      returns (TransparentUtxoSetSummaryResponse);
 
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);

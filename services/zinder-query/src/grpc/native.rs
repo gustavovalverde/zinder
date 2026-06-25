@@ -15,7 +15,7 @@ use zinder_core::{
     TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TxStatus,
+    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
@@ -191,6 +191,29 @@ pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
         .latest_safe_block(at_epoch_id)
         .await
         .map(build_latest_safe_block_response)
+}
+
+/// Aggregates the chain-wide transparent UTXO set at the settled tip and
+/// encodes the native wallet response.
+pub(super) async fn transparent_utxo_set_summary_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
+    query_api
+        .transparent_utxo_set_summary(at_epoch_id)
+        .await
+        .map(build_transparent_utxo_set_summary_response)
+}
+
+fn build_transparent_utxo_set_summary_response(
+    summary: TransparentUtxoSetSummary,
+) -> wallet::TransparentUtxoSetSummaryResponse {
+    wallet::TransparentUtxoSetSummaryResponse {
+        chain_view: Some(build_chain_view_message(summary.chain_epoch)),
+        utxo_count: summary.utxo_count,
+        total_value_zat: summary.total_value_zat,
+        summarized_height: summary.summarized_height.value(),
+    }
 }
 
 /// Reads the compact block at `height` and encodes the native wallet response.

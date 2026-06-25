@@ -45,7 +45,7 @@ service ExplorerQuery {
 }
 ```
 
-The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, and `ValuePoolSummary`. Every method follows the same shape rules:
+The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`, and `UtxoSetSummary`. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -142,6 +142,18 @@ Received-output events are always exact. Spend events carry `spent_value_zat` fr
 
 `ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `repeated ChainValuePool pools` so existing UI can render known ids while future consensus pools remain visible without a new explorer wire shape.
 
+`ValuePoolSummary` reports the upstream node's `getblockchaininfo.valuePools` totals; it is not a Zinder-computed UTXO accounting. The chain-wide transparent UTXO accounting is `UtxoSetSummary`.
+
+## UTXO-set summary
+
+`ExplorerQuery.UtxoSetSummary` reports the chain-wide transparent UTXO set as two totals: `utxo_count` (unspent transparent outputs) and `total_value_zat` (their summed value). It wraps `WalletQuery.TransparentUtxoSetSummary` in the standard `ExplorerFreshness` envelope. This is the Zinder-computed equivalent of `gettxoutsetinfo`.
+
+The wallet primitive answers by a request-time streaming scan of the canonical current-UTXO projection: it folds every row into the two integers without buffering the set, so memory stays constant regardless of UTXO-set size. There is no materialized counter and no new column family; the cost is one full-set scan per call, which matches `gettxoutsetinfo`'s cost model. The scan is rarely called and runs on the canonical base read path with no mempool overlay.
+
+The aggregate is taken at the resolved chain epoch's settled tip, and `summarized_height` reports that height. Below the settled tip the projection is the irreversible unspent set: reorgs cannot reach those heights, and the safe-tip retention sweep has already removed finalized spends and reverted creations. Rows inside the reorg window (above the settled tip) are excluded so a later reorg or spend can never make the reported total wrong. An optional `at_epoch_id` pins the read to a specific epoch; absent resolves against the visible tip.
+
+`hash_serialized` and `bytes_serialized` (the serialized-set digest and byte size that `gettxoutsetinfo` also returns) are intentionally omitted. Both depend on a defined UTXO-set serialization ordering, and Zinder does not commit to one; inventing an ordering would expose a hash no other implementation could reproduce. Only the order-independent count and value totals are reported.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -158,6 +170,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
+| `explorer.utxo_set.summary_v1` | `ExplorerQuery.UtxoSetSummary` | When the wallet endpoint is configured |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.

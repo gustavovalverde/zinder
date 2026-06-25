@@ -13,6 +13,7 @@ mod search;
 mod transaction_detail;
 mod transparent_address_activity;
 mod transparent_address_deltas;
+mod utxo_set_summary;
 mod value_pool_summary;
 
 pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};

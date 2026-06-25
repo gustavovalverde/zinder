@@ -33,8 +33,9 @@ use zinder_proto::v1::{
         SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
         TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
         TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
-        TransparentAddressDeltasResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
-        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
+        TransparentAddressDeltasResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
+        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
+        VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -67,6 +68,7 @@ use super::search::handle_search;
 use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
 use super::transparent_address_activity::handle_transparent_address_activity;
 use super::transparent_address_deltas::handle_transparent_address_deltas;
+use super::utxo_set_summary::handle_utxo_set_summary;
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::DeriveStore;
 use zinder_store::SecondaryChainStore;
@@ -560,6 +562,30 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
             handle_value_pool_summary(
+                self.derive_store.as_ref(),
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn utxo_set_summary(
+        &self,
+        request: Request<UtxoSetSummaryRequest>,
+    ) -> Result<Response<UtxoSetSummaryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "UtxoSetSummary",
+            metric: "utxo_set_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_utxo_set_summary(
                 self.derive_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,

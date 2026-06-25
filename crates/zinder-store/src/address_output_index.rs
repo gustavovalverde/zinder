@@ -29,6 +29,52 @@ pub trait AddressOutputIndexStore {
     ) -> Result<Vec<TransparentUnspentOutput>, StoreError>;
 }
 
+/// Chain-wide aggregate of the transparent UTXO-set projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransparentUtxoSetAggregate {
+    /// Number of unspent transparent outputs at or below the settled tip.
+    pub(crate) utxo_count: u64,
+    /// Sum of the values of those outputs, in zatoshi.
+    pub(crate) total_value_zat: u64,
+}
+
+/// Streams the whole current-UTXO projection for one network and accumulates a
+/// count and value sum over the outputs created at or below the chain epoch's
+/// settled tip.
+///
+/// Rows at heights at or below `settled_tip_height` are the irreversible
+/// unspent set: reorgs cannot reach them, and the safe-tip retention sweep has
+/// already deleted finalized spends and reverted creations. The scan therefore
+/// needs neither a producing-block visibility check nor a spend re-check. Rows
+/// above the settled tip live inside the reorg window and are excluded so the
+/// aggregate cannot count an output a later reorg or spend could remove. The
+/// accumulator is two integers, so memory stays constant regardless of set
+/// size.
+pub(crate) fn read_transparent_utxo_set_aggregate(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+) -> Result<TransparentUtxoSetAggregate, StoreError> {
+    let prefix = StoreKey::address_output_index_network_prefix(chain_epoch.network);
+    let settled_tip_height = chain_epoch.settled_tip_height;
+    let mut aggregate = TransparentUtxoSetAggregate::default();
+
+    inner.scan_prefix(
+        StorageTable::AddressOutputIndex,
+        &prefix,
+        &mut |_key_bytes, envelope_bytes| {
+            let output = decode_address_output_index_artifact(&prefix, envelope_bytes)?;
+            if output.block_height > settled_tip_height {
+                return Ok(PrefixScanControl::Continue);
+            }
+            aggregate.utxo_count = aggregate.utxo_count.saturating_add(1);
+            aggregate.total_value_zat = aggregate.total_value_zat.saturating_add(output.value_zat);
+            Ok(PrefixScanControl::Continue)
+        },
+    )?;
+
+    Ok(aggregate)
+}
+
 /// Scan parameters for [`read_address_output_index_rows_paged`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AddressOutputIndexRowsScan {

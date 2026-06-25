@@ -14,3 +14,4 @@ mod transparent_address_unspent_outputs;
 mod transparent_outputs_by_outpoint;
 mod transparent_spends_by_outpoint;
 mod transparent_unspent_outputs_by_outpoint;
+mod transparent_utxo_set_summary;

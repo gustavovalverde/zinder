@@ -23,6 +23,7 @@ mod transaction_public_facts;
 mod transparent_address_balance;
 mod transparent_address_tx_index;
 mod transparent_output;
+mod transparent_utxo_set_summary;
 mod tree_state;
 pub mod wire;
 
@@ -67,4 +68,5 @@ pub use transparent_output::{
     TransparentSpendFact, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse,
 };
+pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
 pub use tree_state::TreeStateArtifact;

@@ -7,6 +7,7 @@ use eyre::eyre;
 use prost::Message;
 use zinder_proto::capabilities::{
     EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_UTXO_SET_SUMMARY_V1,
 };
 use zinder_proto::v1::{explorer, wallet};
 
@@ -239,6 +240,50 @@ fn transparent_address_deltas_response_carries_freshness_and_cursor() -> eyre::R
             .capability_version,
         EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1
     );
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
+    let response = explorer::UtxoSetSummaryResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet::ChainEpoch::default()),
+                indexed_tip: None,
+                upstream_tip: None,
+                derive: None,
+            }),
+            snapshot_age_millis: 0,
+            capability_version: EXPLORER_UTXO_SET_SUMMARY_V1.to_owned(),
+            unavailable: Vec::new(),
+        }),
+        utxo_count: 4096,
+        total_value_zat: 2_100_000_000_000_000,
+        summarized_height: 2_500_000,
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.utxo_count, 4096);
+    assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
+    assert_eq!(decoded.summarized_height, 2_500_000);
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_UTXO_SET_SUMMARY_V1
+    );
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_request_round_trips_the_epoch_pin() -> eyre::Result<()> {
+    let request = explorer::UtxoSetSummaryRequest {
+        at_epoch_id: Some(77),
+    };
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(decoded.at_epoch_id, Some(77));
     Ok(())
 }
 

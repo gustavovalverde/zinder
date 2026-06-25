@@ -602,6 +602,36 @@ fn synthetic_chain_view() -> wallet::ChainView {
 }
 
 #[test]
+fn transparent_utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
+    let response = wallet::TransparentUtxoSetSummaryResponse {
+        chain_view: Some(synthetic_chain_view()),
+        utxo_count: 4096,
+        total_value_zat: 2_100_000_000_000_000,
+        summarized_height: 2_500_000,
+    };
+
+    let decoded = round_trip(&response)?;
+
+    assert!(decoded.chain_view.is_some());
+    assert_eq!(decoded.utxo_count, 4096);
+    assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
+    assert_eq!(decoded.summarized_height, 2_500_000);
+    Ok(())
+}
+
+#[test]
+fn transparent_utxo_set_summary_request_round_trips_the_epoch_pin() -> eyre::Result<()> {
+    let request = wallet::TransparentUtxoSetSummaryRequest {
+        at_epoch_id: Some(77),
+    };
+
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(decoded.at_epoch_id, Some(77));
+    Ok(())
+}
+
+#[test]
 fn transparent_spends_by_outpoint_response_round_trips_through_prost() -> eyre::Result<()> {
     let spending_transaction_id = TransactionId::from_bytes([0xAB; 32]);
     let spending_block_hash = BlockHash::from_bytes([0xCD; 32]);

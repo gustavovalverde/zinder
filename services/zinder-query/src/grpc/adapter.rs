@@ -43,7 +43,7 @@ use super::native::{
     latest_tree_state_checkpoint_response, subtree_roots_response, transaction_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    tree_state_at_response,
+    transparent_utxo_set_summary_response, tree_state_at_response,
 };
 use super::status_from_query_error;
 
@@ -665,6 +665,19 @@ where
         let outcome = self.compute_transparent_address_balance(request).await;
         record_proxy_outcome("transparent_address_balance", started_at, &outcome);
         outcome
+    }
+
+    async fn transparent_utxo_set_summary(
+        &self,
+        request: Request<wallet::TransparentUtxoSetSummaryRequest>,
+    ) -> Result<Response<wallet::TransparentUtxoSetSummaryResponse>, Status> {
+        transparent_utxo_set_summary_response(
+            &self.query_api,
+            chain_epoch_id_from_request(request.into_inner().at_epoch_id),
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
     }
 
     async fn server_info(

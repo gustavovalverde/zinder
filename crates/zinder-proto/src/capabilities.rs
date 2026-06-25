@@ -79,6 +79,15 @@ pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
+/// Capability advertised for `WalletQuery.TransparentUtxoSetSummary`.
+///
+/// The count and total value are folded in-process from the canonical
+/// current-UTXO projection at the settled tip. Always advertised: the
+/// projection the scan reads is present on every wallet-plane deployment. The
+/// serialized-set hash and byte size of `gettxoutsetinfo` are not reported;
+/// both depend on a UTXO-set serialization ordering Zinder does not define.
+pub const WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1: &str =
+    "wallet.read.transparent_utxo_set_summary_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
 pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
 /// Capability advertised for `WalletQuery.ChainEvents`.
@@ -189,6 +198,14 @@ pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 /// `ChainValuePoolsAtTip` primitive. The response preserves upstream pool ids
 /// instead of projecting into a fixed list of known pools.
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
+/// Capability advertised for `ExplorerQuery.UtxoSetSummary`.
+///
+/// Signals that the explorer plane can surface the chain-wide transparent
+/// UTXO-set count and total value through the wallet-plane
+/// `TransparentUtxoSetSummary` primitive. A request-time full scan of the
+/// current-UTXO projection; the serialized-set hash and byte size are not
+/// reported.
+pub const EXPLORER_UTXO_SET_SUMMARY_V1: &str = "explorer.utxo_set.summary_v1";
 /// Capability advertised for the per-transaction paid-fee surface.
 ///
 /// Signals that the explorer plane has transparent-output facts online and
@@ -619,6 +636,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
+        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentUtxoSetSummary"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ServerInfo"),
@@ -682,6 +705,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolSummary"),
+        AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_UTXO_SET_SUMMARY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.UtxoSetSummary"),
         AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(

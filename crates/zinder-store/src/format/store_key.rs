@@ -236,12 +236,17 @@ impl StoreKey {
         Self(key)
     }
 
+    pub(crate) fn address_output_index_network_prefix(network: Network) -> Self {
+        let mut key = artifact_key_prefix(ADDRESS_OUTPUT_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        Self(key)
+    }
+
     pub(crate) fn address_output_index_prefix(
         network: Network,
         address_script_hash: TransparentAddressScriptHash,
     ) -> Self {
-        let mut key = artifact_key_prefix(ADDRESS_OUTPUT_INDEX_KEY_KIND);
-        key.extend_from_slice(&network.id().to_be_bytes());
+        let mut key = Self::address_output_index_network_prefix(network).0;
         key.extend_from_slice(&address_script_hash.as_bytes());
         Self(key)
     }

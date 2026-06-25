@@ -688,6 +688,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `wallet.read.transparent_spends_by_outpoint_v1`
 - `wallet.read.transparent_unspent_outputs_by_outpoint_v1`
 - `wallet.read.chain_value_pools_at_tip_v1`
+- `wallet.read.transparent_utxo_set_summary_v1`
 - `wallet.address.transparent_unspent_outputs_v1`
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
@@ -702,6 +703,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `explorer.transparent_address.deltas_v1`
 - `explorer.fee.summary_v1`
 - `explorer.value_pool.summary_v1`
+- `explorer.utxo_set.summary_v1`
 - `explorer.mempool.event_counts_v1`
 - `explorer.transaction.fees_v1`
 - `explorer.transaction.recent_v1`
@@ -712,6 +714,8 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.
 
 `WalletQuery.TransparentAddressBalance` is served in the wallet plane and advertises `wallet.address.transparent_balance_v1` on every deployment. The handler sums the confirmed total in-process from the canonical unspent-output index, then overlays the signed mempool delta (`unconfirmed_delta_zat`) through the colocated ingest-control endpoint; deployments without that endpoint return a zero delta rather than failing. Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` projects the same wallet primitive into one `value_zat`.
+
+`WalletQuery.TransparentUtxoSetSummary` is served in the wallet plane and advertises `wallet.read.transparent_utxo_set_summary_v1` on every deployment. It is the chain-wide transparent UTXO accounting (`gettxoutsetinfo`-equivalent): a request-time streaming scan of the canonical current-UTXO projection that folds the set into `utxo_count` and `total_value_zat` without buffering it. The scan runs at the resolved epoch's settled tip, where the projection is the irreversible unspent set, so it applies no per-row spend re-check or block-visibility check; `summarized_height` reports that tip and an optional `at_epoch_id` pins it. There is no materialized counter and no new column family, so the cost is one full-set scan per call. The serialized-set hash and byte size are intentionally not reported: both require a UTXO-set serialization ordering Zinder does not define. `ExplorerQuery.UtxoSetSummary` wraps this primitive in the `ExplorerFreshness` envelope.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are

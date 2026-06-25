@@ -1078,6 +1078,12 @@ service ExplorerQuery {
   // `explorer.value_pool.summary_v1`.
   rpc ValuePoolSummary(ValuePoolSummaryRequest) returns (ValuePoolSummaryResponse);
 
+  // Returns the chain-wide transparent UTXO-set summary: the count and total
+  // value of unspent transparent outputs at the settled tip. Composed from
+  // `WalletQuery.TransparentUtxoSetSummary`. Capability:
+  // `explorer.utxo_set.summary_v1`.
+  rpc UtxoSetSummary(UtxoSetSummaryRequest) returns (UtxoSetSummaryResponse);
+
   // Returns rolling counts of mempool events from the per-second counter
   // column family. Replaces consumer-side in-memory ring buffers.
   // Capability: `explorer.mempool.event_counts_v1`.
@@ -1130,6 +1136,35 @@ message ValuePoolSummaryResponse {
 
   // Tip height the upstream node observed when computing the pools.
   uint32 tip_height = 3;
+}
+
+// `ExplorerQuery.UtxoSetSummary` request.
+message UtxoSetSummaryRequest {
+  // Optional chain-epoch id pin for the canonical read. Absent resolves
+  // against the visible tip; present pins the read to a specific epoch.
+  optional uint64 at_epoch_id = 1;
+}
+
+// `ExplorerQuery.UtxoSetSummary` response.
+//
+// The chain-wide transparent UTXO-set aggregate, computed by a request-time
+// full scan of the current-UTXO projection at the settled tip
+// (gettxoutsetinfo-equivalent). `hash_serialized` and `bytes_serialized` are
+// intentionally omitted: both depend on a defined UTXO-set serialization
+// ordering that Zinder does not commit to, so only the order-independent
+// count and value totals are reported.
+message UtxoSetSummaryResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Number of unspent transparent outputs at the summarized settled tip.
+  uint64 utxo_count = 2;
+
+  // Sum of the values of every unspent transparent output, in zatoshi.
+  uint64 total_value_zat = 3;
+
+  // Settled tip height the aggregate was taken at. Below this height the
+  // projection is the irreversible unspent set.
+  uint32 summarized_height = 4;
 }
 
 // Per-row record materialized by `TransparentAddressActivityConsumer`.

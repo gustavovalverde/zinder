@@ -7,12 +7,14 @@ use zinder_core::{
     CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
     TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
-    TreeStateArtifact,
+    TransparentUtxoSetSummary, TreeStateArtifact,
 };
 
 use crate::{
     StoreError,
-    address_output_index::{AddressOutputIndexStore, read_address_output_index},
+    address_output_index::{
+        AddressOutputIndexStore, read_address_output_index, read_transparent_utxo_set_aggregate,
+    },
     block_artifact::{
         BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
         read_block_blob_artifact, read_block_blob_artifacts, read_block_header_artifact,
@@ -219,6 +221,22 @@ impl<'store> ChainEpochReader<'store> {
             start_height,
             max_entries,
         )
+    }
+
+    /// Aggregates the chain-wide transparent UTXO set at this epoch's settled tip.
+    ///
+    /// Streams the whole current-UTXO projection and folds it into an unspent
+    /// count and total value over the outputs created at or below
+    /// `settled_tip_height`, where the projection is the irreversible unspent
+    /// set. Request-time, full-set scan with constant memory.
+    pub fn transparent_utxo_set_summary(&self) -> Result<TransparentUtxoSetSummary, StoreError> {
+        let aggregate = read_transparent_utxo_set_aggregate(&self.read_view, self.chain_epoch)?;
+        Ok(TransparentUtxoSetSummary {
+            utxo_count: aggregate.utxo_count,
+            total_value_zat: aggregate.total_value_zat,
+            summarized_height: self.chain_epoch.settled_tip_height,
+            chain_epoch: self.chain_epoch,
+        })
     }
 
     /// Resolves a block hash through the canonical best-chain index.

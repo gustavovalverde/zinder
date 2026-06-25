@@ -249,6 +249,102 @@ fn batched_read_matches_visible_unspent_set_and_respects_bounds() -> eyre::Resul
     Ok(())
 }
 
+#[test]
+fn utxo_set_summary_counts_unspent_below_the_settled_tip_and_excludes_swept_spends()
+-> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let unspent_low = output_at(BlockHeight::new(1), [61; 32]);
+    let unspent_mid = output_at(BlockHeight::new(2), [62; 32]);
+    let finalized_spent = output_at(BlockHeight::new(1), [63; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![
+                unspent_low,
+                unspent_mid,
+                finalized_spent.clone(),
+            ])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_spent)]),
+    )?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let summary = reader.transparent_utxo_set_summary()?;
+
+    assert_eq!(summary.utxo_count, 2);
+    assert_eq!(summary.total_value_zat, 100_000);
+    assert_eq!(summary.summarized_height, BlockHeight::new(3));
+
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_excludes_outputs_above_the_settled_tip() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let settled_output = output_at(BlockHeight::new(1), [71; 32]);
+    let in_window_output = output_at(BlockHeight::new(4), [72; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![settled_output, in_window_output]),
+    )?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let summary = reader.transparent_utxo_set_summary()?;
+
+    assert_eq!(summary.utxo_count, 1);
+    assert_eq!(summary.total_value_zat, 50_000);
+    assert_eq!(summary.summarized_height, BlockHeight::new(3));
+
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_is_zero_for_an_empty_projection() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    store.commit_chain_epoch(epoch_artifacts(1, 1, 5))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let summary = reader.transparent_utxo_set_summary()?;
+
+    assert_eq!(summary.utxo_count, 0);
+    assert_eq!(summary.total_value_zat, 0);
+
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_respects_the_pinned_epoch_settled_tip() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let low_output = output_at(BlockHeight::new(1), [81; 32]);
+    let mid_output = output_at(BlockHeight::new(2), [82; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5).with_transparent_outputs_by_outpoint(vec![low_output, mid_output]),
+    )?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let pinned = store.chain_epoch_reader_at(ChainEpochId::new(1))?;
+    let pinned_summary = pinned.transparent_utxo_set_summary()?;
+    assert_eq!(pinned_summary.summarized_height, BlockHeight::new(1));
+    assert_eq!(pinned_summary.utxo_count, 1);
+    assert_eq!(pinned_summary.total_value_zat, 50_000);
+    drop(pinned);
+
+    let current = store.current_chain_epoch_reader()?;
+    let current_summary = current.transparent_utxo_set_summary()?;
+    assert_eq!(current_summary.summarized_height, BlockHeight::new(3));
+    assert_eq!(current_summary.utxo_count, 2);
+    assert_eq!(current_summary.total_value_zat, 100_000);
+
+    Ok(())
+}
+
 // Deterministic single-branch chain helpers: the block at height `h`
 // hashes to `block_hash(h)`.
 

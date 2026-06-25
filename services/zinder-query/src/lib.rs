@@ -16,7 +16,7 @@ use zinder_core::{
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputEntry,
     TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TxStatus,
+    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -232,6 +232,17 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError>;
+
+    /// Aggregates the chain-wide transparent UTXO set at the settled tip.
+    ///
+    /// Folds the canonical current-UTXO projection into an unspent count and a
+    /// total value (gettxoutsetinfo-equivalent) by a request-time full scan.
+    /// The aggregate is taken at the resolved epoch's settled tip, where the
+    /// projection is the irreversible unspent set.
+    async fn transparent_utxo_set_summary(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUtxoSetSummary, QueryError>;
 
     /// Reads the tree state at exactly `height`.
     ///
@@ -1069,6 +1080,28 @@ where
         .await;
         record_wallet_query_outcome(
             "transparent_address_balance",
+            started_at,
+            &query_outcome,
+            None,
+        );
+        query_outcome
+    }
+
+    async fn transparent_utxo_set_summary(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUtxoSetSummary, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            reader
+                .transparent_utxo_set_summary()
+                .map_err(QueryError::Store)
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "transparent_utxo_set_summary",
             started_at,
             &query_outcome,
             None,
