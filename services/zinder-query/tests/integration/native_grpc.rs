@@ -99,9 +99,9 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let status = match WalletQueryService::compact_block_range(
+    let status = match WalletQueryService::compact_blocks_in_range(
         &grpc_adapter,
-        Request::new(wallet::CompactBlockRangeRequest {
+        Request::new(wallet::CompactBlocksInRangeRequest {
             start_height: 1,
             end_height: 2,
             at_epoch_id: None,
@@ -523,7 +523,7 @@ struct StoredWalletArtifacts {
 
 struct WalletGrpcResponses {
     latest_block: wallet::LatestBlockResponse,
-    compact_block_range: Vec<wallet::CompactBlockRangeChunk>,
+    compact_block_range: Vec<wallet::CompactBlocksInRangeChunk>,
     explicit_tree_state: wallet::TreeStateResponse,
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
@@ -566,9 +566,9 @@ async fn read_wallet_grpc_responses(
     )
     .await?
     .into_inner();
-    let mut compact_block_stream = WalletQueryService::compact_block_range(
+    let mut compact_block_stream = WalletQueryService::compact_blocks_in_range(
         grpc_adapter,
-        Request::new(wallet::CompactBlockRangeRequest {
+        Request::new(wallet::CompactBlocksInRangeRequest {
             start_height: 1,
             end_height: 1,
             at_epoch_id: None,
@@ -650,7 +650,7 @@ impl HasChainEpoch for wallet::LatestBlockResponse {
     }
 }
 
-impl HasChainEpoch for wallet::CompactBlockRangeChunk {
+impl HasChainEpoch for wallet::CompactBlocksInRangeChunk {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
         self.chain_view
             .as_ref()

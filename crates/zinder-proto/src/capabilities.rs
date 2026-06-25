@@ -27,7 +27,7 @@ pub const WALLET_READ_BLOCK_ID_BY_SELECTOR_V1: &str = "wallet.read.block_id_by_s
 pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_header_by_selector_v1";
 /// Capability advertised for `WalletQuery.CompactBlock`.
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
-/// Capability advertised for `WalletQuery.CompactBlockRange`.
+/// Capability advertised for `WalletQuery.CompactBlocksInRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
 pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V1: &str = "wallet.read.tree_state_at_height_v1";
@@ -447,7 +447,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
     CapabilitySpec::new(
         WALLET_READ_COMPACT_BLOCK_RANGE_V1,
         CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.CompactBlockRange"),
+        Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

@@ -591,9 +591,9 @@ async fn assert_native_wallet_grpc_responses(
     )
     .await?
     .into_inner();
-    let mut compact_block_stream = WalletQueryService::compact_block_range(
+    let mut compact_block_stream = WalletQueryService::compact_blocks_in_range(
         &grpc_adapter,
-        Request::new(wallet::CompactBlockRangeRequest {
+        Request::new(wallet::CompactBlocksInRangeRequest {
             start_height,
             end_height,
             at_epoch_id: None,
@@ -705,7 +705,7 @@ impl HasNativeGrpcChainEpoch for wallet::LatestBlockResponse {
     }
 }
 
-impl HasNativeGrpcChainEpoch for wallet::CompactBlockRangeChunk {
+impl HasNativeGrpcChainEpoch for wallet::CompactBlocksInRangeChunk {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
         self.chain_view
             .as_ref()
@@ -760,7 +760,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
     end_height: u32,
 ) -> Result<()> {
     let compact_block_range = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(
                 BlockHeight::new(start_height),
                 BlockHeight::new(end_height),
@@ -782,7 +782,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
     for (height, compact_block) in
         (start_height..=end_height).zip(compact_block_range.compact_blocks)
     {
-        let chunk = wallet::CompactBlockRangeChunk {
+        let chunk = wallet::CompactBlocksInRangeChunk {
             chain_view: Some(zinder_store::chain_view_message(range_chain_epoch)),
             compact_block: Some(wallet::CompactBlock {
                 height: compact_block.height.value(),
@@ -791,7 +791,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
             }),
         };
         let encoded_chunk = chunk.encode_to_vec();
-        let decoded_chunk = wallet::CompactBlockRangeChunk::decode(encoded_chunk.as_slice())?;
+        let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
         let chunk_chain_epoch = decoded_chunk
             .chain_view
             .and_then(|chain_view| chain_view.chain_epoch)

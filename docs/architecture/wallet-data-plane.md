@@ -62,7 +62,7 @@ This avoids two problems:
 
 If a compact block artifact is missing, `zinder-query` should return a typed unavailable error or readiness failure. It should not fetch the block from the upstream node and build a one-off response.
 
-The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the derive-plane axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlockRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
+The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the derive-plane axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
 A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
 
@@ -137,12 +137,19 @@ mempool; a non-best-chain lookup must add its own named API surface.
 Native transaction lookup returns typed transaction status. The public Rust shape is
 `zinder_core::TxStatus` and the native gRPC surface mirrors it through
 `WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
-under capability `wallet.read.transaction_by_id_v1`. The wire oneof has three arms; `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
+under capability `wallet.read.transaction_by_id_v1`. The response carries the
+shared `TransactionLocation` oneof on its `location` field; the oneof has three
+arms. `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
 
-- `Mined`: `MinedTransaction { Transaction transaction; MinedDetails details }`.
-- `InMempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
-- `ConflictingChain`: `ConflictingChainTransaction {}` (reserved shape; status
+- `mined`: `MinedTransaction { MinedBlockLocation location; MinedDetails details }`.
+- `in_mempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
+- `conflicting`: `ConflictingChainTransaction {}` (reserved shape; status
   is the signal, fields are reserved for future non-best-chain lookup).
+
+`TransactionLocation` is one message defined in `wallet.proto` and embedded by
+every read surface that answers "where does this transaction live", including
+`ExplorerQuery.TransactionDetail`, so a consumer writes one match shape for both
+planes and the explorer detail carries the `conflicting` arm rather than dropping it.
 
 The mined variant carries epoch-bound `MinedDetails {
 consensus_branch_id, block_time, confirmations }`. These fields are
@@ -236,8 +243,9 @@ address, or outpoint answer. Native gRPC exposes focused point lookups that
 mirror the `ChainIndex` methods:
 
 - `WalletQuery.Transaction` returns the typed `TransactionStatusResponse`
-  carrying `Mined`/`InMempool`/`ConflictingChain` (with `NotFound` mapped to
-  gRPC `NOT_FOUND`).
+  carrying the shared `TransactionLocation` oneof
+  (`mined`/`in_mempool`/`conflicting`, with `NotFound` mapped to gRPC
+  `NOT_FOUND`).
 - `WalletQuery.TransparentMempoolOutputsByAddress` (capability
   `wallet.mempool.transparent_outputs_by_address_v1`) returns unmined
   transparent outputs that fund one transparent address.

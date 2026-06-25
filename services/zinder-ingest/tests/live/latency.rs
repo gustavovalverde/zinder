@@ -78,7 +78,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
 
     let measurement_start = std::time::Instant::now();
     let range = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(
                 BlockHeight::new(1),
                 BlockHeight::new(tip_height.value().min(50)),
@@ -204,7 +204,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
 
     let measurement_start = std::time::Instant::now();
     let range = wallet_query
-        .compact_block_range(BlockHeightRange::inclusive(from_height, tip_height), None)
+        .compact_blocks_in_range(BlockHeightRange::inclusive(from_height, tip_height), None)
         .await?;
     let compact_block_range_micros = measurement_start.elapsed().as_micros();
     let expected_block_count = usize::try_from(HOSTED_BACKFILL_DEPTH_BLOCKS)

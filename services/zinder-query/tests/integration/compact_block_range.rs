@@ -45,7 +45,7 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
             None,
         )
@@ -74,7 +74,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
             None,
         )
@@ -86,7 +86,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         .ok_or_else(|| eyre!("missing compact block"))?;
     let chunk = compact_block_range_chunk(compact_block_range.chain_epoch, response_compact_block);
     let encoded_chunk = chunk.encode_to_vec();
-    let decoded_chunk = wallet::CompactBlockRangeChunk::decode(encoded_chunk.as_slice())?;
+    let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
     let response_chain_epoch = decoded_chunk
         .chain_view
         .as_ref()
@@ -451,7 +451,7 @@ async fn compact_block_range_reports_unavailable_artifact_without_node_repair() 
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
             None,
         )
@@ -515,7 +515,7 @@ async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()>
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let error = match wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(1)),
             None,
         )
@@ -547,7 +547,7 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
     );
 
     let error = match wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
             None,
         )
@@ -572,8 +572,8 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
 fn compact_block_range_chunk(
     chain_epoch: ChainEpoch,
     compact_block: CompactBlockArtifact,
-) -> wallet::CompactBlockRangeChunk {
-    wallet::CompactBlockRangeChunk {
+) -> wallet::CompactBlocksInRangeChunk {
+    wallet::CompactBlocksInRangeChunk {
         chain_view: Some(wallet::ChainView {
             chain_epoch: Some(wallet::ChainEpoch {
                 chain_epoch_id: chain_epoch.id.value(),

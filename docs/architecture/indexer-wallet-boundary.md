@@ -8,7 +8,7 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 
 ## Zinder does this
 
-- **Compact-block range reads**: paginated `CompactBlock` artifacts (`WalletQuery.CompactBlockRange`).
+- **Compact-block range reads**: paginated `CompactBlock` artifacts (`WalletQuery.CompactBlocksInRange`).
 - **Tree-state reads**: Sapling/Orchard commitment-tree state at a height (`WalletQuery.TreeState`).
 - **Subtree-root reads**: shielded subtree roots for batched scanning (`WalletQuery.SubtreeRootsInRange`).
 - **Transparent-address output reads**: the complete current unspent set per address, streamed at one pinned chain epoch (`WalletQuery.TransparentAddressUnspentOutputs`).

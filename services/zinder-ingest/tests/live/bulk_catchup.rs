@@ -258,7 +258,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     let one_block_range = BlockHeightRange::inclusive(from_height, from_height);
     let measurement_start = std::time::Instant::now();
     let one_block = wallet_query
-        .compact_block_range(one_block_range, None)
+        .compact_blocks_in_range(one_block_range, None)
         .await?;
     let compact_block_range_1_micros = measurement_start.elapsed().as_micros();
     assert_eq!(one_block.compact_blocks.len(), 1);
@@ -267,7 +267,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
         BlockHeightRange::inclusive(from_height, BlockHeight::new(from_height.value() + 9));
     let measurement_start = std::time::Instant::now();
     let ten_blocks = wallet_query
-        .compact_block_range(ten_block_range, None)
+        .compact_blocks_in_range(ten_block_range, None)
         .await?;
     let compact_block_range_10_micros = measurement_start.elapsed().as_micros();
     assert_eq!(ten_blocks.compact_blocks.len(), 10);
@@ -276,14 +276,16 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
         BlockHeightRange::inclusive(from_height, BlockHeight::new(from_height.value() + 49));
     let measurement_start = std::time::Instant::now();
     let fifty_blocks = wallet_query
-        .compact_block_range(fifty_block_range, None)
+        .compact_blocks_in_range(fifty_block_range, None)
         .await?;
     let compact_block_range_50_micros = measurement_start.elapsed().as_micros();
     assert_eq!(fifty_blocks.compact_blocks.len(), 50);
 
     let full_range = BlockHeightRange::inclusive(from_height, tip_height);
     let measurement_start = std::time::Instant::now();
-    let full_blocks = wallet_query.compact_block_range(full_range, None).await?;
+    let full_blocks = wallet_query
+        .compact_blocks_in_range(full_range, None)
+        .await?;
     let compact_block_range_1000_micros = measurement_start.elapsed().as_micros();
     assert_eq!(full_blocks.compact_blocks.len(), 1000);
 

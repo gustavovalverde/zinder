@@ -169,7 +169,7 @@ async fn resolve_block_height(
                 selector: Some(block_selector::Selector::Hash(hash.clone())),
             };
             let response = wallet_client
-                .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+                .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
                     selector: Some(selector),
                     at_epoch_id: request.at_epoch_id,
                 }))

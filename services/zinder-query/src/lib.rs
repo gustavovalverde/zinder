@@ -91,7 +91,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ) -> Result<CompactBlock, QueryError>;
 
     /// Reads compact block artifacts for an inclusive height range.
-    async fn compact_block_range(
+    async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
@@ -631,7 +631,7 @@ where
         query_outcome
     }
 
-    async fn compact_block_range(
+    async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,

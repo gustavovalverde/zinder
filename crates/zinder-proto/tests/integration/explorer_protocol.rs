@@ -106,6 +106,80 @@ fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
     Ok(())
 }
 
+#[test]
+fn transaction_detail_response_embeds_shared_wallet_location() -> eyre::Result<()> {
+    let response = explorer::TransactionDetailResponse {
+        freshness: None,
+        facts: None,
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::Mined(
+                wallet::MinedTransaction {
+                    location: Some(wallet::MinedBlockLocation {
+                        transaction_id: "ab".repeat(32),
+                        block_height: 99,
+                        block_hash: "cd".repeat(32),
+                        tx_index_in_block: 1,
+                    }),
+                    details: Some(wallet::MinedDetails {
+                        consensus_branch_id: 0xc2d6_d0b4,
+                        block_time: 1_774_670_000,
+                        confirmations: 12,
+                    }),
+                },
+            )),
+        }),
+        paid_fee_zat: None,
+        prevout_resolution_status: 0,
+        transparent_inputs: Vec::new(),
+    };
+    let decoded = round_trip(&response)?;
+
+    let location = decoded
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre!("location oneof missing"))?;
+    let wallet::transaction_location::Location::Mined(mined) = location else {
+        return Err(eyre!("expected mined arm"));
+    };
+    assert_eq!(
+        mined
+            .location
+            .ok_or_else(|| eyre!("mined block location missing"))?
+            .block_height,
+        99
+    );
+
+    Ok(())
+}
+
+#[test]
+fn transaction_detail_response_carries_conflicting_location() -> eyre::Result<()> {
+    let response = explorer::TransactionDetailResponse {
+        freshness: None,
+        facts: None,
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::Conflicting(
+                wallet::ConflictingChainTransaction {},
+            )),
+        }),
+        paid_fee_zat: None,
+        prevout_resolution_status: 0,
+        transparent_inputs: Vec::new(),
+    };
+    let decoded = round_trip(&response)?;
+
+    let location = decoded
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre!("location oneof missing"))?;
+    assert!(matches!(
+        location,
+        wallet::transaction_location::Location::Conflicting(_)
+    ));
+
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

@@ -207,7 +207,7 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
     let latest_block = wallet_query.latest_block(None).await?;
     assert_eq!(latest_block.height, to_height);
     let compact_blocks = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(wallet_serving_floor, to_height),
             None,
         )

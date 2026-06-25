@@ -502,21 +502,21 @@ fn build_transaction_status_response(
     status: TransactionStatus,
 ) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
     let chain_epoch = status.chain_epoch;
-    let oneof = match status.status {
+    let location = match status.status {
         TxStatus::Mined(mined) => {
-            wallet::transaction_status_response::Status::Mined(wallet::MinedTransaction {
-                location: Some(build_transaction_location_message(mined.location)),
+            wallet::transaction_location::Location::Mined(wallet::MinedTransaction {
+                location: Some(build_mined_block_location_message(mined.location)),
                 details: Some(build_mined_details_message(mined.details)),
             })
         }
         TxStatus::InMempool(entry) => {
-            wallet::transaction_status_response::Status::InMempool(wallet::MempoolTransaction {
+            wallet::transaction_location::Location::InMempool(wallet::MempoolTransaction {
                 payload_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
                 first_seen_unix_seconds: i64::try_from(entry.first_seen_unix_millis.value() / 1000)
                     .unwrap_or(i64::MAX),
             })
         }
-        TxStatus::ConflictingChain => wallet::transaction_status_response::Status::Conflicting(
+        TxStatus::ConflictingChain => wallet::transaction_location::Location::Conflicting(
             wallet::ConflictingChainTransaction {},
         ),
         TxStatus::NotFound => return Ok(None),
@@ -528,7 +528,9 @@ fn build_transaction_status_response(
     };
     Ok(Some(wallet::TransactionStatusResponse {
         chain_view: Some(build_chain_view_message(chain_epoch)),
-        status: Some(oneof),
+        location: Some(wallet::TransactionLocation {
+            location: Some(location),
+        }),
     }))
 }
 
@@ -540,10 +542,10 @@ fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
     }
 }
 
-fn build_transaction_location_message(
+fn build_mined_block_location_message(
     transaction: TransactionLocation,
-) -> wallet::TransactionLocation {
-    wallet::TransactionLocation {
+) -> wallet::MinedBlockLocation {
+    wallet::MinedBlockLocation {
         transaction_id: encode_rpc_transaction_id_hex(transaction.transaction_id),
         block_height: transaction.block_height.value(),
         block_hash: encode_rpc_block_hash_hex(transaction.block_hash),

@@ -50,7 +50,7 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
     let compact_block_range = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
             None,
         )

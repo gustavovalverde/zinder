@@ -58,7 +58,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
     let mut client = WalletQueryClient::connect(server_addr).await?;
 
     let mut first_stream = client
-        .compact_block_range(wallet::CompactBlockRangeRequest {
+        .compact_blocks_in_range(wallet::CompactBlocksInRangeRequest {
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
             at_epoch_id: None,
@@ -79,7 +79,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
     drop(first_stream);
 
     let mut second_stream = client
-        .compact_block_range(wallet::CompactBlockRangeRequest {
+        .compact_blocks_in_range(wallet::CompactBlocksInRangeRequest {
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
             at_epoch_id: None,
@@ -112,7 +112,7 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
             tokio::spawn(async move {
                 let mut client = WalletQueryClient::connect(server_addr).await?;
                 let mut stream = client
-                    .compact_block_range(wallet::CompactBlockRangeRequest {
+                    .compact_blocks_in_range(wallet::CompactBlocksInRangeRequest {
                         start_height: 1,
                         end_height: COMMITTED_BLOCK_COUNT,
                         at_epoch_id: None,

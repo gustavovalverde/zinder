@@ -184,6 +184,105 @@ fn broadcast_transaction_response_carries_queued_outcome() -> eyre::Result<()> {
 }
 
 #[test]
+fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
+    let response = wallet::TransactionStatusResponse {
+        chain_view: Some(synthetic_chain_view()),
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::Mined(
+                wallet::MinedTransaction {
+                    location: Some(wallet::MinedBlockLocation {
+                        transaction_id: "ab".repeat(32),
+                        block_height: 42,
+                        block_hash: "cd".repeat(32),
+                        tx_index_in_block: 3,
+                    }),
+                    details: Some(wallet::MinedDetails {
+                        consensus_branch_id: 0xc2d6_d0b4,
+                        block_time: 1_774_670_000,
+                        confirmations: 6,
+                    }),
+                },
+            )),
+        }),
+    };
+    let decoded = round_trip(&response)?;
+
+    let location = decoded
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre!("location oneof missing"))?;
+    let wallet::transaction_location::Location::Mined(mined) = location else {
+        return Err(eyre!("expected mined arm"));
+    };
+    let block_location = mined
+        .location
+        .ok_or_else(|| eyre!("mined location missing"))?;
+    assert_eq!(block_location.block_height, 42);
+    assert_eq!(block_location.tx_index_in_block, 3);
+    assert_eq!(
+        mined
+            .details
+            .ok_or_else(|| eyre!("details missing"))?
+            .confirmations,
+        6
+    );
+
+    Ok(())
+}
+
+#[test]
+fn transaction_status_response_carries_in_mempool_location() -> eyre::Result<()> {
+    let response = wallet::TransactionStatusResponse {
+        chain_view: Some(synthetic_chain_view()),
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::InMempool(
+                wallet::MempoolTransaction {
+                    payload_bytes: vec![0x07, 0x08, 0x09],
+                    first_seen_unix_seconds: 1_774_670_111,
+                },
+            )),
+        }),
+    };
+    let decoded = round_trip(&response)?;
+
+    let location = decoded
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre!("location oneof missing"))?;
+    let wallet::transaction_location::Location::InMempool(mempool) = location else {
+        return Err(eyre!("expected in_mempool arm"));
+    };
+    assert_eq!(mempool.payload_bytes, vec![0x07, 0x08, 0x09]);
+    assert_eq!(mempool.first_seen_unix_seconds, 1_774_670_111);
+
+    Ok(())
+}
+
+#[test]
+fn transaction_status_response_carries_conflicting_location() -> eyre::Result<()> {
+    let response = wallet::TransactionStatusResponse {
+        chain_view: Some(synthetic_chain_view()),
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::Conflicting(
+                wallet::ConflictingChainTransaction {},
+            )),
+        }),
+    };
+    let decoded = round_trip(&response)?;
+
+    let location = decoded
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre!("location oneof missing"))?;
+    assert!(matches!(
+        location,
+        wallet::transaction_location::Location::Conflicting(_)
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::ChainEventEnvelope {
         cursor: vec![0x99; 82],

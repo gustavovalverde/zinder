@@ -191,8 +191,9 @@ message BlockSelector {
   }
 }
 
-// Block-identity resolver request.
-message BlockIdBySelectorRequest {
+// Block-selector resolver request, shared by the block-identity and
+// block-header reads that both resolve a `BlockSelector`.
+message BlockSelectorRequest {
   // Typed selector for the requested block.
   BlockSelector selector = 1;
 
@@ -269,7 +270,7 @@ message CompactBlock {
 }
 
 // Inclusive compact block range request.
-message CompactBlockRangeRequest {
+message CompactBlocksInRangeRequest {
   // First requested block height.
   uint32 start_height = 1;
 
@@ -311,8 +312,8 @@ message TransactionRequest {
   optional uint64 at_epoch_id = 2;
 }
 
-// Indexed transaction location.
-message TransactionLocation {
+// Block coordinates of a mined transaction.
+message MinedBlockLocation {
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
   string transaction_id = 1;
@@ -348,11 +349,11 @@ message MinedDetails {
   uint32 confirmations = 3;
 }
 
-// Mined-transaction response carrier: the durable `TransactionLocation`
+// Mined-transaction response carrier: the durable `MinedBlockLocation`
 // plus epoch-bound enrichment.
 message MinedTransaction {
-  // Mined-transaction location.
-  TransactionLocation location = 1;
+  // Mined-transaction block coordinates.
+  MinedBlockLocation location = 1;
 
   // Epoch-bound enrichment fields.
   MinedDetails details = 2;
@@ -374,29 +375,41 @@ message ConflictingChainTransaction {
   // ships. Empty today; the conflicting-chain status is its own signal.
 }
 
+// Canonical transaction-location discriminator shared by every read surface.
+//
+// One match shape answers "where does this transaction live": mined in the
+// canonical chain, visible in the live mempool, or conflicting with the
+// visible canonical chain. `NotFound` is never an arm here; the read surface
+// conveys it out of band (gRPC `NOT_FOUND`) so typed errors do not consume
+// oneof slots. `WalletQuery.Transaction` and `ExplorerQuery.TransactionDetail`
+// both embed this message so a consumer writes the match once.
+message TransactionLocation {
+  oneof location {
+    // Transaction is mined in the canonical chain.
+    MinedTransaction mined = 1;
+
+    // Transaction is currently visible in the live mempool.
+    MempoolTransaction in_mempool = 2;
+
+    // Transaction is known to conflict with the visible canonical chain.
+    ConflictingChainTransaction conflicting = 3;
+  }
+}
+
 // Single transaction-status response bound to one chain epoch.
 //
-// `NotFound` is conveyed as gRPC `NOT_FOUND`, not as an oneof arm,
+// `NotFound` is conveyed as gRPC `NOT_FOUND`, not as a location arm,
 // because typed errors do not consume oneof slots.
 message TransactionStatusResponse {
   // Chain epoch used to answer this response.
   ChainView chain_view = 1;
 
-  // Typed transaction status.
-  oneof status {
-    // Transaction is mined in the canonical chain.
-    MinedTransaction mined = 2;
-
-    // Transaction is currently visible in the live mempool.
-    MempoolTransaction in_mempool = 3;
-
-    // Transaction is known to conflict with the visible canonical chain.
-    ConflictingChainTransaction conflicting = 4;
-  }
+  // Canonical transaction-location discriminator.
+  TransactionLocation location = 2;
 }
 
 // Streamed compact block range chunk bound to one chain epoch.
-message CompactBlockRangeChunk {
+message CompactBlocksInRangeChunk {
   // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
   ChainView chain_view = 1;
 
@@ -1243,20 +1256,20 @@ service WalletQuery {
   rpc LatestSafeBlock(LatestSafeBlockRequest) returns (LatestSafeBlockResponse);
 
   // Resolve a typed block selector against the canonical best chain.
-  rpc BlockIdBySelector(BlockIdBySelectorRequest) returns (BlockIdResponse);
+  rpc BlockIdBySelector(BlockSelectorRequest) returns (BlockIdResponse);
 
   // Return the typed block-header read model at a typed block selector.
-  rpc BlockHeaderBySelector(BlockIdBySelectorRequest) returns (BlockHeaderResponse);
+  rpc BlockHeaderBySelector(BlockSelectorRequest) returns (BlockHeaderResponse);
 
   // Return one compact block at a given height.
   rpc CompactBlock(CompactBlockRequest) returns (CompactBlockResponse);
 
   // Stream compact blocks for an inclusive height range.
-  rpc CompactBlockRange(CompactBlockRangeRequest) returns (stream CompactBlockRangeChunk);
+  rpc CompactBlocksInRange(CompactBlocksInRangeRequest) returns (stream CompactBlocksInRangeChunk);
 
   // Return the typed status of one transaction by transaction id. NotFound
   // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states
-  // are typed in the response oneof.
+  // are typed in the response location oneof.
   rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
   // Return the tree state at one exact block height. Served from a stored

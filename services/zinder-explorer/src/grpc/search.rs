@@ -35,7 +35,7 @@ use zinder_proto::v1::explorer::{
     unified_address_receiver,
 };
 use zinder_proto::v1::wallet::{
-    self, BlockSelector, LatestBlockRequest, block_selector, transaction_status_response,
+    self, BlockSelector, LatestBlockRequest, block_selector, transaction_location,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -159,7 +159,7 @@ async fn probe_block_height(
     height: u32,
 ) -> Result<Vec<SearchCandidate>, Status> {
     let response = wallet_client
-        .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+        .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
             selector: Some(BlockSelector {
                 selector: Some(block_selector::Selector::Height(height)),
             }),
@@ -217,7 +217,7 @@ async fn resolve_block_by_hash(
     rpc_hex: &str,
 ) -> Result<Option<wallet::BlockMetadata>, Status> {
     match wallet_client
-        .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+        .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
             selector: Some(BlockSelector {
                 selector: Some(block_selector::Selector::Hash(rpc_hex.to_owned())),
             }),
@@ -244,8 +244,9 @@ async fn resolve_transaction_by_hash(
     match response {
         Ok(envelope) => Ok(envelope
             .into_inner()
-            .status
-            .and_then(|status| build_transaction_match(rpc_hex, status))),
+            .location
+            .and_then(|location| location.location)
+            .and_then(|location| build_transaction_match(rpc_hex, location))),
         Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
         Err(status) => Err(status),
     }
@@ -253,25 +254,25 @@ async fn resolve_transaction_by_hash(
 
 fn build_transaction_match(
     rpc_hex: String,
-    status: transaction_status_response::Status,
+    location: transaction_location::Location,
 ) -> Option<TransactionMatch> {
-    match status {
-        transaction_status_response::Status::Mined(mined) => {
-            let transaction = mined.location?;
+    match location {
+        transaction_location::Location::Mined(mined) => {
+            let block_location = mined.location?;
             Some(TransactionMatch {
                 transaction_id: rpc_hex,
                 in_mempool: false,
-                mined_block_height: transaction.block_height,
-                mined_block_hash: transaction.block_hash,
+                mined_block_height: block_location.block_height,
+                mined_block_hash: block_location.block_hash,
             })
         }
-        transaction_status_response::Status::InMempool(_) => Some(TransactionMatch {
+        transaction_location::Location::InMempool(_) => Some(TransactionMatch {
             transaction_id: rpc_hex,
             in_mempool: true,
             mined_block_height: 0,
             mined_block_hash: String::new(),
         }),
-        transaction_status_response::Status::Conflicting(_) => None,
+        transaction_location::Location::Conflicting(_) => None,
     }
 }
 

@@ -99,7 +99,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `WalletQueryApi` | Rust query boundary used by `zinder-query` and compatibility adapters |
 | `WalletQueryGrpcAdapter` | Tonic adapter that serves native `WalletQuery` over `WalletQueryApi` through `grpc/native.rs` response builders |
 | `LatestBlockResponse` | Native wallet protocol response for latest visible block metadata |
-| `CompactBlockRangeChunk` | Native wallet protocol stream item for one compact block bound to one chain epoch |
+| `CompactBlocksInRangeChunk` | Native wallet protocol stream item for one compact block bound to one chain epoch |
 | `TreeStateResponse` | Native wallet protocol response for one commitment tree-state artifact |
 | `SubtreeRootsResponse` | Native wallet protocol response for Sapling or Orchard subtree roots |
 | `BroadcastTransactionRequest` | Native wallet protocol request to submit a raw transaction |
@@ -226,6 +226,16 @@ Do not mix these in the same crate:
 - `_at` for non-height keys (e.g. `transaction_at`).
 - Singular range methods (`block_in_range`).
 - Cursor-bearing methods named `subscribe_*` instead of `*_events`.
+
+### Wire-RPC naming rule (native `zinder.v1`)
+
+Native gRPC RPC names are the `PascalCase` spelling of the Rust method the rules above produce, so a consumer derives the wire name from the Rust method and vice versa. The native surface is `zinder.v1` only; the vendored lightwalletd compatibility proto is frozen (ADR-0024) and does not follow this rule.
+
+- A bounded range read (Rule 2) is plural with the `InRange` suffix on both the RPC and its messages: `CompactBlocksInRange(CompactBlocksInRangeRequest) returns (stream CompactBlocksInRangeChunk)`, `TransparentAddressTxIdsInRange`. The Rust counterpart is `compact_blocks_in_range`.
+- A request message is named for what it carries, not for the one RPC that first used it. `BlockSelectorRequest` carries a `BlockSelector` and backs both `BlockIdBySelector` and `BlockHeaderBySelector`; neither RPC name appears in the request name.
+- A transaction-location discriminator is the shared `TransactionLocation` oneof `{ mined, in_mempool, conflicting }`. Every read surface that answers "where does this transaction live" embeds that one message (`WalletQuery.Transaction`, `ExplorerQuery.TransactionDetail`) so a consumer writes one match shape.
+
+Renames applied to converge the divergent names this rule exposed: the range RPC `CompactBlockRange` and its `*Request`/`*Chunk` messages became the `CompactBlocksInRange` form; the shared `BlockIdBySelectorRequest` became `BlockSelectorRequest`. Single-key and tip-pinned reads (`CompactBlock`, `LatestBlock`, `BlockIdBySelector`) already matched their rules and were left unchanged; capability strings are unchanged because a method rename does not alter the semantic response shape.
 
 ## Cursor Conventions
 
@@ -757,13 +767,13 @@ Wallet and application developers integrate with the native protobuf service. Th
 
 ```rust
 use zinder_proto::v1::wallet::{
-    wallet_query_client::WalletQueryClient, CompactBlockRangeRequest, LatestBlockRequest,
+    wallet_query_client::WalletQueryClient, CompactBlocksInRangeRequest, LatestBlockRequest,
 };
 
 let mut wallet = WalletQueryClient::connect("https://zinder.example").await?;
 let tip = wallet.latest_block(LatestBlockRequest {}).await?;
 let blocks = wallet
-    .compact_block_range(CompactBlockRangeRequest {
+    .compact_blocks_in_range(CompactBlocksInRangeRequest {
         start_height: 1_000_000,
         end_height: 1_000_100,
     })

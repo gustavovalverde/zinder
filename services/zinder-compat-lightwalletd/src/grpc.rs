@@ -356,7 +356,7 @@ where
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_block_range(block_range, None)
+            .compact_blocks_in_range(block_range, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(
@@ -377,7 +377,7 @@ where
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_block_range(block_range, None)
+            .compact_blocks_in_range(block_range, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(

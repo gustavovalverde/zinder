@@ -265,7 +265,7 @@ impl ChainIndex for RemoteChainIndex {
     ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
-            .block_id_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+            .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
                 selector: Some(block_selector_to_message(selector)?),
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
@@ -282,7 +282,7 @@ impl ChainIndex for RemoteChainIndex {
     ) -> Result<BlockHeaderInfo, IndexerError> {
         let response = self
             .client()
-            .block_header_by_selector(Request::new(wallet::BlockIdBySelectorRequest {
+            .block_header_by_selector(Request::new(wallet::BlockSelectorRequest {
                 selector: Some(block_selector_to_message(selector)?),
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
@@ -323,7 +323,7 @@ impl ChainIndex for RemoteChainIndex {
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
         let response = self
             .client()
-            .compact_block_range(Request::new(wallet::CompactBlockRangeRequest {
+            .compact_blocks_in_range(Request::new(wallet::CompactBlocksInRangeRequest {
                 start_height: block_range.start.value(),
                 end_height: block_range.end.value(),
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
@@ -992,18 +992,18 @@ fn transparent_unspent_output_item_from_message(
 
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "TransactionLocation is a tiny POD; taking by value matches the symmetric encoder."
+    reason = "MinedBlockLocation is a tiny POD; taking by value matches the symmetric encoder."
 )]
-fn transaction_location_from_message(
-    message: wallet::TransactionLocation,
+fn mined_block_location_from_message(
+    message: wallet::MinedBlockLocation,
 ) -> Result<TransactionLocation, IndexerError> {
     Ok(TransactionLocation::new(
         transaction_id_from_rpc_hex(
-            "transaction_location.transaction_id",
+            "mined_block_location.transaction_id",
             &message.transaction_id,
         )?,
         BlockHeight::new(message.block_height),
-        block_hash_from_rpc_hex("transaction_location.block_hash", &message.block_hash)?,
+        block_hash_from_rpc_hex("mined_block_location.block_hash", &message.block_hash)?,
         message.tx_index_in_block,
     ))
 }
@@ -1232,7 +1232,7 @@ fn block_selector_to_message(
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "TransactionStatusResponse oneof is non-exhaustive in the protobuf-generated enum; new variants are a deliberate wire change."
+    reason = "TransactionLocation oneof is non-exhaustive in the protobuf-generated enum; new variants are a deliberate wire change."
 )]
 fn tx_status_from_message(
     response: wallet::TransactionStatusResponse,
@@ -1241,13 +1241,14 @@ fn tx_status_from_message(
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
-    let status = response
-        .status
-        .ok_or_else(|| IndexerError::malformed("status", "field is missing"))?;
-    match status {
-        wallet::transaction_status_response::Status::Mined(mined) => {
+    let location = response
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| IndexerError::malformed("location.location", "field is missing"))?;
+    match location {
+        wallet::transaction_location::Location::Mined(mined) => {
             let location =
-                transaction_location_from_message(mined.location.ok_or_else(|| {
+                mined_block_location_from_message(mined.location.ok_or_else(|| {
                     IndexerError::malformed("mined.location", "field is missing")
                 })?)?;
             let details_message = mined
@@ -1260,7 +1261,7 @@ fn tx_status_from_message(
             };
             Ok(TxStatus::Mined(MinedTransaction::new(location, details)))
         }
-        wallet::transaction_status_response::Status::InMempool(in_mempool) => {
+        wallet::transaction_location::Location::InMempool(in_mempool) => {
             let chain_epoch = chain_epoch_from_message(chain_epoch_message)
                 .map_err(decode_error_to_indexer_error)?;
             let entry = MempoolEntry {
@@ -1278,9 +1279,7 @@ fn tx_status_from_message(
             };
             Ok(TxStatus::InMempool(entry))
         }
-        wallet::transaction_status_response::Status::Conflicting(_) => {
-            Ok(TxStatus::ConflictingChain)
-        }
+        wallet::transaction_location::Location::Conflicting(_) => Ok(TxStatus::ConflictingChain),
     }
 }
 

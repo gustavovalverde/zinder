@@ -260,35 +260,6 @@ message TransparentInputDetail {
   optional uint64 value_zat = 2;
 }
 
-// Discriminated transaction location.
-//
-// A `TransactionDetail` response carries exactly one of `mined` or
-// `in_mempool`. Transactions the indexer cannot locate at all surface as
-// `Status::NOT_FOUND`, not as an empty `TransactionLocation`.
-message TransactionLocation {
-  oneof kind {
-    MinedLocation mined = 1;
-    MempoolLocation in_mempool = 2;
-  }
-}
-
-// Mined-transaction location carrying block context the explorer page
-// renders alongside the parsed facts.
-message MinedLocation {
-  uint32 block_height = 1;
-  // Canonical block hash in RPC byte order (64 lowercase hex characters).
-  // Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string block_hash = 2;
-  int64 block_time_unix_seconds = 3;
-  uint32 confirmations = 4;
-}
-
-// Mempool-transaction location carrying first-observation metadata.
-message MempoolLocation {
-  uint64 first_seen_unix_millis = 1;
-  zinder.v1.wallet.ChainEpoch first_seen_chain_epoch = 2;
-}
-
 // `ExplorerQuery.TransactionDetail` request.
 //
 // `at_epoch_id` optionally pins the read to a specific chain epoch so the
@@ -304,8 +275,13 @@ message TransactionDetailRequest {
 // `ExplorerQuery.TransactionDetail` response.
 //
 // Carries the cross-cutting freshness envelope plus the parsed public
-// facts, location discriminator, and raw transaction bytes so consumers
-// can keep parsed and raw forms together (per the PRD's user story 16).
+// facts, the shared transaction-location discriminator, and raw
+// transaction bytes so consumers can keep parsed and raw forms together
+// (per the PRD's user story 16).
+//
+// `location` is the same `zinder.v1.wallet.TransactionLocation` oneof
+// `WalletQuery.Transaction` returns, so a consumer writes one match shape
+// for both surfaces and TransactionDetail carries the `conflicting` arm.
 //
 // `paid_fee_zat`, `prevout_resolution_status`, and `transparent_inputs`
 // are populated when the explorer advertises
@@ -315,7 +291,7 @@ message TransactionDetailRequest {
 message TransactionDetailResponse {
   ExplorerFreshness freshness = 1;
   TransactionPublicFacts facts = 2;
-  TransactionLocation location = 3;
+  zinder.v1.wallet.TransactionLocation location = 3;
   optional uint64 paid_fee_zat = 5;
   PrevoutResolutionStatus prevout_resolution_status = 6;
   repeated TransparentInputDetail transparent_inputs = 7;

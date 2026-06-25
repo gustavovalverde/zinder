@@ -64,10 +64,10 @@ The current native wallet read-sync surface is:
 - `zinder_proto::v1::wallet::LatestBlockRequest`
 - `zinder_proto::v1::wallet::LatestBlockResponse`
 - `zinder_proto::v1::wallet::CompactBlock`
-- `zinder_proto::v1::wallet::CompactBlockRangeRequest`
+- `zinder_proto::v1::wallet::CompactBlocksInRangeRequest`
 - `zinder_proto::v1::wallet::CompactBlockRequest`
 - `zinder_proto::v1::wallet::CompactBlockResponse`
-- `zinder_proto::v1::wallet::CompactBlockRangeChunk`
+- `zinder_proto::v1::wallet::CompactBlocksInRangeChunk`
 - `zinder_proto::v1::wallet::TransactionRequest`
 - `zinder_proto::v1::wallet::Transaction`
 - `zinder_proto::v1::wallet::TransactionResponse`
@@ -106,7 +106,7 @@ stay behind `WalletQueryApi`, `ChainEpochReadApi`, and ingestion.
 
 The current native network service exposes Zinder concepts:
 
-- `LatestBlock`, `CompactBlock`, `CompactBlockRange`, `Transaction`
+- `LatestBlock`, `CompactBlock`, `CompactBlocksInRange`, `Transaction`
 - `TreeStateCheckpoint`, `LatestTreeStateCheckpoint`, `SubtreeRoots`
 - `ServerInfo`
 

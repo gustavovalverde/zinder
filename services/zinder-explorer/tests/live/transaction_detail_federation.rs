@@ -15,8 +15,8 @@
 //! - `facts.is_coinbase` is `true` and `facts.privacy_shape` is the
 //!   coinbase classifier output.
 //! - `facts.version.effective_version` matches the wire integer.
-//! - `location.mined.block_height` matches the tip height the coinbase was
-//!   sampled from.
+//! - `location.mined.location.block_height` matches the tip height the
+//!   coinbase was sampled from.
 //!
 //! Mainnet is opt-in via `require_live_for([Network::ZcashMainnet])`.
 
@@ -40,8 +40,9 @@ use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
 use zinder_proto::v1::explorer::{
     PrivacyShape as WirePrivacyShape, TransactionDetailRequest, TransactionVersionKind,
-    explorer_query_server::ExplorerQuery as ExplorerQueryService, transaction_location,
+    explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
+use zinder_proto::v1::wallet::transaction_location;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{NodeSource as _, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, SecondaryChainStore};
@@ -125,14 +126,21 @@ fn assert_response_invariants(
         .location
         .as_ref()
         .ok_or_else(|| eyre!("missing location"))?;
-    let mined_location = match &location.kind {
-        Some(transaction_location::Kind::Mined(mined)) => mined,
-        Some(transaction_location::Kind::InMempool(_)) | None => {
+    let mined_block_location = match &location.location {
+        Some(transaction_location::Location::Mined(mined)) => mined
+            .location
+            .as_ref()
+            .ok_or_else(|| eyre!("mined transaction missing block location"))?,
+        Some(
+            transaction_location::Location::InMempool(_)
+            | transaction_location::Location::Conflicting(_),
+        )
+        | None => {
             return Err(eyre!("expected mined location for tip-block coinbase"));
         }
     };
     assert_eq!(
-        BlockHeight::new(mined_location.block_height),
+        BlockHeight::new(mined_block_location.block_height),
         fixture.sample_block_height,
     );
     assert!(facts.size_bytes > 0);

@@ -49,6 +49,7 @@ type ChainEventsStream = WalletGrpcStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
 type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspentOutput>;
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
+type CompactBlocksInRangeStream = WalletGrpcStream<wallet::CompactBlocksInRangeChunk>;
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
@@ -131,7 +132,7 @@ impl<QueryApi> wallet_query_server::WalletQuery for WalletQueryGrpcAdapter<Query
 where
     QueryApi: Clone + WalletQueryApi + Send + Sync + 'static,
 {
-    type CompactBlockRangeStream = WalletGrpcStream<wallet::CompactBlockRangeChunk>;
+    type CompactBlocksInRangeStream = CompactBlocksInRangeStream;
     type ChainEventsStream = ChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
     type TransparentAddressUnspentOutputsStream = TransparentUnspentOutputsStream;
@@ -180,7 +181,7 @@ where
 
     async fn block_id_by_selector(
         &self,
-        request: Request<wallet::BlockIdBySelectorRequest>,
+        request: Request<wallet::BlockSelectorRequest>,
     ) -> Result<Response<wallet::BlockIdResponse>, Status> {
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
@@ -193,7 +194,7 @@ where
 
     async fn block_header_by_selector(
         &self,
-        request: Request<wallet::BlockIdBySelectorRequest>,
+        request: Request<wallet::BlockSelectorRequest>,
     ) -> Result<Response<wallet::BlockHeaderResponse>, Status> {
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
@@ -224,10 +225,10 @@ where
         .map(Response::new)
     }
 
-    async fn compact_block_range(
+    async fn compact_blocks_in_range(
         &self,
-        request: Request<wallet::CompactBlockRangeRequest>,
-    ) -> Result<Response<Self::CompactBlockRangeStream>, Status> {
+        request: Request<wallet::CompactBlocksInRangeRequest>,
+    ) -> Result<Response<Self::CompactBlocksInRangeStream>, Status> {
         let request = request.into_inner();
         let block_range = BlockHeightRange::inclusive(
             BlockHeight::new(request.start_height),
@@ -235,18 +236,18 @@ where
         );
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
 
-        let compact_block_range = self
+        let compact_blocks_in_range = self
             .query_api
-            .compact_block_range(block_range, at_epoch)
+            .compact_blocks_in_range(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chain_view = build_chain_view_message(compact_block_range.chain_epoch);
+        let chain_view = build_chain_view_message(compact_blocks_in_range.chain_epoch);
         let compact_block_chunks =
-            compact_block_range
+            compact_blocks_in_range
                 .compact_blocks
                 .into_iter()
                 .map(move |compact_block| {
-                    Ok(wallet::CompactBlockRangeChunk {
+                    Ok(wallet::CompactBlocksInRangeChunk {
                         chain_view: Some(chain_view.clone()),
                         compact_block: Some(build_compact_block_message(compact_block)),
                     })

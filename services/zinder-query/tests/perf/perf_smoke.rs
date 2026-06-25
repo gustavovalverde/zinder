@@ -38,7 +38,7 @@ async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::R
 
     let start = Instant::now();
     let response = wallet_query
-        .compact_block_range(
+        .compact_blocks_in_range(
             BlockHeightRange::inclusive(
                 BlockHeight::new(1),
                 BlockHeight::new(PERF_SMOKE_BLOCK_COUNT),
