@@ -132,6 +132,34 @@ fn tampered_mempool_event_cursor_is_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Resuming from the most recent event returns nothing, rather than rejecting
+/// the cursor as ahead of history when its sequence equals the current tip.
+#[test]
+fn mempool_event_history_resume_from_latest_event_is_empty() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+    let chain_epoch = synthetic_chain_epoch(1);
+
+    let _first = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA0, chain_epoch),
+        },
+        UnixTimestampMillis::new(1_000),
+    )?;
+    let latest = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA1, chain_epoch),
+        },
+        UnixTimestampMillis::new(2_000),
+    )?;
+
+    let resumed = store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(
+        Some(&latest.cursor),
+    ))?;
+    assert!(resumed.is_empty());
+    Ok(())
+}
+
 /// Atomicity: idempotent floor advancement on resumed prune.
 ///
 /// When a prune pass observes that the floor must advance but no physical
