@@ -36,12 +36,11 @@
 use prost::Message as _;
 use zinder_core::wire::{
     encode_address_script_hash, encode_height_key_ascending, encode_in_block_position,
-    encode_rpc_transaction_id_hex,
 };
 use zinder_core::{BlockHeight, TransparentAddressScriptHash};
 use zinder_proto::v1::explorer::TransparentAddressDeltasRecord;
 
-use crate::consumer::address_value_event::address_value_events;
+use crate::consumer::address_value_event::{address_value_events, transaction_ids_by_position};
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
@@ -237,17 +236,6 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
         ctx.batch.delete_cf(&index_cf, index_key);
         Ok(())
     }
-}
-
-fn transaction_ids_by_position(block: &BlockCommitContext) -> Vec<String> {
-    let mut transaction_ids = vec![String::new(); block.transactions.len()];
-    for transaction in &block.transactions {
-        if let Some(slot) = transaction_ids.get_mut(transaction.location.tx_index_in_block as usize)
-        {
-            *slot = encode_rpc_transaction_id_hex(transaction.location.transaction_id);
-        }
-    }
-    transaction_ids
 }
 
 /// Consumer-specific failure modes [`TransparentAddressDeltasConsumer`] can

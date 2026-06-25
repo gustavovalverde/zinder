@@ -1,13 +1,13 @@
 //! Epoch-bound chain artifact reader.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
     CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
     TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
-    TransparentUtxoSetSummary, TreeStateArtifact,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
+    TransparentUnspentOutput, TransparentUtxoSetSummary, TreeStateArtifact,
 };
 
 use crate::{
@@ -294,6 +294,38 @@ impl<'store> ChainEpochReader<'store> {
             self.chain_epoch,
             outpoints,
         )
+    }
+
+    /// Resolves the unspent transparent outputs among `outpoints` at this
+    /// epoch.
+    ///
+    /// An outpoint is kept only when its output is present and carries no
+    /// canonical spend fact at the pinned epoch. Duplicate input outpoints
+    /// yield at most one entry, preserving first-seen order. Each kept entry's
+    /// `output` is always populated.
+    pub fn transparent_unspent_outputs_by_outpoints(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<Vec<TransparentOutputEntry>, StoreError> {
+        let outputs_by_outpoint = self.transparent_outputs_by_outpoints(outpoints)?;
+        let spends_by_outpoint = self.transparent_spend_facts_by_outpoints(outpoints)?;
+
+        let mut entries = Vec::with_capacity(outputs_by_outpoint.len());
+        let mut seen = HashSet::with_capacity(outputs_by_outpoint.len());
+        for outpoint in outpoints {
+            if spends_by_outpoint.contains_key(outpoint) {
+                continue;
+            }
+            if let Some(output) = outputs_by_outpoint.get(outpoint)
+                && seen.insert(*outpoint)
+            {
+                entries.push(TransparentOutputEntry {
+                    outpoint: *outpoint,
+                    output: Some(output.clone().into_output()),
+                });
+            }
+        }
+        Ok(entries)
     }
 
     /// Resolves transparent spend facts from the current projection, skipping

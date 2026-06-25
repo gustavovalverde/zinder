@@ -316,6 +316,11 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
 /// Default maximum compact-block count returned by one range call.
 pub const DEFAULT_MAX_COMPACT_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
+/// Default maximum full-block count returned by one range call. A mainnet
+/// full block can reach ~2 MB, so this bounds the buffered range to a few
+/// hundred MB before streaming.
+pub const DEFAULT_MAX_FULL_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
+
 /// Hard cap on the number of addresses one balance request may sum across.
 ///
 /// Each address fans out into one complete unspent-output read (and, in the
@@ -329,12 +334,15 @@ pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
 pub struct WalletQueryOptions {
     /// Maximum compact-block count returned by one range call.
     pub max_compact_block_range: NonZeroU32,
+    /// Maximum full-block count returned by one range call.
+    pub max_full_block_range: NonZeroU32,
 }
 
 impl Default for WalletQueryOptions {
     fn default() -> Self {
         Self {
             max_compact_block_range: DEFAULT_MAX_COMPACT_BLOCK_RANGE,
+            max_full_block_range: DEFAULT_MAX_FULL_BLOCK_RANGE,
         }
     }
 }
@@ -751,25 +759,7 @@ where
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
-
-            let outputs_by_outpoint = reader.transparent_outputs_by_outpoints(&outpoints)?;
-            let spends_by_outpoint = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
-
-            let mut entries = Vec::with_capacity(outputs_by_outpoint.len());
-            let mut seen = HashSet::with_capacity(outputs_by_outpoint.len());
-            for outpoint in outpoints {
-                if spends_by_outpoint.contains_key(&outpoint) {
-                    continue;
-                }
-                if let Some(output) = outputs_by_outpoint.get(&outpoint)
-                    && seen.insert(outpoint)
-                {
-                    entries.push(TransparentOutputEntry {
-                        outpoint,
-                        output: Some(output.clone().into_output()),
-                    });
-                }
-            }
+            let entries = reader.transparent_unspent_outputs_by_outpoints(&outpoints)?;
 
             Ok(TransparentUnspentOutputsByOutpointResponse {
                 chain_epoch,
@@ -793,7 +783,8 @@ where
     ) -> Result<CompactBlockRange, QueryError> {
         let started_at = Instant::now();
         let requested_blocks = block_range.into_iter().len();
-        if let Err(error) = validate_block_range(block_range, self.options) {
+        if let Err(error) = validate_block_range(block_range, self.options.max_compact_block_range)
+        {
             let query_outcome = Err(error);
             record_wallet_query_outcome(
                 "compact_blocks_in_range",
@@ -869,7 +860,7 @@ where
     ) -> Result<FullBlockRange, QueryError> {
         let started_at = Instant::now();
         let requested_blocks = block_range.into_iter().len();
-        if let Err(error) = validate_block_range(block_range, self.options) {
+        if let Err(error) = validate_block_range(block_range, self.options.max_full_block_range) {
             let query_outcome = Err(error);
             record_wallet_query_outcome(
                 "full_blocks_in_range",
@@ -2088,7 +2079,7 @@ fn artifact_unavailable(family: ArtifactFamily, key: ArtifactKey) -> QueryError 
 
 fn validate_block_range(
     block_range: BlockHeightRange,
-    options: WalletQueryOptions,
+    max_blocks: NonZeroU32,
 ) -> Result<(), QueryError> {
     if block_range.start > block_range.end {
         return Err(QueryError::InvalidBlockRange {
@@ -2098,7 +2089,7 @@ fn validate_block_range(
     }
 
     let requested = block_range.into_iter().len();
-    let maximum = u32_to_usize(options.max_compact_block_range.get());
+    let maximum = u32_to_usize(max_blocks.get());
     if requested > maximum {
         return Err(QueryError::CompactBlockRangeTooLarge { requested, maximum });
     }

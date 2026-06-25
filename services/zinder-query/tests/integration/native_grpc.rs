@@ -95,6 +95,7 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
         WalletQueryOptions {
             max_compact_block_range: NonZeroU32::new(1)
                 .ok_or_else(|| eyre!("invalid range limit"))?,
+            ..WalletQueryOptions::default()
         },
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());

@@ -543,6 +543,7 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
         WalletQueryOptions {
             max_compact_block_range: NonZeroU32::new(1)
                 .ok_or_else(|| eyre!("invalid range limit"))?,
+            ..WalletQueryOptions::default()
         },
     );
 

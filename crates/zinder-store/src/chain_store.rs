@@ -2594,7 +2594,9 @@ fn decode_raw_blob_retention_signal(signal_bytes: &[u8]) -> Result<RawBlobRetent
         0 => Ok(RawBlobRetention::None),
         1 => Ok(RawBlobRetention::Transactions),
         2 => Ok(RawBlobRetention::All),
-        _ => Err(corrupt("raw blob retention signal has unknown discriminant")),
+        _ => Err(corrupt(
+            "raw blob retention signal has unknown discriminant",
+        )),
     }
 }
 

@@ -22,6 +22,7 @@ use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQu
 use zinder_proto::wire::decode_transparent_delta_kind;
 use zinder_runtime::AuthenticatedChannel;
 
+use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -230,9 +231,4 @@ fn decode_event_index(key: &RowKey) -> Result<u32, Status> {
         .try_into()
         .map_err(|_| ExplorerError::internal("event-index segment not 4 bytes"))?;
     Ok(u32::from_be_bytes(index_bytes))
-}
-
-const fn clamp_max_entries(requested: u32, default: u32, cap: u32) -> u32 {
-    let target = if requested == 0 { default } else { requested };
-    if target > cap { cap } else { target }
 }

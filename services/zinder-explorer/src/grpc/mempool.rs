@@ -28,6 +28,7 @@ use zinder_proto::v1::wallet::{
 use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 
+use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -322,11 +323,6 @@ fn decode_activity_cursor(cursor: &[u8]) -> Result<Option<(u64, u32)>, Status> {
         u64::from_be_bytes(millis_bytes),
         u32::from_be_bytes(tail_bytes),
     )))
-}
-
-fn clamp_max_entries(requested: u32, default: u32, cap: u32) -> u32 {
-    let target = if requested == 0 { default } else { requested };
-    target.min(cap)
 }
 
 fn current_unix_millis() -> u64 {

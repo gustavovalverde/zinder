@@ -20,6 +20,7 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
+use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -161,9 +162,4 @@ fn join_paid_fees(
         }
     }
     Ok(())
-}
-
-const fn clamp_max_entries(requested: u32, default: u32, cap: u32) -> u32 {
-    let target = if requested == 0 { default } else { requested };
-    if target > cap { cap } else { target }
 }

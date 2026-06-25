@@ -31,14 +31,16 @@ use std::collections::HashMap;
 use prost::Message as _;
 use zinder_core::wire::{
     encode_address_script_hash, encode_height_key_ascending, encode_height_key_descending,
-    encode_in_block_position, encode_rpc_transaction_id_hex,
+    encode_in_block_position,
 };
 use zinder_core::{
     BlockHeight, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
-use crate::consumer::address_value_event::{AddressValueEventKind, address_value_events};
+use crate::consumer::address_value_event::{
+    AddressValueEventKind, address_value_events, transaction_ids_by_position,
+};
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
     DeriveConsumerName,
@@ -250,7 +252,7 @@ fn aggregate_address_rows(
         let key = (event.address_script_hash, event.in_block_position);
         let entry = accumulators.entry(key).or_insert_with(|| {
             let transaction_id = transaction_ids
-                .get(&event.in_block_position)
+                .get(event.in_block_position as usize)
                 .cloned()
                 .unwrap_or_default();
             RowAccumulator::new(transaction_id)
@@ -285,19 +287,6 @@ fn aggregate_address_rows(
             };
             let record = accumulator.into_record(block_time_unix_seconds, row_status);
             (key, record)
-        })
-        .collect()
-}
-
-fn transaction_ids_by_position(block: &BlockCommitContext) -> HashMap<u32, String> {
-    block
-        .transactions
-        .iter()
-        .map(|transaction| {
-            (
-                transaction.location.tx_index_in_block,
-                encode_rpc_transaction_id_hex(transaction.location.transaction_id),
-            )
         })
         .collect()
 }

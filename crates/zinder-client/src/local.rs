@@ -675,27 +675,9 @@ impl ChainIndex for LocalChainIndex {
         let outpoints = normalize_transparent_outpoints(outpoints)?;
         self.read_at_epoch(at_epoch_id, move |reader| {
             let chain_epoch = reader.chain_epoch();
-            let outputs_by_outpoint = reader
-                .transparent_outputs_by_outpoints(&outpoints)
+            let entries = reader
+                .transparent_unspent_outputs_by_outpoints(&outpoints)
                 .map_err(IndexerError::from_store_error)?;
-            let spends_by_outpoint = reader
-                .transparent_spend_facts_by_outpoints(&outpoints)
-                .map_err(IndexerError::from_store_error)?;
-            let mut entries = Vec::with_capacity(outputs_by_outpoint.len());
-            let mut seen = std::collections::HashSet::with_capacity(outputs_by_outpoint.len());
-            for outpoint in outpoints {
-                if spends_by_outpoint.contains_key(&outpoint) {
-                    continue;
-                }
-                if let Some(output) = outputs_by_outpoint.get(&outpoint)
-                    && seen.insert(outpoint)
-                {
-                    entries.push(zinder_core::TransparentOutputEntry {
-                        outpoint,
-                        output: Some(output.clone().into_output()),
-                    });
-                }
-            }
             Ok(zinder_core::TransparentUnspentOutputsByOutpointResponse {
                 chain_epoch,
                 entries,

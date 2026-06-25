@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use zinder_core::wire::encode_rpc_transaction_id_hex;
 use zinder_core::{TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 
@@ -128,6 +129,21 @@ pub(crate) fn address_value_events(
     }
 
     events
+}
+
+/// Maps each block-local transaction position to its RPC-hex transaction id.
+///
+/// Indexed by `in_block_position`; absent positions hold an empty string.
+#[must_use]
+pub(crate) fn transaction_ids_by_position(block: &BlockCommitContext) -> Vec<String> {
+    let mut transaction_ids = vec![String::new(); block.transactions.len()];
+    for transaction in &block.transactions {
+        if let Some(slot) = transaction_ids.get_mut(transaction.location.tx_index_in_block as usize)
+        {
+            *slot = encode_rpc_transaction_id_hex(transaction.location.transaction_id);
+        }
+    }
+    transaction_ids
 }
 
 #[cfg(test)]

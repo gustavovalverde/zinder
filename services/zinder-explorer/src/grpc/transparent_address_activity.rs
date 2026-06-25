@@ -25,6 +25,7 @@ use zinder_proto::v1::wallet::{
 };
 use zinder_runtime::AuthenticatedChannel;
 
+use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -278,9 +279,4 @@ fn network_matches(
                 Network::ZcashTestnet | Network::ZcashRegtest
             )
     )
-}
-
-const fn clamp_max_entries(requested: u32, default: u32, cap: u32) -> u32 {
-    let target = if requested == 0 { default } else { requested };
-    if target > cap { cap } else { target }
 }

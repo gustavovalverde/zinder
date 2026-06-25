@@ -973,7 +973,8 @@ mod server_info_tests {
 
     #[test]
     fn server_info_gates_blob_capabilities_on_retention() {
-        for (block_retained, transaction_retained) in [(false, false), (false, true), (true, true)] {
+        for (block_retained, transaction_retained) in [(false, false), (false, true), (true, true)]
+        {
             let capabilities = advertised_capabilities(block_retained, transaction_retained);
             assert_eq!(
                 advertises(&capabilities, WALLET_READ_FULL_BLOCK_AT_V1),
