@@ -3,7 +3,9 @@
     reason = "Integration test names describe the compatibility behavior under test."
 )]
 
+use async_trait::async_trait;
 use eyre::eyre;
+use parking_lot::Mutex;
 use prost::Message;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -14,19 +16,27 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHash, BlockHeight, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
-    BroadcastRejectionReason, BroadcastUnknown, ChainEpochId, ChainTipMetadata, Network,
-    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    TransactionBroadcastResult, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentSpendFact,
-    TransparentUnspentOutput,
+    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown,
+    ChainEpochId, ChainTipMetadata, Network, RawTransactionBytes, SUBTREE_LEAF_COUNT,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutputsByOutpointResponse, TransparentSpendFact, TransparentUnspentOutput,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
     compact_tx_streamer_server::CompactTxStreamer,
 };
 
-use zinder_query::WalletQuery;
+use zinder_query::{
+    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, CompactBlockRange,
+    LatestBlock, LatestSafeBlock, QueryError, RawTransaction, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQuery, WalletQueryApi,
+};
+use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
     open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
@@ -108,10 +118,18 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     assert_eq!(latest_block.height, 1);
     assert_eq!(block.height, 1);
     assert_eq!(block.vtx.len(), 1);
+    assert!(
+        block.chain_metadata.is_some(),
+        "GetBlock must retain commitment-tree sizes"
+    );
     assert_eq!(ranged_blocks.len(), 1);
     assert_eq!(ranged_blocks[0].height, 1);
     assert_eq!(ranged_blocks[0].vtx[0].vin.len(), 0);
     assert_eq!(ranged_blocks[0].vtx[0].vout.len(), 0);
+    assert!(
+        ranged_blocks[0].chain_metadata.is_some(),
+        "GetBlockRange must retain commitment-tree sizes"
+    );
     assert_eq!(tree_state.sapling_tree, "000000");
     assert_eq!(
         latest_tree_state_checkpoint.sapling_tree,
@@ -137,6 +155,369 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         lightd_info.upgrade_height > 0,
         "upgrade_height must reflect the active upgrade activation; got {}",
         lightd_info.upgrade_height
+    );
+
+    Ok(())
+}
+
+/// Both nullifiers-only RPCs must omit everything the deprecated lightwalletd
+/// contract excludes.
+///
+/// The redacted fields are block-level commitment-tree sizes
+/// (`chain_metadata`), transparent inputs and outputs, Sapling outputs, and the
+/// non-nullifier Orchard action fields. Only the shielded nullifiers survive.
+#[tokio::test]
+async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fields()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let single = adapter
+        .get_block_nullifiers(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let ranged = adapter
+        .get_block_range_nullifiers(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let ranged = collect_stream(ranged).await?;
+
+    let ranged_block = ranged
+        .first()
+        .ok_or_else(|| eyre!("GetBlockRangeNullifiers must return the indexed block"))?;
+    assert_nullifiers_only_redaction(&single)?;
+    assert_nullifiers_only_redaction(ranged_block)?;
+
+    Ok(())
+}
+
+/// Asserts one nullifiers-only compact block carries only shielded nullifiers
+/// and has every excluded field cleared.
+fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre::Result<()> {
+    assert!(
+        block.chain_metadata.is_none(),
+        "nullifiers-only responses must omit commitment-tree sizes"
+    );
+    let transaction = block
+        .vtx
+        .first()
+        .ok_or_else(|| eyre!("nullifiers-only block must retain the nullifier-bearing tx"))?;
+    assert_eq!(
+        transaction.vin.len(),
+        0,
+        "transparent inputs must be cleared"
+    );
+    assert_eq!(
+        transaction.vout.len(),
+        0,
+        "transparent outputs must be cleared"
+    );
+    assert_eq!(
+        transaction.outputs.len(),
+        0,
+        "Sapling outputs must be cleared"
+    );
+    assert_eq!(
+        transaction.spends.len(),
+        1,
+        "Sapling spend nullifiers must survive"
+    );
+    assert_eq!(transaction.spends[0].nf, vec![3; 32]);
+    let action = transaction
+        .actions
+        .first()
+        .ok_or_else(|| eyre!("Orchard action must survive in nullifier-only form"))?;
+    assert_eq!(
+        action.nullifier,
+        vec![9; 32],
+        "Orchard nullifier must survive"
+    );
+    assert!(action.cmx.is_empty(), "Orchard cmx must be cleared");
+    assert!(
+        action.ephemeral_key.is_empty(),
+        "Orchard ephemeralKey must be cleared"
+    );
+    assert!(
+        action.ciphertext.is_empty(),
+        "Orchard ciphertext must be cleared"
+    );
+    Ok(())
+}
+
+/// Records the `at_epoch_id` argument of every canonical read so a test can
+/// assert one handler pins all of its reads to a single chain epoch.
+#[derive(Clone)]
+struct EpochPinRecorder<Inner> {
+    inner: Inner,
+    recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
+}
+
+impl<Inner> EpochPinRecorder<Inner> {
+    fn new(inner: Inner) -> Self {
+        Self {
+            inner,
+            recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn record(&self, at_epoch_id: Option<ChainEpochId>) {
+        self.recorded_epoch_ids.lock().push(at_epoch_id);
+    }
+
+    fn recorded_epoch_ids(&self) -> Vec<Option<ChainEpochId>> {
+        self.recorded_epoch_ids.lock().clone()
+    }
+}
+
+#[async_trait]
+impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestBlock, QueryError> {
+        self.inner.latest_block(at_epoch_id).await
+    }
+
+    async fn latest_safe_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestSafeBlock, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.latest_safe_block(at_epoch_id).await
+    }
+
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockIdResponseValue, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.block_id_by_selector(selector, at_epoch_id).await
+    }
+
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockHeaderResponseValue, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .block_header_by_selector(selector, at_epoch_id)
+            .await
+    }
+
+    async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlock, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.compact_block_at(height, at_epoch_id).await
+    }
+
+    async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .compact_blocks_in_range(block_range, at_epoch_id)
+            .await
+    }
+
+    async fn transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionStatus, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.transaction(transaction_id, at_epoch_id).await
+    }
+
+    async fn transaction_at_block_index(
+        &self,
+        height: BlockHeight,
+        tx_index: u64,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Transaction, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transaction_at_block_index(height, tx_index, at_epoch_id)
+            .await
+    }
+
+    async fn raw_transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<RawTransaction, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .raw_transaction(transaction_id, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_outputs_by_outpoint(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_outputs_by_outpoint(outpoints, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_unspent_outputs(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_address_unspent_outputs(request, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        self.inner
+            .transparent_address_tx_ids_in_range(request)
+            .await
+    }
+
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_address_balance(addresses, at_epoch_id)
+            .await
+    }
+
+    async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.tree_state_at(height, at_epoch_id).await
+    }
+
+    async fn latest_tree_state_checkpoint(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.latest_tree_state_checkpoint(at_epoch_id).await
+    }
+
+    async fn subtree_roots(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<SubtreeRoots, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .subtree_roots(subtree_root_range, at_epoch_id)
+            .await
+    }
+
+    async fn chain_events(
+        &self,
+        from_cursor: Option<StreamCursorTokenV1>,
+        family: ChainEventStreamFamily,
+    ) -> Result<ChainEvents, QueryError> {
+        self.inner.chain_events(from_cursor, family).await
+    }
+
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastResult, QueryError> {
+        self.inner.broadcast_transaction(raw_transaction).await
+    }
+}
+
+/// The by-hash `GetTransaction` path issues two canonical reads.
+///
+/// The status lookup and the raw-transaction fetch must pin to the same chain
+/// epoch so the response cannot mix two chain states across a tip move.
+#[tokio::test]
+async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x77; 32]);
+    let transaction_payload = b"single-epoch-transaction-bytes".to_vec();
+    let store_fixture = acceptance_store_fixture_with_transaction_rows(
+        DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        |block| {
+            vec![FixtureTransactionRows::from_raw_transaction(
+                transaction_id,
+                block.height,
+                block.hash,
+                0,
+                transaction_payload.clone(),
+            )]
+        },
+    )?;
+    let recorder = EpochPinRecorder::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    ));
+    let adapter = LightwalletdGrpcAdapter::new(
+        recorder.clone(),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let transaction = adapter
+        .get_transaction(Request::new(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: transaction_id.as_bytes().to_vec(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(transaction.data, transaction_payload);
+    let recorded_pins = recorder.recorded_epoch_ids();
+    assert_eq!(
+        recorded_pins.len(),
+        2,
+        "the by-hash path issues two canonical reads"
+    );
+    let entry_epoch_id = recorded_pins
+        .first()
+        .copied()
+        .flatten()
+        .ok_or_else(|| eyre!("the first canonical read must be pinned to an epoch"))?;
+    assert!(
+        recorded_pins.iter().all(|pin| *pin == Some(entry_epoch_id)),
+        "every read in one handler must pin the same epoch; recorded {recorded_pins:?}"
     );
 
     Ok(())
@@ -1221,7 +1602,12 @@ fn acceptance_compact_block_payload(
                 ephemeral_key: vec![5; 32],
                 ciphertext: vec![6; 52],
             }],
-            actions: Vec::new(),
+            actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![9; 32],
+                cmx: vec![10; 32],
+                ephemeral_key: vec![11; 32],
+                ciphertext: vec![12; 52],
+            }],
             vin: vec![lightwalletd::CompactTxIn {
                 prevout_txid: vec![8; 32],
                 prevout_index: 1,

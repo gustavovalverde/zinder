@@ -198,6 +198,73 @@ async fn transaction_round_trips_through_get_transaction_by_hash() -> Result<()>
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    deprecated,
+    reason = "GetBlockRangeNullifiers is deprecated in the lightwalletd contract but the redaction parity must still hold for the wallets that call it."
+)]
+async fn block_range_nullifiers_omit_commitment_tree_sizes_like_reference() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+
+    let request = || BlockRange {
+        start: Some(BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }),
+        end: Some(BlockId {
+            height: PARITY_BLOCK_RANGE_END,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+    let zinder_blocks = drain_block_range(
+        zinder
+            .get_block_range_nullifiers(request())
+            .await?
+            .into_inner(),
+    )
+    .await
+    .map_err(|error| eyre!("zinder nullifier-range stream failed: {error}"))?;
+    let reference_blocks = drain_block_range(
+        reference
+            .get_block_range_nullifiers(request())
+            .await?
+            .into_inner(),
+    )
+    .await
+    .map_err(|error| eyre!("reference nullifier-range stream failed: {error}"))?;
+
+    for blocks in [&zinder_blocks, &reference_blocks] {
+        for block in blocks {
+            assert!(
+                block.chain_metadata.is_none(),
+                "nullifiers-only responses must omit commitment-tree sizes at height {}",
+                block.height,
+            );
+            for transaction in &block.vtx {
+                assert!(
+                    transaction.vin.is_empty() && transaction.vout.is_empty(),
+                    "nullifiers-only transparent data must be cleared at height {}",
+                    block.height,
+                );
+                assert!(
+                    transaction.outputs.is_empty(),
+                    "nullifiers-only Sapling outputs must be cleared at height {}",
+                    block.height,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn open_parity_clients() -> Result<
     Option<(
         CompactTxStreamerClient<tonic::transport::Channel>,

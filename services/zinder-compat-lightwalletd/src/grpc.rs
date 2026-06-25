@@ -167,17 +167,32 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
+    /// Resolves the visible chain epoch id at call time.
+    ///
+    /// Every lightwalletd handler pins all of its downstream canonical reads
+    /// to one epoch so a single logical response cannot straddle a reorg.
+    /// This resolves that epoch from the visible tip once at handler entry.
+    async fn entry_chain_epoch_id(&self) -> Result<ChainEpochId, Status> {
+        let latest_block = self
+            .query_api
+            .latest_block(None)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        Ok(latest_block.chain_epoch.id)
+    }
+
     /// Resolves a lightwalletd `BlockId` to a typed [`BlockHeight`].
     ///
     /// `BlockId { height, hash }` accepts three legacy shapes: height-only
     /// (`hash` empty), hash-only (`height = 0` with `hash` populated), and
     /// height-with-hash (both populated; the hash is verified after the read).
     /// Hash-only resolves through the canonical best-chain
-    /// [`BlockSelector`] resolver; height-zero with empty hash returns
-    /// `Status::not_found`.
+    /// [`BlockSelector`] resolver, pinned to `at_epoch_id`; height-zero with
+    /// empty hash returns `Status::not_found`.
     async fn resolve_block_height(
         &self,
         block_id: &lightwalletd::BlockId,
+        at_epoch_id: ChainEpochId,
     ) -> Result<BlockHeight, Status> {
         let height_zero = block_id.height == 0;
         if !block_id.hash.is_empty() && height_zero {
@@ -188,12 +203,39 @@ where
                 .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
             let resolved = self
                 .query_api
-                .block_id_by_selector(BlockSelector::Hash(BlockHash::from_bytes(hash_bytes)), None)
+                .block_id_by_selector(
+                    BlockSelector::Hash(BlockHash::from_bytes(hash_bytes)),
+                    Some(at_epoch_id),
+                )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             return Ok(resolved.block_id.height);
         }
         block_height_from_id(block_id)
+    }
+
+    /// Reads one compact block for `block_id`, pinning the height resolution
+    /// and the block read to a single chain epoch.
+    async fn block_at_epoch(
+        &self,
+        block_id: &lightwalletd::BlockId,
+        at_epoch_id: ChainEpochId,
+    ) -> Result<lightwalletd::CompactBlock, Status> {
+        let height = self.resolve_block_height(block_id, at_epoch_id).await?;
+        let compact_block = self
+            .query_api
+            .compact_block_at(height, Some(at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let compact_block = decode_compact_block(&compact_block.compact_block.payload_bytes)?;
+
+        if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
+            return Err(Status::not_found(
+                "requested block hash does not match indexed block",
+            ));
+        }
+
+        Ok(compact_block)
     }
 
     async fn address_utxos(
@@ -315,29 +357,20 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let block_id = request.into_inner();
-        let height = self.resolve_block_height(&block_id).await?;
-        let compact_block = self
-            .query_api
-            .compact_block_at(height, None)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        let compact_block = decode_compact_block(&compact_block.compact_block.payload_bytes)?;
-
-        if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
-            return Err(Status::not_found(
-                "requested block hash does not match indexed block",
-            ));
-        }
-
-        Ok(Response::new(compact_block))
+        Ok(Response::new(
+            self.block_at_epoch(&block_id, at_epoch_id).await?,
+        ))
     }
 
     async fn get_block_nullifiers(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let compact_block = self.get_block(request).await?.into_inner();
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
+        let block_id = request.into_inner();
+        let compact_block = self.block_at_epoch(&block_id, at_epoch_id).await?;
         Ok(Response::new(prune_compact_block(
             compact_block,
             CompactBlockPoolSelection::shielded(),
@@ -351,12 +384,13 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let block_range_request = request.into_inner();
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_blocks_in_range(block_range, None)
+            .compact_blocks_in_range(block_range, Some(at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(
@@ -373,11 +407,12 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         let compact_block_range = self
             .query_api
-            .compact_blocks_in_range(block_range, None)
+            .compact_blocks_in_range(block_range, Some(at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(Response::new(stream_compact_blocks(
@@ -392,32 +427,30 @@ where
         &self,
         request: Request<lightwalletd::TxFilter>,
     ) -> Result<Response<lightwalletd::RawTransaction>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let filter = request.into_inner();
 
-        let (chain_epoch, location) = if let Some(block_id) = filter.block.as_ref() {
-            let height = self.resolve_block_height(block_id).await?;
+        let location = if let Some(block_id) = filter.block.as_ref() {
+            let height = self.resolve_block_height(block_id, at_epoch_id).await?;
             let response = self
                 .query_api
-                .transaction_at_block_index(height, filter.index, None)
+                .transaction_at_block_index(height, filter.index, Some(at_epoch_id))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            (response.chain_epoch, response.transaction)
+            response.transaction
         } else {
             let transaction_id = decode_internal_transaction_id(&filter.hash)
                 .map_err(|error| wire_decode_error_to_status(&error))?;
             let response = self
                 .query_api
-                .transaction(transaction_id, None)
+                .transaction(transaction_id, Some(at_epoch_id))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            (
-                response.chain_epoch,
-                mined_location_from_status(response.status)?,
-            )
+            mined_location_from_status(response.status)?
         };
 
         Ok(Response::new(
-            raw_transaction_from_location(&self.query_api, chain_epoch.id, location).await?,
+            raw_transaction_from_location(&self.query_api, at_epoch_id, location).await?,
         ))
     }
 
@@ -472,6 +505,7 @@ where
             .latest_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
+        let at_epoch_id = latest_block.chain_epoch.id;
         let typed_request =
             transparent_address_tx_history_request(&filter, latest_block.chain_epoch.network)?;
         let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
@@ -479,14 +513,12 @@ where
         for artifact in history {
             let response = self
                 .query_api
-                .transaction(artifact.transaction_id, Some(latest_block.chain_epoch.id))
+                .transaction(artifact.transaction_id, Some(at_epoch_id))
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
             let location = mined_location_from_status(response.status)?;
-            raw_transactions.push(
-                raw_transaction_from_location(&self.query_api, response.chain_epoch.id, location)
-                    .await,
-            );
+            raw_transactions
+                .push(raw_transaction_from_location(&self.query_api, at_epoch_id, location).await);
         }
         Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
     }
@@ -605,11 +637,12 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let block_id = request.into_inner();
-        let height = self.resolve_block_height(&block_id).await?;
+        let height = self.resolve_block_height(&block_id, at_epoch_id).await?;
         let tree_state = self
             .query_api
-            .tree_state_at(height, None)
+            .tree_state_at(height, Some(at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
@@ -635,6 +668,7 @@ where
         &self,
         request: Request<lightwalletd::GetSubtreeRootsArg>,
     ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
+        let at_epoch_id = self.entry_chain_epoch_id().await?;
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
         let max_entries =
@@ -647,7 +681,7 @@ where
                     SubtreeRootIndex::new(request.start_index),
                     max_entries,
                 ),
-                None,
+                Some(at_epoch_id),
             )
             .await
             .map_err(|error| status_from_query_error(&error))?;
@@ -813,6 +847,12 @@ fn prune_compact_block(
     pool_selection: CompactBlockPoolSelection,
     payload_mode: CompactBlockPayloadMode,
 ) -> lightwalletd::CompactBlock {
+    // The nullifiers-only contract excludes commitment tree sizes: the
+    // GetBlockNullifiers / GetBlockRangeNullifiers responses must not leak the
+    // witness-construction tree sizes carried in chain_metadata.
+    if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
+        compact_block.chain_metadata = None;
+    }
     compact_block.vtx = compact_block
         .vtx
         .into_iter()
