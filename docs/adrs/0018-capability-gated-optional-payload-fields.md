@@ -87,6 +87,34 @@ convention. Specifically:
 | `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
 | `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not resolved") |
+| `MinedTransaction.raw_transaction_bytes` | `wallet.read.transaction_bytes_v1` | (none; absence means "transaction blob not retained") |
+
+`MinedTransaction.raw_transaction_bytes` is the wallet-surface example.
+The field is `optional bytes`, gated on the `RequiresTransactionBlobs`
+advertise policy. The handler reads the transaction blob from the store
+and carries its `Option<Vec<u8>>` straight into the field: `None` when no
+blob is retained, `Some(bytes)` when it is. The gate is the store's
+persisted raw-blob retention, surfaced through `WalletQuery.ServerInfo`.
+
+## Advertise policies gated on persisted blob retention
+
+Blob-serving wallet capabilities are gated on the retention the writer
+persisted, not advertised unconditionally:
+
+- `RequiresBlockBlobs` advertises `wallet.read.full_block_at_v1` and
+  `wallet.read.full_block_range_v1` when the store retains full block
+  blobs (ingest `raw_blob_policy = all`).
+- `RequiresTransactionBlobs` advertises
+  `wallet.read.transaction_bytes_v1` when the store retains transaction
+  blobs (ingest `raw_blob_policy` in `{transactions, all}`).
+
+The signal travels in a `StorageControl` `raw_blob_policy` singleton
+(key byte 16, one-byte value: `0 = none`, `1 = transactions`,
+`2 = all`). The primary writer persists it on every open inside the
+control lock; readers read it. An absent key on a legacy store reads
+back as `none`, so the deployment advertises the minimum until the next
+ingest restart persists the real signal. The signal needs no schema
+bump: `StorageControl` is an unstructured key-value bag.
 
 ## Consequences
 
@@ -104,3 +132,12 @@ convention. Specifically:
   flag, the binary adds a new named gate next to the existing ones,
   `advertised_capabilities()` adds one `if flag` arm, and the
   capability string lights up only when the gate is true.
+
+## Revision history
+
+- 2026-06-25: Added the wallet-surface field capability
+  `wallet.read.transaction_bytes_v1` gating `MinedTransaction
+  .raw_transaction_bytes` (`bytes` to `optional bytes`), the
+  `RequiresBlockBlobs` and `RequiresTransactionBlobs` advertise policies,
+  and the `StorageControl` `raw_blob_policy` singleton the writer persists
+  for reader-side capability discovery.

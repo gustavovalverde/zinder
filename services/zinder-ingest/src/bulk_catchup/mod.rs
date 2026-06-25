@@ -235,6 +235,7 @@ where
 {
     let store_options = ChainStoreOptions {
         rocksdb_resource_budget: config.canonical_rocksdb_budget,
+        raw_blob_retention: config.raw_blob_policy.to_retention(),
         ..ChainStoreOptions::for_network(config.node.network)
     };
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
@@ -608,6 +609,7 @@ where
 {
     let store_options = ChainStoreOptions {
         rocksdb_resource_budget: config.canonical_rocksdb_budget,
+        raw_blob_retention: config.raw_blob_policy.to_retention(),
         ..ChainStoreOptions::for_network(config.node.network)
     };
     validate_bulk_catchup_finality_bound(

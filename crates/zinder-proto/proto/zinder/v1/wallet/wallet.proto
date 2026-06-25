@@ -425,10 +425,12 @@ message MinedTransaction {
   // Serialized consensus transaction bytes. Carries the same value the
   // mempool arm exposes as `MempoolTransaction.payload_bytes`, so a verbose
   // mined-transaction read (serialized bytes plus mined location plus
-  // confirmations) is answered by this one response. Empty when the
+  // confirmations) is answered by this one response. Absent when the
   // deployment does not retain raw transaction blobs (ingest `raw_blob_policy`
-  // is `none`); present when the policy is `transactions` or `all`.
-  bytes raw_transaction_bytes = 3;
+  // is `none`); present when the policy is `transactions` or `all`. Gated by
+  // the `wallet.read.transaction_bytes_v1` capability; clients branch on
+  // presence.
+  optional bytes raw_transaction_bytes = 3;
 }
 
 // Mempool-transaction response carrier.

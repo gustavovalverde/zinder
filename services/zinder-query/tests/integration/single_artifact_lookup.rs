@@ -146,7 +146,7 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
     assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(
         mined.raw_transaction_bytes,
-        b"raw-transaction-bytes".to_vec(),
+        Some(b"raw-transaction-bytes".to_vec()),
         "the mined arm must carry the serialized transaction bytes alongside the location",
     );
     assert!(
@@ -185,8 +185,8 @@ async fn transaction_omits_bytes_when_blob_is_not_retained() -> eyre::Result<()>
         return Err(eyre!("expected mined transaction status, got {response:?}"));
     };
     assert!(
-        mined.raw_transaction_bytes.is_empty(),
-        "raw bytes are empty when the deployment does not retain transaction blobs",
+        mined.raw_transaction_bytes.is_none(),
+        "raw bytes are absent when the deployment does not retain transaction blobs",
     );
 
     Ok(())

@@ -234,6 +234,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
     }
     let cancel = CancellationToken::new();
+    let raw_blob_retention = store
+        .raw_blob_retention()
+        .map_err(QueryConfigError::Store)?;
+    let block_blobs_retained = raw_blob_retention.retains_block_blobs();
+    let transaction_blobs_retained = raw_blob_retention.retains_transaction_blobs();
     let server_info = zinder_query::ServerInfoSettings {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         transaction_broadcast_enabled,
@@ -242,6 +247,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         mempool_invalidated_retention_seconds: query_config.mempool_invalidated_retention_seconds(),
         upstream_node_capabilities,
         chain_value_pools_enabled,
+        block_blobs_retained,
+        transaction_blobs_retained,
         ..zinder_query::ServerInfoSettings::default()
     };
     let grpc_adapter = {

@@ -570,8 +570,7 @@ where
             );
             let raw_transaction_bytes = reader
                 .transaction_blob_by_id(transaction_id)?
-                .map(|blob| blob.raw_transaction_bytes)
-                .unwrap_or_default();
+                .map(|blob| blob.raw_transaction_bytes);
             Ok(TransactionStatus {
                 chain_epoch,
                 status: TxStatus::Mined(MinedTransaction::new(

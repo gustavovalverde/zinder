@@ -434,6 +434,7 @@ async fn run_ingest(
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let store_options = ChainStoreOptions {
         rocksdb_resource_budget: command_config.loop_config.canonical_rocksdb_budget,
+        raw_blob_retention: command_config.loop_config.raw_blob_policy.to_retention(),
         ..ChainStoreOptions::for_network(command_config.loop_config.node.network)
     };
     let store =

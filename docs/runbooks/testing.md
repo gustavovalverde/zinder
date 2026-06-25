@@ -800,6 +800,7 @@ wallet.read.tree_state_at_height_v1
 wallet.read.latest_tree_state_checkpoint_v1
 wallet.read.subtree_roots_in_range_v1
 wallet.read.transaction_by_id_v1
+wallet.read.transaction_bytes_v1
 wallet.read.server_info_v1
 wallet.broadcast.transaction_v1
 wallet.events.chain_v1

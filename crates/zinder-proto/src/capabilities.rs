@@ -52,11 +52,17 @@ pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
 pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
 /// Capability advertised for `WalletQuery.Transaction`.
 ///
-/// Covers the typed transaction-status response, including the mined arm's
-/// `raw_transaction_bytes`. The serialized bytes ride on this capability
-/// rather than a separate one; they are empty when the deployment does not
-/// retain transaction blobs (ingest `raw_blob_policy` is `none`).
+/// Covers the typed transaction-status response. The RPC always works; the
+/// optional `raw_transaction_bytes` field on the mined arm is gated
+/// separately by [`WALLET_READ_TRANSACTION_BYTES_V1`].
 pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_id_v1";
+/// Field capability gating `raw_transaction_bytes` on the mined arm of
+/// `WalletQuery.Transaction`.
+///
+/// Advertised when the store retains transaction blobs (ingest
+/// `raw_blob_policy` in `{transactions, all}`). When absent the field is
+/// `None`; clients branch on presence rather than empty-vs-populated bytes.
+pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
 pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
 /// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
@@ -338,26 +344,30 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when the in-process payment-disclosure verifier
     /// is enabled.
     RequiresPaymentDisclosureVerifier,
+    /// Wallet: advertised when the store retains full block blobs
+    /// (ingest `raw_blob_policy = all`).
+    RequiresBlockBlobs,
+    /// Wallet: advertised when the store retains transaction blobs
+    /// (ingest `raw_blob_policy` in `{transactions, all}`).
+    RequiresTransactionBlobs,
 }
 
 impl AdvertisePolicy {
     /// Resolves a `WalletQuery` capability against `zinder-query` settings.
     ///
     /// Wallet capabilities use only the always-on, broadcaster, chain-event,
-    /// and chain-value-pool gates; the explorer-only variants never appear on
-    /// a [`CapabilitySurface::Wallet`] spec and resolve to `false`.
+    /// chain-value-pool, and blob-retention gates; the explorer-only variants
+    /// never appear on a [`CapabilitySurface::Wallet`] spec and resolve to
+    /// `false`.
     #[must_use]
-    pub fn wallet_satisfied(
-        self,
-        broadcaster_enabled: bool,
-        chain_events_enabled: bool,
-        chain_value_pools_enabled: bool,
-    ) -> bool {
+    pub fn wallet_satisfied(self, inputs: WalletAdvertiseInputs) -> bool {
         match self {
             Self::AlwaysOn => true,
-            Self::RequiresBroadcaster => broadcaster_enabled,
-            Self::RequiresChainEvents => chain_events_enabled,
-            Self::RequiresChainValuePools => chain_value_pools_enabled,
+            Self::RequiresBroadcaster => inputs.broadcaster_enabled,
+            Self::RequiresChainEvents => inputs.chain_events_enabled,
+            Self::RequiresChainValuePools => inputs.chain_value_pools_enabled,
+            Self::RequiresBlockBlobs => inputs.block_blobs_retained,
+            Self::RequiresTransactionBlobs => inputs.transaction_blobs_retained,
             Self::RequiresWalletQuery
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
@@ -385,7 +395,9 @@ impl AdvertisePolicy {
             Self::RequiresPaymentDisclosureVerifier => readiness.payment_disclosure_verifier_online,
             Self::RequiresBroadcaster
             | Self::RequiresChainEvents
-            | Self::RequiresChainValuePools => false,
+            | Self::RequiresChainValuePools
+            | Self::RequiresBlockBlobs
+            | Self::RequiresTransactionBlobs => false,
         }
     }
 
@@ -404,9 +416,34 @@ impl AdvertisePolicy {
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
             | Self::RequiresPrevoutResolution
-            | Self::RequiresPaymentDisclosureVerifier => false,
+            | Self::RequiresPaymentDisclosureVerifier
+            | Self::RequiresBlockBlobs
+            | Self::RequiresTransactionBlobs => false,
         }
     }
+}
+
+/// Inputs the wallet plane resolves an [`AdvertisePolicy`] against.
+///
+/// Each field mirrors a gate the `WalletQuery` `ServerInfo` builder already
+/// tracks. The query plane constructs this directly per request, so it is not
+/// `#[non_exhaustive]`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Each bool is an independent wallet advertisement gate, not a state machine."
+)]
+pub struct WalletAdvertiseInputs {
+    /// A transaction broadcaster is configured.
+    pub broadcaster_enabled: bool,
+    /// The chain-event stream is served.
+    pub chain_events_enabled: bool,
+    /// The upstream node reports chain value-pool totals.
+    pub chain_value_pools_enabled: bool,
+    /// The store retains full block blobs.
+    pub block_blobs_retained: bool,
+    /// The store retains transaction blobs.
+    pub transaction_blobs_retained: bool,
 }
 
 /// Readiness inputs the explorer plane resolves an [`AdvertisePolicy`] against.
@@ -513,13 +550,13 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_FULL_BLOCK_AT_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.FullBlock"),
-        AdvertisePolicy::AlwaysOn,
+        AdvertisePolicy::RequiresBlockBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_FULL_BLOCK_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.FullBlocksInRange"),
-        AdvertisePolicy::AlwaysOn,
+        AdvertisePolicy::RequiresBlockBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_TREE_STATE_AT_HEIGHT_V1,
@@ -544,6 +581,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.Transaction"),
         AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_TRANSACTION_BYTES_V1,
+        CapabilitySurface::Wallet,
+        None,
+        AdvertisePolicy::RequiresTransactionBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_SERVER_INFO_V1,

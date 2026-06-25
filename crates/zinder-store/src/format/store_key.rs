@@ -91,6 +91,10 @@ impl StoreKey {
         Self(vec![KEY_VERSION, 15])
     }
 
+    pub(crate) fn raw_blob_retention() -> Self {
+        Self(vec![KEY_VERSION, 16])
+    }
+
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
@@ -693,12 +697,13 @@ mod tests {
             StoreKey::mempool_event_sequence_pointer(),
             StoreKey::oldest_retained_mempool_event_sequence(),
             StoreKey::transparent_retention_swept_height(),
+            StoreKey::raw_blob_retention(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 8);
+        assert_eq!(storage_control_keys.len(), 9);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),

@@ -219,7 +219,9 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
                         block_time: 1_774_670_000,
                         confirmations: 6,
                     }),
-                    raw_transaction_bytes: vec![0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef],
+                    raw_transaction_bytes: Some(vec![
+                        0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef,
+                    ]),
                 },
             )),
         }),
@@ -247,8 +249,33 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
     );
     assert_eq!(
         mined.raw_transaction_bytes,
-        vec![0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef],
+        Some(vec![0x05, 0x00, 0x00, 0x80, 0xde, 0xad, 0xbe, 0xef]),
         "the mined arm must round-trip its serialized transaction bytes",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mined_transaction_round_trips_absent_raw_transaction_bytes() -> eyre::Result<()> {
+    let mined = wallet::MinedTransaction {
+        location: Some(wallet::MinedBlockLocation {
+            transaction_id: "ab".repeat(32),
+            block_height: 42,
+            block_hash: "cd".repeat(32),
+            tx_index_in_block: 3,
+        }),
+        details: Some(wallet::MinedDetails {
+            consensus_branch_id: 0xc2d6_d0b4,
+            block_time: 1_774_670_000,
+            confirmations: 6,
+        }),
+        raw_transaction_bytes: None,
+    };
+    let decoded = round_trip(&mined)?;
+    assert_eq!(
+        decoded.raw_transaction_bytes, None,
+        "an absent raw-transaction-bytes field must round-trip as None, not empty bytes",
     );
 
     Ok(())

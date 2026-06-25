@@ -427,8 +427,7 @@ impl ChainIndex for LocalChainIndex {
                 let raw_transaction_bytes = reader
                     .transaction_blob_by_id(transaction_id)
                     .map_err(IndexerError::from_store_error)?
-                    .map(|blob| blob.raw_transaction_bytes)
-                    .unwrap_or_default();
+                    .map(|blob| blob.raw_transaction_bytes);
                 Ok(TxStatus::Mined(MinedTransaction::new(
                     artifact.location,
                     details,

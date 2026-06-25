@@ -18,7 +18,9 @@ use zinder_core::{
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
+use zinder_proto::capabilities::{
+    CapabilitySurface, WalletAdvertiseInputs, capabilities_for_surface,
+};
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
@@ -42,6 +44,10 @@ use zinder_store::{
 /// Populated once at startup; the adapter does not call config-rs on each
 /// `ServerInfo` request.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Each bool is an independent advertisement or retention gate read once at startup, not a state machine."
+)]
 pub struct ServerInfoSettings {
     /// Network identifier such as `"zcash-mainnet"` or `"zcash-regtest"`.
     pub network: String,
@@ -73,6 +79,12 @@ pub struct ServerInfoSettings {
     /// Whether this deployment can proxy chain value-pool reads through the
     /// ingest writer's source handle.
     pub chain_value_pools_enabled: bool,
+    /// Whether the store retains full block blobs (ingest `raw_blob_policy`
+    /// is `all`).
+    pub block_blobs_retained: bool,
+    /// Whether the store retains transaction blobs (ingest `raw_blob_policy`
+    /// in `{transactions, all}`).
+    pub transaction_blobs_retained: bool,
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -107,6 +119,8 @@ impl Default for ServerInfoSettings {
             mempool_invalidated_retention_seconds: 0,
             upstream_node_capabilities: None,
             chain_value_pools_enabled: false,
+            block_blobs_retained: false,
+            transaction_blobs_retained: false,
         }
     }
 }
@@ -144,11 +158,13 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
         service_version: settings.service_version.clone(),
         capabilities: capabilities_for_surface(CapabilitySurface::Wallet)
             .filter(|spec| {
-                spec.policy.wallet_satisfied(
-                    settings.transaction_broadcast_enabled,
-                    settings.chain_events_enabled,
-                    settings.chain_value_pools_enabled,
-                )
+                spec.policy.wallet_satisfied(WalletAdvertiseInputs {
+                    broadcaster_enabled: settings.transaction_broadcast_enabled,
+                    chain_events_enabled: settings.chain_events_enabled,
+                    chain_value_pools_enabled: settings.chain_value_pools_enabled,
+                    block_blobs_retained: settings.block_blobs_retained,
+                    transaction_blobs_retained: settings.transaction_blobs_retained,
+                })
             })
             .map(|spec| spec.string.to_owned())
             .collect(),
@@ -885,6 +901,11 @@ fn native_shielded_protocol(
 
 #[cfg(test)]
 mod server_info_tests {
+    use zinder_proto::capabilities::{
+        WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
+        WALLET_READ_TRANSACTION_BY_ID_V1, WALLET_READ_TRANSACTION_BYTES_V1,
+    };
+
     use super::{ServerInfoSettings, UpstreamNodeCapabilities, build_wallet_server_info};
 
     #[test]
@@ -926,5 +947,47 @@ mod server_info_tests {
             unreachable!("common ops.ServerInfo field must always be set")
         };
         assert_eq!(common.network, "zcash-regtest");
+    }
+
+    fn advertised_capabilities(
+        block_blobs_retained: bool,
+        transaction_blobs_retained: bool,
+    ) -> Vec<String> {
+        let settings = ServerInfoSettings {
+            block_blobs_retained,
+            transaction_blobs_retained,
+            ..ServerInfoSettings::default()
+        };
+        let descriptor = build_wallet_server_info(&settings);
+        let Some(common) = descriptor.common else {
+            unreachable!("common ops.ServerInfo field must always be set")
+        };
+        common.capabilities
+    }
+
+    fn advertises(capabilities: &[String], capability: &str) -> bool {
+        capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
+    }
+
+    #[test]
+    fn server_info_gates_blob_capabilities_on_retention() {
+        for (block_retained, transaction_retained) in [(false, false), (false, true), (true, true)] {
+            let capabilities = advertised_capabilities(block_retained, transaction_retained);
+            assert_eq!(
+                advertises(&capabilities, WALLET_READ_FULL_BLOCK_AT_V1),
+                block_retained
+            );
+            assert_eq!(
+                advertises(&capabilities, WALLET_READ_FULL_BLOCK_RANGE_V1),
+                block_retained
+            );
+            assert_eq!(
+                advertises(&capabilities, WALLET_READ_TRANSACTION_BYTES_V1),
+                transaction_retained
+            );
+            assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V1));
+        }
     }
 }

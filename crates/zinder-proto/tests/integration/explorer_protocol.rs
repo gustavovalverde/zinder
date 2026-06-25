@@ -128,7 +128,7 @@ fn transaction_detail_response_embeds_shared_wallet_location() -> eyre::Result<(
                         block_time: 1_774_670_000,
                         confirmations: 12,
                     }),
-                    raw_transaction_bytes: Vec::new(),
+                    raw_transaction_bytes: None,
                 },
             )),
         }),

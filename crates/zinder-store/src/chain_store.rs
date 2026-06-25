@@ -61,6 +61,38 @@ use validation::{
     validate_reorg_window_change, validate_visible_chain_commit,
 };
 
+/// Raw-blob retention persisted by the writer and read by advertising readers.
+///
+/// The reader-facing projection of the ingest raw-blob policy. The writer maps
+/// its own policy type to this shape at the write boundary so the store crate
+/// stays free of the ingest config type. An absent signal on a legacy store
+/// reads back as [`RawBlobRetention::None`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RawBlobRetention {
+    /// Neither block nor transaction blobs are retained.
+    None,
+    /// Transaction blobs are retained; block blobs are not.
+    Transactions,
+    /// Both block and transaction blobs are retained.
+    All,
+}
+
+impl RawBlobRetention {
+    /// Whether full block blobs are retained (ingest `raw_blob_policy = all`).
+    #[must_use]
+    pub const fn retains_block_blobs(self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    /// Whether transaction blobs are retained (ingest `raw_blob_policy` in
+    /// {transactions, all}).
+    #[must_use]
+    pub const fn retains_transaction_blobs(self) -> bool {
+        matches!(self, Self::Transactions | Self::All)
+    }
+}
+
 /// Runtime options for [`PrimaryChainStore`] and [`SecondaryChainStore`].
 ///
 /// Construct one with [`ChainStoreOptions::for_network`] for production use, or
@@ -78,6 +110,8 @@ pub struct ChainStoreOptions {
     pub network: Option<Network>,
     /// Bounded `RocksDB` resource budget applied at open time.
     pub rocksdb_resource_budget: RocksDbResourceBudget,
+    /// Raw-blob retention the primary writer persists on open.
+    pub raw_blob_retention: RawBlobRetention,
 }
 
 impl ChainStoreOptions {
@@ -89,6 +123,7 @@ impl ChainStoreOptions {
             sync_writes: true,
             network: Some(network),
             rocksdb_resource_budget: RocksDbResourceBudget::canonical_writer_defaults(),
+            raw_blob_retention: RawBlobRetention::None,
         }
     }
 
@@ -104,6 +139,7 @@ impl ChainStoreOptions {
             sync_writes: false,
             network: Some(Network::ZcashRegtest),
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_retention: RawBlobRetention::None,
         }
     }
 }
@@ -429,6 +465,13 @@ impl PrimaryChainStore {
         self.store.inner.flush()
     }
 
+    /// Reads the persisted raw-blob retention signal.
+    ///
+    /// Returns [`RawBlobRetention::None`] when the store predates the signal.
+    pub fn raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
+        read_raw_blob_retention_signal(self.store.inner.as_ref())
+    }
+
     /// Reads the currently visible chain epoch.
     pub fn current_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         let cached = *self.cached_visible_chain_epoch.read();
@@ -645,6 +688,13 @@ impl SecondaryChainStore {
         Ok(Self { store })
     }
 
+    /// Reads the persisted raw-blob retention signal.
+    ///
+    /// Returns [`RawBlobRetention::None`] when the store predates the signal.
+    pub fn raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
+        read_raw_blob_retention_signal(self.store.inner.as_ref())
+    }
+
     /// Reads the currently visible chain epoch.
     pub fn current_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         self.store.current_chain_epoch()
@@ -730,6 +780,7 @@ impl ChainStoreInner {
             if let Some(network) = options.network {
                 ensure_store_metadata(&inner, network)?;
             }
+            persist_raw_blob_retention(&inner, options.raw_blob_retention)?;
             ensure_supported_artifact_schema(inner.as_ref())?;
             ensure_cursor_auth_key(&inner)?
         };
@@ -2521,6 +2572,53 @@ fn build_safe_tip_retention_sweep(
     })
 }
 
+fn encode_raw_blob_retention_signal(retention: RawBlobRetention) -> Vec<u8> {
+    let discriminant = match retention {
+        RawBlobRetention::None => 0,
+        RawBlobRetention::Transactions => 1,
+        RawBlobRetention::All => 2,
+    };
+    vec![discriminant]
+}
+
+fn decode_raw_blob_retention_signal(signal_bytes: &[u8]) -> Result<RawBlobRetention, StoreError> {
+    let corrupt = |reason: &'static str| StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::ChainEpoch,
+        key: StoreKey::raw_blob_retention().into(),
+        reason,
+    };
+    let [discriminant] = signal_bytes else {
+        return Err(corrupt("raw blob retention signal must be 1 byte"));
+    };
+    match discriminant {
+        0 => Ok(RawBlobRetention::None),
+        1 => Ok(RawBlobRetention::Transactions),
+        2 => Ok(RawBlobRetention::All),
+        _ => Err(corrupt("raw blob retention signal has unknown discriminant")),
+    }
+}
+
+fn persist_raw_blob_retention(
+    inner: &RocksChainStore,
+    retention: RawBlobRetention,
+) -> Result<(), StoreError> {
+    inner.write(vec![StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::raw_blob_retention(),
+        value: encode_raw_blob_retention_signal(retention),
+    }])
+}
+
+fn read_raw_blob_retention_signal(
+    inner: &impl RocksChainStoreRead,
+) -> Result<RawBlobRetention, StoreError> {
+    let key = StoreKey::raw_blob_retention();
+    let Some(signal_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
+        return Ok(RawBlobRetention::None);
+    };
+    decode_raw_blob_retention_signal(&signal_bytes)
+}
+
 fn transparent_retention_swept_height_put(height: BlockHeight) -> StoragePut {
     StoragePut {
         table: StorageTable::StorageControl,
@@ -3519,6 +3617,30 @@ mod tests {
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
         );
+    }
+
+    #[test]
+    fn raw_blob_retention_signal_round_trips_every_retention() -> Result<(), Box<dyn Error>> {
+        for retention in [
+            RawBlobRetention::None,
+            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
+        ] {
+            let encoded = encode_raw_blob_retention_signal(retention);
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(decode_raw_blob_retention_signal(&encoded)?, retention);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_blob_retention_signal_rejects_malformed_inputs() {
+        for malformed in [vec![], vec![0, 0], vec![3], vec![255]] {
+            assert!(matches!(
+                decode_raw_blob_retention_signal(&malformed),
+                Err(StoreError::ArtifactCorrupt { .. })
+            ));
+        }
     }
 
     #[test]

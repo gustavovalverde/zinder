@@ -664,6 +664,8 @@ Pre-1.0, replaced RPCs are deleted rather than aliased: a renamed method removes
 
 The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs). Each row binds a capability string to its surface (`Wallet`, `Explorer`, `Ingest`), the proto method it gates, and a declarative advertise policy. The three `ServerInfo` builders fold over the table filtered by surface and evaluate each row's policy against their own readiness; no service hand-maintains a parallel capability array. Two CI guards keep the table honest: `capability_descriptor_drift` cross-checks every row's proto-method binding against the compiled `FileDescriptorSet`, and `capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities` fails when the list below diverges from the wallet and explorer rows of the table.
 
+Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the wallet-plane `RequiresBroadcaster`, `RequiresChainEvents`, `RequiresChainValuePools`, `RequiresBlockBlobs`, and `RequiresTransactionBlobs`; and the explorer-plane readiness gates. `RequiresBlockBlobs` gates `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`; `RequiresTransactionBlobs` gates `wallet.read.transaction_bytes_v1` (the `MinedTransaction.raw_transaction_bytes` field). Both resolve against the store's persisted raw-blob retention, not against reader config: ingest persists the active `raw_blob_policy` into a `StorageControl` singleton on every primary open, and readers read it. A legacy store with no signal reads back as `none`, so a blob-serving capability is never advertised unless the store demonstrably retains the bytes. See [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md).
+
 <!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
 - `wallet.read.block_id_by_selector_v1`
@@ -676,6 +678,7 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `wallet.read.latest_tree_state_checkpoint_v1`
 - `wallet.read.subtree_roots_in_range_v1`
 - `wallet.read.transaction_by_id_v1`
+- `wallet.read.transaction_bytes_v1`
 - `wallet.read.server_info_v1`
 - `wallet.broadcast.transaction_v1`
 - `wallet.events.chain_v1`

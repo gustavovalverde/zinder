@@ -10,7 +10,8 @@ use zinder_core::{
     ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, SecondaryChainStore, StoreError,
+    ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, RawBlobRetention,
+    SecondaryChainStore, StoreError,
 };
 
 #[test]
@@ -175,6 +176,64 @@ fn checkpoint_round_trip_preserves_visible_epoch() -> eyre::Result<()> {
     assert_eq!(checkpoint.current_chain_epoch()?, Some(chain_epoch));
     let reader = checkpoint.current_chain_epoch_reader()?;
     assert_eq!(reader.block_header_at(BlockHeight::new(1))?, Some(block));
+
+    Ok(())
+}
+
+#[test]
+fn secondary_reads_persisted_raw_blob_retention_after_catch_up() -> eyre::Result<()> {
+    for retention in [
+        RawBlobRetention::None,
+        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
+    ] {
+        let tempdir = tempdir()?;
+        let primary_path = tempdir.path().join("primary");
+        let secondary_path = tempdir.path().join("secondary-query");
+        let primary = PrimaryChainStore::open(
+            &primary_path,
+            ChainStoreOptions {
+                raw_blob_retention: retention,
+                ..ChainStoreOptions::for_local_tests()
+            },
+        )?;
+        assert_eq!(primary.raw_blob_retention()?, retention);
+
+        let secondary = SecondaryChainStore::open(
+            &primary_path,
+            &secondary_path,
+            ChainStoreOptions::for_local_tests(),
+        )?;
+        secondary.try_catch_up()?;
+        assert_eq!(secondary.raw_blob_retention()?, retention);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn primary_reopen_overwrites_raw_blob_retention_signal() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let primary_path = tempdir.path().join("primary");
+    {
+        let primary = PrimaryChainStore::open(
+            &primary_path,
+            ChainStoreOptions {
+                raw_blob_retention: RawBlobRetention::None,
+                ..ChainStoreOptions::for_local_tests()
+            },
+        )?;
+        assert_eq!(primary.raw_blob_retention()?, RawBlobRetention::None);
+    }
+
+    let primary = PrimaryChainStore::open(
+        &primary_path,
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobRetention::All,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    )?;
+    assert_eq!(primary.raw_blob_retention()?, RawBlobRetention::All);
 
     Ok(())
 }

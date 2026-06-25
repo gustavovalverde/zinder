@@ -28,6 +28,7 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_source::{
     SourceBlock, block_header_info_from_raw_block_bytes, parse_transaction_public_facts,
 };
+use zinder_store::RawBlobRetention;
 
 const LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION: u32 = 1;
 const COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN: usize = 52;
@@ -61,6 +62,17 @@ impl RawBlobPolicy {
 
     const fn writes_transaction_blobs(self) -> bool {
         matches!(self, Self::Transactions | Self::All)
+    }
+
+    /// Maps the policy to the reader-facing retention signal the writer
+    /// persists for capability discovery.
+    #[must_use]
+    pub const fn to_retention(self) -> RawBlobRetention {
+        match self {
+            Self::None => RawBlobRetention::None,
+            Self::Transactions => RawBlobRetention::Transactions,
+            Self::All => RawBlobRetention::All,
+        }
     }
 }
 

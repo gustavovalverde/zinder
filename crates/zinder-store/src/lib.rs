@@ -42,8 +42,8 @@ pub use chain_store::{
     AddressOutputIndexPage, AddressOutputIndexPageRequest, CURRENT_ARTIFACT_SCHEMA_VERSION,
     ChainEpochReadApi, ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
     DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
-    PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, TransparentAddressTxIndexPage,
-    TransparentAddressTxIndexPageRequest,
+    PrimaryChainStore, RawBlobRetention, SecondaryCatchupOutcome, SecondaryChainStore,
+    TransparentAddressTxIndexPage, TransparentAddressTxIndexPageRequest,
 };
 pub use event_stream::{EventEnvelope, run_event_stream};
 pub use format::{
