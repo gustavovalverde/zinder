@@ -44,3 +44,10 @@ wallet_query_endpoint = "http://127.0.0.1:9101"
 
 [ops]
 listen_addr = "0.0.0.0:9069"
+
+# Required because the listen addresses above bind unspecified/public
+# interfaces. Zinder ships no server TLS (ADR-0006); the single-container
+# image fronts these ports with its nginx multiplexer. Without this the
+# binary refuses to start.
+[security]
+allow_public_bind = true

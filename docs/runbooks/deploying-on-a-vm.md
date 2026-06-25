@@ -124,7 +124,7 @@ grpcurl -plaintext localhost:9101 list
 
 ### 6. Front Zinder with a reverse proxy
 
-Zinder serves plaintext gRPC. Terminate TLS and apply auth/rate-limit at the proxy. Example Caddy config:
+Zinder serves plaintext gRPC. Terminate TLS and apply auth/rate-limit at the proxy. Because the listeners bind public or unspecified addresses, each binary requires `security.allow_public_bind = true` (`ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`) to start; the example configs fetched in step 1 already set it. Without a proxy in front, the plaintext ports are exposed directly. Example Caddy config:
 
 ```caddy
 zinder.example.org {

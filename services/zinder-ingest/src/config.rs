@@ -30,9 +30,11 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
     IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, RetentionSection, RetentionToml, ServiceIdentifier, StorageRoleSection,
-    StorageRoleToml, duration_as_millis_u64, require_field, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
+    ResolvedRetention, RetentionSection, RetentionToml, SecuritySection, SecurityToml,
+    ServiceIdentifier, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
+    resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::{MempoolEventRetentionConfig, RocksDbResourceBudget};
@@ -115,6 +117,7 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) allow_public_bind: bool,
     pub(crate) retention: ResolvedRetention,
 }
 
@@ -353,6 +356,7 @@ pub(crate) fn load_ingest_config(
             DEFAULT_RAW_BLOB_POLICY.as_kebab_case(),
         )?
         .with_ops_section(ServiceIdentifier::Ingest)?
+        .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -493,6 +497,7 @@ struct IngestConfig {
     ingest_control: IngestControlSection,
     retention: RetentionSection,
     backup: BackupSection,
+    security: SecuritySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -861,6 +866,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     } = resolve_ingest_control_writer(config.ingest_control)?;
     let retention = resolve_retention(config.retention)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
+    let allow_public_bind = resolve_allow_public_bind(config.security)?;
+    guard_optional_serving_bind(
+        "ingest_control.listen_addr",
+        ingest_control_listen_addr,
+        allow_public_bind,
+    )?;
+    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
     if source_segment_target_response_bytes > node_target.max_response_bytes {
         return Err(ConfigError::invalid(
@@ -934,6 +946,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
         ops_listen_addr,
+        allow_public_bind,
         retention,
     })
 }
@@ -963,6 +976,7 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
 struct RedactedIngestConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    security: SecurityToml,
     node: NodeToml,
     storage: IngestPrimaryStorageToml,
     ingest: IngestToml,
@@ -987,6 +1001,7 @@ impl RedactedIngestConfigToml {
         Self {
             network: NetworkToml::from_network(loop_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            security: SecurityToml::from_resolved(config.allow_public_bind),
             node: NodeToml::from_node_target(&loop_config.node),
             storage: IngestPrimaryStorageToml {
                 path: loop_config.storage_path.display().to_string(),

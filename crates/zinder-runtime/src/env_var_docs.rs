@@ -284,6 +284,24 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       endpoint entirely.",
     },
     EnvVarDoc {
+        name: "ZINDER_SECURITY__ALLOW_PUBLIC_BIND",
+        toml_path: "security.allow_public_bind",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Opts a binary in to binding its plaintext serving and operational \
+                      surfaces to a public or unspecified (`0.0.0.0`, `::`) address. Defaults \
+                      to `false`: a loopback or private-range bind is always allowed, but a \
+                      public or unspecified bind is refused at startup unless this is `true`. \
+                      Zinder ships no server TLS (ADR-0006); set this only when a reverse \
+                      proxy terminates TLS and authorization in front of the listener.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__LISTEN_ADDR",
         toml_path: "ingest_control.listen_addr",
         used_by: &["zinder-ingest"],

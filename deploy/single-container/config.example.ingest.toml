@@ -69,3 +69,10 @@ poll_interval_ms = 2000
 
 [ingest_control]
 listen_addr = "0.0.0.0:9100"
+
+# Required because the listen addresses above bind unspecified/public
+# interfaces. Zinder ships no server TLS (ADR-0006); the single-container
+# image fronts these ports with its nginx multiplexer. Without this the
+# binary refuses to start.
+[security]
+allow_public_bind = true

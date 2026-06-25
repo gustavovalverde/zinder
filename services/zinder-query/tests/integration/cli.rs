@@ -58,6 +58,56 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
 }
 
 #[test]
+fn public_listen_addr_without_opt_in_is_refused() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("query-public-bind-store");
+    let secondary_path = tempdir.path().join("query-public-bind-secondary");
+    let config_path = tempdir.path().join("zinder-query.toml");
+    fs::write(
+        &config_path,
+        query_config_with_public_listen_addr_toml(&storage_path, &secondary_path, false)?,
+    )?;
+
+    let output = zinder_query_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("query.listen_addr"), "{stderr}");
+    assert!(stderr.contains("security.allow_public_bind"), "{stderr}");
+
+    Ok(())
+}
+
+#[test]
+fn public_listen_addr_with_opt_in_validates_and_warns() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("query-public-bind-optin-store");
+    let secondary_path = tempdir.path().join("query-public-bind-optin-secondary");
+    let config_path = tempdir.path().join("zinder-query.toml");
+    fs::write(
+        &config_path,
+        query_config_with_public_listen_addr_toml(&storage_path, &secondary_path, true)?,
+    )?;
+
+    let output = zinder_query_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stdout.contains("listen_addr = \"0.0.0.0:9101\""),
+        "{stdout}"
+    );
+    assert!(stderr.contains("query.listen_addr"), "{stderr}");
+
+    Ok(())
+}
+
+#[test]
 fn storage_path_default_resolves_to_canonical_zinder_layout() -> eyre::Result<()> {
     // The binary's default for `storage.path` matches the canonical Zinder
     // layout under `/var/lib/zinder/store`. The default exists so the
@@ -140,6 +190,30 @@ secondary_path = "{}"
 
 [query]
 listen_addr = "127.0.0.1:9101"
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?,
+    ))
+}
+
+fn query_config_with_public_listen_addr_toml(
+    storage_path: &Path,
+    secondary_path: &Path,
+    allow_public_bind: bool,
+) -> eyre::Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+
+[query]
+listen_addr = "0.0.0.0:9101"
+
+[security]
+allow_public_bind = {allow_public_bind}
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,

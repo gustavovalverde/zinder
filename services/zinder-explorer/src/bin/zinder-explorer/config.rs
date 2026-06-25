@@ -8,8 +8,9 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
     OpsSection, OpsToml, ResolvedSecondaryStorage, SecondaryStorageSection, SecondaryStorageToml,
-    ServiceIdentifier, load_bearer_token, parse_socket_addr, require_field,
-    resolve_ops_listen_addr, resolve_secondary_storage,
+    SecuritySection, SecurityToml, ServiceIdentifier, guard_optional_serving_bind,
+    guard_serving_bind, load_bearer_token, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
 };
 use zinder_source::{NodeSection, NodeTarget};
 
@@ -22,6 +23,7 @@ pub(crate) struct ExplorerConfig {
     pub(crate) storage: ResolvedSecondaryStorage,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) allow_public_bind: bool,
     pub(crate) bearer_token_path: Option<PathBuf>,
     pub(crate) bearer_token: Option<BearerToken>,
     /// Wallet-query endpoint that backs the explorer's wallet-composed reads
@@ -96,6 +98,7 @@ pub(crate) fn load_explorer_config(
         )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
         .with_ops_section(ServiceIdentifier::Explorer)?
+        .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -133,6 +136,7 @@ struct ExplorerRawConfig {
     explorer: ExplorerSection,
     ops: OpsSection,
     node: NodeSection,
+    security: SecuritySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -147,6 +151,7 @@ struct ExplorerSection {
 struct ExplorerConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    security: SecurityToml,
     storage: SecondaryStorageToml,
     explorer: ExplorerToml,
 }
@@ -164,6 +169,7 @@ impl ExplorerConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: SecondaryStorageToml::from_resolved(&config.storage),
             explorer: ExplorerToml {
                 listen_addr: config.listen_addr.to_string(),
@@ -185,6 +191,9 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
     let bearer_token_path = raw.explorer.bearer_token_path;
     let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
+    let allow_public_bind = resolve_allow_public_bind(raw.security)?;
+    guard_serving_bind("explorer.listen_addr", listen_addr, allow_public_bind)?;
+    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let wallet_query_endpoint = raw
         .explorer
         .wallet_query_endpoint
@@ -195,6 +204,7 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         storage,
         listen_addr,
         ops_listen_addr,
+        allow_public_bind,
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,

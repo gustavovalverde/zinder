@@ -36,7 +36,9 @@ use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
 
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
-use crate::sections::{ServiceIdentifier, defaults::default_ops_listen_addr};
+use crate::sections::{
+    DEFAULT_ALLOW_PUBLIC_BIND, ServiceIdentifier, defaults::default_ops_listen_addr,
+};
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
@@ -408,6 +410,19 @@ impl ConfigLoader {
     /// `ZINDER_OPS__LISTEN_ADDR=` to the empty string).
     pub fn with_ops_section(self, service: ServiceIdentifier) -> Result<Self, ConfigError> {
         self.with_default("ops.listen_addr", default_ops_listen_addr(service))
+    }
+
+    /// Wires the shared `[security]` section with the default public-bind
+    /// posture.
+    ///
+    /// Every service binary calls this exactly once so the same default
+    /// applies uniformly: a binary started without any override refuses to
+    /// bind a plaintext serving surface to a public or unspecified address
+    /// (see [`guard_serving_bind`](crate::guard_serving_bind)). Operators
+    /// opt in by setting `security.allow_public_bind = true` (or
+    /// `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`).
+    pub fn with_security_section(self) -> Result<Self, ConfigError> {
+        self.with_default("security.allow_public_bind", DEFAULT_ALLOW_PUBLIC_BIND)
     }
 
     /// Records an override for `key` when `override_for_key` is `Some`.

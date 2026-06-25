@@ -4,6 +4,11 @@
 
 Accepted.
 
+## Revision history
+
+- 2026-06-25: Added the `[security]` shared section and the public-bind
+  refusal it carries (see [§Public-bind refusal](#public-bind-refusal)).
+
 ## Context
 
 Zinder ships four service binaries (`zinder-ingest`, `zinder-query`,
@@ -68,6 +73,10 @@ The eight shared sections at the time of writing are:
   one section that carries writer-side `listen_addr`, reader-side `addr`,
   and shared `bearer_token_path` (ADR-0006); each binary reads only what
   it needs
+- `[security]`
+  ([`SecuritySection`](../../crates/zinder-runtime/src/sections/security.rs)),
+  uniform across all four binaries, carrying the serving-surface
+  public-bind posture (see [§Public-bind refusal](#public-bind-refusal))
 - `[node]` and `[node.auth]` ([`NodeSection`](../../crates/zinder-source/src/node_target.rs),
   pre-existing in `zinder-source`)
 
@@ -91,6 +100,43 @@ as `pub const` functions keyed on
 Per-section retention/catchup constants live in the section module that
 consumes them; they are intentionally private because external callers
 work through the resolver, which already applies the defaults.
+
+### Public-bind refusal
+
+Zinder ships no server TLS (ADR-0006 assigns encryption and public
+exposure to a reverse proxy), so every serving and operational listener
+is plaintext. A listener bound to an unspecified (`0.0.0.0`, `::`) or
+globally-routable address exposes unauthenticated chain data directly to
+the network. The `[security] allow_public_bind` field gates that exposure.
+
+The guard lives in
+[`crates/zinder-runtime/src/bind_guard.rs`](../../crates/zinder-runtime/src/bind_guard.rs)
+and runs at config-validation time, once per resolved listen address
+(native gRPC `*.listen_addr`, `ops.listen_addr`, the IngestControl
+writer's `ingest_control.listen_addr`). Each address is classified with
+stable `std::net` predicates:
+
+- Loopback (`127.0.0.0/8`, `::1`) and private-range
+  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`,
+  `fe80::/10`) binds are always allowed. The private case keeps the
+  Railway private mesh and LAN development working without an opt-in.
+- Unspecified and globally-routable binds are refused with a
+  [`ConfigError::Invalid`](../../crates/zinder-runtime/src/config.rs)
+  naming the surface, the address, and the opt-in. When
+  `allow_public_bind = true`, the bind proceeds and the guard emits a
+  `tracing::warn!` (target `zinder::runtime`) naming the surface and
+  address. `is_global` is nightly-only, so "public" is defined as the
+  complement of the named ranges.
+
+The opt-in is a **runtime** flag, not a build feature. Zinder ships one
+container image that binds `0.0.0.0`/`[::]` behind a reverse proxy, so a
+build feature would always be compiled in and the guard would never fire.
+A runtime flag (default `false`) lets the single image stay built once
+while only the proxy-fronted deployment consciously opts in. Zinder's own
+`deploy/` Dockerfiles and example configs set
+`ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true` for exactly this reason; a
+deployment that binds a public or unspecified address without it now
+refuses to start.
 
 ### Env-var contract
 

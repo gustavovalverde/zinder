@@ -49,3 +49,9 @@ listen_addr = "0.0.0.0:9101"
 [query.grpc]
 enable_reflection = true
 enable_health = true
+
+# Required because query.listen_addr binds an unspecified/public interface.
+# Zinder ships no server TLS (ADR-0006); front this port with a reverse proxy.
+# Without this the binary refuses to start.
+[security]
+allow_public_bind = true

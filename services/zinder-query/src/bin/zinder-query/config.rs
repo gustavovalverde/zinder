@@ -10,9 +10,10 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlReaderToml,
     IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
     ResolvedIngestControlReader, ResolvedRetention, ResolvedSecondaryStorage, RetentionSection,
-    RetentionToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
-    parse_socket_addr, require_field, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_retention, resolve_secondary_storage,
+    RetentionToml, SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    ServiceIdentifier, guard_optional_serving_bind, guard_serving_bind, parse_socket_addr,
+    require_field, resolve_allow_public_bind, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_retention, resolve_secondary_storage,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
@@ -28,6 +29,7 @@ pub(crate) struct QueryConfig {
     pub(crate) retention: ResolvedRetention,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) allow_public_bind: bool,
     pub(crate) grpc: QueryGrpcConfig,
     /// Optional node broadcaster. Network must match `QueryConfig.network`
     /// when present; the resolver enforces this.
@@ -125,6 +127,7 @@ pub(crate) fn load_query_config(
         .with_default("query.grpc.enable_reflection", true)?
         .with_default("query.grpc.enable_health", true)?
         .with_ops_section(ServiceIdentifier::Query)?
+        .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -178,6 +181,7 @@ struct QueryRawConfig {
     ingest_control: IngestControlSection,
     query: QuerySection,
     node: NodeSection,
+    security: SecuritySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +215,9 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     )?;
     let enable_health = require_field(config.query.grpc.enable_health, "query.grpc.enable_health")?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
+    let allow_public_bind = resolve_allow_public_bind(config.security)?;
+    guard_serving_bind("query.listen_addr", listen_addr, allow_public_bind)?;
+    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let broadcaster =
         NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
 
@@ -223,6 +230,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         retention,
         listen_addr,
         ops_listen_addr,
+        allow_public_bind,
         grpc: QueryGrpcConfig {
             enable_reflection,
             enable_health,
@@ -235,6 +243,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
 struct QueryConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    security: SecurityToml,
     storage: SecondaryStorageToml,
     retention: RetentionToml,
     ingest_control: IngestControlReaderToml,
@@ -248,6 +257,7 @@ impl QueryConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: SecondaryStorageToml::from_resolved(&config.storage),
             retention: RetentionToml::from_resolved(config.retention),
             ingest_control: IngestControlReaderToml::from_resolved(

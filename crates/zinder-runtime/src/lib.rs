@@ -20,6 +20,7 @@
 //! It deliberately exposes no domain types.
 
 mod auth;
+mod bind_guard;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
@@ -35,6 +36,9 @@ mod transport;
 pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
     BearerTokenError, BearerTokenServerInterceptor,
+};
+pub use bind_guard::{
+    BindAddressClass, classify_bind_address, guard_optional_serving_bind, guard_serving_bind,
 };
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeToml,
@@ -60,13 +64,14 @@ pub use readiness::{
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
-    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, IngestControlReaderToml,
-    IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml, PrimaryStorageSection,
-    PrimaryStorageToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
-    ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
-    ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, SecondaryStorageSection, SecondaryStorageToml, ServiceIdentifier,
-    StorageRoleSection, StorageRoleToml, defaults as section_defaults,
+    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
+    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
+    PrimaryStorageSection, PrimaryStorageToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
+    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
+    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecondaryStorageSection,
+    SecondaryStorageToml, SecuritySection, SecurityToml, ServiceIdentifier, StorageRoleSection,
+    StorageRoleToml, defaults as section_defaults, resolve_allow_public_bind,
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_derive_reader_rocksdb_budget,
     resolve_derive_writer_rocksdb_budget, resolve_ingest_control_reader,

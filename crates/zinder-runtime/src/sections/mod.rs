@@ -10,6 +10,7 @@ pub mod defaults;
 mod ingest_control;
 mod ops;
 mod retention;
+mod security;
 mod service;
 mod storage;
 
@@ -20,6 +21,9 @@ pub use ingest_control::{
 };
 pub use ops::{OpsSection, OpsToml, resolve_ops_listen_addr};
 pub use retention::{ResolvedRetention, RetentionSection, RetentionToml, resolve_retention};
+pub use security::{
+    DEFAULT_ALLOW_PUBLIC_BIND, SecuritySection, SecurityToml, resolve_allow_public_bind,
+};
 pub use service::ServiceIdentifier;
 pub use storage::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, PrimaryStorageSection,

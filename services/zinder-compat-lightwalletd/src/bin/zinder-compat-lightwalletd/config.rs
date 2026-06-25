@@ -9,8 +9,10 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
     NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, ServiceIdentifier, parse_socket_addr, require_field,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    ResolvedIngestControlReader, SecuritySection, SecurityToml, ServiceIdentifier,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
@@ -25,6 +27,7 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
+    pub(crate) allow_public_bind: bool,
     pub(crate) broadcaster: Option<NodeTarget>,
 }
 
@@ -71,6 +74,7 @@ pub(crate) fn load_lightwalletd_config(
     let raw_config: LightwalletdRawConfig = ConfigLoader::new()
         .with_default("compat.listen_addr", "127.0.0.1:9067")?
         .with_ops_section(ServiceIdentifier::CompatLightwalletd)?
+        .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -113,6 +117,7 @@ struct LightwalletdRawConfig {
     ingest_control: IngestControlSection,
     compat: CompatSection,
     node: NodeSection,
+    security: SecuritySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,6 +139,9 @@ fn resolve_lightwalletd_config(
     let listen_addr_string = require_field(config.compat.listen_addr, "compat.listen_addr")?;
     let listen_addr = parse_socket_addr("compat.listen_addr", &listen_addr_string)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
+    let allow_public_bind = resolve_allow_public_bind(config.security)?;
+    guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
+    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let broadcaster =
         NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
 
@@ -145,6 +153,7 @@ fn resolve_lightwalletd_config(
         ingest_control_bearer_token,
         listen_addr,
         ops_listen_addr,
+        allow_public_bind,
         broadcaster,
     })
 }
@@ -153,6 +162,7 @@ fn resolve_lightwalletd_config(
 struct LightwalletdConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    security: SecurityToml,
     storage: CanonicalSecondaryStorageToml,
     ingest_control: IngestControlReaderToml,
     compat: CompatToml,
@@ -165,6 +175,7 @@ impl LightwalletdConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),

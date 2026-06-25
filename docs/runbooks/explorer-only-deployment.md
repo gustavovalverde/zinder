@@ -33,6 +33,7 @@ stay on a separate operational footprint (see
 | `ZINDER_STORAGE__SECONDARY_PATH` | Yes | Process-unique RocksDB secondary metadata path for this explorer process. |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | Yes | gRPC listen address (e.g. `0.0.0.0:9087`). |
 | `ZINDER_OPS__LISTEN_ADDR` | Yes | HTTP listen address for `/healthz`, `/readyz`, `/metrics`. |
+| `ZINDER_SECURITY__ALLOW_PUBLIC_BIND` | Yes when binding a public/unspecified address | Set to `true` because the listen addresses above bind `0.0.0.0`. Zinder ships no server TLS (ADR-0006); front the port with a reverse proxy. Without it the explorer refuses to start. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | Yes | gRPC URL of the upstream `zinder-query`. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | Optional | Path to a file containing the shared-secret bearer token. When set, every inbound gRPC request must carry `authorization: Bearer <token>`. |
 
@@ -89,6 +90,7 @@ Environment=ZINDER_STORAGE__PATH=/var/lib/zinder/store
 Environment=ZINDER_STORAGE__SECONDARY_PATH=/var/lib/zinder/explorer-secondary
 Environment=ZINDER_EXPLORER__LISTEN_ADDR=0.0.0.0:9087
 Environment=ZINDER_OPS__LISTEN_ADDR=0.0.0.0:9088
+Environment=ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 Environment=ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT=http://10.1.0.10:9085
 Environment=ZINDER_EXPLORER__BEARER_TOKEN_PATH=/etc/zinder/bearer-token
 Restart=on-failure
@@ -110,6 +112,7 @@ services:
       ZINDER_STORAGE__SECONDARY_PATH: /var/lib/zinder/explorer-secondary
       ZINDER_EXPLORER__LISTEN_ADDR: 0.0.0.0:9087
       ZINDER_OPS__LISTEN_ADDR: 0.0.0.0:9088
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
       ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: http://zinder-query:9085
       ZINDER_EXPLORER__BEARER_TOKEN_PATH: /run/secrets/bearer_token
     ports:
