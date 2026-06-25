@@ -101,6 +101,24 @@ fn compact_block_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn full_block_round_trips_through_prost() -> eyre::Result<()> {
+    let full_block = wallet::FullBlock {
+        height: 42,
+        block_hash: "33".repeat(32),
+        payload_bytes: vec![0x04, 0x05, 0x06],
+        parent_block_hash: "22".repeat(32),
+    };
+    let decoded_full_block = round_trip(&full_block)?;
+
+    assert_eq!(decoded_full_block.height, 42);
+    assert_eq!(decoded_full_block.block_hash, "33".repeat(32));
+    assert_eq!(decoded_full_block.payload_bytes, vec![0x04, 0x05, 0x06]);
+    assert_eq!(decoded_full_block.parent_block_hash, "22".repeat(32));
+
+    Ok(())
+}
+
+#[test]
 fn subtree_root_round_trips_through_prost() -> eyre::Result<()> {
     let subtree_root = wallet::SubtreeRoot {
         subtree_index: 9,

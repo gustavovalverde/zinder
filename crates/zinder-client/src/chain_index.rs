@@ -5,14 +5,15 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact, MempoolEntry, MempoolEvictionReason,
-    RawTransactionBytes, SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult,
-    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
+    BlockBlobArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
+    BlockSelector, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
+    MempoolEntry, MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact,
+    SubtreeRootRange, TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
+    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact,
+    TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -448,6 +449,47 @@ pub trait ChainIndex: Send + Sync + 'static {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError>;
+
+    /// Reads one full serialized block.
+    ///
+    /// Served only when the writer deployment retains block blobs
+    /// (`raw_blob_policy = "all"`). Heights with no retained blob return
+    /// [`IndexerError::NotFound`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let block = client.full_block_at(BlockHeight::new(0), None).await?;
+    /// # let _ = block; Ok(()) }
+    /// ```
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockBlobArtifact, IndexerError>;
+
+    /// Streams full serialized blocks for an inclusive range.
+    ///
+    /// Served only when the writer deployment retains block blobs
+    /// (`raw_blob_policy = "all"`); the stream errors on the first height with
+    /// no retained blob.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, BlockHeightRange, ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let range = BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(0));
+    /// let stream = client.full_blocks_in_range(range, None).await?;
+    /// # let _ = stream; Ok(()) }
+    /// ```
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError>;
 
     /// Reads the tree-state artifact at exactly `height`.
     ///

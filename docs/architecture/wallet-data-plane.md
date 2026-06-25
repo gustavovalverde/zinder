@@ -66,6 +66,12 @@ The native wallet protocol slices expose latest block metadata, compact block ra
 
 A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
 
+## Full Blocks
+
+Full-block-scanning wallets parse whole serialized blocks for inline transparent detection and shielded trial-decryption, so the wallet plane serves the consensus-serialized block bytes alongside the compact-block surface. `FullBlock(height, at_epoch_id)` returns one serialized block; `FullBlocksInRange(start, end, at_epoch_id)` streams them as `FullBlocksInRangeChunk` messages. The range mirrors `CompactBlocksInRange`: it pins one epoch for the whole stream, bounds size by `max_compact_block_range` before opening a reader, and repeats the `ChainView` at field tag 1 on every chunk rather than emitting a one-shot header.
+
+The bytes are served from the `BlockBlobArtifact` the canonical reader resolves. Block blobs are not unconditionally present: ingest writes them only when `raw_blob_policy` is `all`. The default policy `none` and the `transactions` policy both skip block blobs, so a `FullBlock` read at any height returns `ArtifactUnavailable` (gRPC `NOT_FOUND`) under those policies, and `FullBlocksInRange` aborts on the first unretained height. A deployment that serves full blocks must set `storage.raw_blob_policy = "all"` (env `ZINDER_STORAGE__RAW_BLOB_POLICY=all`); operators who do not run full-block-scanning wallets leave the default and pay no storage cost. The capabilities `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1` advertise the RPC surface unconditionally; byte availability is a deployment concern, not a capability gate. The handler never re-fetches an unretained block from the upstream node.
+
 Tree-state storage preserves upstream node JSON at canonical checkpoints and the
 latest committed tip. The native read surface is
 `tree_state_at(height, at_epoch_id)` and `latest_tree_state_checkpoint(at_epoch_id)`.

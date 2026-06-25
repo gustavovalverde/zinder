@@ -33,10 +33,10 @@ use zinder_proto::compat::lightwalletd::{
 
 use zinder_query::{
     BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, CompactBlockRange,
-    LatestBlock, LatestSafeBlock, QueryError, RawTransaction, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQuery, WalletQueryApi,
+    FullBlock, FullBlockRange, LatestBlock, LatestSafeBlock, QueryError, RawTransaction,
+    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
 };
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
 use zinder_testkit::{
@@ -345,6 +345,26 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.record(at_epoch_id);
         self.inner
             .compact_blocks_in_range(block_range, at_epoch_id)
+            .await
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlock, QueryError> {
+        self.record(at_epoch_id);
+        self.inner.full_block_at(height, at_epoch_id).await
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlockRange, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .full_blocks_in_range(block_range, at_epoch_id)
             .await
     }
 

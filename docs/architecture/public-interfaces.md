@@ -100,6 +100,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `WalletQueryGrpcAdapter` | Tonic adapter that serves native `WalletQuery` over `WalletQueryApi` through `grpc/native.rs` response builders |
 | `LatestBlockResponse` | Native wallet protocol response for latest visible block metadata |
 | `CompactBlocksInRangeChunk` | Native wallet protocol stream item for one compact block bound to one chain epoch |
+| `FullBlocksInRangeChunk` | Native wallet protocol stream item for one serialized full block bound to one chain epoch |
 | `TreeStateResponse` | Native wallet protocol response for one commitment tree-state artifact |
 | `SubtreeRootsResponse` | Native wallet protocol response for Sapling or Orchard subtree roots |
 | `BroadcastTransactionRequest` | Native wallet protocol request to submit a raw transaction |
@@ -668,6 +669,8 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 - `wallet.read.block_header_by_selector_v1`
 - `wallet.read.compact_block_at_v1`
 - `wallet.read.compact_block_range_v1`
+- `wallet.read.full_block_at_v1`
+- `wallet.read.full_block_range_v1`
 - `wallet.read.tree_state_at_height_v1`
 - `wallet.read.latest_tree_state_checkpoint_v1`
 - `wallet.read.subtree_roots_in_range_v1`

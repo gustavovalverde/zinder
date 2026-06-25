@@ -301,6 +301,70 @@ message CompactBlockResponse {
   CompactBlock compact_block = 2;
 }
 
+// A wallet-facing full serialized block payload from one chain epoch.
+//
+// Carries the consensus-serialized block bytes for full-block-scanning
+// wallets that parse whole blocks for inline transparent detection and
+// shielded trial-decryption. The bytes are present only when the writer
+// deployment retains block blobs (`storage.raw_blob_policy = "all"`);
+// reads for unretained heights return gRPC NOT_FOUND.
+message FullBlock {
+  // Height of the source block.
+  uint32 height = 1;
+
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string block_hash = 2;
+
+  // Consensus-serialized full block bytes.
+  bytes payload_bytes = 3;
+
+  // Parent block hash in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string parent_block_hash = 4;
+}
+
+// Single full block request.
+message FullBlockRequest {
+  // Requested block height.
+  uint32 height = 1;
+
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 2;
+}
+
+// Single full block response bound to one chain epoch.
+message FullBlockResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
+
+  // Full block at the requested height.
+  FullBlock full_block = 2;
+}
+
+// Inclusive full block range request.
+message FullBlocksInRangeRequest {
+  // First requested block height.
+  uint32 start_height = 1;
+
+  // Last requested block height.
+  uint32 end_height = 2;
+
+  // Optional chain-epoch id that must be used to answer the request. When
+  // absent, the server uses the visible epoch at request time.
+  optional uint64 at_epoch_id = 3;
+}
+
+// Streamed full block range chunk bound to one chain epoch.
+message FullBlocksInRangeChunk {
+  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
+  ChainView chain_view = 1;
+
+  // Full block at the next requested height.
+  FullBlock full_block = 2;
+}
+
 // Single transaction request.
 message TransactionRequest {
   // Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1395,6 +1459,16 @@ service WalletQuery {
 
   // Stream compact blocks for an inclusive height range.
   rpc CompactBlocksInRange(CompactBlocksInRangeRequest) returns (stream CompactBlocksInRangeChunk);
+
+  // Return one full serialized block at a given height. Served from the
+  // stored block blob, present only when the writer deployment retains
+  // block blobs (`storage.raw_blob_policy = "all"`); otherwise NOT_FOUND.
+  rpc FullBlock(FullBlockRequest) returns (FullBlockResponse);
+
+  // Stream full serialized blocks for an inclusive height range. Each chunk
+  // carries its own ChainView. Served from stored block blobs; reads for
+  // unretained heights return NOT_FOUND.
+  rpc FullBlocksInRange(FullBlocksInRangeRequest) returns (stream FullBlocksInRangeChunk);
 
   // Return the typed status of one transaction by transaction id. NotFound
   // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states

@@ -8,13 +8,14 @@
 
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
-    BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, MinedDetails, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse, TxStatus,
+    BlockBlobArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
@@ -23,10 +24,11 @@ use zinder_proto::v1::{ops, wallet};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, LatestBlock,
-    LatestSafeBlock, QueryError, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
+    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, FullBlock,
+    LatestBlock, LatestSafeBlock, QueryError, SubtreeRoots, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
@@ -201,6 +203,18 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
         .compact_block_at(height, at_epoch_id)
         .await
         .map(build_compact_block_response)
+}
+
+/// Reads the full block at `height` and encodes the native wallet response.
+pub async fn full_block_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    height: BlockHeight,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<wallet::FullBlockResponse, QueryError> {
+    query_api
+        .full_block_at(height, at_epoch_id)
+        .await
+        .map(build_full_block_response)
 }
 
 /// Resolves a typed block selector and encodes the native wallet response.
@@ -578,6 +592,13 @@ fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactB
     }
 }
 
+fn build_full_block_response(full_block: FullBlock) -> wallet::FullBlockResponse {
+    wallet::FullBlockResponse {
+        chain_view: Some(build_chain_view_message(full_block.chain_epoch)),
+        full_block: Some(build_full_block_message(full_block.block_blob)),
+    }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "TxStatus is #[non_exhaustive]; new arms must be wired into the proto oneof in a deliberate change, not folded into a default branch."
@@ -804,6 +825,15 @@ pub(crate) fn build_compact_block_message(
         height: compact_block.height.value(),
         block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
         payload_bytes: compact_block.payload_bytes,
+    }
+}
+
+pub(crate) fn build_full_block_message(block_blob: BlockBlobArtifact) -> wallet::FullBlock {
+    wallet::FullBlock {
+        height: block_blob.height.value(),
+        block_hash: encode_rpc_block_hash_hex(block_blob.block_hash),
+        payload_bytes: block_blob.raw_block_bytes,
+        parent_block_hash: encode_rpc_block_hash_hex(block_blob.parent_hash),
     }
 }
 

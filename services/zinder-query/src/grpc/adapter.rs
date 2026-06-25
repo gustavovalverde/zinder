@@ -36,13 +36,14 @@ use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
     ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response, build_chain_view_message,
-    build_compact_block_message, build_transparent_address_tx_ids_chunk,
+    build_compact_block_message, build_full_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
-    latest_block_response, latest_safe_block_response, latest_tree_state_checkpoint_response,
-    subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
+    full_block_response, latest_block_response, latest_safe_block_response,
+    latest_tree_state_checkpoint_response, subtree_roots_response, transaction_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response,
 };
 use super::status_from_query_error;
 
@@ -52,6 +53,7 @@ type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
 type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspentOutputsChunk>;
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
 type CompactBlocksInRangeStream = WalletGrpcStream<wallet::CompactBlocksInRangeChunk>;
+type FullBlocksInRangeStream = WalletGrpcStream<wallet::FullBlocksInRangeChunk>;
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
@@ -135,6 +137,7 @@ where
     QueryApi: Clone + WalletQueryApi + Send + Sync + 'static,
 {
     type CompactBlocksInRangeStream = CompactBlocksInRangeStream;
+    type FullBlocksInRangeStream = FullBlocksInRangeStream;
     type ChainEventsStream = ChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
     type TransparentAddressUnspentOutputsStream = TransparentUnspentOutputsStream;
@@ -172,6 +175,21 @@ where
     ) -> Result<Response<wallet::CompactBlockResponse>, Status> {
         let request = request.into_inner();
         compact_block_response(
+            &self.query_api,
+            BlockHeight::new(request.height),
+            chain_epoch_id_from_request(request.at_epoch_id),
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn full_block(
+        &self,
+        request: Request<wallet::FullBlockRequest>,
+    ) -> Result<Response<wallet::FullBlockResponse>, Status> {
+        let request = request.into_inner();
+        full_block_response(
             &self.query_api,
             BlockHeight::new(request.height),
             chain_epoch_id_from_request(request.at_epoch_id),
@@ -256,6 +274,37 @@ where
                 });
 
         Ok(Response::new(Box::pin(stream::iter(compact_block_chunks))))
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        request: Request<wallet::FullBlocksInRangeRequest>,
+    ) -> Result<Response<Self::FullBlocksInRangeStream>, Status> {
+        let request = request.into_inner();
+        let block_range = BlockHeightRange::inclusive(
+            BlockHeight::new(request.start_height),
+            BlockHeight::new(request.end_height),
+        );
+        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
+
+        let full_blocks_in_range = self
+            .query_api
+            .full_blocks_in_range(block_range, at_epoch)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let chain_view = build_chain_view_message(full_blocks_in_range.chain_epoch);
+        let full_block_chunks =
+            full_blocks_in_range
+                .block_blobs
+                .into_iter()
+                .map(move |block_blob| {
+                    Ok(wallet::FullBlocksInRangeChunk {
+                        chain_view: Some(chain_view.clone()),
+                        full_block: Some(build_full_block_message(block_blob)),
+                    })
+                });
+
+        Ok(Response::new(Box::pin(stream::iter(full_block_chunks))))
     }
 
     async fn tree_state_at_height(

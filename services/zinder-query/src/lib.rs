@@ -8,13 +8,14 @@ use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionBroadcastResult, TransactionId, TransactionLocation,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
-    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact, TransactionBroadcastResult,
+    TransactionId, TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputEntry,
+    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TxStatus,
 };
 use zinder_derive::{
@@ -38,9 +39,9 @@ pub use grpc::{
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
-    build_wallet_server_info, chain_events_response, compact_block_response, latest_block_response,
-    latest_tree_state_checkpoint_response, status_from_query_error, subtree_roots_response,
-    transaction_response, transparent_address_tx_ids_response,
+    build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
+    latest_block_response, latest_tree_state_checkpoint_response, status_from_query_error,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
     tree_state_at_response,
@@ -99,6 +100,27 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads one full serialized block at a given height.
+    ///
+    /// Served from the stored block blob, present only when the writer
+    /// deployment retains block blobs (`raw_blob_policy = "all"`). Heights with
+    /// no retained blob return [`QueryError::ArtifactUnavailable`].
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlock, QueryError>;
+
+    /// Reads full serialized blocks for an inclusive height range.
+    ///
+    /// Served from stored block blobs. Any height with no retained blob aborts
+    /// the read with [`QueryError::ArtifactUnavailable`] for that height.
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlockRange, QueryError>;
 
     /// Reads typed transaction status by transaction id.
     ///
@@ -806,6 +828,82 @@ where
         query_outcome
     }
 
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlock, QueryError> {
+        let started_at = Instant::now();
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            let chain_epoch = reader.chain_epoch();
+            let block_blob = reader.block_blob_at(height)?.ok_or_else(|| {
+                block_height_artifact_unavailable(ArtifactFamily::BlockBlob, height)
+            })?;
+
+            Ok(FullBlock {
+                chain_epoch,
+                block_blob,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome("full_block_at", started_at, &query_outcome, None);
+        query_outcome
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlockRange, QueryError> {
+        let started_at = Instant::now();
+        let requested_blocks = block_range.into_iter().len();
+        if let Err(error) = validate_block_range(block_range, self.options) {
+            let query_outcome = Err(error);
+            record_wallet_query_outcome(
+                "full_blocks_in_range",
+                started_at,
+                &query_outcome,
+                Some(requested_blocks),
+            );
+            return query_outcome;
+        }
+
+        let read_api = self.read_api.clone();
+        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
+            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
+            let chain_epoch = reader.chain_epoch();
+            let block_blobs = reader.block_blobs_in_range(block_range)?;
+            let mut available_block_blobs = Vec::with_capacity(block_blobs.len());
+
+            for (height, block_blob) in block_range.into_iter().zip(block_blobs) {
+                let Some(block_blob) = block_blob else {
+                    return Err(block_height_artifact_unavailable(
+                        ArtifactFamily::BlockBlob,
+                        height,
+                    ));
+                };
+
+                available_block_blobs.push(block_blob);
+            }
+
+            Ok(FullBlockRange {
+                chain_epoch,
+                block_range,
+                block_blobs: available_block_blobs,
+            })
+        }))
+        .await;
+        record_wallet_query_outcome(
+            "full_blocks_in_range",
+            started_at,
+            &query_outcome,
+            Some(requested_blocks),
+        );
+        query_outcome
+    }
+
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
@@ -1501,6 +1599,26 @@ pub struct CompactBlockRange {
     pub block_range: BlockHeightRange,
     /// Compact block artifacts in ascending height order.
     pub compact_blocks: Vec<CompactBlockArtifact>,
+}
+
+/// Full serialized block response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullBlock {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Raw block blob at the requested height.
+    pub block_blob: BlockBlobArtifact,
+}
+
+/// Full serialized block range response bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullBlockRange {
+    /// Chain epoch used for every block in this range.
+    pub chain_epoch: ChainEpoch,
+    /// Inclusive height range requested.
+    pub block_range: BlockHeightRange,
+    /// Raw block blobs in ascending height order.
+    pub block_blobs: Vec<BlockBlobArtifact>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by

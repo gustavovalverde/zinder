@@ -59,6 +59,8 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::block_header_by_selector;
     let _ = T::compact_block_at;
     let _ = T::compact_blocks_in_range;
+    let _ = T::full_block_at;
+    let _ = T::full_blocks_in_range;
     let _ = T::tree_state_at;
     let _ = T::latest_tree_state_checkpoint;
     let _ = T::subtree_roots_in_range;

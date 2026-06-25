@@ -15,9 +15,10 @@ use crate::{
     address_output_index::{AddressOutputIndexStore, read_address_output_index},
     block_artifact::{
         BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
-        read_block_blob_artifact, read_block_header_artifact, read_block_header_artifacts,
-        read_block_transaction_index_artifact, read_block_transaction_index_artifacts_at_height,
-        read_compact_block_artifact, read_compact_block_artifacts,
+        read_block_blob_artifact, read_block_blob_artifacts, read_block_header_artifact,
+        read_block_header_artifacts, read_block_transaction_index_artifact,
+        read_block_transaction_index_artifacts_at_height, read_compact_block_artifact,
+        read_compact_block_artifacts,
     },
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
     kv::RocksChainStoreReadView,
@@ -96,6 +97,14 @@ impl<'store> ChainEpochReader<'store> {
         height: BlockHeight,
     ) -> Result<Option<BlockBlobArtifact>, StoreError> {
         read_block_blob_artifact(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads optional raw block blobs in one batched store read.
+    pub fn block_blobs_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockBlobArtifact>>, StoreError> {
+        read_block_blob_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
     /// Reads the transaction id at a block-local index.

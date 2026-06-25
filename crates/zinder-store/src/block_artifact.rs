@@ -186,6 +186,79 @@ pub(crate) fn read_block_blob_artifact(
     decode_block_blob_artifact(&key, &envelope_bytes).map(Some)
 }
 
+pub(crate) fn read_block_blob_artifacts(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    block_range: BlockHeightRange,
+) -> Result<Vec<Option<BlockBlobArtifact>>, StoreError> {
+    let mut keys = Vec::new();
+    let mut heights = Vec::new();
+
+    for height in block_range {
+        if height > chain_epoch.visible_tip_height {
+            heights.push(height);
+            keys.push(None);
+            continue;
+        }
+
+        let source_epoch = match visible_height_source_epoch(
+            inner,
+            chain_epoch,
+            height,
+            ArtifactFamily::BlockBlob,
+            HeightVisibilityIndex::SafeBlock,
+        ) {
+            Ok(source_epoch) => source_epoch,
+            Err(StoreError::ArtifactMissing { .. }) => {
+                heights.push(height);
+                keys.push(None);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        heights.push(height);
+        keys.push(Some(StoreKey::block_blob(
+            chain_epoch.network,
+            source_epoch,
+            height,
+        )));
+    }
+
+    let block_keys = keys.iter().flatten().cloned().collect::<Vec<_>>();
+    let mut block_values = inner
+        .multi_get(StorageTable::BlockBlob, &block_keys)?
+        .into_iter();
+    let mut block_blobs = Vec::with_capacity(keys.len());
+
+    for (height, key) in heights.into_iter().zip(keys) {
+        let Some(key) = key else {
+            block_blobs.push(None);
+            continue;
+        };
+
+        let envelope_value = block_values.next().ok_or(StoreError::ArtifactMissing {
+            family: ArtifactFamily::BlockBlob,
+            key: key.clone().into(),
+        })?;
+        let Some(envelope_bytes) = envelope_value else {
+            block_blobs.push(None);
+            continue;
+        };
+        let block_blob = decode_block_blob_artifact(&key, &envelope_bytes)?;
+        if block_blob.height != height {
+            return Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::BlockBlob,
+                key: key.into(),
+                reason: "block blob artifact height does not match requested height",
+            });
+        }
+
+        block_blobs.push(Some(block_blob));
+    }
+
+    Ok(block_blobs)
+}
+
 pub(crate) fn read_block_transaction_index_artifact(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,

@@ -7,10 +7,10 @@ use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, MinedDetails, MinedTransaction, Network, NetworkUpgradeActivations,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TreeStateArtifact, TxStatus,
+    BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
+    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionId,
+    TransparentAddressBalance, TransparentAddressScriptHash, TreeStateArtifact, TxStatus,
 };
 use zinder_derive::{
     DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
@@ -290,6 +290,58 @@ impl ChainIndex for LocalChainIndex {
             .await?;
 
         Ok(Box::pin(stream::iter(compact_blocks.into_iter().map(Ok))))
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockBlobArtifact, IndexerError> {
+        self.read_at_epoch(at_epoch_id, move |reader| {
+            reader
+                .block_blob_at(height)
+                .map_err(IndexerError::from_store_error)?
+                .ok_or(IndexerError::NotFound {
+                    resource: "full block",
+                })
+        })
+        .await
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
+        if block_range.start > block_range.end {
+            return Err(IndexerError::invalid_request(
+                "start height exceeds end height",
+            ));
+        }
+
+        let block_blobs = self
+            .read_at_epoch(at_epoch_id, move |reader| {
+                let maybe_blobs = reader
+                    .block_blobs_in_range(block_range)
+                    .map_err(IndexerError::from_store_error)?;
+                let mut block_blobs = Vec::with_capacity(maybe_blobs.len());
+                for (height, maybe_blob) in block_range.into_iter().zip(maybe_blobs) {
+                    let block_blob = maybe_blob.ok_or(IndexerError::NotFound {
+                        resource: "full block",
+                    })?;
+                    if block_blob.height != height {
+                        return Err(IndexerError::malformed(
+                            "full_block.height",
+                            "height does not match requested range",
+                        ));
+                    }
+                    block_blobs.push(block_blob);
+                }
+                Ok(block_blobs)
+            })
+            .await?;
+
+        Ok(Box::pin(stream::iter(block_blobs.into_iter().map(Ok))))
     }
 
     async fn tree_state_at(

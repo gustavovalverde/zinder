@@ -29,6 +29,20 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
 /// Capability advertised for `WalletQuery.CompactBlocksInRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
+/// Capability advertised for `WalletQuery.FullBlock`.
+///
+/// The serialized block bytes are present only when the writer deployment
+/// retains block blobs (ingest `raw_blob_policy` is `all`). Reads for
+/// unretained heights return `ArtifactUnavailable` (gRPC `NOT_FOUND`). The
+/// capability advertises the RPC surface unconditionally; bytes availability
+/// is a deployment concern.
+pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
+/// Capability advertised for `WalletQuery.FullBlocksInRange`.
+///
+/// Same block-blob retention requirement as
+/// [`WALLET_READ_FULL_BLOCK_AT_V1`]: the stream yields serialized blocks only
+/// when the writer deployment sets `raw_blob_policy = "all"`.
+pub const WALLET_READ_FULL_BLOCK_RANGE_V1: &str = "wallet.read.full_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
 pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V1: &str = "wallet.read.tree_state_at_height_v1";
 /// Capability advertised for `WalletQuery.LatestTreeStateCheckpoint`.
@@ -468,6 +482,18 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_COMPACT_BLOCK_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_FULL_BLOCK_AT_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.FullBlock"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_FULL_BLOCK_RANGE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.FullBlocksInRange"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

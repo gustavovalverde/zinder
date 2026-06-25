@@ -19,10 +19,10 @@ use zinder_core::wire::{
     decode_zinder_native_chain_name, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
-    MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    BlockBlobArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector,
+    ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
+    ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
@@ -320,6 +320,54 @@ impl ChainIndex for RemoteChainIndex {
                 chunk
                     .compact_block
                     .ok_or_else(|| IndexerError::malformed("compact_block", "field is missing"))?,
+            )
+        });
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockBlobArtifact, IndexerError> {
+        let response = self
+            .client()
+            .full_block(Request::new(wallet::FullBlockRequest {
+                height: height.value(),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+            }))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        full_block_from_message(
+            response
+                .full_block
+                .ok_or_else(|| IndexerError::malformed("full_block", "field is missing"))?,
+        )
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
+        let response = self
+            .client()
+            .full_blocks_in_range(Request::new(wallet::FullBlocksInRangeRequest {
+                start_height: block_range.start.value(),
+                end_height: block_range.end.value(),
+                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+            }))
+            .await
+            .map_err(|status| self.handle_status(status))?;
+        let recovery = self.clone();
+        let stream = response.into_inner().map(move |chunk_result| {
+            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
+            full_block_from_message(
+                chunk
+                    .full_block
+                    .ok_or_else(|| IndexerError::malformed("full_block", "field is missing"))?,
             )
         });
 
@@ -1026,6 +1074,15 @@ fn compact_block_from_message(
     Ok(CompactBlockArtifact::new(
         BlockHeight::new(message.height),
         block_hash_from_rpc_hex("compact_block.block_hash", &message.block_hash)?,
+        message.payload_bytes,
+    ))
+}
+
+fn full_block_from_message(message: wallet::FullBlock) -> Result<BlockBlobArtifact, IndexerError> {
+    Ok(BlockBlobArtifact::new(
+        BlockHeight::new(message.height),
+        block_hash_from_rpc_hex("full_block.block_hash", &message.block_hash)?,
+        block_hash_from_rpc_hex("full_block.parent_block_hash", &message.parent_block_hash)?,
         message.payload_bytes,
     ))
 }
