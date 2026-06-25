@@ -16,7 +16,7 @@ use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionLocation, TransparentAddressScriptHash,
+    TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputArtifact,
     TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
 };
@@ -31,17 +31,18 @@ use crate::{
     block_hash_index::block_hash_index_put,
     format::{
         CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
-        MempoolEventKind, MempoolEventStreamFamily, StoreKey, decode_chain_epoch,
-        decode_chain_event_envelope, decode_mempool_event_envelope, decode_mempool_event_kind,
-        decode_mempool_event_observed_at, decode_transparent_output_block_index,
-        encode_address_output_index_artifact, encode_block_blob_artifact,
-        encode_block_header_artifact, encode_block_transaction_index_artifact, encode_chain_epoch,
-        encode_chain_event_envelope, encode_compact_block_artifact, encode_mempool_event_envelope,
-        encode_subtree_root_artifact, encode_transaction_blob_artifact,
-        encode_transaction_facts_artifact, encode_transaction_location_artifact,
-        encode_transparent_address_tx_index_artifact, encode_transparent_output_artifact,
-        encode_transparent_output_block_index, encode_transparent_spend_fact,
-        encode_transparent_spend_fact_block_index, encode_tree_state_artifact,
+        MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorPayload,
+        SnapshotPageStreamFamily, StoreKey, decode_chain_epoch, decode_chain_event_envelope,
+        decode_mempool_event_envelope, decode_mempool_event_kind, decode_mempool_event_observed_at,
+        decode_transparent_output_block_index, encode_address_output_index_artifact,
+        encode_block_blob_artifact, encode_block_header_artifact,
+        encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
+        encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
+        encode_transaction_blob_artifact, encode_transaction_facts_artifact,
+        encode_transaction_location_artifact, encode_transparent_address_tx_index_artifact,
+        encode_transparent_output_artifact, encode_transparent_output_block_index,
+        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
+        encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
@@ -504,6 +505,60 @@ impl PrimaryChainStore {
         request: TransparentAddressTxIndexPageRequest<'_>,
     ) -> Result<TransparentAddressTxIndexPage, StoreError> {
         self.store.transparent_address_tx_index_page(request)
+    }
+
+    /// Builds an HMAC-authenticated next-page cursor for a `MempoolSnapshot`
+    /// walk, bookmarking `(snapshot_sequence, after_transaction_id)`.
+    pub fn encode_snapshot_page_cursor(
+        &self,
+        snapshot_sequence: u64,
+        after_transaction_id: TransactionId,
+    ) -> Result<StreamCursorTokenV1, StoreError> {
+        let network = self
+            .network()
+            .ok_or(StoreError::SnapshotPageCursorInvalid {
+                reason: "store has no network",
+            })?;
+        StreamCursorTokenV1::snapshot_page(
+            network,
+            SnapshotPageStreamFamily::SnapshotPage,
+            snapshot_sequence,
+            after_transaction_id,
+            self.store.cursor_auth_key,
+        )
+        .map_err(|_| StoreError::SnapshotPageCursorInvalid {
+            reason: "cursor authentication key could not initialize the MAC",
+        })
+    }
+
+    /// Decodes a `MempoolSnapshot` next-page cursor, verifying its HMAC,
+    /// network, and stream family, then bounding it against the snapshot
+    /// sequence the writer currently serves.
+    ///
+    /// A cursor for a snapshot newer than `current_snapshot_sequence` is
+    /// rejected as expired.
+    pub fn decode_snapshot_page_cursor(
+        &self,
+        cursor: &StreamCursorTokenV1,
+        current_snapshot_sequence: u64,
+    ) -> Result<SnapshotPageCursorPayload, StoreError> {
+        let network = self
+            .network()
+            .ok_or(StoreError::SnapshotPageCursorInvalid {
+                reason: "store has no network",
+            })?;
+        let payload = cursor
+            .decode_snapshot_page(network, self.store.cursor_auth_key)
+            .map_err(|_| StoreError::SnapshotPageCursorInvalid {
+                reason: "cursor failed authentication, network, or stream-family validation",
+            })?;
+        if payload.snapshot_sequence > current_snapshot_sequence {
+            return Err(StoreError::SnapshotPageCursorExpired {
+                snapshot_sequence: payload.snapshot_sequence,
+                current_snapshot_sequence,
+            });
+        }
+        Ok(payload)
     }
 
     /// Deletes retained chain-event rows older than `cutoff_created_at`.

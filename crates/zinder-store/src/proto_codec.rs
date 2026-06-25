@@ -62,8 +62,7 @@ pub fn chain_event_envelope_message(
     Ok(wallet::ChainEventEnvelope {
         cursor: event_envelope.cursor.as_bytes().into(),
         event_sequence: event_envelope.event_sequence,
-        chain_epoch: Some(chain_epoch_message(event_envelope.chain_epoch)),
-        safe_tip_height: event_envelope.safe_tip_height.value(),
+        chain_view: Some(chain_view_message(event_envelope.chain_epoch)),
         event: Some(event),
     })
 }

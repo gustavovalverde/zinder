@@ -141,8 +141,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 
 | Term | Meaning |
 |------|---------|
-| `StreamCursorTokenV1` | Opaque cursor body for chain-event subscriptions; fork-aware, encodes the event sequence, a back-spaced `(height, hash)` locator, and a stream-family tag |
-| `MempoolStreamCursorV1` | Opaque cursor body for mempool-event subscriptions |
+| `StreamCursorTokenV1` | The single opaque, HMAC-authenticated cursor envelope for every resumable read: chain-event subscriptions (fork-aware locator), mempool-event subscriptions, transparent-history paging, address-output paging, and `MempoolSnapshot` paging. The family nibble at byte offset 49 selects the body shape |
 | `ChainEventStreamFamily` | Stream-family enum used inside chain-event cursor bodies (`Tip`, `Safe`; `Mempool` is a reserved family code, not an active chain-event family) |
 | `ArtifactFamily` | Open-ended enum naming an artifact family in storage and query errors |
 | `ArtifactKey` | Open-ended enum union of keys used to look up an artifact (`BlockHeight`, `TransactionId`, `SubtreeRootIndex`, `BlockTransactionIndex`, future variants) |
@@ -207,6 +206,12 @@ Methods that return a server-streaming subscription with cursor resume:
 - The request field carrying the cursor is always `from_cursor` (see Cursor Conventions below).
 - The envelope field carrying the cursor position is always `cursor`.
 
+### Rule 4a — Current-projection streams use a one-shot header
+
+A read that walks a single pinned chain epoch once and streams the whole result set (no cursor, no entry cap) carries the `ChainView` as one leading header message, never repeated on every item. The chunk message is a `oneof body { ChainView header = 1; <Item> item = 2; }`. The server sends exactly one `header` message first, then one `item` per element. This makes the stream-wide single-epoch guarantee structural rather than a repeated field: a consumer reads the epoch once from the header and binds every later item to it.
+
+`TransparentAddressUnspentOutputs` (`TransparentUnspentOutputsChunk`) and `TransparentAddressTxIdsInRange` (`TransparentAddressTxIdsChunk`) follow this shape. The header carries the one pinned epoch; it does not add per-element epoch pins, client cursors, or page sizes to these streams. Cursor-resumed event subscriptions (Rule 4) keep their per-envelope `chain_view` because each envelope is independently resumable.
+
 ### Rule 5 — Capability and identity probes
 
 Methods that ask the server about itself rather than about chain data:
@@ -251,11 +256,13 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 - `family`: the `ChainEventStreamFamily` nibble at byte offset 49 (`Tip`, `Safe`; `Mempool` is a reserved family code).
 - a 32-byte HMAC over the whole body so a tampered cursor (including a tampered locator entry) returns `EventCursorInvalid` rather than serving wrong data.
 
-The chain-event cursor is variable-length because the locator grows with its entry count; the mempool, transparent-history, and address-output families keep a fixed-length body. Hash bytes inside the cursor are storage-internal byte order (ADR-0024); the cursor is server-internal material, distinct from the RPC-byte-order hashes on the wire.
+The chain-event cursor is variable-length because the locator grows with its entry count; the mempool-event, transparent-history, address-output, and snapshot-page families keep a fixed-length body of `STREAM_CURSOR_TOKEN_V1_LEN` bytes. Hash bytes inside the cursor are storage-internal byte order (ADR-0024); the cursor is server-internal material, distinct from the RPC-byte-order hashes on the wire.
+
+Every cursor family is the same `StreamCursorTokenV1` envelope distinguished by the family nibble at byte offset 49: `Tip`/`Safe` (chain events), `Mempool` (mempool events, `0x2`), `TransparentHistory` (`0x3`, with the iteration-direction bit in the flags high nibble), `AddressOutput` (`0x4`), and `SnapshotPage` (`0x5`). The `SnapshotPage` family bookmarks one `MempoolSnapshot` paging walk; its body carries the snapshot sequence the page belongs to plus the last yielded transaction id, and it shares the same HMAC authentication as every other family. There is no separate, unauthenticated snapshot-cursor codec: a tampered snapshot cursor fails the HMAC and returns `SNAPSHOT_PAGE_CURSOR_INVALID`, and a cursor naming a snapshot newer than the writer currently serves returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
 
 On reconnect the server resolves the fork point as the most recent locator entry whose hash equals the canonical block hash at that height. The block index outlives the pruned event-log window, so the fork point resolves even when the divergence base is no longer in retained history. If the cursor's branch was reorged out and the real reorg event was pruned, the server delivers a synthetic `ChainReorged` envelope describing the divergence before resuming; clients never see "silent" branch changes. A divergence deeper than the cap, or an unresolvable fork-point block, degrades to `EventCursorExpired` with re-derive guidance. The `Safe` family never receives a synthesized reorg. See [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md).
 
-`MempoolStreamCursorV1` uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
+The mempool-event family uses the `family = Mempool` cursor-family code with mempool-specific position fields, defined in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md). It is the same `StreamCursorTokenV1` envelope, not a separate codec.
 
 ### Field naming
 
@@ -854,7 +861,7 @@ This example is illustrative, not final. The important points:
 
 ### Storage-level names
 
-Storage and cursor byte contracts are lower-level than the normal public API, but their names are stable and searchable: `StoreKey`, `ArtifactEnvelopeHeaderV1`, `StreamCursorTokenV1`, and `MempoolStreamCursorV1`. Mechanism-shaped names such as `key_codec`, `cursor_helper`, or `bytes_utils` are forbidden.
+Storage and cursor byte contracts are lower-level than the normal public API, but their names are stable and searchable: `StoreKey`, `ArtifactEnvelopeHeaderV1`, and `StreamCursorTokenV1` (the one cursor envelope for every resumable read). Mechanism-shaped names such as `key_codec`, `cursor_helper`, or `bytes_utils` are forbidden.
 
 ## Crate Boundaries
 

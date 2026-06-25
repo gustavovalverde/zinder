@@ -387,38 +387,67 @@ pub async fn transparent_address_tx_ids_response<Q: WalletQueryApi + ?Sized>(
     query_api.transparent_address_tx_ids_in_range(request).await
 }
 
-/// Builds one streamed tx-history chunk message.
+/// Builds the leading header chunk carrying the chain epoch pinned for the
+/// whole tx-history stream.
+#[must_use]
+pub fn build_transparent_address_tx_ids_header(
+    chain_epoch: ChainEpoch,
+) -> wallet::TransparentAddressTxIdsChunk {
+    wallet::TransparentAddressTxIdsChunk {
+        body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+            build_chain_view_message(chain_epoch),
+        )),
+    }
+}
+
+/// Builds one streamed tx-history item chunk.
 #[must_use]
 pub fn build_transparent_address_tx_ids_chunk(
-    chain_epoch: ChainEpoch,
     artifact: &TransparentAddressTxIndexArtifact,
     cursor: Vec<u8>,
 ) -> wallet::TransparentAddressTxIdsChunk {
     wallet::TransparentAddressTxIdsChunk {
-        chain_view: Some(build_chain_view_message(chain_epoch)),
-        transaction_id: encode_rpc_transaction_id_hex(artifact.transaction_id),
-        block_height: artifact.block_height.value(),
-        tx_index_in_block: artifact.tx_index_in_block,
-        block_hash: encode_rpc_block_hash_hex(artifact.block_hash),
-        cursor,
+        body: Some(wallet::transparent_address_tx_ids_chunk::Body::Item(
+            wallet::TransparentAddressTxId {
+                transaction_id: encode_rpc_transaction_id_hex(artifact.transaction_id),
+                block_height: artifact.block_height.value(),
+                tx_index_in_block: artifact.tx_index_in_block,
+                block_hash: encode_rpc_block_hash_hex(artifact.block_hash),
+                cursor,
+            },
+        )),
     }
 }
 
-/// Builds one streamed unspent-output message bound to the stream's pinned
-/// chain epoch.
+/// Builds the leading header chunk carrying the chain epoch pinned for the
+/// whole unspent-output stream.
+#[must_use]
+pub fn build_transparent_unspent_outputs_header(
+    chain_epoch: ChainEpoch,
+) -> wallet::TransparentUnspentOutputsChunk {
+    wallet::TransparentUnspentOutputsChunk {
+        body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
+            build_chain_view_message(chain_epoch),
+        )),
+    }
+}
+
+/// Builds one streamed unspent-output item chunk.
 #[must_use]
 pub fn build_transparent_unspent_output_message(
-    chain_epoch: ChainEpoch,
     output: &TransparentUnspentOutput,
-) -> wallet::TransparentUnspentOutput {
-    wallet::TransparentUnspentOutput {
-        chain_view: Some(build_chain_view_message(chain_epoch)),
-        address_script_hash: output.address_script_hash.as_bytes().to_vec(),
-        script_pub_key: output.script_pub_key.clone(),
-        outpoint: Some(outpoint_message(&output.outpoint)),
-        value_zat: output.value_zat,
-        block_height: output.block_height.value(),
-        block_hash: encode_rpc_block_hash_hex(output.block_hash),
+) -> wallet::TransparentUnspentOutputsChunk {
+    wallet::TransparentUnspentOutputsChunk {
+        body: Some(wallet::transparent_unspent_outputs_chunk::Body::Item(
+            wallet::TransparentUnspentOutput {
+                address_script_hash: output.address_script_hash.as_bytes().to_vec(),
+                script_pub_key: output.script_pub_key.clone(),
+                outpoint: Some(outpoint_message(&output.outpoint)),
+                value_zat: output.value_zat,
+                block_height: output.block_height.value(),
+                block_hash: encode_rpc_block_hash_hex(output.block_hash),
+            },
+        )),
     }
 }
 

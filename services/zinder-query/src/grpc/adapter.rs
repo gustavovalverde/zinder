@@ -3,7 +3,7 @@
 use std::{collections::HashMap, num::NonZeroU32, pin::Pin, sync::Arc, time::Instant};
 
 use tokio::sync::{OnceCell, mpsc};
-use tokio_stream::{self as stream, Stream, wrappers::ReceiverStream};
+use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
@@ -37,7 +37,8 @@ use super::native::{
     ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response, build_chain_view_message,
     build_compact_block_message, build_transparent_address_tx_ids_chunk,
-    build_transparent_unspent_output_message, build_wallet_server_info, compact_block_response,
+    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
+    build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
     latest_block_response, latest_safe_block_response, latest_tree_state_checkpoint_response,
     subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, tree_state_at_response,
@@ -47,7 +48,7 @@ use super::status_from_query_error;
 type WalletGrpcStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = WalletGrpcStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = WalletGrpcStream<wallet::MempoolEventEnvelope>;
-type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspentOutput>;
+type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspentOutputsChunk>;
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
 type CompactBlocksInRangeStream = WalletGrpcStream<wallet::CompactBlocksInRangeChunk>;
 
@@ -528,15 +529,16 @@ where
             transparent_address_unspent_outputs_response(&self.query_api, typed_request, None)
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-        let chain_epoch = response.chain_epoch;
-        let messages = response.outputs.into_iter().map(move |output| {
-            Ok(build_transparent_unspent_output_message(
-                chain_epoch,
-                &output,
-            ))
-        });
+        let header = Ok(build_transparent_unspent_outputs_header(
+            response.chain_epoch,
+        ));
+        let items = response
+            .outputs
+            .into_iter()
+            .map(|output| Ok(build_transparent_unspent_output_message(&output)));
+        let messages = stream::once(header).chain(stream::iter(items));
 
-        Ok(Response::new(Box::pin(stream::iter(messages))))
+        Ok(Response::new(Box::pin(messages)))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -553,13 +555,15 @@ where
             .transparent_address_tx_ids_in_range(typed_request)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chain_epoch = response.chain_epoch;
+        let header = Ok(build_transparent_address_tx_ids_header(
+            response.chain_epoch,
+        ));
         let next_cursor_bytes = response
             .next_cursor
             .map(|cursor| cursor.as_bytes().to_vec())
             .unwrap_or_default();
         let last_index = response.artifacts.len().saturating_sub(1);
-        let chunks = response
+        let items = response
             .artifacts
             .into_iter()
             .enumerate()
@@ -569,13 +573,10 @@ where
                 } else {
                     Vec::new()
                 };
-                Ok(build_transparent_address_tx_ids_chunk(
-                    chain_epoch,
-                    &artifact,
-                    cursor,
-                ))
+                Ok(build_transparent_address_tx_ids_chunk(&artifact, cursor))
             });
-        Ok(Response::new(Box::pin(stream::iter(chunks))))
+        let chunks = stream::once(header).chain(stream::iter(items));
+        Ok(Response::new(Box::pin(chunks)))
     }
 
     async fn transparent_address_balance(

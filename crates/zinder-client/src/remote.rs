@@ -426,9 +426,20 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.handle_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        let stream = response.into_inner().map(move |message_result| {
-            let message = message_result.map_err(|status| recovery.handle_status(status))?;
-            transparent_unspent_output_item_from_message(expected_network, message)
+        // The leading header pins the chain epoch for the whole stream; the
+        // closure captures it and drops the header (yielding no item).
+        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
+        let stream = response.into_inner().filter_map(move |message_result| {
+            message_result
+                .map_err(|status| recovery.handle_status(status))
+                .and_then(|message| {
+                    transparent_unspent_output_stream_item(
+                        expected_network,
+                        &mut pinned_chain_epoch,
+                        message,
+                    )
+                })
+                .transpose()
         });
         Ok(Box::pin(stream))
     }
@@ -461,13 +472,21 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.handle_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
-            transparent_address_tx_ids_chunk_from_message(
-                expected_network,
-                address_script_hash,
-                chunk,
-            )
+        // The leading header pins the chain epoch for the whole stream; the
+        // closure captures it and drops the header (yielding no item).
+        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
+        let stream = response.into_inner().filter_map(move |chunk_result| {
+            chunk_result
+                .map_err(|status| recovery.handle_status(status))
+                .and_then(|chunk| {
+                    transparent_address_tx_ids_stream_item(
+                        expected_network,
+                        address_script_hash,
+                        &mut pinned_chain_epoch,
+                        chunk,
+                    )
+                })
+                .transpose()
         });
         Ok(Box::pin(stream))
     }
@@ -932,64 +951,128 @@ fn subtree_root_from_message(
     ))
 }
 
-fn transparent_address_tx_ids_chunk_from_message(
+/// Decodes one message of the `TransparentAddressTxIdsInRange` stream.
+///
+/// The leading header carries the chain epoch pinned for the whole stream; it
+/// is captured in `pinned_chain_epoch` and yields no item (`Ok(None)`). Every
+/// later item is bound to that captured epoch. An item before the header, or a
+/// second header, is a protocol violation.
+fn transparent_address_tx_ids_stream_item(
     expected_network: Network,
     address_script_hash: TransparentAddressScriptHash,
+    pinned_chain_epoch: &mut Option<ChainEpoch>,
     message: wallet::TransparentAddressTxIdsChunk,
-) -> Result<TransparentAddressTxIdsStreamItem, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    let transaction_id = transaction_id_from_rpc_hex("transaction_id", &message.transaction_id)?;
-    let block_hash = block_hash_from_rpc_hex("block_hash", &message.block_hash)?;
-    let artifact = TransparentAddressTxIndexArtifact::new(
-        address_script_hash,
-        BlockHeight::new(message.block_height),
-        message.tx_index_in_block,
-        transaction_id,
-        block_hash,
-    );
-    let cursor = if message.cursor.is_empty() {
-        None
-    } else {
-        Some(TransparentHistoryCursor::from_bytes(message.cursor))
-    };
-    Ok(TransparentAddressTxIdsStreamItem {
-        chain_epoch,
-        artifact,
-        cursor,
-    })
+) -> Result<Option<TransparentAddressTxIdsStreamItem>, IndexerError> {
+    match message.body.ok_or_else(|| {
+        IndexerError::malformed("transparent_address_tx_ids_chunk.body", "field is missing")
+    })? {
+        wallet::transparent_address_tx_ids_chunk::Body::Header(chain_view) => {
+            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            Ok(None)
+        }
+        wallet::transparent_address_tx_ids_chunk::Body::Item(entry) => {
+            let chain_epoch = stream_item_chain_epoch(pinned_chain_epoch.as_ref())?;
+            let transaction_id =
+                transaction_id_from_rpc_hex("transaction_id", &entry.transaction_id)?;
+            let block_hash = block_hash_from_rpc_hex("block_hash", &entry.block_hash)?;
+            let artifact = TransparentAddressTxIndexArtifact::new(
+                address_script_hash,
+                BlockHeight::new(entry.block_height),
+                entry.tx_index_in_block,
+                transaction_id,
+                block_hash,
+            );
+            let cursor = if entry.cursor.is_empty() {
+                None
+            } else {
+                Some(TransparentHistoryCursor::from_bytes(entry.cursor))
+            };
+            Ok(Some(TransparentAddressTxIdsStreamItem {
+                chain_epoch,
+                artifact,
+                cursor,
+            }))
+        }
+    }
 }
 
-fn transparent_unspent_output_item_from_message(
+/// Decodes one message of the `TransparentAddressUnspentOutputs` stream.
+///
+/// The leading header carries the chain epoch pinned for the whole stream; it
+/// is captured in `pinned_chain_epoch` and yields no item (`Ok(None)`). Every
+/// later item is bound to that captured epoch. An item before the header, or a
+/// second header, is a protocol violation.
+fn transparent_unspent_output_stream_item(
     expected_network: Network,
-    message: wallet::TransparentUnspentOutput,
-) -> Result<TransparentUnspentOutputStreamItem, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    let address_script_hash_bytes = fixed_32_bytes(
-        "transparent_unspent_output.address_script_hash",
-        message.address_script_hash,
-    )?;
-    let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed("transparent_unspent_output.outpoint", "field is missing")
-    })?;
-    let transaction_id = transaction_id_from_rpc_hex(
-        "transparent_unspent_output.outpoint.transaction_id",
-        &outpoint_message.transaction_id,
-    )?;
-    let block_hash =
-        block_hash_from_rpc_hex("transparent_unspent_output.block_hash", &message.block_hash)?;
-    let output = TransparentUnspentOutput::new(
-        TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
-        message.script_pub_key,
-        TransparentOutPoint::new(transaction_id, outpoint_message.output_index),
-        message.value_zat,
-        BlockHeight::new(message.block_height),
-        block_hash,
-    );
-    Ok(TransparentUnspentOutputStreamItem {
-        chain_epoch,
-        output,
+    pinned_chain_epoch: &mut Option<ChainEpoch>,
+    message: wallet::TransparentUnspentOutputsChunk,
+) -> Result<Option<TransparentUnspentOutputStreamItem>, IndexerError> {
+    match message.body.ok_or_else(|| {
+        IndexerError::malformed("transparent_unspent_outputs_chunk.body", "field is missing")
+    })? {
+        wallet::transparent_unspent_outputs_chunk::Body::Header(chain_view) => {
+            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            Ok(None)
+        }
+        wallet::transparent_unspent_outputs_chunk::Body::Item(output_message) => {
+            let chain_epoch = stream_item_chain_epoch(pinned_chain_epoch.as_ref())?;
+            let address_script_hash_bytes = fixed_32_bytes(
+                "transparent_unspent_output.address_script_hash",
+                output_message.address_script_hash,
+            )?;
+            let outpoint_message = output_message.outpoint.ok_or_else(|| {
+                IndexerError::malformed("transparent_unspent_output.outpoint", "field is missing")
+            })?;
+            let transaction_id = transaction_id_from_rpc_hex(
+                "transparent_unspent_output.outpoint.transaction_id",
+                &outpoint_message.transaction_id,
+            )?;
+            let block_hash = block_hash_from_rpc_hex(
+                "transparent_unspent_output.block_hash",
+                &output_message.block_hash,
+            )?;
+            let output = TransparentUnspentOutput::new(
+                TransparentAddressScriptHash::from_bytes(address_script_hash_bytes),
+                output_message.script_pub_key,
+                TransparentOutPoint::new(transaction_id, outpoint_message.output_index),
+                output_message.value_zat,
+                BlockHeight::new(output_message.block_height),
+                block_hash,
+            );
+            Ok(Some(TransparentUnspentOutputStreamItem {
+                chain_epoch,
+                output,
+            }))
+        }
+    }
+}
+
+/// Records the pinned chain epoch from a stream's leading header.
+///
+/// Rejects a second header: the stream-header contract sends exactly one.
+fn stream_header_chain_epoch(
+    expected_network: Network,
+    pinned_chain_epoch: &mut Option<ChainEpoch>,
+    chain_view: Option<wallet::ChainView>,
+) -> Result<(), IndexerError> {
+    if pinned_chain_epoch.is_some() {
+        return Err(IndexerError::malformed(
+            "stream.header",
+            "stream sent more than one header",
+        ));
+    }
+    let chain_epoch = chain_epoch_from_chain_view_with_network(expected_network, chain_view)?;
+    *pinned_chain_epoch = Some(chain_epoch);
+    Ok(())
+}
+
+/// Returns the chain epoch a stream item binds to, rejecting an item that
+/// arrives before the leading header.
+fn stream_item_chain_epoch(
+    pinned_chain_epoch: Option<&ChainEpoch>,
+) -> Result<ChainEpoch, IndexerError> {
+    pinned_chain_epoch.copied().ok_or_else(|| {
+        IndexerError::malformed("stream.item", "stream sent an item before its header")
     })
 }
 
@@ -1086,12 +1169,8 @@ fn chain_event_envelope_from_message(
     expected_network: Network,
     message: wallet::ChainEventEnvelope,
 ) -> Result<ChainEventEnvelope, IndexerError> {
-    let chain_epoch = chain_epoch_from_message_with_network(
-        expected_network,
-        message
-            .chain_epoch
-            .ok_or_else(|| IndexerError::malformed("chain_epoch", "field is missing"))?,
-    )?;
+    let chain_epoch =
+        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
     let event = match message
         .event
         .ok_or_else(|| IndexerError::malformed("event", "field is missing"))?
@@ -1127,8 +1206,8 @@ fn chain_event_envelope_from_message(
     Ok(ChainEventEnvelope {
         cursor: ChainEventCursor::from_bytes(message.cursor),
         event_sequence: message.event_sequence,
+        safe_tip_height: chain_epoch.settled_tip_height,
         chain_epoch,
-        safe_tip_height: BlockHeight::new(message.safe_tip_height),
         event,
     })
 }

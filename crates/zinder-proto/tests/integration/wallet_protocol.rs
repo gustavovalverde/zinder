@@ -287,8 +287,7 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::ChainEventEnvelope {
         cursor: vec![0x99; 82],
         event_sequence: 11,
-        chain_epoch: Some(synthetic_chain_epoch()),
-        safe_tip_height: 40,
+        chain_view: Some(synthetic_chain_view()),
         event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
             wallet::ChainCommitted {
                 committed: Some(wallet::ChainEpochCommitted {
@@ -303,7 +302,15 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 
     assert_eq!(decoded_response.cursor, vec![0x99; 82]);
     assert_eq!(decoded_response.event_sequence, 11);
-    assert!(decoded_response.chain_epoch.is_some());
+    // The safe tip height is folded onto chain_view.chain_epoch.settled_tip;
+    // the envelope no longer carries a separate safe_tip_height field.
+    let settled_tip = decoded_response
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .and_then(|chain_epoch| chain_epoch.settled_tip.as_ref())
+        .ok_or_else(|| eyre!("chain_view.chain_epoch.settled_tip missing"))?;
+    assert_eq!(settled_tip.height, 40);
     assert!(matches!(
         decoded_response.event,
         Some(wallet::chain_event_envelope::Event::ChainCommitted(committed))
@@ -312,6 +319,76 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
             })
     ));
 
+    Ok(())
+}
+
+#[test]
+fn transparent_unspent_outputs_chunk_header_round_trips_through_prost() -> eyre::Result<()> {
+    let header = wallet::TransparentUnspentOutputsChunk {
+        body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
+            synthetic_chain_view(),
+        )),
+    };
+    let decoded = round_trip(&header)?;
+    let Some(wallet::transparent_unspent_outputs_chunk::Body::Header(chain_view)) = decoded.body
+    else {
+        return Err(eyre!("decoded chunk is not a header"));
+    };
+    assert_eq!(
+        chain_view
+            .chain_epoch
+            .ok_or_else(|| eyre!("header chain_view.chain_epoch missing"))?
+            .chain_epoch_id,
+        7
+    );
+    Ok(())
+}
+
+#[test]
+fn transparent_unspent_outputs_chunk_item_round_trips_through_prost() -> eyre::Result<()> {
+    let item = wallet::TransparentUnspentOutputsChunk {
+        body: Some(wallet::transparent_unspent_outputs_chunk::Body::Item(
+            wallet::TransparentUnspentOutput {
+                address_script_hash: vec![0xAB; 32],
+                script_pub_key: vec![0x76, 0xa9],
+                outpoint: Some(wallet::OutPoint {
+                    transaction_id: "33".repeat(32),
+                    output_index: 2,
+                }),
+                value_zat: 5000,
+                block_height: 41,
+                block_hash: "44".repeat(32),
+            },
+        )),
+    };
+    let decoded = round_trip(&item)?;
+    assert!(matches!(
+        decoded.body,
+        Some(wallet::transparent_unspent_outputs_chunk::Body::Item(output))
+            if output.value_zat == 5000 && output.block_height == 41
+    ));
+    Ok(())
+}
+
+#[test]
+fn transparent_address_tx_ids_chunk_item_round_trips_through_prost() -> eyre::Result<()> {
+    let item = wallet::TransparentAddressTxIdsChunk {
+        body: Some(wallet::transparent_address_tx_ids_chunk::Body::Item(
+            wallet::TransparentAddressTxId {
+                transaction_id: "55".repeat(32),
+                block_height: 41,
+                tx_index_in_block: 3,
+                block_hash: "66".repeat(32),
+                cursor: vec![0x01, 0x02],
+            },
+        )),
+    };
+    let decoded = round_trip(&item)?;
+    assert!(matches!(
+        decoded.body,
+        Some(wallet::transparent_address_tx_ids_chunk::Body::Item(entry))
+            if entry.block_height == 41 && entry.tx_index_in_block == 3
+    ));
     Ok(())
 }
 

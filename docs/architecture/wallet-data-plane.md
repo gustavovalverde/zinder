@@ -185,6 +185,7 @@ Wallet sync needs durable chain-state notifications. `WalletQuery.ChainEvents` i
 
 The contract:
 
+- Each `ChainEventEnvelope` carries the cross-plane `ChainView` at field tag 3 (`chain_view`). `chain_view.chain_epoch` is the epoch visible after the event, and `chain_view.chain_epoch.settled_tip.height` is the safe tip height that was true for the event. The envelope carries no separate `safe_tip_height` field.
 - The cursor is the `StreamCursorTokenV1` bytes documented in [Chain events](chain-events.md). Clients persist the exact bytes returned in the previous envelope and resume strictly after that cursor.
 - Empty `from_cursor` returns events from the earliest retained event sequence, which is the bootstrap path for a fresh wallet install.
 - The server emits historical events first (replay phase) and then continues with live events in one ordered sequence; clients see no transition.
@@ -224,8 +225,8 @@ Three architectural consequences follow from that map:
 
 The native protocol exposes two complementary mempool methods:
 
-- **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold.
-- **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via `MempoolStreamCursorV1`.
+- **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold. Paging uses the standard opaque, HMAC-authenticated `StreamCursorTokenV1` under its `SnapshotPage` family (offset-49 nibble `0x5`): the next-page `bytes` carry the snapshot sequence and the last yielded transaction id. A tampered cursor returns `SNAPSHOT_PAGE_CURSOR_INVALID`; a cursor for a snapshot sequence newer than the writer currently retains returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`. There is no separate snapshot-cursor codec.
+- **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via the `StreamCursorTokenV1` mempool-event family.
 
 `Invalidated` is not optional. If the polling backend observes a txid disappear
 from `getrawmempool` without a corresponding block commit, it emits
@@ -310,12 +311,15 @@ transparent output artifacts. It is a product contract for lightwalletd
 clients, not a way to silence Android SDK logs.
 
 The native `WalletQuery` proto exposes the same artifact-backed read through
-one server-streaming RPC, `TransparentAddressUnspentOutputs`. The server walks
-the address-output projection once at a single pinned chain epoch and emits
-every unspent output as a `TransparentUnspentOutput` message; `start_height`
-is the wallet-birthday floor. There is no cursor and no entry cap on the
-wire: a stream that is always complete cannot be truncated by a client that
-ignores pagination. The request consumes the shared `AddressLookup` oneof
+one server-streaming RPC, `TransparentAddressUnspentOutputs`, which streams
+`TransparentUnspentOutputsChunk` messages. The server walks the address-output
+projection once at a single pinned chain epoch and emits the `ChainView` as one
+leading header message (`chunk.body.header`), then one `TransparentUnspentOutput`
+per unspent output (`chunk.body.item`); `start_height` is the wallet-birthday
+floor. The single header makes the stream-wide single-epoch guarantee
+structural: the epoch is carried once, never repeated on every item. There is
+no cursor and no entry cap on the wire: a stream that is always complete cannot
+be truncated by a client that ignores pagination. The request consumes the shared `AddressLookup` oneof
 that accepts either a 32-byte `script_hash` (typed clients) or a base58
 transparent `address` (CLI, tests, debug callers); the native adapter parses
 string addresses through `ZebraTransparentAddress`, validates the network,
@@ -334,13 +338,19 @@ and a drained stream costs the client memory proportional to the address's
 unspent set; acceptable for wallet receivers and documented here for future
 consumers.
 
+`TransparentAddressTxIdsInRange` streams `TransparentAddressTxIdsChunk`
+messages with the same one-shot header shape: one leading `ChainView` header
+(`chunk.body.header`), then one `TransparentAddressTxId` per indexed
+transaction (`chunk.body.item`). The chain epoch is carried once on the header,
+not on every item.
+
 Cursor cadence on the tx-history streaming surface: the wire emits the resume
-cursor only on the terminal chunk of a server stream. Non-terminal
-`TransparentAddressTxIdsChunk` envelopes carry empty `cursor` bytes; the
-last envelope carries either the next-page cursor (when more entries may be
-available) or empty bytes (stream fully drained). Clients that lose the
-connection mid-stream must restart the page rather than resume from a
-non-terminal envelope; bounded history pages keep that restart cost small.
+cursor only on the terminal item of a server stream. Non-terminal
+`TransparentAddressTxId` items carry empty `cursor` bytes; the last item
+carries either the next-page cursor (when more entries may be available) or
+empty bytes (stream fully drained). Clients that lose the connection mid-stream
+must restart the page rather than resume from a non-terminal item; bounded
+history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the store was produced with the wallet-serving

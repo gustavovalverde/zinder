@@ -688,11 +688,11 @@ message ChainEventEnvelope {
   // Monotonic sequence in the chain-event stream.
   uint64 event_sequence = 2;
 
-  // Chain epoch visible after this event.
-  ChainEpoch chain_epoch = 3;
-
-  // Safe tip height that was true for this event.
-  uint32 safe_tip_height = 4;
+  // Cross-plane chain-state envelope visible after this event (ADR-0011,
+  // field tag 3 on this message). `chain_view.chain_epoch` is the epoch
+  // visible after the event; `chain_view.chain_epoch.settled_tip.height`
+  // carries the safe tip height that was true for this event.
+  ChainView chain_view = 3;
 
   oneof event {
     ChainCommitted chain_committed = 10;
@@ -1095,29 +1095,43 @@ message TransparentAddressUnspentOutputsRequest {
 // One unspent transparent output streamed by
 // [`TransparentAddressUnspentOutputs`].
 message TransparentUnspentOutput {
-  // Cross-plane chain-state envelope pinned for the entire stream (ADR-0011,
-  // field tag 1). Identical on every message of one response stream.
-  ChainView chain_view = 1;
-
   // SHA-256 of the transparent address scriptPubKey.
-  bytes address_script_hash = 2;
+  bytes address_script_hash = 1;
 
   // Raw scriptPubKey bytes.
-  bytes script_pub_key = 3;
+  bytes script_pub_key = 2;
 
   // Outpoint of the unspent output, in the transaction that created it.
-  OutPoint outpoint = 4;
+  OutPoint outpoint = 3;
 
   // Output value in zatoshis.
-  uint64 value_zat = 5;
+  uint64 value_zat = 4;
 
   // Height of the block that mined the creating transaction.
-  uint32 block_height = 6;
+  uint32 block_height = 5;
 
   // Canonical block hash in RPC byte order (64 lowercase hex characters)
   // of the block that mined the creating transaction.
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string block_hash = 7;
+  string block_hash = 6;
+}
+
+// One message in the [`TransparentAddressUnspentOutputs`] server stream.
+//
+// The server sends exactly one `header` message first, then one `item`
+// message per unspent output. The header carries the single pinned chain
+// epoch for the whole stream; payload items carry no per-element epoch. This
+// makes the stream-wide single-epoch guarantee structural: a consumer reads
+// the epoch once from the leading header and never reconciles it across items.
+message TransparentUnspentOutputsChunk {
+  oneof body {
+    // Leading header carrying the chain epoch pinned for the entire stream
+    // (ADR-0011). Sent once, before any item.
+    ChainView header = 1;
+
+    // One unspent transparent output. Sent after the header.
+    TransparentUnspentOutput item = 2;
+  }
 }
 
 // Bounded transparent-address balance request computed in the wallet plane.
@@ -1220,29 +1234,44 @@ message TransparentAddressTxIdsInRangeRequest {
   bool descending = 6;
 }
 
-// One streamed transparent-address tx-history chunk.
-message TransparentAddressTxIdsChunk {
-  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
-  ChainView chain_view = 1;
-
+// One indexed transparent-address tx-history entry.
+message TransparentAddressTxId {
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 2;
+  string transaction_id = 1;
 
   // Height of the block that mined the indexed transaction.
-  uint32 block_height = 3;
+  uint32 block_height = 2;
 
   // Position of the indexed transaction inside its block.
-  uint32 tx_index_in_block = 4;
+  uint32 tx_index_in_block = 3;
 
   // Canonical block hash in RPC byte order (64 lowercase hex characters)
   // of the block that mined the indexed transaction.
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string block_hash = 5;
+  string block_hash = 4;
 
-  // Cursor for resuming strictly after this entry. Empty on every chunk
+  // Cursor for resuming strictly after this entry. Empty on every entry
   // except the last one when more entries may be available.
-  bytes cursor = 6;
+  bytes cursor = 5;
+}
+
+// One message in the [`TransparentAddressTxIdsInRange`] server stream.
+//
+// The server sends exactly one `header` message first, then one `item`
+// message per indexed transaction. The header carries the single pinned chain
+// epoch for the whole stream; payload items carry no per-element epoch. This
+// makes the stream-wide single-epoch guarantee structural rather than a
+// per-item repetition.
+message TransparentAddressTxIdsChunk {
+  oneof body {
+    // Leading header carrying the chain epoch pinned for the entire stream
+    // (ADR-0011). Sent once, before any item.
+    ChainView header = 1;
+
+    // One indexed transparent-address tx-history entry. Sent after the header.
+    TransparentAddressTxId item = 2;
+  }
 }
 
 // Native Zinder wallet and wallet-like application query service.
@@ -1321,7 +1350,7 @@ service WalletQuery {
   // address at a single pinned chain epoch. The stream is always complete:
   // no cursor, no entry cap.
   rpc TransparentAddressUnspentOutputs(TransparentAddressUnspentOutputsRequest)
-      returns (stream TransparentUnspentOutput);
+      returns (stream TransparentUnspentOutputsChunk);
 
   // Stream the transparent-address tx-history index for an inclusive
   // height range, in ascending or descending mined order.

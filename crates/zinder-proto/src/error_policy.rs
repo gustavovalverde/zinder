@@ -81,13 +81,15 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::InvalidChainStoreOptions
         | ErrorReason::ArtifactPayloadTooLarge
         | ErrorReason::InvalidChainEpochArtifacts
-        | ErrorReason::TransparentBalanceAddressCountExceeded => {
+        | ErrorReason::TransparentBalanceAddressCountExceeded
+        | ErrorReason::SnapshotPageCursorInvalid => {
             ReasonPolicy::new(Code::InvalidArgument, NonRetryable)
         }
 
         ErrorReason::BroadcastDisabled
         | ErrorReason::ChainEventCursorExpired
         | ErrorReason::MempoolEventCursorExpired
+        | ErrorReason::SnapshotPageCursorExpired
         | ErrorReason::ChainEpochPinUnsupported
         | ErrorReason::ChainEpochPinUnavailable
         // CHAIN_EPOCH_PIN_MISMATCH is wire-reserved and unproduced: requests pin

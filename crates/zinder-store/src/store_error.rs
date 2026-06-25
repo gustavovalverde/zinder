@@ -300,6 +300,25 @@ pub enum StoreError {
         reason: &'static str,
     },
 
+    /// Mempool snapshot paging cursor failed validation.
+    #[error("mempool snapshot page cursor is invalid: {reason}")]
+    SnapshotPageCursorInvalid {
+        /// Cursor validation failure reason.
+        reason: &'static str,
+    },
+
+    /// Mempool snapshot paging cursor names a snapshot newer than the writer
+    /// currently retains.
+    #[error(
+        "mempool snapshot page cursor expired: cursor snapshot sequence {snapshot_sequence}, current {current_snapshot_sequence}"
+    )]
+    SnapshotPageCursorExpired {
+        /// Snapshot sequence carried by the cursor.
+        snapshot_sequence: u64,
+        /// Snapshot sequence the writer currently serves.
+        current_snapshot_sequence: u64,
+    },
+
     /// Chain event sequence reached the maximum representable value.
     #[error("chain event sequence overflow")]
     ChainEventSequenceOverflow,

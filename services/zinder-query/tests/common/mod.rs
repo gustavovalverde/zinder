@@ -18,6 +18,67 @@ use zinder_core::{
     ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
+use zinder_proto::v1::wallet;
+
+/// Splits a `TransparentAddressUnspentOutputs` stream into the single leading
+/// `ChainView` header and the payload items that follow it.
+///
+/// Asserts the structural stream-header contract: the first message is the
+/// header, every later message is an item, and no second header appears.
+pub fn split_unspent_outputs_stream(
+    chunks: Vec<wallet::TransparentUnspentOutputsChunk>,
+) -> eyre::Result<(wallet::ChainView, Vec<wallet::TransparentUnspentOutput>)> {
+    let mut header: Option<wallet::ChainView> = None;
+    let mut items = Vec::new();
+    for chunk in chunks {
+        match chunk
+            .body
+            .ok_or_else(|| eyre::eyre!("chunk carries no body"))?
+        {
+            wallet::transparent_unspent_outputs_chunk::Body::Header(chain_view) => {
+                assert!(header.is_none(), "stream sent more than one header");
+                assert!(items.is_empty(), "header must precede every item");
+                header = Some(chain_view);
+            }
+            wallet::transparent_unspent_outputs_chunk::Body::Item(output) => {
+                assert!(header.is_some(), "item arrived before the header");
+                items.push(output);
+            }
+        }
+    }
+    let header = header.ok_or_else(|| eyre::eyre!("stream emits exactly one header"))?;
+    Ok((header, items))
+}
+
+/// Splits a `TransparentAddressTxIdsInRange` stream into the single leading
+/// `ChainView` header and the payload items that follow it.
+///
+/// Asserts the structural stream-header contract: the first message is the
+/// header, every later message is an item, and no second header appears.
+pub fn split_tx_ids_stream(
+    chunks: Vec<wallet::TransparentAddressTxIdsChunk>,
+) -> eyre::Result<(wallet::ChainView, Vec<wallet::TransparentAddressTxId>)> {
+    let mut header: Option<wallet::ChainView> = None;
+    let mut items = Vec::new();
+    for chunk in chunks {
+        match chunk
+            .body
+            .ok_or_else(|| eyre::eyre!("chunk carries no body"))?
+        {
+            wallet::transparent_address_tx_ids_chunk::Body::Header(chain_view) => {
+                assert!(header.is_none(), "stream sent more than one header");
+                assert!(items.is_empty(), "header must precede every item");
+                header = Some(chain_view);
+            }
+            wallet::transparent_address_tx_ids_chunk::Body::Item(entry) => {
+                assert!(header.is_some(), "item arrived before the header");
+                items.push(entry);
+            }
+        }
+    }
+    let header = header.ok_or_else(|| eyre::eyre!("stream emits exactly one header"))?;
+    Ok((header, items))
+}
 
 /// Builds a block hash whose 32 bytes repeat `seed` as four big-endian u32 chunks.
 #[must_use]

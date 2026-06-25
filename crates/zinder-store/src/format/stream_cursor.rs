@@ -219,6 +219,49 @@ pub struct AddressOutputCursorPayload {
     pub last_outpoint: TransparentOutPoint,
 }
 
+/// Snapshot-page stream family encoded in the low nibble of a cursor flags
+/// byte.
+///
+/// The single variant `SnapshotPage` (flag `0x5`) bookmarks a position inside
+/// one `MempoolSnapshot` paging walk. The body carries the snapshot sequence
+/// the page belongs to and the last yielded transaction id, so resuming
+/// continues strictly after that transaction within the same snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPageStreamFamily {
+    /// Mempool snapshot paging family (flag `0x5`).
+    SnapshotPage,
+}
+
+impl SnapshotPageStreamFamily {
+    pub(crate) const fn flags(self) -> u8 {
+        match self {
+            Self::SnapshotPage => 0x5,
+        }
+    }
+
+    const fn from_flags(flags: u8) -> Option<Self> {
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
+            return None;
+        }
+        match flags & STREAM_FAMILY_MASK {
+            0x5 => Some(Self::SnapshotPage),
+            _ => None,
+        }
+    }
+}
+
+/// Cursor payload decoded from a mempool-snapshot paging cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPageCursorPayload {
+    /// Stream family encoded in the cursor flags byte.
+    pub family: SnapshotPageStreamFamily,
+    /// Snapshot sequence the page belongs to.
+    pub snapshot_sequence: u64,
+    /// Identifier of the snapshot transaction last delivered before this
+    /// cursor was issued.
+    pub after_transaction_id: TransactionId,
+}
+
 /// One `(height, hash)` pair in a chain-event cursor locator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChainEventCursorAnchor {
@@ -616,6 +659,80 @@ impl StreamCursorTokenV1 {
         })
     }
 
+    /// Builds a mempool-snapshot paging cursor token bookmarking
+    /// `(snapshot_sequence, after_transaction_id)`.
+    pub fn snapshot_page(
+        network: Network,
+        family: SnapshotPageStreamFamily,
+        snapshot_sequence: u64,
+        after_transaction_id: TransactionId,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<Self, StreamCursorError> {
+        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
+        cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
+        cursor_bytes.extend_from_slice(&network.id().to_be_bytes());
+        cursor_bytes.extend_from_slice(&snapshot_sequence.to_be_bytes());
+        cursor_bytes.extend_from_slice(&after_transaction_id.as_bytes());
+        // Reserved padding to keep the body 50 bytes long (1 + 4 + 8 + 32 +
+        // 4 + 1) so this cursor shares the on-the-wire length of the family.
+        cursor_bytes.extend_from_slice(&[0u8; 4]);
+        cursor_bytes.push(family.flags());
+
+        let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
+        cursor_bytes.extend_from_slice(&auth_tag);
+
+        Ok(Self(cursor_bytes))
+    }
+
+    /// Decodes a mempool-snapshot paging cursor token.
+    pub fn decode_snapshot_page(
+        &self,
+        expected_network: Network,
+        cursor_auth_key: [u8; 32],
+    ) -> Result<SnapshotPageCursorPayload, StreamCursorError> {
+        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
+            return Err(StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            });
+        }
+
+        if self.0[0] != STREAM_CURSOR_SCHEMA_VERSION {
+            return Err(StreamCursorError::UnsupportedSchemaVersion { version: self.0[0] });
+        }
+
+        let network_id = read_u32_be(&self.0, 1)?;
+        let network =
+            Network::from_id(network_id).ok_or(StreamCursorError::UnknownNetwork { network_id })?;
+        if network != expected_network {
+            return Err(StreamCursorError::NetworkMismatch {
+                expected: expected_network,
+                actual: network,
+            });
+        }
+
+        let flags = self.0[49];
+        let family = SnapshotPageStreamFamily::from_flags(flags)
+            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+
+        verify_auth_tag(
+            cursor_auth_key,
+            &self.0[..CURSOR_BODY_LEN],
+            &self.0[CURSOR_BODY_LEN..],
+        )?;
+
+        let transaction_id_bytes = <[u8; 32]>::try_from(&self.0[13..45]).map_err(|_| {
+            StreamCursorError::InvalidLength {
+                byte_count: self.0.len(),
+            }
+        })?;
+
+        Ok(SnapshotPageCursorPayload {
+            family,
+            snapshot_sequence: read_u64_be(&self.0, 5)?,
+            after_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
+        })
+    }
+
     /// Creates a cursor token from encoded bytes supplied by a client.
     #[must_use]
     pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
@@ -793,7 +910,8 @@ mod tests {
     use super::{
         AUTH_TAG_LEN, AddressOutputCursorPayload, AddressOutputStreamFamily,
         CHAIN_EVENT_LOCATOR_MAX, CURSOR_BODY_LEN, ChainEventCursorAnchor, ChainEventLocator,
-        ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, StreamCursorError, StreamCursorTokenV1,
+        ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorPayload,
+        SnapshotPageStreamFamily, StreamCursorError, StreamCursorTokenV1,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -1123,6 +1241,78 @@ mod tests {
         assert!(matches!(
             cursor.decode_address_output(Network::ZcashMainnet, CURSOR_AUTH_KEY),
             Err(StreamCursorError::NetworkMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_page_cursor_round_trips() -> Result<(), StreamCursorError> {
+        let after_transaction_id = TransactionId::from_bytes([3; 32]);
+        let cursor = StreamCursorTokenV1::snapshot_page(
+            Network::ZcashRegtest,
+            SnapshotPageStreamFamily::SnapshotPage,
+            17,
+            after_transaction_id,
+            CURSOR_AUTH_KEY,
+        )?;
+
+        assert_eq!(cursor.as_bytes().len(), STREAM_CURSOR_TOKEN_V1_LEN);
+        assert_eq!(
+            cursor.as_bytes()[49],
+            SnapshotPageStreamFamily::SnapshotPage.flags()
+        );
+
+        let decoded = cursor.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
+        assert_eq!(
+            decoded,
+            SnapshotPageCursorPayload {
+                family: SnapshotPageStreamFamily::SnapshotPage,
+                snapshot_sequence: 17,
+                after_transaction_id,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_snapshot_page_cursor_fails_auth() -> Result<(), StreamCursorError> {
+        let cursor = StreamCursorTokenV1::snapshot_page(
+            Network::ZcashRegtest,
+            SnapshotPageStreamFamily::SnapshotPage,
+            17,
+            TransactionId::from_bytes([3; 32]),
+            CURSOR_AUTH_KEY,
+        )?;
+        let mut cursor_bytes = cursor.as_bytes().to_vec();
+        // Flip a byte inside the transaction-id field to alter the resume
+        // position; the HMAC must reject it instead of serving the wrong page.
+        cursor_bytes[20] ^= 1;
+        let tampered = StreamCursorTokenV1::from_bytes(cursor_bytes);
+
+        assert!(matches!(
+            tampered.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::InvalidAuthTag)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_page_cursor_rejects_wrong_family() -> Result<(), StreamCursorError> {
+        let cursor = StreamCursorTokenV1::address_output(
+            Network::ZcashRegtest,
+            AddressOutputStreamFamily::AddressOutput,
+            BlockHeight::new(1),
+            TransparentOutPoint {
+                transaction_id: TransactionId::from_bytes([0; 32]),
+                output_index: 0,
+            },
+            CURSOR_AUTH_KEY,
+        )?;
+        assert!(matches!(
+            cursor.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY),
+            Err(StreamCursorError::StreamFamilyMismatch { .. })
         ));
         Ok(())
     }

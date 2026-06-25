@@ -30,7 +30,8 @@ fn typed_detail_for(error: &StoreError) -> ErrorDetails {
         StoreError::ChainEventCursorInvalid { reason }
         | StoreError::MempoolEventCursorInvalid { reason }
         | StoreError::AddressOutputCursorInvalid { reason }
-        | StoreError::TransparentHistoryCursorInvalid { reason } => {
+        | StoreError::TransparentHistoryCursorInvalid { reason }
+        | StoreError::SnapshotPageCursorInvalid { reason } => {
             ErrorDetails::with_bad_request(vec![FieldViolation::new("from_cursor", *reason)])
         }
         StoreError::ChainEventCursorExpired {
@@ -48,6 +49,14 @@ fn typed_detail_for(error: &StoreError) -> ErrorDetails {
             "MEMPOOL_EVENT_CURSOR_EXPIRED",
             format!("mempool_event:{event_sequence}"),
             format!("oldest retained mempool event sequence is {oldest_retained_sequence}"),
+        )]),
+        StoreError::SnapshotPageCursorExpired {
+            snapshot_sequence,
+            current_snapshot_sequence,
+        } => ErrorDetails::with_precondition_failure(vec![PreconditionViolation::new(
+            "SNAPSHOT_PAGE_CURSOR_EXPIRED",
+            format!("snapshot_page:{snapshot_sequence}"),
+            format!("current snapshot sequence is {current_snapshot_sequence}"),
         )]),
         StoreError::ArtifactMissing { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
@@ -85,6 +94,8 @@ impl BoundaryError for StoreError {
             }
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::MempoolEventCursorExpired { .. } => ErrorReason::MempoolEventCursorExpired,
+            Self::SnapshotPageCursorInvalid { .. } => ErrorReason::SnapshotPageCursorInvalid,
+            Self::SnapshotPageCursorExpired { .. } => ErrorReason::SnapshotPageCursorExpired,
             Self::SchemaMismatch { .. } | Self::SchemaTooOld { .. } => ErrorReason::SchemaMismatch,
             Self::SchemaTooNew { .. } => ErrorReason::SchemaTooNew,
             Self::ReorgWindowExceeded { .. } => ErrorReason::ReorgWindowExceeded,
@@ -184,6 +195,11 @@ mod tests {
                 oldest_retained_sequence: 2,
             },
             StoreError::MempoolEventCursorInvalid { reason: "probe" },
+            StoreError::SnapshotPageCursorInvalid { reason: "probe" },
+            StoreError::SnapshotPageCursorExpired {
+                snapshot_sequence: 2,
+                current_snapshot_sequence: 1,
+            },
             StoreError::ChainEventSequenceOverflow,
             StoreError::MempoolEventSequenceOverflow,
             StoreError::ChainEpochSequenceOverflow,

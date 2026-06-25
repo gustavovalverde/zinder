@@ -53,6 +53,7 @@ The request shape failed validation. Retry disposition: **NonRetryable**. Carrie
 | `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, or are for a different network / store / stream family | `field_violations[from_cursor]` |
 | `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
 | `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |
+| `SNAPSHOT_PAGE_CURSOR_INVALID` | Same as above for `MempoolSnapshot` paging cursors | `field_violations[from_cursor]` |
 | `INVALID_ADDRESS` | Address selector is empty, malformed, or targets a different network | `field_violations[address]` |
 | `UNSUPPORTED_SHIELDED_PROTOCOL` | Shielded protocol value is not supported by the wallet protocol | `field_violations[shielded_protocol]` |
 | `INVALID_CHAIN_STORE_OPTIONS` | Operator misconfiguration in `[storage]` | — |
@@ -68,6 +69,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `BROADCAST_DISABLED` | The `broadcaster` is the no-op `()` implementation; deployment is read-only | `type=TRANSACTION_BROADCAST_DISABLED, subject=wallet.broadcast.transaction_v1` |
 | `CHAIN_EVENT_CURSOR_EXPIRED` | Cursor sequence is older than retained history (consumer fell behind) | `type=CHAIN_EVENT_CURSOR_EXPIRED, subject=chain_event:<seq>` |
 | `MEMPOOL_EVENT_CURSOR_EXPIRED` | Same as above for the mempool event stream | `type=MEMPOOL_EVENT_CURSOR_EXPIRED, subject=mempool_event:<seq>` |
+| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | `MempoolSnapshot` paging cursor is for a snapshot sequence newer than the writer currently retains | `type=SNAPSHOT_PAGE_CURSOR_EXPIRED, subject=snapshot_page:<seq>` |
 | `CHAIN_EPOCH_PIN_UNSUPPORTED` | Request pinned `at_epoch_id` but the query implementation does not support it | `subject=at_epoch` |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | Pinned chain epoch is no longer retained | `subject=chain_epoch:<id>` |
 | `CHAIN_EPOCH_PIN_MISMATCH` | Wire-reserved and not produced. Requests pin by bare epoch id, so there is no echoed epoch body to mismatch. | — |

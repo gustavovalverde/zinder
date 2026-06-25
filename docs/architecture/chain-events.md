@@ -76,12 +76,11 @@ The ingest subscription plane exposes chain events as a resumable stream of `Cha
 ChainEventEnvelope
   cursor: StreamCursorTokenV1
   event_sequence: u64
-  chain_epoch: ChainEpoch
-  safe_tip_height: BlockHeight
+  chain_view: ChainView   // field tag 3
   event: ChainCommitted | ChainReorged
 ```
 
-The Substreams last-irreversible-block pattern maps to Zinder`s `safe_tip_height`. Every envelope carries the safe tip height that was true for that event. Consumers may discard undo state at or below that height.
+The envelope carries the cross-plane `ChainView` at field tag 3. The Substreams last-irreversible-block pattern maps to `chain_view.chain_epoch.settled_tip.height`: every envelope carries the safe tip height that was true for that event as the settled tip of its epoch, so the envelope needs no separate `safe_tip_height` field. Consumers may discard undo state at or below that height.
 
 `StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). It carries the event sequence and a fork-aware locator (a tip-first, exponentially back-spaced set of `(height, hash)` pairs, capped at `CHAIN_EVENT_LOCATOR_MAX = 32`) for one chain-event stream, per [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md). Adding a second cursor format for chain events requires updating this contract and the boundary-specific serialization ADR.
 
@@ -190,4 +189,4 @@ Avoid `event_service`, `reorg_manager`, `notification_handler`, `source_processo
 ## Cross-References
 
 - [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription) defines the public wire surface (`WalletQuery.ChainEvents`, `ChainEventEnvelope`, `ChainCommitted`, `ChainReorged`).
-- [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) defines the parallel mempool event stream and its `MempoolStreamCursorV1` cursor body.
+- [ADR-0007](../adrs/0007-mempool-topology-and-retention.md) defines the parallel mempool event stream, which resumes through the `StreamCursorTokenV1` mempool-event family.

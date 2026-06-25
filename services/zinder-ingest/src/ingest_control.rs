@@ -47,13 +47,6 @@ const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
 /// receive a truncated page plus a cursor for the next call.
 pub const MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 
-const MEMPOOL_SNAPSHOT_CURSOR_LEN: usize = 40;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MempoolSnapshotCursor {
-    after_transaction_id: TransactionId,
-}
-
 /// Tonic adapter for the private ingest control service.
 #[derive(Clone)]
 pub struct IngestControlGrpcAdapter {
@@ -232,12 +225,18 @@ impl IngestControl for IngestControlGrpcAdapter {
         .map_err(|join_error| Status::unavailable(join_error.to_string()))?
         .map_err(|error| status_from_store_error(&error))?;
         let snapshot_sequence = retention_report.current_event_sequence;
-        let snapshot_cursor =
-            decode_mempool_snapshot_cursor(&request.from_cursor, snapshot_sequence)?;
-        let snapshot_page = mempool_index.snapshot_page(
-            max_entries,
-            snapshot_cursor.map(|cursor| cursor.after_transaction_id),
-        );
+        let after_transaction_id = if request.from_cursor.is_empty() {
+            None
+        } else {
+            let cursor = stream_cursor_from_message_bytes(request.from_cursor)
+                .ok_or_else(|| Status::invalid_argument("mempool snapshot cursor is empty"))?;
+            let payload = self
+                .store
+                .decode_snapshot_page_cursor(&cursor, snapshot_sequence)
+                .map_err(|error| status_from_store_error(&error))?;
+            Some(payload.after_transaction_id)
+        };
+        let snapshot_page = mempool_index.snapshot_page(max_entries, after_transaction_id);
         let snapshot_age_millis = UnixTimestampMillis::now()
             .value()
             .saturating_sub(snapshot_page.last_updated_at.value());
@@ -246,11 +245,15 @@ impl IngestControl for IngestControlGrpcAdapter {
             .iter()
             .map(|entry| mempool_entry_message(entry.as_ref()))
             .collect();
-        let next_cursor = snapshot_page
-            .next_after_transaction_id
-            .map_or_else(Vec::new, |transaction_id| {
-                encode_mempool_snapshot_cursor(snapshot_sequence, transaction_id)
-            });
+        let next_cursor = match snapshot_page.next_after_transaction_id {
+            Some(transaction_id) => self
+                .store
+                .encode_snapshot_page_cursor(snapshot_sequence, transaction_id)
+                .map_err(|error| status_from_store_error(&error))?
+                .as_bytes()
+                .to_vec(),
+            None => Vec::new(),
+        };
         record_mempool_snapshot_age_seconds(snapshot_age_millis);
         Ok(Response::new(wallet::MempoolSnapshotResponse {
             chain_view: Some(zinder_store::chain_view_message(chain_epoch)),
@@ -549,46 +552,6 @@ const fn bounded_snapshot_page_size(requested: u32) -> u32 {
     } else {
         requested
     }
-}
-
-fn decode_mempool_snapshot_cursor(
-    cursor_bytes: &[u8],
-    current_snapshot_sequence: u64,
-) -> Result<Option<MempoolSnapshotCursor>, Status> {
-    if cursor_bytes.is_empty() {
-        return Ok(None);
-    }
-    if cursor_bytes.len() != MEMPOOL_SNAPSHOT_CURSOR_LEN {
-        return Err(Status::invalid_argument(
-            "mempool snapshot cursor is invalid",
-        ));
-    }
-
-    let sequence_bytes = <[u8; 8]>::try_from(&cursor_bytes[..8])
-        .map_err(|_| Status::invalid_argument("mempool snapshot cursor sequence is invalid"))?;
-    let snapshot_sequence = u64::from_be_bytes(sequence_bytes);
-    if snapshot_sequence > current_snapshot_sequence {
-        return Err(Status::invalid_argument(
-            "mempool snapshot cursor is ahead of retained history",
-        ));
-    }
-
-    let transaction_id_bytes = <[u8; 32]>::try_from(&cursor_bytes[8..]).map_err(|_| {
-        Status::invalid_argument("mempool snapshot cursor transaction id is invalid")
-    })?;
-    Ok(Some(MempoolSnapshotCursor {
-        after_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
-    }))
-}
-
-fn encode_mempool_snapshot_cursor(
-    snapshot_sequence: u64,
-    after_transaction_id: TransactionId,
-) -> Vec<u8> {
-    let mut cursor_bytes = Vec::with_capacity(MEMPOOL_SNAPSHOT_CURSOR_LEN);
-    cursor_bytes.extend_from_slice(&snapshot_sequence.to_be_bytes());
-    cursor_bytes.extend_from_slice(&after_transaction_id.as_bytes());
-    cursor_bytes
 }
 
 async fn read_chain_event_page(

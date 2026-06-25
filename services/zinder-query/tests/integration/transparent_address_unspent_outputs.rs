@@ -19,7 +19,7 @@ use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::synthetic_chain_epoch;
+use crate::common::{split_unspent_outputs_stream, synthetic_chain_epoch};
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xAB; 32];
 const SCRIPT_PUB_KEY: &[u8] = &[
@@ -41,18 +41,18 @@ fn unspent_outputs_request(start_height: u32) -> wallet::TransparentAddressUnspe
 async fn drain_unspent_outputs(
     grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
     start_height: u32,
-) -> eyre::Result<Vec<wallet::TransparentUnspentOutput>> {
+) -> eyre::Result<(wallet::ChainView, Vec<wallet::TransparentUnspentOutput>)> {
     let mut stream = WalletQueryService::transparent_address_unspent_outputs(
         grpc_adapter,
         Request::new(unspent_outputs_request(start_height)),
     )
     .await?
     .into_inner();
-    let mut outputs = Vec::new();
+    let mut chunks = Vec::new();
     while let Some(message) = stream.next().await {
-        outputs.push(message?);
+        chunks.push(message?);
     }
-    Ok(outputs)
+    split_unspent_outputs_stream(chunks)
 }
 
 #[tokio::test]
@@ -64,19 +64,17 @@ async fn transparent_address_unspent_outputs_streams_complete_set() -> eyre::Res
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let outputs = drain_unspent_outputs(&grpc_adapter, 0).await?;
+    let (header, outputs) = drain_unspent_outputs(&grpc_adapter, 0).await?;
 
     assert_eq!(outputs.len(), stored_utxos.len());
-    let first_epoch = outputs[0].chain_view.clone();
-    assert!(first_epoch.is_some(), "every message carries a chain view");
-    for (message, stored) in outputs.iter().zip(&stored_utxos) {
-        assert_eq!(
-            message.chain_view, first_epoch,
-            "the whole stream binds to one pinned chain epoch"
-        );
-        assert_eq!(message.value_zat, stored.value_zat);
-        assert_eq!(message.script_pub_key, stored.script_pub_key);
-        assert_eq!(message.block_height, stored.block_height.value());
+    assert!(
+        header.chain_epoch.is_some(),
+        "the leading header carries the pinned chain epoch for the whole stream"
+    );
+    for (output, stored) in outputs.iter().zip(&stored_utxos) {
+        assert_eq!(output.value_zat, stored.value_zat);
+        assert_eq!(output.script_pub_key, stored.script_pub_key);
+        assert_eq!(output.block_height, stored.block_height.value());
     }
 
     Ok(())
@@ -91,7 +89,7 @@ async fn transparent_address_unspent_outputs_streams_past_the_old_page_cap() -> 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let outputs = drain_unspent_outputs(&grpc_adapter, 0).await?;
+    let (_header, outputs) = drain_unspent_outputs(&grpc_adapter, 0).await?;
 
     assert_eq!(
         outputs.len(),
@@ -111,10 +109,10 @@ async fn transparent_address_unspent_outputs_honors_start_height_floor() -> eyre
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let at_mined_height = drain_unspent_outputs(&grpc_adapter, 7).await?;
+    let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 7).await?;
     assert_eq!(at_mined_height.len(), stored_utxos.len());
 
-    let above_mined_height = drain_unspent_outputs(&grpc_adapter, 8).await?;
+    let (_above_header, above_mined_height) = drain_unspent_outputs(&grpc_adapter, 8).await?;
     assert!(
         above_mined_height.is_empty(),
         "outputs mined below the wallet-birthday floor are excluded"

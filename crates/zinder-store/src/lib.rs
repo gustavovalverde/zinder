@@ -49,8 +49,9 @@ pub use event_stream::{EventEnvelope, run_event_stream};
 pub use format::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
-    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
+    SnapshotPageCursorPayload, SnapshotPageStreamFamily, StreamCursorError, StreamCursorTokenV1,
+    TransparentHistoryCursorAnchor, TransparentHistoryCursorPayload,
+    TransparentHistoryStreamFamily,
 };
 pub use grpc_status::status_from_store_error;
 pub use kv::{

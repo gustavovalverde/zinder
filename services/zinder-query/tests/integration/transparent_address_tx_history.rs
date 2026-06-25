@@ -24,7 +24,7 @@ use zinder_testkit::{
     seed_transparent_address_transaction_history,
 };
 
-use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
+use crate::common::{block_hash_from_seed, split_tx_ids_stream, synthetic_chain_epoch};
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xEF; 32];
 
@@ -70,13 +70,14 @@ async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -
     while let Some(chunk) = stream.next().await {
         chunks.push(chunk?);
     }
+    let (_header, items) = split_tx_ids_stream(chunks)?;
 
-    assert_eq!(chunks.len(), 5);
-    for (chunk, tx_index) in chunks.iter().zip(0_u32..) {
-        assert_eq!(chunk.tx_index_in_block, tx_index);
-        assert_eq!(chunk.block_height, 1);
-        assert!(!chunk.transaction_id.is_empty());
-        assert!(!chunk.block_hash.is_empty());
+    assert_eq!(items.len(), 5);
+    for (item, tx_index) in items.iter().zip(0_u32..) {
+        assert_eq!(item.tx_index_in_block, tx_index);
+        assert_eq!(item.block_height, 1);
+        assert!(!item.transaction_id.is_empty());
+        assert!(!item.block_hash.is_empty());
     }
     Ok(())
 }
@@ -123,9 +124,10 @@ async fn transparent_address_tx_ids_in_range_supports_descending() -> eyre::Resu
     while let Some(chunk) = stream.next().await {
         chunks.push(chunk?);
     }
+    let (_header, items) = split_tx_ids_stream(chunks)?;
 
-    assert_eq!(chunks.len(), 4);
-    let tx_indexes: Vec<u32> = chunks.iter().map(|chunk| chunk.tx_index_in_block).collect();
+    assert_eq!(items.len(), 4);
+    let tx_indexes: Vec<u32> = items.iter().map(|item| item.tx_index_in_block).collect();
     assert_eq!(tx_indexes, vec![3, 2, 1, 0]);
     Ok(())
 }
@@ -242,7 +244,7 @@ async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() ->
 async fn collect_tx_history_chunks(
     grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore, ()>>,
     request: wallet::TransparentAddressTxIdsInRangeRequest,
-) -> eyre::Result<Vec<wallet::TransparentAddressTxIdsChunk>> {
+) -> eyre::Result<Vec<wallet::TransparentAddressTxId>> {
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
         grpc_adapter,
         Request::new(request),
@@ -253,8 +255,8 @@ async fn collect_tx_history_chunks(
     while let Some(chunk) = stream.next().await {
         chunks.push(chunk?);
     }
-
-    Ok(chunks)
+    let (_header, items) = split_tx_ids_stream(chunks)?;
+    Ok(items)
 }
 
 fn tx_history_request(

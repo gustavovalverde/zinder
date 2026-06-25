@@ -257,7 +257,8 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
     assert_eq!(first_event.event_sequence, 1);
     assert_eq!(
         first_event
-            .chain_epoch
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
             .ok_or_else(|| eyre!("missing chain epoch"))?
             .chain_epoch_id,
         stored_artifacts.chain_epoch.id.value()
@@ -379,42 +380,16 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
     let proxied_event = wallet::ChainEventEnvelope {
         cursor: vec![0x01, 0x02],
         event_sequence: 77,
-        chain_epoch: Some(wallet::ChainEpoch {
-            chain_epoch_id: 11,
-            network_name: "zcash-regtest".to_owned(),
-            artifact_schema_version: 1,
-            created_at_millis: 123,
-            visible_tip: Some(wallet::BlockTip {
-                height: 5,
-                hash: "05".repeat(32),
-            }),
-            settled_tip: Some(wallet::BlockTip {
-                height: 4,
-                hash: "04".repeat(32),
-            }),
-            sapling_commitment_tree_size: 0,
-            orchard_commitment_tree_size: 0,
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(proxied_event_chain_epoch()),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
         }),
-        safe_tip_height: 4,
         event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
             wallet::ChainCommitted {
                 committed: Some(wallet::ChainEpochCommitted {
-                    chain_epoch: Some(wallet::ChainEpoch {
-                        chain_epoch_id: 11,
-                        network_name: "zcash-regtest".to_owned(),
-                        artifact_schema_version: 1,
-                        created_at_millis: 123,
-                        visible_tip: Some(wallet::BlockTip {
-                            height: 5,
-                            hash: "05".repeat(32),
-                        }),
-                        settled_tip: Some(wallet::BlockTip {
-                            height: 4,
-                            hash: "04".repeat(32),
-                        }),
-                        sapling_commitment_tree_size: 0,
-                        orchard_commitment_tree_size: 0,
-                    }),
+                    chain_epoch: Some(proxied_event_chain_epoch()),
                     start_height: 5,
                     end_height: 5,
                 }),
@@ -813,6 +788,25 @@ impl IngestControl for StaticIngestControl {
         Err(Status::unimplemented(
             "test scaffold does not stub ChainValuePoolsAtTip",
         ))
+    }
+}
+
+fn proxied_event_chain_epoch() -> wallet::ChainEpoch {
+    wallet::ChainEpoch {
+        chain_epoch_id: 11,
+        network_name: "zcash-regtest".to_owned(),
+        artifact_schema_version: 1,
+        created_at_millis: 123,
+        visible_tip: Some(wallet::BlockTip {
+            height: 5,
+            hash: "05".repeat(32),
+        }),
+        settled_tip: Some(wallet::BlockTip {
+            height: 4,
+            hash: "04".repeat(32),
+        }),
+        sapling_commitment_tree_size: 0,
+        orchard_commitment_tree_size: 0,
     }
 }
 

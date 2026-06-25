@@ -28,8 +28,9 @@ pub(crate) use store_key::StoreKey;
 pub use stream_cursor::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
-    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
+    SnapshotPageCursorPayload, SnapshotPageStreamFamily, StreamCursorError, StreamCursorTokenV1,
+    TransparentHistoryCursorAnchor, TransparentHistoryCursorPayload,
+    TransparentHistoryStreamFamily,
 };
 pub(crate) use stream_cursor::{
     CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator,
