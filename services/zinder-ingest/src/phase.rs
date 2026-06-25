@@ -26,7 +26,7 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
         .current_chain_epoch()
         .ok()
         .flatten()
-        .map(|chain_epoch| chain_epoch.tip_height.value())
+        .map(|chain_epoch| chain_epoch.visible_tip_height.value())
 }
 
 /// Picks the [`IngestPhase`] for the current iteration.

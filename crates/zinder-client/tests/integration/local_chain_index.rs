@@ -83,7 +83,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         compact_block_count += 1;
     }
 
-    assert_eq!(current_epoch.tip_height, BlockHeight::new(2));
+    assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(latest_block.height, BlockHeight::new(2));
     assert_eq!(compact_block.height, BlockHeight::new(1));
     assert_eq!(tree_state.height, BlockHeight::new(2));

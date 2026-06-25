@@ -770,7 +770,10 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
         .await?;
     let range_chain_epoch = compact_block_range.chain_epoch;
     assert_eq!(range_chain_epoch.network, network);
-    assert_eq!(range_chain_epoch.tip_height, BlockHeight::new(end_height));
+    assert_eq!(
+        range_chain_epoch.visible_tip_height,
+        BlockHeight::new(end_height)
+    );
     assert_eq!(
         compact_block_range.compact_blocks.len(),
         usize::try_from(end_height - start_height + 1)?

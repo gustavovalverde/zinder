@@ -110,18 +110,21 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         response_chain_epoch.network_name,
         encode_zinder_native_chain_name(chain_epoch.network)
     );
-    assert_eq!(response_visible_tip.height, chain_epoch.tip_height.value());
+    assert_eq!(
+        response_visible_tip.height,
+        chain_epoch.visible_tip_height.value()
+    );
     assert_eq!(
         response_visible_tip.hash,
-        encode_rpc_block_hash_hex(chain_epoch.tip_hash)
+        encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash)
     );
     assert_eq!(
         response_settled_tip.height,
-        chain_epoch.safe_tip_height.value()
+        chain_epoch.settled_tip_height.value()
     );
     assert_eq!(
         response_settled_tip.hash,
-        encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash)
+        encode_rpc_block_hash_hex(chain_epoch.settled_tip_hash)
     );
     assert_eq!(
         response_chain_epoch.artifact_schema_version,
@@ -171,10 +174,10 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
         .ok_or_else(|| eyre!("missing latest block metadata"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
-    assert_eq!(latest_block.height, chain_epoch.tip_height.value());
+    assert_eq!(latest_block.height, chain_epoch.visible_tip_height.value());
     assert_eq!(
         latest_block.block_hash,
-        encode_rpc_block_hash_hex(chain_epoch.tip_hash)
+        encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash)
     );
 
     Ok(())
@@ -187,7 +190,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(1),
-        chain_epoch.tip_hash,
+        chain_epoch.visible_tip_hash,
         b"tree-state-1".to_vec(),
     );
 
@@ -224,7 +227,7 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(1),
-        chain_epoch.tip_hash,
+        chain_epoch.visible_tip_hash,
         b"tree-state-1".to_vec(),
     );
 
@@ -578,12 +581,12 @@ fn compact_block_range_chunk(
                 artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
                 created_at_millis: chain_epoch.created_at.value(),
                 visible_tip: Some(wallet::BlockTip {
-                    height: chain_epoch.tip_height.value(),
-                    hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
+                    height: chain_epoch.visible_tip_height.value(),
+                    hash: encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash),
                 }),
                 settled_tip: Some(wallet::BlockTip {
-                    height: chain_epoch.safe_tip_height.value(),
-                    hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
+                    height: chain_epoch.settled_tip_height.value(),
+                    hash: encode_rpc_block_hash_hex(chain_epoch.settled_tip_hash),
                 }),
                 sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
                 orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,

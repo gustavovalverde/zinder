@@ -65,7 +65,7 @@ fn rebuild_address_output_projection(
         .map(|chain_epoch_id| read_chain_epoch(inner, chain_epoch_id))
         .transpose()?;
     let safe_tip_height = current_chain_epoch.map_or(BlockHeight::new(0), |chain_epoch| {
-        chain_epoch.safe_tip_height
+        chain_epoch.settled_tip_height
     });
 
     tracing::info!(
@@ -514,10 +514,10 @@ mod tests {
         let chain_epoch = ChainEpoch {
             id: ChainEpochId::new(1),
             network: NETWORK,
-            tip_height: BlockHeight::new(5),
-            tip_hash: block_hash(5),
-            safe_tip_height: BlockHeight::new(3),
-            safe_tip_hash: block_hash(3),
+            visible_tip_height: BlockHeight::new(5),
+            visible_tip_hash: block_hash(5),
+            settled_tip_height: BlockHeight::new(3),
+            settled_tip_hash: block_hash(3),
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000),

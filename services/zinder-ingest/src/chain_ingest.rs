@@ -871,10 +871,10 @@ pub(crate) fn select_best_chain(
         .ok_or(IngestError::EmptyCanonicalBatch)?;
 
     if current_chain_epoch
-        .tip_height
+        .visible_tip_height
         .next()
         .is_some_and(|next_tip| first_candidate.height == next_tip)
-        && first_candidate.parent_hash == current_chain_epoch.tip_hash
+        && first_candidate.parent_hash == current_chain_epoch.visible_tip_hash
     {
         return Ok(ReorgWindowChange::Extend {
             block_range: BlockHeightRange::inclusive(first_candidate.height, last_candidate.height),
@@ -882,7 +882,7 @@ pub(crate) fn select_best_chain(
     }
 
     let replacement_depth = current_chain_epoch
-        .tip_height
+        .visible_tip_height
         .value()
         .saturating_sub(first_candidate.height.value())
         .saturating_add(1);
@@ -1519,9 +1519,9 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 event = "chain_committed",
                 chain_epoch_id = chain_epoch.id.value(),
                 network = encode_zinder_native_chain_name(chain_epoch.network),
-                tip_height = chain_epoch.tip_height.value(),
-                tip_hash = %display_block_hash(chain_epoch.tip_hash),
-                safe_tip_height = chain_epoch.safe_tip_height.value(),
+                tip_height = chain_epoch.visible_tip_height.value(),
+                tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
+                safe_tip_height = chain_epoch.settled_tip_height.value(),
                 block_range_start = committed.block_range.start.value(),
                 block_range_end = committed.block_range.end.value(),
                 event_sequence,
@@ -1537,9 +1537,9 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 event = "chain_reorged",
                 chain_epoch_id = chain_epoch.id.value(),
                 network = encode_zinder_native_chain_name(chain_epoch.network),
-                tip_height = chain_epoch.tip_height.value(),
-                tip_hash = %display_block_hash(chain_epoch.tip_hash),
-                safe_tip_height = chain_epoch.safe_tip_height.value(),
+                tip_height = chain_epoch.visible_tip_height.value(),
+                tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
+                safe_tip_height = chain_epoch.settled_tip_height.value(),
                 committed_block_range_start = committed.block_range.start.value(),
                 committed_block_range_end = committed.block_range.end.value(),
                 reverted_block_range_start = reverted.block_range.start.value(),
@@ -1570,12 +1570,12 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
         "zinder_ingest_writer_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.tip_height.value()));
+    .set(u32_to_f64(chain_epoch.visible_tip_height.value()));
     metrics::gauge!(
         "zinder_ingest_writer_safe_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.safe_tip_height.value()));
+    .set(u32_to_f64(chain_epoch.settled_tip_height.value()));
 }
 
 fn display_block_hash(block_hash: BlockHash) -> String {

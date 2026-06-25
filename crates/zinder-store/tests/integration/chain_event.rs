@@ -359,12 +359,12 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
             DerivedBlockRow {
                 height: BlockHeight::new(1),
                 chain_epoch: initial_epoch.id,
-                block_hash: initial_epoch.tip_hash,
+                block_hash: initial_epoch.visible_tip_hash,
             },
             DerivedBlockRow {
                 height: BlockHeight::new(2),
                 chain_epoch: initial_epoch.id,
-                block_hash: initial_epoch.tip_hash,
+                block_hash: initial_epoch.visible_tip_hash,
             }
         ]
     );
@@ -391,7 +391,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
             DerivedBlockRow {
                 height: BlockHeight::new(1),
                 chain_epoch: initial_epoch.id,
-                block_hash: initial_epoch.tip_hash,
+                block_hash: initial_epoch.visible_tip_hash,
             },
             DerivedBlockRow {
                 height: BlockHeight::new(2),
@@ -533,7 +533,10 @@ fn past_retention_reorg_reconnect_synthesizes_a_reorg() -> eyre::Result<()> {
 fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: ChainEpoch) {
     assert_eq!(event_envelope.event_sequence, 1);
     assert_eq!(event_envelope.chain_epoch, chain_epoch);
-    assert_eq!(event_envelope.safe_tip_height, chain_epoch.safe_tip_height);
+    assert_eq!(
+        event_envelope.safe_tip_height,
+        chain_epoch.settled_tip_height
+    );
     assert!(matches!(
         &event_envelope.event,
         ChainEvent::ChainCommitted { committed } if committed.chain_epoch == chain_epoch
@@ -587,7 +590,7 @@ impl TestDerivedConsumer {
             self.rows.push(DerivedBlockRow {
                 height: BlockHeight::new(height),
                 chain_epoch: committed.chain_epoch.id,
-                block_hash: committed.chain_epoch.tip_hash,
+                block_hash: committed.chain_epoch.visible_tip_hash,
             });
         }
         self.rows.sort_by_key(|row| row.height.value());
@@ -626,10 +629,10 @@ fn synthetic_epoch_with_safe_tip(
         ChainEpoch {
             id: ChainEpochId::new(chain_epoch_id),
             network: Network::ZcashRegtest,
-            tip_height: block_height,
-            tip_hash: source_hash,
-            safe_tip_height: BlockHeight::new(safe_tip_height),
-            safe_tip_hash: block_hash(safe_tip_height),
+            visible_tip_height: block_height,
+            visible_tip_hash: source_hash,
+            settled_tip_height: BlockHeight::new(safe_tip_height),
+            settled_tip_hash: block_hash(safe_tip_height),
             artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),

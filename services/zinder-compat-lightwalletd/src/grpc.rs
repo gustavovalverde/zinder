@@ -1361,7 +1361,7 @@ fn project_added_after_sequence_to_raw_transaction(
                 // ignores the value and uses GetLatestBlock for tip
                 // tracking; Zinder reports the chain epoch's tip height
                 // recorded on the entry.
-                height: u64::from(entry.first_seen_chain_epoch.tip_height.value()),
+                height: u64::from(entry.first_seen_chain_epoch.visible_tip_height.value()),
             })),
             _ => None,
         },

@@ -502,7 +502,9 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
         cursor_at_risk_warning,
     };
 
-    let readiness = Readiness::new(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
+    let readiness = Readiness::new(ReadinessState::ready(Some(
+        chain_epoch.visible_tip_height.value(),
+    )));
     let cancel = CancellationToken::new();
     let worker_handle = spawn_mempool_event_retention_task(
         store.clone(),

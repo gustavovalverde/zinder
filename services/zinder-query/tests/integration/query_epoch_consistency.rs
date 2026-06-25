@@ -100,10 +100,10 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
         .ok_or_else(|| eyre!("missing latest block metadata"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
-    assert_eq!(latest_block.height, first_epoch.tip_height.value());
+    assert_eq!(latest_block.height, first_epoch.visible_tip_height.value());
     assert_eq!(
         latest_block.block_hash,
-        encode_rpc_block_hash_hex(first_epoch.tip_hash)
+        encode_rpc_block_hash_hex(first_epoch.visible_tip_hash)
     );
 
     Ok(())

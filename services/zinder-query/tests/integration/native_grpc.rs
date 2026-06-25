@@ -765,12 +765,12 @@ fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         visible_tip: Some(wallet::BlockTip {
-            height: chain_epoch.tip_height.value(),
-            hash: encode_rpc_block_hash_hex(chain_epoch.tip_hash),
+            height: chain_epoch.visible_tip_height.value(),
+            hash: encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash),
         }),
         settled_tip: Some(wallet::BlockTip {
-            height: chain_epoch.safe_tip_height.value(),
-            hash: encode_rpc_block_hash_hex(chain_epoch.safe_tip_hash),
+            height: chain_epoch.settled_tip_height.value(),
+            hash: encode_rpc_block_hash_hex(chain_epoch.settled_tip_hash),
         }),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,

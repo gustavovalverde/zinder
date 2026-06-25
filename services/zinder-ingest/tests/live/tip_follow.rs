@@ -55,7 +55,7 @@ async fn tip_follow_advances_to_node_tip() -> Result<()> {
         .ok_or_else(|| eyre!("tip-follow did not commit any chain epoch"))?;
     assert_eq!(chain_epoch.network, env.network());
     assert!(
-        chain_epoch.tip_height >= BlockHeight::new(1),
+        chain_epoch.visible_tip_height >= BlockHeight::new(1),
         "tip-follow did not advance the visible chain epoch"
     );
     Ok(())

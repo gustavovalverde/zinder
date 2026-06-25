@@ -57,7 +57,7 @@ async fn bulk_catchup_initial_range() -> Result<()> {
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     assert_eq!(commit_outcome.chain_epoch.network, env.network());
-    assert_eq!(commit_outcome.chain_epoch.tip_height, to_height);
+    assert_eq!(commit_outcome.chain_epoch.visible_tip_height, to_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
@@ -133,8 +133,8 @@ async fn bulk_catchup_from_checkpoint() -> Result<()> {
         .ok_or_else(|| eyre!("expected committed checkpoint bulk-catchup outcome"))?;
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
-    assert_eq!(chain_epoch.tip_height, tip_height);
-    assert_eq!(chain_epoch.safe_tip_height, tip_height);
+    assert_eq!(chain_epoch.visible_tip_height, tip_height);
+    assert_eq!(chain_epoch.settled_tip_height, tip_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
@@ -229,7 +229,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     let bulk_catchup_seconds = bulk_catchup_started_at.elapsed().as_secs();
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
-    assert_eq!(chain_epoch.tip_height, tip_height);
+    assert_eq!(chain_epoch.visible_tip_height, tip_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

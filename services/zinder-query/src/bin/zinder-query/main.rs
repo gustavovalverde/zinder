@@ -197,7 +197,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let visible_height = store
         .current_chain_epoch()
         .map_err(QueryConfigError::Store)?
-        .map(|epoch| epoch.tip_height.value());
+        .map(|epoch| epoch.visible_tip_height.value());
     let broadcaster_and_capabilities = build_broadcaster(query_config.broadcaster.as_ref()).await?;
     let transaction_broadcast_enabled = broadcaster_and_capabilities.is_some();
     let upstream_node_capabilities =

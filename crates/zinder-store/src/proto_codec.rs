@@ -289,12 +289,12 @@ pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         created_at_millis: chain_epoch.created_at.value(),
         visible_tip: Some(block_tip_message(
-            chain_epoch.tip_height,
-            chain_epoch.tip_hash,
+            chain_epoch.visible_tip_height,
+            chain_epoch.visible_tip_hash,
         )),
         settled_tip: Some(block_tip_message(
-            chain_epoch.safe_tip_height,
-            chain_epoch.safe_tip_hash,
+            chain_epoch.settled_tip_height,
+            chain_epoch.settled_tip_hash,
         )),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
@@ -421,10 +421,16 @@ pub fn chain_epoch_from_message(
     Ok(ChainEpoch {
         id: ChainEpochId::new(message.chain_epoch_id),
         network,
-        tip_height: BlockHeight::new(visible_tip.height),
-        tip_hash: block_hash_from_rpc_hex("chain_epoch.visible_tip.hash", &visible_tip.hash)?,
-        safe_tip_height: BlockHeight::new(settled_tip.height),
-        safe_tip_hash: block_hash_from_rpc_hex("chain_epoch.settled_tip.hash", &settled_tip.hash)?,
+        visible_tip_height: BlockHeight::new(visible_tip.height),
+        visible_tip_hash: block_hash_from_rpc_hex(
+            "chain_epoch.visible_tip.hash",
+            &visible_tip.hash,
+        )?,
+        settled_tip_height: BlockHeight::new(settled_tip.height),
+        settled_tip_hash: block_hash_from_rpc_hex(
+            "chain_epoch.settled_tip.hash",
+            &settled_tip.hash,
+        )?,
         artifact_schema_version: ArtifactSchemaVersion::new(artifact_schema_version),
         tip_metadata: ChainTipMetadata::new(
             message.sapling_commitment_tree_size,

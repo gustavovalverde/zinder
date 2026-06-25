@@ -145,7 +145,7 @@ mod tests {
         let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
         let reader = store_fixture.chain_store().current_chain_epoch_reader()?;
         let chain_epoch = reader.chain_epoch();
-        assert_eq!(chain_epoch.tip_height, BlockHeight::new(1));
+        assert_eq!(chain_epoch.visible_tip_height, BlockHeight::new(1));
         assert_eq!(chain_epoch.network, Network::ZcashRegtest);
         Ok(())
     }
@@ -157,7 +157,7 @@ mod tests {
             StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
         let reader = store_fixture.chain_store().current_chain_epoch_reader()?;
         let chain_epoch = reader.chain_epoch();
-        assert_eq!(chain_epoch.tip_height, BlockHeight::new(3));
+        assert_eq!(chain_epoch.visible_tip_height, BlockHeight::new(3));
 
         for height_value in 1..=3_u32 {
             let block = reader.block_header_at(BlockHeight::new(height_value))?;

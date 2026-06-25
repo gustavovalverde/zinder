@@ -1945,7 +1945,7 @@ fn build_synthetic_reorg_envelope(
     );
     let committed = ChainEpochCommitted::new(
         current_chain_epoch,
-        BlockHeightRange::inclusive(reverted_start, current_chain_epoch.tip_height),
+        BlockHeightRange::inclusive(reverted_start, current_chain_epoch.visible_tip_height),
     );
     let fork_locator = build_chain_event_locator(inner, current_chain_epoch, fork_point)?;
     let cursor_event_sequence = oldest_retained_sequence.saturating_sub(1);
@@ -1963,7 +1963,7 @@ fn build_synthetic_reorg_envelope(
         cursor,
         cursor_event_sequence,
         current_chain_epoch,
-        current_chain_epoch.safe_tip_height,
+        current_chain_epoch.settled_tip_height,
         ChainEvent::ChainReorged {
             reverted,
             committed,
@@ -1984,8 +1984,8 @@ fn enrich_chain_event_cursor(
         inner,
         chain_epoch,
         ChainEventCursorAnchor {
-            height: chain_epoch.tip_height,
-            hash: chain_epoch.tip_hash,
+            height: chain_epoch.visible_tip_height,
+            hash: chain_epoch.visible_tip_hash,
         },
     )?;
     event_envelope.cursor = StreamCursorTokenV1::chain_event(
@@ -2014,7 +2014,7 @@ fn build_chain_event(
                 })?;
             let reverted = ChainRangeReverted::new(
                 previous_chain_epoch,
-                BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height),
+                BlockHeightRange::inclusive(from_height, previous_chain_epoch.visible_tip_height),
             );
 
             ChainEvent::ChainReorged {
@@ -2060,8 +2060,8 @@ fn build_chain_event_envelope<R: RocksChainStoreRead>(
         inner,
         chain_epoch,
         ChainEventCursorAnchor {
-            height: chain_epoch.tip_height,
-            hash: chain_epoch.tip_hash,
+            height: chain_epoch.visible_tip_height,
+            hash: chain_epoch.visible_tip_hash,
         },
     )?;
     let cursor = StreamCursorTokenV1::chain_event(
@@ -2079,7 +2079,7 @@ fn build_chain_event_envelope<R: RocksChainStoreRead>(
         cursor,
         event_sequence,
         chain_epoch,
-        chain_epoch.safe_tip_height,
+        chain_epoch.settled_tip_height,
         event,
     ))
 }
@@ -2091,7 +2091,7 @@ fn chain_event_matches_family(
     match family {
         ChainEventStreamFamily::Tip => true,
         ChainEventStreamFamily::Safe => {
-            event_envelope.chain_epoch.tip_height <= event_envelope.safe_tip_height
+            event_envelope.chain_epoch.visible_tip_height <= event_envelope.safe_tip_height
                 && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
         }
     }
@@ -2313,7 +2313,7 @@ fn build_safe_tip_retention_sweep(
         if artifacts.block_headers.is_empty() {
             return Ok(SafeTipRetentionSweep {
                 puts: vec![transparent_retention_swept_height_put(
-                    chain_epoch.safe_tip_height,
+                    chain_epoch.settled_tip_height,
                 )],
                 deletes: Vec::new(),
                 swept_outpoints: 0,
@@ -2325,8 +2325,8 @@ fn build_safe_tip_retention_sweep(
     let swept_through =
         read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
     let sweep_ceiling = chain_epoch
-        .safe_tip_height
-        .min(previous_chain_epoch.tip_height);
+        .settled_tip_height
+        .min(previous_chain_epoch.visible_tip_height);
     if sweep_ceiling <= swept_through {
         return Ok(SafeTipRetentionSweep::empty());
     }
@@ -2435,7 +2435,8 @@ fn read_reverted_transparent_spend_fact_outpoints(
     from_height: BlockHeight,
 ) -> Result<Vec<TransparentOutPoint>, StoreError> {
     let mut outpoints = HashSet::new();
-    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height) {
+    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.visible_tip_height)
+    {
         outpoints.extend(read_visible_transparent_spend_fact_block_outpoints(
             inner,
             previous_chain_epoch,
@@ -2454,7 +2455,8 @@ fn read_reverted_transparent_output_outpoints(
     from_height: BlockHeight,
 ) -> Result<Vec<TransparentOutPoint>, StoreError> {
     let mut outpoints = HashSet::new();
-    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.tip_height) {
+    for height in BlockHeightRange::inclusive(from_height, previous_chain_epoch.visible_tip_height)
+    {
         outpoints.extend(read_visible_transparent_output_block_outpoints(
             inner,
             previous_chain_epoch,
@@ -3476,8 +3478,8 @@ mod tests {
         let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
         let (mut second_epoch, second_block, second_compact_block) =
             synthetic_epoch_with_hash_seed(2, 2, 2, 1);
-        second_epoch.safe_tip_height = first_epoch.tip_height;
-        second_epoch.safe_tip_hash = first_epoch.tip_hash;
+        second_epoch.settled_tip_height = first_epoch.visible_tip_height;
+        second_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
         let second_tree_state = TreeStateArtifact::new(
             second_block.height,
             second_block.block_hash,
@@ -3485,8 +3487,8 @@ mod tests {
         );
         let (mut replacement_epoch, replacement_block, replacement_compact_block) =
             synthetic_epoch_with_hash_seed(3, 2, 200, 1);
-        replacement_epoch.safe_tip_height = first_epoch.tip_height;
-        replacement_epoch.safe_tip_hash = first_epoch.tip_hash;
+        replacement_epoch.settled_tip_height = first_epoch.visible_tip_height;
+        replacement_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
         let replacement_tree_state = TreeStateArtifact::new(
             replacement_block.height,
             replacement_block.block_hash,
@@ -3606,10 +3608,10 @@ mod tests {
             ChainEpoch {
                 id: ChainEpochId::new(chain_epoch_id),
                 network: Network::ZcashRegtest,
-                tip_height: block_height,
-                tip_hash: source_hash,
-                safe_tip_height: block_height,
-                safe_tip_hash: source_hash,
+                visible_tip_height: block_height,
+                visible_tip_hash: source_hash,
+                settled_tip_height: block_height,
+                settled_tip_hash: source_hash,
                 artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
                 tip_metadata: ChainTipMetadata::empty(),
                 created_at: UnixTimestampMillis::new(1_774_668_500_000 + u64::from(height)),

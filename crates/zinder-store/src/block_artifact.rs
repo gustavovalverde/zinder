@@ -66,7 +66,7 @@ pub(crate) fn read_block_header_artifact(
     chain_epoch: ChainEpoch,
     height: BlockHeight,
 ) -> Result<Option<BlockHeaderArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
+    if height > chain_epoch.visible_tip_height {
         return Ok(None);
     }
 
@@ -97,7 +97,7 @@ pub(crate) fn read_block_header_artifacts(
     let mut heights = Vec::new();
 
     for height in block_range {
-        if height > chain_epoch.tip_height {
+        if height > chain_epoch.visible_tip_height {
             heights.push(height);
             keys.push(None);
             continue;
@@ -168,7 +168,7 @@ pub(crate) fn read_block_blob_artifact(
     chain_epoch: ChainEpoch,
     height: BlockHeight,
 ) -> Result<Option<BlockBlobArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
+    if height > chain_epoch.visible_tip_height {
         return Ok(None);
     }
 
@@ -192,7 +192,7 @@ pub(crate) fn read_block_transaction_index_artifact(
     height: BlockHeight,
     tx_index_in_block: u32,
 ) -> Result<Option<BlockTransactionIndexArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
+    if height > chain_epoch.visible_tip_height {
         return Ok(None);
     }
 
@@ -229,7 +229,7 @@ pub(crate) fn read_block_transaction_index_artifacts_at_height(
     chain_epoch: ChainEpoch,
     height: BlockHeight,
 ) -> Result<Vec<BlockTransactionIndexArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
+    if height > chain_epoch.visible_tip_height {
         return Ok(Vec::new());
     }
 
@@ -269,7 +269,7 @@ pub(crate) fn read_compact_block_artifact(
     chain_epoch: ChainEpoch,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, StoreError> {
-    if height > chain_epoch.tip_height {
+    if height > chain_epoch.visible_tip_height {
         return Ok(None);
     }
 
@@ -300,7 +300,7 @@ pub(crate) fn read_compact_block_artifacts(
     let mut heights = Vec::new();
 
     for height in block_range {
-        if height > chain_epoch.tip_height {
+        if height > chain_epoch.visible_tip_height {
             heights.push(height);
             keys.push(None);
             continue;

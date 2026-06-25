@@ -84,7 +84,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
             .iter()
             .any(|capability| capability == WALLET_BROADCAST_TRANSACTION_V1)
     );
-    assert_eq!(current_epoch.tip_height, BlockHeight::new(2));
+    assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height, BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);
     assert_eq!(

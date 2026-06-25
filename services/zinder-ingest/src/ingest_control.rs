@@ -704,12 +704,12 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
         "zinder_ingest_writer_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.tip_height.value()));
+    .set(u32_to_f64(chain_epoch.visible_tip_height.value()));
     metrics::gauge!(
         "zinder_ingest_writer_safe_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
-    .set(u32_to_f64(chain_epoch.safe_tip_height.value()));
+    .set(u32_to_f64(chain_epoch.settled_tip_height.value()));
 }
 
 fn record_empty_writer_progress(network: Network) {

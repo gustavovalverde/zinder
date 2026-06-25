@@ -200,15 +200,16 @@ pub struct ChainEpoch {
     /// Network this chain epoch belongs to.
     pub network: Network,
     /// Best visible tip height for this chain epoch.
-    pub tip_height: BlockHeight,
+    pub visible_tip_height: BlockHeight,
     /// Best visible tip hash for this chain epoch.
-    pub tip_hash: BlockHash,
-    /// Highest height in this chain epoch for which both compact-block and
-    /// commitment-tree artifacts are coherent past the reorg window. The
-    /// wallet uses this as its scan ceiling; see ADR-0005 in the zally repo.
-    pub safe_tip_height: BlockHeight,
-    /// Block hash at `safe_tip_height`.
-    pub safe_tip_hash: BlockHash,
+    pub visible_tip_hash: BlockHash,
+    /// Reorg-window scan ceiling: the highest height for which both
+    /// compact-block and commitment-tree artifacts are coherent past the
+    /// reorg window. The wallet uses this as its scan ceiling; see ADR-0005
+    /// in the zally repo.
+    pub settled_tip_height: BlockHeight,
+    /// Block hash at `settled_tip_height`.
+    pub settled_tip_hash: BlockHash,
     /// Artifact schema version used by artifacts in this chain epoch.
     pub artifact_schema_version: ArtifactSchemaVersion,
     /// Chain-derived metadata at the visible tip.

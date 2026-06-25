@@ -87,8 +87,8 @@ pub(crate) fn decode_chain_event_envelope(
     // carries only the event's own tip. `chain_event_history` enriches it with
     // the back-spaced locator entries it reads from the block index.
     let tip_only_locator = ChainEventLocator::new(vec![ChainEventCursorAnchor {
-        height: chain_epoch.tip_height,
-        hash: chain_epoch.tip_hash,
+        height: chain_epoch.visible_tip_height,
+        hash: chain_epoch.visible_tip_hash,
     }])
     .map_err(|_| StoreError::ArtifactCorrupt {
         family: ArtifactFamily::ChainEvent,
@@ -1681,10 +1681,10 @@ fn chain_epoch_record(chain_epoch: &ChainEpoch) -> ChainEpochRecord {
     ChainEpochRecord {
         chain_epoch: chain_epoch.id.value(),
         network_id: chain_epoch.network.id(),
-        tip_height: chain_epoch.tip_height.value(),
-        tip_hash: chain_epoch.tip_hash.as_bytes().to_vec(),
-        safe_tip_height: chain_epoch.safe_tip_height.value(),
-        safe_tip_hash: chain_epoch.safe_tip_hash.as_bytes().to_vec(),
+        tip_height: chain_epoch.visible_tip_height.value(),
+        tip_hash: chain_epoch.visible_tip_hash.as_bytes().to_vec(),
+        safe_tip_height: chain_epoch.settled_tip_height.value(),
+        safe_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
@@ -1706,10 +1706,10 @@ fn decode_chain_epoch_record(
     Ok(ChainEpoch {
         id: ChainEpochId::new(record.chain_epoch),
         network,
-        tip_height: BlockHeight::new(record.tip_height),
-        tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
-        safe_tip_height: BlockHeight::new(record.safe_tip_height),
-        safe_tip_hash: decode_block_hash(family, key, &record.safe_tip_hash)?,
+        visible_tip_height: BlockHeight::new(record.tip_height),
+        visible_tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
+        settled_tip_height: BlockHeight::new(record.safe_tip_height),
+        settled_tip_hash: decode_block_hash(family, key, &record.safe_tip_hash)?,
         artifact_schema_version: ArtifactSchemaVersion::new(
             u16::try_from(record.artifact_schema_version).map_err(|_| {
                 StoreError::ArtifactCorrupt {

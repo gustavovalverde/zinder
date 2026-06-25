@@ -337,8 +337,8 @@ where
             let chain_epoch = reader.chain_epoch();
             Ok(LatestBlock {
                 chain_epoch,
-                height: chain_epoch.tip_height,
-                block_hash: chain_epoch.tip_hash,
+                height: chain_epoch.visible_tip_height,
+                block_hash: chain_epoch.visible_tip_hash,
             })
         }))
         .await;
@@ -357,8 +357,8 @@ where
             let chain_epoch = reader.chain_epoch();
             Ok(LatestSafeBlock {
                 chain_epoch,
-                height: chain_epoch.safe_tip_height,
-                block_hash: chain_epoch.safe_tip_hash,
+                height: chain_epoch.settled_tip_height,
+                block_hash: chain_epoch.settled_tip_hash,
             })
         }))
         .await;
@@ -733,10 +733,10 @@ where
                     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
                 )
                 .map_err(QueryError::DeriveStore)?;
-            if derive_height.is_none_or(|height| height < chain_epoch.tip_height) {
+            if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
                 return Err(QueryError::DeriveLag {
                     capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-                    chain_tip_height: chain_epoch.tip_height,
+                    chain_tip_height: chain_epoch.visible_tip_height,
                     derive_height,
                 });
             }
@@ -779,7 +779,7 @@ where
         let probe = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch)?;
             let chain_epoch = reader.chain_epoch();
-            if height > chain_epoch.tip_height {
+            if height > chain_epoch.visible_tip_height {
                 return Err(block_height_artifact_unavailable(
                     ArtifactFamily::TreeState,
                     height,
@@ -868,7 +868,7 @@ where
                 }) => {
                     return Err(block_height_artifact_unavailable(
                         ArtifactFamily::TreeState,
-                        chain_epoch.tip_height,
+                        chain_epoch.visible_tip_height,
                     ));
                 }
                 Err(error) => return Err(QueryError::Store(error)),
@@ -1696,7 +1696,7 @@ fn resolve_block_selector(
     match selector {
         BlockSelector::Height(height) => {
             let chain_epoch = reader.chain_epoch();
-            if height > chain_epoch.tip_height {
+            if height > chain_epoch.visible_tip_height {
                 return Err(QueryError::BlockNotInBestChain);
             }
             let block = reader

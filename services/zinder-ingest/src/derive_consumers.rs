@@ -1229,7 +1229,7 @@ fn record_current_derive_replay_tip(
 ) -> Result<Option<BlockHeight>, IngestError> {
     let canonical_tip_height = chain_store
         .current_chain_epoch()?
-        .map(|epoch| epoch.tip_height);
+        .map(|epoch| epoch.visible_tip_height);
     if let Some(tip_height) = canonical_tip_height {
         metrics::gauge!("zinder_ingest_derive_replay_tip_height")
             .set(f64::from(tip_height.value()));

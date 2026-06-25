@@ -290,8 +290,8 @@ fn advance_safe_tip_artifacts(
     target: u32,
 ) -> ChainEpochArtifacts {
     let mut chain_epoch = chain_epoch(epoch_id, tip);
-    chain_epoch.safe_tip_height = BlockHeight::new(epoch_safe_tip);
-    chain_epoch.safe_tip_hash = block_hash(epoch_safe_tip);
+    chain_epoch.settled_tip_height = BlockHeight::new(epoch_safe_tip);
+    chain_epoch.settled_tip_hash = block_hash(epoch_safe_tip);
     ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
         ReorgWindowChange::AdvanceSafeTipTo {
             height: BlockHeight::new(target),
@@ -318,7 +318,7 @@ fn replacement_artifacts(
         format!("replacement-compact-{replaced_height}").into_bytes(),
     );
     let mut chain_epoch = chain_epoch(epoch_id, replaced_height);
-    chain_epoch.tip_hash = replacement_hash;
+    chain_epoch.visible_tip_hash = replacement_hash;
     ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
         .with_reorg_window_change(ReorgWindowChange::Replace {
             from_height: height,
@@ -329,10 +329,10 @@ fn chain_epoch(epoch_id: u64, tip: u32) -> ChainEpoch {
     ChainEpoch {
         id: ChainEpochId::new(epoch_id),
         network: Network::ZcashRegtest,
-        tip_height: BlockHeight::new(tip),
-        tip_hash: block_hash(tip),
-        safe_tip_height: BlockHeight::new(1),
-        safe_tip_hash: block_hash(1),
+        visible_tip_height: BlockHeight::new(tip),
+        visible_tip_hash: block_hash(tip),
+        settled_tip_height: BlockHeight::new(1),
+        settled_tip_hash: block_hash(1),
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_200_000 + epoch_id),

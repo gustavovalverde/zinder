@@ -144,7 +144,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let visible_height = store
         .current_chain_epoch()
         .map_err(LightwalletdConfigError::Store)?
-        .map(|epoch| epoch.tip_height.value());
+        .map(|epoch| epoch.visible_tip_height.value());
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let broadcaster = match build_broadcaster(lightwalletd_config.broadcaster.as_ref()) {

@@ -184,7 +184,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
         .ok_or_else(|| eyre!("expected committed checkpoint-bounded bulk-catchup outcome"))?;
     let bulk_catchup_micros = bulk_catchup_started_at.elapsed().as_micros();
     assert_eq!(commit_outcome.chain_epoch.network, env.network());
-    assert_eq!(commit_outcome.chain_epoch.tip_height, tip_height);
+    assert_eq!(commit_outcome.chain_epoch.visible_tip_height, tip_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

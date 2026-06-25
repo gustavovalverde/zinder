@@ -209,8 +209,8 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch, |reader| {
             let chain_epoch = reader.chain_epoch();
             Ok(BlockId {
-                height: chain_epoch.tip_height,
-                hash: chain_epoch.tip_hash,
+                height: chain_epoch.visible_tip_height,
+                hash: chain_epoch.visible_tip_hash,
             })
         })
         .await
@@ -223,8 +223,8 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch, |reader| {
             let chain_epoch = reader.chain_epoch();
             Ok(BlockId {
-                height: chain_epoch.safe_tip_height,
-                hash: chain_epoch.safe_tip_hash,
+                height: chain_epoch.settled_tip_height,
+                hash: chain_epoch.settled_tip_hash,
             })
         })
         .await
@@ -522,11 +522,11 @@ impl ChainIndex for LocalChainIndex {
                     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
                 )
                 .map_err(IndexerError::from_derive_store_error)?;
-            if derive_height.is_none_or(|height| height < chain_epoch.tip_height) {
+            if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
                 return Err(IndexerError::FailedPrecondition {
                     reason: format!(
                         "transparent-address transaction history is behind canonical height {}: derive height {:?}",
-                        chain_epoch.tip_height.value(),
+                        chain_epoch.visible_tip_height.value(),
                         derive_height.map(BlockHeight::value)
                     ),
                 });
@@ -802,7 +802,7 @@ fn resolve_block_id(
     match selector {
         BlockSelector::Height(height) => {
             let chain_epoch = reader.chain_epoch();
-            if height > chain_epoch.tip_height {
+            if height > chain_epoch.visible_tip_height {
                 return Err(IndexerError::NotFound { resource: "block" });
             }
             let block = reader

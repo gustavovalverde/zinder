@@ -23,8 +23,12 @@ pub(crate) fn read_tree_state_checkpoint_at_or_before(
     chain_epoch: ChainEpoch,
     max_height: BlockHeight,
 ) -> Result<Option<TreeStateArtifact>, StoreError> {
-    if max_height > chain_epoch.tip_height {
-        return read_tree_state_checkpoint_at_or_before(inner, chain_epoch, chain_epoch.tip_height);
+    if max_height > chain_epoch.visible_tip_height {
+        return read_tree_state_checkpoint_at_or_before(
+            inner,
+            chain_epoch,
+            chain_epoch.visible_tip_height,
+        );
     }
 
     let prefix = StoreKey::tree_state_network_prefix(chain_epoch.network);

@@ -56,7 +56,7 @@ pub(crate) fn read_block_hash_lookup(
     };
     let recorded_height = decode_block_hash_index_value(&key, &value_bytes)?;
 
-    if recorded_height > chain_epoch.tip_height {
+    if recorded_height > chain_epoch.visible_tip_height {
         return Ok(BlockHashLookup::NotInBestChain);
     }
 

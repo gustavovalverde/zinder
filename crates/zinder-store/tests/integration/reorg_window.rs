@@ -175,8 +175,8 @@ fn safe_tip_height_can_advance_without_new_block_artifacts() -> eyre::Result<()>
 
     let safe_tip_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
-        safe_tip_height: BlockHeight::new(2),
-        safe_tip_hash: block_hash(2),
+        settled_tip_height: BlockHeight::new(2),
+        settled_tip_hash: block_hash(2),
         created_at: UnixTimestampMillis::new(1_774_668_101_000),
         ..initial_epoch
     };
@@ -296,8 +296,8 @@ fn advance_safe_tip_can_target_height_below_current_safe_tip() -> eyre::Result<(
 
     let safe_tip_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
-        safe_tip_height: BlockHeight::new(3),
-        safe_tip_hash: block_hash(3),
+        settled_tip_height: BlockHeight::new(3),
+        settled_tip_hash: block_hash(3),
         created_at: UnixTimestampMillis::new(1_774_668_101_000),
         ..initial_epoch
     };
@@ -426,7 +426,7 @@ fn replacement_cannot_change_safe_tip_anchor_hash() -> eyre::Result<()> {
 
     let (mut attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 6, 5, block_hash(60), block_hash(5));
-    attempted_epoch.safe_tip_hash = block_hash(50);
+    attempted_epoch.settled_tip_hash = block_hash(50);
     let error = match store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             attempted_epoch,
@@ -588,7 +588,7 @@ fn safe_tip_hash_must_match_existing_visible_block() -> eyre::Result<()> {
 
     let (mut attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 2, block_hash(3), block_hash(2));
-    attempted_epoch.safe_tip_hash = block_hash(99);
+    attempted_epoch.settled_tip_hash = block_hash(99);
     let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
         attempted_epoch,
         vec![appended_block],
@@ -784,10 +784,10 @@ fn synthetic_epoch(
         ChainEpoch {
             id: ChainEpochId::new(chain_epoch_id),
             network: Network::ZcashRegtest,
-            tip_height: block_height,
-            tip_hash: hash,
-            safe_tip_height: BlockHeight::new(safe_tip_height),
-            safe_tip_hash: block_hash(safe_tip_height),
+            visible_tip_height: block_height,
+            visible_tip_hash: hash,
+            settled_tip_height: BlockHeight::new(safe_tip_height),
+            settled_tip_hash: block_hash(safe_tip_height),
             artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),
@@ -810,10 +810,10 @@ fn artifacts_from_height_one_to_tip(chain_epoch: ChainEpoch) -> ChainEpochArtifa
     let mut blocks = Vec::new();
     let mut compact_blocks = Vec::new();
 
-    for height in 1..=chain_epoch.tip_height.value() {
+    for height in 1..=chain_epoch.visible_tip_height.value() {
         let block_height = BlockHeight::new(height);
-        let block_hash = if block_height == chain_epoch.tip_height {
-            chain_epoch.tip_hash
+        let block_hash = if block_height == chain_epoch.visible_tip_height {
+            chain_epoch.visible_tip_hash
         } else {
             self::block_hash(height)
         };

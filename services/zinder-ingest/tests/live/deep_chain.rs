@@ -64,7 +64,7 @@ async fn bulk_catchup_deep_chain_with_by_block_index_lookups() -> Result<()> {
         .ok_or_else(|| eyre!("expected committed deep-chain bulk-catchup outcome"))?;
     let chain_epoch = commit_outcome.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
-    assert_eq!(chain_epoch.tip_height, tip_height);
+    assert_eq!(chain_epoch.visible_tip_height, tip_height);
 
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;

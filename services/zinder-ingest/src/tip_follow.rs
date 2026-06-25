@@ -371,7 +371,7 @@ fn compute_tip_follow_readiness_state(
 ) -> Result<ReadinessState, IngestError> {
     let store_tip_height = store
         .current_chain_epoch()?
-        .map(|chain_epoch| chain_epoch.tip_height);
+        .map(|chain_epoch| chain_epoch.visible_tip_height);
 
     let node_tip_value = u64::from(node_tip_height.value());
     let store_tip_value = store_tip_height.map_or(0_u64, |height| u64::from(height.value()));
@@ -604,7 +604,7 @@ where
         }));
     };
 
-    if observed_tip_id.height < current_chain_epoch.tip_height {
+    if observed_tip_id.height < current_chain_epoch.visible_tip_height {
         // `invalidateblock`-style local reorg gates expose a transient state
         // where the node has rewound before the replacement block exists.
         // Zinder's event model records replacements, not rollback-only epochs,
@@ -612,8 +612,8 @@ where
         return Ok(None);
     }
 
-    if observed_tip_id.height == current_chain_epoch.tip_height {
-        if observed_tip_id.hash == current_chain_epoch.tip_hash {
+    if observed_tip_id.height == current_chain_epoch.visible_tip_height {
+        if observed_tip_id.hash == current_chain_epoch.visible_tip_hash {
             return Ok(None);
         }
 
@@ -638,9 +638,9 @@ where
     }
 
     let next_height = current_chain_epoch
-        .tip_height
+        .visible_tip_height
         .next()
-        .unwrap_or(current_chain_epoch.tip_height);
+        .unwrap_or(current_chain_epoch.visible_tip_height);
     let next_block = fetch_block_with_retry(
         config.node.request_timeout,
         source,
@@ -648,7 +648,7 @@ where
         retry_state,
     )
     .await?;
-    if next_block.parent_hash == current_chain_epoch.tip_hash {
+    if next_block.parent_hash == current_chain_epoch.visible_tip_hash {
         return Ok(Some(TipFollowPlan {
             source_blocks: vec![next_block],
             reorg_window_change: ReorgWindowChange::Extend {
@@ -781,7 +781,7 @@ fn tip_metadata_at(
     if height.value() == 0 {
         return Ok(ChainTipMetadata::empty());
     }
-    if height == current_chain_epoch.tip_height {
+    if height == current_chain_epoch.visible_tip_height {
         return Ok(current_chain_epoch.tip_metadata);
     }
 
@@ -936,16 +936,16 @@ fn chain_epoch_for_tip_commit(
         .ok_or(IngestError::EmptyCanonicalBatch)?;
     let parent_safe_tip = current_chain_epoch.map_or(
         (BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
-        |chain_epoch| (chain_epoch.safe_tip_height, chain_epoch.safe_tip_hash),
+        |chain_epoch| (chain_epoch.settled_tip_height, chain_epoch.settled_tip_hash),
     );
 
     Ok(ChainEpoch {
         id: chain_epoch_id,
         network,
-        tip_height: tip_block.height,
-        tip_hash: tip_block.block_hash,
-        safe_tip_height: parent_safe_tip.0,
-        safe_tip_hash: parent_safe_tip.1,
+        visible_tip_height: tip_block.height,
+        visible_tip_hash: tip_block.block_hash,
+        settled_tip_height: parent_safe_tip.0,
+        settled_tip_hash: parent_safe_tip.1,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: batch.tip_metadata.ok_or(IngestError::EmptyCanonicalBatch)?,
         created_at: current_unix_millis()?,
@@ -958,11 +958,11 @@ fn finalize_tip_if_ready(
     chain_epoch: ChainEpoch,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError> {
     let Some(safe_tip_height) =
-        safe_tip_height_for_tip(chain_epoch.tip_height, config.reorg_window_blocks)
+        safe_tip_height_for_tip(chain_epoch.visible_tip_height, config.reorg_window_blocks)
     else {
         return Ok(None);
     };
-    if safe_tip_height <= chain_epoch.safe_tip_height {
+    if safe_tip_height <= chain_epoch.settled_tip_height {
         return Ok(None);
     }
 
@@ -974,8 +974,8 @@ fn finalize_tip_if_ready(
     )?;
     let safe_tip_advanced_chain_epoch = ChainEpoch {
         id: next_chain_epoch_id_after(chain_epoch.id)?,
-        safe_tip_height,
-        safe_tip_hash: safe_tip_block.block_hash,
+        settled_tip_height: safe_tip_height,
+        settled_tip_hash: safe_tip_block.block_hash,
         created_at: current_unix_millis()?,
         ..chain_epoch
     };
@@ -1047,13 +1047,16 @@ mod tests {
             .await?
             .ok_or("expected a tip-follow commit")?;
 
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(1)
+        );
         assert_eq!(
             commit_outcome.chain_epoch.artifact_schema_version,
             CURRENT_ARTIFACT_SCHEMA_VERSION
         );
         assert_eq!(
-            commit_outcome.chain_epoch.safe_tip_height,
+            commit_outcome.chain_epoch.settled_tip_height,
             BlockHeight::new(0)
         );
 
@@ -1099,7 +1102,7 @@ mod tests {
             .await?
             .ok_or("expected extension commit")?;
 
-        assert_eq!(second.chain_epoch.tip_height, BlockHeight::new(2));
+        assert_eq!(second.chain_epoch.visible_tip_height, BlockHeight::new(2));
         let reader = store.current_chain_epoch_reader()?;
         assert_eq!(
             reader
@@ -1131,8 +1134,8 @@ mod tests {
             .await?
             .ok_or("expected replacement commit")?;
 
-        assert_eq!(reorged.chain_epoch.tip_height, BlockHeight::new(2));
-        assert_eq!(reorged.chain_epoch.tip_hash, block_hash(20));
+        assert_eq!(reorged.chain_epoch.visible_tip_height, BlockHeight::new(2));
+        assert_eq!(reorged.chain_epoch.visible_tip_hash, block_hash(20));
         let reader = store.current_chain_epoch_reader()?;
         assert_eq!(
             reader
@@ -1168,7 +1171,7 @@ mod tests {
             store
                 .current_chain_epoch()?
                 .ok_or("missing chain epoch")?
-                .tip_height,
+                .visible_tip_height,
             BlockHeight::new(2)
         );
 
@@ -1178,8 +1181,8 @@ mod tests {
             .await?
             .ok_or("expected replacement commit")?;
 
-        assert_eq!(reorged.chain_epoch.tip_height, BlockHeight::new(2));
-        assert_eq!(reorged.chain_epoch.tip_hash, block_hash(20));
+        assert_eq!(reorged.chain_epoch.visible_tip_height, BlockHeight::new(2));
+        assert_eq!(reorged.chain_epoch.visible_tip_hash, block_hash(20));
 
         Ok(())
     }

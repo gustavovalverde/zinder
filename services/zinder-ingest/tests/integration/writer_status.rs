@@ -61,14 +61,14 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
             .visible_tip
             .ok_or_else(|| eyre::eyre!("writer status response missing visible tip"))?
             .height,
-        expected_chain_epoch.tip_height.value()
+        expected_chain_epoch.visible_tip_height.value()
     );
     assert_eq!(
         response_chain_epoch
             .settled_tip
             .ok_or_else(|| eyre::eyre!("writer status response missing settled tip"))?
             .height,
-        expected_chain_epoch.safe_tip_height.value()
+        expected_chain_epoch.settled_tip_height.value()
     );
 
     cancel.cancel();

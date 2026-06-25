@@ -302,7 +302,7 @@ impl MinedDetails {
         consensus_branch_id: ConsensusBranchId,
         block_time: i64,
     ) -> Self {
-        let tip = epoch.tip_height.value();
+        let tip = epoch.visible_tip_height.value();
         let mined = mined_height.value();
         let confirmations = tip.saturating_sub(mined).saturating_add(1);
         Self {

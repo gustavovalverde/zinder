@@ -126,7 +126,7 @@ fn update_retention_readiness(
 ) -> Result<(), StoreError> {
     let current_height = store
         .current_chain_epoch()?
-        .map(|chain_epoch| chain_epoch.tip_height.value());
+        .map(|chain_epoch| chain_epoch.visible_tip_height.value());
     let is_at_risk = is_cursor_at_risk(config, now, report);
     let current_cause = readiness.report().cause;
 
@@ -230,7 +230,7 @@ fn update_mempool_retention_readiness(
 ) -> Result<(), StoreError> {
     let current_height = store
         .current_chain_epoch()?
-        .map(|chain_epoch| chain_epoch.tip_height.value());
+        .map(|chain_epoch| chain_epoch.visible_tip_height.value());
     let is_at_risk = is_mempool_cursor_at_risk(config, now, report);
     let current_cause = readiness.report().cause;
 

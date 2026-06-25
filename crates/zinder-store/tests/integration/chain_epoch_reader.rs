@@ -84,8 +84,8 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
         vec![safe_tip_block.clone(), initial_block],
@@ -98,10 +98,10 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
@@ -152,8 +152,8 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
     let reintroduced_hash = initial_block.block_hash;
     let replacement_height = BlockHeight::new(2);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
@@ -166,10 +166,10 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
@@ -199,10 +199,10 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
     let reintroduced_epoch = ChainEpoch {
         id: ChainEpochId::new(3),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: reintroduced_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: reintroduced_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
@@ -250,18 +250,18 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
 
     let replacement_hash = BlockHash::from_bytes([42; 32]);
     let replacement_height = BlockHeight::new(2);
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
@@ -516,17 +516,17 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(2, 2);
-    initial_epoch.safe_tip_height = epoch_1.tip_height;
-    initial_epoch.safe_tip_hash = epoch_1.tip_hash;
+    initial_epoch.settled_tip_height = epoch_1.visible_tip_height;
+    initial_epoch.settled_tip_hash = epoch_1.visible_tip_hash;
     let replacement_height = BlockHeight::new(2);
     let replacement_hash = BlockHash::from_bytes([45; 32]);
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(3),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: epoch_1.tip_height,
-        safe_tip_hash: epoch_1.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: epoch_1.visible_tip_height,
+        settled_tip_hash: epoch_1.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
@@ -623,18 +623,18 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(2, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
 
     let replacement_height = BlockHeight::new(2);
     let replacement_hash = BlockHash::from_bytes([44; 32]);
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(3),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
@@ -709,18 +709,18 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(2, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
 
     let replacement_hash = BlockHash::from_bytes([43; 32]);
     let replacement_height = BlockHeight::new(2);
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(3),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
@@ -786,8 +786,8 @@ fn reorged_outpoint_rows(
         75_000,
         b"visible-script".to_vec(),
         base_address,
-        safe_tip_epoch.tip_height,
-        safe_tip_epoch.tip_hash,
+        safe_tip_epoch.visible_tip_height,
+        safe_tip_epoch.visible_tip_hash,
     );
     let stale_prevout = TransparentOutputArtifact::new(
         stale_outpoint,
@@ -1022,10 +1022,10 @@ fn synthetic_epoch(
         ChainEpoch {
             id: ChainEpochId::new(chain_epoch_id),
             network: Network::ZcashRegtest,
-            tip_height: block_height,
-            tip_hash: source_hash,
-            safe_tip_height: block_height,
-            safe_tip_hash: source_hash,
+            visible_tip_height: block_height,
+            visible_tip_hash: source_hash,
+            settled_tip_height: block_height,
+            settled_tip_hash: source_hash,
             artifact_schema_version: ArtifactSchemaVersion::new(11),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
@@ -1091,8 +1091,8 @@ fn commit_append_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
 fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
-    initial_epoch.safe_tip_height = first_epoch.tip_height;
-    initial_epoch.safe_tip_hash = first_epoch.tip_hash;
+    initial_epoch.settled_tip_height = first_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
         vec![first_block.clone(), initial_block],
@@ -1104,10 +1104,10 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: first_epoch.tip_height,
-        safe_tip_hash: first_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: first_epoch.visible_tip_height,
+        settled_tip_hash: first_epoch.visible_tip_hash,
         artifact_schema_version: ArtifactSchemaVersion::new(11),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),

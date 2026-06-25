@@ -124,8 +124,8 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 
     assert_eq!(outcome.chain_epoch.network, Network::ZcashTestnet);
     assert_current_artifact_schema(outcome.chain_epoch);
-    assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
-    assert_eq!(outcome.chain_epoch.safe_tip_height, source_block.height);
+    assert_eq!(outcome.chain_epoch.visible_tip_height, source_block.height);
+    assert_eq!(outcome.chain_epoch.settled_tip_height, source_block.height);
     assert_eq!(
         outcome.chain_epoch.tip_metadata,
         ChainTipMetadata::new(1, 0)
@@ -164,7 +164,10 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     let compact_block = wallet_query
         .compact_block_at(source_block.height, None)
         .await?;
-    assert_eq!(compact_block.chain_epoch.tip_height, source_block.height);
+    assert_eq!(
+        compact_block.chain_epoch.visible_tip_height,
+        source_block.height
+    );
     assert_eq!(compact_block.compact_block.height, source_block.height);
     let tree_state = wallet_query
         .tree_state_at(source_block.height, None)
@@ -461,7 +464,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .await?
             .ok_or_else(|| eyre!("expected recovered bulk catchup to commit"))?;
 
-    assert_eq!(outcome.chain_epoch.tip_height, source_block.height);
+    assert_eq!(outcome.chain_epoch.visible_tip_height, source_block.height);
     assert_eq!(*pending_retryable_fetch_failures.lock(), 0);
     assert_eq!(fetched_heights.lock().len(), 7);
     let readiness_report = readiness.report();

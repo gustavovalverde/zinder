@@ -283,8 +283,8 @@ fn commit_reorged_tx_index_rows(
 ) -> eyre::Result<()> {
     let (safe_tip_epoch, safe_tip_block, safe_tip_compact_block) = synthetic_chain_epoch(1, 1);
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_chain_epoch(1, 2);
-    initial_epoch.safe_tip_height = safe_tip_epoch.tip_height;
-    initial_epoch.safe_tip_hash = safe_tip_epoch.tip_hash;
+    initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
         vec![safe_tip_block.clone(), initial_block],
@@ -296,10 +296,10 @@ fn commit_reorged_tx_index_rows(
     let replacement_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
         network: Network::ZcashRegtest,
-        tip_height: replacement_height,
-        tip_hash: replacement_hash,
-        safe_tip_height: safe_tip_epoch.tip_height,
-        safe_tip_hash: safe_tip_epoch.tip_hash,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: safe_tip_epoch.visible_tip_height,
+        settled_tip_hash: safe_tip_epoch.visible_tip_hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_020),

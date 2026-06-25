@@ -386,11 +386,11 @@ where
         match run_bulk_catchup_with_store_inner(run, flush_state, completion_flush).await {
             Ok(commit_outcome) => {
                 let tip_height = match &commit_outcome {
-                    Some(commit) => Some(commit.chain_epoch.tip_height.value()),
+                    Some(commit) => Some(commit.chain_epoch.visible_tip_height.value()),
                     None => run
                         .store
                         .current_chain_epoch()?
-                        .map(|chain_epoch| chain_epoch.tip_height.value()),
+                        .map(|chain_epoch| chain_epoch.visible_tip_height.value()),
                 };
                 readiness.set(bulk_catchup_readiness_state(run.config, tip_height));
                 if outage.take().is_some() {
@@ -725,10 +725,10 @@ fn bootstrap_from_checkpoint_if_needed(
     let bootstrap_chain_epoch = ChainEpoch {
         id: ChainEpochId::new(1),
         network,
-        tip_height: checkpoint.height,
-        tip_hash: checkpoint.hash,
-        safe_tip_height: checkpoint.height,
-        safe_tip_hash: checkpoint.hash,
+        visible_tip_height: checkpoint.height,
+        visible_tip_hash: checkpoint.hash,
+        settled_tip_height: checkpoint.height,
+        settled_tip_hash: checkpoint.hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: checkpoint.tip_metadata,
         created_at: current_unix_millis()?,
@@ -765,11 +765,11 @@ fn bulk_catchup_start(
         });
     };
 
-    if current_chain_epoch.tip_height >= to_height {
+    if current_chain_epoch.visible_tip_height >= to_height {
         return Ok(None);
     }
 
-    if let Some(next_height) = current_chain_epoch.tip_height.next()
+    if let Some(next_height) = current_chain_epoch.visible_tip_height.next()
         && from_height <= next_height
     {
         return Ok(Some(BulkCatchupStart {
@@ -780,7 +780,7 @@ fn bulk_catchup_start(
 
     Err(IngestError::BulkCatchupRequiresContiguousTipMetadata {
         from_height,
-        current_tip_height: Some(current_chain_epoch.tip_height),
+        current_tip_height: Some(current_chain_epoch.visible_tip_height),
     })
 }
 
@@ -1074,7 +1074,10 @@ mod tests {
         .await?;
 
         assert_eq!(commit_outcome.chain_epoch.id, ChainEpochId::new(2));
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(10));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(10)
+        );
         let store = PrimaryChainStore::open(
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
@@ -1502,7 +1505,10 @@ mod tests {
         })
         .await?;
 
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(1)
+        );
         assert_eq!(source.fetch_attempts.load(Ordering::SeqCst), 3);
 
         Ok(())
@@ -1596,7 +1602,10 @@ mod tests {
         })
         .await?;
 
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(1));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(1)
+        );
         let store = PrimaryChainStore::open(
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
@@ -1733,7 +1742,10 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(12));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(12)
+        );
 
         let store = PrimaryChainStore::open(
             &storage_path,
@@ -1787,7 +1799,10 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(commit_outcome.chain_epoch.tip_height, BlockHeight::new(11));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(11)
+        );
         Ok(())
     }
 
@@ -2383,10 +2398,10 @@ mod tests {
         ChainEpoch {
             id: ChainEpochId::new(1),
             network: Network::ZcashRegtest,
-            tip_height,
-            tip_hash: block_hash(tip_height.value()),
-            safe_tip_height: tip_height,
-            safe_tip_hash: block_hash(tip_height.value()),
+            visible_tip_height: tip_height,
+            visible_tip_hash: block_hash(tip_height.value()),
+            settled_tip_height: tip_height,
+            settled_tip_hash: block_hash(tip_height.value()),
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),

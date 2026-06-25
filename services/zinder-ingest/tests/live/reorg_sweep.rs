@@ -250,9 +250,9 @@ async fn wait_for_chain_epoch_at_or_above(
     let started = Instant::now();
     loop {
         if let Some(chain_epoch) = store.current_chain_epoch()?
-            && chain_epoch.tip_height.value() >= minimum_tip_height
+            && chain_epoch.visible_tip_height.value() >= minimum_tip_height
         {
-            return Ok(chain_epoch.tip_height);
+            return Ok(chain_epoch.visible_tip_height);
         }
         if started.elapsed() > deadline {
             return Err(eyre!(

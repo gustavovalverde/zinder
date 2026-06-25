@@ -273,7 +273,9 @@ enum WriterStatusFetchError {
 fn refresh_visible_height(store: &PrimaryChainStore, readiness: &Readiness) {
     match store.current_chain_epoch() {
         Ok(Some(chain_epoch)) => {
-            readiness.set(ReadinessState::ready(Some(chain_epoch.tip_height.value())));
+            readiness.set(ReadinessState::ready(Some(
+                chain_epoch.visible_tip_height.value(),
+            )));
         }
         Ok(None) => {
             // Store has no visible epoch yet; preserve the startup snapshot
@@ -328,7 +330,7 @@ async fn catch_up_secondary(
             }
 
             record_secondary_progress(current_chain_epoch);
-            let current_height = current_chain_epoch.map(|epoch| epoch.tip_height.value());
+            let current_height = current_chain_epoch.map(|epoch| epoch.visible_tip_height.value());
             let writer_status_read = writer_status_read(writer_status_upstream).await;
             update_secondary_readiness(
                 readiness,
@@ -470,7 +472,7 @@ fn record_secondary_progress(current_chain_epoch: Option<zinder_core::ChainEpoch
             (
                 1.0,
                 u64_to_f64(chain_epoch.id.value()),
-                u32_to_f64(chain_epoch.tip_height.value()),
+                u32_to_f64(chain_epoch.visible_tip_height.value()),
             )
         });
 

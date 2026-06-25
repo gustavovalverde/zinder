@@ -185,7 +185,7 @@ impl<'store> ChainEpochReader<'store> {
 
     /// Reads the latest checkpoint tree-state artifact visible to this reader.
     pub fn latest_tree_state_checkpoint(&self) -> Result<Option<TreeStateArtifact>, StoreError> {
-        self.tree_state_checkpoint_at_or_before(self.chain_epoch.tip_height)
+        self.tree_state_checkpoint_at_or_before(self.chain_epoch.visible_tip_height)
     }
 
     /// Reads subtree-root artifacts in ascending subtree-index order.
@@ -273,7 +273,7 @@ impl<'store> ChainEpochReader<'store> {
     /// the per-outpoint reorg-visibility header reads.
     ///
     /// Correct only when every referenced block is finalized (at or below
-    /// `safe_tip_height`): such blocks are immutable, so the visibility filter
+    /// `settled_tip_height`): such blocks are immutable, so the visibility filter
     /// that [`Self::transparent_spend_facts_by_outpoints`] applies on a
     /// non-current reader can never drop a fact. Skipping it turns two reads per
     /// outpoint into a single `multi_get`, which is the dominant cost of

@@ -575,10 +575,10 @@ impl ChainFixture {
         Some(ChainEpoch {
             id: epoch_id,
             network: self.network,
-            tip_height: tip_block.height,
-            tip_hash: tip_block.hash,
-            safe_tip_height: tip_block.height,
-            safe_tip_hash: tip_block.hash,
+            visible_tip_height: tip_block.height,
+            visible_tip_hash: tip_block.hash,
+            settled_tip_height: tip_block.height,
+            settled_tip_hash: tip_block.hash,
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: self
                 .tip_metadata_override
@@ -600,8 +600,10 @@ impl ChainFixture {
         let tree_state_checkpoint_artifacts = self.tree_state_checkpoint_artifacts();
         let subtree_root_artifacts = self.subtree_root_artifacts();
 
-        let block_range =
-            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), chain_epoch.tip_height);
+        let block_range = zinder_core::BlockHeightRange::inclusive(
+            BlockHeight::new(1),
+            chain_epoch.visible_tip_height,
+        );
 
         let mut chain_epoch_artifacts =
             ChainEpochArtifacts::new(chain_epoch, block_artifacts, compact_block_artifacts)
@@ -792,7 +794,10 @@ mod tests {
             chain_epoch_artifacts.tree_states[0].height,
             BlockHeight::new(4)
         );
-        assert_eq!(chain_epoch_artifacts.chain_epoch.tip_height.value(), 4);
+        assert_eq!(
+            chain_epoch_artifacts.chain_epoch.visible_tip_height.value(),
+            4
+        );
         assert_eq!(
             chain_epoch_artifacts.chain_epoch.network,
             Network::ZcashRegtest
