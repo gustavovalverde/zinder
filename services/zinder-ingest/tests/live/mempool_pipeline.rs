@@ -442,7 +442,7 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
     ));
 
     // Drop the client-side stream first so the gRPC framework releases its
-    // response handler; the server-side `stream_mempool_events` task then
+    // response handler; the server-side `run_event_stream` task then
     // observes `event_sender.closed()` and exits, freeing
     // `serve_with_incoming_shutdown` to finalize.
     drop(event_stream);

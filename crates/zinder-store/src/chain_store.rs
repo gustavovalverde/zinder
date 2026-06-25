@@ -313,6 +313,13 @@ struct ChainEventHistoryBounds {
     oldest_retained_sequence: u64,
 }
 
+/// Retained-sequence window for a mempool-event history read.
+#[derive(Clone, Copy)]
+struct MempoolEventHistoryBounds {
+    current_event_sequence: u64,
+    oldest_retained_sequence: u64,
+}
+
 /// Resolved resume position for a chain-event history read.
 struct ChainEventResume {
     /// First retained event sequence to read forward from.
@@ -322,6 +329,23 @@ struct ChainEventResume {
     /// Synthetic `ChainReorged` envelope to deliver ahead of the page when the
     /// cursor's branch was reorged out and the real reorg event was pruned.
     synthetic_reorg: Option<ChainEventEnvelope>,
+}
+
+/// Resolves the resume position for one event-history read, dispatching on
+/// whether the caller supplied a cursor.
+///
+/// Every cursor-bound event family (chain events, mempool events) shares this
+/// skeleton: with no cursor, the read starts at the retention floor; with a
+/// cursor, a family-specific position-check resolves where retained delivery
+/// resumes. The check owns cursor authentication, sequence-bound validation,
+/// and any family-specific fork or expiry handling, so the typed error
+/// vocabulary stays inside the family that owns it.
+fn resolve_event_history_start_sequence<Resume>(
+    from_cursor: Option<&StreamCursorTokenV1>,
+    floor_resume: impl FnOnce() -> Resume,
+    position_check: impl FnOnce(&StreamCursorTokenV1) -> Result<Resume, StoreError>,
+) -> Result<Resume, StoreError> {
+    from_cursor.map_or_else(|| Ok(floor_resume()), position_check)
 }
 
 /// Inputs for resolving the resume position of a reorged-out cursor.
@@ -1015,14 +1039,33 @@ impl ChainStoreInner {
         current_chain_epoch: &ChainEpoch,
         bounds: ChainEventHistoryBounds,
     ) -> Result<ChainEventResume, StoreError> {
-        let Some(cursor) = request.from_cursor else {
-            return Ok(ChainEventResume {
+        resolve_event_history_start_sequence(
+            request.from_cursor,
+            || ChainEventResume {
                 start_sequence: bounds.oldest_retained_sequence,
                 family: request.family,
                 synthetic_reorg: None,
-            });
-        };
+            },
+            |cursor| self.chain_event_cursor_resume(inner, cursor, current_chain_epoch, bounds),
+        )
+    }
 
+    /// Resolves the resume position for a chain-event cursor: the
+    /// position-check hook for the chain-event family.
+    ///
+    /// Authenticates the cursor, rejects forged sequences as
+    /// `ChainEventCursorInvalid`, then resolves the locator fork point. A
+    /// cursor still on the canonical chain resumes from the next event; one
+    /// reorged out below its tip routes through
+    /// [`resolve_reorged_cursor_resume`], which replays the retained reorg or
+    /// synthesizes a `ChainReorged` ahead of the page.
+    fn chain_event_cursor_resume(
+        &self,
+        inner: &impl RocksChainStoreRead,
+        cursor: &StreamCursorTokenV1,
+        current_chain_epoch: &ChainEpoch,
+        bounds: ChainEventHistoryBounds,
+    ) -> Result<ChainEventResume, StoreError> {
         let cursor_payload = cursor
             .decode_chain_event(current_chain_epoch.network, self.cursor_auth_key)
             .map_err(|_| StoreError::ChainEventCursorInvalid {
@@ -1300,10 +1343,13 @@ impl ChainStoreInner {
             read_oldest_retained_mempool_event_sequence(&read_view, current_event_sequence)?
                 .unwrap_or(1);
         let start_sequence = self.mempool_event_history_start_sequence(
+            &read_view,
             request,
             network,
-            current_event_sequence,
-            oldest_retained_sequence,
+            MempoolEventHistoryBounds {
+                current_event_sequence,
+                oldest_retained_sequence,
+            },
         )?;
 
         if start_sequence > current_event_sequence {
@@ -1360,30 +1406,65 @@ impl ChainStoreInner {
 
     fn mempool_event_history_start_sequence(
         &self,
+        inner: &impl RocksChainStoreRead,
         request: MempoolEventHistoryRequest<'_>,
         network: Network,
-        current_event_sequence: u64,
-        oldest_retained_sequence: u64,
+        bounds: MempoolEventHistoryBounds,
     ) -> Result<u64, StoreError> {
-        let Some(cursor) = request.from_cursor else {
-            return Ok(oldest_retained_sequence);
-        };
+        resolve_event_history_start_sequence(
+            request.from_cursor,
+            || bounds.oldest_retained_sequence,
+            |cursor| self.mempool_event_cursor_resume(inner, cursor, network, bounds),
+        )
+    }
+
+    /// Resolves the resume sequence for a mempool-event cursor: the
+    /// position-check hook for the mempool family.
+    ///
+    /// Authenticates the cursor, rejects an ahead-of-history sequence as
+    /// `MempoolEventCursorInvalid` and a below-floor sequence as
+    /// `MempoolEventCursorExpired`, then verifies the cursor's claimed
+    /// position against the stored event before trusting it. The mempool
+    /// cursor bookmarks a `(sequence, transaction_id)` pair rather than a
+    /// `(height, hash)` fork anchor, so this check confirms the retained
+    /// event at the cursor's sequence still carries the bookmarked
+    /// transaction id; a mismatch means a stale or forged cursor and yields
+    /// `MempoolEventCursorInvalid`.
+    fn mempool_event_cursor_resume(
+        &self,
+        inner: &impl RocksChainStoreRead,
+        cursor: &StreamCursorTokenV1,
+        network: Network,
+        bounds: MempoolEventHistoryBounds,
+    ) -> Result<u64, StoreError> {
         let cursor_payload = cursor
             .decode_mempool_event(network, self.cursor_auth_key)
             .map_err(|_| StoreError::MempoolEventCursorInvalid {
                 reason: "cursor token failed validation",
             })?;
-        if cursor_payload.event_sequence > current_event_sequence {
+        if cursor_payload.event_sequence > bounds.current_event_sequence {
             return Err(StoreError::MempoolEventCursorInvalid {
                 reason: "cursor sequence is ahead of retained history",
             });
         }
-        if cursor_payload.event_sequence < oldest_retained_sequence {
+        if cursor_payload.event_sequence < bounds.oldest_retained_sequence {
             return Err(StoreError::MempoolEventCursorExpired {
                 event_sequence: cursor_payload.event_sequence,
-                oldest_retained_sequence,
+                oldest_retained_sequence: bounds.oldest_retained_sequence,
             });
         }
+
+        let key = StoreKey::mempool_event(cursor_payload.event_sequence);
+        if let Some(record_bytes) = inner.get(StorageTable::MempoolEvent, &key)? {
+            let bookmarked =
+                decode_mempool_event_envelope(&key, &record_bytes, network, self.cursor_auth_key)?;
+            if bookmarked.transaction_id() != cursor_payload.last_transaction_id {
+                return Err(StoreError::MempoolEventCursorInvalid {
+                    reason: "cursor transaction id does not match the bookmarked event",
+                });
+            }
+        }
+
         cursor_payload
             .event_sequence
             .checked_add(1)

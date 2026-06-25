@@ -10,8 +10,8 @@ mod block_hash_index;
 mod chain_epoch;
 mod chain_epoch_reader;
 mod chain_event;
-mod chain_event_stream;
 mod chain_store;
+mod event_stream;
 mod format;
 mod grpc_status;
 mod kv;
@@ -38,7 +38,6 @@ pub use chain_event::{
     ChainEpochCommitOutcome, ChainEpochCommitted, ChainEvent, ChainEventEnvelope,
     ChainRangeReverted,
 };
-pub use chain_event_stream::run_chain_event_stream;
 pub use chain_store::{
     AddressOutputIndexPage, AddressOutputIndexPageRequest, CURRENT_ARTIFACT_SCHEMA_VERSION,
     ChainEpochReadApi, ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
@@ -46,6 +45,7 @@ pub use chain_store::{
     PrimaryChainStore, SecondaryCatchupOutcome, SecondaryChainStore, TransparentAddressTxIndexPage,
     TransparentAddressTxIndexPageRequest,
 };
+pub use event_stream::{EventEnvelope, run_event_stream};
 pub use format::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,

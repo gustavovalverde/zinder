@@ -18,7 +18,7 @@ use std::num::NonZeroU32;
 use tokio::sync::mpsc;
 use zinder_core::{BlockHeight, Network, TransparentAddressScriptHash};
 use zinder_proto::v1::wallet;
-use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1, run_chain_event_stream};
+use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1, run_event_stream};
 
 use crate::{
     QueryError, TransparentAddressTxIdsInRangeRequest, WalletQueryApi,
@@ -81,7 +81,7 @@ pub(super) fn spawn_filtered_stream<Q>(
     Q: WalletQueryApi + Clone + 'static,
 {
     let filter = std::sync::Arc::new(address_filter);
-    tokio::spawn(run_chain_event_stream(
+    tokio::spawn(run_event_stream(
         from_cursor,
         move |cursor| {
             let query_api = query_api.clone();

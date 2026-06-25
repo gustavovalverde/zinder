@@ -15,7 +15,7 @@ use zinder_core::{
 };
 use zinder_store::{
     ChainStoreOptions, MempoolEvent, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
-    PrimaryChainStore, StoreError,
+    PrimaryChainStore, StoreError, StreamCursorTokenV1,
 };
 
 /// Round-trip: appending three mempool events and reading them back without
@@ -95,6 +95,40 @@ fn mempool_event_history_resumes_strictly_after_cursor() -> eyre::Result<()> {
         .map(|envelope| envelope.event_sequence)
         .collect();
     assert_eq!(sequences, vec![first.event_sequence + 1]);
+    Ok(())
+}
+
+/// A mempool resume cursor that fails authentication is rejected, the same
+/// integrity discipline the chain-event resume applies.
+#[test]
+fn tampered_mempool_event_cursor_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+    let chain_epoch = synthetic_chain_epoch(1);
+
+    let appended = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA0, chain_epoch),
+        },
+        UnixTimestampMillis::new(1_000),
+    )?;
+
+    let mut cursor_bytes = appended.cursor.as_bytes().to_vec();
+    *cursor_bytes
+        .last_mut()
+        .ok_or_else(|| eyre!("expected non-empty cursor bytes"))? ^= 1;
+    let cursor = StreamCursorTokenV1::from_bytes(cursor_bytes);
+
+    let error = match store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(
+        Some(&cursor),
+    )) {
+        Ok(history) => return Err(eyre!("expected invalid cursor, got {history:?}")),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::MempoolEventCursorInvalid { .. }
+    ));
     Ok(())
 }
 

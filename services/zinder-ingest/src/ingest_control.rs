@@ -26,10 +26,9 @@ use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
     StreamCursorTokenV1, chain_event_envelope_message, chain_event_stream_family_from_message,
-    chain_view_message, mempool_entry_message, mempool_event_envelope_message,
-    run_chain_event_stream, status_from_store_error, stream_cursor_from_message_bytes,
-    transparent_mempool_output_message, transparent_mempool_spend_message,
-    transparent_output_entry_message,
+    chain_view_message, mempool_entry_message, mempool_event_envelope_message, run_event_stream,
+    status_from_store_error, stream_cursor_from_message_bytes, transparent_mempool_output_message,
+    transparent_mempool_spend_message, transparent_output_entry_message,
 };
 
 use crate::mempool::MempoolIndex;
@@ -201,7 +200,7 @@ impl IngestControl for IngestControlGrpcAdapter {
             .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
         let store = self.store.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
-        tokio::spawn(run_chain_event_stream(
+        tokio::spawn(run_event_stream(
             from_cursor,
             move |cursor| read_chain_event_page(store.clone(), cursor, family),
             event_sender,
@@ -273,7 +272,11 @@ impl IngestControl for IngestControlGrpcAdapter {
         let request = request.into_inner();
         let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
         let (event_sender, event_receiver) = mpsc::channel(16);
-        tokio::spawn(stream_mempool_events(store, from_cursor, event_sender));
+        tokio::spawn(run_event_stream(
+            from_cursor,
+            move |cursor| read_mempool_event_page(store.clone(), cursor),
+            event_sender,
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(event_receiver))))
     }
 
@@ -502,71 +505,27 @@ fn outpoint_from_request_message(
     ))
 }
 
-async fn stream_mempool_events(
+async fn read_mempool_event_page(
     store: PrimaryChainStore,
-    mut from_cursor: Option<StreamCursorTokenV1>,
-    event_sender: mpsc::Sender<Result<wallet::MempoolEventEnvelope, Status>>,
-) {
-    loop {
-        // RocksDB reads are synchronous; offload off the runtime worker so
-        // the orchestrator and other async tasks keep making progress.
-        let page_store = store.clone();
-        let page_cursor = from_cursor.clone();
-        let page_outcome = match tokio::task::spawn_blocking(move || {
-            let request = MempoolEventHistoryRequest::new(
-                page_cursor.as_ref(),
-                DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS,
-            );
-            page_store.mempool_event_history(request)
+    cursor: Option<StreamCursorTokenV1>,
+) -> Result<Vec<wallet::MempoolEventEnvelope>, Status> {
+    let event_history = tokio::task::spawn_blocking(move || {
+        store.mempool_event_history(MempoolEventHistoryRequest::new(
+            cursor.as_ref(),
+            DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS,
+        ))
+    })
+    .await
+    .map_err(|join_error| Status::unavailable(join_error.to_string()))?
+    .map_err(|error| status_from_store_error(&error))?;
+
+    event_history
+        .iter()
+        .map(|event_envelope| {
+            mempool_event_envelope_message(event_envelope)
+                .map_err(status_from_chain_event_encode_error)
         })
-        .await
-        {
-            Ok(page_outcome) => page_outcome,
-            Err(join_error) => {
-                let _ = event_sender
-                    .send(Err(Status::unavailable(join_error.to_string())))
-                    .await;
-                return;
-            }
-        };
-        match page_outcome {
-            Ok(envelopes) => {
-                let truncated = u32::try_from(envelopes.len())
-                    .is_ok_and(|count| count >= DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS.get());
-                for envelope in envelopes {
-                    let proto_outcome = mempool_event_envelope_message(&envelope);
-                    let send_outcome = match proto_outcome {
-                        Ok(message) => {
-                            from_cursor = Some(envelope.cursor.clone());
-                            event_sender.send(Ok(message)).await
-                        }
-                        Err(error) => {
-                            event_sender
-                                .send(Err(status_from_chain_event_encode_error(error)))
-                                .await
-                        }
-                    };
-                    if send_outcome.is_err() {
-                        return;
-                    }
-                }
-                if !truncated {
-                    // Exit immediately when the receiver drops so server
-                    // shutdown does not have to wait out the poll interval.
-                    tokio::select! {
-                        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                        () = event_sender.closed() => return,
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = event_sender
-                    .send(Err(status_from_store_error(&error)))
-                    .await;
-                return;
-            }
-        }
-    }
+        .collect()
 }
 
 fn record_mempool_snapshot_age_seconds(snapshot_age_millis: u64) {

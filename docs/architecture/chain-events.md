@@ -173,15 +173,17 @@ Chain-event retention is governed by [Chain events §Retention And Backpressure]
 
 ## Module Naming Guidance
 
-Future implementation modules should be named after the boundary they own:
+Implementation modules are named after the boundary they own:
 
 - `node_source`
 - `chain_source_event`
 - `chain_event`
 - `chain_event_publisher`
-- `chain_event_stream`
+- `event_stream`
 - `chain_reorg`
 - `event_cursor`
+
+`event_stream` is the single home for the resumable subscription driver. One generic `run_event_stream`, parameterized by the `EventEnvelope` cursor-extraction trait, serves every cursor-bound family (chain events and mempool events); families differ only in the page-reader they pass in. The store-side resume resolution shares one `resolve_event_history_start_sequence` skeleton across families, with a family-specific position-check hook that owns cursor authentication, sequence-bound validation, and any fork or expiry handling.
 
 Avoid `event_service`, `reorg_manager`, `notification_handler`, `source_processor`, `stream_utils`, and public `push` modules. Those names hide ownership and do not tell a reader which boundary they are reading.
 
