@@ -7,8 +7,8 @@ use eyre::eyre;
 use std::sync::Arc;
 use zinder_core::{
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, Network, RawTransactionBytes,
-    TransactionBroadcastResult, TransactionId,
+    BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES, Network,
+    RawTransactionBytes, TransactionBroadcastResult, TransactionId,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
 use zinder_source::SourceError;
@@ -83,6 +83,61 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
 
         assert_eq!(broadcast_result, expected_broadcast_result);
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() -> eyre::Result<()>
+{
+    let mock_broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([1; 32]));
+    let store_fixture = StoreFixture::open()?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        mock_broadcaster.clone(),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let oversized = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES + 1]);
+
+    let error = match wallet_query.broadcast_transaction(oversized).await {
+        Ok(broadcast_result) => {
+            return Err(eyre!("expected size error, got {broadcast_result:?}"));
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        QueryError::BroadcastTransactionTooLarge { actual, maximum }
+            if actual == MAX_RAW_TRANSACTION_BYTES + 1 && maximum == MAX_RAW_TRANSACTION_BYTES
+    ));
+    assert!(
+        mock_broadcaster.captured_calls().is_empty(),
+        "oversized payload must be rejected before reaching the broadcaster"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([6; 32]);
+    let mock_broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
+    let store_fixture = StoreFixture::open()?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        mock_broadcaster.clone(),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let at_bound = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES]);
+
+    let broadcast_result = wallet_query.broadcast_transaction(at_bound.clone()).await?;
+
+    assert_eq!(
+        broadcast_result,
+        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+    );
+    assert_eq!(mock_broadcaster.captured_calls(), vec![at_bound]);
 
     Ok(())
 }

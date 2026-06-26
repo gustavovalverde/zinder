@@ -58,7 +58,8 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::ChainEventCursorInvalid { .. }
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
-        | QueryError::UnsupportedShieldedProtocol { .. } => bad_request_details(error),
+        | QueryError::UnsupportedShieldedProtocol { .. }
+        | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
         | QueryError::DeriveUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
@@ -118,6 +119,12 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
             ErrorDetails::with_bad_request_violation(
                 "shielded_protocol",
                 format!("{protocol:?} is not supported by the native wallet protocol"),
+            )
+        }
+        QueryError::BroadcastTransactionTooLarge { actual, maximum } => {
+            ErrorDetails::with_bad_request_violation(
+                "raw_transaction",
+                format!("transaction is {actual} bytes; maximum is {maximum}"),
             )
         }
         _ => ErrorDetails::new(),

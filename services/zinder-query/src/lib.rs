@@ -9,12 +9,12 @@ use async_trait::async_trait;
 use thiserror::Error;
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact, TransactionBroadcastResult,
-    TransactionId, TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputEntry,
-    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, MAX_RAW_TRANSACTION_BYTES, MinedDetails,
+    MinedTransaction, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutputEntry, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
 };
@@ -1311,11 +1311,14 @@ where
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastResult, QueryError> {
         let started_at = Instant::now();
-        let broadcast_outcome = self
-            .transaction_broadcaster
-            .broadcast_transaction(raw_transaction)
-            .await
-            .map_err(map_broadcast_source_error);
+        let broadcast_outcome = async {
+            guard_broadcast_payload_size(&raw_transaction)?;
+            self.transaction_broadcaster
+                .broadcast_transaction(raw_transaction)
+                .await
+                .map_err(map_broadcast_source_error)
+        }
+        .await;
         record_wallet_query_outcome(
             "broadcast_transaction",
             started_at,
@@ -1376,6 +1379,17 @@ fn map_broadcast_source_error(error: SourceError) -> QueryError {
     } else {
         QueryError::Node(error)
     }
+}
+
+fn guard_broadcast_payload_size(raw_transaction: &RawTransactionBytes) -> Result<(), QueryError> {
+    let actual = raw_transaction.len();
+    if actual > MAX_RAW_TRANSACTION_BYTES {
+        return Err(QueryError::BroadcastTransactionTooLarge {
+            actual,
+            maximum: MAX_RAW_TRANSACTION_BYTES,
+        });
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1499,6 +1513,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
+        Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::DeriveUnavailable { .. }) => "derive_unavailable",
         Some(QueryError::DeriveLag { .. }) => "derive_lag",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
@@ -1944,6 +1959,15 @@ pub enum QueryError {
     #[error("transaction broadcast is disabled")]
     TransactionBroadcastDisabled,
 
+    /// Raw transaction exceeds the maximum serialized size accepted for broadcast.
+    #[error("raw transaction is too large: {actual} bytes exceeds maximum {maximum}")]
+    BroadcastTransactionTooLarge {
+        /// Serialized length of the submitted transaction.
+        actual: usize,
+        /// Maximum accepted serialized length.
+        maximum: usize,
+    },
+
     /// Derive-owned wallet projection is not configured for this query handle.
     #[error("derive projection is unavailable for {capability}")]
     DeriveUnavailable {
@@ -2006,6 +2030,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::InvalidAddress { .. } => ErrorReason::InvalidAddress,
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
             Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
+            Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
             Self::DeriveUnavailable { .. } => ErrorReason::DeriveProjectionUnavailable,
             Self::DeriveLag { .. } => ErrorReason::DeriveProjectionLagging,
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
@@ -2169,6 +2194,10 @@ mod error_reason_tests {
             QueryError::UnsupportedBlockSelector { reason: "probe" },
             QueryError::UnsupportedTransactionStatus { reason: "probe" },
             QueryError::TransactionBroadcastDisabled,
+            QueryError::BroadcastTransactionTooLarge {
+                actual: MAX_RAW_TRANSACTION_BYTES + 1,
+                maximum: MAX_RAW_TRANSACTION_BYTES,
+            },
             QueryError::DeriveUnavailable {
                 capability: "probe",
             },

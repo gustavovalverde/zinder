@@ -42,6 +42,7 @@ enum ErrorReason {
   INVALID_CHAIN_EPOCH_ARTIFACTS = 10;
   TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED = 43;
   SNAPSHOT_PAGE_CURSOR_INVALID = 44;
+  BROADCAST_TRANSACTION_TOO_LARGE = 46;
 
   // FAILED_PRECONDITION family.
   BROADCAST_DISABLED = 11;
@@ -103,5 +104,5 @@ enum ErrorReason {
 
   // Reserved slots for additive growth. Removing a reserved range is a
   // breaking change.
-  reserved 46 to 63;
+  reserved 47 to 63;
 }

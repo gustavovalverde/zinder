@@ -51,9 +51,10 @@ pub use subtree_root::{
 };
 pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MinedDetails, MinedTransaction,
-    RawTransactionBytes, TransactionBlobArtifact, TransactionBroadcastResult,
-    TransactionFactsArtifact, TransactionId, TransactionLocation, TxStatus,
+    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MAX_RAW_TRANSACTION_BYTES,
+    MinedDetails, MinedTransaction, RawTransactionBytes, TransactionBlobArtifact,
+    TransactionBroadcastResult, TransactionFactsArtifact, TransactionId, TransactionLocation,
+    TxStatus,
 };
 pub use transaction_public_facts::{
     LockTime, PrivacyShape, TransactionComponentCounts, TransactionPublicFacts, TransactionVersion,

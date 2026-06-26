@@ -52,6 +52,16 @@ impl AuthDigest {
     }
 }
 
+/// Maximum serialized length, in bytes, of a raw transaction accepted for
+/// broadcast.
+///
+/// A post-Sapling Zcash transaction cannot exceed the maximum block size, since
+/// a transaction larger than a block could never be mined. The bound matches
+/// `zebra-chain`'s `MAX_BLOCK_BYTES`; the per-transaction limit is in practice a
+/// few bytes smaller (a block also carries a header and a transaction count),
+/// so the block size is a safe upper bound for the broadcast guard.
+pub const MAX_RAW_TRANSACTION_BYTES: usize = 2_000_000;
+
 /// Raw serialized Zcash transaction bytes submitted by a wallet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawTransactionBytes(Vec<u8>);
@@ -67,6 +77,18 @@ impl RawTransactionBytes {
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Returns the serialized transaction length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the serialized transaction carries no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

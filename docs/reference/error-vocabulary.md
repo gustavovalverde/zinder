@@ -56,6 +56,7 @@ The request shape failed validation. Retry disposition: **NonRetryable**. Carrie
 | `SNAPSHOT_PAGE_CURSOR_INVALID` | Same as above for `MempoolSnapshot` paging cursors | `field_violations[from_cursor]` |
 | `INVALID_ADDRESS` | Address selector is empty, malformed, or targets a different network | `field_violations[address]` |
 | `UNSUPPORTED_SHIELDED_PROTOCOL` | Shielded protocol value is not supported by the wallet protocol | `field_violations[shielded_protocol]` |
+| `BROADCAST_TRANSACTION_TOO_LARGE` | Submitted raw transaction exceeds the maximum serialized transaction size | `field_violations[raw_transaction]` |
 | `INVALID_CHAIN_STORE_OPTIONS` | Operator misconfiguration in `[storage]` | — |
 | `ARTIFACT_PAYLOAD_TOO_LARGE` | Stored artifact exceeds size limits (deployment data issue) | — |
 | `INVALID_CHAIN_EPOCH_ARTIFACTS` | A future commit batch failed structural validation | — |

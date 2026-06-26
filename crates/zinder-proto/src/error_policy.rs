@@ -82,6 +82,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::ArtifactPayloadTooLarge
         | ErrorReason::InvalidChainEpochArtifacts
         | ErrorReason::TransparentBalanceAddressCountExceeded
+        | ErrorReason::BroadcastTransactionTooLarge
         | ErrorReason::SnapshotPageCursorInvalid => {
             ReasonPolicy::new(Code::InvalidArgument, NonRetryable)
         }
