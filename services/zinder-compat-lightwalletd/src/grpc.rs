@@ -160,6 +160,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         Self: compact_tx_streamer_server::CompactTxStreamer,
     {
         compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
     }
 }
 

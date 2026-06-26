@@ -117,7 +117,9 @@ impl IngestControlGrpcAdapter {
         self,
     ) -> InterceptedService<IngestControlServer<Self>, BearerTokenServerInterceptor> {
         let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
-        IngestControlServer::with_interceptor(self, interceptor)
+        let server = IngestControlServer::new(self)
+            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES);
+        InterceptedService::new(server, interceptor)
     }
 
     fn advertised_capabilities(&self) -> Vec<String> {

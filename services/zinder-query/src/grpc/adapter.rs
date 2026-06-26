@@ -128,6 +128,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self: wallet_query_server::WalletQuery,
     {
         wallet_query_server::WalletQueryServer::new(self)
+            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
     }
 }
 

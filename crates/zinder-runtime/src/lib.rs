@@ -86,6 +86,20 @@ pub use transport::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Upper bound on the size of an incoming gRPC request frame, applied to
+/// every serving Zinder gRPC server via `max_decoding_message_size`.
+///
+/// The value accommodates the largest legitimate request: a broadcast
+/// transaction, itself capped at
+/// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2 MB), plus gRPC framing
+/// overhead. It must stay at or above that 2 MB bound so an oversized
+/// broadcast is rejected by the application-layer broadcast guard with its
+/// typed error, not by the transport.
+///
+/// Setting it explicitly pins tonic's implicit default in place so a
+/// future framework default change cannot silently widen the limit.
+pub const MAX_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Spawns a task that cancels `cancel` when the process receives a
 /// terminating signal. Returns the join handle for the spawned task;
 /// callers usually drop it.

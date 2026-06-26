@@ -16,6 +16,7 @@ use zinder_proto::v1::{
     ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient},
     wallet::{ChainEventStreamFamily, ChainEventsRequest},
 };
+use zinder_runtime::MAX_DECODING_MESSAGE_BYTES;
 use zinder_testkit::StoreFixture;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -115,6 +116,47 @@ async fn ingest_control_streams_chain_events_from_primary_store() -> Result<()> 
 
     drop(stream);
     drop(client);
+    cancel.cancel();
+    server.await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_rejects_request_frame_exceeding_decoding_cap() -> Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+    let adapter =
+        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone());
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                server_cancel.cancelled_owned(),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+    let oversized_cursor = vec![0u8; MAX_DECODING_MESSAGE_BYTES + 1];
+    let outcome = client
+        .chain_events(ChainEventsRequest {
+            from_cursor: oversized_cursor,
+            family: ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
+        })
+        .await;
+
+    let status = outcome.err().ok_or_else(|| {
+        eyre::eyre!("server accepted a request frame larger than the decoding cap")
+    })?;
+    assert_eq!(status.code(), tonic::Code::OutOfRange);
+
     cancel.cancel();
     server.await??;
 

@@ -232,7 +232,9 @@ impl ExplorerQueryGrpcAdapter {
         self,
     ) -> InterceptedService<ExplorerQueryServer<Self>, BearerTokenServerInterceptor> {
         let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
-        ExplorerQueryServer::with_interceptor(self, interceptor)
+        let server = ExplorerQueryServer::new(self)
+            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES);
+        InterceptedService::new(server, interceptor)
     }
 
     /// Returns the capability strings the adapter currently advertises.
