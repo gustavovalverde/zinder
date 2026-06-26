@@ -325,6 +325,43 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
 }
 
 #[test]
+fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(), Box<dyn Error>> {
+    let source_block = fixture_source_block()?;
+    let activations = sample_regtest_upgrade_activations();
+    let derived =
+        derive_block_with_raw_blob_policy(&source_block, &activations, RawBlobPolicy::All)?;
+
+    assert_eq!(derived.tree_size_additions.orchard, 0);
+    assert_eq!(derived.tree_size_additions.sapling, 0);
+
+    let mut running_tree_sizes = CommitmentTreeSizes {
+        sapling: 11,
+        orchard: 42,
+    };
+    let built = finalize_derived_block(derived, &mut running_tree_sizes)?;
+
+    assert_eq!(running_tree_sizes.orchard, 42);
+    assert_eq!(running_tree_sizes.sapling, 11);
+
+    let compact_block = CompactBlock::decode(built.compact_block.payload_bytes.as_slice())?;
+    let chain_metadata = compact_block
+        .chain_metadata
+        .as_ref()
+        .ok_or("compact block missing chain metadata")?;
+    assert_eq!(chain_metadata.orchard_commitment_tree_size, 42);
+    assert_eq!(chain_metadata.sapling_commitment_tree_size, 11);
+    assert!(
+        compact_block
+            .vtx
+            .iter()
+            .all(|transaction| transaction.actions.is_empty()),
+        "regtest block 1 carries no Orchard actions"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compact_block_builder_rejects_source_identity_mismatch() -> Result<(), Box<dyn Error>> {
     let mut mismatched_hash_block = fixture_source_block()?;
     mismatched_hash_block.hash = changed_block_hash(mismatched_hash_block.hash);

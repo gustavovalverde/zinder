@@ -1067,6 +1067,52 @@ async fn fetch_network_upgrade_activations_parses_getblockchaininfo_upgrades() -
 }
 
 #[tokio::test]
+async fn fetch_network_upgrade_activations_activates_nu6_2() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "upgrades": {
+                "c8e71055": {
+                    "name": "NU6",
+                    "activationheight": 2_976_000,
+                    "status": "active"
+                },
+                "5437f330": {
+                    "name": "NU6.2",
+                    "activationheight": 3_146_400,
+                    "status": "active"
+                }
+            }
+        })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashTestnet,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let activations = source.fetch_network_upgrade_activations().await?;
+
+    assert_eq!(
+        activations.activation_height_by_name("NU6.2"),
+        Some(zinder_core::BlockHeight::new(3_146_400))
+    );
+    assert_eq!(
+        activations
+            .activation_height_by_branch_id(zinder_core::ConsensusBranchId::new(0x5437_f330)),
+        Some(zinder_core::BlockHeight::new(3_146_400))
+    );
+    assert_eq!(
+        activations.consensus_branch_id_at(zinder_core::BlockHeight::new(3_146_400)),
+        zinder_core::ConsensusBranchId::new(0x5437_f330)
+    );
+    assert_eq!(
+        activations.consensus_branch_id_at(zinder_core::BlockHeight::new(3_146_399)),
+        zinder_core::ConsensusBranchId::new(0xc8e7_1055)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_chain_value_pools_at_tip_preserves_upstream_pool_entries() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({

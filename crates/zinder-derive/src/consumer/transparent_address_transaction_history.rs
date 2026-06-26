@@ -501,6 +501,199 @@ fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
     usize::try_from(amount.get()).unwrap_or(usize::MAX)
 }
 
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "tests assert on a known-present row; absence is a test-code bug, not a runtime condition."
+    )]
+
+    use std::collections::HashMap;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    use rust_rocksdb::WriteBatch;
+    use tempfile::tempdir;
+    use zinder_core::{
+        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+        TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
+        TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
+        TransparentOutPoint, TransparentOutputFact, TransparentSpendFact,
+    };
+    use zinder_store::RocksDbResourceBudget;
+
+    use super::{
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+        TransparentAddressTransactionHistoryConsumer,
+        TransparentAddressTransactionHistoryPageRequest,
+    };
+    use crate::consumer::block_commit_context::{
+        BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
+    };
+    use crate::consumer::{BlockKeyedConsumer, DeriveConsumerCtx};
+    use crate::store::{DeriveStore, DeriveStoreOptions};
+
+    const WATCHED_ADDRESS: TransparentAddressScriptHash =
+        TransparentAddressScriptHash::from_bytes([7; 32]);
+
+    fn transaction_id(seed: u8) -> TransactionId {
+        TransactionId::from_bytes([seed; 32])
+    }
+
+    fn block_hash(seed: u8) -> BlockHash {
+        BlockHash::from_bytes([seed; 32])
+    }
+
+    fn public_facts(seed: u8) -> TransactionPublicFacts {
+        TransactionPublicFacts {
+            transaction_id: transaction_id(seed),
+            auth_digest: None,
+            wtxid: None,
+            version: TransactionVersion::V5,
+            consensus_branch_id: None,
+            lock_time: LockTime::Unlocked,
+            expiry_height: None,
+            size_bytes: 0,
+            counts: TransactionComponentCounts::EMPTY,
+            privacy_shape: PrivacyShape::Unclassified,
+            is_coinbase: false,
+            unsupported_sections: Vec::new(),
+        }
+    }
+
+    fn open_store()
+    -> Result<(tempfile::TempDir, DeriveStore), Box<dyn std::error::Error + Send + Sync>> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumer_column_families: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+            },
+        )?;
+        Ok((tempdir, store))
+    }
+
+    fn apply_block(
+        store: &DeriveStore,
+        consumer: &mut TransparentAddressTransactionHistoryConsumer,
+        block: &BlockCommitContext,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut batch = WriteBatch::default();
+        let mut ctx = DeriveConsumerCtx {
+            store,
+            batch: &mut batch,
+        };
+        consumer.apply_block(block, &mut ctx)?;
+        store.write_batch(&batch)?;
+        Ok(())
+    }
+
+    const RECEIVE_HEIGHT: BlockHeight = BlockHeight::new(100);
+    const SPEND_HEIGHT: BlockHeight = BlockHeight::new(105);
+
+    fn received_outpoint() -> TransparentOutPoint {
+        TransparentOutPoint::new(transaction_id(10), 0)
+    }
+
+    fn receive_block() -> BlockCommitContext {
+        let location =
+            TransactionLocation::new(transaction_id(10), RECEIVE_HEIGHT, block_hash(1), 0);
+        let transaction = TransactionFactsArtifact::new(location, public_facts(10))
+            .with_transparent_facts(
+                Vec::new(),
+                vec![TransparentOutputFact::new(
+                    0,
+                    5_000,
+                    vec![1, 2, 3],
+                    WATCHED_ADDRESS,
+                )],
+            );
+        BlockCommitContext::new(
+            BlockCommitPayload {
+                height: RECEIVE_HEIGHT,
+                block_hash: block_hash(1),
+                previous_block_hash: block_hash(0),
+                block_time_unix_seconds: 1_700_000_000,
+                block_size_bytes: 0,
+                transactions: vec![transaction],
+            },
+            TransparentSpendFacts::Offline,
+        )
+    }
+
+    fn spend_block() -> BlockCommitContext {
+        let location = TransactionLocation::new(transaction_id(20), SPEND_HEIGHT, block_hash(5), 0);
+        let transaction = TransactionFactsArtifact::new(location, public_facts(20))
+            .with_transparent_facts(
+                vec![TransparentInputFact::new(0, received_outpoint())],
+                Vec::new(),
+            );
+        let mut spends = HashMap::new();
+        spends.insert(
+            received_outpoint(),
+            TransparentSpendFact::new(
+                received_outpoint(),
+                0,
+                transaction_id(20),
+                0,
+                SPEND_HEIGHT,
+                block_hash(5),
+                5_000,
+                WATCHED_ADDRESS,
+                RECEIVE_HEIGHT,
+                block_hash(1),
+            ),
+        );
+        BlockCommitContext::new(
+            BlockCommitPayload {
+                height: SPEND_HEIGHT,
+                block_hash: block_hash(5),
+                previous_block_hash: block_hash(4),
+                block_time_unix_seconds: 1_700_000_500,
+                block_size_bytes: 0,
+                transactions: vec![transaction],
+            },
+            TransparentSpendFacts::Static(Arc::new(spends)),
+        )
+    }
+
+    #[test]
+    fn spend_from_watched_address_emits_a_spend_row()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransparentAddressTransactionHistoryConsumer::new();
+
+        apply_block(&store, &mut consumer, &receive_block())?;
+        apply_block(&store, &mut consumer, &spend_block())?;
+
+        let page = TransparentAddressTransactionHistoryConsumer::read_page(
+            &store,
+            TransparentAddressTransactionHistoryPageRequest {
+                address_script_hash: WATCHED_ADDRESS,
+                start_height: BlockHeight::new(1),
+                end_height: BlockHeight::new(200),
+                max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
+                from_cursor: None,
+                descending: false,
+            },
+        )?;
+
+        assert_eq!(page.artifacts.len(), 2);
+        let spend_row = page
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.block_height == SPEND_HEIGHT)
+            .expect("spend row must be present for the watched address");
+        assert_eq!(spend_row.address_script_hash, WATCHED_ADDRESS);
+        assert_eq!(spend_row.transaction_id, transaction_id(20));
+        assert_eq!(spend_row.block_hash, block_hash(5));
+        assert_eq!(spend_row.tx_index_in_block, 0);
+        Ok(())
+    }
+}
+
 /// Consumer-specific failure modes.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

@@ -279,7 +279,7 @@ impl std::fmt::Debug for TransparentTestKey {
 }
 
 /// Activation heights for the `z3` regtest sidecar:
-/// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, later upgrades unset.
+/// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, `nu6_2 = 3`.
 ///
 /// Derived from
 /// [`crate::network_upgrade_fixtures::sample_regtest_upgrade_activations`]

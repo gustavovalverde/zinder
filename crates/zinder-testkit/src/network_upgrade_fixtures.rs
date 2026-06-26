@@ -11,8 +11,8 @@
 //!
 //! - [`sample_regtest_upgrade_activations`] returns a hand-built table that
 //!   matches ZFND's `z3` regtest sidecar defaults
-//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2). Intended for in-process
-//!   integration tests that exercise `GetLightdInfo` or
+//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3). Intended for
+//!   in-process integration tests that exercise `GetLightdInfo` or
 //!   `MinedDetails.consensus_branch_id` without a live node. Live tests must
 //!   discover the activations from the running node, not hard-code them here.
 //! - [`local_network_from_activations`] converts a node-discovered
@@ -35,8 +35,8 @@ use zinder_core::{
 /// Sample regtest [`NetworkUpgradeActivations`] for in-process tests.
 ///
 /// Matches the activation heights ZFND's `z3` regtest sidecar is configured
-/// with by default: Overwinter..Canopy at 1, NU5 at 2, NU6 at 2. Intended for
-/// integration tests that exercise `GetLightdInfo` or
+/// with by default: Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3.
+/// Intended for integration tests that exercise `GetLightdInfo` or
 /// `MinedDetails.consensus_branch_id` without a live node. Live tests must
 /// discover the activations from the running node, not hard-code them here.
 #[must_use]
@@ -82,6 +82,11 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
                 branch_id: ConsensusBranchId::new(0xc8e7_1055),
                 activation_height: CoreBlockHeight::new(2),
                 name: "NU6".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5437_f330),
+                activation_height: CoreBlockHeight::new(3),
+                name: "NU6.2".to_owned(),
             },
         ],
     )
