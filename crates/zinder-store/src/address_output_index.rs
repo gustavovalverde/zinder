@@ -50,6 +50,11 @@ pub(crate) struct TransparentUtxoSetAggregate {
 /// aggregate cannot count an output a later reorg or spend could remove. The
 /// accumulator is two integers, so memory stays constant regardless of set
 /// size.
+///
+/// The projection keys every transparent output by the SHA-256 of its raw
+/// `scriptPubKey`, including non-standard and provably-unspendable scripts
+/// (`OP_RETURN`, bare data outputs). Such outputs are counted here, so the totals
+/// are the full unspent set and not zcashd's `IsUnspendable`-filtered set.
 pub(crate) fn read_transparent_utxo_set_aggregate(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,

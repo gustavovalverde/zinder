@@ -9,6 +9,12 @@
 //! A serialized-set hash and byte size are intentionally not offered. Both
 //! depend on a defined UTXO-set serialization ordering, which Zinder does not
 //! commit to; only the order-independent count and value totals are reported.
+//!
+//! Every transparent output is counted, including non-standard and
+//! provably-unspendable scripts (`OP_RETURN`, bare data outputs): the projection
+//! keys outputs by the hash of their raw `scriptPubKey` and never inspects the
+//! script template. The totals are therefore the full unspent set, not zcashd's
+//! `IsUnspendable`-filtered set.
 
 use crate::{BlockHeight, ChainEpoch};
 

@@ -154,6 +154,8 @@ The aggregate is taken at the resolved chain epoch's settled tip, and `summarize
 
 `hash_serialized` and `bytes_serialized` (the serialized-set digest and byte size that `gettxoutsetinfo` also returns) are intentionally omitted. Both depend on a defined UTXO-set serialization ordering, and Zinder does not commit to one; inventing an ordering would expose a hash no other implementation could reproduce. Only the order-independent count and value totals are reported.
 
+The totals count every unspent transparent output, including non-standard and provably-unspendable scripts (OP_RETURN, bare data outputs). The current-UTXO projection keys outputs by the hash of their raw `scriptPubKey` and never inspects the script template, so it does not apply zcashd's `IsUnspendable` filter. The two totals can therefore sit slightly above a zcashd `gettxoutsetinfo` that excludes the unspendable class.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
