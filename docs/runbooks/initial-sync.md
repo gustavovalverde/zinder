@@ -114,6 +114,8 @@ In both cases the loop keeps committing whatever blocks Zebra has made available
 
 A store that has diverged from the upstream history beyond the configured `reorg_window_blocks` fails closed with `cause=reorg_window_exceeded`. The loop does not attempt to recover; the operator is expected to drop the store and restart from cold. Preserve `chain_event_history` for the divergence point first if the incident is under investigation. The store path is whatever `[storage].path` resolves to (defaults to `/var/lib/zinder/store` in the shipped deployments).
 
+The default `reorg_window_blocks` is `100`. Upstream Zebra (v5 onwards) follows and serves reorgs up to `MAX_BLOCK_REORG_HEIGHT = 1000`, so a rollback deeper than the configured window lands below the settled tip and trips this fail-closed path even though Zebra itself recovered cleanly. The fail-closed posture means a deep reorg degrades to a re-sync, never to silent corruption. No reorg approaching 100 blocks has been observed on Zcash mainnet, so the default covers all observed history; operators who run against a node expecting deeper rollbacks can raise `reorg_window_blocks` (`ZINDER_INGEST__REORG_WINDOW_BLOCKS`), trading near-tip retention memory, which scales with the window, for the wider recovery range.
+
 ```bash
 docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml down
 docker volume rm zinder-mainnet-data
