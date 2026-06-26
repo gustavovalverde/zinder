@@ -31,6 +31,7 @@ use zinder_core::{
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
+use zinder_proto::wire::decode_transparent_utxo_set_commitment;
 use zinder_store::{
     self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
     mempool_entry_from_message,
@@ -48,7 +49,7 @@ use crate::{
     MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
     TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentHistoryCursor, TransparentUnspentOutputStreamItem,
+    TransparentHistoryCursor, TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -620,6 +621,37 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.handle_status(status))?
             .into_inner();
         transparent_unspent_outputs_by_outpoint_response_from_message(self.network, response)
+    }
+
+    async fn transparent_utxo_set_summary(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
+        let request = wallet::TransparentUtxoSetSummaryRequest {
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+        };
+        let response = self
+            .client()
+            .transparent_utxo_set_summary(Request::new(request))
+            .await
+            .map_err(|status| self.handle_status(status))?
+            .into_inner();
+        let chain_epoch =
+            chain_epoch_from_chain_view_with_network(self.network, response.chain_view)?;
+        let commitment = response
+            .commitment
+            .map(|message| {
+                decode_transparent_utxo_set_commitment(&message)
+                    .map_err(|error| IndexerError::malformed("commitment", error.to_string()))
+            })
+            .transpose()?;
+        Ok(TransparentUtxoSetSummaryView {
+            chain_epoch,
+            summarized_height: BlockHeight::new(response.summarized_height),
+            utxo_count: response.utxo_count,
+            total_value_zat: response.total_value_zat,
+            commitment,
+        })
     }
 }
 

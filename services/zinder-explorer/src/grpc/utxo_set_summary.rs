@@ -56,5 +56,6 @@ pub(crate) async fn handle_utxo_set_summary(
         utxo_count: response.utxo_count,
         total_value_zat: response.total_value_zat,
         summarized_height: response.summarized_height,
+        commitment: response.commitment,
     }))
 }

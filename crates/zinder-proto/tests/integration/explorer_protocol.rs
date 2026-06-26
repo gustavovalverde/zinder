@@ -260,12 +260,24 @@ fn utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
         utxo_count: 4096,
         total_value_zat: 2_100_000_000_000_000,
         summarized_height: 2_500_000,
+        commitment: Some(wallet::TransparentUtxoSetCommitment {
+            scheme: wallet::UtxoSetCommitmentScheme::Lthash16 as i32,
+            commitment: vec![0xcd; 2048],
+        }),
     };
     let decoded = round_trip(&response)?;
 
     assert_eq!(decoded.utxo_count, 4096);
     assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
     assert_eq!(decoded.summarized_height, 2_500_000);
+    assert_eq!(
+        decoded
+            .commitment
+            .ok_or_else(|| eyre!("commitment present after round-trip"))?
+            .commitment
+            .len(),
+        2048
+    );
     assert_eq!(
         decoded
             .freshness

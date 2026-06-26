@@ -1165,6 +1165,11 @@ message UtxoSetSummaryResponse {
   // Settled tip height the aggregate was taken at. Below this height the
   // projection is the irreversible unspent set.
   uint32 summarized_height = 4;
+
+  // Homomorphic commitment to the full unspent set. Mirrors the wallet-plane
+  // field: present only when the server advertises
+  // `explorer.utxo_set.commitment_v1`, absent otherwise.
+  optional zinder.v1.wallet.TransparentUtxoSetCommitment commitment = 5;
 }
 
 // Per-row record materialized by `TransparentAddressActivityConsumer`.

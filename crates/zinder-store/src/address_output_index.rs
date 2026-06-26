@@ -8,6 +8,7 @@ use std::{
 use zinder_core::{
     BlockHash, BlockHeight, ChainEpoch, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
+    TransparentUtxoSetCommitment, wire::UtxoSetCommitmentElement,
 };
 
 use crate::{
@@ -30,12 +31,15 @@ pub trait AddressOutputIndexStore {
 }
 
 /// Chain-wide aggregate of the transparent UTXO-set projection.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TransparentUtxoSetAggregate {
     /// Number of unspent transparent outputs at or below the settled tip.
     pub(crate) utxo_count: u64,
     /// Sum of the values of those outputs, in zatoshi.
     pub(crate) total_value_zat: u64,
+    /// Homomorphic commitment to the same outputs, present only when the fold
+    /// was asked to compute it.
+    pub(crate) commitment: Option<TransparentUtxoSetCommitment>,
 }
 
 /// Streams the whole current-UTXO projection for one network and accumulates a
@@ -55,13 +59,22 @@ pub(crate) struct TransparentUtxoSetAggregate {
 /// `scriptPubKey`, including non-standard and provably-unspendable scripts
 /// (`OP_RETURN`, bare data outputs). Such outputs are counted here, so the totals
 /// are the full unspent set and not zcashd's `IsUnspendable`-filtered set.
+///
+/// When `commitment_enabled` is set, the same loop folds every counted output
+/// into a [`TransparentUtxoSetCommitment`] (LtHash16): each surviving row's
+/// outpoint, value, raw script, and height are the exact element the commitment
+/// binds, so no extra read is needed. The fold has real per-output CPU cost, so
+/// the commitment is computed only when the operator opts in.
 pub(crate) fn read_transparent_utxo_set_aggregate(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
+    commitment_enabled: bool,
 ) -> Result<TransparentUtxoSetAggregate, StoreError> {
     let prefix = StoreKey::address_output_index_network_prefix(chain_epoch.network);
     let settled_tip_height = chain_epoch.settled_tip_height;
+    let network_id = chain_epoch.network.id();
     let mut aggregate = TransparentUtxoSetAggregate::default();
+    let mut commitment = commitment_enabled.then(TransparentUtxoSetCommitment::empty);
 
     inner.scan_prefix(
         StorageTable::AddressOutputIndex,
@@ -73,10 +86,20 @@ pub(crate) fn read_transparent_utxo_set_aggregate(
             }
             aggregate.utxo_count = aggregate.utxo_count.saturating_add(1);
             aggregate.total_value_zat = aggregate.total_value_zat.saturating_add(output.value_zat);
+            if let Some(commitment) = commitment.as_mut() {
+                commitment.insert(&UtxoSetCommitmentElement {
+                    network_id,
+                    outpoint: output.outpoint,
+                    value_zat: output.value_zat,
+                    script_pub_key: &output.script_pub_key,
+                    block_height: output.block_height,
+                });
+            }
             Ok(PrefixScanControl::Continue)
         },
     )?;
 
+    aggregate.commitment = commitment;
     Ok(aggregate)
 }
 

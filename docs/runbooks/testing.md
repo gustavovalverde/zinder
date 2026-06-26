@@ -814,6 +814,7 @@ wallet.read.transparent_spends_by_outpoint_v1
 wallet.read.transparent_unspent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
 wallet.read.transparent_utxo_set_summary_v1
+wallet.read.transparent_utxo_set_commitment_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
@@ -829,6 +830,7 @@ explorer.transparent_address.deltas_v1
 explorer.fee.summary_v1
 explorer.value_pool.summary_v1
 explorer.utxo_set.summary_v1
+explorer.utxo_set.commitment_v1
 explorer.mempool.event_counts_v1
 explorer.transaction.fees_v1
 explorer.transaction.recent_v1

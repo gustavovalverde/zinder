@@ -25,7 +25,13 @@ mod transparent_address_tx_index;
 mod transparent_output;
 mod transparent_utxo_set_summary;
 mod tree_state;
+mod utxo_set_commitment;
 pub mod wire;
+
+pub use utxo_set_commitment::{
+    TransparentUtxoSetCommitment, UTXO_SET_COMMITMENT_DIGEST_LEN, UTXO_SET_COMMITMENT_LEN,
+    UtxoSetCommitmentScheme,
+};
 
 pub use block_artifact::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockTransactionIndexArtifact, CompactBlockArtifact,

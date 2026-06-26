@@ -301,6 +301,45 @@ fn deleted_chain_name_helpers_have_no_lingering_references() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn utxo_set_commitment_personal_lives_only_in_wire_module() -> Result<()> {
+    const PERSONAL_TAG_LITERAL: &str = "ZinderUtxoSet___";
+    const PERSONAL_ALLOWLIST: &[&str] = &["crates/zinder-core/src/wire/utxo_set_commitment.rs"];
+
+    let root = workspace_root()?;
+    let allowlist: Vec<PathBuf> = PERSONAL_ALLOWLIST
+        .iter()
+        .map(|path| root.join(path))
+        .collect();
+
+    let mut offenders: Vec<PathBuf> = Vec::new();
+    for directory in SCANNED_DIRECTORIES {
+        for source_path in production_source_files(&root.join(directory))? {
+            if allowlist.iter().any(|allowed| allowed == &source_path) {
+                continue;
+            }
+            let contents = fs::read_to_string(&source_path)?;
+            if code_lines_contain(&contents, PERSONAL_TAG_LITERAL) {
+                offenders.push(source_path);
+            }
+        }
+    }
+
+    let formatted_offenders = offenders
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    assert!(
+        offenders.is_empty(),
+        "the UTXO-set commitment personalization and element encoding must live in \
+         `crates/zinder-core/src/wire/utxo_set_commitment.rs`; call \
+         `zinder_core::wire::encode_utxo_set_commitment_element` instead of \
+         re-serializing the preimage. Found the personalization literal in:\n  {formatted_offenders}",
+    );
+    Ok(())
+}
+
 fn workspace_root() -> Result<PathBuf> {
     let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest_directory

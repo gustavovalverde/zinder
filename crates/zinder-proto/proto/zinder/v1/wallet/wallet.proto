@@ -1374,6 +1374,40 @@ message ChainValuePoolsAtTipResponse {
   uint32 tip_height = 3;
 }
 
+// Snapshot scheme a TransparentUtxoSetCommitment was built under.
+//
+// The scheme id is self-describing: comparing two commitments is meaningful
+// only when their schemes match. A zcashd-comparable membership rule would be
+// a new value, never a reinterpretation of an existing one.
+enum UtxoSetCommitmentScheme {
+  // Scheme not stated. The absence sentinel; never emitted by a server that
+  // populated the commitment.
+  UTXO_SET_COMMITMENT_SCHEME_UNSPECIFIED = 0;
+
+  // Componentwise u16-lane homomorphic hash (LtHash16) over the full
+  // transparent unspent set, each element BLAKE2X-expanded to 1024 lanes and
+  // summed modulo 2^16. The 2048-byte accumulator is the commitment.
+  UTXO_SET_COMMITMENT_SCHEME_LTHASH16 = 1;
+}
+
+// Homomorphic commitment to the full transparent unspent set at one settled
+// tip.
+//
+// Order-independent and reproducible: two deployments at the same settled tip
+// produce identical `commitment` bytes under the same `scheme`. The height the
+// commitment was taken at is the enclosing ChainView's `chain_epoch.settled_tip`
+// for request-time comparison; a `committed_height` field is added later when a
+// snapshot manifest detaches this message from the response.
+message TransparentUtxoSetCommitment {
+  // Scheme the commitment was built under. Comparison is only meaningful
+  // across equal schemes.
+  UtxoSetCommitmentScheme scheme = 1;
+
+  // Raw accumulator bytes (2048 bytes for LTHASH16). Opaque; compare for
+  // equality, do not interpret field-by-field.
+  bytes commitment = 2;
+}
+
 // Wallet-plane request for the chain-wide transparent UTXO-set summary.
 //
 // `at_epoch_id` pins the canonical read. Absent resolves against the visible
@@ -1406,6 +1440,11 @@ message TransparentUtxoSetSummaryResponse {
   // Settled tip height the aggregate was taken at. Below this height the
   // projection is the irreversible unspent set.
   uint32 summarized_height = 4;
+
+  // Homomorphic commitment to the full unspent set. Present only when the
+  // operator opted into the request-time fold and the server advertises
+  // `wallet.read.transparent_utxo_set_commitment_v1`; absent otherwise.
+  optional TransparentUtxoSetCommitment commitment = 5;
 }
 
 // Transparent-address tx-history range request, server-streamed.

@@ -65,6 +65,7 @@ async fn transparent_output_parity_harness() -> eyre::Result<TransparentOutputPa
         catchup_interval: Duration::from_millis(20),
         initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
+        utxo_set_commitment_enabled: false,
     })
     .await?;
 

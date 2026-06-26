@@ -692,6 +692,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `wallet.read.transparent_unspent_outputs_by_outpoint_v1`
 - `wallet.read.chain_value_pools_at_tip_v1`
 - `wallet.read.transparent_utxo_set_summary_v1`
+- `wallet.read.transparent_utxo_set_commitment_v1`
 - `wallet.address.transparent_unspent_outputs_v1`
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
@@ -707,6 +708,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `explorer.fee.summary_v1`
 - `explorer.value_pool.summary_v1`
 - `explorer.utxo_set.summary_v1`
+- `explorer.utxo_set.commitment_v1`
 - `explorer.mempool.event_counts_v1`
 - `explorer.transaction.fees_v1`
 - `explorer.transaction.recent_v1`
@@ -718,7 +720,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 
 `WalletQuery.TransparentAddressBalance` is served in the wallet plane and advertises `wallet.address.transparent_balance_v1` on every deployment. The handler sums the confirmed total in-process from the canonical unspent-output index, then overlays the signed mempool delta (`unconfirmed_delta_zat`) through the colocated ingest-control endpoint; deployments without that endpoint return a zero delta rather than failing. Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` projects the same wallet primitive into one `value_zat`.
 
-`WalletQuery.TransparentUtxoSetSummary` is served in the wallet plane and advertises `wallet.read.transparent_utxo_set_summary_v1` on every deployment. It is the chain-wide transparent UTXO accounting (`gettxoutsetinfo`-equivalent): a request-time streaming scan of the canonical current-UTXO projection that folds the set into `utxo_count` and `total_value_zat` without buffering it. The scan runs at the resolved epoch's settled tip, where the projection is the irreversible unspent set, so it applies no per-row spend re-check or block-visibility check; `summarized_height` reports that tip and an optional `at_epoch_id` pins it. There is no materialized counter and no new column family, so the cost is one full-set scan per call. The serialized-set hash and byte size are intentionally not reported: both require a UTXO-set serialization ordering Zinder does not define. `ExplorerQuery.UtxoSetSummary` wraps this primitive in the `ExplorerFreshness` envelope.
+`WalletQuery.TransparentUtxoSetSummary` is served in the wallet plane and advertises `wallet.read.transparent_utxo_set_summary_v1` on every deployment. It is the chain-wide transparent UTXO accounting (`gettxoutsetinfo`-equivalent): a request-time streaming scan of the canonical current-UTXO projection that folds the set into `utxo_count` and `total_value_zat` without buffering it. The scan runs at the resolved epoch's settled tip, where the projection is the irreversible unspent set, so it applies no per-row spend re-check or block-visibility check; `summarized_height` reports that tip and an optional `at_epoch_id` pins it. There is no materialized counter and no new column family, so the cost is one full-set scan per call. The serialized-set hash and byte size of `gettxoutsetinfo` are not reported: both require a UTXO-set serialization ordering Zinder does not define. In their place the response carries an optional order-independent `commitment` (LtHash16, see [ADR-0026](../adrs/0026-utxo-set-commitment.md)) that binds full set membership and is reproducible across deployments at the same settled tip. The commitment fold has per-output CPU cost, so it is operator opt-in: it is present only when the deployment advertises `wallet.read.transparent_utxo_set_commitment_v1`, absent (`None`) otherwise. `ExplorerQuery.UtxoSetSummary` wraps this primitive in the `ExplorerFreshness` envelope and mirrors the commitment under `explorer.utxo_set.commitment_v1`.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are
@@ -763,6 +765,10 @@ Zcash 32-byte hashes have two byte orders. Both are spec-defined terms; both app
 
 The public proto contract uses **RPC byte order** for every hash-shaped field (`transaction_id`, `block_hash`, `previous_block_hash`, `merkle_root_hash`, `auth_digest`, `wtxid`, `BlockTip.hash`, `mined_block_hash`, `completing_block_hash`, `spending_transaction_id`, etc.), conveyed as a lowercase ASCII hex `string`. The two forms convert via the `encode_rpc_*_hex` / `decode_rpc_*_hex` pair in `wire/`; the storage-facing `encode_internal_*` / `decode_internal_*` pair is the identity for `[u8; 32]` <-> `[u8; 32]` and exists so storage code never names raw byte slices. See [ADR-0024](../adrs/0024-wire-format-rpc-byte-order.md).
 
+### UTXO-set commitment element encoding
+
+The transparent UTXO-set commitment binds each unspent output through a fixed-width little-endian preimage: `network_id(u32 LE) ‖ encoding_version(u8) ‖ txid(32, internal order) ‖ output_index(u32 LE) ‖ value_zat(u64 LE) ‖ script_len(u32 LE) ‖ raw_scriptPubKey ‖ block_height(u32 LE)`. The preimage and the 16-byte BLAKE2X personalization (`b"ZinderUtxoSet___"`) live in `crates/zinder-core/src/wire/utxo_set_commitment.rs`; `encode_utxo_set_commitment_element` is the only encoder. `network_id` and `encoding_version` ride in the preimage rather than the BLAKE2 personalization so a third party reproduces the bytes from a plain UTXO dump. The scheme is carried on the wire as the `UtxoSetCommitmentScheme` enum, never a string. See [ADR-0026](../adrs/0026-utxo-set-commitment.md).
+
 ### Forbidden inline forms
 
 When adding a new wire field or a new ingress dialect, locate or add a function in `crates/zinder-core/src/wire/` before writing any boundary code. The following inline forms are forbidden anywhere outside that module:
@@ -772,6 +778,7 @@ When adding a new wire field or a new ingress dialect, locate or add a function 
 - Inline hex-string transaction id or block hash encode or decode. Use `encode_rpc_*_hex` / `decode_rpc_*_hex`.
 - Manual byte-reversal of a hash before hex-encoding or after hex-decoding. The reversal lives inside `encode_rpc_*_hex` / `decode_rpc_*_hex`; callers never reverse.
 - Hardcoded capability literals. Import the `pub const` from [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs).
+- Inline serialization of a UTXO-set commitment element preimage, or the personalization literal `ZinderUtxoSet___`. Use `encode_utxo_set_commitment_element`.
 - Duplicate `Network` to wire-string tables. Use `encode_bip70_chain_name` (`"main"`/`"test"`, BIP70/lightwalletd/Zebra JSON-RPC) or `encode_zinder_native_chain_name` (`"zcash-mainnet"`/`"zcash-testnet"`/`"zcash-regtest"`, native config and protobuf).
 
 Two integration tests enforce the rules on every CI invocation: [`crates/zinder-core/tests/integration/wire_invariants.rs`](../../crates/zinder-core/tests/integration/wire_invariants.rs) and [`crates/zinder-proto/tests/integration/capability_string_uniqueness.rs`](../../crates/zinder-proto/tests/integration/capability_string_uniqueness.rs).

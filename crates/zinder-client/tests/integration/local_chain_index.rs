@@ -48,6 +48,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         catchup_interval: Duration::from_millis(20),
         initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
+        utxo_set_commitment_enabled: false,
     })
     .await?;
 

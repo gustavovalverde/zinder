@@ -11,7 +11,7 @@ use zinder_core::{
     BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, Network, TransactionId, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
-    UnixTimestampMillis,
+    TransparentUtxoSetCommitment, UnixTimestampMillis, UtxoSetCommitmentScheme,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
@@ -270,7 +270,7 @@ fn utxo_set_summary_counts_unspent_below_the_settled_tip_and_excludes_swept_spen
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
 
     let reader = store.current_chain_epoch_reader()?;
-    let summary = reader.transparent_utxo_set_summary()?;
+    let summary = reader.transparent_utxo_set_summary(false)?;
 
     assert_eq!(summary.utxo_count, 2);
     assert_eq!(summary.total_value_zat, 100_000);
@@ -293,7 +293,7 @@ fn utxo_set_summary_excludes_outputs_above_the_settled_tip() -> eyre::Result<()>
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
 
     let reader = store.current_chain_epoch_reader()?;
-    let summary = reader.transparent_utxo_set_summary()?;
+    let summary = reader.transparent_utxo_set_summary(false)?;
 
     assert_eq!(summary.utxo_count, 1);
     assert_eq!(summary.total_value_zat, 50_000);
@@ -309,10 +309,57 @@ fn utxo_set_summary_is_zero_for_an_empty_projection() -> eyre::Result<()> {
     store.commit_chain_epoch(epoch_artifacts(1, 1, 5))?;
 
     let reader = store.current_chain_epoch_reader()?;
-    let summary = reader.transparent_utxo_set_summary()?;
+    let summary = reader.transparent_utxo_set_summary(false)?;
 
     assert_eq!(summary.utxo_count, 0);
     assert_eq!(summary.total_value_zat, 0);
+
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_commitment_is_present_only_when_enabled() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let first = output_at(BlockHeight::new(1), [91; 32]);
+    let second = output_at(BlockHeight::new(2), [92; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5).with_transparent_outputs_by_outpoint(vec![first, second]),
+    )?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+
+    let disabled = reader.transparent_utxo_set_summary(false)?;
+    assert_eq!(disabled.utxo_count, 2);
+    assert!(disabled.commitment.is_none());
+
+    let enabled = reader.transparent_utxo_set_summary(true)?;
+    assert_eq!(enabled.utxo_count, 2);
+    let commitment = enabled
+        .commitment
+        .ok_or_else(|| eyre!("commitment present when enabled"))?;
+    assert_eq!(commitment.scheme(), UtxoSetCommitmentScheme::LtHash16);
+    assert_ne!(commitment, TransparentUtxoSetCommitment::empty());
+
+    Ok(())
+}
+
+#[test]
+fn utxo_set_summary_commitment_is_empty_for_an_empty_projection() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    store.commit_chain_epoch(epoch_artifacts(1, 1, 5))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let summary = reader.transparent_utxo_set_summary(true)?;
+
+    assert_eq!(summary.utxo_count, 0);
+    assert_eq!(
+        summary.commitment,
+        Some(TransparentUtxoSetCommitment::empty())
+    );
 
     Ok(())
 }
@@ -330,14 +377,14 @@ fn utxo_set_summary_respects_the_pinned_epoch_settled_tip() -> eyre::Result<()> 
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
 
     let pinned = store.chain_epoch_reader_at(ChainEpochId::new(1))?;
-    let pinned_summary = pinned.transparent_utxo_set_summary()?;
+    let pinned_summary = pinned.transparent_utxo_set_summary(false)?;
     assert_eq!(pinned_summary.summarized_height, BlockHeight::new(1));
     assert_eq!(pinned_summary.utxo_count, 1);
     assert_eq!(pinned_summary.total_value_zat, 50_000);
     drop(pinned);
 
     let current = store.current_chain_epoch_reader()?;
-    let current_summary = current.transparent_utxo_set_summary()?;
+    let current_summary = current.transparent_utxo_set_summary(false)?;
     assert_eq!(current_summary.summarized_height, BlockHeight::new(3));
     assert_eq!(current_summary.utxo_count, 2);
     assert_eq!(current_summary.total_value_zat, 100_000);

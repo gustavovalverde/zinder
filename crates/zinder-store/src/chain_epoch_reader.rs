@@ -229,11 +229,23 @@ impl<'store> ChainEpochReader<'store> {
     /// count and total value over the outputs created at or below
     /// `settled_tip_height`, where the projection is the irreversible unspent
     /// set. Request-time, full-set scan with constant memory.
-    pub fn transparent_utxo_set_summary(&self) -> Result<TransparentUtxoSetSummary, StoreError> {
-        let aggregate = read_transparent_utxo_set_aggregate(&self.read_view, self.chain_epoch)?;
+    ///
+    /// When `commitment_enabled` is set, the same scan also folds the `LtHash16`
+    /// homomorphic commitment over the full set; otherwise the commitment field
+    /// is absent.
+    pub fn transparent_utxo_set_summary(
+        &self,
+        commitment_enabled: bool,
+    ) -> Result<TransparentUtxoSetSummary, StoreError> {
+        let aggregate = read_transparent_utxo_set_aggregate(
+            &self.read_view,
+            self.chain_epoch,
+            commitment_enabled,
+        )?;
         Ok(TransparentUtxoSetSummary {
             utxo_count: aggregate.utxo_count,
             total_value_zat: aggregate.total_value_zat,
+            commitment: aggregate.commitment,
             summarized_height: self.chain_epoch.settled_tip_height,
             chain_epoch: self.chain_epoch,
         })

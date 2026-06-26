@@ -17,7 +17,7 @@ pub use chain_index::{
     MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentHistoryCursor, TransparentUnspentOutputStreamItem,
+    TransparentHistoryCursor, TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
 };
 pub use error::{IndexerError, RetryPolicy};
 pub use local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
@@ -32,7 +32,8 @@ pub use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    TransparentUnspentOutput, TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus,
+    UtxoSetCommitmentScheme,
 };
 pub use zinder_proto::capabilities::{
     AdvertisePolicy, CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySpec,

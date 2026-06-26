@@ -12,8 +12,8 @@ use zinder_core::{
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact,
-    TxStatus,
+    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse,
+    TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::WalletServerInfo;
 use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
@@ -300,6 +300,43 @@ pub struct TransparentUnspentOutputStreamItem {
     pub chain_epoch: ChainEpoch,
     /// Single unspent output.
     pub output: TransparentUnspentOutput,
+}
+
+/// Chain-wide transparent UTXO-set summary returned to a client.
+///
+/// `utxo_count` and `total_value_zat` are the order-independent set totals at
+/// `summarized_height`. `commitment` is present only when the serving
+/// deployment advertises `wallet.read.transparent_utxo_set_commitment_v1`;
+/// absence is `None`, not an error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentUtxoSetSummaryView {
+    /// Chain epoch the summary was taken at.
+    pub chain_epoch: ChainEpoch,
+    /// Settled tip height the aggregate was taken at.
+    pub summarized_height: BlockHeight,
+    /// Number of unspent transparent outputs at the settled tip.
+    pub utxo_count: u64,
+    /// Sum of the values of every unspent transparent output, in zatoshi.
+    pub total_value_zat: u64,
+    /// Homomorphic commitment to the full unspent set, when advertised.
+    pub commitment: Option<TransparentUtxoSetCommitment>,
+}
+
+impl TransparentUtxoSetSummaryView {
+    /// Returns true only when both summaries carry a commitment under the same
+    /// scheme.
+    ///
+    /// Two commitments are comparable only when their schemes match: a scheme
+    /// mismatch (or either side absent) means not-comparable, never diverged.
+    /// Callers that get `true` may then compare the commitment bytes to detect
+    /// genuine divergence at the same scheme and epoch.
+    #[must_use]
+    pub fn comparable_with(&self, other: &Self) -> bool {
+        match (self.commitment.as_ref(), other.commitment.as_ref()) {
+            (Some(left), Some(right)) => left.scheme() == right.scheme(),
+            _ => false,
+        }
+    }
 }
 
 /// Canonical and derive-store reads served identically by every chain-index
@@ -728,6 +765,27 @@ pub trait ChainIndex: Send + Sync + 'static {
         outpoints: &[TransparentOutPoint],
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError>;
+
+    /// Aggregates the chain-wide transparent UTXO set at the settled tip.
+    ///
+    /// Returns the order-independent count and total value (the
+    /// `gettxoutsetinfo`-equivalent), plus the homomorphic commitment when the
+    /// serving deployment advertises
+    /// `wallet.read.transparent_utxo_set_commitment_v1`. Absence of the
+    /// commitment is `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let summary = client.transparent_utxo_set_summary(None).await?;
+    /// # let _ = summary; Ok(()) }
+    /// ```
+    async fn transparent_utxo_set_summary(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUtxoSetSummaryView, IndexerError>;
 
     /// Returns the catchup cadence used by local implementations, or `None`
     /// for purely remote implementations.

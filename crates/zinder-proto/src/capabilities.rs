@@ -94,6 +94,13 @@ pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_val
 /// both depend on a UTXO-set serialization ordering Zinder does not define.
 pub const WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1: &str =
     "wallet.read.transparent_utxo_set_summary_v1";
+/// Field capability gating `commitment` on `TransparentUtxoSetSummaryResponse`.
+///
+/// Operator opt-in: the `LtHash16` commitment is folded inside the summary scan
+/// and has real per-output CPU cost, so it is advertised only when the operator
+/// enables it. When absent the field is `None`; clients branch on presence.
+pub const WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1: &str =
+    "wallet.read.transparent_utxo_set_commitment_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
 pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
 /// Capability advertised for `WalletQuery.ChainEvents`.
@@ -212,6 +219,13 @@ pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1
 /// current-UTXO projection; the serialized-set hash and byte size are not
 /// reported.
 pub const EXPLORER_UTXO_SET_SUMMARY_V1: &str = "explorer.utxo_set.summary_v1";
+/// Field capability gating `commitment` on `UtxoSetSummaryResponse`.
+///
+/// Mirrors [`WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1`]: the explorer
+/// surfaces the wallet-plane commitment when a `WalletQuery` endpoint is wired.
+/// The wallet endpoint populates the field only when its own commitment
+/// capability is advertised, so a present field here always carries real bytes.
+pub const EXPLORER_UTXO_SET_COMMITMENT_V1: &str = "explorer.utxo_set.commitment_v1";
 /// Capability advertised for the per-transaction paid-fee surface.
 ///
 /// Signals that the explorer plane has transparent-output facts online and
@@ -350,6 +364,9 @@ pub enum AdvertisePolicy {
     /// Wallet: advertised when the store retains transaction blobs
     /// (ingest `raw_blob_policy` in `{transactions, all}`).
     RequiresTransactionBlobs,
+    /// Wallet: advertised when the operator opted into the transparent
+    /// UTXO-set commitment fold.
+    RequiresUtxoSetCommitment,
 }
 
 impl AdvertisePolicy {
@@ -368,6 +385,7 @@ impl AdvertisePolicy {
             Self::RequiresChainValuePools => inputs.chain_value_pools_enabled,
             Self::RequiresBlockBlobs => inputs.block_blobs_retained,
             Self::RequiresTransactionBlobs => inputs.transaction_blobs_retained,
+            Self::RequiresUtxoSetCommitment => inputs.utxo_set_commitment_enabled,
             Self::RequiresWalletQuery
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
@@ -397,7 +415,8 @@ impl AdvertisePolicy {
             | Self::RequiresChainEvents
             | Self::RequiresChainValuePools
             | Self::RequiresBlockBlobs
-            | Self::RequiresTransactionBlobs => false,
+            | Self::RequiresTransactionBlobs
+            | Self::RequiresUtxoSetCommitment => false,
         }
     }
 
@@ -418,7 +437,8 @@ impl AdvertisePolicy {
             | Self::RequiresPrevoutResolution
             | Self::RequiresPaymentDisclosureVerifier
             | Self::RequiresBlockBlobs
-            | Self::RequiresTransactionBlobs => false,
+            | Self::RequiresTransactionBlobs
+            | Self::RequiresUtxoSetCommitment => false,
         }
     }
 }
@@ -444,6 +464,8 @@ pub struct WalletAdvertiseInputs {
     pub block_blobs_retained: bool,
     /// The store retains transaction blobs.
     pub transaction_blobs_retained: bool,
+    /// The operator opted into the transparent UTXO-set commitment fold.
+    pub utxo_set_commitment_enabled: bool,
 }
 
 /// Readiness inputs the explorer plane resolves an [`AdvertisePolicy`] against.
@@ -685,6 +707,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
+        WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
+        CapabilitySurface::Wallet,
+        None,
+        AdvertisePolicy::RequiresUtxoSetCommitment,
+    ),
+    CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ServerInfo"),
@@ -754,6 +782,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_UTXO_SET_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.UtxoSetSummary"),
+        AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_UTXO_SET_COMMITMENT_V1,
+        CapabilitySurface::Explorer,
+        None,
         AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(

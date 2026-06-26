@@ -635,6 +635,10 @@ fn transparent_utxo_set_summary_response_round_trips_through_prost() -> eyre::Re
         utxo_count: 4096,
         total_value_zat: 2_100_000_000_000_000,
         summarized_height: 2_500_000,
+        commitment: Some(wallet::TransparentUtxoSetCommitment {
+            scheme: wallet::UtxoSetCommitmentScheme::Lthash16 as i32,
+            commitment: vec![0xab; 2048],
+        }),
     };
 
     let decoded = round_trip(&response)?;
@@ -643,6 +647,30 @@ fn transparent_utxo_set_summary_response_round_trips_through_prost() -> eyre::Re
     assert_eq!(decoded.utxo_count, 4096);
     assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
     assert_eq!(decoded.summarized_height, 2_500_000);
+    let commitment = decoded
+        .commitment
+        .ok_or_else(|| eyre::eyre!("commitment present after round-trip"))?;
+    assert_eq!(
+        commitment.scheme,
+        wallet::UtxoSetCommitmentScheme::Lthash16 as i32
+    );
+    assert_eq!(commitment.commitment.len(), 2048);
+    Ok(())
+}
+
+#[test]
+fn transparent_utxo_set_summary_response_omits_absent_commitment() -> eyre::Result<()> {
+    let response = wallet::TransparentUtxoSetSummaryResponse {
+        chain_view: Some(synthetic_chain_view()),
+        utxo_count: 0,
+        total_value_zat: 0,
+        summarized_height: 0,
+        commitment: None,
+    };
+
+    let decoded = round_trip(&response)?;
+
+    assert!(decoded.commitment.is_none());
     Ok(())
 }
 

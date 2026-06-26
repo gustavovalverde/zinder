@@ -52,12 +52,54 @@ async fn transparent_utxo_set_summary_counts_and_sums_the_unspent_set() -> eyre:
     assert_eq!(response.total_value_zat, total_value_zat);
     assert_eq!(response.summarized_height, 1);
     assert!(
+        response.commitment.is_none(),
+        "the commitment field is absent when the operator did not opt in"
+    );
+    assert!(
         response
             .chain_view
             .and_then(|chain_view| chain_view.chain_epoch)
             .is_some(),
         "the summary response binds to one chain epoch"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_utxo_set_summary_carries_the_commitment_when_enabled() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    commit_unspent_outputs(
+        &store,
+        ChainEpochId::new(1),
+        &[
+            TransparentAddressScriptHash::from_bytes([0x11; 32]),
+            TransparentAddressScriptHash::from_bytes([0x22; 32]),
+        ],
+    )?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let settings = ServerInfoSettings {
+        utxo_set_commitment_enabled: true,
+        ..ServerInfoSettings::default()
+    };
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, settings);
+
+    let response = WalletQueryService::transparent_utxo_set_summary(
+        &grpc_adapter,
+        Request::new(TransparentUtxoSetSummaryRequest { at_epoch_id: None }),
+    )
+    .await?
+    .into_inner();
+
+    let commitment = response
+        .commitment
+        .ok_or_else(|| eyre::eyre!("commitment present when enabled"))?;
+    assert_eq!(
+        commitment.scheme,
+        zinder_proto::v1::wallet::UtxoSetCommitmentScheme::Lthash16 as i32
+    );
+    assert_eq!(commitment.commitment.len(), 2048);
     Ok(())
 }
 

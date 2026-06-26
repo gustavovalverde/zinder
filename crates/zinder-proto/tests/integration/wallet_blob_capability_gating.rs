@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use zinder_proto::capabilities::{
     AdvertisePolicy, CapabilitySurface, ExplorerReadiness, WALLET_READ_FULL_BLOCK_AT_V1,
     WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
-    WALLET_READ_TRANSACTION_BYTES_V1, WalletAdvertiseInputs, always_on_capability_strings,
-    capabilities_for_surface,
+    WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
+    WalletAdvertiseInputs, always_on_capability_strings, capabilities_for_surface,
 };
 
 fn advertised_wallet_capabilities(
@@ -22,6 +22,7 @@ fn advertised_wallet_capabilities(
         chain_value_pools_enabled: false,
         block_blobs_retained,
         transaction_blobs_retained,
+        utxo_set_commitment_enabled: false,
     };
     capabilities_for_surface(CapabilitySurface::Wallet)
         .filter(|spec| spec.policy.wallet_satisfied(inputs))
@@ -55,6 +56,23 @@ fn transaction_blob_policy_resolves_against_transaction_blob_retention() {
     };
     assert!(AdvertisePolicy::RequiresTransactionBlobs.wallet_satisfied(with_blobs));
     assert!(!AdvertisePolicy::RequiresTransactionBlobs.wallet_satisfied(without_blobs));
+}
+
+#[test]
+fn utxo_set_commitment_policy_resolves_against_operator_opt_in() {
+    let enabled = WalletAdvertiseInputs {
+        utxo_set_commitment_enabled: true,
+        ..WalletAdvertiseInputs::default()
+    };
+    let disabled = WalletAdvertiseInputs::default();
+    assert!(AdvertisePolicy::RequiresUtxoSetCommitment.wallet_satisfied(enabled));
+    assert!(!AdvertisePolicy::RequiresUtxoSetCommitment.wallet_satisfied(disabled));
+}
+
+#[test]
+fn utxo_set_commitment_capability_is_off_by_default() {
+    let advertised = advertised_wallet_capabilities(false, false);
+    assert!(!advertised.contains(WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1));
 }
 
 #[test]

@@ -23,6 +23,7 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::{ops, wallet};
+use zinder_proto::wire::encode_transparent_utxo_set_commitment;
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
@@ -85,6 +86,9 @@ pub struct ServerInfoSettings {
     /// Whether the store retains transaction blobs (ingest `raw_blob_policy`
     /// in `{transactions, all}`).
     pub transaction_blobs_retained: bool,
+    /// Whether the operator opted into the transparent UTXO-set commitment
+    /// fold on `TransparentUtxoSetSummary`.
+    pub utxo_set_commitment_enabled: bool,
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -121,6 +125,7 @@ impl Default for ServerInfoSettings {
             chain_value_pools_enabled: false,
             block_blobs_retained: false,
             transaction_blobs_retained: false,
+            utxo_set_commitment_enabled: false,
         }
     }
 }
@@ -164,6 +169,7 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
                     chain_value_pools_enabled: settings.chain_value_pools_enabled,
                     block_blobs_retained: settings.block_blobs_retained,
                     transaction_blobs_retained: settings.transaction_blobs_retained,
+                    utxo_set_commitment_enabled: settings.utxo_set_commitment_enabled,
                 })
             })
             .map(|spec| spec.string.to_owned())
@@ -211,12 +217,17 @@ pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
 
 /// Aggregates the chain-wide transparent UTXO set at the settled tip and
 /// encodes the native wallet response.
+///
+/// `commitment_enabled` drives both the store-side fold and whether the
+/// optional commitment field is populated, so the capability and the field stay
+/// in lockstep.
 pub(super) async fn transparent_utxo_set_summary_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     at_epoch_id: Option<ChainEpochId>,
+    commitment_enabled: bool,
 ) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
     query_api
-        .transparent_utxo_set_summary(at_epoch_id)
+        .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
         .await
         .map(build_transparent_utxo_set_summary_response)
 }
@@ -229,6 +240,9 @@ fn build_transparent_utxo_set_summary_response(
         utxo_count: summary.utxo_count,
         total_value_zat: summary.total_value_zat,
         summarized_height: summary.summarized_height.value(),
+        commitment: summary
+            .commitment
+            .map(|commitment| encode_transparent_utxo_set_commitment(&commitment)),
     }
 }
 

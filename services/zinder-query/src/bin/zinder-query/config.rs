@@ -31,6 +31,9 @@ pub(crate) struct QueryConfig {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
     pub(crate) grpc: QueryGrpcConfig,
+    /// Whether `TransparentUtxoSetSummary` folds the `LtHash16` UTXO-set
+    /// commitment. Operator opt-in; the fold has per-output CPU cost.
+    pub(crate) utxo_set_commitment_enabled: bool,
     /// Optional node broadcaster. Network must match `QueryConfig.network`
     /// when present; the resolver enforces this.
     pub(crate) broadcaster: Option<NodeTarget>,
@@ -126,6 +129,7 @@ pub(crate) fn load_query_config(
         .with_default("query.listen_addr", "127.0.0.1:9101")?
         .with_default("query.grpc.enable_reflection", true)?
         .with_default("query.grpc.enable_health", true)?
+        .with_default("query.utxo_set_commitment_enabled", false)?
         .with_ops_section(ServiceIdentifier::Query)?
         .with_security_section()?
         .with_file(config_path)
@@ -189,6 +193,7 @@ struct QueryRawConfig {
 struct QuerySection {
     listen_addr: Option<String>,
     grpc: QueryGrpcSection,
+    utxo_set_commitment_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -214,6 +219,10 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         "query.grpc.enable_reflection",
     )?;
     let enable_health = require_field(config.query.grpc.enable_health, "query.grpc.enable_health")?;
+    let utxo_set_commitment_enabled = require_field(
+        config.query.utxo_set_commitment_enabled,
+        "query.utxo_set_commitment_enabled",
+    )?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
     guard_serving_bind("query.listen_addr", listen_addr, allow_public_bind)?;
@@ -235,6 +244,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
             enable_reflection,
             enable_health,
         },
+        utxo_set_commitment_enabled,
         broadcaster,
     })
 }
@@ -270,6 +280,7 @@ impl QueryConfigToml {
                     enable_reflection: config.grpc.enable_reflection,
                     enable_health: config.grpc.enable_health,
                 },
+                utxo_set_commitment_enabled: config.utxo_set_commitment_enabled,
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
         }
@@ -280,6 +291,7 @@ impl QueryConfigToml {
 struct QueryToml {
     listen_addr: String,
     grpc: QueryGrpcToml,
+    utxo_set_commitment_enabled: bool,
 }
 
 #[derive(Serialize)]

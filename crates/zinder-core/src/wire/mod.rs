@@ -36,6 +36,7 @@ mod in_block_position;
 mod merkle_root;
 mod transaction_id;
 mod unix_seconds;
+mod utxo_set_commitment;
 mod wtxid;
 
 pub use address_script_hash::{
@@ -66,6 +67,10 @@ pub use transaction_id::{
     encode_rpc_transaction_id_hex,
 };
 pub use unix_seconds::{UNIX_SECONDS_KEY_LEN, decode_unix_seconds, encode_unix_seconds};
+pub use utxo_set_commitment::{
+    UTXO_SET_COMMITMENT_ENCODING_VERSION, UTXO_SET_COMMITMENT_PERSONAL, UtxoSetCommitmentElement,
+    encode_utxo_set_commitment_element,
+};
 pub use wtxid::{
     decode_internal_wtxid, decode_rpc_wtxid_hex, encode_internal_wtxid, encode_rpc_wtxid_hex,
 };

@@ -674,6 +674,7 @@ where
         transparent_utxo_set_summary_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
+            self.server_info.utxo_set_commitment_enabled,
         )
         .await
         .map(Response::new)

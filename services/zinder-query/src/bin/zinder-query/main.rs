@@ -249,6 +249,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         chain_value_pools_enabled,
         block_blobs_retained,
         transaction_blobs_retained,
+        utxo_set_commitment_enabled: query_config.utxo_set_commitment_enabled,
         ..zinder_query::ServerInfoSettings::default()
     };
     let grpc_adapter = {

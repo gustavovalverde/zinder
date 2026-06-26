@@ -467,9 +467,12 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
+        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         self.record(at_epoch_id);
-        self.inner.transparent_utxo_set_summary(at_epoch_id).await
+        self.inner
+            .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
+            .await
     }
 
     async fn tree_state_at(

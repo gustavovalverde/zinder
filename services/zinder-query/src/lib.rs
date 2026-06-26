@@ -238,10 +238,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Folds the canonical current-UTXO projection into an unspent count and a
     /// total value (gettxoutsetinfo-equivalent) by a request-time full scan.
     /// The aggregate is taken at the resolved epoch's settled tip, where the
-    /// projection is the irreversible unspent set.
+    /// projection is the irreversible unspent set. When `commitment_enabled`
+    /// is set the same scan also folds the `LtHash16` homomorphic commitment.
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
+        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError>;
 
     /// Reads the tree state at exactly `height`.
@@ -1080,13 +1082,14 @@ where
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
+        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             reader
-                .transparent_utxo_set_summary()
+                .transparent_utxo_set_summary(commitment_enabled)
                 .map_err(QueryError::Store)
         }))
         .await;

@@ -25,7 +25,7 @@ use crate::{
     BlockId, ChainIndex, IndexStream, IndexerError, RemoteChainIndex, RemoteOpenOptions,
     TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentUnspentOutputStreamItem,
+    TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
 };
 
 /// Default maximum time spent on initial secondary catchup during local open.
@@ -58,6 +58,10 @@ pub struct LocalOpenOptions {
     /// The production binary discovers this via
     /// `ZebraJsonRpcSource::discover_network_upgrade_activations`.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    /// Whether `transparent_utxo_set_summary` folds the `LtHash16` UTXO-set
+    /// commitment. Matches the query service's operator opt-in; the fold has
+    /// per-output CPU cost, so the default is off.
+    pub utxo_set_commitment_enabled: bool,
 }
 
 /// Local chain index backed by a `RocksDB` secondary reader.
@@ -68,6 +72,7 @@ pub struct LocalChainIndex {
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    utxo_set_commitment_enabled: bool,
 }
 
 impl LocalChainIndex {
@@ -136,6 +141,7 @@ impl LocalChainIndex {
             catchup_interval: options.catchup_interval,
             catchup_cancel,
             network_upgrade_activations: options.network_upgrade_activations,
+            utxo_set_commitment_enabled: options.utxo_set_commitment_enabled,
         })
     }
 
@@ -681,6 +687,26 @@ impl ChainIndex for LocalChainIndex {
             Ok(zinder_core::TransparentUnspentOutputsByOutpointResponse {
                 chain_epoch,
                 entries,
+            })
+        })
+        .await
+    }
+
+    async fn transparent_utxo_set_summary(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
+        let commitment_enabled = self.utxo_set_commitment_enabled;
+        self.read_at_epoch(at_epoch_id, move |reader| {
+            let summary = reader
+                .transparent_utxo_set_summary(commitment_enabled)
+                .map_err(IndexerError::from_store_error)?;
+            Ok(TransparentUtxoSetSummaryView {
+                chain_epoch: summary.chain_epoch,
+                summarized_height: summary.summarized_height,
+                utxo_count: summary.utxo_count,
+                total_value_zat: summary.total_value_zat,
+                commitment: summary.commitment,
             })
         })
         .await
