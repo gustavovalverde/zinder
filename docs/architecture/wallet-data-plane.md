@@ -344,15 +344,16 @@ be truncated by a client that ignores pagination. The request consumes the share
 that accepts either a 32-byte `script_hash` (typed clients) or a base58
 transparent `address` (CLI, tests, debug callers); the native adapter parses
 string addresses through `ZebraTransparentAddress`, validates the network,
-and SHA-256-hashes the `scriptPubKey` before any in-process call. The Rust
-`ChainIndex` trait carries the same surface:
+and SHA-256-hashes the `scriptPubKey` before any in-process call. The request
+also carries the standard `optional uint64 at_epoch_id`: absent resolves
+against the live visible tip; present pins the unspent read to a specific
+chain epoch, so the stream is snapshot-consistent with the other canonical
+reads. The Rust `ChainIndex` trait carries the same surface:
 `transparent_address_unspent_outputs(query)` keyed by the typed
-`TransparentAddressScriptHash`. The in-process `WalletQueryApi` form keeps
-the standard `at_epoch_id: Option<ChainEpochId>` pin (the compat shim uses it
-to pin multi-address reads to one epoch); the wire request carries no epoch
-pin because the server always pins internally and no consumer pins old
-epochs. Capability `wallet.address.transparent_unspent_outputs_v1` is
-advertised on every deployment that can serve the read.
+`TransparentAddressScriptHash`, with `query.at_epoch_id:
+Option<ChainEpochId>` threading the pin. Capability
+`wallet.address.transparent_unspent_outputs_v1` is advertised on every
+deployment that can serve the read.
 
 Server streams hold the materialized unspent set for the stream lifetime,
 and a drained stream costs the client memory proportional to the address's

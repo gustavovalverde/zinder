@@ -468,6 +468,7 @@ impl ChainIndex for RemoteChainIndex {
                 )),
             }),
             start_height: query.start_height.value(),
+            at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
         };
         let response = self
             .client()

@@ -90,6 +90,7 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
             address_script_hash,
             start_height: BlockHeight::new(1),
+            at_epoch_id: None,
         })
         .await?;
     let mut utxo_items = Vec::new();

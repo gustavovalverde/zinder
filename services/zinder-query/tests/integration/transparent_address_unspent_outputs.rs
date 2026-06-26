@@ -10,7 +10,7 @@ use tonic::{Code, Request};
 use tonic_types::StatusExt;
 use zinder_core::{
     ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentUnspentOutput,
+    TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
 };
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
@@ -27,7 +27,10 @@ const SCRIPT_PUB_KEY: &[u8] = &[
     0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac,
 ];
 
-fn unspent_outputs_request(start_height: u32) -> wallet::TransparentAddressUnspentOutputsRequest {
+fn unspent_outputs_request(
+    start_height: u32,
+    at_epoch_id: Option<ChainEpochId>,
+) -> wallet::TransparentAddressUnspentOutputsRequest {
     wallet::TransparentAddressUnspentOutputsRequest {
         address: Some(AddressLookup {
             selector: Some(address_lookup::Selector::ScriptHash(
@@ -35,16 +38,18 @@ fn unspent_outputs_request(start_height: u32) -> wallet::TransparentAddressUnspe
             )),
         }),
         start_height,
+        at_epoch_id: at_epoch_id.map(ChainEpochId::value),
     }
 }
 
 async fn drain_unspent_outputs(
     grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
     start_height: u32,
+    at_epoch_id: Option<ChainEpochId>,
 ) -> eyre::Result<(wallet::ChainView, Vec<wallet::TransparentUnspentOutput>)> {
     let mut stream = WalletQueryService::transparent_address_unspent_outputs(
         grpc_adapter,
-        Request::new(unspent_outputs_request(start_height)),
+        Request::new(unspent_outputs_request(start_height, at_epoch_id)),
     )
     .await?
     .into_inner();
@@ -64,7 +69,7 @@ async fn transparent_address_unspent_outputs_streams_complete_set() -> eyre::Res
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let (header, outputs) = drain_unspent_outputs(&grpc_adapter, 0).await?;
+    let (header, outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
 
     assert_eq!(outputs.len(), stored_utxos.len());
     assert!(
@@ -89,7 +94,7 @@ async fn transparent_address_unspent_outputs_streams_past_the_old_page_cap() -> 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let (_header, outputs) = drain_unspent_outputs(&grpc_adapter, 0).await?;
+    let (_header, outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
 
     assert_eq!(
         outputs.len(),
@@ -109,10 +114,10 @@ async fn transparent_address_unspent_outputs_honors_start_height_floor() -> eyre
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 7).await?;
+    let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 7, None).await?;
     assert_eq!(at_mined_height.len(), stored_utxos.len());
 
-    let (_above_header, above_mined_height) = drain_unspent_outputs(&grpc_adapter, 8).await?;
+    let (_above_header, above_mined_height) = drain_unspent_outputs(&grpc_adapter, 8, None).await?;
     assert!(
         above_mined_height.is_empty(),
         "outputs mined below the wallet-birthday floor are excluded"
@@ -140,6 +145,7 @@ async fn transparent_address_unspent_outputs_rejects_invalid_address_selector() 
                 ))),
             }),
             start_height: 0,
+            at_epoch_id: None,
         }),
     )
     .await
@@ -156,6 +162,89 @@ async fn transparent_address_unspent_outputs_rejects_invalid_address_selector() 
             .any(|violation| violation.field == "address")),
         "expected a `address` field violation in BadRequest details"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_unspent_outputs_pinned_to_a_past_epoch_diverges_from_the_live_tip()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let funding_epoch = ChainEpochId::new(1);
+    commit_address_output_then_spend(&store, funding_epoch)?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+
+    let (live_header, live_outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
+    assert!(
+        live_outputs.is_empty(),
+        "at the live tip the funding output is already spent"
+    );
+
+    let (pinned_header, pinned_outputs) =
+        drain_unspent_outputs(&grpc_adapter, 0, Some(funding_epoch)).await?;
+    assert_eq!(
+        pinned_outputs.len(),
+        1,
+        "pinned to the funding epoch the output is still unspent"
+    );
+
+    let pinned_epoch = pinned_header
+        .chain_epoch
+        .ok_or_else(|| eyre!("the pinned header must carry its chain epoch"))?;
+    assert_eq!(pinned_epoch.chain_epoch_id, funding_epoch.value());
+    let live_epoch = live_header
+        .chain_epoch
+        .ok_or_else(|| eyre!("the live header must carry its chain epoch"))?;
+    assert_ne!(
+        pinned_epoch.chain_epoch_id, live_epoch.chain_epoch_id,
+        "the pin reads a different epoch than the live tip"
+    );
+
+    Ok(())
+}
+
+fn commit_address_output_then_spend(
+    store: &PrimaryChainStore,
+    funding_epoch: ChainEpochId,
+) -> eyre::Result<()> {
+    let (epoch_one, block_one, compact_one) = synthetic_chain_epoch(funding_epoch.value(), 1);
+    let (epoch_two, block_two, compact_two) = synthetic_chain_epoch(funding_epoch.value() + 1, 2);
+
+    let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
+    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x21; 32]), 0);
+    let output = TransparentOutputArtifact::new(
+        outpoint,
+        7_000_000,
+        SCRIPT_PUB_KEY.to_vec(),
+        address_script_hash,
+        block_one.height,
+        block_one.block_hash,
+    );
+
+    let spend = TransparentSpendFact::new(
+        outpoint,
+        0,
+        TransactionId::from_bytes([0x33; 32]),
+        0,
+        block_two.height,
+        block_two.block_hash,
+        output.value_zat,
+        address_script_hash,
+        output.block_height,
+        output.block_hash,
+    );
+
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_one, vec![block_one], vec![compact_one])
+            .with_transparent_outputs_by_outpoint(vec![output]),
+    )?;
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(epoch_two, vec![block_two], vec![compact_two])
+            .with_transparent_spend_facts(vec![spend]),
+    )?;
 
     Ok(())
 }

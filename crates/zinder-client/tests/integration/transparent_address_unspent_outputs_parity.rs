@@ -43,6 +43,7 @@ async fn local_and_remote_streams_return_identical_unspent_sets() -> eyre::Resul
     let query = TransparentAddressUnspentOutputsQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(0),
+        at_epoch_id: None,
     };
     let local_items = drain(
         fixtures
@@ -80,6 +81,7 @@ async fn local_and_remote_streams_honor_start_height_floor() -> eyre::Result<()>
     let query = TransparentAddressUnspentOutputsQuery {
         address_script_hash: fixtures.address_script_hash,
         start_height: BlockHeight::new(2),
+        at_epoch_id: None,
     };
     let local_items = drain(
         fixtures

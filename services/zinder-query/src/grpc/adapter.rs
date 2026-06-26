@@ -597,6 +597,7 @@ where
         request: Request<wallet::TransparentAddressUnspentOutputsRequest>,
     ) -> Result<Response<Self::TransparentAddressUnspentOutputsStream>, Status> {
         let request = request.into_inner();
+        let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
         let address_script_hash =
             address_lookup_to_script_hash(request.address, self.server_info_network()?)
                 .map_err(|error| status_from_query_error(&error))?;
@@ -604,10 +605,13 @@ where
             address_script_hash,
             start_height: BlockHeight::new(request.start_height),
         };
-        let response =
-            transparent_address_unspent_outputs_response(&self.query_api, typed_request, None)
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
+        let response = transparent_address_unspent_outputs_response(
+            &self.query_api,
+            typed_request,
+            at_epoch_id,
+        )
+        .await
+        .map_err(|error| status_from_query_error(&error))?;
         let header = Ok(build_transparent_unspent_outputs_header(
             response.chain_epoch,
         ));

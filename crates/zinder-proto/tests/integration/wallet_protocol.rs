@@ -422,6 +422,25 @@ fn transparent_unspent_outputs_chunk_item_round_trips_through_prost() -> eyre::R
 }
 
 #[test]
+fn transparent_address_unspent_outputs_request_round_trips_at_epoch_id() -> eyre::Result<()> {
+    let pinned = wallet::TransparentAddressUnspentOutputsRequest {
+        address: Some(wallet::AddressLookup {
+            selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![0xAB; 32])),
+        }),
+        start_height: 7,
+        at_epoch_id: Some(42),
+    };
+    assert_eq!(round_trip(&pinned)?.at_epoch_id, Some(42));
+
+    let live = wallet::TransparentAddressUnspentOutputsRequest {
+        at_epoch_id: None,
+        ..pinned
+    };
+    assert_eq!(round_trip(&live)?.at_epoch_id, None);
+    Ok(())
+}
+
+#[test]
 fn transparent_address_tx_ids_chunk_item_round_trips_through_prost() -> eyre::Result<()> {
     let item = wallet::TransparentAddressTxIdsChunk {
         body: Some(wallet::transparent_address_tx_ids_chunk::Body::Item(

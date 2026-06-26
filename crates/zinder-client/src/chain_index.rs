@@ -236,6 +236,9 @@ pub struct TransparentAddressUnspentOutputsQuery {
     pub address_script_hash: TransparentAddressScriptHash,
     /// Wallet-birthday floor: minimum mined height to include.
     pub start_height: BlockHeight,
+    /// Optional chain-epoch pin. `None` resolves against the live visible
+    /// tip; `Some(id)` pins the unspent read to that epoch.
+    pub at_epoch_id: Option<ChainEpochId>,
 }
 
 /// Stream of unspent transparent outputs returned by
@@ -630,6 +633,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// let query = TransparentAddressUnspentOutputsQuery {
     ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
     ///     start_height: BlockHeight::new(0),
+    ///     at_epoch_id: None,
     /// };
     /// let stream = client.transparent_address_unspent_outputs(query).await?;
     /// # let _ = stream; Ok(()) }

@@ -463,23 +463,18 @@ impl ChainIndex for LocalChainIndex {
         &self,
         query: TransparentAddressUnspentOutputsQuery,
     ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
-        let store = self.store.clone();
-        let (chain_epoch, outputs) = join_blocking(tokio::task::spawn_blocking(move || {
-            store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
-            let page = store
-                .address_output_index_page(AddressOutputIndexPageRequest {
-                    at_epoch: None,
-                    address_script_hash: query.address_script_hash,
-                    start_height: query.start_height,
-                    max_entries: NonZeroU32::MAX,
-                    from_cursor: None,
-                })
-                .map_err(IndexerError::from_store_error)?;
-            Ok((page.chain_epoch, page.outputs))
-        }))
-        .await?;
+        let (chain_epoch, outputs) = self
+            .read_at_epoch(query.at_epoch_id, move |reader| {
+                let outputs = reader
+                    .address_output_index(
+                        query.address_script_hash,
+                        query.start_height,
+                        NonZeroU32::MAX,
+                    )
+                    .map_err(IndexerError::from_store_error)?;
+                Ok((reader.chain_epoch(), outputs))
+            })
+            .await?;
         let items = outputs.into_iter().map(move |output| {
             Ok(TransparentUnspentOutputStreamItem {
                 chain_epoch,

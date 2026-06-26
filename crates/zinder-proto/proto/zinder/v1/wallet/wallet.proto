@@ -1256,6 +1256,10 @@ message TransparentAddressUnspentOutputsRequest {
   // Wallet-birthday floor: minimum mined height to include. 0 means
   // scan from genesis.
   uint32 start_height = 2;
+
+  // Optional chain-epoch id that pins the read to a specific `ChainEpoch`.
+  // Absent resolves against the live visible tip.
+  optional uint64 at_epoch_id = 3;
 }
 
 // One unspent transparent output streamed by

@@ -142,6 +142,7 @@ async fn snapshot_utxos(
         .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
             address_script_hash: script_hash,
             start_height: BlockHeight::new(0),
+            at_epoch_id: None,
         })
         .await?;
     while let Some(unspent_item) = unspent_outputs.next().await {
