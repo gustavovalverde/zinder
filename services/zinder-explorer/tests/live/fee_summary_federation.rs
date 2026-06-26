@@ -25,7 +25,10 @@ use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{
     DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
 };
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
+use zinder_ingest::{
+    DeriveReplayPolicy, IngestControlGrpcAdapter, IngestDeriveConfig, MempoolIndex,
+    catch_up_derive_store_to_canonical, open_primary_derive_store_for_canonical, run_bulk_catchup,
+};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
     FeeSummaryRequest, FeeSummaryResponse,
@@ -275,7 +278,29 @@ async fn bulk_catchup_store(
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let derive_primary = open_primary_derive_store_for_canonical(
+        &storage_path,
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    catch_up_derive_store_to_canonical(&store, &derive_primary, derive_replay_config()?).await?;
+    drop(derive_primary);
     Ok((tempdir, store, tip_height))
+}
+
+/// Builds the one-shot derive replay configuration used to populate the
+/// derive primary before the explorer attaches its secondary reader.
+fn derive_replay_config() -> Result<IngestDeriveConfig> {
+    Ok(IngestDeriveConfig {
+        replay_batch_blocks: NonZeroU32::new(500)
+            .ok_or_else(|| eyre!("invalid derive replay batch"))?,
+        min_replay_batch_blocks: NonZeroU32::new(10)
+            .ok_or_else(|| eyre!("invalid minimum derive replay batch"))?,
+        replay_policy: DeriveReplayPolicy::Continuous,
+        memory_budget_bytes: None,
+        memory_degrade_ratio: 0.85,
+        memory_pause_ratio: 0.95,
+        memory_resume_ratio: 0.75,
+    })
 }
 
 async fn serve_wallet_query_grpc(

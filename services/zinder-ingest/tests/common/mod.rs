@@ -646,7 +646,7 @@ async fn assert_native_wallet_grpc_responses(
             .as_ref()
             .ok_or_else(|| eyre!("native gRPC compact-block chunk missing compact block"))?;
         assert_eq!(compact_block.height, start_height + offset);
-        assert_eq!(compact_block.block_hash.len(), 32);
+        assert_eq!(compact_block.block_hash.len(), 64);
         assert!(!compact_block.payload_bytes.is_empty());
     }
     assert_eq!(tree_state.height, end_height);

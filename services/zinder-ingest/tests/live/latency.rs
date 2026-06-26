@@ -90,9 +90,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     assert!(!range.compact_blocks.is_empty());
 
     let measurement_start = std::time::Instant::now();
-    let _tree = wallet_query
-        .tree_state_at(BlockHeight::new(1), None)
-        .await?;
+    let _tree = wallet_query.tree_state_at(tip_height, None).await?;
     let tree_state_at_micros = measurement_start.elapsed().as_micros();
 
     // Pick a real txid from the bulk-caught-up chain by reading the coinbase at

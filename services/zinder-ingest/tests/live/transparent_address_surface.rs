@@ -34,7 +34,10 @@ use zinder_core::{
     BlockHash, BlockHeight, Network, NetworkUpgradeActivations, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
 };
-use zinder_ingest::run_bulk_catchup;
+use zinder_ingest::{
+    DeriveReplayPolicy, IngestDeriveConfig, catch_up_derive_store_to_canonical,
+    open_primary_derive_store_for_canonical, run_bulk_catchup,
+};
 use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQuery,
     WalletQueryApi,
@@ -70,8 +73,21 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     let network = env.network();
     let (storage_path_owner, store, sample, activations) =
         bulk_catchup_and_sample_tip_coinbase(&env).await?;
-    let _storage_path_owner = storage_path_owner;
-    let wallet_query = WalletQuery::new(store, (), activations);
+    let storage_path = storage_path_owner.path().join("zinder-store");
+    let derive_secondary = zinder_derive::DeriveStore::open_secondary(
+        zinder_derive::DeriveStore::path_for_canonical(&storage_path),
+        storage_path_owner
+            .path()
+            .join("zinder-derive-secondary-history"),
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumer_column_families: zinder_derive::DeriveStore::bundled_consumer_column_families(
+            ),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    derive_secondary.try_catch_up()?;
+    let wallet_query = WalletQuery::new(store, (), activations).with_derive_store(derive_secondary);
 
     assert_utxo_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_round_trip(&wallet_query, &sample).await?;
@@ -143,7 +159,30 @@ async fn bulk_catchup_and_sample_tip_coinbase(
     let sample = sample_first_coinbase_output(&block_at_tip, from_height, tip_height)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let derive_primary = open_primary_derive_store_for_canonical(
+        &storage_path,
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    catch_up_derive_store_to_canonical(&store, &derive_primary, derive_replay_config()?).await?;
+    drop(derive_primary);
     Ok((tempdir, store, sample, activations))
+}
+
+/// Builds the one-shot derive replay configuration used to populate the
+/// derive primary before the transparent-history reader attaches its
+/// secondary.
+fn derive_replay_config() -> Result<IngestDeriveConfig> {
+    Ok(IngestDeriveConfig {
+        replay_batch_blocks: NonZeroU32::new(500)
+            .ok_or_else(|| eyre!("invalid derive replay batch"))?,
+        min_replay_batch_blocks: NonZeroU32::new(10)
+            .ok_or_else(|| eyre!("invalid minimum derive replay batch"))?,
+        replay_policy: DeriveReplayPolicy::Continuous,
+        memory_budget_bytes: None,
+        memory_degrade_ratio: 0.85,
+        memory_pause_ratio: 0.95,
+        memory_resume_ratio: 0.75,
+    })
 }
 
 fn sample_first_coinbase_output(
