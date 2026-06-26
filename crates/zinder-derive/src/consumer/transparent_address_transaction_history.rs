@@ -316,7 +316,7 @@ fn start_key_for_request(
         } else {
             request.start_height
         },
-        0,
+        if request.descending { u32::MAX } else { 0 },
         request.descending,
     ))
 }
@@ -331,7 +331,7 @@ fn end_key_for_request(
         } else {
             request.end_height
         },
-        u32::MAX,
+        if request.descending { 0 } else { u32::MAX },
         request.descending,
     )
 }
@@ -690,6 +690,114 @@ mod tests {
         assert_eq!(spend_row.transaction_id, transaction_id(20));
         assert_eq!(spend_row.block_hash, block_hash(5));
         assert_eq!(spend_row.tx_index_in_block, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn descending_page_keeps_both_range_boundaries()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransparentAddressTransactionHistoryConsumer::new();
+
+        apply_block(&store, &mut consumer, &receive_block())?;
+        apply_block(&store, &mut consumer, &spend_block())?;
+
+        let read = |descending| {
+            TransparentAddressTransactionHistoryConsumer::read_page(
+                &store,
+                TransparentAddressTransactionHistoryPageRequest {
+                    address_script_hash: WATCHED_ADDRESS,
+                    start_height: RECEIVE_HEIGHT,
+                    end_height: SPEND_HEIGHT,
+                    max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
+                    from_cursor: None,
+                    descending,
+                },
+            )
+        };
+
+        let ascending = read(false)?;
+        let descending = read(true)?;
+
+        assert_eq!(ascending.artifacts.len(), 2);
+        assert_eq!(descending.artifacts.len(), 2);
+        for height in [RECEIVE_HEIGHT, SPEND_HEIGHT] {
+            assert!(
+                descending
+                    .artifacts
+                    .iter()
+                    .any(|row| row.block_height == height),
+                "descending page must include the boundary row at height {height:?}"
+            );
+        }
+        Ok(())
+    }
+
+    const MULTI_RECEIVE_HEIGHT: BlockHeight = BlockHeight::new(110);
+
+    fn multi_receive_block() -> BlockCommitContext {
+        let first = TransactionFactsArtifact::new(
+            TransactionLocation::new(transaction_id(30), MULTI_RECEIVE_HEIGHT, block_hash(7), 0),
+            public_facts(30),
+        )
+        .with_transparent_facts(
+            Vec::new(),
+            vec![TransparentOutputFact::new(
+                0,
+                5_000,
+                vec![1, 2, 3],
+                WATCHED_ADDRESS,
+            )],
+        );
+        let second = TransactionFactsArtifact::new(
+            TransactionLocation::new(transaction_id(31), MULTI_RECEIVE_HEIGHT, block_hash(7), 1),
+            public_facts(31),
+        )
+        .with_transparent_facts(
+            Vec::new(),
+            vec![TransparentOutputFact::new(
+                0,
+                6_000,
+                vec![4, 5, 6],
+                WATCHED_ADDRESS,
+            )],
+        );
+        BlockCommitContext::new(
+            BlockCommitPayload {
+                height: MULTI_RECEIVE_HEIGHT,
+                block_hash: block_hash(7),
+                previous_block_hash: block_hash(6),
+                block_time_unix_seconds: 1_700_001_000,
+                block_size_bytes: 0,
+                transactions: vec![first, second],
+            },
+            TransparentSpendFacts::Offline,
+        )
+    }
+
+    #[test]
+    fn descending_page_keeps_every_transaction_within_a_block()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransparentAddressTransactionHistoryConsumer::new();
+
+        apply_block(&store, &mut consumer, &multi_receive_block())?;
+
+        let page = TransparentAddressTransactionHistoryConsumer::read_page(
+            &store,
+            TransparentAddressTransactionHistoryPageRequest {
+                address_script_hash: WATCHED_ADDRESS,
+                start_height: MULTI_RECEIVE_HEIGHT,
+                end_height: MULTI_RECEIVE_HEIGHT,
+                max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
+                from_cursor: None,
+                descending: true,
+            },
+        )?;
+
+        assert_eq!(page.artifacts.len(), 2);
+        assert_eq!(page.artifacts[0].tx_index_in_block, 1);
+        assert_eq!(page.artifacts[1].tx_index_in_block, 0);
         Ok(())
     }
 }
