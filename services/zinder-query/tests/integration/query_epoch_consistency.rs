@@ -291,6 +291,15 @@ impl ChainEpochReadApi for CommitAfterReaderReadApi {
         self.store.chain_event_history(request)
     }
 
+    fn resolve_chain_event_stream_start(
+        &self,
+        start: &zinder_store::EventStreamStartPosition,
+        requested_family: zinder_store::ChainEventStreamFamily,
+    ) -> Result<zinder_store::ChainEventStreamResume, StoreError> {
+        self.store
+            .resolve_chain_event_stream_start(start, requested_family)
+    }
+
     fn address_output_index_page(
         &self,
         request: zinder_store::AddressOutputIndexPageRequest<'_>,

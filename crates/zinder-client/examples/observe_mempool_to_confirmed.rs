@@ -38,8 +38,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    EndpointBackedIndex, IndexerError, MempoolEvent, Network, RemoteChainIndex, RemoteOpenOptions,
-    RetryPolicy, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutputsRequest,
+    EndpointBackedIndex, EventStreamStart, IndexerError, MempoolEvent, Network, RemoteChainIndex,
+    RemoteOpenOptions, RetryPolicy, TransactionId, TransparentAddressScriptHash,
+    TransparentMempoolOutputsRequest,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -146,7 +147,9 @@ async fn subscribe_mempool_events(
     initial_watched: HashSet<TransactionId>,
     script_hash: TransparentAddressScriptHash,
 ) -> Result<(), IndexerError> {
-    let mut events = chain_index.mempool_events(None).await?;
+    let mut events = chain_index
+        .mempool_events(EventStreamStart::EarliestRetained)
+        .await?;
     let mut watched = initial_watched;
     println!(
         "subscribed to mempool events; tracking {} transactions",

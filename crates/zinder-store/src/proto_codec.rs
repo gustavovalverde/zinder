@@ -17,7 +17,8 @@ use zinder_proto::v1::wallet;
 
 use crate::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventStreamFamily,
-    ChainRangeReverted, MempoolEvent, MempoolEventEnvelope, StreamCursorTokenV1,
+    ChainRangeReverted, EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope,
+    MempoolEventStreamFamily, StreamCursorTokenV1,
 };
 
 /// Error returned when a store chain event cannot be represented on the v1 wallet proto.
@@ -240,6 +241,63 @@ pub fn chain_event_stream_family_from_message(family: i32) -> Option<ChainEventS
         Ok(wallet::ChainEventStreamFamily::Tip) => Some(ChainEventStreamFamily::Tip),
         Ok(wallet::ChainEventStreamFamily::Safe) => Some(ChainEventStreamFamily::Safe),
         Err(_) => None,
+    }
+}
+
+/// Decodes the mempool-event stream family carried by a request message.
+///
+/// `Unspecified` resolves to the single `Mempool` family; unknown integers
+/// return `None` and map to `INVALID_ARGUMENT` at the transport boundary.
+#[must_use]
+pub fn mempool_event_stream_family_from_message(family: i32) -> Option<MempoolEventStreamFamily> {
+    match wallet::MempoolEventStreamFamily::try_from(family) {
+        Ok(
+            wallet::MempoolEventStreamFamily::Unspecified
+            | wallet::MempoolEventStreamFamily::Mempool,
+        ) => Some(MempoolEventStreamFamily::Mempool),
+        Err(_) => None,
+    }
+}
+
+/// Decodes the wire `EventStreamStart` into the typed start position.
+///
+/// Returns `None` when the message or its `position` oneof is unset, and
+/// when `after_cursor` carries empty bytes; callers map `None` to
+/// `INVALID_ARGUMENT` at the transport boundary.
+#[must_use]
+pub fn event_stream_start_from_message(
+    start: Option<wallet::EventStreamStart>,
+) -> Option<EventStreamStartPosition> {
+    match start?.position? {
+        wallet::event_stream_start::Position::AfterCursor(cursor_bytes) => {
+            stream_cursor_from_message_bytes(cursor_bytes)
+                .map(EventStreamStartPosition::AfterCursor)
+        }
+        wallet::event_stream_start::Position::EarliestRetained(_) => {
+            Some(EventStreamStartPosition::EarliestRetained)
+        }
+        wallet::event_stream_start::Position::LiveTail(_) => {
+            Some(EventStreamStartPosition::LiveTail)
+        }
+    }
+}
+
+/// Encodes a typed start position into the wire `EventStreamStart` message.
+#[must_use]
+pub fn event_stream_start_message(start: &EventStreamStartPosition) -> wallet::EventStreamStart {
+    let position = match start {
+        EventStreamStartPosition::AfterCursor(cursor) => {
+            wallet::event_stream_start::Position::AfterCursor(cursor.as_bytes().to_vec())
+        }
+        EventStreamStartPosition::EarliestRetained => {
+            wallet::event_stream_start::Position::EarliestRetained(wallet::EarliestRetained {})
+        }
+        EventStreamStartPosition::LiveTail => {
+            wallet::event_stream_start::Position::LiveTail(wallet::LiveTail {})
+        }
+    };
+    wallet::EventStreamStart {
+        position: Some(position),
     }
 }
 

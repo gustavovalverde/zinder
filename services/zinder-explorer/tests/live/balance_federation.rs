@@ -750,7 +750,13 @@ fn hydrate_and_apply_pending_spend(
         },
         visible_chain_epoch,
     )?;
-    let outcome = mempool_index.apply_added(entry.clone());
+    let outcome = mempool_index.apply_added(
+        entry.clone(),
+        zinder_store::MempoolEventPosition {
+            event_sequence: 1,
+            transaction_id: broadcast_txid,
+        },
+    );
     if !matches!(outcome, MempoolApplyOutcome::Applied) {
         return Err(eyre!(
             "MempoolIndex::apply_added returned {outcome:?} for fresh broadcast txid"

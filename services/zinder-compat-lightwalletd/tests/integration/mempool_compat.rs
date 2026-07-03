@@ -225,6 +225,72 @@ async fn lightwalletd_get_mempool_stream_starts_after_retained_tail() -> eyre::R
     Ok(())
 }
 
+/// `GetMempoolStream` streams the snapshot walk's contents first.
+///
+/// Live events follow strictly after the walk's resume anchor; the retained
+/// events behind the anchor are not re-delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_events()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry(0x10, synthetic_chain_epoch()),
+        synthetic_entry(0x20, synthetic_chain_epoch()),
+    ])
+    .with_snapshot_page_size(1);
+    let control = surface.event_control();
+    control.append_retained_event(MempoolEvent::Added {
+        entry: synthetic_entry(0x10, synthetic_chain_epoch()),
+    })?;
+    control.append_retained_event(MempoolEvent::Added {
+        entry: synthetic_entry(0x20, synthetic_chain_epoch()),
+    })?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_mempool_surface(Arc::new(surface));
+
+    let mut response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    let first_raw = response_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected first snapshot raw transaction"))??;
+    assert_eq!(first_raw.data, vec![0x10; 16]);
+    let second_raw = response_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected second snapshot raw transaction"))??;
+    assert_eq!(second_raw.data, vec![0x20; 16]);
+
+    control.push_event(MempoolEvent::Added {
+        entry: synthetic_entry(0x30, synthetic_chain_epoch()),
+    })?;
+    let live_raw = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected live raw transaction after the snapshot contents"))??;
+    assert_eq!(live_raw.data, vec![0x30; 16]);
+
+    let no_more = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        response_stream.next(),
+    )
+    .await;
+    assert!(
+        no_more.is_err(),
+        "retained events behind the anchor must not replay; got {no_more:?}"
+    );
+    Ok(())
+}
+
 fn synthetic_chain_epoch() -> ChainEpoch {
     ChainEpoch {
         id: ChainEpochId::new(7),
@@ -515,8 +581,13 @@ impl MempoolSurface for ScriptedMempoolSurface {
         } else {
             None
         };
+        let events_resume_cursor = self
+            .retained_events
+            .lock()
+            .last()
+            .map(|envelope| envelope.cursor.clone());
         Ok(MempoolSnapshotPage {
-            snapshot_sequence: *self.event_sequence.lock(),
+            events_resume_cursor,
             entries: page_entries,
             next_cursor,
         })
@@ -524,10 +595,25 @@ impl MempoolSurface for ScriptedMempoolSurface {
 
     async fn mempool_events(
         &self,
-        _from_cursor: Option<StreamCursorTokenV1>,
+        from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
+        let resume_after_sequence = match from_cursor {
+            Some(cursor) => {
+                cursor
+                    .decode_mempool_event(Network::ZcashRegtest, [9; 32])
+                    .map_err(|_| MempoolSurfaceError::CursorInvalid)?
+                    .event_sequence
+            }
+            None => 0,
+        };
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        for envelope in self.retained_events.lock().iter().cloned() {
+        for envelope in self
+            .retained_events
+            .lock()
+            .iter()
+            .filter(|envelope| envelope.event_sequence > resume_after_sequence)
+            .cloned()
+        {
             if event_sender.send(Ok(envelope)).is_err() {
                 return Err(MempoolSurfaceError::Unavailable {
                     reason: "scripted retained mempool event receiver dropped".to_owned(),

@@ -693,14 +693,43 @@ enum ChainEventStreamFamily {
   CHAIN_EVENT_STREAM_FAMILY_SAFE = 1;
 }
 
+// Marker for the earliest-retained start position of an event stream.
+message EarliestRetained {}
+
+// Marker for the live-tail start position of an event stream.
+message LiveTail {}
+
+// Explicit start position shared by every replayable event-stream request.
+message EventStreamStart {
+  // Required start position; an unset oneof is rejected with
+  // `INVALID_ARGUMENT`.
+  oneof position {
+    // Resumes strictly after this opaque cursor. The cursor's encoded
+    // family is authoritative: the request's family field must be
+    // unset/default or match it, and a mismatch is rejected with
+    // `INVALID_ARGUMENT`.
+    bytes after_cursor = 1;
+
+    // Replays from the earliest retained event, resolved within the
+    // request's family field.
+    EarliestRetained earliest_retained = 2;
+
+    // Resolves once at subscribe time to the current stream head for the
+    // request's family field, delivering only events applied after
+    // subscription.
+    LiveTail live_tail = 3;
+  }
+}
+
 // Replayable chain-event stream request.
 message ChainEventsRequest {
-  // Empty starts at the earliest retained event. Non-empty resumes strictly
-  // after the supplied opaque cursor.
-  bytes from_cursor = 1;
+  // Required start position. `after_cursor` carries the opaque cursor
+  // bytes from a previously delivered envelope.
+  EventStreamStart start = 1;
 
-  // Stream family for an empty cursor. When from_cursor is non-empty, the
-  // cursor's encoded family is authoritative.
+  // Stream family for the `earliest_retained` and `live_tail` start
+  // positions. With `after_cursor`, the cursor's encoded family is
+  // authoritative and this field must be unset/default or match it.
   ChainEventStreamFamily family = 2;
 
   // Address-invalidation filter. Empty disables filtering.
@@ -923,8 +952,11 @@ message MempoolSnapshotResponse {
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   ChainView chain_view = 1;
 
-  // Monotonic snapshot sequence reported by the server.
-  uint64 snapshot_sequence = 2;
+  // Opaque `MempoolEvents` `after_cursor` value anchored at the moment the
+  // snapshot walk began. Identical on every page of one paged walk.
+  // Replaying from it yields at-least-once delivery; consumers apply
+  // events idempotently.
+  bytes events_resume_cursor = 2;
 
   // Snapshot age in milliseconds when the response was constructed.
   uint64 snapshot_age_millis = 3;
@@ -1145,12 +1177,13 @@ enum MempoolEventStreamFamily {
 
 // Replayable mempool-event stream request.
 message MempoolEventsRequest {
-  // Empty starts at the earliest retained mempool event. Non-empty resumes
-  // strictly after the supplied opaque cursor.
-  bytes from_cursor = 1;
+  // Required start position. `after_cursor` carries the opaque cursor
+  // bytes from a previously delivered envelope.
+  EventStreamStart start = 1;
 
-  // Stream family for an empty cursor. When from_cursor is non-empty, the
-  // cursor's encoded family is authoritative.
+  // Stream family for the `earliest_retained` and `live_tail` start
+  // positions. With `after_cursor`, the cursor's encoded family is
+  // authoritative and this field must be unset/default or match it.
   MempoolEventStreamFamily family = 2;
 }
 

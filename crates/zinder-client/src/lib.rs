@@ -12,10 +12,10 @@ mod remote;
 
 pub use chain_index::{
     ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventStream,
-    ChainIndex, ChainRangeReverted, EndpointBackedIndex, IndexStream, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
+    ChainIndex, ChainRangeReverted, EndpointBackedIndex, EventStreamStart, IndexStream,
+    MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
+    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
     TransparentHistoryCursor, TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
 };

@@ -14,8 +14,9 @@ use zinder_core::{
     TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainStoreOptions, MempoolEvent, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
-    PrimaryChainStore, StoreError, StreamCursorTokenV1,
+    ChainStoreOptions, EventStreamStartPosition, MempoolEvent, MempoolEventHistoryRequest,
+    MempoolEventPosition, MempoolEventRetentionConfig, PrimaryChainStore, StoreError,
+    StreamCursorTokenV1,
 };
 
 /// Round-trip: appending three mempool events and reading them back without
@@ -160,19 +161,32 @@ fn mempool_event_history_resume_from_latest_event_is_empty() -> eyre::Result<()>
     Ok(())
 }
 
-/// A snapshot-page cursor at the current snapshot sequence is valid; a cursor
-/// for a newer snapshot is rejected as expired.
+/// A snapshot-page cursor anchored at the current applied sequence is valid.
+///
+/// A cursor anchored ahead of it is rejected as expired. The decoded payload
+/// carries the anchor pair so every page re-mints one identical
+/// events-resume cursor.
 #[test]
 fn snapshot_page_cursor_at_current_is_valid_and_future_is_expired() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = open_store(tempdir.path())?;
     let after = TransactionId::from_bytes([0xA0; 32]);
+    let anchor = MempoolEventPosition {
+        event_sequence: 5,
+        transaction_id: TransactionId::from_bytes([0xA5; 32]),
+    };
 
-    let at_current = store.encode_snapshot_page_cursor(5, after)?;
+    let at_current = store.encode_snapshot_page_cursor(Some(anchor), after)?;
     let payload = store.decode_snapshot_page_cursor(&at_current, 5)?;
-    assert_eq!(payload.snapshot_sequence, 5);
+    assert_eq!(payload.anchor_event_sequence, 5);
+    assert_eq!(payload.anchor_transaction_id, anchor.transaction_id);
+    assert_eq!(payload.after_transaction_id, after);
 
-    let future = store.encode_snapshot_page_cursor(6, after)?;
+    let future_anchor = MempoolEventPosition {
+        event_sequence: 6,
+        ..anchor
+    };
+    let future = store.encode_snapshot_page_cursor(Some(future_anchor), after)?;
     let error = match store.decode_snapshot_page_cursor(&future, 5) {
         Ok(payload) => return Err(eyre!("expected expired cursor, got {payload:?}")),
         Err(error) => error,
@@ -181,6 +195,85 @@ fn snapshot_page_cursor_at_current_is_valid_and_future_is_expired() -> eyre::Res
         error,
         StoreError::SnapshotPageCursorExpired { .. }
     ));
+    Ok(())
+}
+
+/// The events-resume cursor minted from an anchor is byte-identical to the
+/// cursor carried by the anchor event's envelope.
+#[test]
+fn events_resume_cursor_matches_anchor_envelope_cursor() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+    let chain_epoch = synthetic_chain_epoch(1);
+
+    let envelope = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA0, chain_epoch),
+        },
+        UnixTimestampMillis::new(1_000),
+    )?;
+
+    let minted = store.encode_mempool_events_resume_cursor(envelope.position())?;
+    assert_eq!(minted, envelope.cursor);
+    Ok(())
+}
+
+/// `LiveTail` resolves to the newest retained envelope's own cursor: events
+/// already in the log are skipped and a later append is the first event
+/// delivered after it.
+#[test]
+fn mempool_live_tail_start_skips_prior_events_and_delivers_later_appends() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+    let chain_epoch = synthetic_chain_epoch(1);
+
+    let _first = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA0, chain_epoch),
+        },
+        UnixTimestampMillis::new(1_000),
+    )?;
+    let second = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA1, chain_epoch),
+        },
+        UnixTimestampMillis::new(2_000),
+    )?;
+
+    let head_cursor = store
+        .resolve_mempool_event_stream_start(&EventStreamStartPosition::LiveTail)?
+        .ok_or_else(|| eyre!("live tail on a non-empty log must resolve to a cursor"))?;
+    assert_eq!(head_cursor, second.cursor);
+
+    let quiet_page = store.mempool_event_history(
+        MempoolEventHistoryRequest::with_default_limit(Some(&head_cursor)),
+    )?;
+    assert!(quiet_page.is_empty());
+
+    let third = store.append_mempool_event(
+        MempoolEvent::Added {
+            entry: synthetic_entry(0xA2, chain_epoch),
+        },
+        UnixTimestampMillis::new(3_000),
+    )?;
+    let delivered = store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(
+        Some(&head_cursor),
+    ))?;
+    assert_eq!(delivered, vec![third]);
+
+    Ok(())
+}
+
+/// `LiveTail` on an empty mempool-event log degrades to the retention floor.
+#[test]
+fn mempool_live_tail_start_on_empty_log_starts_at_earliest_retained() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = open_store(tempdir.path())?;
+
+    let resolved = store.resolve_mempool_event_stream_start(&EventStreamStartPosition::LiveTail)?;
+
+    assert_eq!(resolved, None);
+
     Ok(())
 }
 

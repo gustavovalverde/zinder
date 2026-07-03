@@ -26,8 +26,9 @@ use zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1;
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
-    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, StoreError, StreamCursorTokenV1,
+    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, StoreError,
+    StreamCursorTokenV1,
 };
 
 mod grpc;
@@ -276,6 +277,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         from_cursor: Option<StreamCursorTokenV1>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError>;
+
+    /// Resolves an event-stream start position for the chain-event family
+    /// once at subscribe time.
+    async fn resolve_chain_events_start(
+        &self,
+        start: EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, QueryError>;
 
     /// Broadcasts a raw transaction without mutating canonical storage.
     async fn broadcast_transaction(
@@ -1307,6 +1316,20 @@ where
         .await;
         record_wallet_query_outcome("chain_events", started_at, &query_outcome, None);
         query_outcome
+    }
+
+    async fn resolve_chain_events_start(
+        &self,
+        start: EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, QueryError> {
+        let read_api = self.read_api.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            read_api
+                .resolve_chain_event_stream_start(&start, requested_family)
+                .map_err(map_chain_event_store_error)
+        }))
+        .await
     }
 
     async fn broadcast_transaction(

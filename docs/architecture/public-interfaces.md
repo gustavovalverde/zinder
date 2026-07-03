@@ -202,9 +202,9 @@ Methods that return the artifact at the visible tip with no caller-supplied key:
 
 Methods that return a server-streaming subscription with cursor resume:
 
-- `{event_kind}_events(from_cursor)` returning `impl Stream<Item = Result<{EventKind}Envelope, _>>`.
-- Example: `chain_events(from_cursor)`, `mempool_events(from_cursor)`, future `derive_events(from_cursor)`.
-- The request field carrying the cursor is always `from_cursor` (see Cursor Conventions below).
+- `{event_kind}_events(start)` returning `impl Stream<Item = Result<{EventKind}Envelope, _>>`.
+- Example: `chain_events(start)`, `mempool_events(start)`, future `derive_events(start)`.
+- `start` is the required `EventStreamStart` position (`after_cursor` | `earliest_retained` | `live_tail`, [ADR-0027](../adrs/0027-event-stream-start-positions.md)); an unset position is `INVALID_ARGUMENT`. Cursor-paged history reads keep `from_cursor` (see Cursor Conventions below).
 - The envelope field carrying the cursor position is always `cursor`.
 
 ### Rule 4a — Current-projection streams use a one-shot header
@@ -257,9 +257,9 @@ Cursors are opaque to clients, fork-aware on the server, and authenticated where
 - `family`: the `ChainEventStreamFamily` nibble at byte offset 49 (`Tip`, `Safe`; `Mempool` is a reserved family code).
 - a 32-byte HMAC over the whole body so a tampered cursor (including a tampered locator entry) returns `EventCursorInvalid` rather than serving wrong data.
 
-The chain-event cursor is variable-length because the locator grows with its entry count; the mempool-event, transparent-history, address-output, and snapshot-page families keep a fixed-length body of `STREAM_CURSOR_TOKEN_V1_LEN` bytes. Hash bytes inside the cursor are storage-internal byte order (ADR-0024); the cursor is server-internal material, distinct from the RPC-byte-order hashes on the wire.
+The chain-event cursor is variable-length because the locator grows with its entry count; the mempool-event, transparent-history, and address-output families keep a fixed-length body of `STREAM_CURSOR_TOKEN_V1_LEN` bytes, and the snapshot-page family is fixed-length with a 32-byte anchor transaction id between the fixed body and the auth tag. Hash bytes inside the cursor are storage-internal byte order (ADR-0024); the cursor is server-internal material, distinct from the RPC-byte-order hashes on the wire.
 
-Every cursor family is the same `StreamCursorTokenV1` envelope distinguished by the family nibble at byte offset 49: `Tip`/`Safe` (chain events), `Mempool` (mempool events, `0x2`), `TransparentHistory` (`0x3`, with the iteration-direction bit in the flags high nibble), `AddressOutput` (`0x4`), and `SnapshotPage` (`0x5`). The `SnapshotPage` family bookmarks one `MempoolSnapshot` paging walk; its body carries the snapshot sequence the page belongs to plus the last yielded transaction id, and it shares the same HMAC authentication as every other family. There is no separate, unauthenticated snapshot-cursor codec: a tampered snapshot cursor fails the HMAC and returns `SNAPSHOT_PAGE_CURSOR_INVALID`, and a cursor naming a snapshot newer than the writer currently serves returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
+Every cursor family is the same `StreamCursorTokenV1` envelope distinguished by the family nibble at byte offset 49: `Tip`/`Safe` (chain events), `Mempool` (mempool events, `0x2`), `TransparentHistory` (`0x3`, with the iteration-direction bit in the flags high nibble), `AddressOutput` (`0x4`), and `SnapshotPage` (`0x5`). The `SnapshotPage` family bookmarks one `MempoolSnapshot` paging walk; its body carries the walk's mempool-event anchor (event sequence plus anchor transaction id, from which every page re-mints the identical `events_resume_cursor`) plus the last yielded transaction id, and it shares the same HMAC authentication as every other family. There is no separate, unauthenticated snapshot-cursor codec: a tampered snapshot cursor fails the HMAC and returns `SNAPSHOT_PAGE_CURSOR_INVALID`, and a cursor anchored ahead of the mempool-event sequence the writer has applied returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
 
 On reconnect the server resolves the fork point as the most recent locator entry whose hash equals the canonical block hash at that height. The block index outlives the pruned event-log window, so the fork point resolves even when the divergence base is no longer in retained history. If the cursor's branch was reorged out and the real reorg event was pruned, the server delivers a synthetic `ChainReorged` envelope describing the divergence before resuming; clients never see "silent" branch changes. A divergence deeper than the cap, or an unresolvable fork-point block, degrades to `EventCursorExpired` with re-derive guidance. The `Safe` family never receives a synthesized reorg. See [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md).
 
@@ -267,7 +267,8 @@ The mempool-event family uses the `family = Mempool` cursor-family code with mem
 
 ### Field naming
 
-- Request resume field: always `from_cursor: bytes` (proto) or `from_cursor: Option<&[u8]>` (Rust). Never `start_cursor`, `cursor`, `since`, or `after`.
+- Event-stream subscription start: always `start: EventStreamStart` (proto) whose `after_cursor` arm carries the resume bytes ([ADR-0027](../adrs/0027-event-stream-start-positions.md)). The store-side mirror is `EventStreamStartPosition`.
+- Paged-read resume field: always `from_cursor: bytes` (proto) or `from_cursor: Option<&StreamCursorTokenV1>` (Rust). Never `start_cursor`, `cursor`, `since`, or `after`.
 - Envelope position field: always `cursor: bytes`. Never `next_cursor`, `position`, or `token`.
 - Cursor-related errors: always `{Stream}CursorExpired` and `{Stream}CursorInvalid`. Examples: `EventCursorExpired`, `MempoolCursorExpired`.
 
@@ -633,19 +634,26 @@ Every public gRPC service exposes a `ServerInfo` RPC that returns a `ServerCapab
 
 ### Descriptor shape
 
+The cross-service descriptor is `zinder.v1.ops.ServerInfo`; per-service descriptors (`WalletServerInfo`, `ExplorerServerInfo`) embed it as `common` and layer service-specific fields on top.
+
 ```proto
-message ServerCapabilities {
-  string network = 1;                            // "zcash-mainnet" / "zcash-testnet" / "zcash-regtest"
-  string service_version = 2;                    // semver of the running binary
-  string lightwalletd_protocol_commit = 3;       // vendored lightwalletd commit hash
-  uint32 schema_version = 4;                     // canonical artifact schema version
-  uint32 reorg_window_blocks = 5;                // configured reorg window depth
-  uint64 chain_event_retention_seconds = 6;         // 0 = unbounded retention (development only)
-  uint64 mempool_mined_retention_seconds = 7;       // 0 = mined-event family not retained on this deployment
-  uint64 mempool_invalidated_retention_seconds = 8; // 0 = invalidated-event family not retained on this deployment
-  repeated string capabilities = 9;              // capability strings; clients match exact strings
-  NodeCapabilitiesDescriptor node = 10;
-  optional string mcp_endpoint = 11;             // unset in v1
+message zinder.v1.ops.ServerInfo {
+  string network = 1;                  // "zcash-mainnet" / "zcash-testnet" / "zcash-regtest"
+  string service_name = 2;             // "zinder-ingest" / "zinder-query" / ...
+  string service_version = 3;          // semver of the running binary
+  repeated string capabilities = 4;    // capability strings; clients match exact strings
+  uint32 contract_revision = 5;        // monotonic in-place-revision marker (ADR-0027)
+}
+
+message WalletServerInfo {
+  zinder.v1.ops.ServerInfo common = 1;
+  string lightwalletd_protocol_commit = 2;          // vendored lightwalletd commit hash
+  uint32 schema_version = 3;                        // canonical artifact schema version
+  uint32 reorg_window_blocks = 4;                   // configured reorg window depth
+  uint64 chain_event_retention_seconds = 5;         // 0 = unbounded retention (development only)
+  uint64 mempool_mined_retention_seconds = 6;       // 0 = mined-event family not retained on this deployment
+  uint64 mempool_invalidated_retention_seconds = 7; // 0 = invalidated-event family not retained on this deployment
+  NodeCapabilitiesDescriptor node = 8;
 }
 
 message NodeCapabilitiesDescriptor {
@@ -653,6 +661,8 @@ message NodeCapabilitiesDescriptor {
   repeated string capabilities = 2;
 }
 ```
+
+`contract_revision` is a monotonically increasing marker, incremented whenever the semantics of an existing wire surface are revised in place. Capability strings identify wire shapes additively; the revision marker covers what they cannot: an RPC whose name and message tags survive while its meaning changes. The value is the single `zinder_proto::CONTRACT_REVISION` constant, currently 1. Consumers assert a minimum (`contract_revision >= N`) and refuse to run against an older server rather than misinterpreting its streams. See [ADR-0027](../adrs/0027-event-stream-start-positions.md).
 
 ### Capability strings
 

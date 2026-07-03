@@ -36,9 +36,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex, IndexerError,
-    Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
-    TransparentAddressUnspentOutputsQuery,
+    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
+    EventStreamStart, IndexerError, Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
+    TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -166,7 +166,11 @@ async fn subscribe_chain_events(
     address: &str,
 ) -> Result<(), IndexerError> {
     let mut events = chain_index
-        .chain_events_with_filter(None, ChainEventStreamFamily::Tip, vec![address.to_owned()])
+        .chain_events_with_filter(
+            EventStreamStart::EarliestRetained,
+            ChainEventStreamFamily::Tip,
+            vec![address.to_owned()],
+        )
         .await?;
     println!("subscribed to chain events with address_filter=[{address}]");
     while let Some(envelope) = events.next().await {

@@ -35,4 +35,9 @@ message ServerInfo {
   // additions land as new capability identifiers (the `_v1` suffix is
   // part of the identity), not as version bumps.
   repeated string capabilities = 4;
+
+  // Monotonically increasing marker, incremented whenever the semantics of
+  // an existing wire surface are revised in place. Consumers assert a
+  // minimum.
+  uint32 contract_revision = 5;
 }

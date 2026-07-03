@@ -38,7 +38,8 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
-    StreamCursorTokenV1, mempool_entry_from_message, mempool_event_envelope_from_message,
+    EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
+    mempool_entry_from_message, mempool_event_envelope_from_message,
 };
 
 use super::surface::{
@@ -143,8 +144,15 @@ impl MempoolSurface for IngestControlMempoolSurface {
         } else {
             Some(response.next_cursor)
         };
+        let events_resume_cursor = if response.events_resume_cursor.is_empty() {
+            None
+        } else {
+            Some(StreamCursorTokenV1::from_bytes(
+                response.events_resume_cursor,
+            ))
+        };
         Ok(MempoolSnapshotPage {
-            snapshot_sequence: response.snapshot_sequence,
+            events_resume_cursor,
             entries,
             next_cursor,
         })
@@ -155,12 +163,13 @@ impl MempoolSurface for IngestControlMempoolSurface {
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
         let mut client = self.ingest_control_client().await?;
-        let cursor_bytes = from_cursor
-            .as_ref()
-            .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec());
+        let start = from_cursor.map_or(
+            EventStreamStartPosition::EarliestRetained,
+            EventStreamStartPosition::AfterCursor,
+        );
         let response = client
             .mempool_events(wallet::MempoolEventsRequest {
-                from_cursor: cursor_bytes,
+                start: Some(event_stream_start_message(&start)),
                 family: MempoolEventStreamFamily::Mempool as i32,
             })
             .await
@@ -281,7 +290,9 @@ async fn run_ingest_control_tip_change_session(
     };
     let response_outcome = client
         .chain_events(Request::new(wallet::ChainEventsRequest {
-            from_cursor: Vec::new(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::LiveTail,
+            )),
             family: wallet::ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         }))

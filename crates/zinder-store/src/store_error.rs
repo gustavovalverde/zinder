@@ -307,16 +307,16 @@ pub enum StoreError {
         reason: &'static str,
     },
 
-    /// Mempool snapshot paging cursor names a snapshot newer than the writer
-    /// currently retains.
+    /// Mempool snapshot paging cursor is anchored ahead of the mempool-event
+    /// sequence the writer has applied.
     #[error(
-        "mempool snapshot page cursor expired: cursor snapshot sequence {snapshot_sequence}, current {current_snapshot_sequence}"
+        "mempool snapshot page cursor expired: cursor anchor sequence {anchor_event_sequence}, current {current_event_sequence}"
     )]
     SnapshotPageCursorExpired {
-        /// Snapshot sequence carried by the cursor.
-        snapshot_sequence: u64,
-        /// Snapshot sequence the writer currently serves.
-        current_snapshot_sequence: u64,
+        /// Anchor mempool-event sequence carried by the cursor.
+        anchor_event_sequence: u64,
+        /// Mempool-event sequence the writer has applied.
+        current_event_sequence: u64,
     },
 
     /// Chain event sequence reached the maximum representable value.

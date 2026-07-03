@@ -23,7 +23,7 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    StreamCursorTokenV1, chain_event_stream_family_from_message, stream_cursor_from_message_bytes,
+    StreamCursorTokenV1, chain_event_stream_family_from_message, event_stream_start_from_message,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -388,15 +388,28 @@ where
             }
 
             let request = request.into_inner();
-            let from_cursor = stream_cursor_from_message_bytes(request.from_cursor);
-            let family = chain_event_stream_family_from_message(request.family)
+            let start = event_stream_start_from_message(request.start).ok_or_else(|| {
+                Status::invalid_argument("event-stream start position is required")
+            })?;
+            let requested_family = chain_event_stream_family_from_message(request.family)
                 .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
             let network = self.server_info_network()?;
             let address_filter = decode_address_filter(request.address_filter, network)
                 .map_err(|error| status_from_query_error(&error))?;
+            let resume = self
+                .query_api
+                .resolve_chain_events_start(start, requested_family)
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
             let query_api = self.query_api.clone();
             let (event_sender, event_receiver) = mpsc::channel(16);
-            spawn_filtered_stream(query_api, from_cursor, family, address_filter, event_sender);
+            spawn_filtered_stream(
+                query_api,
+                resume.cursor,
+                resume.family,
+                address_filter,
+                event_sender,
+            );
 
             let stream: ChainEventsStream = Box::pin(ReceiverStream::new(event_receiver));
             Ok(Response::new(stream))

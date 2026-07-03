@@ -33,6 +33,28 @@ impl MempoolEventEnvelope {
     pub fn transaction_id(&self) -> TransactionId {
         self.event.transaction_id()
     }
+
+    /// Returns this event's position in the persistent log.
+    #[must_use]
+    pub fn position(&self) -> MempoolEventPosition {
+        MempoolEventPosition {
+            event_sequence: self.event_sequence,
+            transaction_id: self.transaction_id(),
+        }
+    }
+}
+
+/// Position of one mempool event in the persistent log.
+///
+/// The pair is sufficient to re-mint the event's resume cursor: the mempool
+/// cursor body encodes exactly the sequence and the transaction id the event
+/// names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolEventPosition {
+    /// Monotonic sequence in the mempool-event stream.
+    pub event_sequence: u64,
+    /// Transaction id named by the event.
+    pub transaction_id: TransactionId,
 }
 
 /// Mempool source transition emitted into the event log.

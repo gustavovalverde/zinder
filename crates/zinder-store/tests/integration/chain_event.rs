@@ -13,8 +13,8 @@ use zinder_core::{
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, StoreError,
-    StreamCursorTokenV1,
+    ChainEventStreamFamily, ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore,
+    ReorgWindowChange, StoreError, StreamCursorTokenV1,
 };
 
 #[test]
@@ -526,6 +526,158 @@ fn past_retention_reorg_reconnect_synthesizes_a_reorg() -> eyre::Result<()> {
         replayed_first.event,
         ChainEvent::ChainReorged { .. }
     ));
+
+    Ok(())
+}
+
+/// `LiveTail` resolves once at subscribe time: events already in the log are
+/// skipped and a later commit is the first event delivered after the resolved
+/// cursor.
+#[test]
+fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    for height in 1..=2 {
+        let (chain_epoch, block, compact_block) = synthetic_epoch(u64::from(height), height);
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block],
+            vec![compact_block],
+        ))?;
+    }
+
+    let resume = store.resolve_chain_event_stream_start(
+        &EventStreamStartPosition::LiveTail,
+        ChainEventStreamFamily::Tip,
+    )?;
+    assert_eq!(resume.family, ChainEventStreamFamily::Tip);
+    let head_cursor = resume
+        .cursor
+        .ok_or_else(|| eyre!("live tail on a non-empty log must mint a head cursor"))?;
+
+    let quiet_page = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&head_cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    assert!(quiet_page.is_empty());
+
+    let (third_epoch, third_block, third_compact_block) = synthetic_epoch(3, 3);
+    let third_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        third_epoch,
+        vec![third_block],
+        vec![third_compact_block],
+    ))?;
+
+    let delivered = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&head_cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    assert_eq!(delivered, vec![third_commit.event_envelope]);
+
+    Ok(())
+}
+
+/// A `LiveTail` head cursor carries the requested family so later pages stay
+/// on the safe-tip stream.
+#[test]
+fn live_tail_start_mints_a_cursor_in_the_requested_family() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+    ))?;
+
+    let resume = store.resolve_chain_event_stream_start(
+        &EventStreamStartPosition::LiveTail,
+        ChainEventStreamFamily::Safe,
+    )?;
+    assert_eq!(resume.family, ChainEventStreamFamily::Safe);
+    let head_cursor = resume
+        .cursor
+        .ok_or_else(|| eyre!("live tail on a non-empty log must mint a head cursor"))?;
+    assert_eq!(head_cursor.as_bytes()[49], 0x1);
+
+    Ok(())
+}
+
+/// `LiveTail` on an empty event log degrades to the retention floor, which
+/// only widens delivery.
+#[test]
+fn live_tail_start_on_empty_log_starts_at_earliest_retained() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+
+    let resume = store.resolve_chain_event_stream_start(
+        &EventStreamStartPosition::LiveTail,
+        ChainEventStreamFamily::Tip,
+    )?;
+
+    assert_eq!(resume.cursor, None);
+    assert_eq!(resume.family, ChainEventStreamFamily::Tip);
+
+    Ok(())
+}
+
+/// With `after_cursor` the cursor's encoded family is authoritative when the
+/// request family is left at its default.
+#[test]
+fn after_cursor_start_takes_the_cursor_family_as_authoritative() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+    ))?;
+    let safe_page = store.chain_event_history(ChainEventHistoryRequest::new_for_family(
+        None,
+        ChainEventStreamFamily::Safe,
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+    let safe_cursor = safe_page
+        .first()
+        .ok_or_else(|| eyre!("expected a safe-family event"))?
+        .cursor
+        .clone();
+
+    let resume = store.resolve_chain_event_stream_start(
+        &EventStreamStartPosition::AfterCursor(safe_cursor.clone()),
+        ChainEventStreamFamily::Tip,
+    )?;
+
+    assert_eq!(resume.family, ChainEventStreamFamily::Safe);
+    assert_eq!(resume.cursor, Some(safe_cursor));
+
+    Ok(())
+}
+
+/// A non-default request family that disagrees with the cursor's encoded
+/// family is rejected as an invalid cursor.
+#[test]
+fn after_cursor_start_rejects_request_family_mismatch() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+    let commit_outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+    ))?;
+    let tip_cursor = commit_outcome.event_envelope.cursor;
+
+    let error = match store.resolve_chain_event_stream_start(
+        &EventStreamStartPosition::AfterCursor(tip_cursor),
+        ChainEventStreamFamily::Safe,
+    ) {
+        Ok(resume) => return Err(eyre!("expected family mismatch, got {resume:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StoreError::ChainEventCursorInvalid { .. }));
 
     Ok(())
 }

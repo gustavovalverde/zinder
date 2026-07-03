@@ -609,18 +609,38 @@ where
             .as_ref()
             .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
             .clone();
-        let live_tail_sequence = mempool_surface
-            .mempool_snapshot_page(1, None)
-            .await
-            .map_err(status_from_mempool_surface_error)?
-            .snapshot_sequence;
+        // Deliver the current mempool contents from the snapshot walk, then
+        // continue with events strictly after the walk's resume anchor. The
+        // anchor guarantees at-least-once delivery; a transaction admitted
+        // mid-walk may appear both in a later page and as an event.
+        let mut initial_raw_transactions = Vec::new();
+        let mut events_resume_cursor = None;
+        let mut first_page = true;
+        let mut next_cursor = None;
+        loop {
+            let snapshot_page = mempool_surface
+                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, next_cursor)
+                .await
+                .map_err(status_from_mempool_surface_error)?;
+            if first_page {
+                events_resume_cursor = snapshot_page.events_resume_cursor;
+                first_page = false;
+            }
+            for entry in &snapshot_page.entries {
+                initial_raw_transactions.push(Ok(mempool_raw_transaction(entry)));
+            }
+            match snapshot_page.next_cursor {
+                Some(cursor) => next_cursor = Some(cursor),
+                None => break,
+            }
+        }
         let event_stream = mempool_surface
-            .mempool_events(None)
+            .mempool_events(events_resume_cursor)
             .await
             .map_err(status_from_mempool_surface_error)?;
-        let raw_transaction_stream = stream::StreamExt::filter_map(event_stream, move |event| {
-            project_added_after_sequence_to_raw_transaction(event, live_tail_sequence)
-        });
+        let raw_transaction_stream = stream::iter(initial_raw_transactions).chain(
+            stream::StreamExt::filter_map(event_stream, project_added_to_raw_transaction),
+        );
 
         let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
             if let Some(watcher) = self.tip_change_watcher.clone() {
@@ -1373,25 +1393,26 @@ fn txid_matches_excluded_suffix(transaction_id: &[u8; 32], exclude_suffixes: &[V
     clippy::wildcard_enum_match_arm,
     reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so all current and future non-Added variants are filtered out of the GetMempoolStream projection."
 )]
-fn project_added_after_sequence_to_raw_transaction(
+fn project_added_to_raw_transaction(
     event_outcome: Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>,
-    after_event_sequence: u64,
 ) -> Option<Result<lightwalletd::RawTransaction, Status>> {
     match event_outcome {
-        Ok(envelope) if envelope.event_sequence <= after_event_sequence => None,
         Ok(envelope) => match envelope.event {
-            MempoolEvent::Added { entry } => Some(Ok(lightwalletd::RawTransaction {
-                data: entry.raw_transaction_bytes.as_slice().to_vec(),
-                // Lightwalletd contract: the height field on a mempool
-                // raw transaction is "the latest block height" at the
-                // moment the transaction was observed. The Android SDK
-                // ignores the value and uses GetLatestBlock for tip
-                // tracking; Zinder reports the chain epoch's tip height
-                // recorded on the entry.
-                height: u64::from(entry.first_seen_chain_epoch.visible_tip_height.value()),
-            })),
+            MempoolEvent::Added { entry } => Some(Ok(mempool_raw_transaction(&entry))),
             _ => None,
         },
         Err(error) => Some(Err(status_from_mempool_surface_error(error))),
+    }
+}
+
+fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::RawTransaction {
+    lightwalletd::RawTransaction {
+        data: entry.raw_transaction_bytes.as_slice().to_vec(),
+        // Lightwalletd contract: the height field on a mempool raw
+        // transaction is "the latest block height" at the moment the
+        // transaction was observed. The Android SDK ignores the value and
+        // uses GetLatestBlock for tip tracking; Zinder reports the chain
+        // epoch's tip height recorded on the entry.
+        height: u64::from(entry.first_seen_chain_epoch.visible_tip_height.value()),
     }
 }

@@ -40,7 +40,9 @@ use zinder_proto::v1::{
     },
 };
 use zinder_runtime::Readiness;
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::{
+    ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore, event_stream_start_message,
+};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -189,7 +191,9 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     let mut client = IngestControlClient::connect(format!("http://{ingest_control_addr}")).await?;
     let mut chain_events = client
         .chain_events(ChainEventsRequest {
-            from_cursor: Vec::new(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )),
             family: ProtoChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         })

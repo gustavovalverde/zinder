@@ -38,7 +38,9 @@ use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
 };
-use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
+use zinder_store::{
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, StreamCursorTokenV1,
+};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
     open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
@@ -509,6 +511,16 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError> {
         self.inner.chain_events(from_cursor, family).await
+    }
+
+    async fn resolve_chain_events_start(
+        &self,
+        start: EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, QueryError> {
+        self.inner
+            .resolve_chain_events_start(start, requested_family)
+            .await
     }
 
     async fn broadcast_transaction(

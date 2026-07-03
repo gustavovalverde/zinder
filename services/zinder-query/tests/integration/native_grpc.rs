@@ -26,7 +26,10 @@ use zinder_proto::v1::{
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletQueryOptions};
-use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
+use zinder_store::{
+    ChainEpochArtifacts, EventStreamStartPosition, PrimaryChainStore, StreamCursorTokenV1,
+    event_stream_start_message,
+};
 use zinder_testkit::{
     MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
 };
@@ -243,7 +246,9 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
         Request::new(wallet::ChainEventsRequest {
-            from_cursor: Vec::new(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )),
             family: wallet::ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         }),
@@ -277,6 +282,74 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
 }
 
 #[tokio::test]
+async fn native_grpc_service_rejects_unset_event_stream_start() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    commit_wallet_artifacts(&store)?;
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+
+    for start in [None, Some(wallet::EventStreamStart { position: None })] {
+        let status = match WalletQueryService::chain_events(
+            &grpc_adapter,
+            Request::new(wallet::ChainEventsRequest {
+                start,
+                family: wallet::ChainEventStreamFamily::Tip as i32,
+                address_filter: Vec::new(),
+            }),
+        )
+        .await
+        {
+            Ok(_response) => return Err(eyre!("expected unset-start rejection")),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    commit_wallet_artifacts(&store)?;
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+
+    let mut event_stream = WalletQueryService::chain_events(
+        &grpc_adapter,
+        Request::new(wallet::ChainEventsRequest {
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::LiveTail,
+            )),
+            family: wallet::ChainEventStreamFamily::Tip as i32,
+            address_filter: Vec::new(),
+        }),
+    )
+    .await?
+    .into_inner();
+
+    let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        second_epoch,
+        vec![second_block],
+        vec![second_compact_block],
+    ))?;
+
+    let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), event_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("chain-events stream closed before the post-subscribe event"))??;
+    assert_eq!(first_event.event_sequence, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -300,7 +373,11 @@ async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Resul
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
         Request::new(wallet::ChainEventsRequest {
-            from_cursor: first_cursor,
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::AfterCursor(StreamCursorTokenV1::from_bytes(
+                    first_cursor,
+                )),
+            )),
             family: wallet::ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         }),
@@ -414,7 +491,9 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
         Request::new(wallet::ChainEventsRequest {
-            from_cursor: Vec::new(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )),
             family: wallet::ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         }),

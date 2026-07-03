@@ -310,7 +310,8 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
     };
     use zinder_source::{MempoolSourceEntry, NodeSource};
     use zinder_store::{
-        CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, MempoolEvent, PrimaryChainStore,
+        CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, EventStreamStartPosition, MempoolEvent,
+        PrimaryChainStore, event_stream_start_message,
     };
 
     let _guard = init();
@@ -421,7 +422,9 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
     let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
     let mut event_stream = client
         .mempool_events(MempoolEventsRequest {
-            from_cursor: pre_restart_cursor.as_bytes().to_vec(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::AfterCursor(pre_restart_cursor.clone()),
+            )),
             family: ProtoMempoolEventStreamFamily::Mempool as i32,
         })
         .await?

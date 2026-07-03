@@ -109,7 +109,7 @@ cursor advance atomically with consumer writes. Fresh consumers whose persisted
 cursor sits below the retention floor rebuild from canonical artifacts before
 resuming retained-event replay.
 
-Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The cursor protocol below is the same for both consumer paths.
+Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The wire request expresses the start as the required `EventStreamStart` oneof (`after_cursor` | `earliest_retained` | `live_tail`, [ADR-0027](../adrs/0027-event-stream-start-positions.md)); the rules below govern the resolved resume position and are the same for both consumer paths.
 
 Rules:
 
@@ -128,7 +128,7 @@ Rules:
 `StreamCursorTokenV1`'s `flags` byte carries a family code in the lower nibble (per [Chain events §Cursor varieties](chain-events.md#cursor-varieties)). Two `ChainEvents` family codes are active:
 
 - **`0x0` `ChainEventTip`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
-- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= safe_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and an empty `from_cursor`.
+- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= safe_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
 
 Future stream families (`Mempool`, `Derive`) are reserved in the family-code table but use parallel cursor body types under their own contracts.
 

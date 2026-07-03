@@ -161,6 +161,7 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
         network: settings.network.clone(),
         service_name: env!("CARGO_PKG_NAME").to_owned(),
         service_version: settings.service_version.clone(),
+        contract_revision: zinder_proto::CONTRACT_REVISION,
         capabilities: capabilities_for_surface(CapabilitySurface::Wallet)
             .filter(|spec| {
                 spec.policy.wallet_satisfied(WalletAdvertiseInputs {

@@ -33,7 +33,8 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_transparent_utxo_set_commitment;
 use zinder_store::{
-    self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
+    self, ChainEventStreamFamily, EventStreamStartPosition, MempoolDecodeError,
+    StreamCursorTokenV1, chain_epoch_from_message, event_stream_start_message,
     mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
     outpoint_message,
@@ -44,9 +45,9 @@ use zinder_store::{
 use crate::error::ZINDER_ERROR_DOMAIN;
 use crate::{
     BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
-    ChainEventStream, ChainIndex, ChainRangeReverted, EndpointBackedIndex, IndexStream,
-    IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
-    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
+    ChainEventStream, ChainIndex, ChainRangeReverted, EndpointBackedIndex, EventStreamStart,
+    IndexStream, IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope,
+    MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
     TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
     TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
     TransparentHistoryCursor, TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
@@ -703,23 +704,25 @@ impl EndpointBackedIndex for RemoteChainIndex {
 
     async fn chain_events_for_family(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: EventStreamStart<ChainEventCursor>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEventStream, IndexerError> {
-        self.chain_events_with_filter(from_cursor, family, Vec::new())
+        self.chain_events_with_filter(start, family, Vec::new())
             .await
     }
 
     async fn chain_events_with_filter(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: EventStreamStart<ChainEventCursor>,
         family: ChainEventStreamFamily,
         address_filter: Vec<String>,
     ) -> Result<ChainEventStream, IndexerError> {
         let response = self
             .client()
             .chain_events(Request::new(wallet::ChainEventsRequest {
-                from_cursor: from_cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+                start: Some(event_stream_start_to_message(&start, |cursor| {
+                    cursor.as_bytes().to_vec()
+                })),
                 family: chain_event_stream_family_to_message(family) as i32,
                 address_filter,
             }))
@@ -757,12 +760,14 @@ impl EndpointBackedIndex for RemoteChainIndex {
 
     async fn mempool_events(
         &self,
-        from_cursor: Option<MempoolEventCursor>,
+        start: EventStreamStart<MempoolEventCursor>,
     ) -> Result<MempoolEventStream, IndexerError> {
         let response = self
             .client()
             .mempool_events(Request::new(wallet::MempoolEventsRequest {
-                from_cursor: from_cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+                start: Some(event_stream_start_to_message(&start, |cursor| {
+                    cursor.as_bytes().to_vec()
+                })),
                 family: wallet::MempoolEventStreamFamily::Mempool as i32,
             }))
             .await
@@ -1646,13 +1651,34 @@ fn mempool_snapshot_view_from_message(
     } else {
         Some(MempoolSnapshotCursor::from_bytes(message.next_cursor))
     };
+    let events_resume_cursor = if message.events_resume_cursor.is_empty() {
+        None
+    } else {
+        Some(MempoolEventCursor::from_bytes(message.events_resume_cursor))
+    };
     Ok(MempoolSnapshotView {
         chain_epoch,
-        snapshot_sequence: message.snapshot_sequence,
+        events_resume_cursor,
         snapshot_age_millis: message.snapshot_age_millis,
         entries,
         next_cursor,
     })
+}
+
+/// Encodes a typed client start position into the wire `EventStreamStart`,
+/// extracting the opaque cursor bytes with `cursor_bytes`.
+fn event_stream_start_to_message<Cursor>(
+    start: &EventStreamStart<Cursor>,
+    cursor_bytes: impl Fn(&Cursor) -> Vec<u8>,
+) -> wallet::EventStreamStart {
+    let position = match start {
+        EventStreamStart::AfterCursor(cursor) => EventStreamStartPosition::AfterCursor(
+            StreamCursorTokenV1::from_bytes(cursor_bytes(cursor)),
+        ),
+        EventStreamStart::EarliestRetained => EventStreamStartPosition::EarliestRetained,
+        EventStreamStart::LiveTail => EventStreamStartPosition::LiveTail,
+    };
+    event_stream_start_message(&position)
 }
 
 #[allow(

@@ -45,20 +45,22 @@ pub use chain_store::{
     PrimaryChainStore, RawBlobRetention, SecondaryCatchupOutcome, SecondaryChainStore,
     TransparentAddressTxIndexPage, TransparentAddressTxIndexPageRequest,
 };
-pub use event_stream::{EventEnvelope, run_event_stream};
+pub use event_stream::{
+    ChainEventStreamResume, EventEnvelope, EventStreamStartPosition, run_event_stream,
+};
 pub use format::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-    SnapshotPageCursorPayload, SnapshotPageStreamFamily, StreamCursorError, StreamCursorTokenV1,
-    TransparentHistoryCursorAnchor, TransparentHistoryCursorPayload,
-    TransparentHistoryStreamFamily,
+    SnapshotPageCursorAnchor, SnapshotPageCursorPayload, SnapshotPageStreamFamily,
+    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
+    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
 };
 pub use grpc_status::status_from_store_error;
 pub use kv::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, build_block_based_table_factory,
     open_bounded_rocksdb,
 };
-pub use mempool_event::{MempoolEvent, MempoolEventEnvelope};
+pub use mempool_event::{MempoolEvent, MempoolEventEnvelope, MempoolEventPosition};
 pub use mempool_event_store::{
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest,
     MempoolEventRetentionConfig, MempoolEventRetentionReport,
@@ -66,12 +68,13 @@ pub use mempool_event_store::{
 pub use proto_codec::{
     ChainEventEncodeError, MempoolDecodeError, block_tip_message, chain_epoch_from_message,
     chain_epoch_message, chain_event_envelope_message, chain_event_stream_family_from_message,
-    chain_view_message, mempool_entry_from_message, mempool_entry_message,
-    mempool_event_envelope_from_message, mempool_event_envelope_message, outpoint_from_message,
-    outpoint_message, stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
-    transparent_mempool_output_message, transparent_mempool_spend_from_message,
-    transparent_mempool_spend_message, transparent_output_entry_message,
-    transparent_output_message, transparent_spend_message,
+    chain_view_message, event_stream_start_from_message, event_stream_start_message,
+    mempool_entry_from_message, mempool_entry_message, mempool_event_envelope_from_message,
+    mempool_event_envelope_message, mempool_event_stream_family_from_message,
+    outpoint_from_message, outpoint_message, stream_cursor_from_message_bytes,
+    transparent_mempool_output_from_message, transparent_mempool_output_message,
+    transparent_mempool_spend_from_message, transparent_mempool_spend_message,
+    transparent_output_entry_message, transparent_output_message, transparent_spend_message,
 };
 pub use rocksdb_resource_budget::RocksDbResourceBudget;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};

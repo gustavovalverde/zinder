@@ -23,26 +23,26 @@ use zinder_core::{
 
 use crate::{
     ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
-    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainRangeReverted, MempoolEvent,
-    MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
-    MempoolEventRetentionReport, ReorgWindowChange, RocksDbResourceBudget, StoreError,
-    StreamCursorTokenV1,
+    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainEventStreamResume, ChainRangeReverted,
+    EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
+    MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionReport,
+    ReorgWindowChange, RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     format::{
         CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
-        MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorPayload,
-        SnapshotPageStreamFamily, StoreKey, decode_chain_epoch, decode_chain_event_envelope,
-        decode_mempool_event_envelope, decode_mempool_event_kind, decode_mempool_event_observed_at,
-        decode_transparent_output_block_index, encode_address_output_index_artifact,
-        encode_block_blob_artifact, encode_block_header_artifact,
-        encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
-        encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
-        encode_transaction_blob_artifact, encode_transaction_facts_artifact,
-        encode_transaction_location_artifact, encode_transparent_address_tx_index_artifact,
-        encode_transparent_output_artifact, encode_transparent_output_block_index,
-        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
-        encode_tree_state_artifact,
+        MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorAnchor,
+        SnapshotPageCursorPayload, SnapshotPageStreamFamily, StoreKey, decode_chain_epoch,
+        decode_chain_event_envelope, decode_mempool_event_envelope, decode_mempool_event_kind,
+        decode_mempool_event_observed_at, decode_transparent_output_block_index,
+        encode_address_output_index_artifact, encode_block_blob_artifact,
+        encode_block_header_artifact, encode_block_transaction_index_artifact, encode_chain_epoch,
+        encode_chain_event_envelope, encode_compact_block_artifact, encode_mempool_event_envelope,
+        encode_subtree_root_artifact, encode_transaction_blob_artifact,
+        encode_transaction_facts_artifact, encode_transaction_location_artifact,
+        encode_transparent_address_tx_index_artifact, encode_transparent_output_artifact,
+        encode_transparent_output_block_index, encode_transparent_spend_fact,
+        encode_transparent_spend_fact_block_index, encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
@@ -414,6 +414,13 @@ pub trait ChainEpochReadApi {
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError>;
 
+    /// Resolves an event-stream start position for the chain-event family.
+    fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError>;
+
     /// Reads a bounded page of unspent transparent outputs.
     ///
     /// Decodes any supplied cursor against the store's per-instance auth key
@@ -551,10 +558,12 @@ impl PrimaryChainStore {
     }
 
     /// Builds an HMAC-authenticated next-page cursor for a `MempoolSnapshot`
-    /// walk, bookmarking `(snapshot_sequence, after_transaction_id)`.
+    /// walk, bookmarking the paging position plus the walk's events-resume
+    /// anchor. A `None` anchor (walk began before any mempool event was
+    /// applied) is encoded as a zero anchor.
     pub fn encode_snapshot_page_cursor(
         &self,
-        snapshot_sequence: u64,
+        events_resume_anchor: Option<MempoolEventPosition>,
         after_transaction_id: TransactionId,
     ) -> Result<StreamCursorTokenV1, StoreError> {
         let network = self
@@ -562,11 +571,18 @@ impl PrimaryChainStore {
             .ok_or(StoreError::SnapshotPageCursorInvalid {
                 reason: "store has no network",
             })?;
+        let anchor = events_resume_anchor.unwrap_or(MempoolEventPosition {
+            event_sequence: 0,
+            transaction_id: TransactionId::from_bytes([0; 32]),
+        });
         StreamCursorTokenV1::snapshot_page(
-            network,
-            SnapshotPageStreamFamily::SnapshotPage,
-            snapshot_sequence,
-            after_transaction_id,
+            SnapshotPageCursorAnchor {
+                network,
+                family: SnapshotPageStreamFamily::SnapshotPage,
+                anchor_event_sequence: anchor.event_sequence,
+                anchor_transaction_id: anchor.transaction_id,
+                after_transaction_id,
+            },
             self.store.cursor_auth_key,
         )
         .map_err(|_| StoreError::SnapshotPageCursorInvalid {
@@ -575,15 +591,15 @@ impl PrimaryChainStore {
     }
 
     /// Decodes a `MempoolSnapshot` next-page cursor, verifying its HMAC,
-    /// network, and stream family, then bounding it against the snapshot
-    /// sequence the writer currently serves.
+    /// network, and stream family, then bounding its anchor against the
+    /// mempool-event sequence the writer has applied.
     ///
-    /// A cursor for a snapshot newer than `current_snapshot_sequence` is
-    /// rejected as expired.
+    /// A cursor anchored ahead of `current_event_sequence` is rejected as
+    /// expired.
     pub fn decode_snapshot_page_cursor(
         &self,
         cursor: &StreamCursorTokenV1,
-        current_snapshot_sequence: u64,
+        current_event_sequence: u64,
     ) -> Result<SnapshotPageCursorPayload, StoreError> {
         let network = self
             .network()
@@ -595,13 +611,58 @@ impl PrimaryChainStore {
             .map_err(|_| StoreError::SnapshotPageCursorInvalid {
                 reason: "cursor failed authentication, network, or stream-family validation",
             })?;
-        if payload.snapshot_sequence > current_snapshot_sequence {
+        if payload.anchor_event_sequence > current_event_sequence {
             return Err(StoreError::SnapshotPageCursorExpired {
-                snapshot_sequence: payload.snapshot_sequence,
-                current_snapshot_sequence,
+                anchor_event_sequence: payload.anchor_event_sequence,
+                current_event_sequence,
             });
         }
         Ok(payload)
+    }
+
+    /// Mints the `MempoolEvents` resume cursor for a snapshot walk anchored
+    /// at `anchor`.
+    ///
+    /// Byte-identical to the cursor carried by the anchor event's envelope:
+    /// the mempool cursor body encodes exactly the anchor pair.
+    pub fn encode_mempool_events_resume_cursor(
+        &self,
+        anchor: MempoolEventPosition,
+    ) -> Result<StreamCursorTokenV1, StoreError> {
+        let network = self
+            .network()
+            .ok_or(StoreError::SnapshotPageCursorInvalid {
+                reason: "store has no network",
+            })?;
+        StreamCursorTokenV1::mempool_event(
+            network,
+            MempoolEventStreamFamily::Mempool,
+            anchor.event_sequence,
+            anchor.transaction_id,
+            self.store.cursor_auth_key,
+        )
+        .map_err(|_| StoreError::SnapshotPageCursorInvalid {
+            reason: "cursor authentication key could not initialize the MAC",
+        })
+    }
+
+    /// Resolves an event-stream start position for the chain-event family.
+    pub fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError> {
+        self.store
+            .resolve_chain_event_stream_start(start, requested_family)
+    }
+
+    /// Resolves an event-stream start position for the mempool-event family
+    /// to the cursor the page loop resumes strictly after.
+    pub fn resolve_mempool_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+    ) -> Result<Option<StreamCursorTokenV1>, StoreError> {
+        self.store.resolve_mempool_event_stream_start(start)
     }
 
     /// Deletes retained chain-event rows older than `cutoff_created_at`.
@@ -741,6 +802,16 @@ impl SecondaryChainStore {
     /// Reads the current chain-event retention floor without pruning.
     pub fn chain_event_retention_report(&self) -> Result<ChainEventRetentionReport, StoreError> {
         self.store.chain_event_retention_report()
+    }
+
+    /// Resolves an event-stream start position for the chain-event family.
+    pub fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError> {
+        self.store
+            .resolve_chain_event_stream_start(start, requested_family)
     }
 
     /// Reads a bounded page of retained mempool events strictly after the
@@ -1510,6 +1581,129 @@ impl ChainStoreInner {
         Ok(event_envelopes)
     }
 
+    /// Resolves an event-stream start position for the chain-event family.
+    ///
+    /// `AfterCursor` authenticates the cursor and takes its encoded family as
+    /// authoritative, rejecting a non-default request family that disagrees.
+    /// `LiveTail` mints a cursor at the current head so the page loop resumes
+    /// strictly after it, delivering only events applied after subscription.
+    fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError> {
+        match start {
+            EventStreamStartPosition::AfterCursor(cursor) => {
+                let payload = cursor
+                    .decode_chain_event(self.stream_network()?, self.cursor_auth_key)
+                    .map_err(|_| StoreError::ChainEventCursorInvalid {
+                        reason: "cursor token failed validation",
+                    })?;
+                if requested_family != ChainEventStreamFamily::Tip
+                    && requested_family != payload.family
+                {
+                    return Err(StoreError::ChainEventCursorInvalid {
+                        reason: "request family does not match the cursor's encoded family",
+                    });
+                }
+                Ok(ChainEventStreamResume {
+                    cursor: Some(cursor.clone()),
+                    family: payload.family,
+                })
+            }
+            EventStreamStartPosition::EarliestRetained => Ok(ChainEventStreamResume {
+                cursor: None,
+                family: requested_family,
+            }),
+            EventStreamStartPosition::LiveTail => {
+                let read_view = self.read_view();
+                let current_event_sequence = read_current_chain_event_sequence(&read_view)?;
+                if current_event_sequence == 0 {
+                    return Ok(ChainEventStreamResume {
+                        cursor: None,
+                        family: requested_family,
+                    });
+                }
+                let chain_epoch = require_current_chain_epoch(&read_view)?;
+                let locator = build_chain_event_locator(
+                    &read_view,
+                    chain_epoch,
+                    ChainEventCursorAnchor {
+                        height: chain_epoch.visible_tip_height,
+                        hash: chain_epoch.visible_tip_hash,
+                    },
+                )?;
+                let cursor = StreamCursorTokenV1::chain_event(
+                    chain_epoch.network,
+                    requested_family,
+                    current_event_sequence,
+                    &locator,
+                    self.cursor_auth_key,
+                )
+                .map_err(|_| StoreError::InvalidChainEpochArtifacts {
+                    reason: "cursor authentication key could not initialize the MAC",
+                })?;
+                Ok(ChainEventStreamResume {
+                    cursor: Some(cursor),
+                    family: requested_family,
+                })
+            }
+        }
+    }
+
+    /// Resolves an event-stream start position for the mempool-event family.
+    ///
+    /// `LiveTail` returns the newest retained envelope's own cursor; a
+    /// missing newest row degrades to the retention floor, which only
+    /// widens delivery (at-least-once, never loss).
+    fn resolve_mempool_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+    ) -> Result<Option<StreamCursorTokenV1>, StoreError> {
+        let network = self
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainStoreOptions {
+                reason: "mempool events require a network-bound store",
+            })?;
+        match start {
+            EventStreamStartPosition::AfterCursor(cursor) => {
+                cursor
+                    .decode_mempool_event(network, self.cursor_auth_key)
+                    .map_err(|_| StoreError::MempoolEventCursorInvalid {
+                        reason: "cursor token failed validation",
+                    })?;
+                Ok(Some(cursor.clone()))
+            }
+            EventStreamStartPosition::EarliestRetained => Ok(None),
+            EventStreamStartPosition::LiveTail => {
+                let read_view = self.read_view();
+                let current_event_sequence = read_current_mempool_event_sequence(&read_view)?;
+                if current_event_sequence == 0 {
+                    return Ok(None);
+                }
+                let key = StoreKey::mempool_event(current_event_sequence);
+                let Some(record_bytes) = read_view.get(StorageTable::MempoolEvent, &key)? else {
+                    return Ok(None);
+                };
+                let envelope = decode_mempool_event_envelope(
+                    &key,
+                    &record_bytes,
+                    network,
+                    self.cursor_auth_key,
+                )?;
+                Ok(Some(envelope.cursor))
+            }
+        }
+    }
+
+    fn stream_network(&self) -> Result<Network, StoreError> {
+        match self.options.network {
+            Some(network) => Ok(network),
+            None => Ok(require_current_chain_epoch(&self.read_view())?.network),
+        }
+    }
+
     fn mempool_event_history_start_sequence(
         &self,
         inner: &impl RocksChainStoreRead,
@@ -1747,6 +1941,14 @@ impl ChainEpochReadApi for PrimaryChainStore {
         self.chain_event_history(request)
     }
 
+    fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError> {
+        self.resolve_chain_event_stream_start(start, requested_family)
+    }
+
     fn address_output_index_page(
         &self,
         request: AddressOutputIndexPageRequest<'_>,
@@ -1779,6 +1981,14 @@ impl ChainEpochReadApi for SecondaryChainStore {
         request: ChainEventHistoryRequest<'_>,
     ) -> Result<Vec<ChainEventEnvelope>, StoreError> {
         self.chain_event_history(request)
+    }
+
+    fn resolve_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, StoreError> {
+        self.resolve_chain_event_stream_start(start, requested_family)
     }
 
     fn address_output_index_page(

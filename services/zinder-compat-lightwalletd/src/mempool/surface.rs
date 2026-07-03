@@ -31,8 +31,10 @@ pub type MempoolEventEnvelopeStream =
 /// Page of mempool snapshot entries returned by [`MempoolSurface`].
 #[derive(Clone, Debug)]
 pub struct MempoolSnapshotPage {
-    /// Monotonic event sequence observed when the snapshot page was built.
-    pub snapshot_sequence: u64,
+    /// `MempoolEvents` after-cursor anchored at the moment the snapshot walk
+    /// began; identical on every page of one paged walk. `None` when the
+    /// writer had applied no mempool event yet.
+    pub events_resume_cursor: Option<StreamCursorTokenV1>,
     /// Hydrated mempool entries in this page.
     pub entries: Vec<MempoolEntry>,
     /// Opaque cursor for the next page, when more entries remain.
@@ -72,7 +74,8 @@ pub trait MempoolSurface: Send + Sync + 'static {
     ) -> Result<MempoolSnapshotPage, MempoolSurfaceError>;
 
     /// Opens a streaming subscription over mempool events strictly after
-    /// `from_cursor` (or from the earliest retained event when None).
+    /// `from_cursor` (`Some`), or replaying from the earliest retained event
+    /// (`None`).
     async fn mempool_events(
         &self,
         from_cursor: Option<StreamCursorTokenV1>,

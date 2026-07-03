@@ -26,6 +26,25 @@ pub type IndexStream<T> = Pin<Box<dyn Stream<Item = Result<T, IndexerError>> + S
 /// Chain-event stream returned by [`EndpointBackedIndex::chain_events`].
 pub type ChainEventStream = IndexStream<ChainEventEnvelope>;
 
+/// Explicit start position for a resumable event-stream subscription.
+///
+/// Mirrors the wire `EventStreamStart` oneof. `AfterCursor` resumes strictly
+/// after an opaque cursor from a previously delivered envelope: it is the
+/// reconnect path once at least one event has been applied. A fresh
+/// subscription chooses `EarliestRetained` to replay the retention window or
+/// `LiveTail` to resolve once at subscribe time to the current stream head,
+/// receiving only events applied after subscription.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventStreamStart<Cursor> {
+    /// Resume strictly after this cursor; its encoded family is
+    /// authoritative.
+    AfterCursor(Cursor),
+    /// Replay from the earliest retained event.
+    EarliestRetained,
+    /// Start at the stream head resolved at subscribe time.
+    LiveTail,
+}
+
 /// Opaque chain-event cursor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChainEventCursor(StreamCursorTokenV1);
@@ -161,8 +180,12 @@ impl MempoolSnapshotCursor {
 pub struct MempoolSnapshotView {
     /// Chain epoch visible at snapshot time.
     pub chain_epoch: ChainEpoch,
-    /// Monotonic snapshot sequence reported by the server.
-    pub snapshot_sequence: u64,
+    /// `MempoolEvents` after-cursor anchored at the moment the snapshot walk
+    /// began; identical on every page of one paged walk. `None` when the
+    /// server had applied no mempool event yet, in which case a consumer
+    /// subscribes with [`EventStreamStart::EarliestRetained`]. Replaying from
+    /// it yields at-least-once delivery; consumers apply events idempotently.
+    pub events_resume_cursor: Option<MempoolEventCursor>,
     /// Snapshot age in milliseconds when the response was constructed.
     pub snapshot_age_millis: u64,
     /// Hydrated mempool entries.
@@ -872,16 +895,16 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # Examples
     ///
     /// ```no_run
-    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # use zinder_client::{EndpointBackedIndex, EventStreamStart, IndexerError};
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client.chain_events(None).await?;
+    /// let stream = client.chain_events(EventStreamStart::EarliestRetained).await?;
     /// # let _ = stream; Ok(()) }
     /// ```
     async fn chain_events(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: EventStreamStart<ChainEventCursor>,
     ) -> Result<ChainEventStream, IndexerError> {
-        self.chain_events_for_family(from_cursor, ChainEventStreamFamily::Tip)
+        self.chain_events_for_family(start, ChainEventStreamFamily::Tip)
             .await
     }
 
@@ -890,16 +913,18 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # Examples
     ///
     /// ```no_run
-    /// # use zinder_client::{ChainEventStreamFamily, EndpointBackedIndex, IndexerError};
+    /// # use zinder_client::{
+    /// #     ChainEventStreamFamily, EndpointBackedIndex, EventStreamStart, IndexerError,
+    /// # };
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
     /// let stream = client
-    ///     .chain_events_for_family(None, ChainEventStreamFamily::Tip)
+    ///     .chain_events_for_family(EventStreamStart::LiveTail, ChainEventStreamFamily::Tip)
     ///     .await?;
     /// # let _ = stream; Ok(()) }
     /// ```
     async fn chain_events_for_family(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: EventStreamStart<ChainEventCursor>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEventStream, IndexerError>;
 
@@ -921,21 +946,27 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # Examples
     ///
     /// ```no_run
-    /// # use zinder_client::{ChainEventStreamFamily, EndpointBackedIndex, IndexerError};
+    /// # use zinder_client::{
+    /// #     ChainEventStreamFamily, EndpointBackedIndex, EventStreamStart, IndexerError,
+    /// # };
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
     /// let stream = client
-    ///     .chain_events_with_filter(None, ChainEventStreamFamily::Tip, Vec::new())
+    ///     .chain_events_with_filter(
+    ///         EventStreamStart::EarliestRetained,
+    ///         ChainEventStreamFamily::Tip,
+    ///         Vec::new(),
+    ///     )
     ///     .await?;
     /// # let _ = stream; Ok(()) }
     /// ```
     async fn chain_events_with_filter(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: EventStreamStart<ChainEventCursor>,
         family: ChainEventStreamFamily,
         address_filter: Vec<String>,
     ) -> Result<ChainEventStream, IndexerError> {
         let _ = address_filter;
-        self.chain_events_for_family(from_cursor, family).await
+        self.chain_events_for_family(start, family).await
     }
 
     /// Returns a bounded snapshot of the live mempool index.
@@ -960,14 +991,14 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # Examples
     ///
     /// ```no_run
-    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # use zinder_client::{EndpointBackedIndex, EventStreamStart, IndexerError};
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let stream = client.mempool_events(None).await?;
+    /// let stream = client.mempool_events(EventStreamStart::LiveTail).await?;
     /// # let _ = stream; Ok(()) }
     /// ```
     async fn mempool_events(
         &self,
-        from_cursor: Option<MempoolEventCursor>,
+        start: EventStreamStart<MempoolEventCursor>,
     ) -> Result<MempoolEventStream, IndexerError>;
 
     /// Returns whether `transaction_id` is currently visible in the live

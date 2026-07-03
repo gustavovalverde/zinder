@@ -17,6 +17,36 @@ use crate::StreamCursorTokenV1;
 
 const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Typed start position for a resumable event-stream subscription.
+///
+/// Mirrors the wire `EventStreamStart` oneof. `AfterCursor` resumes strictly
+/// after an opaque cursor previously delivered in an envelope;
+/// `EarliestRetained` replays from the retention floor; `LiveTail` resolves
+/// once at subscribe time to the current stream head so only events applied
+/// after subscription are delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventStreamStartPosition {
+    /// Resume strictly after this cursor; its encoded family is authoritative.
+    AfterCursor(crate::StreamCursorTokenV1),
+    /// Replay from the earliest retained event.
+    EarliestRetained,
+    /// Start at the stream head resolved at subscribe time.
+    LiveTail,
+}
+
+/// Resolved start of one chain-event subscription.
+///
+/// `cursor` is the position the page loop resumes strictly after (`None`
+/// reads from the retention floor); `family` is the effective stream family,
+/// taken from the cursor when the subscription resumed with one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainEventStreamResume {
+    /// Cursor the page loop resumes strictly after.
+    pub cursor: Option<crate::StreamCursorTokenV1>,
+    /// Effective stream family for page reads.
+    pub family: crate::ChainEventStreamFamily,
+}
+
 /// Cursor-bearing wire envelope a stream family delivers to subscribers.
 ///
 /// The driver is generic over this trait so one loop serves every family: it

@@ -307,6 +307,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
+                    contract_revision: zinder_proto::CONTRACT_REVISION,
                 }),
                 vendor: "Zinder".to_owned(),
                 derive_status,

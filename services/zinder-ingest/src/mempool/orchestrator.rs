@@ -160,7 +160,7 @@ fn commit_source_event(
         crate::derive_consumers::dispatch_mempool_event(derive_store, &envelope)
             .map_err(|source| MempoolOrchestratorError::DeriveDispatch { source })?;
     }
-    let _apply_outcome = apply_to_index(mempool_index, canonical_event);
+    let _apply_outcome = apply_to_index(mempool_index, canonical_event, envelope.position());
     record_mempool_size_gauges(mempool_index, chain_store);
     Ok(MempoolOrchestratorEventOutcome::Applied)
 }
@@ -233,13 +233,19 @@ fn canonical_event_from_source(
     unreachable_patterns,
     reason = "MempoolEvent is #[non_exhaustive]; future variants are observed as no-ops until we extend the index."
 )]
-fn apply_to_index(mempool_index: &MempoolIndex, event: MempoolEvent) -> MempoolApplyOutcome {
+fn apply_to_index(
+    mempool_index: &MempoolIndex,
+    event: MempoolEvent,
+    applied_event: zinder_store::MempoolEventPosition,
+) -> MempoolApplyOutcome {
     match event {
-        MempoolEvent::Added { entry } => mempool_index.apply_added(entry),
+        MempoolEvent::Added { entry } => mempool_index.apply_added(entry, applied_event),
         MempoolEvent::Invalidated { transaction_id, .. } => {
-            mempool_index.apply_invalidated(transaction_id)
+            mempool_index.apply_invalidated(transaction_id, applied_event)
         }
-        MempoolEvent::Mined { transaction_id, .. } => mempool_index.apply_mined(transaction_id),
+        MempoolEvent::Mined { transaction_id, .. } => {
+            mempool_index.apply_mined(transaction_id, applied_event)
+        }
         // Suppressed transactions never entered the live index; the
         // wildcard captures future variants Zinder hasn't taught the
         // orchestrator about yet.

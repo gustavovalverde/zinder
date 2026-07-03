@@ -77,8 +77,8 @@ The block below is a compiled doctest. It uses the real `zinder-client` connect 
 use tokio_stream::StreamExt as _;
 use zinder_client::{
     ChainEventCursor, ChainEventEnvelope, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
-    IndexerError, Network, RawTransactionBytes, RemoteChainIndex, RemoteOpenOptions,
-    TransactionBroadcastResult, TransparentAddressScriptHash,
+    EventStreamStart, IndexerError, Network, RawTransactionBytes, RemoteChainIndex,
+    RemoteOpenOptions, TransactionBroadcastResult, TransparentAddressScriptHash,
     TransparentAddressUnspentOutputsQuery,
 };
 
@@ -117,6 +117,7 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
             .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
                 address_script_hash,
                 start_height: zinder_client::BlockHeight::new(0),
+                at_epoch_id: None,
             })
             .await?;
         while let Some(unspent) = unspent_outputs.next().await {
@@ -130,9 +131,13 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
 
     // 4. Subscribe forever. `chain_events_for_family` needs a live endpoint, so
     //    it is an `EndpointBackedIndex` method: a handle without an endpoint
-    //    would not compile here.
+    //    would not compile here. A persisted cursor resumes strictly after the
+    //    last applied event; a fresh wallet replays the retention window.
+    let start = wallet
+        .load_last_chain_event_cursor()
+        .map_or(EventStreamStart::EarliestRetained, EventStreamStart::AfterCursor);
     let mut stream = zinder
-        .chain_events_for_family(wallet.load_last_chain_event_cursor(), ChainEventStreamFamily::Tip)
+        .chain_events_for_family(start, ChainEventStreamFamily::Tip)
         .await?;
     while let Some(envelope) = stream.next().await {
         let envelope = envelope?;

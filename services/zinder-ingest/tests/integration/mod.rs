@@ -1,5 +1,6 @@
 mod bulk_catchup;
 mod cli;
+mod event_stream_start;
 mod fixture_block;
 mod ingest_loop;
 mod mempool_pipeline;

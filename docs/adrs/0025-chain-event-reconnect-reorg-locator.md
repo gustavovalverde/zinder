@@ -68,3 +68,7 @@ A `Safe` cursor delivers only commits whose range is past the settled tip. A `Sa
 - `CHAIN_EVENT_CURSOR_INVALID` (reserved for corruption or forgery only).
 
 See [Chain events §Resume Semantics](../architecture/chain-events.md#resume-semantics) and [Public interfaces §Cursor Conventions](../architecture/public-interfaces.md#cursor-conventions).
+
+## Revision history
+
+- 2026-07-03: The resume and self-heal semantics here compose with the explicit `EventStreamStart` start positions of [ADR-0027](0027-event-stream-start-positions.md). The `after_cursor` position feeds the resume algorithm exactly as a resumed cursor does, and the `live_tail` head cursor is minted with a locator anchored at the current visible tip, so a later reconnect from it recovers through the same algorithm. Cursor bytes, the locator layout, and the `CHAIN_EVENT_CURSOR_EXPIRED`/`CHAIN_EVENT_CURSOR_INVALID` classification are unchanged.

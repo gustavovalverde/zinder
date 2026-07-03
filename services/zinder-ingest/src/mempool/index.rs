@@ -21,6 +21,7 @@ use zinder_core::{
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
     UnixTimestampMillis,
 };
+use zinder_store::MempoolEventPosition;
 
 /// Outcome of applying a single source-observed event to the index.
 ///
@@ -46,6 +47,9 @@ pub struct MempoolSnapshotPage {
     pub next_after_transaction_id: Option<TransactionId>,
     /// Last time this in-memory index observed an applied mempool state change.
     pub last_updated_at: UnixTimestampMillis,
+    /// Log position of the last event applied to the index, read atomically
+    /// with the page entries. `None` before any event has been applied.
+    pub last_applied_event: Option<MempoolEventPosition>,
 }
 
 /// Concurrent live mempool index.
@@ -64,6 +68,7 @@ struct MempoolIndexState {
     output_by_outpoint: HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     spend_by_outpoint: HashMap<TransparentOutPoint, TransactionId>,
     last_updated_at: UnixTimestampMillis,
+    last_applied_event: Option<MempoolEventPosition>,
 }
 
 impl Default for MempoolIndexState {
@@ -74,6 +79,7 @@ impl Default for MempoolIndexState {
             output_by_outpoint: HashMap::new(),
             spend_by_outpoint: HashMap::new(),
             last_updated_at: UnixTimestampMillis::now(),
+            last_applied_event: None,
         }
     }
 }
@@ -85,16 +91,22 @@ impl MempoolIndex {
         Self::default()
     }
 
-    /// Inserts a hydrated entry. Returns [`MempoolApplyOutcome::NoChange`]
-    /// when the entry's txid is already present; existing entries are
-    /// immutable until the source emits an `Invalidated` or `Mined` event
-    /// for them.
+    /// Inserts a hydrated entry, recording `applied_event` as the index's
+    /// last-applied log position under the same write lock. Returns
+    /// [`MempoolApplyOutcome::NoChange`] when the entry's txid is already
+    /// present; existing entries are immutable until the source emits an
+    /// `Invalidated` or `Mined` event for them.
     ///
     /// The entry is wrapped in an [`Arc`] so subsequent reads return shared
     /// references without re-cloning the entry payload.
     #[must_use]
-    pub fn apply_added(&self, entry: MempoolEntry) -> MempoolApplyOutcome {
+    pub fn apply_added(
+        &self,
+        entry: MempoolEntry,
+        applied_event: MempoolEventPosition,
+    ) -> MempoolApplyOutcome {
         let mut state = self.state.write();
+        state.last_applied_event = Some(applied_event);
         let inserted_entry = match state.entries.entry(entry.transaction_id) {
             Entry::Occupied(_) => {
                 drop(state);
@@ -109,21 +121,35 @@ impl MempoolIndex {
     }
 
     /// Removes the entry for `transaction_id` as if the upstream source
-    /// invalidated it.
+    /// invalidated it, recording `applied_event` under the same write lock.
     #[must_use]
-    pub fn apply_invalidated(&self, transaction_id: TransactionId) -> MempoolApplyOutcome {
-        self.remove_entry(transaction_id)
+    pub fn apply_invalidated(
+        &self,
+        transaction_id: TransactionId,
+        applied_event: MempoolEventPosition,
+    ) -> MempoolApplyOutcome {
+        self.remove_entry(transaction_id, applied_event)
     }
 
     /// Removes the entry for `transaction_id` as if the upstream source
-    /// mined it into a block.
+    /// mined it into a block, recording `applied_event` under the same
+    /// write lock.
     #[must_use]
-    pub fn apply_mined(&self, transaction_id: TransactionId) -> MempoolApplyOutcome {
-        self.remove_entry(transaction_id)
+    pub fn apply_mined(
+        &self,
+        transaction_id: TransactionId,
+        applied_event: MempoolEventPosition,
+    ) -> MempoolApplyOutcome {
+        self.remove_entry(transaction_id, applied_event)
     }
 
-    fn remove_entry(&self, transaction_id: TransactionId) -> MempoolApplyOutcome {
+    fn remove_entry(
+        &self,
+        transaction_id: TransactionId,
+        applied_event: MempoolEventPosition,
+    ) -> MempoolApplyOutcome {
         let mut state = self.state.write();
+        state.last_applied_event = Some(applied_event);
         let Some(removed_entry) = state.entries.remove(&transaction_id) else {
             drop(state);
             return MempoolApplyOutcome::NoChange;
@@ -132,6 +158,12 @@ impl MempoolIndex {
         state.last_updated_at = UnixTimestampMillis::now();
         drop(state);
         MempoolApplyOutcome::Applied
+    }
+
+    /// Returns the log position of the last event applied to the index.
+    #[must_use]
+    pub fn last_applied_event(&self) -> Option<MempoolEventPosition> {
+        self.state.read().last_applied_event
     }
 
     /// Returns whether `transaction_id` is currently in the live index.
@@ -249,6 +281,7 @@ impl MempoolIndex {
     ) -> MempoolSnapshotPage {
         let state = self.state.read();
         let last_updated_at = state.last_updated_at;
+        let last_applied_event = state.last_applied_event;
         let mut entries = state.entries.values().cloned().collect::<Vec<_>>();
         drop(state);
 
@@ -276,6 +309,7 @@ impl MempoolIndex {
             entries,
             next_after_transaction_id,
             last_updated_at,
+            last_applied_event,
         }
     }
 }
@@ -343,7 +377,14 @@ mod tests {
         RawTransactionBytes, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
         TransparentMempoolSpend, TransparentOutPoint, UnixTimestampMillis,
     };
-    use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
+    use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventPosition};
+
+    fn applied_at(event_sequence: u64, transaction_id: TransactionId) -> MempoolEventPosition {
+        MempoolEventPosition {
+            event_sequence,
+            transaction_id,
+        }
+    }
 
     fn synthetic_chain_epoch() -> ChainEpoch {
         ChainEpoch {
@@ -394,11 +435,15 @@ mod tests {
         let index = MempoolIndex::new();
         let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
 
-        let outcome = index.apply_added(entry.clone());
+        let outcome = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id));
 
         assert_eq!(outcome, MempoolApplyOutcome::Applied);
         assert!(index.is_in_mempool(entry.transaction_id));
         assert_eq!(index.entry_count(), 1);
+        assert_eq!(
+            index.last_applied_event(),
+            Some(applied_at(1, entry.transaction_id))
+        );
 
         let outputs = index.transparent_outputs_by_address(
             TransparentAddressScriptHash::from_bytes([0xAA; 32]),
@@ -418,23 +463,30 @@ mod tests {
         let index = MempoolIndex::new();
         let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
         assert_eq!(
-            index.apply_added(entry.clone()),
+            index.apply_added(entry.clone(), applied_at(1, entry.transaction_id)),
             MempoolApplyOutcome::Applied
         );
 
-        let outcome = index.apply_added(entry);
+        let transaction_id = entry.transaction_id;
+        let outcome = index.apply_added(entry, applied_at(2, transaction_id));
 
         assert_eq!(outcome, MempoolApplyOutcome::NoChange);
         assert_eq!(index.entry_count(), 1);
+        // A logged no-op still advances the last-applied position.
+        assert_eq!(
+            index.last_applied_event(),
+            Some(applied_at(2, transaction_id))
+        );
     }
 
     #[test]
     fn apply_invalidated_removes_entry_and_secondary_indexes() {
         let index = MempoolIndex::new();
         let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
-        let _ = index.apply_added(entry.clone());
+        let _ = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id));
 
-        let outcome = index.apply_invalidated(entry.transaction_id);
+        let outcome =
+            index.apply_invalidated(entry.transaction_id, applied_at(2, entry.transaction_id));
 
         assert_eq!(outcome, MempoolApplyOutcome::Applied);
         assert!(!index.is_in_mempool(entry.transaction_id));
@@ -459,7 +511,8 @@ mod tests {
     #[test]
     fn apply_mined_returns_no_change_for_unknown_txid() {
         let index = MempoolIndex::new();
-        let outcome = index.apply_mined(TransactionId::from_bytes([0xFF; 32]));
+        let unknown = TransactionId::from_bytes([0xFF; 32]);
+        let outcome = index.apply_mined(unknown, applied_at(1, unknown));
         assert_eq!(outcome, MempoolApplyOutcome::NoChange);
     }
 
@@ -467,10 +520,27 @@ mod tests {
     fn snapshot_respects_max_entries_bound() {
         let index = MempoolIndex::new();
         for index_byte in 0u8..5 {
-            let _ = index.apply_added(entry_with_outputs_and_spend(index_byte, 0xAA, 0x20));
+            let entry = entry_with_outputs_and_spend(index_byte, 0xAA, 0x20);
+            let transaction_id = entry.transaction_id;
+            let _ = index.apply_added(entry, applied_at(u64::from(index_byte) + 1, transaction_id));
         }
         assert_eq!(index.snapshot(2).len(), 2);
         assert_eq!(index.snapshot(10).len(), 5);
+    }
+
+    #[test]
+    fn snapshot_page_carries_last_applied_event() {
+        let index = MempoolIndex::new();
+        assert!(index.snapshot_page(10, None).last_applied_event.is_none());
+
+        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
+        let position = applied_at(7, entry.transaction_id);
+        let _ = index.apply_added(entry, position);
+
+        assert_eq!(
+            index.snapshot_page(10, None).last_applied_event,
+            Some(position)
+        );
     }
 
     #[test]

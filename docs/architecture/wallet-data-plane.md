@@ -208,7 +208,8 @@ The contract:
 
 - Each `ChainEventEnvelope` carries the cross-plane `ChainView` at field tag 3 (`chain_view`). `chain_view.chain_epoch` is the epoch visible after the event, and `chain_view.chain_epoch.settled_tip.height` is the safe tip height that was true for the event. The envelope carries no separate `safe_tip_height` field.
 - The cursor is the `StreamCursorTokenV1` bytes documented in [Chain events](chain-events.md). Clients persist the exact bytes returned in the previous envelope and resume strictly after that cursor.
-- Empty `from_cursor` returns events from the earliest retained event sequence, which is the bootstrap path for a fresh wallet install.
+- The request carries a required `EventStreamStart start` oneof per [ADR-0027](../adrs/0027-event-stream-start-positions.md): `after_cursor` resumes strictly after the supplied cursor, `earliest_retained` replays from the retention floor (the bootstrap path for a fresh wallet install), and `live_tail` resolves once at subscribe time to a server-minted head cursor so only events applied after subscription are delivered. An unset start is `INVALID_ARGUMENT`.
+- With `after_cursor`, the cursor's encoded family is authoritative; a non-default request `family` that disagrees is `INVALID_ARGUMENT`. `earliest_retained` and `live_tail` resolve within the request's `family` field.
 - The server emits historical events first (replay phase) and then continues with live events in one ordered sequence; clients see no transition.
 - Stream end means the consumer disconnected or the server is shutting down. It never means a new block arrived. Clients must distinguish stream end from stream error and reconnect with their last persisted cursor in both cases.
 - An expired cursor returns the typed `EventCursorExpired` error and does not silently restart from the current tip.
@@ -246,8 +247,8 @@ Three architectural consequences follow from that map:
 
 The native protocol exposes two complementary mempool methods:
 
-- **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold. Paging uses the standard opaque, HMAC-authenticated `StreamCursorTokenV1` under its `SnapshotPage` family (offset-49 nibble `0x5`): the next-page `bytes` carry the snapshot sequence and the last yielded transaction id. A tampered cursor returns `SNAPSHOT_PAGE_CURSOR_INVALID`; a cursor for a snapshot sequence newer than the writer currently retains returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`. There is no separate snapshot-cursor codec.
-- **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via the `StreamCursorTokenV1` mempool-event family.
+- **`WalletQuery.MempoolSnapshot`** returns a bounded, pageable point-in-time view of the live mempool index, bound to the visible `ChainEpoch` at call time. The response carries `snapshot_age_millis` so clients with strict freshness needs can choose to subscribe to `MempoolEvents` when the age exceeds a threshold, and `events_resume_cursor`, an opaque `MempoolEvents` `after_cursor` value anchored at the last mempool event the writer had applied when the walk began ([ADR-0027](../adrs/0027-event-stream-start-positions.md)). The resume cursor is identical on every page of one paged walk and empty when the writer had applied no event yet (consumers then subscribe with `earliest_retained`). Replaying from it is at-least-once; consumers apply events idempotently. Paging uses the standard opaque, HMAC-authenticated `StreamCursorTokenV1` under its `SnapshotPage` family (offset-49 nibble `0x5`): the next-page `bytes` carry the walk's anchor event position and the last yielded transaction id. A tampered cursor returns `SNAPSHOT_PAGE_CURSOR_INVALID`; a cursor anchored ahead of the mempool-event sequence the writer has applied returns `SNAPSHOT_PAGE_CURSOR_EXPIRED`. There is no separate snapshot-cursor codec.
+- **`WalletQuery.MempoolEvents`** is a server-streaming subscription that mirrors Zebra's `MempoolChange` semantics: typed `Added`, `Invalidated`, `Mined` envelopes with cursor-resume via the `StreamCursorTokenV1` mempool-event family. The request carries the same required `EventStreamStart start` oneof as `ChainEvents`; `live_tail` resolves to the newest retained envelope's cursor at subscribe time.
 
 `Invalidated` is not optional. If the polling backend observes a txid disappear
 from `getrawmempool` without a corresponding block commit, it emits
@@ -306,7 +307,11 @@ identity in one cursor delivery.
 
 The lightwalletd compat shim maps `GetMempoolStream` and `GetMempoolTx` over
 `MempoolEvents` and `MempoolSnapshot` when the adapter is configured with the
-mempool surface. Deployments without that surface omit
+mempool surface. `GetMempoolStream` streams the current snapshot walk's
+contents first, then subscribes `MempoolEvents` with
+`after_cursor = events_resume_cursor` for live delivery; the composition is
+at-least-once, matching lightwalletd-go semantics. Deployments without that
+surface omit
 `wallet.events.mempool_v1` and `wallet.snapshot.mempool_v1` from
 `ServerCapabilities` and return a typed unavailable response from the compat
 methods.

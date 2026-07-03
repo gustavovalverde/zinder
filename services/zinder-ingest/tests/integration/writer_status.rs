@@ -14,9 +14,10 @@ use zinder_core::Network;
 use zinder_ingest::IngestControlGrpcAdapter;
 use zinder_proto::v1::{
     ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient},
-    wallet::{ChainEventStreamFamily, ChainEventsRequest},
+    wallet::{self, ChainEventStreamFamily, ChainEventsRequest},
 };
 use zinder_runtime::MAX_DECODING_MESSAGE_BYTES;
+use zinder_store::{EventStreamStartPosition, event_stream_start_message};
 use zinder_testkit::StoreFixture;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -101,7 +102,9 @@ async fn ingest_control_streams_chain_events_from_primary_store() -> Result<()> 
     let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
     let mut stream = client
         .chain_events(ChainEventsRequest {
-            from_cursor: Vec::new(),
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )),
             family: ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         })
@@ -146,7 +149,11 @@ async fn ingest_control_rejects_request_frame_exceeding_decoding_cap() -> Result
     let oversized_cursor = vec![0u8; MAX_DECODING_MESSAGE_BYTES + 1];
     let outcome = client
         .chain_events(ChainEventsRequest {
-            from_cursor: oversized_cursor,
+            start: Some(wallet::EventStreamStart {
+                position: Some(wallet::event_stream_start::Position::AfterCursor(
+                    oversized_cursor,
+                )),
+            }),
             family: ChainEventStreamFamily::Tip as i32,
             address_filter: Vec::new(),
         })

@@ -15,6 +15,12 @@ pub use error_policy::{
     status_for_reason, status_with_reason,
 };
 
+/// Wire-contract revision advertised in every `ops.ServerInfo` response.
+///
+/// Monotonically increasing marker, incremented whenever the semantics of an
+/// existing wire surface are revised in place. Consumers assert a minimum.
+pub const CONTRACT_REVISION: u32 = 1;
+
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///
 /// Wire it into `tonic_reflection::server::Builder::configure().register_encoded_file_descriptor_set(...)`

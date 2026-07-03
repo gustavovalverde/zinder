@@ -51,12 +51,12 @@ fn typed_detail_for(error: &StoreError) -> ErrorDetails {
             format!("oldest retained mempool event sequence is {oldest_retained_sequence}"),
         )]),
         StoreError::SnapshotPageCursorExpired {
-            snapshot_sequence,
-            current_snapshot_sequence,
+            anchor_event_sequence,
+            current_event_sequence,
         } => ErrorDetails::with_precondition_failure(vec![PreconditionViolation::new(
             "SNAPSHOT_PAGE_CURSOR_EXPIRED",
-            format!("snapshot_page:{snapshot_sequence}"),
-            format!("current snapshot sequence is {current_snapshot_sequence}"),
+            format!("snapshot_page:{anchor_event_sequence}"),
+            format!("current applied mempool-event sequence is {current_event_sequence}"),
         )]),
         StoreError::ArtifactMissing { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
@@ -197,8 +197,8 @@ mod tests {
             StoreError::MempoolEventCursorInvalid { reason: "probe" },
             StoreError::SnapshotPageCursorInvalid { reason: "probe" },
             StoreError::SnapshotPageCursorExpired {
-                snapshot_sequence: 2,
-                current_snapshot_sequence: 1,
+                anchor_event_sequence: 2,
+                current_event_sequence: 1,
             },
             StoreError::ChainEventSequenceOverflow,
             StoreError::MempoolEventSequenceOverflow,

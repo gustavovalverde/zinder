@@ -796,6 +796,135 @@ fn transparent_unspent_outputs_by_outpoint_response_round_trips_through_prost() 
     Ok(())
 }
 
+#[test]
+fn event_stream_start_round_trips_each_position() -> eyre::Result<()> {
+    let after_cursor = wallet::EventStreamStart {
+        position: Some(wallet::event_stream_start::Position::AfterCursor(vec![
+            0xAB;
+            82
+        ])),
+    };
+    assert_eq!(
+        round_trip(&after_cursor)?.position,
+        Some(wallet::event_stream_start::Position::AfterCursor(vec![
+            0xAB;
+            82
+        ]))
+    );
+
+    let earliest = wallet::EventStreamStart {
+        position: Some(wallet::event_stream_start::Position::EarliestRetained(
+            wallet::EarliestRetained {},
+        )),
+    };
+    assert!(matches!(
+        round_trip(&earliest)?.position,
+        Some(wallet::event_stream_start::Position::EarliestRetained(_))
+    ));
+
+    let live_tail = wallet::EventStreamStart {
+        position: Some(wallet::event_stream_start::Position::LiveTail(
+            wallet::LiveTail {},
+        )),
+    };
+    assert!(matches!(
+        round_trip(&live_tail)?.position,
+        Some(wallet::event_stream_start::Position::LiveTail(_))
+    ));
+
+    let unset = wallet::EventStreamStart { position: None };
+    assert!(round_trip(&unset)?.position.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn chain_events_request_round_trips_start_and_family() -> eyre::Result<()> {
+    let request = wallet::ChainEventsRequest {
+        start: Some(wallet::EventStreamStart {
+            position: Some(wallet::event_stream_start::Position::LiveTail(
+                wallet::LiveTail {},
+            )),
+        }),
+        family: wallet::ChainEventStreamFamily::Safe as i32,
+        address_filter: vec!["t1deadbeef".to_owned()],
+    };
+    let decoded = round_trip(&request)?;
+
+    assert!(matches!(
+        decoded.start.and_then(|start| start.position),
+        Some(wallet::event_stream_start::Position::LiveTail(_))
+    ));
+    assert_eq!(decoded.family, wallet::ChainEventStreamFamily::Safe as i32);
+    assert_eq!(decoded.address_filter, vec!["t1deadbeef".to_owned()]);
+    Ok(())
+}
+
+#[test]
+fn mempool_events_request_round_trips_start_and_family() -> eyre::Result<()> {
+    let request = wallet::MempoolEventsRequest {
+        start: Some(wallet::EventStreamStart {
+            position: Some(wallet::event_stream_start::Position::AfterCursor(vec![
+                0x0F;
+                82
+            ])),
+        }),
+        family: wallet::MempoolEventStreamFamily::Mempool as i32,
+    };
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(
+        decoded.start.and_then(|start| start.position),
+        Some(wallet::event_stream_start::Position::AfterCursor(vec![
+            0x0F;
+            82
+        ]))
+    );
+    assert_eq!(
+        decoded.family,
+        wallet::MempoolEventStreamFamily::Mempool as i32
+    );
+    Ok(())
+}
+
+#[test]
+fn mempool_snapshot_response_round_trips_events_resume_cursor() -> eyre::Result<()> {
+    let response = wallet::MempoolSnapshotResponse {
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(synthetic_chain_epoch()),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }),
+        events_resume_cursor: vec![0xC4; 82],
+        snapshot_age_millis: 250,
+        entries: Vec::new(),
+        next_cursor: vec![0xD5; 114],
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.events_resume_cursor, vec![0xC4; 82]);
+    assert_eq!(decoded.snapshot_age_millis, 250);
+    assert_eq!(decoded.next_cursor, vec![0xD5; 114]);
+    Ok(())
+}
+
+#[test]
+fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
+    let server_info = ops::ServerInfo {
+        network: "zcash-regtest".to_owned(),
+        service_name: "zinder-query".to_owned(),
+        service_version: "0.1.0".to_owned(),
+        capabilities: vec![zinder_proto::capabilities::WALLET_EVENTS_CHAIN_V1.to_owned()],
+        contract_revision: zinder_proto::CONTRACT_REVISION,
+    };
+    let decoded = round_trip(&server_info)?;
+
+    assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
+    assert_eq!(decoded.contract_revision, 1);
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

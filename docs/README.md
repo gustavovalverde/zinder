@@ -51,6 +51,8 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0023: Typed broadcast rejection reasons and a queued outcome](adrs/0023-typed-broadcast-rejection-reasons.md)
 - [ADR-0024: Wire format uses RPC byte order for hashes](adrs/0024-wire-format-rpc-byte-order.md)
 - [ADR-0025: Self-healing reorg on ChainEvents reconnect with a locator cursor](adrs/0025-chain-event-reconnect-reorg-locator.md)
+- [ADR-0026: Transparent UTXO-set commitment](adrs/0026-utxo-set-commitment.md)
+- [ADR-0027: Explicit event-stream start positions](adrs/0027-event-stream-start-positions.md)
 
 ## Reference
 
