@@ -3,9 +3,43 @@
 use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
 use zinder_proto::v1::ops::ErrorReason;
+use zinder_proto::v1::wallet;
 use zinder_proto::{BoundaryError, status_with_reason};
 
-use crate::StoreError;
+use crate::proto_codec::{
+    chain_event_stream_family_from_message, event_stream_start_from_message,
+    mempool_event_stream_family_from_message,
+};
+use crate::{
+    ChainEventStreamFamily, EventStreamStartPosition, MempoolEventStreamFamily, StoreError,
+};
+
+/// Decodes the wire `EventStreamStart` carried by a stream-subscribe request,
+/// mapping an unset or empty start position to `INVALID_ARGUMENT`.
+pub fn event_stream_start_from_request(
+    start: Option<wallet::EventStreamStart>,
+) -> Result<EventStreamStartPosition, Status> {
+    event_stream_start_from_message(start)
+        .ok_or_else(|| Status::invalid_argument("event-stream start position is required"))
+}
+
+/// Decodes the wire chain-event stream family carried by a stream-subscribe
+/// request, mapping unknown integers to `INVALID_ARGUMENT`.
+pub fn chain_event_stream_family_from_request(
+    family: i32,
+) -> Result<ChainEventStreamFamily, Status> {
+    chain_event_stream_family_from_message(family)
+        .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))
+}
+
+/// Decodes the wire mempool-event stream family carried by a stream-subscribe
+/// request, mapping unknown integers to `INVALID_ARGUMENT`.
+pub fn mempool_event_stream_family_from_request(
+    family: i32,
+) -> Result<MempoolEventStreamFamily, Status> {
+    mempool_event_stream_family_from_message(family)
+        .ok_or_else(|| Status::invalid_argument("mempool-event stream family is unknown"))
+}
 
 /// Maps a [`StoreError`] to the canonical gRPC status used by all services.
 ///

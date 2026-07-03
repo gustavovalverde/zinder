@@ -40,6 +40,7 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
     mempool_entry_from_message, mempool_event_envelope_from_message,
+    stream_cursor_from_message_bytes,
 };
 
 use super::surface::{
@@ -144,13 +145,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
         } else {
             Some(response.next_cursor)
         };
-        let events_resume_cursor = if response.events_resume_cursor.is_empty() {
-            None
-        } else {
-            Some(StreamCursorTokenV1::from_bytes(
-                response.events_resume_cursor,
-            ))
-        };
+        let events_resume_cursor = stream_cursor_from_message_bytes(response.events_resume_cursor);
         Ok(MempoolSnapshotPage {
             events_resume_cursor,
             entries,

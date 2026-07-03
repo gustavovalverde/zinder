@@ -6,6 +6,8 @@ use sha2::Sha256;
 use thiserror::Error;
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
+use crate::MempoolEventPosition;
+
 /// Fixed byte length of a fixed-body [`StreamCursorTokenV1`].
 ///
 /// Mempool, transparent-history, and address-output cursors are exactly this
@@ -256,22 +258,18 @@ impl SnapshotPageStreamFamily {
 
 /// Anchor used to construct a mempool-snapshot paging cursor token.
 ///
-/// The anchor pair (`anchor_event_sequence`, `anchor_transaction_id`) names
-/// the last mempool event applied to the live index when the snapshot walk
-/// began; every page of the walk re-mints the identical `MempoolEvents`
-/// resume cursor from it. A walk that began before any mempool event was
-/// applied carries a zero anchor.
+/// The events-resume anchor names the last mempool event applied to the live
+/// index when the snapshot walk began; every page of the walk re-mints the
+/// identical `MempoolEvents` resume cursor from it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotPageCursorAnchor {
     /// Network the cursor is bound to.
     pub network: Network,
     /// Stream family encoded in the cursor flags byte.
     pub family: SnapshotPageStreamFamily,
-    /// Mempool-event sequence the walk is anchored at; zero when the walk
-    /// began before any event was applied.
-    pub anchor_event_sequence: u64,
-    /// Transaction id of the anchor event; zeroed for a zero anchor.
-    pub anchor_transaction_id: TransactionId,
+    /// Position of the last mempool event applied when the walk began;
+    /// `None` when the walk began before any event was applied.
+    pub events_resume_anchor: Option<MempoolEventPosition>,
     /// Identifier of the snapshot transaction last delivered before this
     /// cursor was issued.
     pub after_transaction_id: TransactionId,
@@ -282,11 +280,9 @@ pub struct SnapshotPageCursorAnchor {
 pub struct SnapshotPageCursorPayload {
     /// Stream family encoded in the cursor flags byte.
     pub family: SnapshotPageStreamFamily,
-    /// Mempool-event sequence the walk is anchored at; zero when the walk
-    /// began before any event was applied.
-    pub anchor_event_sequence: u64,
-    /// Transaction id of the anchor event; zeroed for a zero anchor.
-    pub anchor_transaction_id: TransactionId,
+    /// Position of the last mempool event applied when the walk began;
+    /// `None` when the walk began before any event was applied.
+    pub events_resume_anchor: Option<MempoolEventPosition>,
     /// Identifier of the snapshot transaction last delivered before this
     /// cursor was issued.
     pub after_transaction_id: TransactionId,
@@ -695,21 +691,26 @@ impl StreamCursorTokenV1 {
     ///
     /// The fixed 50-byte body carries the paging position; the 32-byte
     /// anchor transaction id follows the flags byte, mirroring how
-    /// chain-event cursors extend past the fixed body.
+    /// chain-event cursors extend past the fixed body. An absent
+    /// events-resume anchor is encoded as a zero anchor pair.
     pub fn snapshot_page(
         anchor: SnapshotPageCursorAnchor,
         cursor_auth_key: [u8; 32],
     ) -> Result<Self, StreamCursorError> {
+        let events_resume_anchor = anchor.events_resume_anchor.unwrap_or(MempoolEventPosition {
+            event_sequence: 0,
+            transaction_id: TransactionId::from_bytes([0; 32]),
+        });
         let mut cursor_bytes = Vec::with_capacity(SNAPSHOT_PAGE_CURSOR_LEN);
         cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
         cursor_bytes.extend_from_slice(&anchor.network.id().to_be_bytes());
-        cursor_bytes.extend_from_slice(&anchor.anchor_event_sequence.to_be_bytes());
+        cursor_bytes.extend_from_slice(&events_resume_anchor.event_sequence.to_be_bytes());
         cursor_bytes.extend_from_slice(&anchor.after_transaction_id.as_bytes());
         // Reserved padding to keep the fixed body 50 bytes long
         // (1 + 4 + 8 + 32 + 4 + 1).
         cursor_bytes.extend_from_slice(&[0u8; 4]);
         cursor_bytes.push(anchor.family.flags());
-        cursor_bytes.extend_from_slice(&anchor.anchor_transaction_id.as_bytes());
+        cursor_bytes.extend_from_slice(&events_resume_anchor.transaction_id.as_bytes());
 
         let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
         cursor_bytes.extend_from_slice(&auth_tag);
@@ -759,11 +760,15 @@ impl StreamCursorTokenV1 {
             .map_err(|_| StreamCursorError::InvalidLength {
                 byte_count: self.0.len(),
             })?;
+        let anchor_event_sequence = read_u64_be(&self.0, 5)?;
+        let events_resume_anchor = (anchor_event_sequence > 0).then(|| MempoolEventPosition {
+            event_sequence: anchor_event_sequence,
+            transaction_id: TransactionId::from_bytes(anchor_transaction_id_bytes),
+        });
 
         Ok(SnapshotPageCursorPayload {
             family,
-            anchor_event_sequence: read_u64_be(&self.0, 5)?,
-            anchor_transaction_id: TransactionId::from_bytes(anchor_transaction_id_bytes),
+            events_resume_anchor,
             after_transaction_id: TransactionId::from_bytes(after_transaction_id_bytes),
         })
     }
@@ -945,9 +950,9 @@ mod tests {
     use super::{
         AUTH_TAG_LEN, AddressOutputCursorPayload, AddressOutputStreamFamily,
         CHAIN_EVENT_LOCATOR_MAX, CURSOR_BODY_LEN, ChainEventCursorAnchor, ChainEventLocator,
-        ChainEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor,
-        SnapshotPageCursorPayload, SnapshotPageStreamFamily, StreamCursorError,
-        StreamCursorTokenV1,
+        ChainEventStreamFamily, MempoolEventPosition, STREAM_CURSOR_TOKEN_V1_LEN,
+        SnapshotPageCursorAnchor, SnapshotPageCursorPayload, SnapshotPageStreamFamily,
+        StreamCursorError, StreamCursorTokenV1,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -1284,13 +1289,15 @@ mod tests {
     #[test]
     fn snapshot_page_cursor_round_trips() -> Result<(), StreamCursorError> {
         let after_transaction_id = TransactionId::from_bytes([3; 32]);
-        let anchor_transaction_id = TransactionId::from_bytes([8; 32]);
+        let events_resume_anchor = Some(MempoolEventPosition {
+            event_sequence: 17,
+            transaction_id: TransactionId::from_bytes([8; 32]),
+        });
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
                 family: SnapshotPageStreamFamily::SnapshotPage,
-                anchor_event_sequence: 17,
-                anchor_transaction_id,
+                events_resume_anchor,
                 after_transaction_id,
             },
             CURSOR_AUTH_KEY,
@@ -1307,11 +1314,28 @@ mod tests {
             decoded,
             SnapshotPageCursorPayload {
                 family: SnapshotPageStreamFamily::SnapshotPage,
-                anchor_event_sequence: 17,
-                anchor_transaction_id,
+                events_resume_anchor,
                 after_transaction_id,
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_page_cursor_round_trips_absent_anchor() -> Result<(), StreamCursorError> {
+        let cursor = StreamCursorTokenV1::snapshot_page(
+            SnapshotPageCursorAnchor {
+                network: Network::ZcashRegtest,
+                family: SnapshotPageStreamFamily::SnapshotPage,
+                events_resume_anchor: None,
+                after_transaction_id: TransactionId::from_bytes([3; 32]),
+            },
+            CURSOR_AUTH_KEY,
+        )?;
+
+        let decoded = cursor.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
+        assert_eq!(decoded.events_resume_anchor, None);
 
         Ok(())
     }
@@ -1322,8 +1346,10 @@ mod tests {
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
                 family: SnapshotPageStreamFamily::SnapshotPage,
-                anchor_event_sequence: 17,
-                anchor_transaction_id: TransactionId::from_bytes([8; 32]),
+                events_resume_anchor: Some(MempoolEventPosition {
+                    event_sequence: 17,
+                    transaction_id: TransactionId::from_bytes([8; 32]),
+                }),
                 after_transaction_id: TransactionId::from_bytes([3; 32]),
             },
             CURSOR_AUTH_KEY,
@@ -1348,8 +1374,10 @@ mod tests {
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
                 family: SnapshotPageStreamFamily::SnapshotPage,
-                anchor_event_sequence: 17,
-                anchor_transaction_id: TransactionId::from_bytes([8; 32]),
+                events_resume_anchor: Some(MempoolEventPosition {
+                    event_sequence: 17,
+                    transaction_id: TransactionId::from_bytes([8; 32]),
+                }),
                 after_transaction_id: TransactionId::from_bytes([3; 32]),
             },
             CURSOR_AUTH_KEY,
@@ -1374,8 +1402,10 @@ mod tests {
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
                 family: SnapshotPageStreamFamily::SnapshotPage,
-                anchor_event_sequence: 1,
-                anchor_transaction_id: TransactionId::from_bytes([8; 32]),
+                events_resume_anchor: Some(MempoolEventPosition {
+                    event_sequence: 1,
+                    transaction_id: TransactionId::from_bytes([8; 32]),
+                }),
                 after_transaction_id: TransactionId::from_bytes([3; 32]),
             },
             CURSOR_AUTH_KEY,

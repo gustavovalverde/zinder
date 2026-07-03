@@ -23,7 +23,7 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    StreamCursorTokenV1, chain_event_stream_family_from_message, event_stream_start_from_message,
+    StreamCursorTokenV1, chain_event_stream_family_from_request, event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -388,11 +388,8 @@ where
             }
 
             let request = request.into_inner();
-            let start = event_stream_start_from_message(request.start).ok_or_else(|| {
-                Status::invalid_argument("event-stream start position is required")
-            })?;
-            let requested_family = chain_event_stream_family_from_message(request.family)
-                .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
+            let start = event_stream_start_from_request(request.start)?;
+            let requested_family = chain_event_stream_family_from_request(request.family)?;
             let network = self.server_info_network()?;
             let address_filter = decode_address_filter(request.address_filter, network)
                 .map_err(|error| status_from_query_error(&error))?;

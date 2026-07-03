@@ -18,7 +18,7 @@ use zinder_core::{
 
 use crate::{
     ArtifactFamily, ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainRangeReverted,
-    MempoolEvent, MempoolEventEnvelope, StoreError, StreamCursorTokenV1,
+    MempoolEvent, MempoolEventEnvelope, MempoolEventPosition, StoreError, StreamCursorTokenV1,
 };
 
 use super::{
@@ -178,6 +178,65 @@ pub(crate) fn decode_mempool_event_observed_at(
         }
     })?;
     Ok(UnixTimestampMillis::new(record.source_observed_unix_millis))
+}
+
+/// Decodes only the `(event_sequence, transaction_id)` position of a
+/// persisted mempool event, skipping payload hydration.
+pub(crate) fn decode_mempool_event_position(
+    key: &StoreKey,
+    record_bytes: &[u8],
+) -> Result<MempoolEventPosition, StoreError> {
+    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event envelope record is not valid protobuf",
+        }
+    })?;
+    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event envelope is missing event",
+    })?;
+    let kind = MempoolEventKind::from_kind(event_record.event_kind).ok_or(
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event kind is unknown",
+        },
+    )?;
+    let transaction_id_bytes = match kind {
+        MempoolEventKind::Added => event_record
+            .added
+            .as_ref()
+            .map(|entry| entry.transaction_id.as_slice()),
+        MempoolEventKind::Invalidated => event_record
+            .invalidated
+            .as_ref()
+            .map(|invalidated| invalidated.transaction_id.as_slice()),
+        MempoolEventKind::Mined => event_record
+            .mined
+            .as_ref()
+            .map(|mined| mined.transaction_id.as_slice()),
+        MempoolEventKind::Suppressed => event_record
+            .suppressed
+            .as_ref()
+            .map(|suppressed| suppressed.transaction_id.as_slice()),
+    }
+    .ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool event is missing its payload",
+    })?;
+
+    Ok(MempoolEventPosition {
+        event_sequence: record.event_sequence,
+        transaction_id: decode_transaction_id_for_family(
+            ArtifactFamily::MempoolEvent,
+            key,
+            transaction_id_bytes,
+        )?,
+    })
 }
 
 pub(crate) fn decode_mempool_event_kind(

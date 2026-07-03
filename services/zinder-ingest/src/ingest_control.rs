@@ -24,11 +24,11 @@ use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
-    DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, MempoolEventPosition,
-    PrimaryChainStore, StreamCursorTokenV1, chain_event_envelope_message,
-    chain_event_stream_family_from_message, chain_view_message, event_stream_start_from_message,
+    DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
+    StoreError, StreamCursorTokenV1, chain_event_envelope_message,
+    chain_event_stream_family_from_request, chain_view_message, event_stream_start_from_request,
     mempool_entry_message, mempool_event_envelope_message,
-    mempool_event_stream_family_from_message, run_event_stream, status_from_store_error,
+    mempool_event_stream_family_from_request, run_event_stream, status_from_store_error,
     stream_cursor_from_message_bytes, transparent_mempool_output_message,
     transparent_mempool_spend_message, transparent_output_entry_message,
 };
@@ -193,14 +193,15 @@ impl IngestControl for IngestControlGrpcAdapter {
         request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
         let request = request.into_inner();
-        let start = event_stream_start_from_message(request.start)
-            .ok_or_else(|| Status::invalid_argument("event-stream start position is required"))?;
-        let requested_family = chain_event_stream_family_from_message(request.family)
-            .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))?;
-        let resume = self
-            .store
-            .resolve_chain_event_stream_start(&start, requested_family)
-            .map_err(|error| status_from_store_error(&error))?;
+        let start = event_stream_start_from_request(request.start)?;
+        let requested_family = chain_event_stream_family_from_request(request.family)?;
+        let resolve_store = self.store.clone();
+        let resume = tokio::task::spawn_blocking(move || {
+            resolve_store.resolve_chain_event_stream_start(&start, requested_family)
+        })
+        .await
+        .map_err(|join_error| Status::unavailable(join_error.to_string()))?
+        .map_err(|error| status_from_store_error(&error))?;
         let family = resume.family;
         let store = self.store.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
@@ -235,23 +236,29 @@ impl IngestControl for IngestControlGrpcAdapter {
         } else {
             let cursor = stream_cursor_from_message_bytes(request.from_cursor)
                 .ok_or_else(|| Status::invalid_argument("mempool snapshot cursor is empty"))?;
-            let applied_event_sequence = mempool_index
-                .last_applied_event()
-                .map_or(0, |position| position.event_sequence);
             let payload = self
                 .store
-                .decode_snapshot_page_cursor(&cursor, applied_event_sequence)
+                .decode_snapshot_page_cursor(&cursor)
                 .map_err(|error| status_from_store_error(&error))?;
             Some(payload)
         };
         let after_transaction_id = walk_anchor.map(|payload| payload.after_transaction_id);
         let snapshot_page = mempool_index.snapshot_page(max_entries, after_transaction_id);
+        if let Some(anchor) = walk_anchor.and_then(|payload| payload.events_resume_anchor) {
+            let current_event_sequence = snapshot_page
+                .last_applied_event
+                .map_or(0, |position| position.event_sequence);
+            if anchor.event_sequence > current_event_sequence {
+                return Err(status_from_store_error(
+                    &StoreError::SnapshotPageCursorExpired {
+                        anchor_event_sequence: anchor.event_sequence,
+                        current_event_sequence,
+                    },
+                ));
+            }
+        }
         let events_resume_anchor = match walk_anchor {
-            Some(payload) if payload.anchor_event_sequence > 0 => Some(MempoolEventPosition {
-                event_sequence: payload.anchor_event_sequence,
-                transaction_id: payload.anchor_transaction_id,
-            }),
-            Some(_) => None,
+            Some(payload) => payload.events_resume_anchor,
             None => snapshot_page.last_applied_event,
         };
         let events_resume_cursor = match events_resume_anchor {
@@ -298,14 +305,15 @@ impl IngestControl for IngestControlGrpcAdapter {
             return Err(Status::unavailable("mempool surface is not configured"));
         }
         let request = request.into_inner();
-        let start = event_stream_start_from_message(request.start)
-            .ok_or_else(|| Status::invalid_argument("event-stream start position is required"))?;
-        mempool_event_stream_family_from_message(request.family)
-            .ok_or_else(|| Status::invalid_argument("mempool-event stream family is unknown"))?;
-        let from_cursor = self
-            .store
-            .resolve_mempool_event_stream_start(&start)
-            .map_err(|error| status_from_store_error(&error))?;
+        let start = event_stream_start_from_request(request.start)?;
+        mempool_event_stream_family_from_request(request.family)?;
+        let resolve_store = self.store.clone();
+        let from_cursor = tokio::task::spawn_blocking(move || {
+            resolve_store.resolve_mempool_event_stream_start(&start)
+        })
+        .await
+        .map_err(|join_error| Status::unavailable(join_error.to_string()))?
+        .map_err(|error| status_from_store_error(&error))?;
         let store = self.store.clone();
         let (event_sender, event_receiver) = mpsc::channel(16);
         tokio::spawn(run_event_stream(

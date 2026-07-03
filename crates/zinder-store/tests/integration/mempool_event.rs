@@ -161,13 +161,11 @@ fn mempool_event_history_resume_from_latest_event_is_empty() -> eyre::Result<()>
     Ok(())
 }
 
-/// A snapshot-page cursor anchored at the current applied sequence is valid.
-///
-/// A cursor anchored ahead of it is rejected as expired. The decoded payload
-/// carries the anchor pair so every page re-mints one identical
-/// events-resume cursor.
+/// A snapshot-page cursor round-trips its events-resume anchor and paging
+/// position, so every page of a walk re-mints one identical events-resume
+/// cursor. An absent anchor round-trips as `None`.
 #[test]
-fn snapshot_page_cursor_at_current_is_valid_and_future_is_expired() -> eyre::Result<()> {
+fn snapshot_page_cursor_round_trips_anchor_and_paging_position() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = open_store(tempdir.path())?;
     let after = TransactionId::from_bytes([0xA0; 32]);
@@ -176,25 +174,15 @@ fn snapshot_page_cursor_at_current_is_valid_and_future_is_expired() -> eyre::Res
         transaction_id: TransactionId::from_bytes([0xA5; 32]),
     };
 
-    let at_current = store.encode_snapshot_page_cursor(Some(anchor), after)?;
-    let payload = store.decode_snapshot_page_cursor(&at_current, 5)?;
-    assert_eq!(payload.anchor_event_sequence, 5);
-    assert_eq!(payload.anchor_transaction_id, anchor.transaction_id);
+    let anchored = store.encode_snapshot_page_cursor(Some(anchor), after)?;
+    let payload = store.decode_snapshot_page_cursor(&anchored)?;
+    assert_eq!(payload.events_resume_anchor, Some(anchor));
     assert_eq!(payload.after_transaction_id, after);
 
-    let future_anchor = MempoolEventPosition {
-        event_sequence: 6,
-        ..anchor
-    };
-    let future = store.encode_snapshot_page_cursor(Some(future_anchor), after)?;
-    let error = match store.decode_snapshot_page_cursor(&future, 5) {
-        Ok(payload) => return Err(eyre!("expected expired cursor, got {payload:?}")),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error,
-        StoreError::SnapshotPageCursorExpired { .. }
-    ));
+    let unanchored = store.encode_snapshot_page_cursor(None, after)?;
+    let payload = store.decode_snapshot_page_cursor(&unanchored)?;
+    assert_eq!(payload.events_resume_anchor, None);
+    assert_eq!(payload.after_transaction_id, after);
     Ok(())
 }
 

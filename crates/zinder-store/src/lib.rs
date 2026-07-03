@@ -55,7 +55,10 @@ pub use format::{
     StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
     TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
 };
-pub use grpc_status::status_from_store_error;
+pub use grpc_status::{
+    chain_event_stream_family_from_request, event_stream_start_from_request,
+    mempool_event_stream_family_from_request, status_from_store_error,
+};
 pub use kv::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, build_block_based_table_factory,
     open_bounded_rocksdb,

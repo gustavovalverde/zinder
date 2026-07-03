@@ -34,7 +34,8 @@ use zinder_source::transparent_address_matches_network;
 use zinder_store::MempoolEvent;
 
 use crate::mempool::{
-    MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcherError,
+    MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
+    TipChangeWatcherError,
 };
 
 type GrpcStream<T> =
@@ -559,41 +560,36 @@ where
         let request = request.into_inner();
         let exclude_txid_suffixes = request.exclude_txid_suffixes;
         let pool_selection = pool_selection_from_request(&request.pool_types)?;
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
         let mut compact_messages = Vec::new();
-        let mut next_cursor = None;
-        loop {
-            let snapshot_page = mempool_surface
-                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, next_cursor)
-                .await
-                .map_err(status_from_mempool_surface_error)?;
-            for entry in snapshot_page.entries {
-                if txid_matches_excluded_suffix(
-                    &encode_internal_transaction_id(entry.transaction_id),
-                    &exclude_txid_suffixes,
-                ) {
-                    continue;
-                }
-                let compact_message =
-                    lightwalletd::CompactTx::decode(entry.compact_transaction_bytes.as_slice())
-                        .map_err(|error| {
-                            Status::data_loss(format!(
-                                "stored compact transaction bytes failed to decode: {error}"
-                            ))
-                        })?;
-                let pruned = prune_compact_transaction(
-                    compact_message,
-                    pool_selection,
-                    CompactBlockPayloadMode::Full,
-                );
-                if !compact_transaction_has_payload(&pruned) {
-                    continue;
-                }
-                compact_messages.push(Ok(pruned));
+        while let Some(entry_outcome) = entries.next().await {
+            let entry = entry_outcome?;
+            if txid_matches_excluded_suffix(
+                &encode_internal_transaction_id(entry.transaction_id),
+                &exclude_txid_suffixes,
+            ) {
+                continue;
             }
-            if snapshot_page.next_cursor.is_none() {
-                break;
+            let compact_message =
+                lightwalletd::CompactTx::decode(entry.compact_transaction_bytes.as_slice())
+                    .map_err(|error| {
+                        Status::data_loss(format!(
+                            "stored compact transaction bytes failed to decode: {error}"
+                        ))
+                    })?;
+            let pruned = prune_compact_transaction(
+                compact_message,
+                pool_selection,
+                CompactBlockPayloadMode::Full,
+            );
+            if !compact_transaction_has_payload(&pruned) {
+                continue;
             }
-            next_cursor = snapshot_page.next_cursor;
+            compact_messages.push(Ok(pruned));
         }
         Ok(Response::new(Box::pin(stream::iter(compact_messages))))
     }
@@ -613,32 +609,17 @@ where
         // continue with events strictly after the walk's resume anchor. The
         // anchor guarantees at-least-once delivery; a transaction admitted
         // mid-walk may appear both in a later page and as an event.
-        let mut initial_raw_transactions = Vec::new();
-        let mut events_resume_cursor = None;
-        let mut first_page = true;
-        let mut next_cursor = None;
-        loop {
-            let snapshot_page = mempool_surface
-                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, next_cursor)
-                .await
-                .map_err(status_from_mempool_surface_error)?;
-            if first_page {
-                events_resume_cursor = snapshot_page.events_resume_cursor;
-                first_page = false;
-            }
-            for entry in &snapshot_page.entries {
-                initial_raw_transactions.push(Ok(mempool_raw_transaction(entry)));
-            }
-            match snapshot_page.next_cursor {
-                Some(cursor) => next_cursor = Some(cursor),
-                None => break,
-            }
-        }
-        let event_stream = mempool_surface
-            .mempool_events(events_resume_cursor)
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
             .map_err(status_from_mempool_surface_error)?;
-        let raw_transaction_stream = stream::iter(initial_raw_transactions).chain(
+        let event_stream = mempool_surface
+            .mempool_events(first_page.events_resume_cursor.clone())
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let snapshot_raw_transactions = mempool_snapshot_entries(mempool_surface, first_page)
+            .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
+        let raw_transaction_stream = snapshot_raw_transactions.chain(
             stream::StreamExt::filter_map(event_stream, project_added_to_raw_transaction),
         );
 
@@ -1373,6 +1354,42 @@ where
         }
     });
     tokio_stream::wrappers::ReceiverStream::new(output_receiver)
+}
+
+/// Streams live-mempool entries page by page, starting with the
+/// already-fetched first page and fetching later pages only as the consumer
+/// pulls, so the walk never materializes the whole mempool.
+fn mempool_snapshot_entries(
+    mempool_surface: SharedMempoolSurface,
+    first_page: MempoolSnapshotPage,
+) -> tokio_stream::wrappers::ReceiverStream<Result<zinder_core::MempoolEntry, Status>> {
+    let (entry_sender, entry_receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut page = first_page;
+        loop {
+            for entry in page.entries {
+                if entry_sender.send(Ok(entry)).await.is_err() {
+                    return;
+                }
+            }
+            let Some(cursor) = page.next_cursor else {
+                return;
+            };
+            page = match mempool_surface
+                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, Some(cursor))
+                .await
+            {
+                Ok(next_page) => next_page,
+                Err(error) => {
+                    let _ = entry_sender
+                        .send(Err(status_from_mempool_surface_error(error)))
+                        .await;
+                    return;
+                }
+            };
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(entry_receiver)
 }
 
 fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {

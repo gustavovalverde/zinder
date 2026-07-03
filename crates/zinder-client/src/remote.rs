@@ -33,8 +33,7 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_transparent_utxo_set_commitment;
 use zinder_store::{
-    self, ChainEventStreamFamily, EventStreamStartPosition, MempoolDecodeError,
-    StreamCursorTokenV1, chain_epoch_from_message, event_stream_start_message,
+    self, ChainEventStreamFamily, MempoolDecodeError, chain_epoch_from_message,
     mempool_entry_from_message,
     mempool_event_envelope_from_message as mempool_event_envelope_from_message_shared,
     outpoint_message,
@@ -721,7 +720,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .chain_events(Request::new(wallet::ChainEventsRequest {
                 start: Some(event_stream_start_to_message(&start, |cursor| {
-                    cursor.as_bytes().to_vec()
+                    cursor.as_bytes()
                 })),
                 family: chain_event_stream_family_to_message(family) as i32,
                 address_filter,
@@ -766,7 +765,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .mempool_events(Request::new(wallet::MempoolEventsRequest {
                 start: Some(event_stream_start_to_message(&start, |cursor| {
-                    cursor.as_bytes().to_vec()
+                    cursor.as_bytes()
                 })),
                 family: wallet::MempoolEventStreamFamily::Mempool as i32,
             }))
@@ -1669,16 +1668,22 @@ fn mempool_snapshot_view_from_message(
 /// extracting the opaque cursor bytes with `cursor_bytes`.
 fn event_stream_start_to_message<Cursor>(
     start: &EventStreamStart<Cursor>,
-    cursor_bytes: impl Fn(&Cursor) -> Vec<u8>,
+    cursor_bytes: impl for<'cursor> Fn(&'cursor Cursor) -> &'cursor [u8],
 ) -> wallet::EventStreamStart {
     let position = match start {
-        EventStreamStart::AfterCursor(cursor) => EventStreamStartPosition::AfterCursor(
-            StreamCursorTokenV1::from_bytes(cursor_bytes(cursor)),
-        ),
-        EventStreamStart::EarliestRetained => EventStreamStartPosition::EarliestRetained,
-        EventStreamStart::LiveTail => EventStreamStartPosition::LiveTail,
+        EventStreamStart::AfterCursor(cursor) => {
+            wallet::event_stream_start::Position::AfterCursor(cursor_bytes(cursor).to_vec())
+        }
+        EventStreamStart::EarliestRetained => {
+            wallet::event_stream_start::Position::EarliestRetained(wallet::EarliestRetained {})
+        }
+        EventStreamStart::LiveTail => {
+            wallet::event_stream_start::Position::LiveTail(wallet::LiveTail {})
+        }
     };
-    event_stream_start_message(&position)
+    wallet::EventStreamStart {
+        position: Some(position),
+    }
 }
 
 #[allow(

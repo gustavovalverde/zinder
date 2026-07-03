@@ -489,6 +489,42 @@ async fn ingest_control_snapshot_resume_cursor_is_stable_and_replays_exactly() -
     Ok(())
 }
 
+/// A snapshot cursor anchored ahead of the writer's applied mempool-event
+/// sequence names an event this writer never emitted; the walk is rejected
+/// as expired.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_rejects_snapshot_cursor_anchored_ahead_of_applied_events() -> Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let store = store_fixture.chain_store().clone();
+    let ahead_cursor = store.encode_snapshot_page_cursor(
+        Some(MempoolEventPosition {
+            event_sequence: 7,
+            transaction_id: TransactionId::from_bytes([0xAA; 32]),
+        }),
+        TransactionId::from_bytes([0xA0; 32]),
+    )?;
+
+    let listen_addr = spawn_ingest_control(store, MempoolIndex::new()).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+    let status = match client
+        .mempool_snapshot(ControlMempoolSnapshotRequest {
+            max_entries: 1,
+            from_cursor: ahead_cursor.as_bytes().to_vec(),
+        })
+        .await
+    {
+        Ok(response) => {
+            return Err(eyre::eyre!(
+                "expected expired-cursor rejection, got {response:?}"
+            ));
+        }
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+    Ok(())
+}
+
 /// Bearer-token auth: a server configured with a token rejects requests
 /// that lack the header, rejects requests with the wrong token, and accepts
 /// requests carrying the matching token.
