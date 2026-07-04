@@ -62,6 +62,10 @@ jobs:
               - PACKAGE
           YAML
           )"
+          # buf's `.git#branch` reads a local branch ref; pull_request checkouts
+          # are detached with the base only under refs/remotes, so materialize it.
+          git rev-parse --verify --quiet "refs/heads/${base_ref}" >/dev/null \
+            || git branch "${base_ref}" "origin/${base_ref}"
           buf lint
           buf breaking \
             --against ".git#branch=${base_ref}" \
