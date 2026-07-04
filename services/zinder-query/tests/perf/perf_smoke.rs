@@ -18,12 +18,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
-use zinder_query::{WalletQuery, WalletQueryApi};
+use zinder_query::{FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQuery, WalletQueryApi};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 const PERF_SMOKE_BLOCK_COUNT: u32 = 1_000;
 const PERF_SMOKE_RANGE_BUDGET: Duration = Duration::from_secs(2);
+const PERF_SMOKE_FULL_BLOCK_RANGE_BUDGET: Duration = Duration::from_secs(5);
 const PERF_SMOKE_LATEST_BUDGET: Duration = Duration::from_millis(250);
+
+/// Upper bound the demand-driven full-block channel depth must respect. Far
+/// below [`PERF_SMOKE_BLOCK_COUNT`] so the assertion proves peak buffering
+/// tracks one sub-read, never the requested window.
+const FULL_BLOCK_STREAM_MAX_BUFFERED_CHUNKS: usize = 16;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Result<()> {
@@ -55,6 +61,51 @@ async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::R
     assert!(
         elapsed <= PERF_SMOKE_RANGE_BUDGET,
         "compact_block_range over {PERF_SMOKE_BLOCK_COUNT} blocks took {elapsed:?}, budget is {PERF_SMOKE_RANGE_BUDGET:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Result<()> {
+    const {
+        assert!(
+            FULL_BLOCK_STREAM_CHANNEL_CAPACITY <= FULL_BLOCK_STREAM_MAX_BUFFERED_CHUNKS,
+            "full-block stream must buffer far fewer chunks than the requested window so peak \
+             memory tracks one sub-read, not the block count"
+        );
+    }
+
+    let chain_fixture =
+        ChainFixture::new(Network::ZcashRegtest).extend_blocks(PERF_SMOKE_BLOCK_COUNT);
+    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let start = Instant::now();
+    let mut stream = wallet_query
+        .full_blocks_in_range(
+            BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(PERF_SMOKE_BLOCK_COUNT),
+            ),
+            None,
+        )
+        .await?;
+    let mut delivered: u32 = 0;
+    while let Some(block) = stream.blocks.recv().await {
+        block?;
+        delivered = delivered.saturating_add(1);
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(delivered, PERF_SMOKE_BLOCK_COUNT);
+    assert!(
+        elapsed <= PERF_SMOKE_FULL_BLOCK_RANGE_BUDGET,
+        "full_block_range over {PERF_SMOKE_BLOCK_COUNT} blocks took {elapsed:?}, budget is {PERF_SMOKE_FULL_BLOCK_RANGE_BUDGET:?}"
     );
 
     Ok(())

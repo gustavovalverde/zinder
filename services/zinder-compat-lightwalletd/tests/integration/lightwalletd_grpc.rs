@@ -33,7 +33,7 @@ use zinder_proto::compat::lightwalletd::{
 
 use zinder_query::{
     BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, CompactBlockRange,
-    FullBlock, FullBlockRange, LatestBlock, LatestSafeBlock, QueryError, RawTransaction,
+    FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock, QueryError, RawTransaction,
     SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
@@ -363,7 +363,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         &self,
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<FullBlockRange, QueryError> {
+    ) -> Result<FullBlockStream, QueryError> {
         self.record(at_epoch_id);
         self.inner
             .full_blocks_in_range(block_range, at_epoch_id)

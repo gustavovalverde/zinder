@@ -7,6 +7,7 @@ use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, CompactBlockArtifact, MAX_RAW_TRANSACTION_BYTES, MinedDetails,
@@ -113,15 +114,20 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError>;
 
-    /// Reads full serialized blocks for an inclusive height range.
+    /// Streams full serialized blocks for an inclusive height range under one
+    /// pinned chain epoch.
     ///
-    /// Served from stored block blobs. Any height with no retained blob aborts
-    /// the read with [`QueryError::ArtifactUnavailable`] for that height.
+    /// Served from stored block blobs. The whole stream reads one epoch,
+    /// resolved before this call returns, so an epoch-pin failure surfaces as
+    /// the returned error rather than mid-stream. Blocks arrive ascending and
+    /// contiguous; the first height with no retained blob terminates the
+    /// stream with [`QueryError::ArtifactUnavailable`] after the blocks
+    /// already delivered.
     async fn full_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<FullBlockRange, QueryError>;
+    ) -> Result<FullBlockStream, QueryError>;
 
     /// Reads typed transaction status by transaction id.
     ///
@@ -327,10 +333,23 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
 /// Default maximum compact-block count returned by one range call.
 pub const DEFAULT_MAX_COMPACT_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
-/// Default maximum full-block count returned by one range call. A mainnet
-/// full block can reach ~2 MB, so this bounds the buffered range to a few
-/// hundred MB before streaming.
-pub const DEFAULT_MAX_FULL_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
+/// Default maximum full-block count returned by one range call.
+///
+/// Sized to one wallet initial-scan batch so a 1000-block window is a single
+/// stream. The range is served demand-driven, so this bounds request width,
+/// not memory.
+pub const DEFAULT_MAX_FULL_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Blocks read per store multi-get while streaming a full-block range.
+///
+/// Caps the producer's working set to one sub-read regardless of window width.
+const FULL_BLOCK_STREAM_SUB_READ_BLOCKS: u32 = 16;
+
+/// Bounded depth of the full-block range channel.
+///
+/// In-flight blocks a slow consumer can stall behind stay near this many blobs
+/// plus one sub-read, so per-stream memory never scales with the window.
+pub const FULL_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 4;
 
 /// Hard cap on the number of addresses one balance request may sum across.
 ///
@@ -868,44 +887,15 @@ where
         &self,
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<FullBlockRange, QueryError> {
+    ) -> Result<FullBlockStream, QueryError> {
         let started_at = Instant::now();
         let requested_blocks = block_range.into_iter().len();
-        if let Err(error) = validate_block_range(block_range, self.options.max_full_block_range) {
-            let query_outcome = Err(error);
-            record_wallet_query_outcome(
-                "full_blocks_in_range",
-                started_at,
-                &query_outcome,
-                Some(requested_blocks),
-            );
-            return query_outcome;
-        }
-
-        let read_api = self.read_api.clone();
-        let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
-            let chain_epoch = reader.chain_epoch();
-            let block_blobs = reader.block_blobs_in_range(block_range)?;
-            let mut available_block_blobs = Vec::with_capacity(block_blobs.len());
-
-            for (height, block_blob) in block_range.into_iter().zip(block_blobs) {
-                let Some(block_blob) = block_blob else {
-                    return Err(block_height_artifact_unavailable(
-                        ArtifactFamily::BlockBlob,
-                        height,
-                    ));
-                };
-
-                available_block_blobs.push(block_blob);
-            }
-
-            Ok(FullBlockRange {
-                chain_epoch,
-                block_range,
-                block_blobs: available_block_blobs,
-            })
-        }))
+        let query_outcome = spawn_full_block_stream(
+            self.read_api.clone(),
+            self.options.max_full_block_range,
+            block_range,
+            at_epoch_id,
+        )
         .await;
         record_wallet_query_outcome(
             "full_blocks_in_range",
@@ -1399,6 +1389,151 @@ async fn join_blocking<Output>(
     }
 }
 
+/// Validates the range, resolves the pinning epoch, then spawns the async
+/// driver that streams it.
+///
+/// The chain epoch resolves before returning, so an over-cap request or an
+/// epoch-pin failure is the returned error rather than a mid-stream one. The
+/// driver holds no blocking thread across the client drain: each sub-read is
+/// its own short blocking task and blocks flow to the sink with async sends.
+async fn spawn_full_block_stream<ReadApi>(
+    read_api: ReadApi,
+    max_full_block_range: NonZeroU32,
+    block_range: BlockHeightRange,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<FullBlockStream, QueryError>
+where
+    ReadApi: ChainEpochReadApi + Clone + Send + 'static,
+{
+    validate_block_range(block_range, max_full_block_range)?;
+
+    let chain_epoch = resolve_full_block_epoch(read_api.clone(), at_epoch_id).await?;
+
+    let (block_sender, block_receiver) = mpsc::channel(FULL_BLOCK_STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(drive_full_block_range(
+        read_api,
+        chain_epoch.id,
+        block_range,
+        block_sender,
+    ));
+
+    Ok(FullBlockStream {
+        chain_epoch,
+        blocks: block_receiver,
+    })
+}
+
+/// Resolves the chain epoch that pins the whole full-block stream.
+///
+/// Runs in a short blocking task so the pin failure or store error surfaces as
+/// the returned error before any block is streamed.
+async fn resolve_full_block_epoch<ReadApi>(
+    read_api: ReadApi,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<ChainEpoch, QueryError>
+where
+    ReadApi: ChainEpochReadApi + Send + 'static,
+{
+    join_blocking(tokio::task::spawn_blocking(move || {
+        open_chain_epoch_reader(&read_api, at_epoch_id).map(|reader| reader.chain_epoch())
+    }))
+    .await
+}
+
+/// Async driver that streams one full-block range from a pinned epoch.
+///
+/// Walks the range in [`FULL_BLOCK_STREAM_SUB_READ_BLOCKS`] sub-reads, each in
+/// its own short blocking task re-pinned to `chain_epoch_id`, and forwards each
+/// blob to the sink with async sends. The first missing blob, store error,
+/// blocking-task failure, or mid-stream epoch sweep ends the stream with a
+/// terminal error after the blocks already sent; a dropped receiver stops the
+/// walk on the next send.
+async fn drive_full_block_range<ReadApi>(
+    read_api: ReadApi,
+    chain_epoch_id: ChainEpochId,
+    block_range: BlockHeightRange,
+    block_sender: mpsc::Sender<Result<BlockBlobArtifact, QueryError>>,
+) where
+    ReadApi: ChainEpochReadApi + Clone + Send + 'static,
+{
+    let last_height = block_range.end.value();
+    let mut sub_read_start = block_range.start.value();
+    loop {
+        let sub_read_end = sub_read_start
+            .saturating_add(FULL_BLOCK_STREAM_SUB_READ_BLOCKS - 1)
+            .min(last_height);
+        let sub_range = BlockHeightRange::inclusive(
+            BlockHeight::new(sub_read_start),
+            BlockHeight::new(sub_read_end),
+        );
+        let block_blobs =
+            match read_full_block_sub_range(read_api.clone(), chain_epoch_id, sub_range).await {
+                Ok(block_blobs) => block_blobs,
+                Err(error) => {
+                    let _ = block_sender.send(Err(error)).await;
+                    return;
+                }
+            };
+        if !forward_full_block_sub_range(&block_sender, sub_range, block_blobs).await {
+            return;
+        }
+        if sub_read_end == last_height {
+            return;
+        }
+        sub_read_start = sub_read_end.saturating_add(1);
+    }
+}
+
+/// Reads one epoch-pinned sub-range of block blobs in a short blocking task.
+///
+/// Re-pins `chain_epoch_id` per call so a mid-stream sweep of the epoch fails
+/// this read with [`QueryError::ChainEpochPinUnavailable`]; a panic in the walk
+/// surfaces as [`QueryError::BlockingTaskFailed`] rather than silent truncation.
+async fn read_full_block_sub_range<ReadApi>(
+    read_api: ReadApi,
+    chain_epoch_id: ChainEpochId,
+    sub_range: BlockHeightRange,
+) -> Result<Vec<Option<BlockBlobArtifact>>, QueryError>
+where
+    ReadApi: ChainEpochReadApi + Send + 'static,
+{
+    join_blocking(tokio::task::spawn_blocking(move || {
+        read_api
+            .chain_epoch_reader_at(chain_epoch_id)
+            .map_err(|error| map_epoch_pin_store_error(error, chain_epoch_id))?
+            .block_blobs_in_range(sub_range)
+            .map_err(QueryError::Store)
+    }))
+    .await
+}
+
+/// Forwards one sub-read's blobs to the sink in ascending height order.
+///
+/// Returns `true` when every blob was delivered and the walk should continue. A
+/// missing blob is sent as a terminal [`ArtifactFamily::BlockBlob`] unavailable
+/// error and returns `false`; a dropped receiver also returns `false`.
+async fn forward_full_block_sub_range(
+    block_sender: &mpsc::Sender<Result<BlockBlobArtifact, QueryError>>,
+    sub_range: BlockHeightRange,
+    block_blobs: Vec<Option<BlockBlobArtifact>>,
+) -> bool {
+    for (height, block_blob) in sub_range.into_iter().zip(block_blobs) {
+        let Some(block_blob) = block_blob else {
+            let _ = block_sender
+                .send(Err(block_height_artifact_unavailable(
+                    ArtifactFamily::BlockBlob,
+                    height,
+                )))
+                .await;
+            return false;
+        };
+        if block_sender.send(Ok(block_blob)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 fn map_broadcast_source_error(error: SourceError) -> QueryError {
     if matches!(error, SourceError::TransactionBroadcastDisabled) {
         QueryError::TransactionBroadcastDisabled
@@ -1674,15 +1809,19 @@ pub struct FullBlock {
     pub block_blob: BlockBlobArtifact,
 }
 
-/// Full serialized block range response bound to one chain epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FullBlockRange {
-    /// Chain epoch used for every block in this range.
+/// Demand-driven full-block range stream bound to one pinned chain epoch.
+///
+/// [`chain_epoch`](Self::chain_epoch) is resolved once and describes every
+/// delivered block. [`blocks`](Self::blocks) yields raw block blobs in
+/// ascending, contiguous height order until the range is exhausted; a missing
+/// blob or store failure arrives as a terminal `Err` after the blocks already
+/// delivered, and dropping the receiver stops the backing producer.
+#[derive(Debug)]
+pub struct FullBlockStream {
+    /// Chain epoch every delivered block is read under.
     pub chain_epoch: ChainEpoch,
-    /// Inclusive height range requested.
-    pub block_range: BlockHeightRange,
-    /// Raw block blobs in ascending height order.
-    pub block_blobs: Vec<BlockBlobArtifact>,
+    /// Ascending block blobs, then optionally one terminal error.
+    pub blocks: mpsc::Receiver<Result<BlockBlobArtifact, QueryError>>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by

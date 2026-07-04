@@ -288,24 +288,22 @@ where
         );
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
 
-        let full_blocks_in_range = self
+        let full_block_stream = self
             .query_api
             .full_blocks_in_range(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chain_view = build_chain_view_message(full_blocks_in_range.chain_epoch);
-        let full_block_chunks =
-            full_blocks_in_range
-                .block_blobs
-                .into_iter()
-                .map(move |block_blob| {
-                    Ok(wallet::FullBlocksInRangeChunk {
-                        chain_view: Some(chain_view.clone()),
-                        full_block: Some(build_full_block_message(block_blob)),
-                    })
-                });
+        let chain_view = build_chain_view_message(full_block_stream.chain_epoch);
+        let full_block_chunks = ReceiverStream::new(full_block_stream.blocks).map(move |block| {
+            block
+                .map(|block_blob| wallet::FullBlocksInRangeChunk {
+                    chain_view: Some(chain_view.clone()),
+                    full_block: Some(build_full_block_message(block_blob)),
+                })
+                .map_err(|error| status_from_query_error(&error))
+        });
 
-        Ok(Response::new(Box::pin(stream::iter(full_block_chunks))))
+        Ok(Response::new(Box::pin(full_block_chunks)))
     }
 
     async fn tree_state_at_height(

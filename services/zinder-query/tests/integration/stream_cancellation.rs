@@ -29,13 +29,13 @@ use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::transport::Server;
-use zinder_core::BlockHeight;
+use zinder_core::{BlockBlobArtifact, BlockHeight};
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::synthetic_chain_epoch;
+use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
 
 /// Number of pre-committed blocks the test store carries. Picked so each
 /// streamed range yields multiple chunks but the fixture build stays fast.
@@ -92,6 +92,56 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
         assert!(
             chunk.compact_block.is_some(),
             "second-stream chunk must carry a compact block"
+        );
+        second_chunk_count = second_chunk_count.saturating_add(1);
+    }
+    assert_eq!(
+        second_chunk_count, COMMITTED_BLOCK_COUNT,
+        "post-cancellation request must drain the full committed range"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_full_block_range_stream_does_not_break_subsequent_requests() -> Result<()> {
+    let server_addr = commit_store_and_spawn_grpc().await?;
+    let mut client = WalletQueryClient::connect(server_addr).await?;
+
+    let mut first_stream = client
+        .full_blocks_in_range(wallet::FullBlocksInRangeRequest {
+            start_height: 1,
+            end_height: COMMITTED_BLOCK_COUNT,
+            at_epoch_id: None,
+        })
+        .await?
+        .into_inner();
+    let first_chunk = first_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("server closed full-block-range stream without any chunk"))??;
+    assert!(
+        first_chunk.full_block.is_some(),
+        "first stream's first chunk must carry a full block"
+    );
+
+    // Drop the stream mid-flight so the bounded producer observes the closed
+    // receiver and stops issuing sub-reads instead of leaking a task.
+    drop(first_stream);
+
+    let mut second_stream = client
+        .full_blocks_in_range(wallet::FullBlocksInRangeRequest {
+            start_height: 1,
+            end_height: COMMITTED_BLOCK_COUNT,
+            at_epoch_id: None,
+        })
+        .await?
+        .into_inner();
+    let mut second_chunk_count: u32 = 0;
+    while let Some(chunk) = second_stream.next().await {
+        let chunk = chunk?;
+        assert!(
+            chunk.full_block.is_some(),
+            "second-stream chunk must carry a full block"
         );
         second_chunk_count = second_chunk_count.saturating_add(1);
     }
@@ -167,11 +217,16 @@ async fn commit_store_and_spawn_grpc() -> Result<String> {
 fn commit_synthetic_chain(store: &PrimaryChainStore, block_count: u32) -> Result<()> {
     for height in 1..=block_count {
         let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![compact_block],
-        ))?;
+        let block_blob = BlockBlobArtifact::new(
+            BlockHeight::new(height),
+            block_hash_from_seed(height),
+            block_hash_from_seed(height.saturating_sub(1)),
+            format!("raw-block-{height}").into_bytes(),
+        );
+        store.commit_chain_epoch(
+            ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+                .with_block_blobs(vec![block_blob]),
+        )?;
     }
     Ok(())
 }
