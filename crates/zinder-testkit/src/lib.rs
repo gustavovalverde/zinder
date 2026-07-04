@@ -55,7 +55,7 @@ pub use chain_fixture::{
 };
 pub use derive_fixture::{
     DeriveFixtureError, open_test_derive_store_for_canonical,
-    seed_transparent_address_transaction_history,
+    seed_transparent_address_transaction_history, seed_transparent_outpoint_spends,
 };
 pub use json_rpc_test_server::{
     JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,

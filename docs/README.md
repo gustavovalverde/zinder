@@ -54,6 +54,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0026: Transparent UTXO-set commitment](adrs/0026-utxo-set-commitment.md)
 - [ADR-0027: Explicit event-stream start positions](adrs/0027-event-stream-start-positions.md)
 - [ADR-0028: Per-consumer derive schema versioning](adrs/0028-per-consumer-derive-schema-versioning.md)
+- [ADR-0029: Durable transparent-outpoint spend projection and retention release floor](adrs/0029-durable-transparent-outpoint-spend-projection.md)
 
 ## Reference
 
@@ -78,6 +79,7 @@ Operational procedures for running Zinder against the workspace and external sys
 - **Transparent-address artifact surface**: [Wallet data plane §Transparent Address Outputs](architecture/wallet-data-plane.md#transparent-address-outputs) and [§Transparent Address Tx History](architecture/wallet-data-plane.md#transparent-address-tx-history) carry the wire shapes and capability strings; [Extending artifacts](architecture/extending-artifacts.md) holds the canonical worked example for adding a new artifact family.
 - **Transparent-address balance + derive-plane instantiation**: [Wallet data plane §Transparent Address Balance](architecture/wallet-data-plane.md#transparent-address-balance) defines the wallet and derive capabilities, and [Derive plane](architecture/derive-plane.md) defines the federation primitive.
 - **Prevout resolution**: [Wallet data plane §Transparent Prevout Resolution](architecture/wallet-data-plane.md#transparent-prevout-resolution) defines the compute-at-read-time read path.
+- **Durable spender resolution**: [Wallet data plane §Transparent Reverse-Spend Resolution](architecture/wallet-data-plane.md#transparent-reverse-spend-resolution) owns the public surface; [ADR-0029](adrs/0029-durable-transparent-outpoint-spend-projection.md) records the authority split, the retention release floor, and the startup guard.
 - **Mempool topology**: [ADR-0007](adrs/0007-mempool-topology-and-retention.md) records the durable mempool topology; [Wallet data plane §Mempool Snapshot and Subscription](architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) owns the public surface.
 
 ## Vocabulary and naming rules

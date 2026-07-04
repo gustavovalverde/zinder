@@ -359,6 +359,20 @@ impl<'store> ChainEpochReader<'store> {
             outpoints,
         )
     }
+
+    /// Reads the height through which the safe-tip retention sweep has actually
+    /// deleted transparent spend facts, or `None` before any real deletion.
+    ///
+    /// A canonical spend-fact miss for an outpoint spent at or below this
+    /// height means the fact was swept, not that the outpoint is unspent: a
+    /// durable projection is the only remaining source of the spender identity.
+    /// Below it a canonical miss must consult the projection; a checkpoint
+    /// bootstrap that advanced only the swept cursor leaves this marker unset.
+    pub fn transparent_retention_deleted_through_height(
+        &self,
+    ) -> Result<Option<BlockHeight>, StoreError> {
+        crate::chain_store::read_transparent_retention_deleted_through_height(&self.read_view)
+    }
 }
 
 impl BlockHeaderStore for ChainEpochReader<'_> {

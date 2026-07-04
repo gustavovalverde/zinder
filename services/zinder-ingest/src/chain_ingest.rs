@@ -140,6 +140,19 @@ pub enum IngestError {
     #[error(transparent)]
     DeriveStore(#[from] zinder_derive::DeriveStoreError),
 
+    /// The durable transparent-outpoint-spend projection is behind the
+    /// canonical retention sweep, so swept spender identities can never be
+    /// re-derived.
+    #[error(
+        "transparent-outpoint-spend projection height {projection_height} is behind the canonical retention sweep at height {deleted_through}; swept spend facts cannot be re-derived, so a full canonical re-ingest is required"
+    )]
+    SpendProjectionBehindRetentionSweep {
+        /// Durable height the spend projection has consumed through.
+        projection_height: u32,
+        /// Height through which canonical has deleted spend facts.
+        deleted_through: u32,
+    },
+
     /// Internal batching produced an empty commit.
     #[error("internal error: attempted to commit an empty canonical batch")]
     EmptyCanonicalBatch,
@@ -1486,6 +1499,9 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
         Some(IngestError::DeriveStore(_)) => "derive_store",
+        Some(IngestError::SpendProjectionBehindRetentionSweep { .. }) => {
+            "spend_projection_behind_retention_sweep"
+        }
     }
 }
 

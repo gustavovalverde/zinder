@@ -18,7 +18,8 @@ use zinder_ingest::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
     MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, classify_phase, current_chain_height, mempool_ready_channel,
+    TipFollowSubsystemsLauncher, classify_phase, current_chain_height,
+    ensure_spend_projection_not_behind_retention_sweep, mempool_ready_channel,
     open_primary_derive_store_for_canonical, run_ingest_loop, run_mempool_orchestrator,
     spawn_chain_event_retention_task, spawn_derive_replay_budget_metrics_task,
     spawn_derive_tailer_task, spawn_mempool_event_retention_task,
@@ -459,6 +460,12 @@ async fn run_ingest(
             return Err(wrapped);
         }
     };
+    if let Err(error) = ensure_spend_projection_not_behind_retention_sweep(&store, &derive_store) {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
     let derive_tailer_handle = spawn_derive_tailer_task(
         store.clone(),
         derive_store.clone(),

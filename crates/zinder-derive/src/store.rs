@@ -45,6 +45,9 @@ use crate::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
     },
+    consumer::transparent_outpoint_spend::{
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+    },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
         CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveConsumerSchema,
@@ -99,6 +102,7 @@ const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
     TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
     TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
+    TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
 ];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     BLOCK_SUMMARY_CONSUMER_NAME,
@@ -107,6 +111,7 @@ const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 ];
 
 /// Per-column-family options the derive plane tunes at open time.
@@ -515,6 +520,27 @@ impl DeriveStore {
             .try_catch_up_with_primary()
             .map_err(|source| DeriveStoreError::Operation {
                 operation: "try_catch_up_with_primary",
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })
+    }
+
+    /// Flushes the write-ahead log to disk so every prior write is durable.
+    ///
+    /// The derive store opens with `sync_writes: false`, so writes land in the
+    /// unsynced WAL. Before the canonical retention release floor vouches that
+    /// projection rows up to a height are durable, the writer fsyncs the WAL so
+    /// a host crash cannot leave the floor (and the canonical deletes it
+    /// authorizes) ahead of the projection rows they depend on. No-op on a
+    /// secondary, which owns no WAL of its own.
+    pub fn flush_wal_to_disk(&self) -> Result<(), DeriveStoreError> {
+        if self.is_secondary {
+            return Ok(());
+        }
+        self.db
+            .flush_wal(true)
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "flush_wal",
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
                 source,
             })

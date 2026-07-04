@@ -32,8 +32,8 @@ pub use chain_ingest::{
 };
 pub use derive_consumers::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,
-    open_primary_derive_store_for_canonical, spawn_derive_replay_budget_metrics_task,
-    spawn_derive_tailer_task,
+    ensure_spend_projection_not_behind_retention_sweep, open_primary_derive_store_for_canonical,
+    spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
 };
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use ingest_loop::{

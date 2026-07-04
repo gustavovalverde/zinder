@@ -1086,7 +1086,7 @@ source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
 [ingest.bulk_catchup]
-canonical_batch_max_blocks = 50
+canonical_batch_max_blocks = 100
 
 [ingest.modifiers]
 coverage = "wallet-serving"

@@ -480,6 +480,45 @@ impl PrimaryChainStore {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
     }
 
+    /// Reads the height through which the safe-tip retention sweep has deleted
+    /// transparent spend facts and their spent-output rows, or `None` before
+    /// the first sweep.
+    ///
+    /// Below this height the canonical store holds no transparent spend fact:
+    /// a durable projection is the only source of spender identity.
+    pub fn transparent_retention_swept_height(&self) -> Result<Option<BlockHeight>, StoreError> {
+        read_transparent_retention_swept_height(self.store.inner.as_ref())
+    }
+
+    /// Reads the height through which the safe-tip sweep has actually deleted
+    /// transparent spend facts, or `None` before any real deletion.
+    ///
+    /// Unlike the swept-through cursor, this marker advances only in a batch
+    /// that deletes spend facts, so it names exactly the highest settled height
+    /// whose spender identity survives only in the durable projection. The
+    /// startup guard reads it to decide whether the projection can still resolve
+    /// every swept spend.
+    pub fn transparent_retention_deleted_through_height(
+        &self,
+    ) -> Result<Option<BlockHeight>, StoreError> {
+        read_transparent_retention_deleted_through_height(self.store.inner.as_ref())
+    }
+
+    /// Publishes the durable-consumer retention release height.
+    ///
+    /// `zinder-ingest` calls this from the derive tailer as the durable
+    /// transparent-outpoint-spend projection advances. The safe-tip sweep never
+    /// deletes a spend fact above this height, so canonical retention releases
+    /// only what the durable projection has already recorded.
+    pub fn set_transparent_retention_release_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<(), StoreError> {
+        self.store
+            .inner
+            .write(vec![transparent_retention_release_height_put(height)])
+    }
+
     /// Reads the currently visible chain epoch.
     pub fn current_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         let cached = *self.cached_visible_chain_epoch.read();
@@ -2665,11 +2704,19 @@ impl SafeTipRetentionSweep {
 /// `transparent_spend_fact` in the same commit batch.
 ///
 /// The sweep covers heights from the persisted swept-through marker up to
-/// `min(new safe tip, previous tip)`. Spend facts committed by this same
-/// batch are not durable yet when the sweep reads, so bulk catchup (which
-/// advances the safe tip to the batch tip) sweeps each batch one commit
-/// later. A non-monotonic `AdvanceSafeTipTo` target leaves the marker and
-/// the projections untouched.
+/// `min(new safe tip, previous tip, retention release height)`. The retention
+/// release height is the durable-consumer floor: `zinder-ingest` publishes it
+/// through [`PrimaryChainStore::set_transparent_retention_release_height`] as the
+/// durable transparent-outpoint-spend projection advances, so a spend fact is
+/// deleted only once that projection has recorded its spender identity. Spend
+/// facts committed by this same batch are not durable yet when the sweep reads,
+/// so bulk catchup (which advances the safe tip to the batch tip) sweeps each
+/// batch one commit later. A non-monotonic `AdvanceSafeTipTo` target, or a
+/// release height below the swept marker, leaves the marker and the projections
+/// untouched. A sweep that deletes at least one fact also advances the
+/// `transparent_retention_deleted_through_height` marker to the same ceiling, so
+/// the startup guard can tell a real deletion apart from a checkpoint-bootstrap
+/// swept marker that deleted nothing.
 fn build_safe_tip_retention_sweep(
     inner: &impl RocksChainStoreRead,
     artifacts: &ChainEpochArtifacts,
@@ -2700,19 +2747,46 @@ fn build_safe_tip_retention_sweep(
 
     let swept_through =
         read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
+    let retention_release_height =
+        read_transparent_retention_release_height(inner)?.unwrap_or(BlockHeight::new(0));
     let sweep_ceiling = chain_epoch
         .settled_tip_height
-        .min(previous_chain_epoch.visible_tip_height);
+        .min(previous_chain_epoch.visible_tip_height)
+        .min(retention_release_height);
     if sweep_ceiling <= swept_through {
         return Ok(SafeTipRetentionSweep::empty());
     }
 
-    let mut deletes = Vec::new();
-    let mut swept_outpoints = 0_u64;
     let sweep_range = BlockHeightRange::inclusive(
         BlockHeight::new(swept_through.value().saturating_add(1)),
         sweep_ceiling,
     );
+    let (deletes, swept_outpoints) =
+        collect_settled_spend_sweep_deletes(inner, chain_epoch, previous_chain_epoch, sweep_range)?;
+
+    let mut puts = vec![transparent_retention_swept_height_put(sweep_ceiling)];
+    if swept_outpoints > 0 {
+        puts.push(transparent_retention_deleted_through_height_put(
+            sweep_ceiling,
+        ));
+    }
+    Ok(SafeTipRetentionSweep {
+        puts,
+        deletes,
+        swept_outpoints,
+    })
+}
+
+/// Collects the deletes for spend facts and spent-output rows finalized within
+/// `sweep_range`, returning them with the count of outpoints swept.
+fn collect_settled_spend_sweep_deletes(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    previous_chain_epoch: ChainEpoch,
+    sweep_range: BlockHeightRange,
+) -> Result<(Vec<StorageDelete>, u64), StoreError> {
+    let mut deletes = Vec::new();
+    let mut swept_outpoints = 0_u64;
     for height in sweep_range {
         let outpoints = read_visible_transparent_spend_fact_block_outpoints(
             inner,
@@ -2754,12 +2828,7 @@ fn build_safe_tip_retention_sweep(
             swept_outpoints = swept_outpoints.saturating_add(1);
         }
     }
-
-    Ok(SafeTipRetentionSweep {
-        puts: vec![transparent_retention_swept_height_put(sweep_ceiling)],
-        deletes,
-        swept_outpoints,
-    })
+    Ok((deletes, swept_outpoints))
 }
 
 fn encode_raw_blob_retention_signal(retention: RawBlobRetention) -> Vec<u8> {
@@ -2819,10 +2888,57 @@ fn transparent_retention_swept_height_put(height: BlockHeight) -> StoragePut {
     }
 }
 
-fn read_transparent_retention_swept_height(
+fn transparent_retention_release_height_put(height: BlockHeight) -> StoragePut {
+    StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::transparent_retention_release_height(),
+        value: height.value().to_be_bytes().to_vec(),
+    }
+}
+
+pub(super) fn transparent_retention_deleted_through_height_put(height: BlockHeight) -> StoragePut {
+    StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::transparent_retention_deleted_through_height(),
+        value: height.value().to_be_bytes().to_vec(),
+    }
+}
+
+pub(crate) fn read_transparent_retention_swept_height(
     inner: &impl RocksChainStoreRead,
 ) -> Result<Option<BlockHeight>, StoreError> {
-    let key = StoreKey::transparent_retention_swept_height();
+    read_storage_control_height(
+        inner,
+        StoreKey::transparent_retention_swept_height(),
+        "transparent retention swept height must be 4 bytes",
+    )
+}
+
+pub(crate) fn read_transparent_retention_release_height(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<BlockHeight>, StoreError> {
+    read_storage_control_height(
+        inner,
+        StoreKey::transparent_retention_release_height(),
+        "transparent retention release height must be 4 bytes",
+    )
+}
+
+pub(crate) fn read_transparent_retention_deleted_through_height(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<BlockHeight>, StoreError> {
+    read_storage_control_height(
+        inner,
+        StoreKey::transparent_retention_deleted_through_height(),
+        "transparent retention deleted-through height must be 4 bytes",
+    )
+}
+
+fn read_storage_control_height(
+    inner: &impl RocksChainStoreRead,
+    key: StoreKey,
+    corrupt_reason: &'static str,
+) -> Result<Option<BlockHeight>, StoreError> {
     let Some(height_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
         return Ok(None);
     };
@@ -2830,8 +2946,8 @@ fn read_transparent_retention_swept_height(
     let height_bytes =
         <[u8; 4]>::try_from(height_bytes.as_slice()).map_err(|_| StoreError::ArtifactCorrupt {
             family: ArtifactFamily::TransparentSpendFact,
-            key: key.clone().into(),
-            reason: "transparent retention swept height must be 4 bytes",
+            key: key.into(),
+            reason: corrupt_reason,
         })?;
     Ok(Some(BlockHeight::new(u32::from_be_bytes(height_bytes))))
 }

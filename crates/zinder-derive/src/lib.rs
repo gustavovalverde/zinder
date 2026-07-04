@@ -63,6 +63,12 @@ pub use consumer::transparent_address_transaction_history::{
     TransparentAddressTransactionHistoryConsumerError, TransparentAddressTransactionHistoryPage,
     TransparentAddressTransactionHistoryPageRequest,
 };
+pub use consumer::transparent_outpoint_spend::{
+    TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILIES, TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_OUTPOINT_SPEND_SCHEMA, TransparentOutpointSpendConsumer,
+    TransparentOutpointSpendConsumerError, encode_transparent_spend_row_value,
+};
 pub use consumer::{
     BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockKeyedConsumer,
     ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,

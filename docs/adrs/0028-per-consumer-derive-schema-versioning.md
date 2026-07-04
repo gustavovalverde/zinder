@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Derive-store schema lifecycle, consumer registration, open-time reconciliation |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0009](0009-explorer-plane-as-product-surface.md), [ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md), [Derive plane](../architecture/derive-plane.md) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0009](0009-explorer-plane-as-product-surface.md), [ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [Derive plane](../architecture/derive-plane.md) |
 
 ## Context
 
@@ -17,9 +17,11 @@ rebuild is possible.
 A single store-global derive schema version couples that decision to the
 wrong granularity. One consumer changing its key or payload layout invalidates
 every consumer's data at once: the whole derive store is wiped and every
-projection replays from the retention floor. Once canonical retention is
-clamped to derive progress, a whole-store wipe escalates further, forcing a
-from-genesis canonical re-ingest for a change that touched one column family.
+projection replays from the retention floor. Because canonical retention is
+clamped to durable derive progress
+([ADR-0029](0029-durable-transparent-outpoint-spend-projection.md)), a
+whole-store wipe escalates further, forcing a from-genesis canonical re-ingest
+for a change that touched one column family.
 
 Consumers already own disjoint column families and independent cursors
 ([ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md)). The

@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Wire format, UTXO-set accounting, public proto contract, capability discovery |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
 
 ## Context
 
@@ -67,3 +67,5 @@ The fold has real per-output CPU cost, so it is operator opt-in rather than alwa
 A consumer can verify two Zinder deployments hold the same transparent unspent set at one settled tip by comparing 32-byte display digests, and can recompute the commitment from a UTXO dump without Zinder-specific plumbing. The cost is one BLAKE2X expansion per unspent output per summary call on deployments that opt in; deployments that do not pay nothing and omit the field.
 
 The 2048-byte accumulator (not the 32-byte digest) is the canonical commitment carried on the wire, so two accumulators can be summed or differenced off-Zinder to reason about set deltas. A future zcashd-comparable membership rule or a wider lane width lands as a new scheme value, leaving `LtHash16` stable.
+
+The committed unspent set is also the spentness authority in the wallet plane's authority split ([ADR-0029]): absence from `TransparentUnspentOutputsByOutpoint` decides spent-versus-unspent, while the durable spend projection resolves only spender identity.

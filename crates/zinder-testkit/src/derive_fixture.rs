@@ -5,12 +5,15 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use zinder_core::{
     BlockHeight, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    wire::{encode_height_key_ascending, encode_height_key_descending},
+    TransparentSpendFact,
+    wire::{encode_height_key_ascending, encode_height_key_descending, encode_outpoint_key},
 };
 use zinder_derive::{
     DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    encode_transparent_spend_row_value,
 };
 
 const ADDRESS_HASH_LEN: usize = 32;
@@ -102,6 +105,45 @@ pub fn seed_transparent_address_transaction_history(
         )?;
     }
 
+    Ok(())
+}
+
+/// Seeds durable transparent-outpoint-spend rows in a derive store.
+///
+/// Writes the primary spend rows keyed by spent outpoint plus the per-height
+/// index rows the projection uses for rewind and freshness. Intended for query
+/// and client tests that populate the projection without running the ingest
+/// derive tailer. Row values reuse the consumer's
+/// [`encode_transparent_spend_row_value`] so the seeded bytes never diverge
+/// from what the consumer writes.
+///
+/// # Errors
+///
+/// Returns [`DeriveFixtureError`] when any derive-store write fails.
+pub fn seed_transparent_outpoint_spends(
+    derive_store: &DeriveStore,
+    spends: &[TransparentSpendFact],
+) -> Result<(), DeriveFixtureError> {
+    let mut index_payloads_by_height = BTreeMap::<BlockHeight, Vec<u8>>::new();
+    for spend in spends {
+        let key = encode_outpoint_key(spend.spent_outpoint);
+        derive_store.put_consumer(
+            TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY,
+            &key,
+            &encode_transparent_spend_row_value(spend),
+        )?;
+        index_payloads_by_height
+            .entry(spend.block_height)
+            .or_default()
+            .extend_from_slice(&key);
+    }
+    for (height, index_payload) in index_payloads_by_height {
+        derive_store.put_consumer(
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+            &encode_height_key_ascending(height),
+            &index_payload,
+        )?;
+    }
     Ok(())
 }
 

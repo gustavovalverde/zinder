@@ -34,6 +34,7 @@ mod chain_name;
 mod height_key;
 mod in_block_position;
 mod merkle_root;
+mod outpoint_key;
 mod transaction_id;
 mod unix_seconds;
 mod utxo_set_commitment;
@@ -62,6 +63,7 @@ pub use in_block_position::{
     IN_BLOCK_POSITION_KEY_LEN, decode_in_block_position, encode_in_block_position,
 };
 pub use merkle_root::{decode_rpc_merkle_root_hex, encode_rpc_merkle_root_hex};
+pub use outpoint_key::{OUTPOINT_KEY_LEN, decode_outpoint_key, encode_outpoint_key};
 pub use transaction_id::{
     decode_internal_transaction_id, decode_rpc_transaction_id_hex, encode_internal_transaction_id,
     encode_rpc_transaction_id_hex,

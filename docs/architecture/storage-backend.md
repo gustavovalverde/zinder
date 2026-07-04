@@ -109,7 +109,14 @@ it live again. `validate_reorg_window_change` rejects any `Replace` below
 `safe_tip_height` is irreversible: that is the deletion boundary. The sweep
 runs inside `commit_chain_epoch` on `AdvanceSafeTipTo` commits, covering
 `(previous_safe_tip, new_safe_tip]` via `transparent_spend_fact_block_index`,
-riding the same atomic `WriteBatch` as every other projection mutation.
+riding the same atomic `WriteBatch` as every other projection mutation. The
+sweep ceiling is additionally clamped to the persisted
+`transparent_retention_release_height`, the durable-consumer floor
+`zinder-ingest` publishes as the transparent-outpoint-spend projection
+advances, so a spend fact is deleted only after its spender identity is
+durably recorded elsewhere; a sweep that deletes at least one fact also
+advances the `transparent_retention_deleted_through_height` marker in the same
+batch ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 In-window reverted spends need no machinery at all: their rows were never
 deleted, and the existing spend-fact repair un-hides them. Bulk catchup
 sweeps with one-batch lag because the spend facts a batch commits are not

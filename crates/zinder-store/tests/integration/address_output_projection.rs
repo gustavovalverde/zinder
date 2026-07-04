@@ -81,6 +81,9 @@ fn safe_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> eyre:
                 spend_at(BlockHeight::new(5), &in_window_output),
             ]),
     )?;
+    // The durable spend projection has consumed through the tip, so the sweep
+    // may release retention up to the settled tip.
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
 
     let reader = store.current_chain_epoch_reader()?;
@@ -109,6 +112,146 @@ fn safe_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> eyre:
         NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max entries"))?,
     )?;
     assert_eq!(visible, vec![address_row(&unspent_output)]);
+
+    Ok(())
+}
+
+#[test]
+fn real_sweep_records_the_deleted_through_marker() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let finalized_output = output_at(BlockHeight::new(1), [26; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![finalized_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_output)]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    // A sweep that deletes a fact records the ceiling as the deleted-through
+    // height, so the ingest guard can tell it apart from a bare cursor advance.
+    assert_eq!(
+        store.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(3))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sweep_without_deletions_leaves_the_deleted_through_marker_unset() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let unspent_output = output_at(BlockHeight::new(1), [27; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5).with_transparent_outputs_by_outpoint(vec![unspent_output]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    // The swept cursor advances, but with nothing deleted the deleted-through
+    // marker stays unset so an empty projection reads as no deletion.
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+    assert_eq!(store.transparent_retention_deleted_through_height()?, None);
+
+    Ok(())
+}
+
+#[test]
+fn retention_release_floor_below_spend_height_keeps_the_spend_fact() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let settled_output = output_at(BlockHeight::new(1), [81; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![settled_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_output)]),
+    )?;
+    // The durable projection has only consumed through height 1, below the
+    // spend at height 2, so the sweep must not delete the spend fact even
+    // though it settled below the safe tip.
+    store.set_transparent_retention_release_height(BlockHeight::new(1))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&[settled_output.outpoint])?;
+    assert!(spends.contains_key(&settled_output.outpoint));
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(1))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn retention_release_floor_at_settle_height_sweeps_as_usual() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let settled_output = output_at(BlockHeight::new(1), [82; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![settled_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_output)]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(3))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&[settled_output.outpoint])?;
+    assert!(!spends.contains_key(&settled_output.outpoint));
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn retention_release_floor_regression_is_ignored_safely() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let early_spent = output_at(BlockHeight::new(1), [83; 32]);
+    let later_spent = output_at(BlockHeight::new(6), [84; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 10)
+            .with_transparent_outputs_by_outpoint(vec![early_spent.clone(), later_spent.clone()])
+            .with_transparent_spend_facts(vec![
+                spend_at(BlockHeight::new(2), &early_spent),
+                spend_at(BlockHeight::new(7), &later_spent),
+            ]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(10))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 10, 3, 3))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+
+    // A release floor below the already-swept marker cannot un-sweep, and the
+    // sweep must not regress the marker even though the settled tip advanced.
+    store.set_transparent_retention_release_height(BlockHeight::new(1))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(3, 10, 8, 8))?;
+
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader
+        .transparent_spend_facts_by_outpoints(&[early_spent.outpoint, later_spent.outpoint])?;
+    assert!(!spends.contains_key(&early_spent.outpoint));
+    assert!(spends.contains_key(&later_spent.outpoint));
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
 
     Ok(())
 }
@@ -163,6 +306,7 @@ fn secondary_reader_replays_safe_tip_sweep_deletes() -> eyre::Result<()> {
     );
     drop(pre_sweep_reader);
 
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
     secondary.try_catch_up()?;
 
@@ -267,6 +411,7 @@ fn utxo_set_summary_counts_unspent_below_the_settled_tip_and_excludes_swept_spen
             ])
             .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_spent)]),
     )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
     store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
 
     let reader = store.current_chain_epoch_reader()?;

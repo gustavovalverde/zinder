@@ -196,7 +196,8 @@ pub(crate) fn decide_recovery(
         | IngestError::ArtifactDerive(_)
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::DeriveDispatch(_)
-        | IngestError::DeriveStore(_) => SourceRecoveryDecision::Exit,
+        | IngestError::DeriveStore(_)
+        | IngestError::SpendProjectionBehindRetentionSweep { .. } => SourceRecoveryDecision::Exit,
     }
 }
 

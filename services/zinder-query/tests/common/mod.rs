@@ -132,6 +132,61 @@ pub fn synthetic_chain_epoch(
     )
 }
 
+/// Builds a chain epoch spanning blocks `1..=visible_tip` with an explicit
+/// settled tip.
+///
+/// Unlike [`synthetic_chain_epoch`], the settled tip is decoupled from the
+/// visible tip, so a caller can commit spends below the safe tip and then
+/// advance it to exercise the retention sweep.
+#[must_use]
+pub fn synthetic_multi_block_epoch(
+    chain_epoch_id: u64,
+    visible_tip: u32,
+    settled_tip: u32,
+) -> (
+    ChainEpoch,
+    Vec<BlockHeaderArtifact>,
+    Vec<CompactBlockArtifact>,
+) {
+    let chain_epoch = ChainEpoch {
+        id: ChainEpochId::new(chain_epoch_id),
+        network: Network::ZcashRegtest,
+        visible_tip_height: BlockHeight::new(visible_tip),
+        visible_tip_hash: block_hash_from_seed(visible_tip),
+        settled_tip_height: BlockHeight::new(settled_tip),
+        settled_tip_hash: block_hash_from_seed(settled_tip),
+        artifact_schema_version: ArtifactSchemaVersion::new(11),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(visible_tip)),
+    };
+    let blocks = (1..=visible_tip).map(synthetic_block_header).collect();
+    let compact_blocks = (1..=visible_tip).map(synthetic_block_compact).collect();
+    (chain_epoch, blocks, compact_blocks)
+}
+
+fn synthetic_block_header(height: u32) -> BlockHeaderArtifact {
+    BlockHeaderArtifact::new(
+        BlockHeight::new(height),
+        block_hash_from_seed(height),
+        block_hash_from_seed(height.saturating_sub(1)),
+        [0; 32],
+        [0; 32],
+        0,
+        0,
+        [0; 32],
+        0,
+        32,
+    )
+}
+
+fn synthetic_block_compact(height: u32) -> CompactBlockArtifact {
+    CompactBlockArtifact::new(
+        BlockHeight::new(height),
+        block_hash_from_seed(height),
+        format!("compact-block-{height}").into_bytes(),
+    )
+}
+
 /// Creates a compact block artifact whose payload encodes the given commitment-tree sizes.
 #[must_use]
 pub fn compact_block_with_tree_sizes(

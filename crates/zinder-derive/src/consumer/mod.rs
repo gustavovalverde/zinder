@@ -19,6 +19,7 @@ pub(crate) mod transaction_fees;
 pub(crate) mod transparent_address_activity;
 pub(crate) mod transparent_address_deltas;
 pub(crate) mod transparent_address_transaction_history;
+pub(crate) mod transparent_outpoint_spend;
 
 use std::collections::HashMap;
 

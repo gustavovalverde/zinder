@@ -95,6 +95,14 @@ impl StoreKey {
         Self(vec![KEY_VERSION, 16])
     }
 
+    pub(crate) fn transparent_retention_release_height() -> Self {
+        Self(vec![KEY_VERSION, 17])
+    }
+
+    pub(crate) fn transparent_retention_deleted_through_height() -> Self {
+        Self(vec![KEY_VERSION, 18])
+    }
+
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
@@ -698,12 +706,14 @@ mod tests {
             StoreKey::oldest_retained_mempool_event_sequence(),
             StoreKey::transparent_retention_swept_height(),
             StoreKey::raw_blob_retention(),
+            StoreKey::transparent_retention_release_height(),
+            StoreKey::transparent_retention_deleted_through_height(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 9);
+        assert_eq!(storage_control_keys.len(), 11);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),

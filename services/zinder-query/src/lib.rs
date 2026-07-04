@@ -21,9 +21,12 @@ use zinder_core::{
 };
 use zinder_derive::{
     DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransparentAddressTransactionHistoryConsumer,
+    TransparentAddressTransactionHistoryPageRequest, TransparentOutpointSpendConsumer,
 };
-use zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1;
+use zinder_proto::capabilities::{
+    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+};
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
@@ -748,19 +751,38 @@ where
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
+        let derive_store = self.derive_store.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
 
-            let spends_by_outpoint = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+            let canonical = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
 
-            let mut spends = Vec::with_capacity(spends_by_outpoint.len());
-            let mut seen = HashSet::with_capacity(spends_by_outpoint.len());
-            for outpoint in outpoints {
-                if let Some(fact) = spends_by_outpoint.get(&outpoint)
-                    && seen.insert(outpoint)
-                {
-                    spends.push(TransparentSpendEntry::from_spend_fact(fact));
+            let mut spends = Vec::with_capacity(outpoints.len());
+            let mut seen = HashSet::with_capacity(outpoints.len());
+            let mut canonical_misses = Vec::new();
+            for outpoint in &outpoints {
+                if let Some(fact) = canonical.get(outpoint) {
+                    if seen.insert(*outpoint) {
+                        spends.push(TransparentSpendEntry::from_spend_fact(fact));
+                    }
+                } else {
+                    canonical_misses.push(*outpoint);
+                }
+            }
+
+            if let Some(derive_store) = derive_store.as_ref()
+                && !canonical_misses.is_empty()
+            {
+                for entry in resolve_swept_spends_from_derive(
+                    derive_store,
+                    &reader,
+                    chain_epoch.settled_tip_height,
+                    &canonical_misses,
+                )? {
+                    if seen.insert(entry.spent_outpoint) {
+                        spends.push(entry);
+                    }
                 }
             }
 
@@ -1343,6 +1365,76 @@ where
         );
         broadcast_outcome
     }
+}
+
+/// Resolves canonical spend-fact misses against the durable
+/// transparent-outpoint-spend projection.
+///
+/// The canonical read is authoritative inside the reorg window and above the
+/// deleted-through marker. Below that marker canonical holds no spend fact, so
+/// the projection is the only source of spender identity. Only spends at or
+/// below the pinned epoch's settled tip are surfaced: an above-settled-tip miss
+/// keeps today's semantics (absent means no fact visible in the window). The
+/// read refuses with the derive-lag vocabulary only when facts were actually
+/// deleted below the projection's durable height, so an empty projection on a
+/// store that never swept still returns the correct absent answer.
+fn resolve_swept_spends_from_derive(
+    derive_store: &DeriveStore,
+    reader: &zinder_store::ChainEpochReader<'_>,
+    settled_tip_height: BlockHeight,
+    canonical_misses: &[TransparentOutPoint],
+) -> Result<Vec<TransparentSpendEntry>, QueryError> {
+    derive_store
+        .try_catch_up()
+        .map_err(QueryError::DeriveStore)?;
+    let deleted_through = reader
+        .transparent_retention_deleted_through_height()
+        .map_err(QueryError::Store)?
+        .map_or(0, BlockHeight::value);
+    let derive_height = derive_store
+        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
+        .map_err(QueryError::DeriveStore)?;
+    if derive_height.map_or(0, BlockHeight::value) < deleted_through {
+        return Err(QueryError::DeriveLag {
+            capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
+            chain_tip_height: BlockHeight::new(deleted_through),
+            derive_height,
+        });
+    }
+    let derive_hits =
+        TransparentOutpointSpendConsumer::read_spends_by_outpoints(derive_store, canonical_misses)
+            .map_err(QueryError::DeriveStore)?;
+    let mut resolved = Vec::with_capacity(canonical_misses.len().min(derive_hits.len()));
+    for outpoint in canonical_misses {
+        let Some(entry) = derive_hits.get(outpoint) else {
+            continue;
+        };
+        if entry.spending_block_height <= settled_tip_height
+            && derive_spend_matches_canonical_header(reader, entry)?
+        {
+            resolved.push(entry.clone());
+        }
+    }
+    Ok(resolved)
+}
+
+/// Confirms a projection spend row still names the canonical block at its
+/// spending height.
+///
+/// The projection records rows for in-window blocks a later reorg can remove.
+/// Until the tailer replays that reorg the stale row survives, and once the
+/// safe tip advances past its height the settled-tip filter alone would surface
+/// it as the spender. Cross-checking the row's stored block hash against the
+/// retained canonical header (headers are never swept) makes a reorged-out row
+/// absent instead of a wrong spending transaction id.
+fn derive_spend_matches_canonical_header(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    entry: &TransparentSpendEntry,
+) -> Result<bool, QueryError> {
+    let canonical_header = reader
+        .block_header_at(entry.spending_block_height)
+        .map_err(QueryError::Store)?;
+    Ok(canonical_header.is_some_and(|header| header.block_hash == entry.spending_block_hash))
 }
 
 fn open_chain_epoch_reader<ReadApi>(

@@ -31,7 +31,8 @@ use crate::{
 use super::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, REBUILDABLE_STORE_SCHEMA_VERSION, STORE_SCHEMA_VERSION,
     address_output_row, decode_store_metadata, encode_store_metadata, read_chain_epoch,
-    read_current_chain_epoch_id, transparent_retention_swept_height_put,
+    read_current_chain_epoch_id, transparent_retention_deleted_through_height_put,
+    transparent_retention_swept_height_put,
 };
 
 const REBUILD_WRITE_CHUNK_ROWS: usize = 4096;
@@ -202,9 +203,15 @@ impl ProjectionRebuild {
     }
 
     /// Writes the remaining rows together with the version-11 store
-    /// metadata, the retention marker, and the migrated chain epoch. This
+    /// metadata, the retention markers, and the migrated chain epoch. This
     /// batch is what makes the rebuild durable; everything before it can be
     /// re-run after a crash.
+    ///
+    /// When the rebuild deleted at least one finalized-spent spend fact it also
+    /// seeds the deleted-through marker at the safe tip. Those swept facts are
+    /// the projection's only source, so a store that migrates past an absent
+    /// projection must fail the ingest startup guard rather than serve absent
+    /// spenders for genuinely spent outpoints.
     fn finalize(
         &mut self,
         inner: &RocksChainStore,
@@ -217,6 +224,12 @@ impl ProjectionRebuild {
         });
         self.pending_puts
             .push(transparent_retention_swept_height_put(self.safe_tip_height));
+        if self.swept_outpoints > 0 {
+            self.pending_puts
+                .push(transparent_retention_deleted_through_height_put(
+                    self.safe_tip_height,
+                ));
+        }
         if let Some(chain_epoch) = current_chain_epoch {
             let migrated_chain_epoch = ChainEpoch {
                 artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
@@ -286,7 +299,11 @@ mod tests {
 
     use crate::{
         ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
-        chain_store::read_transparent_retention_swept_height, kv::PrefixScanControl,
+        chain_store::{
+            read_transparent_retention_deleted_through_height,
+            read_transparent_retention_swept_height,
+        },
+        kv::PrefixScanControl,
     };
 
     use super::*;
@@ -480,6 +497,13 @@ mod tests {
 
         assert_eq!(
             read_transparent_retention_swept_height(store.store.inner.as_ref())?,
+            Some(BlockHeight::new(3))
+        );
+        // The migration deleted a finalized-spent fact, so it seeds the
+        // deleted-through marker; a fresh spend projection then fails the ingest
+        // guard rather than serving that swept spender as absent.
+        assert_eq!(
+            read_transparent_retention_deleted_through_height(store.store.inner.as_ref())?,
             Some(BlockHeight::new(3))
         );
 

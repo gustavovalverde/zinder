@@ -28,8 +28,10 @@ use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
     ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, MempoolConsumerEvent,
     MempoolConsumerEventVariant, MempoolEventCountsConsumer, RecentTransactionsConsumer,
-    TransactionFeesConsumer, TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
-    TransparentAddressTransactionHistoryConsumer, TransparentSpendFacts,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionFeesConsumer,
+    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
+    TransparentSpendFacts,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_store::{
@@ -62,6 +64,15 @@ pub const DEFAULT_DERIVE_TAILER_POLL_INTERVAL: Duration = Duration::from_secs(1)
 /// pass's opening head. Re-persisting on this throttle keeps the
 /// operator-facing health and indexed head truthful during the pass.
 const DERIVE_STATUS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cadence for republishing the canonical retention release floor while the
+/// tailer stays inside one long catch-up pass.
+///
+/// Each publish fsyncs the derive write-ahead log and issues one synced
+/// canonical write, so publishing on every replayed event would add a steady
+/// fsync load on the canonical write path during bulk catch-up. A floor that
+/// lags by this interval only defers a sweep, which the design tolerates.
+const RETENTION_RELEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeriveReplayBudgetState {
@@ -214,6 +225,37 @@ pub fn open_primary_derive_store_for_canonical(
             rocksdb_resource_budget,
         },
     )
+}
+
+/// Refuses to run when the durable transparent-outpoint-spend projection is
+/// behind the canonical retention sweep.
+///
+/// The projection sources its spender identities from canonical spend-fact
+/// rows, which the safe-tip sweep deletes. Every batch that deletes a fact
+/// records the highest deleted height in the canonical deleted-through marker
+/// (a checkpoint bootstrap that only advanced the swept cursor leaves it
+/// unset). If the projection's durable height fell below that marker (a
+/// derive-schema rebuild or wipe after the canonical already swept), those
+/// spender identities can never be re-derived: the only remedy is a full
+/// canonical re-ingest. Crash loudly rather than serve a silently incomplete
+/// projection.
+pub fn ensure_spend_projection_not_behind_retention_sweep(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+) -> Result<(), IngestError> {
+    let deleted_through = chain_store
+        .transparent_retention_deleted_through_height()?
+        .map_or(0, BlockHeight::value);
+    let projection_height = derive_store
+        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?
+        .map_or(0, BlockHeight::value);
+    if projection_height < deleted_through {
+        return Err(IngestError::SpendProjectionBehindRetentionSweep {
+            projection_height,
+            deleted_through,
+        });
+    }
+    Ok(())
 }
 
 /// Spawns the ingest-owned chain-event tailer for derive consumers.
@@ -375,6 +417,7 @@ async fn catch_up_derive_store_to_canonical_with_budget(
 
     let mut cursor = persisted_chain_event_cursor(derive_store)?;
     let mut last_status_persist: Option<Instant> = None;
+    let mut last_release_publish: Option<Instant> = None;
     loop {
         let effective_limits = replay_budget.evaluate_current();
         record_derive_replay_budget(
@@ -417,6 +460,11 @@ async fn catch_up_derive_store_to_canonical_with_budget(
             {
                 DeriveReplayProgress::Advanced(next_cursor) => {
                     cursor = Some(next_cursor);
+                    maybe_publish_retention_release_floor(
+                        chain_store,
+                        derive_store,
+                        &mut last_release_publish,
+                    );
                     // Use the budget state the inner replay last evaluated, not
                     // the pre-replay snapshot, so the persisted health reflects
                     // memory pressure as of the just-finished event.
@@ -430,6 +478,69 @@ async fn catch_up_derive_store_to_canonical_with_budget(
                 DeriveReplayProgress::Yielded => return Ok(()),
             }
         }
+    }
+}
+
+/// Publishes the durable transparent-outpoint-spend height as the canonical
+/// retention release floor, at most once per
+/// [`RETENTION_RELEASE_PUBLISH_INTERVAL`].
+fn maybe_publish_retention_release_floor(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    last_publish: &mut Option<Instant>,
+) {
+    if last_publish.is_some_and(|at| at.elapsed() < RETENTION_RELEASE_PUBLISH_INTERVAL) {
+        return;
+    }
+    *last_publish = Some(Instant::now());
+    publish_retention_release_floor(chain_store, derive_store);
+}
+
+/// Publishes the durable transparent-outpoint-spend height as the canonical
+/// retention release floor.
+///
+/// The safe-tip sweep releases a spend fact only once this projection has
+/// durably recorded its spender identity, so the canonical store never deletes
+/// a fact the projection cannot yet resolve. The derive write-ahead log is
+/// fsynced before the floor is published: the derive store writes unsynced, so
+/// without this a host crash could lose projection rows the floor already
+/// authorized the canonical sweep to delete. Best-effort: a failure is logged,
+/// never fatal, because the sweep clamps to the last published floor and a
+/// missed update only defers a sweep by one cycle.
+fn publish_retention_release_floor(chain_store: &PrimaryChainStore, derive_store: &DeriveStore) {
+    if let Err(error) = derive_store.flush_wal_to_disk() {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "retention_release_floor_flush_failed",
+            error = %error,
+            "failed to fsync the derive write-ahead log before publishing the retention release floor",
+        );
+        return;
+    }
+    let durable_height = match derive_store
+        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
+    {
+        Ok(durable_height) => durable_height,
+        Err(error) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "retention_release_floor_read_failed",
+                error = %error,
+                "failed to read the durable transparent-outpoint-spend height",
+            );
+            return;
+        }
+    };
+    let Some(durable_height) = durable_height else {
+        return;
+    };
+    if let Err(error) = chain_store.set_transparent_retention_release_height(durable_height) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "retention_release_floor_publish_failed",
+            error = %error,
+            "failed to publish the canonical retention release floor",
+        );
     }
 }
 
@@ -938,13 +1049,15 @@ pub(crate) fn dispatch_chain_event(
     let mut transparent_activity = TransparentAddressActivityConsumer::new();
     let mut transparent_deltas = TransparentAddressDeltasConsumer::new();
     let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
-    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 6] = [
+    let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
+    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 7] = [
         &mut block_summary,
         &mut transaction_fees,
         &mut recent_transactions,
         &mut transparent_activity,
         &mut transparent_deltas,
         &mut transparent_transaction_history,
+        &mut transparent_outpoint_spend,
     ];
     derive_store
         .write_chain_event_chunk(&mut consumers, inputs, blocks, advance_cursor)
