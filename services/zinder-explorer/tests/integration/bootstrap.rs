@@ -485,6 +485,7 @@ fn seed_block_summary(derive_store: &DeriveStore, chain_fixture: &ChainFixture) 
             coinbase_reward_zat: 0,
             sapling_output_count: 0,
             orchard_action_count: 0,
+            ironwood_action_count: 0,
             confirmations: 0,
             is_canonical: true,
         }),

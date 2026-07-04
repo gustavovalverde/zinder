@@ -259,6 +259,7 @@ const fn encode_transaction_version_kind(
         CoreTransactionVersion::V3 => TransactionVersionKind::V3,
         CoreTransactionVersion::V4 => TransactionVersionKind::V4,
         CoreTransactionVersion::V5 => TransactionVersionKind::V5,
+        CoreTransactionVersion::V6 => TransactionVersionKind::V6,
         CoreTransactionVersion::Unsupported { .. } => TransactionVersionKind::Unsupported,
     }
 }
@@ -273,7 +274,8 @@ fn encode_transaction_version(version: CoreTransactionVersion) -> WireVersion {
         | CoreTransactionVersion::V2
         | CoreTransactionVersion::V3
         | CoreTransactionVersion::V4
-        | CoreTransactionVersion::V5 => None,
+        | CoreTransactionVersion::V5
+        | CoreTransactionVersion::V6 => None,
     };
     WireVersion {
         kind: kind as i32,

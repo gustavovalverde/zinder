@@ -83,6 +83,7 @@ fn classify_transaction_version(transaction: &ZebraTransaction) -> TransactionVe
         ZebraTransaction::V3 { .. } => TransactionVersion::V3,
         ZebraTransaction::V4 { .. } => TransactionVersion::V4,
         ZebraTransaction::V5 { .. } => TransactionVersion::V5,
+        ZebraTransaction::V6 { .. } => TransactionVersion::V6,
     }
 }
 
@@ -105,6 +106,8 @@ pub fn transaction_component_counts(transaction: &ZebraTransaction) -> Transacti
         u32::try_from(transaction.sapling_outputs().count()).unwrap_or(u32::MAX);
     let orchard_action_count =
         u32::try_from(transaction.orchard_actions().count()).unwrap_or(u32::MAX);
+    let ironwood_action_count =
+        u32::try_from(transaction.ironwood_actions().count()).unwrap_or(u32::MAX);
     let sprout_joinsplit_count = u32::try_from(transaction.joinsplit_count()).unwrap_or(u32::MAX);
     TransactionComponentCounts {
         transparent_input_count,
@@ -112,6 +115,7 @@ pub fn transaction_component_counts(transaction: &ZebraTransaction) -> Transacti
         sapling_spend_count,
         sapling_output_count,
         orchard_action_count,
+        ironwood_action_count,
         sprout_joinsplit_count,
     }
 }
@@ -155,7 +159,10 @@ fn resolve_consensus_branch_id(
     }
     match transaction {
         ZebraTransaction::V1 { .. } | ZebraTransaction::V2 { .. } => None,
-        ZebraTransaction::V3 { .. } | ZebraTransaction::V4 { .. } | ZebraTransaction::V5 { .. } => {
+        ZebraTransaction::V3 { .. }
+        | ZebraTransaction::V4 { .. }
+        | ZebraTransaction::V5 { .. }
+        | ZebraTransaction::V6 { .. } => {
             mined_height.map(|height| activations.consensus_branch_id_at(height))
         }
     }

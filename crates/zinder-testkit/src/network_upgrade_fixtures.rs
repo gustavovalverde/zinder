@@ -11,10 +11,11 @@
 //!
 //! - [`sample_regtest_upgrade_activations`] returns a hand-built table that
 //!   matches ZFND's `z3` regtest sidecar defaults
-//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3). Intended for
-//!   in-process integration tests that exercise `GetLightdInfo` or
-//!   `MinedDetails.consensus_branch_id` without a live node. Live tests must
-//!   discover the activations from the running node, not hard-code them here.
+//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3,
+//!   later upgrades unset). Intended for in-process integration tests that
+//!   exercise `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a
+//!   live node. Live tests must discover the activations from the running node,
+//!   not hard-code them here.
 //! - [`local_network_from_activations`] converts a node-discovered
 //!   [`zinder_core::NetworkUpgradeActivations`] into the
 //!   [`zcash_protocol::local_consensus::LocalNetwork`] shape consumed by
@@ -35,10 +36,11 @@ use zinder_core::{
 /// Sample regtest [`NetworkUpgradeActivations`] for in-process tests.
 ///
 /// Matches the activation heights ZFND's `z3` regtest sidecar is configured
-/// with by default: Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3.
-/// Intended for integration tests that exercise `GetLightdInfo` or
-/// `MinedDetails.consensus_branch_id` without a live node. Live tests must
-/// discover the activations from the running node, not hard-code them here.
+/// with by default: Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3,
+/// later upgrades unset. Intended for integration tests that exercise
+/// `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a live node.
+/// Live tests must discover the activations from the running node, not
+/// hard-code them here.
 #[must_use]
 #[allow(
     clippy::expect_used,
@@ -119,5 +121,6 @@ pub fn local_network_from_activations(activations: &NetworkUpgradeActivations) -
         nu6: lookup("NU6"),
         nu6_1: lookup("NU6.1"),
         nu6_2: lookup("NU6.2"),
+        nu6_3: lookup("NU6.3"),
     }
 }

@@ -16,7 +16,7 @@
 //!
 //! [`regtest_local_network`] returns the [`LocalNetwork`] shape ZFND's `z3`
 //! regtest sidecar is configured with by default (`overwinter..canopy = 1`,
-//! `nu5 = 2`, `nu6 = 2`, later upgrades unset). It is derived from
+//! `nu5 = 2`, `nu6 = 2`, `nu6_2 = 3`, later upgrades unset). It is derived from
 //! [`crate::network_upgrade_fixtures::sample_regtest_upgrade_activations`]
 //! so the two fixtures cannot drift apart. Intended for in-process unit-test
 //! fixtures that do not broadcast to a live node.
@@ -246,6 +246,7 @@ impl TransparentTestKey {
             BuildConfig::Standard {
                 sapling_anchor: None,
                 orchard_anchor: None,
+                ironwood_anchor: None,
             },
         );
         builder
@@ -279,7 +280,8 @@ impl std::fmt::Debug for TransparentTestKey {
 }
 
 /// Activation heights for the `z3` regtest sidecar:
-/// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, `nu6_2 = 3`.
+/// `overwinter..canopy = 1`, `nu5 = 2`, `nu6 = 2`, `nu6_2 = 3`,
+/// later upgrades unset.
 ///
 /// Derived from
 /// [`crate::network_upgrade_fixtures::sample_regtest_upgrade_activations`]

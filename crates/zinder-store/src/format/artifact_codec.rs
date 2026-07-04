@@ -1514,6 +1514,7 @@ const TRANSACTION_VERSION_KIND_V3: u32 = 3;
 const TRANSACTION_VERSION_KIND_V4: u32 = 4;
 const TRANSACTION_VERSION_KIND_V5: u32 = 5;
 const TRANSACTION_VERSION_KIND_UNSUPPORTED: u32 = 6;
+const TRANSACTION_VERSION_KIND_V6: u32 = 7;
 
 const fn transaction_version_record(version: TransactionVersion) -> TransactionVersionRecord {
     match version {
@@ -1542,6 +1543,11 @@ const fn transaction_version_record(version: TransactionVersion) -> TransactionV
             effective_version: 5,
             version_group_id: None,
         },
+        TransactionVersion::V6 => TransactionVersionRecord {
+            kind: TRANSACTION_VERSION_KIND_V6,
+            effective_version: 6,
+            version_group_id: None,
+        },
         TransactionVersion::Unsupported {
             effective_version,
             version_group_id,
@@ -1568,6 +1574,7 @@ fn decode_transaction_version_record(
         TRANSACTION_VERSION_KIND_V3 => Ok(TransactionVersion::V3),
         TRANSACTION_VERSION_KIND_V4 => Ok(TransactionVersion::V4),
         TRANSACTION_VERSION_KIND_V5 => Ok(TransactionVersion::V5),
+        TRANSACTION_VERSION_KIND_V6 => Ok(TransactionVersion::V6),
         TRANSACTION_VERSION_KIND_UNSUPPORTED => Ok(TransactionVersion::Unsupported {
             effective_version: record.effective_version,
             version_group_id: record.version_group_id,
@@ -1638,6 +1645,7 @@ const fn transaction_component_counts_record(
         sapling_spend_count: counts.sapling_spend_count,
         sapling_output_count: counts.sapling_output_count,
         orchard_action_count: counts.orchard_action_count,
+        ironwood_action_count: counts.ironwood_action_count,
         sprout_joinsplit_count: counts.sprout_joinsplit_count,
     }
 }
@@ -1651,6 +1659,7 @@ const fn decode_transaction_component_counts_record(
         sapling_spend_count: record.sapling_spend_count,
         sapling_output_count: record.sapling_output_count,
         orchard_action_count: record.orchard_action_count,
+        ironwood_action_count: record.ironwood_action_count,
         sprout_joinsplit_count: record.sprout_joinsplit_count,
     }
 }
@@ -2310,6 +2319,8 @@ struct TransactionComponentCountsRecord {
     orchard_action_count: u32,
     #[prost(uint32, tag = "6")]
     sprout_joinsplit_count: u32,
+    #[prost(uint32, tag = "7")]
+    ironwood_action_count: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]

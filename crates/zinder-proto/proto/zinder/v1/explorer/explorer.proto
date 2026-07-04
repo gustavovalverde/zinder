@@ -130,6 +130,7 @@ enum TransactionVersionKind {
   TRANSACTION_VERSION_KIND_V4 = 4;
   TRANSACTION_VERSION_KIND_V5 = 5;
   TRANSACTION_VERSION_KIND_UNSUPPORTED = 6;
+  TRANSACTION_VERSION_KIND_V6 = 7;
 }
 
 // Transaction-format identifier carried on the explorer wire.
@@ -177,6 +178,7 @@ message TransactionComponentCounts {
   uint32 sapling_output_count = 4;
   uint32 orchard_action_count = 5;
   uint32 sprout_joinsplit_count = 6;
+  uint32 ironwood_action_count = 7;
 }
 
 // Single typed value carrying every public fact the explorer renders for a
@@ -374,6 +376,9 @@ message BlockSummary {
   // rewound but not yet replaced by a heavier chain. Computed at request
   // time; consumers render an "orphaned" badge when false.
   bool is_canonical = 13;
+
+  // Sum of Ironwood action counts across every transaction in the block.
+  uint32 ironwood_action_count = 14;
 }
 
 // Materialized storage record for the `BlockSummary` derive view.

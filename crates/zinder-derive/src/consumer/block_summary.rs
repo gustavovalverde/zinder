@@ -119,6 +119,7 @@ fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord 
         coinbase_reward_zat: aggregates.coinbase_reward_zat,
         sapling_output_count: aggregates.sapling_output_count,
         orchard_action_count: aggregates.orchard_action_count,
+        ironwood_action_count: aggregates.ironwood_action_count,
         confirmations: 0,
         is_canonical: true,
     };
@@ -136,6 +137,7 @@ struct BlockFactsAggregate {
     coinbase_reward_zat: u64,
     sapling_output_count: u32,
     orchard_action_count: u32,
+    ironwood_action_count: u32,
     zip317_conventional_fees_collected_zat: u64,
     fee_transaction_count: u32,
     min_zip317_conventional_fee_zat: Option<u64>,
@@ -153,6 +155,9 @@ fn aggregate_block_facts(transactions: &[TransactionFactsArtifact]) -> BlockFact
         aggregate.orchard_action_count = aggregate
             .orchard_action_count
             .saturating_add(counts.orchard_action_count);
+        aggregate.ironwood_action_count = aggregate
+            .ironwood_action_count
+            .saturating_add(counts.ironwood_action_count);
         if facts.is_coinbase {
             for output in &transaction.transparent_outputs {
                 aggregate.coinbase_reward_zat = aggregate

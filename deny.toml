@@ -51,7 +51,4 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = [
-    # Temporary core2 source pin required by zebra-chain 6.0.2 through equihash 0.2.2.
-    "https://github.com/bbqsrc/core2",
-]
+allow-git = []

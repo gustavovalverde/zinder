@@ -159,6 +159,6 @@ Native protocol changes go in `crates/zinder-proto/proto/zinder/v1/wallet.proto`
 
 When a change alters a service boundary, public API, storage byte layout, protocol surface, or vocabulary, update the owning document in `docs/` in the same change. ADRs are written in present tense and describe the current decision; clarifications and rewordings are edited in place. Substantive design changes get a new ADR with the next contiguous number.
 
-## Workspace Patches
+## Ironwood Dependency Pins
 
-`Cargo.toml` patches `core2` to a git source because `equihash 0.2.2` (transitive through `zebra-chain 6.0.2`) depends on a yanked crates.io version. The patch is gated by the `cargo-deny` `allow-git` list.
+`zebra-chain` is pinned to `11.0.0`, the first release that decodes Ironwood (NU6.3) version-6 transactions. It requires the librustzcash stack (`zcash_address`, `zcash_protocol`, `zcash_primitives`, `zcash_transparent`, `orchard`) at pre-release versions; Zinder matches those exact versions so no duplicate librustzcash type exists at the `zebra-chain` boundary. These pins move to stable releases once the NU6.3 stack stabilizes upstream. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.

@@ -110,6 +110,7 @@ impl BlockKeyedConsumer for RecentTransactionsConsumer {
                     sapling_spend_count: counts.sapling_spend_count,
                     sapling_output_count: counts.sapling_output_count,
                     orchard_action_count: counts.orchard_action_count,
+                    ironwood_action_count: counts.ironwood_action_count,
                     sprout_joinsplit_count: counts.sprout_joinsplit_count,
                 }),
                 size_bytes,

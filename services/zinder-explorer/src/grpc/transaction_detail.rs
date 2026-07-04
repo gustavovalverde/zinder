@@ -256,6 +256,7 @@ fn encode_public_facts(facts: &CoreFacts) -> WireFacts {
             sapling_spend_count: facts.counts.sapling_spend_count,
             sapling_output_count: facts.counts.sapling_output_count,
             orchard_action_count: facts.counts.orchard_action_count,
+            ironwood_action_count: facts.counts.ironwood_action_count,
             sprout_joinsplit_count: facts.counts.sprout_joinsplit_count,
         }),
         privacy_shape: encode_privacy_shape(facts.privacy_shape) as i32,
@@ -270,6 +271,7 @@ fn encode_transaction_version(version: CoreTransactionVersion) -> WireVersion {
         CoreTransactionVersion::V3 => (TransactionVersionKind::V3, None),
         CoreTransactionVersion::V4 => (TransactionVersionKind::V4, None),
         CoreTransactionVersion::V5 => (TransactionVersionKind::V5, None),
+        CoreTransactionVersion::V6 => (TransactionVersionKind::V6, None),
         CoreTransactionVersion::Unsupported {
             version_group_id, ..
         } => (TransactionVersionKind::Unsupported, version_group_id),

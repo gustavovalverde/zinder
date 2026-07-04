@@ -185,6 +185,29 @@ fn transaction_detail_response_carries_conflicting_location() -> eyre::Result<()
 }
 
 #[test]
+fn ironwood_component_counts_round_trip_through_explorer_messages() -> eyre::Result<()> {
+    let counts = explorer::TransactionComponentCounts {
+        transparent_input_count: 1,
+        transparent_output_count: 2,
+        sapling_spend_count: 3,
+        sapling_output_count: 4,
+        orchard_action_count: 5,
+        sprout_joinsplit_count: 6,
+        ironwood_action_count: 7,
+    };
+    let decoded_counts = round_trip(&counts)?;
+    assert_eq!(decoded_counts.ironwood_action_count, 7);
+
+    let summary = explorer::BlockSummary {
+        ironwood_action_count: 11,
+        ..Default::default()
+    };
+    let decoded_summary = round_trip(&summary)?;
+    assert_eq!(decoded_summary.ironwood_action_count, 11);
+    Ok(())
+}
+
+#[test]
 fn transparent_address_deltas_entry_round_trips_signed_values() -> eyre::Result<()> {
     let received = explorer::TransparentAddressDeltasEntry {
         transaction_id: "a".repeat(64),

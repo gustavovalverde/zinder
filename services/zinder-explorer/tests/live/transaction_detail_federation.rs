@@ -164,6 +164,7 @@ const fn version_to_effective_integer(kind: TransactionVersionKind) -> u32 {
         TransactionVersionKind::V3 => 3,
         TransactionVersionKind::V4 => 4,
         TransactionVersionKind::V5 => 5,
+        TransactionVersionKind::V6 => 6,
         TransactionVersionKind::Unspecified | TransactionVersionKind::Unsupported => 0,
     }
 }
