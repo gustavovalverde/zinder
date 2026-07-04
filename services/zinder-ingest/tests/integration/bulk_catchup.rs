@@ -41,8 +41,7 @@ fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStor
         zinder_derive::DeriveStore::path_for_canonical(storage_path),
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: zinder_derive::DeriveStore::bundled_consumer_column_families(
-            ),
+            consumers: zinder_derive::DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)

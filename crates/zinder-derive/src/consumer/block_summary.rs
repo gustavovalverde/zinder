@@ -18,14 +18,14 @@ use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 
 /// Column-family name the `BlockSummary` derive view owns.
 ///
-/// Pass this in [`crate::store::DeriveStoreOptions::consumer_column_families`]
-/// at store open time so the SDK registers the column family before the
-/// consumer issues its first write.
+/// [`BLOCK_SUMMARY_SCHEMA`] carries this in its
+/// [`column_families`](crate::DeriveConsumerSchema::column_families) so the SDK
+/// registers the column family before the consumer issues its first write.
 pub const BLOCK_SUMMARY_COLUMN_FAMILY: &str = "block_summary";
 
 /// Stable consumer name persisted in the SDK cursor table.
@@ -35,6 +35,13 @@ pub const BLOCK_SUMMARY_CONSUMER_NAME: DeriveConsumerName =
 /// Capability strings the consumer's read surface lights up once caught up.
 pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] =
     &[EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_DETAIL_V1];
+
+/// On-disk schema declaration for the block-summary derive consumer.
+pub const BLOCK_SUMMARY_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    BLOCK_SUMMARY_CONSUMER_NAME,
+    1,
+    &[BLOCK_SUMMARY_COLUMN_FAMILY],
+);
 
 /// Materializes one [`BlockSummaryRecord`] per canonical block.
 #[derive(Default)]

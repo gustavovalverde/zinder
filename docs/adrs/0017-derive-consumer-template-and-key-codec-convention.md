@@ -7,6 +7,13 @@ Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
 [Derive plane](../architecture/derive-plane.md),
 [Fact-first indexer](../architecture/fact-first-indexer.md)
 
+Revisions:
+
+- 2026-07-04: The registration surface carries a per-consumer schema version:
+  `DeriveConsumerSchema` binds a consumer's name, `schema_version`, and owned
+  column families in one declaration. Versioning semantics live in
+  [ADR-0028](0028-per-consumer-derive-schema-versioning.md).
+
 Bundled derive writes run inside `zinder-ingest`'s derive tailer. The durable
 contract in this ADR is the shared per-block fact context,
 `BlockKeyedConsumer` range dispatch convention, key codecs in
@@ -113,6 +120,18 @@ derive-store boundaries is a forbidden pattern.
 A consumer whose freshness signal is not chain-height (a mempool-driven
 consumer, for example) defines its own helper on the store rather than
 decoding bytes inline in a handler.
+
+### Per-consumer schema versioning
+
+Registration is one declaration per consumer: `DeriveConsumerSchema` binds a
+consumer's stable `DeriveConsumerName` to a `schema_version` and the column
+families it owns. Requiring the version at construction makes it impossible to
+register a column family without one. The bundled consumers ship as
+`DeriveStore::bundled_consumers()`; every consumer starts at version 1.
+
+The persisted per-consumer manifest, the open-time scoped wipe-and-rebuild
+flow, and the narrowed container-format version are defined in
+[ADR-0028](0028-per-consumer-derive-schema-versioning.md).
 
 ## Rewind contract
 

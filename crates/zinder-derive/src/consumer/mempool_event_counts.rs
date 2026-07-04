@@ -18,8 +18,8 @@
 use zinder_core::wire::{UNIX_SECONDS_KEY_LEN, encode_unix_seconds};
 
 use crate::consumer::{
-    DeriveConsumerCtx, DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer,
-    MempoolConsumerEvent, MempoolConsumerEventVariant,
+    DeriveConsumerCtx, DeriveConsumerError, DeriveConsumerName, DeriveConsumerSchema,
+    DeriveMempoolConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
 };
 
 /// Column-family name the consumer owns.
@@ -28,6 +28,13 @@ pub const MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY: &str = "mempool_event_counts";
 /// Stable consumer name persisted in the SDK cursor table.
 pub const MEMPOOL_EVENT_COUNTS_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("mempool_event_counts");
+
+/// On-disk schema declaration for the mempool-event-counts derive consumer.
+pub const MEMPOOL_EVENT_COUNTS_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
+    1,
+    &[MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY],
+);
 
 /// Number of bytes the consumer stores per per-second row.
 ///

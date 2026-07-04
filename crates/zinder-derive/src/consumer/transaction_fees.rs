@@ -38,7 +38,7 @@ use zinder_proto::v1::explorer::{
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 
 /// Column family holding per-transaction fee records keyed by 32-byte txid.
@@ -59,6 +59,13 @@ pub const TRANSACTION_FEES_COLUMN_FAMILIES: &[&str] = &[
 /// Stable consumer name persisted in the SDK cursor table.
 pub const TRANSACTION_FEES_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("transaction_fees");
+
+/// On-disk schema declaration for the transaction-fees derive consumer.
+pub const TRANSACTION_FEES_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    TRANSACTION_FEES_CONSUMER_NAME,
+    1,
+    TRANSACTION_FEES_COLUMN_FAMILIES,
+);
 
 const TXID_LEN: usize = 32;
 

@@ -26,7 +26,7 @@ use zinder_proto::wire::encode_privacy_shape;
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 
 /// Column-family name the consumer owns.
@@ -35,6 +35,13 @@ pub const RECENT_TRANSACTIONS_COLUMN_FAMILY: &str = "recent_transactions";
 /// Stable consumer name persisted in the SDK cursor table.
 pub const RECENT_TRANSACTIONS_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("recent_transactions");
+
+/// On-disk schema declaration for the recent-transactions derive consumer.
+pub const RECENT_TRANSACTIONS_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    RECENT_TRANSACTIONS_CONSUMER_NAME,
+    1,
+    &[RECENT_TRANSACTIONS_COLUMN_FAMILY],
+);
 
 /// Length of one storage key: 4 reverse-height + 4 in-block position.
 const RECENT_TRANSACTIONS_KEY_LEN: usize = 8;

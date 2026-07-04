@@ -12,7 +12,7 @@
 //! impossible to recur in the derive plane.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     hash::BuildHasher,
     path::{Path, PathBuf},
@@ -29,33 +29,27 @@ use zinder_store::{
 };
 
 use crate::{
-    consumer::block_summary::{BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME},
-    consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    consumer::block_summary::{BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA},
+    consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_SCHEMA,
     consumer::recent_transactions::{
-        RECENT_TRANSACTIONS_COLUMN_FAMILY, RECENT_TRANSACTIONS_CONSUMER_NAME,
+        RECENT_TRANSACTIONS_CONSUMER_NAME, RECENT_TRANSACTIONS_SCHEMA,
     },
-    consumer::transaction_fees::{
-        TRANSACTION_FEES_COLUMN_FAMILY, TRANSACTION_FEES_CONSUMER_NAME,
-        TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
-    },
+    consumer::transaction_fees::{TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_SCHEMA},
     consumer::transparent_address_activity::{
-        TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
-        TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
     },
     consumer::transparent_address_deltas::{
-        TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
-        TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
     },
     consumer::transparent_address_transaction_history::{
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
     },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
-        CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveMempoolConsumer,
-        RevertedRange, apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
+        CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveConsumerSchema,
+        DeriveMempoolConsumer, RevertedRange, apply_chain_committed_in_memory,
+        apply_chain_reorged_in_memory,
     },
     error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError},
 };
@@ -69,43 +63,42 @@ use crate::{
 /// `storage.path` per service.
 pub const DERIVE_STORE_SUBDIR: &str = "derive";
 
-/// On-disk schema version used by the derive plane.
+/// Container-format version of the derive store.
 ///
-/// Bumped by the binary when the column-family layout, key schema, or
-/// metadata payload format changes in a backwards-incompatible way. The
-/// version is persisted in the `consumer_metadata` column family on first
-/// open and validated on subsequent opens.
-///
-/// Version 5 is the first version where derive payloads (e.g. the
-/// `BlockSummaryRecord` and `RecentTransactionEntry` rows) carry
-/// hash-shaped fields as `string` in RPC byte order instead of `bytes`
-/// in internal byte order. Derive stores written under version 4 store
-/// transaction ids and block hashes as raw bytes that the running binary
-/// would attempt to decode as UTF-8 strings and reject; the operator
-/// must wipe the derive store directory before opening with this binary.
-/// See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-///
-/// Version 6 adds the `transparent_address_deltas` column families holding
-/// the per-event signed value series. Stores written under version 5 lack
-/// those rows for already-replayed heights, so the operator must wipe the
-/// derive store directory before opening with this binary.
-pub const DERIVE_SCHEMA_VERSION: u16 = 6;
+/// Gates the parts shared by every consumer: the per-consumer schema
+/// manifest layout, the cursor encoding, and the metadata column family.
+/// Per-consumer column-family layouts version themselves through
+/// [`DeriveConsumerSchema::schema_version`]; a consumer changing its own
+/// layout bumps its own version and only its own data rebuilds. This
+/// constant bumps only when the shared container changes, which forces a
+/// whole-store wipe because no consumer's data survives a container change.
+/// The version is persisted in the `consumer_metadata` column family on
+/// first open and validated on subsequent opens.
+pub const DERIVE_STORE_FORMAT_VERSION: u16 = 7;
 
-const SCHEMA_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
+const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const DERIVE_STATUS_KEY: &[u8] = b"\x00\x02derive_status";
-const BUNDLED_CONSUMER_COLUMN_FAMILIES: &[&str] = &[
-    BLOCK_SUMMARY_COLUMN_FAMILY,
-    MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
-    RECENT_TRANSACTIONS_COLUMN_FAMILY,
-    TRANSACTION_FEES_COLUMN_FAMILY,
-    TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
+const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
+
+/// Inclusive lower bound for a full column-family clear: the empty key sorts
+/// before every stored key.
+const CLEAR_RANGE_LOWER_BOUND: &[u8] = &[];
+/// Exclusive upper bound for a full column-family clear.
+///
+/// It sits above every consumer key, so one range tombstone covers the whole
+/// family; any key at or above it is removed by the residue sweep in
+/// [`DeriveStore::clear_consumer_column_family`].
+const CLEAR_RANGE_UPPER_BOUND: &[u8] = &[0xff; 512];
+
+const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
+    BLOCK_SUMMARY_SCHEMA,
+    MEMPOOL_EVENT_COUNTS_SCHEMA,
+    RECENT_TRANSACTIONS_SCHEMA,
+    TRANSACTION_FEES_SCHEMA,
+    TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+    TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
 ];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     BLOCK_SUMMARY_CONSUMER_NAME,
@@ -132,10 +125,18 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
     options
 }
 
+/// Builds the open-time column-family descriptors.
+///
+/// Every store family and every declared consumer family is opened, plus any
+/// column family already on disk that neither list covers. Opening those
+/// on-disk orphans is what lets reconciliation drop a deleted consumer's
+/// column families, since `RocksDB` refuses to open a store while leaving an
+/// existing column family unlisted.
 fn column_family_descriptors(
     cache: &Cache,
     rocksdb_resource_budget: RocksDbResourceBudget,
-    consumer_column_families: &'static [&'static str],
+    consumers: &[DeriveConsumerSchema],
+    existing_column_families: &[String],
 ) -> Vec<ColumnFamilyDescriptor> {
     let store_families = DeriveStoreTable::all().into_iter().map(|table| {
         ColumnFamilyDescriptor::new(
@@ -143,10 +144,55 @@ fn column_family_descriptors(
             column_family_options(cache, rocksdb_resource_budget),
         )
     });
-    let consumer_families = consumer_column_families.iter().map(|name| {
-        ColumnFamilyDescriptor::new(*name, column_family_options(cache, rocksdb_resource_budget))
+    let mut consumer_names = BTreeSet::<String>::new();
+    for consumer in consumers {
+        for &name in consumer.column_families {
+            consumer_names.insert(name.to_owned());
+        }
+    }
+    for name in existing_column_families {
+        consumer_names.insert(name.clone());
+    }
+    consumer_names.remove(ROCKSDB_DEFAULT_COLUMN_FAMILY);
+    for table in DeriveStoreTable::all() {
+        consumer_names.remove(table.column_family_name());
+    }
+    let consumer_families = consumer_names.into_iter().map(|name| {
+        ColumnFamilyDescriptor::new(name, column_family_options(cache, rocksdb_resource_budget))
     });
     store_families.chain(consumer_families).collect()
+}
+
+/// Lists the column families already present at `path`, or an empty list when
+/// the path is not yet a `RocksDB` store.
+fn existing_column_family_names(path: &Path) -> Vec<String> {
+    DB::list_cf(&Options::default(), path).unwrap_or_default()
+}
+
+/// Rejects consumer declarations whose column families collide.
+///
+/// Every declared column family must be unique across consumers and must not
+/// reuse a store-table name or the `RocksDB` default family. Reconciliation
+/// drops a column family only when no declared consumer owns it, so a name
+/// shared by two declarations would let one consumer's rebuild or removal wipe
+/// another's rows behind a cursor that never rewinds. Rejecting at open time
+/// keeps that impossible.
+fn validate_consumer_declarations(
+    consumers: &[DeriveConsumerSchema],
+) -> Result<(), DeriveStoreError> {
+    let mut declared = BTreeSet::<&'static str>::new();
+    for consumer in consumers {
+        for &name in consumer.column_families {
+            let reserved = name == ROCKSDB_DEFAULT_COLUMN_FAMILY
+                || DeriveStoreTable::all()
+                    .iter()
+                    .any(|table| table.column_family_name() == name);
+            if reserved || !declared.insert(name) {
+                return Err(DeriveStoreError::ConsumerColumnFamilyConflict { name });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Logical column-family identifier.
@@ -204,10 +250,12 @@ pub struct DeriveStoreOptions {
     /// Default `false` matches the canonical store's tunable so operators can
     /// trade durability for throughput in development environments.
     pub sync_writes: bool,
-    /// Consumer-owned column families to register at open time. Each entry is
-    /// the canonical column-family name a consumer reads and writes through
-    /// [`DeriveStore::consumer_column_family`].
-    pub consumer_column_families: &'static [&'static str],
+    /// Consumers to register at open time. Each declares its stable name, its
+    /// schema version, and the column families it reads and writes through
+    /// [`DeriveStore::consumer_column_family`]. On open the store reconciles
+    /// each consumer's declared version against the persisted manifest,
+    /// rebuilding only the consumers whose versions moved.
+    pub consumers: &'static [DeriveConsumerSchema],
     /// Bounded `RocksDB` resource budget applied at open time.
     pub rocksdb_resource_budget: RocksDbResourceBudget,
 }
@@ -216,7 +264,7 @@ impl Default for DeriveStoreOptions {
     fn default() -> Self {
         Self {
             sync_writes: false,
-            consumer_column_families: &[],
+            consumers: &[],
             rocksdb_resource_budget: RocksDbResourceBudget::derive_writer_defaults(),
         }
     }
@@ -266,7 +314,8 @@ pub struct DeriveStore {
     db: Arc<DB>,
     sync_writes: bool,
     storage_path: PathBuf,
-    consumer_column_families: &'static [&'static str],
+    consumers: &'static [DeriveConsumerSchema],
+    rocksdb_resource_budget: RocksDbResourceBudget,
     is_secondary: bool,
     block_cache: Cache,
     write_buffer_manager: rust_rocksdb::WriteBufferManager,
@@ -280,7 +329,8 @@ impl fmt::Debug for DeriveStore {
             .field("db", &self.db)
             .field("sync_writes", &self.sync_writes)
             .field("storage_path", &self.storage_path)
-            .field("consumer_column_families", &self.consumer_column_families)
+            .field("consumers", &self.consumers)
+            .field("rocksdb_resource_budget", &self.rocksdb_resource_budget)
             .field("is_secondary", &self.is_secondary)
             .field("io_mode", &self.io_mode)
             .field("block_cache_usage_bytes", &self.block_cache.get_usage())
@@ -310,11 +360,14 @@ impl DeriveStore {
         canonical_path.join(DERIVE_STORE_SUBDIR)
     }
 
-    /// Returns the consumer-owned column families compiled into the bundled
-    /// derive-plane consumers.
+    /// Returns the schema declarations for the bundled derive-plane consumers.
+    ///
+    /// Pass this into [`DeriveStoreOptions::consumers`] to register every
+    /// bundled consumer with its name, schema version, and owned column
+    /// families in one call.
     #[must_use]
-    pub const fn bundled_consumer_column_families() -> &'static [&'static str] {
-        BUNDLED_CONSUMER_COLUMN_FAMILIES
+    pub const fn bundled_consumers() -> &'static [DeriveConsumerSchema] {
+        BUNDLED_CONSUMERS
     }
 
     /// Returns the bundled chain-event consumer cursor names.
@@ -325,9 +378,18 @@ impl DeriveStore {
 
     /// Opens or creates a derive store at `path`.
     ///
-    /// On a fresh path the schema version is written immediately. On an
-    /// existing path the persisted schema version is validated against
-    /// [`DERIVE_SCHEMA_VERSION`].
+    /// Rejects with [`DeriveStoreError::ConsumerColumnFamilyConflict`] when the
+    /// declared consumers do not own disjoint column families. On a fresh path
+    /// the store-format version is written immediately and the manifest is
+    /// seeded with every declared consumer's version. A persisted store-format
+    /// version older than [`DERIVE_STORE_FORMAT_VERSION`] deletes the whole
+    /// derive directory and reopens it fresh, so the rebuild leaves no
+    /// column-family drop edits in the `RocksDB` manifest for a secondary
+    /// reader to replay; a newer persisted version is rejected with
+    /// [`DeriveStoreError::SchemaMismatch`] so an older binary never wipes a
+    /// store it cannot read. Each consumer is then reconciled: a consumer whose
+    /// declared version moved has its cursor reset and its column families
+    /// rebuilt while every other consumer is left untouched.
     pub fn open(
         path: impl AsRef<Path>,
         options: DeriveStoreOptions,
@@ -337,6 +399,9 @@ impl DeriveStore {
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
+        validate_consumer_declarations(options.consumers)?;
+        Self::wipe_derive_directory_if_store_format_superseded(path, &options)?;
+        let existing_column_families = existing_column_family_names(path);
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             options.rocksdb_resource_budget,
@@ -344,7 +409,8 @@ impl DeriveStore {
                 column_family_descriptors(
                     cache,
                     rocksdb_resource_budget,
-                    options.consumer_column_families,
+                    options.consumers,
+                    &existing_column_families,
                 )
             },
         )
@@ -356,13 +422,15 @@ impl DeriveStore {
             db: Arc::new(bounded_open.db),
             sync_writes: options.sync_writes,
             storage_path: path.to_path_buf(),
-            consumer_column_families: options.consumer_column_families,
+            consumers: options.consumers,
+            rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: false,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
         };
-        store.validate_or_initialize_schema_version()?;
+        store.validate_or_initialize_store_format_version()?;
+        store.reconcile_consumer_schemas()?;
         Ok(store)
     }
 
@@ -378,6 +446,14 @@ impl DeriveStore {
     /// A secondary instance only catches up with the primary when
     /// [`Self::try_catch_up`] is called; reads observe the snapshot from
     /// the last successful catchup.
+    ///
+    /// A secondary reader cannot reconcile schemas, so it validates instead:
+    /// the persisted container version must equal
+    /// [`DERIVE_STORE_FORMAT_VERSION`], and every declared consumer's version
+    /// must match the persisted manifest. A divergence returns
+    /// [`DeriveStoreError::SchemaMismatch`] or
+    /// [`DeriveStoreError::ConsumerSchemaMismatch`]; the caller retries the
+    /// open once the primary has reconciled and rewritten the manifest.
     pub fn open_secondary(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
@@ -389,6 +465,8 @@ impl DeriveStore {
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
+        validate_consumer_declarations(options.consumers)?;
+        let existing_column_families = existing_column_family_names(primary_path);
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Secondary {
                 primary_path,
@@ -399,7 +477,8 @@ impl DeriveStore {
                 column_family_descriptors(
                     cache,
                     rocksdb_resource_budget,
-                    options.consumer_column_families,
+                    options.consumers,
+                    &existing_column_families,
                 )
             },
         )
@@ -411,13 +490,15 @@ impl DeriveStore {
             db: Arc::new(bounded_open.db),
             sync_writes: options.sync_writes,
             storage_path: primary_path.to_path_buf(),
-            consumer_column_families: options.consumer_column_families,
+            consumers: options.consumers,
+            rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: true,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
         };
-        store.schema_version()?;
+        store.require_matching_store_format_version()?;
+        store.validate_secondary_consumer_schemas()?;
         Ok(store)
     }
 
@@ -479,7 +560,9 @@ impl DeriveStore {
     /// dispatch.
     #[must_use]
     pub fn has_consumer_column_families(&self) -> bool {
-        !self.consumer_column_families.is_empty()
+        self.consumers
+            .iter()
+            .any(|schema| !schema.column_families.is_empty())
     }
 
     /// Dispatches chain-event consumers and atomically writes their rows plus
@@ -606,16 +689,17 @@ impl DeriveStore {
             })
     }
 
-    /// Returns the persisted schema version recorded under
+    /// Returns the persisted store-format version recorded under
     /// `consumer_metadata`.
-    pub fn schema_version(&self) -> Result<u16, DeriveStoreError> {
-        let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, SCHEMA_VERSION_KEY)? else {
+    pub fn store_format_version(&self) -> Result<u16, DeriveStoreError> {
+        let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, STORE_FORMAT_VERSION_KEY)?
+        else {
             return Err(DeriveStoreError::SchemaMismatch {
                 persisted: 0,
-                running: DERIVE_SCHEMA_VERSION,
+                running: DERIVE_STORE_FORMAT_VERSION,
             });
         };
-        decode_schema_version(&bytes).map_err(|reason| DeriveStoreError::Decode {
+        decode_store_format_version(&bytes).map_err(|reason| DeriveStoreError::Decode {
             column_family: DeriveStoreColumnFamily::ConsumerMetadata,
             reason,
         })
@@ -649,19 +733,25 @@ impl DeriveStore {
     }
 
     /// Returns a handle for a consumer-owned column family registered through
-    /// [`DeriveStoreOptions::consumer_column_families`]. Consumers stage puts
-    /// and deletes by calling `batch.put_cf(handle, key, value)` on the
-    /// returned handle and committing through [`Self::write_batch`].
+    /// [`DeriveStoreOptions::consumers`]. Consumers stage puts and deletes by
+    /// calling `batch.put_cf(handle, key, value)` on the returned handle and
+    /// committing through [`Self::write_batch`].
     pub fn consumer_column_family(
         &self,
         name: &'static str,
     ) -> Result<Arc<rust_rocksdb::BoundColumnFamily<'_>>, DeriveStoreError> {
-        if !self.consumer_column_families.contains(&name) {
+        if !self.owns_consumer_column_family(name) {
             return Err(DeriveStoreError::ConsumerColumnFamilyMissing { name });
         }
         self.db
             .cf_handle(name)
             .ok_or(DeriveStoreError::ConsumerColumnFamilyMissing { name })
+    }
+
+    fn owns_consumer_column_family(&self, name: &str) -> bool {
+        self.consumers
+            .iter()
+            .any(|schema| schema.column_families.contains(&name))
     }
 
     /// Reads a single value from a consumer-owned column family.
@@ -925,27 +1015,346 @@ impl DeriveStore {
         Ok(())
     }
 
-    fn validate_or_initialize_schema_version(&self) -> Result<(), DeriveStoreError> {
-        let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, SCHEMA_VERSION_KEY)? else {
-            return self.put(
-                DeriveStoreTable::ConsumerMetadata,
-                SCHEMA_VERSION_KEY,
-                &DERIVE_SCHEMA_VERSION.to_be_bytes(),
-            );
-        };
-        let persisted =
-            decode_schema_version(&bytes).map_err(|reason| DeriveStoreError::Decode {
-                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
-                reason,
-            })?;
-        if persisted == DERIVE_SCHEMA_VERSION {
+    /// Fails unless the persisted container version equals the running one.
+    ///
+    /// Secondary readers cannot initialize or migrate, so they reject a
+    /// divergent container version instead of writing to the store.
+    fn require_matching_store_format_version(&self) -> Result<(), DeriveStoreError> {
+        let persisted = self.store_format_version()?;
+        if persisted == DERIVE_STORE_FORMAT_VERSION {
             Ok(())
         } else {
             Err(DeriveStoreError::SchemaMismatch {
                 persisted,
-                running: DERIVE_SCHEMA_VERSION,
+                running: DERIVE_STORE_FORMAT_VERSION,
             })
         }
+    }
+
+    /// Rejects a secondary open whose declared consumer versions disagree with
+    /// the persisted manifest.
+    ///
+    /// A secondary reader cannot rebuild a consumer's column families, so it
+    /// refuses to read rows written under a different consumer layout and lets
+    /// the primary reconcile first. Callers retry the open once the primary
+    /// rewrites the manifest.
+    fn validate_secondary_consumer_schemas(&self) -> Result<(), DeriveStoreError> {
+        let recorded = self.read_consumer_manifest()?;
+        for consumer in self.consumers {
+            let persisted = recorded
+                .get(consumer.name.as_str())
+                .map(|entry| entry.schema_version);
+            if persisted != Some(consumer.schema_version) {
+                return Err(DeriveStoreError::ConsumerSchemaMismatch {
+                    consumer: consumer.name.as_str(),
+                    persisted,
+                    running: consumer.schema_version,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes the derive directory when its persisted container version is
+    /// older than the running binary, so the reopened store starts fresh.
+    ///
+    /// A container-format change invalidates every consumer's rows at once. The
+    /// whole store is wiped by deleting the directory rather than dropping
+    /// column families in place: an in-place drop records column-family drop
+    /// edits in the `RocksDB` manifest, and a secondary reader replaying those
+    /// edits during catch-up crashes. A persisted version newer than the
+    /// running one is left untouched and surfaces later as
+    /// [`DeriveStoreError::SchemaMismatch`], so rolling a binary back never
+    /// destroys a store it cannot read.
+    fn wipe_derive_directory_if_store_format_superseded(
+        path: &Path,
+        options: &DeriveStoreOptions,
+    ) -> Result<(), DeriveStoreError> {
+        let Some(persisted) = Self::peek_store_format_version(path, options)? else {
+            return Ok(());
+        };
+        if persisted >= DERIVE_STORE_FORMAT_VERSION {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "zinder::derive",
+            event = "store_format_rebuild",
+            from_store_format_version = persisted,
+            to_store_format_version = DERIVE_STORE_FORMAT_VERSION,
+            "derive store container format changed; deleting the derive directory and rebuilding the whole store"
+        );
+        std::fs::remove_dir_all(path).map_err(|source| DeriveStoreError::SchemaReconcile {
+            operation: "store_format_wipe",
+            reason: format!("{}: {source}", path.display()),
+        })
+    }
+
+    /// Reads the persisted container version without keeping the store open.
+    ///
+    /// Returns `None` when `path` holds no derive store yet. The store is
+    /// opened as a primary, read, and closed before the caller decides whether
+    /// to wipe or open it for real.
+    fn peek_store_format_version(
+        path: &Path,
+        options: &DeriveStoreOptions,
+    ) -> Result<Option<u16>, DeriveStoreError> {
+        let existing_column_families = existing_column_family_names(path);
+        if existing_column_families.is_empty() {
+            return Ok(None);
+        }
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path },
+            options.rocksdb_resource_budget,
+            |cache, rocksdb_resource_budget| {
+                column_family_descriptors(
+                    cache,
+                    rocksdb_resource_budget,
+                    options.consumers,
+                    &existing_column_families,
+                )
+            },
+        )
+        .map_err(|source| DeriveStoreError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let column_family = bounded_open
+            .db
+            .cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
+            .ok_or(DeriveStoreError::ColumnFamilyMissing {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+            })?;
+        let persisted = bounded_open
+            .db
+            .get_cf(&column_family, STORE_FORMAT_VERSION_KEY)
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "get",
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })?
+            .map(|bytes| decode_store_format_version(&bytes))
+            .transpose()
+            .map_err(|reason| DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason,
+            })?;
+        drop(column_family);
+        drop(bounded_open);
+        Ok(persisted)
+    }
+
+    fn validate_or_initialize_store_format_version(&self) -> Result<(), DeriveStoreError> {
+        let Some(bytes) = self.get(DeriveStoreTable::ConsumerMetadata, STORE_FORMAT_VERSION_KEY)?
+        else {
+            return self.put(
+                DeriveStoreTable::ConsumerMetadata,
+                STORE_FORMAT_VERSION_KEY,
+                &DERIVE_STORE_FORMAT_VERSION.to_be_bytes(),
+            );
+        };
+        let persisted =
+            decode_store_format_version(&bytes).map_err(|reason| DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason,
+            })?;
+        if persisted == DERIVE_STORE_FORMAT_VERSION {
+            Ok(())
+        } else {
+            Err(DeriveStoreError::SchemaMismatch {
+                persisted,
+                running: DERIVE_STORE_FORMAT_VERSION,
+            })
+        }
+    }
+
+    /// Reconciles each declared consumer's schema version against the
+    /// persisted manifest.
+    ///
+    /// A consumer whose declared version matches keeps its column families
+    /// and cursor. A consumer whose version moved has every row in its column
+    /// families cleared and its cursor reset. A consumer recorded in the
+    /// manifest but no longer declared has its rows cleared and its manifest
+    /// entry removed. A newly declared consumer has its column families cleared
+    /// and is then recorded at its declared version, so a family that
+    /// previously belonged to another consumer starts empty rather than serving
+    /// the prior owner's rows behind a fresh cursor. Reconciliation never drops
+    /// a column family in place: a
+    /// range-tombstone clear replays safely on an attached secondary, while a
+    /// `drop_cf`/`create_cf` edit crashes a secondary mid-catchup. An emptied
+    /// orphan family is reclaimed physically only when a container-format
+    /// change wipes the whole derive directory.
+    fn reconcile_consumer_schemas(&self) -> Result<(), DeriveStoreError> {
+        let recorded = self.read_consumer_manifest()?;
+        self.drop_unregistered_consumers(&recorded)?;
+        for consumer in self.consumers {
+            match recorded.get(consumer.name.as_str()) {
+                Some(entry) if entry.schema_version == consumer.schema_version => {}
+                Some(entry) => self.rebuild_consumer(consumer, entry)?,
+                None => self.initialize_new_consumer(consumer)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_unregistered_consumers(
+        &self,
+        recorded: &BTreeMap<String, ConsumerManifestEntry>,
+    ) -> Result<(), DeriveStoreError> {
+        for (name, entry) in recorded {
+            if self
+                .consumers
+                .iter()
+                .any(|schema| schema.name.as_str() == name.as_str())
+            {
+                continue;
+            }
+            tracing::warn!(
+                target: "zinder::derive",
+                event = "consumer_dropped",
+                consumer = name.as_str(),
+                recorded_schema_version = entry.schema_version,
+                "derive consumer no longer declared; resetting its cursor and clearing its column families"
+            );
+            self.reset_consumer_cursors(name)?;
+            for column_family in &entry.column_families {
+                self.clear_consumer_column_family(column_family)?;
+            }
+            self.delete_consumer_manifest_entry(name)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_consumer(
+        &self,
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> Result<(), DeriveStoreError> {
+        tracing::warn!(
+            target: "zinder::derive",
+            event = "consumer_schema_rebuild",
+            consumer = consumer.name.as_str(),
+            from_schema_version = recorded.schema_version,
+            to_schema_version = consumer.schema_version,
+            "derive consumer schema version moved; resetting its cursor and clearing its column families"
+        );
+        self.reset_consumer_cursors(consumer.name.as_str())?;
+        for column_family in &recorded.column_families {
+            if consumer.column_families.contains(&column_family.as_str()) {
+                continue;
+            }
+            self.clear_consumer_column_family(column_family)?;
+        }
+        for column_family in consumer.column_families {
+            self.clear_consumer_column_family(column_family)?;
+        }
+        self.write_consumer_manifest_entry(consumer)
+    }
+
+    /// Clears a newly declared consumer's column families before recording it,
+    /// so a family that previously belonged to another consumer starts empty
+    /// and replays from the earliest retained event.
+    fn initialize_new_consumer(
+        &self,
+        consumer: &DeriveConsumerSchema,
+    ) -> Result<(), DeriveStoreError> {
+        for column_family in consumer.column_families {
+            self.clear_consumer_column_family(column_family)?;
+        }
+        self.write_consumer_manifest_entry(consumer)
+    }
+
+    fn read_consumer_manifest(
+        &self,
+    ) -> Result<BTreeMap<String, ConsumerManifestEntry>, DeriveStoreError> {
+        let column_family = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
+        let iterator = self.db.iterator_cf(
+            &column_family,
+            IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
+        );
+        let mut manifest = BTreeMap::new();
+        for entry in iterator {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::SchemaReconcile {
+                operation: "read_manifest",
+                reason: source.to_string(),
+            })?;
+            let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
+                break;
+            };
+            let name = String::from_utf8(name_bytes.to_vec()).map_err(|error| {
+                DeriveStoreError::SchemaReconcile {
+                    operation: "decode_manifest_name",
+                    reason: error.to_string(),
+                }
+            })?;
+            let decoded = decode_manifest_entry(&payload).map_err(|reason| {
+                DeriveStoreError::SchemaReconcile {
+                    operation: "decode_manifest_entry",
+                    reason,
+                }
+            })?;
+            manifest.insert(name, decoded);
+        }
+        Ok(manifest)
+    }
+
+    /// Clears every row in a consumer-owned column family without dropping the
+    /// family itself.
+    ///
+    /// A range tombstone over the full key span, plus a point-delete sweep of
+    /// any residue at or above the range's exclusive upper bound, leaves the
+    /// family indistinguishable from a freshly created one. The family is never
+    /// dropped: a `drop_cf`/`create_cf` edit records a column-family change in
+    /// the `RocksDB` manifest, and a secondary reader replaying that edit during
+    /// catch-up crashes; range tombstones and point deletes replay as ordinary
+    /// data writes.
+    fn clear_consumer_column_family(&self, name: &str) -> Result<(), DeriveStoreError> {
+        let Some(handle) = self.db.cf_handle(name) else {
+            return Ok(());
+        };
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(&handle, CLEAR_RANGE_LOWER_BOUND, CLEAR_RANGE_UPPER_BOUND);
+        let residue = self.db.iterator_cf(
+            &handle,
+            IteratorMode::From(CLEAR_RANGE_UPPER_BOUND, rust_rocksdb::Direction::Forward),
+        );
+        for entry in residue {
+            let (key, _payload) = entry.map_err(|source| DeriveStoreError::SchemaReconcile {
+                operation: "clear_consumer_column_family",
+                reason: format!("{name}: {source}"),
+            })?;
+            batch.delete_cf(&handle, &key);
+        }
+        self.write_batch(&batch)
+    }
+
+    fn reset_consumer_cursors(&self, name: &str) -> Result<(), DeriveStoreError> {
+        let chain_cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
+        let mempool_cf = self.column_family(DeriveStoreTable::MempoolEventCursor)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&chain_cf, name.as_bytes());
+        batch.delete_cf(&mempool_cf, name.as_bytes());
+        self.write_batch(&batch)
+    }
+
+    fn write_consumer_manifest_entry(
+        &self,
+        consumer: &DeriveConsumerSchema,
+    ) -> Result<(), DeriveStoreError> {
+        let key = consumer_schema_manifest_key(consumer.name.as_str());
+        let payload = encode_manifest_entry(consumer.schema_version, consumer.column_families)
+            .map_err(|reason| DeriveStoreError::SchemaReconcile {
+                operation: "encode_manifest_entry",
+                reason,
+            })?;
+        self.put(DeriveStoreTable::ConsumerMetadata, &key, &payload)
+    }
+
+    fn delete_consumer_manifest_entry(&self, name: &str) -> Result<(), DeriveStoreError> {
+        let key = consumer_schema_manifest_key(name);
+        let column_family = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&column_family, &key);
+        self.write_batch(&batch)
     }
 
     fn get(
@@ -1035,10 +1444,88 @@ where
     }
 }
 
-fn decode_schema_version(bytes: &[u8]) -> Result<u16, String> {
+fn decode_store_format_version(bytes: &[u8]) -> Result<u16, String> {
     let array: [u8; 2] = bytes
         .try_into()
-        .map_err(|_| format!("schema version requires 2 bytes; got {}", bytes.len()))?;
+        .map_err(|_| format!("store format version requires 2 bytes; got {}", bytes.len()))?;
+    Ok(u16::from_be_bytes(array))
+}
+
+/// One consumer's persisted schema manifest row: its declared version and the
+/// column families it owned when the row was written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConsumerManifestEntry {
+    schema_version: u16,
+    column_families: Vec<String>,
+}
+
+fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CONSUMER_SCHEMA_KEY_PREFIX.len() + name.len());
+    key.extend_from_slice(CONSUMER_SCHEMA_KEY_PREFIX);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+fn encode_manifest_entry(schema_version: u16, column_families: &[&str]) -> Result<Vec<u8>, String> {
+    let count = u16::try_from(column_families.len()).map_err(|_| {
+        format!(
+            "consumer declares {} column families; the manifest holds at most {}",
+            column_families.len(),
+            u16::MAX
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&schema_version.to_be_bytes());
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for name in column_families {
+        let name_bytes = name.as_bytes();
+        let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+            format!(
+                "consumer column family name is {} bytes; the manifest holds at most {}",
+                name_bytes.len(),
+                u16::MAX
+            )
+        })?;
+        bytes.extend_from_slice(&name_len.to_be_bytes());
+        bytes.extend_from_slice(name_bytes);
+    }
+    Ok(bytes)
+}
+
+fn decode_manifest_entry(bytes: &[u8]) -> Result<ConsumerManifestEntry, String> {
+    let schema_version = read_manifest_u16(bytes, 0)?;
+    let count = read_manifest_u16(bytes, 2)?;
+    let mut offset = 4usize;
+    let mut column_families = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let name_len = usize::from(read_manifest_u16(bytes, offset)?);
+        offset += 2;
+        let end = offset
+            .checked_add(name_len)
+            .ok_or_else(|| "consumer manifest entry length overflow".to_owned())?;
+        let name_bytes = bytes
+            .get(offset..end)
+            .ok_or_else(|| "consumer manifest entry truncated".to_owned())?;
+        column_families
+            .push(String::from_utf8(name_bytes.to_vec()).map_err(|error| error.to_string())?);
+        offset = end;
+    }
+    Ok(ConsumerManifestEntry {
+        schema_version,
+        column_families,
+    })
+}
+
+fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| "consumer manifest offset overflow".to_owned())?;
+    let slice = bytes
+        .get(offset..end)
+        .ok_or_else(|| "consumer manifest entry truncated".to_owned())?;
+    let array: [u8; 2] = slice
+        .try_into()
+        .map_err(|_| "consumer manifest u16 slice".to_owned())?;
     Ok(u16::from_be_bytes(array))
 }
 
@@ -1050,12 +1537,18 @@ mod tests {
     use super::*;
 
     const TEST_CONSUMER: DeriveConsumerName = DeriveConsumerName::from_static("test_consumer");
+    const TEST_CONSUMER_CF: &str = "test_cf";
+    const TEST_CONSUMER_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+        DeriveConsumerName::from_static("test_cf_consumer"),
+        1,
+        &[TEST_CONSUMER_CF],
+    );
 
     #[test]
-    fn opening_a_fresh_store_writes_the_schema_version() -> Result<()> {
+    fn opening_a_fresh_store_writes_the_store_format_version() -> Result<()> {
         let tempdir = tempdir()?;
         let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
-        assert_eq!(store.schema_version()?, DERIVE_SCHEMA_VERSION);
+        assert_eq!(store.store_format_version()?, DERIVE_STORE_FORMAT_VERSION);
         Ok(())
     }
 
@@ -1081,7 +1574,7 @@ mod tests {
     fn last_consumer_key_returns_none_for_empty_column_family() -> Result<()> {
         let tempdir = tempdir()?;
         let options = DeriveStoreOptions {
-            consumer_column_families: &["test_cf"],
+            consumers: &[TEST_CONSUMER_SCHEMA],
             ..DeriveStoreOptions::default()
         };
         let store = DeriveStore::open(tempdir.path(), options)?;
@@ -1093,7 +1586,7 @@ mod tests {
     fn last_consumer_key_returns_lexicographically_last_key() -> Result<()> {
         let tempdir = tempdir()?;
         let options = DeriveStoreOptions {
-            consumer_column_families: &["test_cf"],
+            consumers: &[TEST_CONSUMER_SCHEMA],
             ..DeriveStoreOptions::default()
         };
         let store = DeriveStore::open(tempdir.path(), options)?;
@@ -1112,14 +1605,14 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_store_with_an_advanced_schema_version_returns_mismatch() -> Result<()> {
+    fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch() -> Result<()> {
         let tempdir = tempdir()?;
         {
             let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
             store.put(
                 DeriveStoreTable::ConsumerMetadata,
-                SCHEMA_VERSION_KEY,
-                &(DERIVE_SCHEMA_VERSION + 1).to_be_bytes(),
+                STORE_FORMAT_VERSION_KEY,
+                &(DERIVE_STORE_FORMAT_VERSION + 1).to_be_bytes(),
             )?;
         }
         let outcome = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default());
@@ -1128,9 +1621,72 @@ mod tests {
             Err(DeriveStoreError::SchemaMismatch {
                 persisted,
                 running,
-            }) if persisted == DERIVE_SCHEMA_VERSION + 1 && running == DERIVE_SCHEMA_VERSION
+            }) if persisted == DERIVE_STORE_FORMAT_VERSION + 1 && running == DERIVE_STORE_FORMAT_VERSION
         ));
         Ok(())
+    }
+
+    #[test]
+    fn reopening_a_store_with_an_older_store_format_version_rebuilds() -> Result<()> {
+        let tempdir = tempdir()?;
+        {
+            let store = DeriveStore::open(
+                tempdir.path(),
+                DeriveStoreOptions {
+                    consumers: &[TEST_CONSUMER_SCHEMA],
+                    ..DeriveStoreOptions::default()
+                },
+            )?;
+            let handle = store.consumer_column_family("test_cf")?;
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&handle, 1_u32.to_be_bytes(), b"row");
+            drop(handle);
+            store.write_batch(&batch)?;
+            store.put_chain_event_cursor(TEST_CONSUMER, &[9])?;
+            store.put(
+                DeriveStoreTable::ConsumerMetadata,
+                STORE_FORMAT_VERSION_KEY,
+                &(DERIVE_STORE_FORMAT_VERSION - 1).to_be_bytes(),
+            )?;
+        }
+        let store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: &[TEST_CONSUMER_SCHEMA],
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        assert_eq!(store.store_format_version()?, DERIVE_STORE_FORMAT_VERSION);
+        assert_eq!(store.last_consumer_key("test_cf")?, None);
+        assert!(store.get_chain_event_cursor(TEST_CONSUMER)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_entry_round_trips_version_and_column_families() -> Result<()> {
+        let encoded = encode_manifest_entry(3, &["alpha", "beta_index"])
+            .map_err(|reason| eyre::eyre!(reason))?;
+        let decoded = decode_manifest_entry(&encoded).map_err(|reason| eyre::eyre!(reason))?;
+        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(
+            decoded.column_families,
+            vec!["alpha".to_owned(), "beta_index".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encoding_a_manifest_entry_rejects_more_column_families_than_the_count_field_holds() {
+        let column_families = vec!["x"; usize::from(u16::MAX) + 1];
+        let outcome = encode_manifest_entry(1, &column_families);
+        assert!(matches!(outcome, Err(reason) if reason.contains("column families")));
+    }
+
+    #[test]
+    fn encoding_a_manifest_entry_rejects_a_column_family_name_longer_than_the_length_field_holds() {
+        let overlong = "a".repeat(usize::from(u16::MAX) + 1);
+        let outcome = encode_manifest_entry(1, &[overlong.as_str()]);
+        assert!(matches!(outcome, Err(reason) if reason.contains("column family name")));
     }
 
     #[test]

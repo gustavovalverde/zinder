@@ -57,7 +57,7 @@ pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::De
         zinder_derive::DeriveStore::path_for_canonical(storage_path),
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: &[],
+            consumers: &[],
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)

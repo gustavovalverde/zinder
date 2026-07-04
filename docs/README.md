@@ -53,6 +53,7 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0025: Self-healing reorg on ChainEvents reconnect with a locator cursor](adrs/0025-chain-event-reconnect-reorg-locator.md)
 - [ADR-0026: Transparent UTXO-set commitment](adrs/0026-utxo-set-commitment.md)
 - [ADR-0027: Explicit event-stream start positions](adrs/0027-event-stream-start-positions.md)
+- [ADR-0028: Per-consumer derive schema versioning](adrs/0028-per-consumer-derive-schema-versioning.md)
 
 ## Reference
 

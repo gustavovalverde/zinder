@@ -5152,6 +5152,7 @@ dependencies = [
  "rust-rocksdb",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "zinder-core",
  "zinder-proto",
  "zinder-store",

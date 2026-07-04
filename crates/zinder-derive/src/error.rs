@@ -48,6 +48,16 @@ pub enum DeriveStoreError {
         /// Validation failure reason.
         reason: &'static str,
     },
+    /// A declared consumer column family is not unique across consumers or
+    /// reuses a name reserved by the store (a store table or the `RocksDB`
+    /// default family).
+    #[error(
+        "derive store consumer column family `{name}` is declared by more than one consumer or reuses a reserved name"
+    )]
+    ConsumerColumnFamilyConflict {
+        /// Column family name that collided.
+        name: &'static str,
+    },
     /// `RocksDB` could not open the database at the configured path.
     #[error("derive store could not open RocksDB at {path:?}: {source}")]
     Open {
@@ -76,13 +86,41 @@ pub enum DeriveStoreError {
         /// Operator-facing reason describing the decode failure.
         reason: String,
     },
-    /// Persisted schema version is incompatible with the running binary.
-    #[error("derive store schema version mismatch: persisted={persisted}, running={running}")]
+    /// Persisted store-format version is incompatible with the running binary.
+    #[error("derive store format version mismatch: persisted={persisted}, running={running}")]
     SchemaMismatch {
-        /// Schema version persisted on disk.
+        /// Store-format version persisted on disk.
         persisted: u16,
-        /// Schema version the running binary expects.
+        /// Store-format version the running binary expects.
         running: u16,
+    },
+    /// A declared consumer's persisted schema version disagrees with the
+    /// running binary. Secondary readers reject this rather than decode rows
+    /// written under a different consumer layout; the primary rebuilds the
+    /// consumer and rewrites the manifest before the reader can proceed.
+    /// `persisted` is `None` when the primary has not recorded the consumer.
+    #[error(
+        "derive store consumer `{consumer}` schema version mismatch: persisted={persisted:?}, running={running}"
+    )]
+    ConsumerSchemaMismatch {
+        /// Consumer whose recorded version diverged.
+        consumer: &'static str,
+        /// Schema version recorded in the manifest, or `None` when absent.
+        persisted: Option<u16>,
+        /// Schema version the running binary declares.
+        running: u16,
+    },
+    /// Per-consumer schema reconciliation failed while opening the store.
+    ///
+    /// Returned when a consumer whose declared version moved could not have
+    /// its column-family rows cleared, or when the persisted consumer manifest
+    /// could not be read or rewritten.
+    #[error("derive store consumer schema reconciliation failed during {operation}: {reason}")]
+    SchemaReconcile {
+        /// Reconciliation step that failed.
+        operation: &'static str,
+        /// Operator-facing reason describing the failure.
+        reason: String,
     },
     /// Column-family handle was unexpectedly absent after open.
     ///
@@ -100,8 +138,8 @@ pub enum DeriveStoreError {
     ///
     /// Returned by [`crate::store::DeriveStore::consumer_column_family`] when
     /// the requested name was not registered through
-    /// [`crate::store::DeriveStoreOptions::consumer_column_families`] before
-    /// the store opened.
+    /// [`crate::store::DeriveStoreOptions::consumers`] before the store
+    /// opened.
     #[error("derive store consumer column family {name} missing after open")]
     ConsumerColumnFamilyMissing {
         /// Column family name the consumer asked for.

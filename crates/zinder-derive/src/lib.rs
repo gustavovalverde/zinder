@@ -25,32 +25,33 @@ pub mod store;
 
 pub use consumer::block_summary::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
-    BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
+    BLOCK_SUMMARY_SCHEMA, BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
 };
 pub use consumer::mempool_event_counts::{
     MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
-    MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS, MempoolEventCountsConsumer,
+    MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS, MEMPOOL_EVENT_COUNTS_SCHEMA,
+    MempoolEventCountsConsumer,
 };
 pub use consumer::recent_transactions::{
     RECENT_TRANSACTIONS_COLUMN_FAMILY, RECENT_TRANSACTIONS_CONSUMER_NAME,
-    RecentTransactionsConsumer, RecentTransactionsConsumerError,
+    RECENT_TRANSACTIONS_SCHEMA, RecentTransactionsConsumer, RecentTransactionsConsumerError,
 };
 pub use consumer::transaction_fees::{
     TRANSACTION_FEES_COLUMN_FAMILIES, TRANSACTION_FEES_COLUMN_FAMILY,
-    TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_INDEX_COLUMN_FAMILY, TransactionFeesConsumer,
-    TransactionFeesConsumerError,
+    TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_INDEX_COLUMN_FAMILY, TRANSACTION_FEES_SCHEMA,
+    TransactionFeesConsumer, TransactionFeesConsumerError,
 };
 pub use consumer::transparent_address_activity::{
     TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressActivityConsumer,
-    TransparentAddressActivityConsumerError,
+    TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+    TransparentAddressActivityConsumer, TransparentAddressActivityConsumerError,
 };
 pub use consumer::transparent_address_deltas::{
     TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILIES, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_DELTAS_KEY_LEN, TransparentAddressDeltasConsumer,
-    TransparentAddressDeltasConsumerError,
+    TRANSPARENT_ADDRESS_DELTAS_KEY_LEN, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
+    TransparentAddressDeltasConsumer, TransparentAddressDeltasConsumerError,
 };
 pub use consumer::transparent_address_transaction_history::{
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
@@ -58,19 +59,19 @@ pub use consumer::transparent_address_transaction_history::{
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TransparentAddressTransactionHistoryConsumer,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA, TransparentAddressTransactionHistoryConsumer,
     TransparentAddressTransactionHistoryConsumerError, TransparentAddressTransactionHistoryPage,
     TransparentAddressTransactionHistoryPageRequest,
 };
 pub use consumer::{
     BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockKeyedConsumer,
     ChainCommittedEvent, ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx,
-    DeriveConsumerError, DeriveConsumerName, DeriveMempoolConsumer, MempoolConsumerEvent,
-    MempoolConsumerEventVariant, RevertedRange, TransparentSpendFacts,
+    DeriveConsumerError, DeriveConsumerName, DeriveConsumerSchema, DeriveMempoolConsumer,
+    MempoolConsumerEvent, MempoolConsumerEventVariant, RevertedRange, TransparentSpendFacts,
     apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use store::{
-    ChainEventDispatchInputs, ConsumerEntry, DERIVE_SCHEMA_VERSION, DERIVE_STORE_SUBDIR,
+    ChainEventDispatchInputs, ConsumerEntry, DERIVE_STORE_FORMAT_VERSION, DERIVE_STORE_SUBDIR,
     DeriveCursorEntry, DeriveStore, DeriveStoreOptions, DeriveStoreTable,
 };

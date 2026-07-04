@@ -281,7 +281,7 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
         &secondary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: explorer_config.storage.derive_rocksdb_budget,
         },
     ) {

@@ -44,7 +44,7 @@ pub fn open_test_derive_store_for_canonical(
         DeriveStore::path_for_canonical(canonical_path),
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)

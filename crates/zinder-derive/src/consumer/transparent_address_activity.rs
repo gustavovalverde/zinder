@@ -43,7 +43,7 @@ use crate::consumer::address_value_event::{
 };
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 
 /// Primary column family holding per-address activity rows.
@@ -64,6 +64,13 @@ pub const TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES: &[&str] = &[
 /// Stable consumer name persisted in the SDK cursor table.
 pub const TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("transparent_address_activity");
+
+/// On-disk schema declaration for the transparent-address-activity consumer.
+pub const TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
+    1,
+    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES,
+);
 
 /// Length of one primary storage key: 32 address + 4 reverse-height + 4 position.
 pub const TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN: usize = 40;

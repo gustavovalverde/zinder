@@ -63,6 +63,44 @@ impl AsRef<[u8]> for DeriveConsumerName {
     }
 }
 
+/// A derive consumer's on-disk schema declaration.
+///
+/// One declaration binds a consumer's stable [`DeriveConsumerName`] to the
+/// version of its column-family layout and the set of column families it
+/// owns. The derive store records the declared version per consumer and
+/// scopes wipe-and-rebuild to the single consumer whose declared version no
+/// longer matches the recorded one, leaving every other consumer's rows and
+/// cursor untouched. Bumping [`schema_version`](Self::schema_version) is the
+/// signal to drop and rebuild this consumer's column families.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DeriveConsumerSchema {
+    /// Stable consumer identity, shared with the consumer's cursor rows.
+    pub name: DeriveConsumerName,
+    /// Version of this consumer's column-family layout and payload encoding.
+    pub schema_version: u16,
+    /// Column families this consumer reads and writes.
+    pub column_families: &'static [&'static str],
+}
+
+impl DeriveConsumerSchema {
+    /// Declares a consumer's schema from its name, version, and owned column
+    /// families. Requiring the version here makes it impossible to register a
+    /// column family without one.
+    #[must_use]
+    pub const fn new(
+        name: DeriveConsumerName,
+        schema_version: u16,
+        column_families: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            schema_version,
+            column_families,
+        }
+    }
+}
+
 /// Boxed application error returned by consumer apply methods.
 ///
 /// The SDK does not constrain how consumers report failures inside their

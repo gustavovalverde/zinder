@@ -159,7 +159,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         query_config.storage.secondary_path.join("derive"),
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: query_config.storage.derive_rocksdb_budget,
         },
     ) {

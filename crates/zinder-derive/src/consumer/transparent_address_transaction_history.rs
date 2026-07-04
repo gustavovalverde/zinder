@@ -20,7 +20,7 @@ use zinder_store::StreamCursorTokenV1;
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 use crate::error::{DeriveStoreColumnFamily, DeriveStoreError};
 
@@ -46,6 +46,14 @@ pub const TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES: &[&str] = &[
 /// Stable consumer name persisted in the derive cursor table.
 pub const TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("transparent_address_transaction_history");
+
+/// On-disk schema declaration for the transparent-address-history consumer.
+pub const TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA: DeriveConsumerSchema =
+    DeriveConsumerSchema::new(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        1,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+    );
 
 const ADDRESS_HASH_LEN: usize = 32;
 const HEIGHT_LEN: usize = 4;
@@ -523,7 +531,7 @@ mod tests {
     use zinder_store::RocksDbResourceBudget;
 
     use super::{
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
         TransparentAddressTransactionHistoryConsumer,
         TransparentAddressTransactionHistoryPageRequest,
     };
@@ -567,7 +575,7 @@ mod tests {
         let store = DeriveStore::open(
             tempdir.path(),
             DeriveStoreOptions {
-                consumer_column_families: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
+                consumers: &[TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
             },

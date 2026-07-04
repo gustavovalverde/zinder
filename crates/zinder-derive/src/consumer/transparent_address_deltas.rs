@@ -43,7 +43,7 @@ use zinder_proto::v1::explorer::TransparentAddressDeltasRecord;
 use crate::consumer::address_value_event::{address_value_events, transaction_ids_by_position};
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName,
+    DeriveConsumerName, DeriveConsumerSchema,
 };
 
 /// Primary column family holding per-address delta rows.
@@ -65,6 +65,13 @@ pub const TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILIES: &[&str] = &[
 /// Stable consumer name persisted in the SDK cursor table.
 pub const TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("transparent_address_deltas");
+
+/// On-disk schema declaration for the transparent-address-deltas consumer.
+pub const TRANSPARENT_ADDRESS_DELTAS_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
+    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+    1,
+    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILIES,
+);
 
 const ADDRESS_HASH_LEN: usize = 32;
 const HEIGHT_LEN: usize = 4;

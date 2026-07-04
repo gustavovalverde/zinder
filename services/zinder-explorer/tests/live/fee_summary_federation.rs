@@ -145,7 +145,7 @@ impl FeeSummaryFixture {
                 .join("zinder-derive-secondary-explorer"),
             DeriveStoreOptions {
                 sync_writes: false,
-                consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+                consumers: DeriveStore::bundled_consumers(),
                 rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
             },
         )?;

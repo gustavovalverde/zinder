@@ -446,7 +446,7 @@ fn seeded_block_summary_derive_store(chain_fixture: &ChainFixture) -> Result<See
         &primary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
@@ -457,7 +457,7 @@ fn seeded_block_summary_derive_store(chain_fixture: &ChainFixture) -> Result<See
         &secondary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
@@ -682,7 +682,7 @@ fn seeded_deltas_derive_store(
         &primary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
@@ -693,7 +693,7 @@ fn seeded_deltas_derive_store(
         &secondary_path,
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;

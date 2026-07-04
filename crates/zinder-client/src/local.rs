@@ -799,7 +799,7 @@ async fn open_derive_secondary_with_timeout(
                 derive_secondary_path,
                 DeriveStoreOptions {
                     sync_writes: false,
-                    consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+                    consumers: DeriveStore::bundled_consumers(),
                     rocksdb_resource_budget: derive_rocksdb_budget,
                 },
             ) {

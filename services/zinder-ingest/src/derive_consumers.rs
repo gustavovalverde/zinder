@@ -210,7 +210,7 @@ pub fn open_primary_derive_store_for_canonical(
         DeriveStore::path_for_canonical(canonical_path),
         DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: DeriveStore::bundled_consumer_column_families(),
+            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget,
         },
     )
@@ -713,7 +713,10 @@ fn persisted_chain_event_cursor(
     let mut cursor: Option<Vec<u8>> = None;
     for consumer_name in DeriveStore::bundled_chain_event_consumer_names() {
         let Some(candidate) = derive_store.get_chain_event_cursor(*consumer_name)? else {
-            continue;
+            // A consumer without a cursor is fresh or was reset by a scoped
+            // schema rebuild; it must replay from the earliest retained event
+            // while the others re-apply the same deterministic rows idempotently.
+            return Ok(None);
         };
         if let Some(existing) = cursor.as_ref() {
             if existing != &candidate {

@@ -81,8 +81,7 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
             .join("zinder-derive-secondary-history"),
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
-            consumer_column_families: zinder_derive::DeriveStore::bundled_consumer_column_families(
-            ),
+            consumers: zinder_derive::DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
