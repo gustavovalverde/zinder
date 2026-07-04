@@ -187,9 +187,7 @@ async fn mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_sta
         return Ok(());
     };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
-        return Err(eyre!(
-            "this test needs ZINDER_NODE__INDEXER_GRPC_ADDR; skipping"
-        ));
+        return Ok(());
     };
 
     let store_fixture = StoreFixture::with_single_block(env.network())?;

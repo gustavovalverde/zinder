@@ -141,9 +141,13 @@ impl NetworkUpgradeActivations {
 
     /// Builds the activation table from an unsorted list.
     ///
-    /// Sorts activations by `activation_height` ascending. Returns
+    /// Stably sorts activations by `activation_height` ascending, preserving
+    /// the caller's order among upgrades that share a height so [`active_at`]
+    /// resolves same-height ties to the last-advertised upgrade. Returns
     /// [`NetworkUpgradeActivationsError::DuplicateBranchId`] if any branch
     /// id appears more than once.
+    ///
+    /// [`active_at`]: Self::active_at
     pub fn new(
         network: Network,
         mut activations: Vec<NetworkUpgradeActivation>,
@@ -176,7 +180,10 @@ impl NetworkUpgradeActivations {
     }
 
     /// Returns the activation active at `height`: the entry with the largest
-    /// `activation_height` such that `activation_height <= height`.
+    /// `activation_height` such that `activation_height <= height`. When
+    /// several upgrades share that height (regtest activates every upgrade at
+    /// height 1), the one advertised last by the node wins, matching the
+    /// node's own consensus-branch-id at the tip.
     ///
     /// Returns `None` if no advertised activation has yet activated at
     /// `height` (pre-Overwinter heights, when the node only reports

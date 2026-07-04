@@ -28,7 +28,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC_VERSION: "29.3"
-  ZEBRA_REGTEST_RPC_PORT: "39232"
+  ZEBRA_RPC_URL: http://127.0.0.1:39232
   ZINDER_COMPAT_PORT: "9087"
   LIGHTWALLETD_REFERENCE_PORT: "9088"
 
@@ -39,32 +39,25 @@ jobs:
     timeout-minutes: 45
 
     services:
+      # Pinned to the image Z3 ships with its v1 platform contract. Coinbase
+      # pays to the broadcast-cycle test key so the shim and reference agree on
+      # real transaction data. The reference lightwalletd runs as a step below,
+      # not a service: its image entrypoint is `lightwalletd --help` with no
+      # env-var config, which a service container cannot override.
       zebra:
-        image: zfnd/zebra:latest
+        image: zfnd/zebra:4.4.1
         ports:
           - 39232:39232
         env:
-          ZEBRA_NETWORK: Regtest
+          ZEBRA_NETWORK__NETWORK: Regtest
+          ZEBRA_RPC__LISTEN_ADDR: 0.0.0.0:39232
+          ZEBRA_RPC__ENABLE_COOKIE_AUTH: "false"
+          ZEBRA_MINING__MINER_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
         options: >-
           --health-cmd "wget -q -O- http://localhost:39232 || true"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 12
-
-      lightwalletd-reference:
-        image: electriccoinco/lightwalletd:latest
-        ports:
-          - 9088:9067
-        env:
-          LIGHTWALLETD_GRPC_BIND_ADDR: "0.0.0.0:9067"
-          LIGHTWALLETD_ZCASHD_RPC_HOST: zebra
-          LIGHTWALLETD_ZCASHD_RPC_PORT: "39232"
-          LIGHTWALLETD_ZCASHD_RPC_USER: zebra
-          LIGHTWALLETD_ZCASHD_RPC_PASSWORD: zebra
-          LIGHTWALLETD_NO_TLS_VERY_INSECURE: "true"
-        options: >-
-          --health-cmd "true"
-          --health-interval 15s
 
     steps:
       - name: Checkout
@@ -86,43 +79,93 @@ jobs:
         run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
 
       - name: Build Zinder binaries
-        run: cargo build --release -p zinder-ingest -p zinder-query -p zinder-compat-lightwalletd
+        run: cargo build --release -p zinder-ingest -p zinder-compat-lightwalletd
 
-      - name: Start Zinder pipeline (ingest + query + compat-shim)
+      - name: Advance regtest chain and start reference lightwalletd
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -sf -X POST -H 'content-type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
+                "${ZEBRA_RPC_URL}" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"generate","params":[25]}' \
+            "${ZEBRA_RPC_URL}" -o /dev/null
+          tip=$(curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+            "${ZEBRA_RPC_URL}")
+          echo "regtest tip after pre-mine: ${tip}"
+          # The reference image cannot be configured as a service container, so
+          # run it here on the host network to reach the mapped Zebra RPC port.
+          docker run -d --name lightwalletd-reference --network host \
+            electriccoinco/lightwalletd:latest \
+            --grpc-bind-addr "0.0.0.0:${LIGHTWALLETD_REFERENCE_PORT}" \
+            --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
+            --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout
+          for _ in $(seq 1 60); do
+            if docker logs lightwalletd-reference 2>&1 | grep -q "Waiting for block: $((tip + 1))"; then
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Start Zinder pipeline (ingest + compat-shim)
         env:
-          ZINDER_NETWORK: zcash-regtest
-          ZINDER_NODE__JSON_RPC_ADDR: "http://127.0.0.1:39232"
+          ZINDER_STORAGE__RAW_BLOB_POLICY: all
+          ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:39232
           ZINDER_NODE__AUTH__METHOD: basic
           ZINDER_NODE__AUTH__USERNAME: zebra
           ZINDER_NODE__AUTH__PASSWORD: zebra
         run: |
           set -euo pipefail
-          mkdir -p .tmp/parity-store
-          ./target/release/zinder-ingest --storage-path .tmp/parity-store &
-          INGEST_PID=$!
+          mkdir -p .tmp
+          ./target/release/zinder-ingest --network zcash-regtest \
+            --storage-path .tmp/parity-store > .tmp/ingest.log 2>&1 &
+          echo "ingest=$!" > .tmp/parity.pids
           sleep 5
-          ./target/release/zinder-query --storage-path .tmp/parity-store --listen-addr 127.0.0.1:9086 &
-          QUERY_PID=$!
-          ./target/release/zinder-compat-lightwalletd --storage-path .tmp/parity-store --listen-addr 127.0.0.1:9087 &
-          COMPAT_PID=$!
-          echo "ingest=$INGEST_PID query=$QUERY_PID compat=$COMPAT_PID" > .tmp/parity.pids
-          sleep 20
+          ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
+            --storage-path .tmp/parity-store \
+            --secondary-path .tmp/parity-secondary-compat \
+            --listen-addr "127.0.0.1:${ZINDER_COMPAT_PORT}" \
+            --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
+          echo "compat=$!" >> .tmp/parity.pids
+          tip=$(curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+            "${ZEBRA_RPC_URL}")
+          for _ in $(seq 1 90); do
+            if grep -qE " tip_height=${tip} " .tmp/ingest.log; then
+              break
+            fi
+            sleep 2
+          done
+          echo "ingest committed tip:"; grep -oE "tip_height=[0-9]+" .tmp/ingest.log | tail -1
 
       - name: Run parity diff
         env:
           ZINDER_TEST_LIVE: "1"
           ZINDER_NETWORK: zcash-regtest
-          ZINDER_NODE__JSON_RPC_ADDR: "http://127.0.0.1:39232"
+          ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:39232
           ZINDER_NODE__AUTH__METHOD: basic
           ZINDER_NODE__AUTH__USERNAME: zebra
           ZINDER_NODE__AUTH__PASSWORD: zebra
-          ZINDER_TEST_PARITY_ZINDER_ADDR: "http://127.0.0.1:9087"
-          ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: "http://127.0.0.1:9088"
+          ZINDER_TEST_PARITY_ZINDER_ADDR: http://127.0.0.1:9087
+          ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: http://127.0.0.1:9088
         run: |
           cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
             -E 'test(/^live::parity_against_lightwalletd::/)'
 
-      - name: Stop Zinder pipeline
+      - name: Dump pipeline logs on failure
+        if: failure()
+        run: |
+          echo "=== ingest.log ==="; tail -n 50 .tmp/ingest.log || true
+          echo "=== compat.log ==="; tail -n 50 .tmp/compat.log || true
+          echo "=== lightwalletd-reference ==="; docker logs lightwalletd-reference 2>&1 | tail -n 50 || true
+
+      - name: Stop Zinder pipeline and reference
         if: always()
         run: |
           if [ -f .tmp/parity.pids ]; then
@@ -132,3 +175,4 @@ jobs:
               kill "${pids[@]}" 2>/dev/null || true
             fi
           fi
+          docker rm -f lightwalletd-reference 2>/dev/null || true

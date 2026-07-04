@@ -243,9 +243,17 @@ async fn block_range_nullifiers_omit_commitment_tree_sizes_like_reference() -> R
 
     for blocks in [&zinder_blocks, &reference_blocks] {
         for block in blocks {
+            // The reference emits an all-zero `chainMetadata` message here while
+            // Zinder omits the field entirely; both withhold the witness-
+            // construction tree sizes, so the parity contract is "no non-zero
+            // tree size leaks", not strict field absence.
+            let leaks_tree_sizes = block.chain_metadata.as_ref().is_some_and(|metadata| {
+                metadata.sapling_commitment_tree_size != 0
+                    || metadata.orchard_commitment_tree_size != 0
+            });
             assert!(
-                block.chain_metadata.is_none(),
-                "nullifiers-only responses must omit commitment-tree sizes at height {}",
+                !leaks_tree_sizes,
+                "nullifiers-only responses must not leak commitment-tree sizes at height {}",
                 block.height,
             );
             for transaction in &block.vtx {

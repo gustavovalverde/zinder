@@ -55,6 +55,10 @@ jobs:
           ZEBRA_NETWORK__NETWORK: Regtest
           ZEBRA_RPC__LISTEN_ADDR: 0.0.0.0:39232
           ZEBRA_RPC__ENABLE_COOKIE_AUTH: "false"
+          # Coinbase pays to the broadcast-cycle test key, so the spend, UTXO,
+          # and balance live tests find outputs they control. Derive with
+          # `cargo run -p zinder-testkit --example print_broadcast_test_address`.
+          ZEBRA_MINING__MINER_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
         options: >-
           --health-cmd "wget -q -O- http://localhost:39232 || true"
           --health-interval 10s
@@ -78,6 +82,30 @@ jobs:
 
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+
+      # The Zebra service container boots a fresh regtest chain at genesis.
+      # Live tests need a chain tall enough to bulk-catch-up (>= 60 blocks) and
+      # a matured coinbase to spend, so seed it before the suite runs.
+      - name: Advance regtest chain to a testable height
+        env:
+          ZEBRA_RPC_URL: http://127.0.0.1:39232
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -sf -X POST -H 'content-type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
+                "$ZEBRA_RPC_URL" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"generate","params":[120]}' \
+            "$ZEBRA_RPC_URL" -o /dev/null
+          tip=$(curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+            "$ZEBRA_RPC_URL")
+          echo "regtest tip after pre-mine: ${tip}"
 
       - name: Run T3 live tests against regtest
         env:

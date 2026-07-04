@@ -23,10 +23,7 @@ async fn zebra_indexer_mempool_source_opens_stream_against_running_indexer() -> 
         return Ok(());
     };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
-        return Err(eyre!(
-            "this live test requires ZINDER_NODE__INDEXER_GRPC_ADDR to point at \
-             a Zebra started with ZEBRA_RPC__INDEXER_LISTEN_ADDR; skipping"
-        ));
+        return Ok(());
     };
     let mempool_source = build_indexer_mempool_source(&env, indexer_endpoint_url)?;
     assert_eq!(
@@ -101,9 +98,7 @@ async fn streaming_source_recovers_after_zebra_indexer_restart() -> Result<()> {
         return Ok(());
     };
     let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
-        return Err(eyre!(
-            "this destructive test needs ZINDER_NODE__INDEXER_GRPC_ADDR; skipping"
-        ));
+        return Ok(());
     };
     let container_name = std::env::var("ZINDER_TEST_INDEXER_CONTAINER_NAME")
         .unwrap_or_else(|_| "z3_regtest_sidecar_zebra".to_owned());

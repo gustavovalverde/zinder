@@ -1749,7 +1749,43 @@ struct ZebraGetBlockTrees {
 
 #[derive(Deserialize)]
 struct ZebraGetBlockchainInfoUpgrades {
-    upgrades: std::collections::BTreeMap<String, ZebraNetworkUpgradeInfo>,
+    // Preserve the node's advertised order. `getblockchaininfo` lists upgrades
+    // in activation sequence, so when several share an activation height
+    // (regtest activates every upgrade at height 1) the last entry is the
+    // active one; a `BTreeMap` would reorder by branch-id hex and resolve the
+    // tie to the wrong upgrade.
+    #[serde(deserialize_with = "deserialize_upgrades_in_advertised_order")]
+    upgrades: Vec<(String, ZebraNetworkUpgradeInfo)>,
+}
+
+fn deserialize_upgrades_in_advertised_order<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(String, ZebraNetworkUpgradeInfo)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AdvertisedOrderVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for AdvertisedOrderVisitor {
+        type Value = Vec<(String, ZebraNetworkUpgradeInfo)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of consensus branch id to network upgrade info")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut entries = Vec::with_capacity(map.size_hint().unwrap_or_default());
+            while let Some(entry) = map.next_entry()? {
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(AdvertisedOrderVisitor)
 }
 
 #[derive(Deserialize)]
@@ -1833,6 +1869,30 @@ mod tests {
                 max_response_bytes,
             } if max_response_bytes == DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get()
         ));
+    }
+
+    #[test]
+    fn upgrades_deserialize_in_advertised_order_not_hex_order() -> Result<(), eyre::Report> {
+        // Heartwood precedes Canopy in the node's advertised order, but its
+        // branch-id hex sorts after Canopy's; a hex-keyed map would swap them
+        // and make Heartwood the active same-height upgrade.
+        let json = r#"{
+            "upgrades": {
+                "f5b9230b": { "name": "Heartwood", "activationheight": 1 },
+                "e9ff75a6": { "name": "Canopy", "activationheight": 1 }
+            }
+        }"#;
+        let parsed: ZebraGetBlockchainInfoUpgrades = serde_json::from_str(json)?;
+        let advertised: Vec<(&str, &str)> = parsed
+            .upgrades
+            .iter()
+            .map(|(branch_id_hex, upgrade)| (branch_id_hex.as_str(), upgrade.name.as_str()))
+            .collect();
+        assert_eq!(
+            advertised,
+            [("f5b9230b", "Heartwood"), ("e9ff75a6", "Canopy")]
+        );
+        Ok(())
     }
 
     #[test]
