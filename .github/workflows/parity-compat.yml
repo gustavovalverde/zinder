@@ -28,9 +28,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC_VERSION: "29.3"
+  # Not prefixed `ZINDER_`: the binaries reject unknown `ZINDER_*` env vars as
+  # invalid config keys, so a `ZINDER_*` port knob would crash them at startup.
   ZEBRA_RPC_URL: http://127.0.0.1:39232
-  ZINDER_COMPAT_PORT: "9087"
-  LIGHTWALLETD_REFERENCE_PORT: "9088"
 
 jobs:
   parity-regtest:
@@ -97,13 +97,13 @@ jobs:
             "${ZEBRA_RPC_URL}" -o /dev/null
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
-            "${ZEBRA_RPC_URL}")
+            "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
           echo "regtest tip after pre-mine: ${tip}"
           # The reference image cannot be configured as a service container, so
           # run it here on the host network to reach the mapped Zebra RPC port.
           docker run -d --name lightwalletd-reference --network host \
             electriccoinco/lightwalletd:latest \
-            --grpc-bind-addr "0.0.0.0:${LIGHTWALLETD_REFERENCE_PORT}" \
+            --grpc-bind-addr 0.0.0.0:9088 \
             --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
             --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout
           for _ in $(seq 1 60); do
@@ -115,7 +115,6 @@ jobs:
 
       - name: Start Zinder pipeline (ingest + compat-shim)
         env:
-          ZINDER_STORAGE__RAW_BLOB_POLICY: all
           ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:39232
           ZINDER_NODE__AUTH__METHOD: basic
           ZINDER_NODE__AUTH__USERNAME: zebra
@@ -123,26 +122,44 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .tmp
-          ./target/release/zinder-ingest --network zcash-regtest \
+          # raw_blob_policy is a writer-only storage knob; the compat shim's
+          # storage config rejects it, so scope it to the ingest process rather
+          # than the step env both binaries inherit.
+          ZINDER_STORAGE__RAW_BLOB_POLICY=all ./target/release/zinder-ingest --network zcash-regtest \
             --storage-path .tmp/parity-store > .tmp/ingest.log 2>&1 &
           echo "ingest=$!" > .tmp/parity.pids
-          sleep 5
-          ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
-            --storage-path .tmp/parity-store \
-            --secondary-path .tmp/parity-secondary-compat \
-            --listen-addr "127.0.0.1:${ZINDER_COMPAT_PORT}" \
-            --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
-          echo "compat=$!" >> .tmp/parity.pids
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
-            "${ZEBRA_RPC_URL}")
+            "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
+          # Bring ingest (the writer) to the mined tip before opening the shim,
+          # so the shim's read-only secondary sees the whole chain on startup
+          # and its GetLatestBlock matches the reference within one block.
+          caught_up=""
           for _ in $(seq 1 90); do
             if grep -qE " tip_height=${tip} " .tmp/ingest.log; then
+              caught_up=yes
               break
             fi
             sleep 2
           done
-          echo "ingest committed tip:"; grep -oE "tip_height=[0-9]+" .tmp/ingest.log | tail -1
+          if [ -z "${caught_up}" ]; then
+            echo "ingest did not commit tip ${tip} in time; last ingest log lines:" >&2
+            tail -n 30 .tmp/ingest.log >&2 || true
+            exit 1
+          fi
+          echo "ingest caught up to tip ${tip}"
+          ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
+            --storage-path .tmp/parity-store \
+            --secondary-path .tmp/parity-secondary-compat \
+            --listen-addr 127.0.0.1:9087 \
+            --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
+          echo "compat=$!" >> .tmp/parity.pids
+          for _ in $(seq 1 30); do
+            if grep -q "compat_started" .tmp/compat.log; then
+              break
+            fi
+            sleep 1
+          done
 
       - name: Run parity diff
         env:
