@@ -33,7 +33,7 @@ use crate::chain_ingest::{
 )]
 pub(super) async fn run_commit_reassembly<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
-    block_prepare_stream: impl Stream<Item = Result<PreparedBlockArtifacts, IngestError>> + Send,
+    block_prepare_stream: impl Stream<Item = Result<Vec<PreparedBlockArtifacts>, IngestError>> + Send,
     bulk_catchup_start: BulkCatchupStart,
     flush_state: &mut BulkCatchupFlushState,
     completion_flush: BulkCatchupCompletionFlush,
@@ -89,20 +89,8 @@ where
             block_prepare_result.as_ref().err(),
         );
         let finalize_started_at = Instant::now();
-        let built_outcome = block_prepare_result.and_then(|prepared| {
-            let prefetched_spent_transparent_outputs =
-                prepared.prefetched_spent_transparent_outputs;
-            finalize_derived_block(prepared.derived, &mut running_tree_sizes)
-                .map(|built| (built, prefetched_spent_transparent_outputs))
-                .map_err(IngestError::from)
-        });
-        record_bulk_pipeline_stage_duration(
-            BULK_STAGE_CANONICAL_FINALIZE,
-            finalize_started_at,
-            built_outcome.as_ref().err(),
-        );
-        let (built, prefetched_spent_transparent_outputs) = match built_outcome {
-            Ok(prepared) => prepared,
+        let prepared_chunk = match block_prepare_result {
+            Ok(prepared_chunk) => prepared_chunk,
             Err(error) => {
                 if let Err(commit_error) = wait_for_in_flight_canonical_commit(
                     &mut in_flight_commit,
@@ -121,46 +109,82 @@ where
             }
         };
 
-        batch.absorb_with_prefetched_spent_outputs(built, prefetched_spent_transparent_outputs);
-        let batch_cost = batch.work_cost();
-        record_ingest_batch_work_cost(batch_cost);
-        record_commit_reassembly_state(&batch);
-
-        if let Some(commit_trigger) = batch_budget.commit_trigger(batch_cost) {
-            if let Err(error) = wait_for_in_flight_canonical_commit(
-                &mut in_flight_commit,
-                &mut next_subtree_root_indexes,
-                &mut retry_state,
-                &mut loop_flush_state,
-                &mut last_commit_outcome,
-            )
-            .await
+        for prepared in prepared_chunk {
+            let prefetched_spent_transparent_outputs =
+                prepared.prefetched_spent_transparent_outputs;
+            let built = match finalize_derived_block(prepared.derived, &mut running_tree_sizes)
+                .map_err(IngestError::from)
             {
-                restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
-                return Err(error);
+                Ok(built) => built,
+                Err(error) => {
+                    record_bulk_pipeline_stage_duration(
+                        BULK_STAGE_CANONICAL_FINALIZE,
+                        finalize_started_at,
+                        Some(&error),
+                    );
+                    if let Err(commit_error) = wait_for_in_flight_canonical_commit(
+                        &mut in_flight_commit,
+                        &mut next_subtree_root_indexes,
+                        &mut retry_state,
+                        &mut loop_flush_state,
+                        &mut last_commit_outcome,
+                    )
+                    .await
+                    {
+                        restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
+                        return Err(commit_error);
+                    }
+                    restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
+                    return Err(error);
+                }
+            };
+            batch.absorb_with_prefetched_spent_outputs(built, prefetched_spent_transparent_outputs);
+
+            if let Some(commit_trigger) = batch_budget.commit_trigger(batch.work_cost()) {
+                if let Err(error) = wait_for_in_flight_canonical_commit(
+                    &mut in_flight_commit,
+                    &mut next_subtree_root_indexes,
+                    &mut retry_state,
+                    &mut loop_flush_state,
+                    &mut last_commit_outcome,
+                )
+                .await
+                {
+                    restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
+                    return Err(error);
+                }
+                let batch_cost = batch.work_cost();
+                record_ingest_batch_work_cost(batch_cost);
+                record_canonical_batch_commit_trigger(run.config, batch_cost, commit_trigger);
+                let commit_batch = std::mem::take(&mut batch);
+                let commit_retry_state = retry_state
+                    .take()
+                    .ok_or(IngestError::BulkCatchupProducedNoCommit)?;
+                let commit_flush_state = loop_flush_state
+                    .take()
+                    .ok_or(IngestError::BulkCatchupProducedNoCommit)?;
+                in_flight_commit = Some(commit_canonical_batch_with_attachments(
+                    run,
+                    CanonicalCommitRequest {
+                        batch: commit_batch,
+                        next_subtree_root_indexes,
+                        retry_state: commit_retry_state,
+                        flush_state: commit_flush_state,
+                        chain_epoch_id,
+                    },
+                ));
+                record_canonical_commit_active(true);
+                record_commit_reassembly_state(&batch);
+                chain_epoch_id = next_chain_epoch_id_after(chain_epoch_id)?;
             }
-            record_canonical_batch_commit_trigger(run.config, batch_cost, commit_trigger);
-            let commit_batch = std::mem::take(&mut batch);
-            let commit_retry_state = retry_state
-                .take()
-                .ok_or(IngestError::BulkCatchupProducedNoCommit)?;
-            let commit_flush_state = loop_flush_state
-                .take()
-                .ok_or(IngestError::BulkCatchupProducedNoCommit)?;
-            in_flight_commit = Some(commit_canonical_batch_with_attachments(
-                run,
-                CanonicalCommitRequest {
-                    batch: commit_batch,
-                    next_subtree_root_indexes,
-                    retry_state: commit_retry_state,
-                    flush_state: commit_flush_state,
-                    chain_epoch_id,
-                },
-            ));
-            record_canonical_commit_active(true);
-            record_commit_reassembly_state(&batch);
-            chain_epoch_id = next_chain_epoch_id_after(chain_epoch_id)?;
         }
+        record_bulk_pipeline_stage_duration(
+            BULK_STAGE_CANONICAL_FINALIZE,
+            finalize_started_at,
+            None,
+        );
+        record_ingest_batch_work_cost(batch.work_cost());
+        record_commit_reassembly_state(&batch);
     }
 
     if let Err(error) = wait_for_in_flight_canonical_commit(
