@@ -231,7 +231,7 @@ pub async fn run_bulk_catchup<Source>(
     source: &Source,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let store_options = ChainStoreOptions {
         rocksdb_resource_budget: config.canonical_rocksdb_budget,
@@ -265,7 +265,7 @@ pub async fn run_bulk_catchup_with_store<Source>(
     store: &PrimaryChainStore,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
@@ -283,7 +283,7 @@ async fn run_bulk_catchup_with_store_inner<Source>(
     completion_flush: BulkCatchupCompletionFlush,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let config = run.config;
     let store_options = ChainStoreOptions::for_network(config.node.network);
@@ -341,7 +341,7 @@ pub async fn run_bulk_catchup_until_complete<Source>(
     readiness: &Readiness,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
@@ -360,7 +360,7 @@ pub(crate) async fn run_bulk_catchup_until_complete_with_flush_state<Source>(
     flush_state: &mut BulkCatchupFlushState,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     run_bulk_catchup_until_complete_inner(
         &run,
@@ -378,7 +378,7 @@ async fn run_bulk_catchup_until_complete_inner<Source>(
     completion_flush: BulkCatchupCompletionFlush,
 ) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let recovery_backoff = default_recovery_backoff();
     let mut outage: Option<(NodeUnavailableDetail, Instant)> = None;
@@ -478,7 +478,7 @@ async fn bulk_catchup_from_source_with_store<Source>(
     completion_flush: BulkCatchupCompletionFlush,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let config = run.config;
     let request_timeout = config.node.request_timeout;
@@ -601,7 +601,7 @@ async fn bulk_catchup_from_source_with_mock_derive<Source, F>(
     derive_fn: F,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
         + Copy
         + Send
@@ -645,7 +645,7 @@ async fn bulk_catchup_from_source_with_store_using_derive_fn<Source, F>(
     bulk_catchup_start: BulkCatchupStart,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
         + Copy
         + Send
@@ -1497,8 +1497,8 @@ mod tests {
                 network: Network::ZcashRegtest,
             },
             failure: FlakySourceFailure::NodeUnavailable,
-            retryable_failures_before_success: AtomicU32::new(2),
-            fetch_attempts: AtomicU32::new(0),
+            retryable_failures_before_success: Arc::new(AtomicU32::new(2)),
+            fetch_attempts: Arc::new(AtomicU32::new(0)),
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
@@ -1537,8 +1537,8 @@ mod tests {
                 network: Network::ZcashRegtest,
             },
             failure: FlakySourceFailure::ProtocolMismatch,
-            retryable_failures_before_success: AtomicU32::new(2),
-            fetch_attempts: AtomicU32::new(0),
+            retryable_failures_before_success: Arc::new(AtomicU32::new(2)),
+            fetch_attempts: Arc::new(AtomicU32::new(0)),
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
@@ -1890,7 +1890,7 @@ mod tests {
         derive_fn: F,
     ) -> Result<ChainEpochCommitOutcome, IngestError>
     where
-        Source: NodeSource,
+        Source: NodeSource + Clone,
         F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError>
             + Copy
             + Send
@@ -2059,16 +2059,19 @@ mod tests {
         derived
     }
 
+    #[derive(Clone)]
     struct TestNodeSource {
         tip_height: BlockHeight,
         network: Network,
     }
 
+    #[derive(Clone)]
     struct RecordingSegmentSource {
         requested_segments: Arc<Mutex<Vec<(u32, u32)>>>,
         network: Network,
     }
 
+    #[derive(Clone)]
     struct DelayedSegmentSource {
         fetch_events: Arc<Mutex<Vec<SegmentFetchEvent>>>,
         network: Network,
@@ -2086,11 +2089,12 @@ mod tests {
         Finished { height: BlockHeight },
     }
 
+    #[derive(Clone)]
     struct FlakyNodeSource {
         delegate: TestNodeSource,
         failure: FlakySourceFailure,
-        retryable_failures_before_success: AtomicU32,
-        fetch_attempts: AtomicU32,
+        retryable_failures_before_success: Arc<AtomicU32>,
+        fetch_attempts: Arc<AtomicU32>,
     }
 
     #[derive(Clone, Copy)]

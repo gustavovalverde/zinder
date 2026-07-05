@@ -477,6 +477,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
     Ok(())
 }
 
+#[derive(Clone)]
 struct FixtureCheckpointSource {
     block: SourceBlock,
     tip_height: BlockHeight,
