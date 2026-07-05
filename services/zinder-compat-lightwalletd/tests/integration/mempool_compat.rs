@@ -113,6 +113,36 @@ async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_drops_ironwood_entries_outside_requested_pool_types()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry(0xD1, synthetic_chain_epoch()),
+        ironwood_only_entry(0xD2, synthetic_chain_epoch()),
+    ]);
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_mempool_surface(Arc::new(surface));
+
+    let response = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: vec![lightwalletd::PoolType::Sapling as i32],
+        }))
+        .await?
+        .into_inner();
+    let collected = collect_compact_txids(response).await?;
+    assert_eq!(collected, vec![[0xD1; 32].to_vec()]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_tx_reads_all_snapshot_pages() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
@@ -321,6 +351,29 @@ fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolE
             }],
             actions: Vec::new(),
             ironwood_actions: Vec::new(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        },
+    )
+}
+
+fn ironwood_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+    synthetic_entry_with_compact_tx(
+        transaction_id_byte,
+        chain_epoch,
+        &lightwalletd::CompactTx {
+            index: 0,
+            txid: transaction_id_byte_to_txid_vec(transaction_id_byte),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: Vec::new(),
+            ironwood_actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![transaction_id_byte; 32],
+                cmx: vec![transaction_id_byte; 32],
+                ephemeral_key: vec![transaction_id_byte; 32],
+                ciphertext: vec![transaction_id_byte; 52],
+            }],
             vin: Vec::new(),
             vout: Vec::new(),
         },

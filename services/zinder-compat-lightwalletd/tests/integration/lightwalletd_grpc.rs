@@ -169,7 +169,8 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
 ///
 /// The redacted fields are block-level commitment-tree sizes
 /// (`chain_metadata`), transparent inputs and outputs, Sapling outputs, and the
-/// non-nullifier Orchard action fields. Only the shielded nullifiers survive.
+/// non-nullifier Orchard and Ironwood action fields. Only the shielded
+/// nullifiers survive.
 #[tokio::test]
 async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fields()
 -> eyre::Result<()> {
@@ -265,6 +266,63 @@ fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre:
         action.ciphertext.is_empty(),
         "Orchard ciphertext must be cleared"
     );
+    let ironwood_action = transaction
+        .ironwood_actions
+        .first()
+        .ok_or_else(|| eyre!("Ironwood action must survive in nullifier-only form"))?;
+    assert_eq!(
+        ironwood_action.nullifier,
+        vec![13; 32],
+        "Ironwood nullifier must survive"
+    );
+    assert!(
+        ironwood_action.cmx.is_empty(),
+        "Ironwood cmx must be cleared"
+    );
+    assert!(
+        ironwood_action.ephemeral_key.is_empty(),
+        "Ironwood ephemeralKey must be cleared"
+    );
+    assert!(
+        ironwood_action.ciphertext.is_empty(),
+        "Ironwood ciphertext must be cleared"
+    );
+    Ok(())
+}
+
+/// Ironwood subtree roots are deliberately unimplemented.
+///
+/// The frontier a from-genesis compact-block sync needs is built
+/// incrementally from `cmx` values, so `GetSubtreeRoots` support is
+/// deferred rather than misrouted.
+#[tokio::test]
+async fn get_subtree_roots_rejects_ironwood_as_unimplemented() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let status = match adapter
+        .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Ironwood as i32,
+            max_entries: 1,
+        }))
+        .await
+    {
+        Ok(_response) => {
+            return Err(eyre!("expected ironwood subtree roots to be unimplemented"));
+        }
+        Err(status) => status,
+    };
+
+    assert_eq!(status.code(), Code::Unimplemented);
+
     Ok(())
 }
 
@@ -1281,6 +1339,35 @@ async fn tree_state_treats_absent_pool_and_empty_commitments_as_empty() -> eyre:
 
     assert_eq!(tree_state.sapling_tree, "");
     assert_eq!(tree_state.orchard_tree, "");
+    assert_eq!(tree_state.ironwood_tree, "");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_maps_ironwood_pool_final_state() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(
+        br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{}},"orchard":{"commitments":{}},"ironwood":{"commitments":{"finalState":"aabbcc"}}}"#
+            .to_vec(),
+    )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let tree_state = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(tree_state.ironwood_tree, "aabbcc");
 
     Ok(())
 }
@@ -1674,7 +1761,12 @@ fn acceptance_compact_block_payload(
                 ephemeral_key: vec![11; 32],
                 ciphertext: vec![12; 52],
             }],
-            ironwood_actions: Vec::new(),
+            ironwood_actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![13; 32],
+                cmx: vec![14; 32],
+                ephemeral_key: vec![15; 32],
+                ciphertext: vec![16; 52],
+            }],
             vin: vec![lightwalletd::CompactTxIn {
                 prevout_txid: vec![8; 32],
                 prevout_index: 1,
