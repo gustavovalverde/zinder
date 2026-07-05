@@ -32,6 +32,7 @@ use watermark::record_stage_duration;
 #[cfg(test)]
 use crate::artifact_builder::{CommitmentTreeSizes, DerivedBlockArtifacts};
 
+mod abort_on_drop;
 mod block_prepare;
 mod commit_reassembly;
 mod flush;
@@ -603,9 +604,10 @@ async fn bulk_catchup_from_source_with_mock_derive<Source, F>(
 where
     Source: NodeSource + Clone,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
-        + Copy
+        + Clone
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     let store_options = ChainStoreOptions {
         rocksdb_resource_budget: config.canonical_rocksdb_budget,
@@ -647,9 +649,10 @@ async fn bulk_catchup_from_source_with_store_using_derive_fn<Source, F>(
 where
     Source: NodeSource + Clone,
     F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
-        + Copy
+        + Clone
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     let request_timeout = config.node.request_timeout;
     #[allow(
@@ -675,7 +678,10 @@ where
                 .block_prepare_max_in_flight_artifact_bytes,
             store: store.clone(),
         },
-        move |source_block| async move { derive_fn(&source_block).map_err(IngestError::from) },
+        move |source_block| {
+            let derive_fn = derive_fn.clone();
+            async move { derive_fn(&source_block).map_err(IngestError::from) }
+        },
     );
 
     let run = BulkCatchupRunContext::new(config, source, store);
@@ -866,14 +872,14 @@ mod tests {
         BlockHash, BlockId, ConsensusBranchId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT,
         ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionFactsArtifact,
         TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentUnspentOutput, UnixTimestampMillis,
-        wire::encode_internal_block_hash,
+        TransparentOutPoint, TransparentOutputArtifact, TransparentUnspentOutput,
+        UnixTimestampMillis, wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
-        NodeCapabilities, SourceBlock, SourceBlockHeader, SourceChainSegment,
+        NodeCapabilities, NodeCapability, SourceBlock, SourceBlockHeader, SourceChainSegment,
         SourceChainSegmentLimits, SourceChainSegmentStats, SourceError, SourceSubtreeRoot,
-        SourceSubtreeRoots, ZebraJsonRpcSource,
+        SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
     use zinder_store::ChainEventHistoryRequest;
 
@@ -1488,6 +1494,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_prepare_derive_futures_progress_without_stream_polling()
+    -> Result<(), Box<dyn Error>> {
+        let source = RecordingSegmentSource {
+            requested_segments: Arc::new(Mutex::new(Vec::new())),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            BlockHeight::new(1),
+        )));
+        let (_store_tempdir, store) = test_primary_chain_store("spawned-block-prepare-store")?;
+        // Handshake: block 1 waits for block 2's task to start, so block 2 is
+        // guaranteed in flight when block 1 is emitted; block 2 then waits for
+        // the test's release and signals completion, which under spawning
+        // happens without the stream being polled.
+        let second_block_started = Arc::new(tokio::sync::Notify::new());
+        let second_block_release = Arc::new(tokio::sync::Notify::new());
+        let second_block_completed = Arc::new(tokio::sync::Notify::new());
+        let started_for_stream = Arc::clone(&second_block_started);
+        let release_for_stream = Arc::clone(&second_block_release);
+        let completed_for_stream = Arc::clone(&second_block_completed);
+        let block_prepare_stream = build_block_prepare_stream(
+            &source,
+            BulkCatchupBlockPrepareStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(2),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
+            },
+            move |source_block| {
+                let started = Arc::clone(&started_for_stream);
+                let release = Arc::clone(&release_for_stream);
+                let completed = Arc::clone(&completed_for_stream);
+                async move {
+                    match source_block.height.value() {
+                        1 => started.notified().await,
+                        2 => {
+                            started.notify_one();
+                            release.notified().await;
+                            completed.notify_one();
+                        }
+                        _ => {}
+                    }
+                    Ok(test_derived_block(&source_block, 0, 0))
+                }
+            },
+        );
+        futures_util::pin_mut!(block_prepare_stream);
+
+        let first_block = block_prepare_stream
+            .next()
+            .await
+            .ok_or("missing first prepared block")??;
+        assert_eq!(first_block.derived.block_header.height, BlockHeight::new(1));
+
+        second_block_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), second_block_completed.notified())
+            .await
+            .map_err(|_timed_out| {
+                "spawned block-prepare task must complete while the stream is not polled"
+            })?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_catchup_commits_epochs_in_order_while_overlapping_commit()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("ordered-overlap-store");
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+        // One block per epoch, so every commit overlaps the next block's
+        // accumulate. The store rejects any out-of-order commit, so eight
+        // successful sequential epochs prove the overlap kept commits ordered.
+        let config = test_bulk_catchup_run_config(&storage_path, 1, 8, 1, false)?;
+
+        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
+            Ok(test_derived_block(sb, 0, 0))
+        })
+        .await?;
+
+        assert_eq!(commit_outcome.chain_epoch.id, ChainEpochId::new(8));
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(8)
+        );
+
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let events =
+            store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
+        assert_eq!(events.len(), 8);
+        let mut sequences = events
+            .iter()
+            .map(|event| event.event_sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=8).collect::<Vec<u64>>());
+        let mut tip_heights = events
+            .iter()
+            .map(|event| event.chain_epoch.visible_tip_height.value())
+            .collect::<Vec<_>>();
+        tip_heights.sort_unstable();
+        assert_eq!(tip_heights, (1..=8).collect::<Vec<u32>>());
+
+        Ok(())
+    }
+
+    /// Batch {1,2} funds an output that block 3 (batch {3,4}) spends.
+    ///
+    /// The first commit is held at its tree-state fetch until block 4's
+    /// derive releases it; with `block_prepare_concurrency = 1`, block 4's
+    /// derive starts only after block 3's whole prepare (including its
+    /// spent-output prefetch) finished, so the prefetch provably ran against
+    /// a store that did not yet contain epoch 1 and the spend fact can only
+    /// come from the commit-time store re-read.
+    #[tokio::test]
+    async fn bulk_catchup_resolves_cross_batch_transparent_spend() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("cross-batch-spend-store");
+        let recorded_events = Arc::new(Mutex::new(Vec::new()));
+        let commit_gate = Arc::new(tokio::sync::Notify::new());
+        let source = GatedTreeStateSource {
+            delegate: TestNodeSource {
+                tip_height: BlockHeight::new(200),
+                network: Network::ZcashRegtest,
+            },
+            gated_tip_height: BlockHeight::new(2),
+            commit_gate: Arc::clone(&commit_gate),
+            events: Arc::clone(&recorded_events),
+        };
+        let mut config = test_bulk_catchup_run_config(&storage_path, 1, 4, 2, false)?;
+        config.block_prepare_concurrency =
+            NonZeroU32::new(1).ok_or("invalid prepare concurrency")?;
+        let funding_transaction_id = TransactionId::from_bytes([0x51; 32]);
+        let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
+        let spending_transaction_id = TransactionId::from_bytes([0x52; 32]);
+        let derive_events = Arc::clone(&recorded_events);
+        let release_gate = Arc::clone(&commit_gate);
+
+        let commit_outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk_catchup_from_source_with_mock_derive(&config, &source, move |source_block| {
+                match source_block.height.value() {
+                    1 => Ok(test_output_creating_block(source_block, spent_outpoint)),
+                    3 => {
+                        derive_events.lock().push("spending_block_derived");
+                        Ok(test_transparent_spend_block(
+                            source_block,
+                            spending_transaction_id,
+                            spent_outpoint,
+                        ))
+                    }
+                    4 => {
+                        derive_events.lock().push("release_block_derived");
+                        release_gate.notify_one();
+                        Ok(test_derived_block(source_block, 0, 0))
+                    }
+                    _ => Ok(test_derived_block(source_block, 0, 0)),
+                }
+            }),
+        )
+        .await
+        .map_err(|_timed_out| "bulk catchup with a gated first commit must complete")??;
+
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(4)
+        );
+        let observed = recorded_events.lock().clone();
+        let spend_derived = recorded_event_index(&observed, "spending_block_derived")?;
+        let release_derived = recorded_event_index(&observed, "release_block_derived")?;
+        let commit_held = recorded_event_index(&observed, "first_commit_holding")?;
+        let commit_released = recorded_event_index(&observed, "first_commit_released")?;
+        assert!(
+            spend_derived < release_derived && release_derived < commit_released,
+            "spending block must be prepared before the first commit resumes; events: {observed:?}"
+        );
+        assert!(commit_held < commit_released);
+
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let reader = store.current_chain_epoch_reader()?;
+        let spend_facts = reader.transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
+        let spend_fact = spend_facts
+            .get(&spent_outpoint)
+            .ok_or("cross-batch spend fact must be committed")?;
+        assert_eq!(spend_fact.spending_transaction_id, spending_transaction_id);
+        assert_eq!(spend_fact.spent_value_zat, 21);
+        assert_eq!(spend_fact.spent_block_height, BlockHeight::new(1));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bulk_catchup_retries_retryable_block_fetch_failures() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("retryable-source-store");
@@ -1892,9 +2114,10 @@ mod tests {
     where
         Source: NodeSource + Clone,
         F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError>
-            + Copy
+            + Clone
             + Send
-            + Sync,
+            + Sync
+            + 'static,
     {
         let store_options = ChainStoreOptions::for_network(config.node.network);
         validate_bulk_catchup_finality_bound(
@@ -2059,10 +2282,41 @@ mod tests {
         derived
     }
 
+    fn test_output_creating_block(
+        source_block: &SourceBlock,
+        outpoint: TransparentOutPoint,
+    ) -> DerivedBlockArtifacts {
+        let mut derived = test_derived_block(source_block, 0, 0);
+        let script_pub_key = vec![0x76, 0xa9, 0x14, 0x77];
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
+        derived
+            .transparent_outputs_by_outpoint
+            .push(TransparentOutputArtifact::new(
+                outpoint,
+                21,
+                script_pub_key,
+                address_script_hash,
+                source_block.height,
+                source_block.hash,
+            ));
+        derived
+    }
+
     #[derive(Clone)]
     struct TestNodeSource {
         tip_height: BlockHeight,
         network: Network,
+    }
+
+    /// Holds the commit whose batch tip is `gated_tip_height` at its
+    /// tree-state fetch until `commit_gate` is notified, recording the hold
+    /// and release into `events`.
+    #[derive(Clone)]
+    struct GatedTreeStateSource {
+        delegate: TestNodeSource,
+        gated_tip_height: BlockHeight,
+        commit_gate: Arc<tokio::sync::Notify>,
+        events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[derive(Clone)]
@@ -2305,6 +2559,46 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl NodeSource for GatedTreeStateSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            self.delegate.capabilities()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            self.delegate.fetch_block_at(height).await
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            self.delegate.tip_id().await
+        }
+
+        async fn fetch_subtree_roots(
+            &self,
+            protocol: ShieldedProtocol,
+            start_index: SubtreeRootIndex,
+            max_entries: NonZeroU32,
+        ) -> Result<SourceSubtreeRoots, SourceError> {
+            self.delegate
+                .fetch_subtree_roots(protocol, start_index, max_entries)
+                .await
+        }
+
+        async fn fetch_tree_state_for_block(
+            &self,
+            block_id: BlockId,
+        ) -> Result<SourceTreeState, SourceError> {
+            if block_id.height == self.gated_tip_height {
+                self.events.lock().push("first_commit_holding");
+                self.commit_gate.notified().await;
+                self.events.lock().push("first_commit_released");
+            }
+            Err(SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::TreeState,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
     impl NodeSource for TestNodeSource {
         fn capabilities(&self) -> NodeCapabilities {
             ZebraJsonRpcSource::baseline_capabilities()
@@ -2376,6 +2670,16 @@ mod tests {
             .ok_or_else(|| {
                 format!("missing expected block prepare event: {expected_event:?}").into()
             })
+    }
+
+    fn recorded_event_index(
+        events: &[&'static str],
+        expected_event: &'static str,
+    ) -> Result<usize, Box<dyn Error>> {
+        events
+            .iter()
+            .position(|event| *event == expected_event)
+            .ok_or_else(|| format!("missing expected recorded event: {expected_event}").into())
     }
 
     fn test_source_block(network: Network, height: BlockHeight) -> SourceBlock {
