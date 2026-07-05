@@ -832,6 +832,7 @@ explorer.fee.summary_v1
 explorer.value_pool.summary_v1
 explorer.utxo_set.summary_v1
 explorer.utxo_set.commitment_v1
+explorer.chain.reorg_history_v1
 explorer.mempool.event_counts_v1
 explorer.transaction.fees_v1
 explorer.transaction.recent_v1

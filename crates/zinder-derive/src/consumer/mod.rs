@@ -15,6 +15,7 @@ pub(crate) mod block_commit_context;
 pub(crate) mod block_summary;
 pub(crate) mod mempool_event_counts;
 pub(crate) mod recent_transactions;
+pub(crate) mod reorg_incidents;
 pub(crate) mod transaction_fees;
 pub(crate) mod transparent_address_activity;
 pub(crate) mod transparent_address_deltas;

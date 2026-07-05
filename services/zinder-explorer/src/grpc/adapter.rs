@@ -26,16 +26,16 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::{
     explorer::{
         BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-        BlockSummariesInRangeResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
-        MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
-        MempoolEventCountsResponse, MempoolSummaryRequest, MempoolSummaryResponse,
-        OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionsRequest,
-        SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
-        TransactionDetailRequest, TransactionDetailResponse, TransparentAddressActivityRequest,
-        TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
-        TransparentAddressDeltasResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
-        ValuePoolSummaryRequest, ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest,
-        VerifyPaymentDisclosureResponse,
+        BlockSummariesInRangeResponse, ChainReorgHistoryRequest, ChainReorgHistoryResponse,
+        ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse, MempoolActivityRequest,
+        MempoolActivityResponse, MempoolEventCountsRequest, MempoolEventCountsResponse,
+        MempoolSummaryRequest, MempoolSummaryResponse, OverviewSnapshotRequest,
+        OverviewSnapshotResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
+        ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
+        TransparentAddressActivityRequest, TransparentAddressActivityResponse,
+        TransparentAddressDeltasRequest, TransparentAddressDeltasResponse, UtxoSetSummaryRequest,
+        UtxoSetSummaryResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
+        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -54,6 +54,7 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 );
 
 use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
+use super::chain_reorg_history::handle_chain_reorg_history;
 use super::error::ExplorerError;
 use super::fee_summary::handle_fee_summary;
 use super::freshness::{
@@ -595,6 +596,29 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 request,
             )
             .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn chain_reorg_history(
+        &self,
+        request: Request<ChainReorgHistoryRequest>,
+    ) -> Result<Response<ChainReorgHistoryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ChainReorgHistory",
+            metric: "chain_reorg_history",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "ChainReorgHistory requires a derive store",
+                )
+            })?;
+            handle_chain_reorg_history(derive_store, &self.upstream_observation_cache, request)
+                .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());

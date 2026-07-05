@@ -6,7 +6,7 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -16,24 +16,24 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
-    BlockHeight, BlockId, ChainEpochId, Network, TransparentAddressScriptHash,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpochId, Network, TransparentAddressScriptHash,
     wire::encode_rpc_block_hash_hex,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
-    DeriveStoreOptions, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    DeriveStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TransparentAddressDeltasConsumer,
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V1, EXPLORER_TRANSACTION_FEES_V1,
     EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
-    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, OverviewSnapshotRequest,
-    ServerInfoRequest, TransactionDetailRequest, TransparentAddressDeltasRecord,
-    TransparentAddressDeltasRequest, TransparentDeltaKind,
+    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, ChainReorgHistoryRequest,
+    OverviewSnapshotRequest, ServerInfoRequest, TransactionDetailRequest,
+    TransparentAddressDeltasRecord, TransparentAddressDeltasRequest, TransparentDeltaKind,
     explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
@@ -43,6 +43,7 @@ use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
+use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -379,6 +380,158 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
     Ok(())
 }
 
+#[tokio::test]
+async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let settled_block = initial_chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("initial fixture missing height 1"))?;
+    let mut initial_epoch = initial_chain
+        .chain_epoch(ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
+    initial_epoch.settled_tip_height = settled_block.height;
+    initial_epoch.settled_tip_hash = settled_block.hash;
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            initial_epoch,
+            initial_chain.block_header_artifacts(),
+            initial_chain.compact_block_artifacts(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+        }),
+    )?;
+
+    let replacement_chain = initial_chain.fork_at(BlockHeight::new(2))?.extend_blocks(1);
+    let replacement_block = replacement_chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("replacement fixture missing height 2"))?;
+    let mut replacement_epoch = replacement_chain
+        .chain_epoch(ChainEpochId::new(2))
+        .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
+    replacement_epoch.settled_tip_height = settled_block.height;
+    replacement_epoch.settled_tip_hash = settled_block.hash;
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            replacement_epoch,
+            vec![replacement_block.block_header_artifact()],
+            vec![replacement_block.compact_block_artifact()],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(2),
+        }),
+    )?;
+
+    let primary_derive_store = zinder_ingest::open_primary_derive_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    zinder_ingest::catch_up_derive_store_to_canonical(
+        store_fixture.chain_store(),
+        &primary_derive_store,
+        test_derive_config(),
+    )
+    .await?;
+    let reorg_cursor = primary_derive_store
+        .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
+        .ok_or_else(|| eyre!("reorg incidents cursor missing after derive replay"))?;
+    assert!(!reorg_cursor.is_empty());
+
+    let derive_secondary_tempdir = tempfile::tempdir()?;
+    let derive_store = DeriveStore::open_secondary(
+        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
+        derive_secondary_tempdir.path(),
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumers: DeriveStore::bundled_consumers(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    derive_store.try_catch_up()?;
+    let (mut client, explorer_handle) =
+        spawn_explorer_query_server_with_derive_store(derive_store).await?;
+
+    let explorer_info = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_CHAIN_REORG_HISTORY_V1);
+
+    let first_page = client
+        .chain_reorg_history(ChainReorgHistoryRequest {
+            max_events: 1,
+            from_cursor: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    let freshness = first_page
+        .freshness
+        .as_ref()
+        .ok_or_else(|| eyre!("reorg history response missing freshness"))?;
+    assert_eq!(
+        freshness.capability_version,
+        EXPLORER_CHAIN_REORG_HISTORY_V1
+    );
+    assert!(first_page.next_cursor.is_empty());
+    assert_eq!(first_page.events.len(), 1);
+    let reorg = first_page
+        .events
+        .first()
+        .ok_or_else(|| eyre!("reorg event missing"))?;
+    assert_eq!(reorg.event_sequence, 2);
+    assert!(!reorg.cursor.is_empty());
+    assert_eq!(reorg.chain_epoch_id, 2);
+    assert_eq!(
+        reorg
+            .visible_tip
+            .as_ref()
+            .ok_or_else(|| eyre!("reorg visible tip missing"))?
+            .height,
+        2
+    );
+    assert_eq!(
+        reorg
+            .settled_tip
+            .as_ref()
+            .ok_or_else(|| eyre!("reorg settled tip missing"))?
+            .height,
+        1
+    );
+    let reverted = reorg
+        .reverted
+        .as_ref()
+        .ok_or_else(|| eyre!("reorg reverted range missing"))?;
+    assert_eq!(reverted.start_height, 2);
+    assert_eq!(reverted.end_height, 2);
+    let committed = reorg
+        .committed
+        .as_ref()
+        .ok_or_else(|| eyre!("reorg committed range missing"))?;
+    assert_eq!(committed.start_height, 2);
+    assert_eq!(committed.end_height, 2);
+
+    let empty_page = client
+        .chain_reorg_history(ChainReorgHistoryRequest {
+            max_events: 10,
+            from_cursor: reorg.cursor.clone(),
+        })
+        .await?
+        .into_inner();
+    assert!(empty_page.events.is_empty());
+    assert!(empty_page.next_cursor.is_empty());
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    Ok(())
+}
+
 /// Minimal `NodeSource` stub used by the upstream-observation probe test.
 ///
 /// Returns a fixed [`UpstreamHealthSnapshot`] from
@@ -477,6 +630,18 @@ fn seeded_block_summary_derive_store(chain_fixture: &ChainFixture) -> Result<See
     })
 }
 
+fn test_derive_config() -> zinder_ingest::IngestDeriveConfig {
+    zinder_ingest::IngestDeriveConfig {
+        replay_batch_blocks: NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
+        replay_policy: zinder_ingest::DeriveReplayPolicy::CanonicalFirst,
+        memory_budget_bytes: None,
+        memory_degrade_ratio: 0.85,
+        memory_pause_ratio: 0.95,
+        memory_resume_ratio: 0.75,
+        min_replay_batch_blocks: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+    }
+}
+
 fn seed_block_summary(derive_store: &DeriveStore, chain_fixture: &ChainFixture) -> Result<()> {
     let fixture_block = chain_fixture
         .block_at(BlockHeight::new(1))
@@ -524,6 +689,25 @@ async fn spawn_explorer_query_server(
     .with_derive_store(derive_store)
     .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
     .with_prevout_resolution_online(true);
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let channel = await_with_retry(addr).await?;
+    Ok((ExplorerQueryClient::new(channel), handle))
+}
+
+async fn spawn_explorer_query_server_with_derive_store(
+    derive_store: DeriveStore,
+) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_derive_store(derive_store);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())

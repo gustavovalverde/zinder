@@ -122,6 +122,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `TransactionPublicFacts` | Single typed transaction-fact value parsed once at ingest/mempool/explorer-read time. See [ADR-0010](../adrs/0010-transaction-public-facts.md). |
 | `ExplorerFreshness` | Explorer response envelope at field tag 1. Wraps the cross-plane `ChainView` (chain-state axes) and keeps only the metadata that varies per explorer call: `snapshot_age_millis`, `unavailable[]`, and `capability_version`. The upstream tip rides on `chain_view.upstream_tip`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
 | `SearchCandidate` | Typed search-result oneof distinguishing every classifiable input class, including the `NotPubliclyIndexable` arm for shielded receivers. See [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). |
+| `ChainReorgHistory` | Explorer RPC returning recorded reorg incidents from the `ReorgIncidentsConsumer` derive projection. The projection starts from the earliest retained chain event when the consumer first runs and then keeps future incidents beyond chain-event retention; it does not reconstruct incidents already pruned before deployment. |
 
 ### Derive-plane SDK
 
@@ -131,11 +132,13 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `DeriveStoreTable` | Logical column-family identifier referenced by reads and `WriteBatch` puts |
 | `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
 | `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
+| `ReorgIncidentsConsumer` | Event-only chain-event derive consumer that writes one durable `reorg_incidents` row per `ChainReorged` event, keyed by ascending `event_sequence`. It does not hydrate committed block contexts and has an event-only cursor independent from block-keyed derive replay. |
 | `DeriveMempoolConsumer` | Rust trait for consumers that observe `MempoolEvents` instead of (or in addition to) chain events |
 | `DeriveConsumerCtx` | Per-event consumer context carrying a `&DeriveStore` borrow for reads and a `&mut WriteBatch` consumers stage their writes into; the SDK appends the cursor advance to the same batch and commits atomically |
 | `ChainCommittedEvent`, `ChainReorgedEvent` | Typed wrappers around the wire chain-event variants, decoded into `zinder-core` primitives so consumers never see prost-generated types |
 | `MempoolConsumerEvent` | Typed wrapper around one `MempoolEventEnvelope`, carrying borrowed transaction-id and raw-transaction-bytes slices for the duration of the apply call |
 | `DeriveStore::write_chain_event` | Ingest-hosted dispatcher that applies `BlockKeyedConsumer` implementations and persists the chain-event cursor atomically with consumer writes |
+| `DeriveStore::write_chain_event_chunk_with_event_consumers` | Ingest-hosted dispatcher for event-only `DeriveConsumer` implementations, with optional block-keyed consumers for rare mixed cases. Use it when a projection observes the chain event itself rather than each committed block. |
 | `DeriveStore::write_mempool_event` | Ingest-hosted dispatcher that applies a `DeriveMempoolConsumer` and persists the mempool-event cursor atomically with consumer writes |
 
 ### Cursors, events, errors
@@ -722,6 +725,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `explorer.value_pool.summary_v1`
 - `explorer.utxo_set.summary_v1`
 - `explorer.utxo_set.commitment_v1`
+- `explorer.chain.reorg_history_v1`
 - `explorer.mempool.event_counts_v1`
 - `explorer.transaction.fees_v1`
 - `explorer.transaction.recent_v1`

@@ -1089,6 +1089,12 @@ service ExplorerQuery {
   // `explorer.utxo_set.summary_v1`.
   rpc UtxoSetSummary(UtxoSetSummaryRequest) returns (UtxoSetSummaryResponse);
 
+  // Returns retained chain reorg events from the canonical chain-event log,
+  // scanning at most `max_events` retained chain events per request.
+  // Capability: `explorer.chain.reorg_history_v1`.
+  rpc ChainReorgHistory(ChainReorgHistoryRequest)
+      returns (ChainReorgHistoryResponse);
+
   // Returns rolling counts of mempool events from the per-second counter
   // column family. Replaces consumer-side in-memory ring buffers.
   // Capability: `explorer.mempool.event_counts_v1`.
@@ -1325,6 +1331,62 @@ message MempoolEventCountsResponse {
   // Stays zero for sources that do not surface ZIP-401
   // `RecentlyEvicted`-style admission refusals.
   uint32 suppressed_count = 6;
+}
+
+// `ExplorerQuery.ChainReorgHistory` request.
+//
+// Reads the durable reorg-incident projection as a bounded stateless page.
+// The projection backfills from the earliest retained chain event when the
+// derive consumer first runs, then keeps future incidents independently of
+// chain-event retention. It cannot reconstruct incidents that were pruned
+// before the projection existed.
+message ChainReorgHistoryRequest {
+  // Maximum incident rows to return. Zero selects the server default; values
+  // above the server cap are clamped.
+  uint32 max_events = 1;
+
+  // Empty starts at the earliest recorded incident. Non-empty resumes strictly
+  // after this opaque cursor from a previous response or event.
+  bytes from_cursor = 2;
+}
+
+// `ExplorerQuery.ChainReorgHistory` response.
+message ChainReorgHistoryResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Recorded reorg incidents, ordered by ascending chain-event sequence.
+  repeated ChainReorgHistoryEvent events = 2;
+
+  // Opaque cursor for the next bounded page. Empty means this response reached
+  // the current end of recorded reorg incidents.
+  bytes next_cursor = 3;
+}
+
+// One recorded chain reorg incident projected for explorer consumers.
+message ChainReorgHistoryEvent {
+  // Monotonic sequence in the chain-event stream.
+  uint64 event_sequence = 1;
+
+  // Opaque cursor for resuming strictly after this reorg event.
+  bytes cursor = 2;
+
+  // Chain epoch visible after the reorg was committed.
+  uint64 chain_epoch_id = 3;
+
+  // Zinder wall-clock creation time for the post-reorg chain epoch.
+  uint64 chain_epoch_created_at_millis = 4;
+
+  // Best visible block after the reorg.
+  zinder.v1.wallet.BlockTip visible_tip = 5;
+
+  // Highest settled block after the reorg.
+  zinder.v1.wallet.BlockTip settled_tip = 6;
+
+  // Previously visible range invalidated by this reorg.
+  zinder.v1.wallet.ChainRangeReverted reverted = 7;
+
+  // Replacement range committed by this reorg.
+  zinder.v1.wallet.ChainEpochCommitted committed = 8;
 }
 
 // `ExplorerQuery.VerifyPaymentDisclosure` request.

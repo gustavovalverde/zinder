@@ -2,6 +2,7 @@
 
 mod adapter;
 mod block_view;
+mod chain_reorg_history;
 mod error;
 mod fee_summary;
 mod freshness;

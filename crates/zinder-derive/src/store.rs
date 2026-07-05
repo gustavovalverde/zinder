@@ -34,6 +34,7 @@ use crate::{
     consumer::recent_transactions::{
         RECENT_TRANSACTIONS_CONSUMER_NAME, RECENT_TRANSACTIONS_SCHEMA,
     },
+    consumer::reorg_incidents::{REORG_INCIDENTS_CONSUMER_NAME, REORG_INCIDENTS_SCHEMA},
     consumer::transaction_fees::{TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_SCHEMA},
     consumer::transparent_address_activity::{
         TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
@@ -50,9 +51,9 @@ use crate::{
     },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
-        CommittedRange, DeriveConsumerCtx, DeriveConsumerName, DeriveConsumerSchema,
-        DeriveMempoolConsumer, RevertedRange, apply_chain_committed_in_memory,
-        apply_chain_reorged_in_memory,
+        CommittedRange, DeriveConsumer, DeriveConsumerCtx, DeriveConsumerName,
+        DeriveConsumerSchema, DeriveMempoolConsumer, RevertedRange,
+        apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
     },
     error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError},
 };
@@ -98,6 +99,7 @@ const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
     BLOCK_SUMMARY_SCHEMA,
     MEMPOOL_EVENT_COUNTS_SCHEMA,
     RECENT_TRANSACTIONS_SCHEMA,
+    REORG_INCIDENTS_SCHEMA,
     TRANSACTION_FEES_SCHEMA,
     TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
     TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
@@ -113,6 +115,8 @@ const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 ];
+const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] =
+    &[REORG_INCIDENTS_CONSUMER_NAME];
 
 /// Per-column-family options the derive plane tunes at open time.
 ///
@@ -381,6 +385,13 @@ impl DeriveStore {
         BUNDLED_CHAIN_EVENT_CONSUMER_NAMES
     }
 
+    /// Returns bundled chain-event consumer cursor names that read only the
+    /// event envelope and do not need committed block contexts.
+    #[must_use]
+    pub const fn bundled_event_only_chain_event_consumer_names() -> &'static [DeriveConsumerName] {
+        BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES
+    }
+
     /// Opens or creates a derive store at `path`.
     ///
     /// Rejects with [`DeriveStoreError::ConsumerColumnFamilyConflict`] when the
@@ -606,7 +617,14 @@ impl DeriveStore {
     where
         S: BuildHasher,
     {
-        self.write_chain_event_chunk(consumers, inputs, blocks, true)
+        let mut event_consumers: [&mut dyn DeriveConsumer; 0] = [];
+        self.write_chain_event_chunk_with_event_consumers(
+            consumers,
+            &mut event_consumers,
+            inputs,
+            blocks,
+            true,
+        )
     }
 
     /// Dispatches one replay chunk and optionally advances chain-event
@@ -628,18 +646,58 @@ impl DeriveStore {
     where
         S: BuildHasher,
     {
+        let mut event_consumers: [&mut dyn DeriveConsumer; 0] = [];
+        self.write_chain_event_chunk_with_event_consumers(
+            consumers,
+            &mut event_consumers,
+            inputs,
+            blocks,
+            advance_cursor,
+        )
+    }
+
+    /// Dispatches one replay chunk to block-keyed and direct chain-event
+    /// consumers, optionally advancing chain-event cursors.
+    ///
+    /// Direct consumers observe the event envelope itself rather than the
+    /// committed block contexts. They share the same write batch and cursor
+    /// advance as block-keyed consumers, so a crash never records an incident
+    /// without advancing its replay cursor or vice versa.
+    pub fn write_chain_event_chunk_with_event_consumers<S>(
+        &self,
+        block_consumers: &mut [&mut dyn BlockKeyedConsumer],
+        event_consumers: &mut [&mut dyn DeriveConsumer],
+        inputs: ChainEventDispatchInputs<'_>,
+        blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+        advance_cursor: bool,
+    ) -> Result<(), DeriveError>
+    where
+        S: BuildHasher,
+    {
         let mut batch = WriteBatch::default();
         let mut ctx = DeriveConsumerCtx {
             store: self,
             batch: &mut batch,
         };
 
-        for consumer in consumers.iter_mut() {
+        for consumer in block_consumers.iter_mut() {
             dispatch_chain_event_to_block_consumer(&mut **consumer, inputs, &mut ctx, blocks)?;
+        }
+        for consumer in event_consumers.iter_mut() {
+            dispatch_chain_event_to_consumer(&mut **consumer, inputs, &mut ctx)?;
         }
 
         if advance_cursor {
-            self.stage_chain_event_cursor_advances(&mut batch, consumers, inputs.chain_cursor)?;
+            self.stage_chain_event_cursor_advances(
+                &mut batch,
+                block_consumers,
+                inputs.chain_cursor,
+            )?;
+            self.stage_event_chain_event_cursor_advances(
+                &mut batch,
+                event_consumers,
+                inputs.chain_cursor,
+            )?;
         }
         self.write_batch(&batch)?;
         Ok(())
@@ -1021,6 +1079,19 @@ impl DeriveStore {
         &self,
         batch: &mut WriteBatch,
         consumers: &[&mut dyn BlockKeyedConsumer],
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
+        for consumer in consumers {
+            batch.put_cf(&cf, consumer.name().as_str().as_bytes(), cursor_bytes);
+        }
+        Ok(())
+    }
+
+    fn stage_event_chain_event_cursor_advances(
+        &self,
+        batch: &mut WriteBatch,
+        consumers: &[&mut dyn DeriveConsumer],
         cursor_bytes: &[u8],
     ) -> Result<(), DeriveStoreError> {
         let cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
@@ -1470,6 +1541,54 @@ where
     }
 }
 
+fn dispatch_chain_event_to_consumer<C>(
+    consumer: &mut C,
+    inputs: ChainEventDispatchInputs<'_>,
+    ctx: &mut DeriveConsumerCtx<'_>,
+) -> Result<(), DeriveError>
+where
+    C: DeriveConsumer + ?Sized,
+{
+    match inputs.chain_event {
+        ChainEvent::ChainCommitted { committed } => {
+            let event = ChainCommittedEvent::new(
+                inputs.event_sequence,
+                inputs.chain_epoch,
+                inputs.safe_tip_height,
+                committed.block_range.start,
+                committed.block_range.end,
+            );
+            consumer
+                .apply_chain_committed(&event, ctx)
+                .map_err(DeriveError::Consumer)
+        }
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } => {
+            let event = ChainReorgedEvent::new(
+                inputs.event_sequence,
+                inputs.chain_epoch,
+                inputs.safe_tip_height,
+                RevertedRange::new(
+                    reverted.chain_epoch,
+                    reverted.block_range.start,
+                    reverted.block_range.end,
+                ),
+                CommittedRange::new(
+                    committed.chain_epoch,
+                    committed.block_range.start,
+                    committed.block_range.end,
+                ),
+            );
+            consumer
+                .apply_chain_reorged(&event, ctx)
+                .map_err(DeriveError::Consumer)
+        }
+        _ => Err(DeriveError::UnsupportedChainEvent),
+    }
+}
+
 fn decode_store_format_version(bytes: &[u8]) -> Result<u16, String> {
     let array: [u8; 2] = bytes
         .try_into()
@@ -1569,6 +1688,18 @@ mod tests {
         1,
         &[TEST_CONSUMER_CF],
     );
+
+    #[test]
+    fn reorg_incidents_cursor_is_event_only() {
+        assert!(
+            !DeriveStore::bundled_chain_event_consumer_names()
+                .contains(&REORG_INCIDENTS_CONSUMER_NAME)
+        );
+        assert!(
+            DeriveStore::bundled_event_only_chain_event_consumer_names()
+                .contains(&REORG_INCIDENTS_CONSUMER_NAME)
+        );
+    }
 
     #[test]
     fn opening_a_fresh_store_writes_the_store_format_version() -> Result<()> {

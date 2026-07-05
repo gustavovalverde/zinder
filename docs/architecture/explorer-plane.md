@@ -282,7 +282,7 @@ Chain value pools (the `ValuePoolSummary` view) is the first source-boundary ext
 
 ## Derived views
 
-Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, and `RecentTransactionsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
+Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, `RecentTransactionsConsumer`, and `ReorgIncidentsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. `ReorgIncidentsConsumer` is an event-only chain-event consumer: it reads `ChainEventEnvelope` rows directly and never waits for block-context hydration. It backfills from the earliest retained chain event when first deployed and then preserves future incidents beyond chain-event retention; it cannot reconstruct incidents already pruned before deployment. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
 
 ## Cross-references
 

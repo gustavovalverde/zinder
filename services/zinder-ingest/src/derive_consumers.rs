@@ -28,8 +28,8 @@ use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
     ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, MempoolConsumerEvent,
     MempoolConsumerEventVariant, MempoolEventCountsConsumer, RecentTransactionsConsumer,
-    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionFeesConsumer,
-    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    ReorgIncidentsConsumer, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    TransactionFeesConsumer, TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
     TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
     TransparentSpendFacts,
 };
@@ -413,6 +413,7 @@ async fn catch_up_derive_store_to_canonical_with_budget(
         return Ok(());
     }
 
+    catch_up_event_only_chain_event_consumers_to_canonical(chain_store, derive_store)?;
     record_current_derive_replay_tip(chain_store)?;
 
     let mut cursor = persisted_chain_event_cursor(derive_store)?;
@@ -633,6 +634,7 @@ async fn replay_committed_event_to_derive_in_batches(
     let block_count = block_height_range_len(committed_range);
     let mut next_height = committed_range.start;
     while next_height <= committed_range.end {
+        catch_up_event_only_chain_event_consumers_to_canonical(chain_store, derive_store)?;
         let effective_limits = evaluate_and_record_replay_budget(replay_budget);
         if effective_limits.state.is_paused() {
             return Ok(DeriveReplayProgress::Yielded);
@@ -816,6 +818,104 @@ async fn replay_reorg_event_to_derive(
         record_derive_replay_progress(committed_range.end, tip_height);
     }
     Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+}
+
+fn catch_up_event_only_chain_event_consumers_to_canonical(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+) -> Result<(), IngestError> {
+    if DeriveStore::bundled_event_only_chain_event_consumer_names().is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor = persisted_event_only_chain_event_cursor(derive_store)?;
+    loop {
+        let read_started_at = Instant::now();
+        let page_outcome = chain_store
+            .chain_event_history(ChainEventHistoryRequest::with_default_limit(
+                cursor.as_ref(),
+            ))
+            .map_err(IngestError::from);
+        record_derive_replay_stage(
+            DERIVE_REPLAY_STAGE_READ_EVENTS,
+            read_started_at,
+            &page_outcome,
+        );
+        let page = page_outcome?;
+        if page.is_empty() {
+            return Ok(());
+        }
+
+        for envelope in page {
+            cursor = Some(replay_event_only_chain_event_to_derive(
+                derive_store,
+                envelope,
+            )?);
+        }
+    }
+}
+
+fn replay_event_only_chain_event_to_derive(
+    derive_store: &DeriveStore,
+    envelope: ChainEventEnvelope,
+) -> Result<StreamCursorTokenV1, IngestError> {
+    let inputs = ChainEventDispatchInputs {
+        chain_epoch: envelope.chain_epoch,
+        chain_event: &envelope.event,
+        chain_cursor: envelope.cursor.as_bytes(),
+        event_sequence: envelope.event_sequence,
+        safe_tip_height: envelope.safe_tip_height,
+    };
+    let dispatch_started_at = Instant::now();
+    let dispatch_outcome = dispatch_event_only_chain_event(derive_store, inputs);
+    record_derive_replay_stage(
+        DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
+        dispatch_started_at,
+        &dispatch_outcome,
+    );
+    dispatch_outcome?;
+    Ok(envelope.cursor)
+}
+
+fn dispatch_event_only_chain_event(
+    derive_store: &DeriveStore,
+    inputs: ChainEventDispatchInputs<'_>,
+) -> Result<(), IngestError> {
+    let mut reorg_incidents = ReorgIncidentsConsumer::new();
+    let mut block_consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 0] = [];
+    let mut event_consumers: [&mut dyn zinder_derive::DeriveConsumer; 1] = [&mut reorg_incidents];
+    let blocks = HashMap::<BlockHeight, Arc<BlockCommitContext>>::new();
+    derive_store
+        .write_chain_event_chunk_with_event_consumers(
+            &mut block_consumers,
+            &mut event_consumers,
+            inputs,
+            &blocks,
+            true,
+        )
+        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    Ok(())
+}
+
+fn persisted_event_only_chain_event_cursor(
+    derive_store: &DeriveStore,
+) -> Result<Option<StreamCursorTokenV1>, IngestError> {
+    let mut cursor: Option<Vec<u8>> = None;
+    for consumer_name in DeriveStore::bundled_event_only_chain_event_consumer_names() {
+        let Some(candidate) = derive_store.get_chain_event_cursor(*consumer_name)? else {
+            return Ok(None);
+        };
+        if let Some(existing) = cursor.as_ref() {
+            if existing != &candidate {
+                return Err(IngestError::DeriveDispatch(
+                    "event-only derive consumer cursors disagree".to_owned(),
+                ));
+            }
+        } else {
+            cursor = Some(candidate);
+        }
+    }
+    Ok(cursor.map(StreamCursorTokenV1::from_bytes))
 }
 
 fn persisted_chain_event_cursor(
@@ -1035,8 +1135,8 @@ fn committed_chain_event_chunk(event: &ChainEvent, replay_range: BlockHeightRang
     }
 }
 
-/// Dispatches the configured chain-event consumers against parsed block
-/// contexts and lets `DeriveStore` own the write-batch boundary.
+/// Dispatches block-keyed chain-event consumers against parsed block contexts
+/// and lets `DeriveStore` own the write-batch boundary.
 pub(crate) fn dispatch_chain_event(
     derive_store: &DeriveStore,
     inputs: ChainEventDispatchInputs<'_>,

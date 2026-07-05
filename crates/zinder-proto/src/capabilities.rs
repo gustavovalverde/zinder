@@ -265,6 +265,12 @@ pub const EXPLORER_TRANSACTION_RECENT_V1: &str = "explorer.transaction.recent_v1
 /// subscription; the count surface survives consumer restarts and works
 /// across horizontally scaled consumer replicas.
 pub const EXPLORER_MEMPOOL_EVENT_COUNTS_V1: &str = "explorer.mempool.event_counts_v1";
+/// Capability advertised for `ExplorerQuery.ChainReorgHistory`.
+///
+/// Signals that the explorer plane materializes durable reorg incident rows
+/// in the derive store. First deployment backfills retained chain events and
+/// future incidents survive chain-event retention.
+pub const EXPLORER_CHAIN_REORG_HISTORY_V1: &str = "explorer.chain.reorg_history_v1";
 /// Capability advertised for `ExplorerQuery.VerifyPaymentDisclosure`.
 ///
 /// Signals that the explorer plane runs the
@@ -356,6 +362,10 @@ pub enum AdvertisePolicy {
     RequiresChainValuePools,
     /// Explorer: advertised when a `WalletQuery` endpoint is wired.
     RequiresWalletQuery,
+    /// Explorer: advertised when the canonical secondary store is online.
+    RequiresCanonicalStore,
+    /// Explorer: advertised when the derive store is online.
+    RequiresDeriveStore,
     /// Explorer: advertised when both a `WalletQuery` endpoint and the
     /// canonical store are online.
     RequiresWalletQueryAndCanonicalStore,
@@ -397,6 +407,8 @@ impl AdvertisePolicy {
             Self::RequiresTransactionBlobs => inputs.transaction_blobs_retained,
             Self::RequiresUtxoSetCommitment => inputs.utxo_set_commitment_enabled,
             Self::RequiresWalletQuery
+            | Self::RequiresCanonicalStore
+            | Self::RequiresDeriveStore
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
             | Self::RequiresPrevoutResolution
@@ -413,6 +425,8 @@ impl AdvertisePolicy {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresWalletQuery => readiness.wallet_query_online,
+            Self::RequiresCanonicalStore => readiness.canonical_store_online,
+            Self::RequiresDeriveStore => readiness.derive_store_online,
             Self::RequiresWalletQueryAndCanonicalStore => {
                 readiness.wallet_query_online && readiness.canonical_store_online
             }
@@ -441,6 +455,8 @@ impl AdvertisePolicy {
             Self::RequiresChainValuePools => chain_value_pools_supported,
             Self::RequiresBroadcaster
             | Self::RequiresChainEvents
+            | Self::RequiresCanonicalStore
+            | Self::RequiresDeriveStore
             | Self::RequiresWalletQuery
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
@@ -805,6 +821,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Explorer,
         None,
         AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_CHAIN_REORG_HISTORY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ChainReorgHistory"),
+        AdvertisePolicy::RequiresDeriveStore,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
