@@ -72,16 +72,29 @@ pub(crate) fn upstream_tip_from_snapshot(snapshot: &UpstreamHealthSnapshot) -> U
 /// Every handler builds its own freshness (the chain epoch, snapshot age,
 /// capability version, and per-field unavailability vary per RPC). The shared
 /// upstream tip is overlaid here so no handler reaches into the cache directly.
-/// A response without a `chain_view` (no chain epoch resolved) cannot carry an
-/// upstream tip and is returned unchanged.
+/// Responses such as `ServerInfo` do not resolve a chain epoch, but still need
+/// the upstream tip as the sync-progress denominator during cold starts and
+/// source-node catch-up. In that case this function creates a minimal
+/// `chain_view` that carries only `upstream_tip`.
 pub(crate) async fn attach_upstream_observation(
     cache: &UpstreamObservationCache,
     mut freshness: ExplorerFreshness,
 ) -> ExplorerFreshness {
-    if let (Some(snapshot), Some(chain_view)) =
-        (cache.observe().await, freshness.chain_view.as_mut())
-    {
-        chain_view.upstream_tip = Some(upstream_tip_from_snapshot(&snapshot));
+    if let Some(snapshot) = cache.observe().await {
+        let upstream_tip = upstream_tip_from_snapshot(&snapshot);
+        match freshness.chain_view.as_mut() {
+            Some(chain_view) => {
+                chain_view.upstream_tip = Some(upstream_tip);
+            }
+            None => {
+                freshness.chain_view = Some(ChainView {
+                    chain_epoch: None,
+                    indexed_tip: None,
+                    upstream_tip: Some(upstream_tip),
+                    derive: None,
+                });
+            }
+        }
     }
     freshness
 }
@@ -125,7 +138,8 @@ pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<Inde
 /// bootstrap `ServerInfo` call and any response built before a derive store is
 /// wired leave `indexed_tip` and `derive` unset. The upstream tip is overlaid
 /// separately by [`attach_upstream_observation`]. A response with no resolved
-/// chain epoch leaves `chain_view` unset entirely.
+/// chain epoch leaves `chain_view` unset until the upstream observation overlay
+/// can add a tip-only view.
 pub(crate) fn build_explorer_freshness(
     derive_store: Option<&DeriveStore>,
     capability_version: &str,

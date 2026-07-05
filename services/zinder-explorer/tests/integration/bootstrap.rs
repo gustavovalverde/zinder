@@ -361,6 +361,15 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
     assert_eq!(upstream.committed_height, Some(2_530_000));
     assert_eq!(upstream.estimated_height, Some(2_544_375));
 
+    let server_info = client.server_info(ServerInfoRequest {}).await?.into_inner();
+    let server_info_upstream = server_info
+        .freshness
+        .and_then(|freshness| freshness.chain_view)
+        .and_then(|chain_view| chain_view.upstream_tip)
+        .ok_or_else(|| eyre!("ServerInfo freshness missing upstream observation"))?;
+    assert_eq!(server_info_upstream.committed_height, Some(2_530_000));
+    assert_eq!(server_info_upstream.estimated_height, Some(2_544_375));
+
     probe_cancel.cancel();
     let _ = probe_handle.await;
     explorer_handle.abort();
