@@ -940,6 +940,7 @@ async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()
         "trees": {
             "sapling": {"size": 1234},
             "orchard": {"size": 567},
+            "ironwood": {"size": 89},
         },
     })))])?;
     let source = ZebraJsonRpcSource::new(
@@ -953,7 +954,10 @@ async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()
 
     assert_eq!(checkpoint.height, BlockHeight::new(100));
     assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
-    assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::new(1234, 567));
+    assert_eq!(
+        checkpoint.tip_metadata,
+        ChainTipMetadata::new(1234, 567, 89)
+    );
     assert!(
         server.requests_for("getblockhash")?.is_empty(),
         "checkpoint fetch should use height-keyed getblock directly"

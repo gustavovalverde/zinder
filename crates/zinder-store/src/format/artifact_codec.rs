@@ -1756,6 +1756,7 @@ fn chain_epoch_record(chain_epoch: &ChainEpoch) -> ChainEpochRecord {
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+        ironwood_commitment_tree_size: chain_epoch.tip_metadata.ironwood_commitment_tree_size,
         created_at_millis: chain_epoch.created_at.value(),
     }
 }
@@ -1790,6 +1791,7 @@ fn decode_chain_epoch_record(
         tip_metadata: ChainTipMetadata::new(
             record.sapling_commitment_tree_size,
             record.orchard_commitment_tree_size,
+            record.ironwood_commitment_tree_size,
         ),
         created_at: UnixTimestampMillis::new(record.created_at_millis),
     })
@@ -2102,6 +2104,8 @@ struct ChainEpochRecord {
     sapling_commitment_tree_size: u32,
     #[prost(uint32, tag = "10")]
     orchard_commitment_tree_size: u32,
+    #[prost(uint32, tag = "11")]
+    ironwood_commitment_tree_size: u32,
 }
 
 const CHAIN_EVENT_KIND_COMMITTED: u32 = 1;

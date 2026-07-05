@@ -299,6 +299,7 @@ fn writer_status_response(epoch: u32) -> WriterStatusResponse {
                 }),
                 sapling_commitment_tree_size: 0,
                 orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
             }),
             indexed_tip: None,
             upstream_tip: None,

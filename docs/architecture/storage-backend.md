@@ -45,9 +45,9 @@ Direct embedded reads outside that contract are allowed only for `zinder dev` co
 - `created_at`
 
 `tip_metadata` is chain-derived state at the visible tip. It carries
-`sapling_commitment_tree_size` and `orchard_commitment_tree_size` so wallet hot
-paths can derive completed subtree counts without decoding compact-block
-payloads.
+`sapling_commitment_tree_size`, `orchard_commitment_tree_size`, and
+`ironwood_commitment_tree_size` so wallet hot paths can derive completed subtree
+counts without decoding compact-block payloads.
 
 `created_at` is wall-clock diagnostic metadata. It is allowed to repeat or move
 backward if system time changes; use `ChainEpochId` and chain-event sequence
@@ -174,6 +174,14 @@ re-runs it on the next open. Secondary readers cannot replay a column-family
 drop; they must restart after the primary migrates, which the rolling-upgrade
 order in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) already
 requires.
+
+Schema version 12 adds the Ironwood (NU6.3) shielded pool to `tip_metadata` and
+to each compact block's payload. A version-11 store carries neither and cannot
+be repaired in place, because the omitted Ironwood action data was never derived
+from the source block; it is rejected at open with `StoreError::SchemaTooOld` and
+must be rebuilt from genesis. The version-10 in-place rebuild still runs, but it
+produces a version-11 projection, so a version-10 store is rejected by the same
+guard and rebuilt from genesis too.
 
 ## Checkpoints and Backups
 

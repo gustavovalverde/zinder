@@ -29,6 +29,7 @@ fn chain_epoch_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(visible_tip.hash, "11".repeat(32));
     assert_eq!(settled_tip.height, 40);
     assert_eq!(settled_tip.hash, "22".repeat(32));
+    assert_eq!(decoded_chain_epoch.ironwood_commitment_tree_size, 99);
 
     Ok(())
 }
@@ -635,6 +636,7 @@ fn synthetic_chain_epoch() -> wallet::ChainEpoch {
         }),
         sapling_commitment_tree_size: 0,
         orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 99,
     }
 }
 

@@ -65,7 +65,6 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
     );
 
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
-    assert_eq!(compact_block.proto_version, 1);
     assert_eq!(compact_block.height, 1);
     assert_eq!(compact_block.hash, source_block.hash.as_bytes().to_vec());
     assert_eq!(
@@ -124,7 +123,7 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         visible_tip_hash: source_block.hash,
         settled_tip_height: source_block.height,
         settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(11),
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -198,7 +197,7 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         visible_tip_hash: source_block.hash,
         settled_tip_height: source_block.height,
         settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(11),
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -325,6 +324,44 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
 }
 
 #[test]
+fn regtest_ironwood_block_compact_artifact_carries_ironwood_actions() -> Result<(), Box<dyn Error>>
+{
+    let source_block = fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
+    )?;
+    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
+    let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
+    let chain_metadata = compact_block
+        .chain_metadata
+        .as_ref()
+        .ok_or("compact block missing chain metadata")?;
+
+    assert_eq!(compact_block.height, 603);
+    assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
+    assert_eq!(chain_metadata.ironwood_commitment_tree_size, 2);
+
+    let ironwood_transaction = compact_block
+        .vtx
+        .iter()
+        .find(|transaction| !transaction.ironwood_actions.is_empty())
+        .ok_or("compact block missing Ironwood-bearing transaction")?;
+    assert_eq!(ironwood_transaction.ironwood_actions.len(), 2);
+    assert!(ironwood_transaction.actions.is_empty());
+    assert!(ironwood_transaction.vout.is_empty());
+    assert_eq!(ironwood_transaction.vin.len(), 1);
+
+    for action in &ironwood_transaction.ironwood_actions {
+        assert_eq!(action.nullifier.len(), 32);
+        assert_eq!(action.cmx.len(), 32);
+        assert_eq!(action.ephemeral_key.len(), 32);
+        assert_eq!(action.ciphertext.len(), 52);
+    }
+
+    Ok(())
+}
+
+#[test]
 fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
     let activations = sample_regtest_upgrade_activations();
@@ -333,15 +370,18 @@ fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(
 
     assert_eq!(derived.tree_size_additions.orchard, 0);
     assert_eq!(derived.tree_size_additions.sapling, 0);
+    assert_eq!(derived.tree_size_additions.ironwood, 0);
 
     let mut running_tree_sizes = CommitmentTreeSizes {
         sapling: 11,
         orchard: 42,
+        ironwood: 7,
     };
     let built = finalize_derived_block(derived, &mut running_tree_sizes)?;
 
     assert_eq!(running_tree_sizes.orchard, 42);
     assert_eq!(running_tree_sizes.sapling, 11);
+    assert_eq!(running_tree_sizes.ironwood, 7);
 
     let compact_block = CompactBlock::decode(built.compact_block.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
@@ -350,12 +390,14 @@ fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(
         .ok_or("compact block missing chain metadata")?;
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 42);
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 11);
+    assert_eq!(chain_metadata.ironwood_commitment_tree_size, 7);
     assert!(
         compact_block
             .vtx
             .iter()
-            .all(|transaction| transaction.actions.is_empty()),
-        "regtest block 1 carries no Orchard actions"
+            .all(|transaction| transaction.actions.is_empty()
+                && transaction.ironwood_actions.is_empty()),
+        "regtest block 1 carries no Orchard or Ironwood actions"
     );
 
     Ok(())

@@ -60,7 +60,7 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(11),
+            artifact_schema_version: ArtifactSchemaVersion::new(12),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_600_000 + u64::from(height)),
         },

@@ -31,7 +31,6 @@ const FIXTURE_GENESIS_TIMESTAMP_SECONDS: u32 = 1_774_668_400;
 const FIXTURE_HASH_HEIGHT_MIX: u32 = 0x9e37_79b9;
 const FIXTURE_TREE_STATE_PAYLOAD: &[u8] =
     br#"{"sapling":{"commitments":{"size":0}},"orchard":{"commitments":{"size":0}}}"#;
-const FIXTURE_LIGHTWALLETD_PROTO_VERSION: u32 = 1;
 const FIXTURE_CHAIN_EPOCH_CREATED_AT_MILLIS: u64 = 1_774_669_000_000;
 
 /// One synthetic block in a [`ChainFixture`].
@@ -104,7 +103,6 @@ impl FixtureBlock {
 
     fn default_compact_block_payload(&self) -> Vec<u8> {
         LightwalletdCompactBlock {
-            proto_version: FIXTURE_LIGHTWALLETD_PROTO_VERSION,
             height: u64::from(self.height.value()),
             hash: encode_internal_block_hash(self.hash).to_vec(),
             prev_hash: encode_internal_block_hash(self.parent_hash).to_vec(),
@@ -114,6 +112,7 @@ impl FixtureBlock {
             chain_metadata: Some(ChainMetadata {
                 sapling_commitment_tree_size: 0,
                 orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
             }),
         }
         .encode_to_vec()

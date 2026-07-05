@@ -320,6 +320,7 @@ fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolE
                 ciphertext: vec![transaction_id_byte; 52],
             }],
             actions: Vec::new(),
+            ironwood_actions: Vec::new(),
             vin: Vec::new(),
             vout: Vec::new(),
         },
@@ -337,6 +338,7 @@ fn transparent_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> M
             spends: Vec::new(),
             outputs: Vec::new(),
             actions: Vec::new(),
+            ironwood_actions: Vec::new(),
             vin: vec![lightwalletd::CompactTxIn {
                 prevout_txid: vec![0x11; 32],
                 prevout_index: 0,

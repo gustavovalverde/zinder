@@ -835,7 +835,6 @@ fn assert_lightwalletd_compact_block_payload(
         .chain_metadata
         .ok_or_else(|| eyre!("lightwalletd compact block missing chain metadata"))?;
 
-    assert_eq!(compact_block.proto_version, 1);
     assert_eq!(compact_block.height, u64::from(expected_height));
     assert_eq!(compact_block.hash, expected_block_hash);
     assert_eq!(compact_block.hash.len(), 32);
@@ -845,6 +844,7 @@ fn assert_lightwalletd_compact_block_payload(
         !transaction.spends.is_empty()
             || !transaction.outputs.is_empty()
             || !transaction.actions.is_empty()
+            || !transaction.ironwood_actions.is_empty()
             || !transaction.vin.is_empty()
             || !transaction.vout.is_empty()
     }));

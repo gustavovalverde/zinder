@@ -64,8 +64,9 @@ The builder must:
   than local offset math or a new hand-rolled transaction parser.
 - Extract the lightwalletd-compatible fields needed for shielded wallet sync:
   block identity fields, compact transaction entries, Sapling spend data,
-  Sapling output data, Orchard action data, commitment-tree sizes, and any
-  header field required by the pinned lightwallet protocol.
+  Sapling output data, Orchard action data, Ironwood action data,
+  commitment-tree sizes, and any header field required by the pinned
+  lightwallet protocol.
 - Keep parser-specific types out of `zinder-core`,
   `zinder-store`, and public query APIs.
 - Store durable `CompactBlockArtifact` payload bytes during ingestion.
@@ -81,9 +82,22 @@ blocks on demand.
 Current status: `zinder-source` and `zinder-ingest` parse raw block bytes
 with `zebra-chain`. The builder extracts block identity, ordered compact
 transactions, transparent data, Sapling compact fields, Orchard compact fields,
-and stateful tree-size metadata for contiguous bulk-catchup ranges. Subtree roots and
-latest tree state remain separate artifacts, not fields to reconstruct at query
-time.
+Ironwood compact fields, and stateful tree-size metadata for contiguous
+bulk-catchup ranges. Subtree roots and latest tree state remain separate
+artifacts, not fields to reconstruct at query time.
+
+Ironwood (NU6.3) reuses the Orchard action shape verbatim at the wire level:
+`CompactTx.ironwoodActions` carries `CompactOrchardAction` entries, and
+`ChainMetadata.ironwoodCommitmentTreeSize` tracks the running Ironwood note
+commitment tree size the same way the Sapling and Orchard counters do. Both
+fields live inside the vendored lightwalletd `payload_bytes`, not on the
+native `zinder.v1.wallet.CompactBlock` envelope, because that is the shape
+`zcash_client_backend` decodes on the wallet side. The native
+`ChainEpoch.ironwood_commitment_tree_size` field mirrors the Sapling and
+Orchard tree-size fields for readers that want the counter without decoding
+`payload_bytes`. A deployment running Ironwood-aware ingest advertises
+`wallet.read.compact_block_ironwood_v1`; see [Public interfaces
+§Capability Discovery](public-interfaces.md#capability-discovery).
 
 Commitment-tree sizes must be chain-global. A fresh bulk-catchup run may start at
 height 1, an existing store may append immediately after its current tip, and a

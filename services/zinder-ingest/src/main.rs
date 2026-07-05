@@ -423,6 +423,7 @@ async fn run_ingest(
             checkpoint_height = checkpoint.height.value(),
             sapling_commitment_tree_size = checkpoint.tip_metadata.sapling_commitment_tree_size,
             orchard_commitment_tree_size = checkpoint.tip_metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size = checkpoint.tip_metadata.ironwood_commitment_tree_size,
             "fetched bootstrap checkpoint from upstream node"
         );
         command_config.loop_config.modifiers.checkpoint = Some(checkpoint);

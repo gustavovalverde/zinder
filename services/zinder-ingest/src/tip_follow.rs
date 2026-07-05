@@ -798,6 +798,7 @@ fn tip_metadata_at(
     Ok(ChainTipMetadata::new(
         chain_metadata.sapling_commitment_tree_size,
         chain_metadata.orchard_commitment_tree_size,
+        chain_metadata.ironwood_commitment_tree_size,
     ))
 }
 
@@ -1467,7 +1468,6 @@ mod tests {
                 source_block.raw_block_bytes.clone(),
             )),
             partial_compact_block: LightwalletdCompactBlock {
-                proto_version: 1,
                 height: u64::from(source_block.height.value()),
                 hash: zinder_core::wire::encode_internal_block_hash(source_block.hash).to_vec(),
                 prev_hash: zinder_core::wire::encode_internal_block_hash(source_block.parent_hash)

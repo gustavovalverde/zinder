@@ -30,7 +30,6 @@ use zinder_source::{
 };
 use zinder_store::RawBlobRetention;
 
-const LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION: u32 = 1;
 const COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN: usize = 52;
 
 /// Policy controlling optional raw-byte blob writes.
@@ -223,6 +222,8 @@ pub struct CommitmentTreeSizes {
     pub sapling: u32,
     /// Orchard action count contributed by (or accumulated up to) this point.
     pub orchard: u32,
+    /// Ironwood action count contributed by (or accumulated up to) this point.
+    pub ironwood: u32,
 }
 
 impl CommitmentTreeSizes {
@@ -233,10 +234,11 @@ impl CommitmentTreeSizes {
         Self {
             sapling: tip_metadata.sapling_commitment_tree_size,
             orchard: tip_metadata.orchard_commitment_tree_size,
+            ironwood: tip_metadata.ironwood_commitment_tree_size,
         }
     }
 
-    /// Sums two positions; errors if either pool overflows `u32`.
+    /// Sums two positions; errors if any pool overflows `u32`.
     pub fn checked_add(self, additions: Self) -> Result<Self, ArtifactDeriveError> {
         let sapling = self.sapling.checked_add(additions.sapling).ok_or(
             ArtifactDeriveError::CommitmentTreeOverflow {
@@ -248,8 +250,17 @@ impl CommitmentTreeSizes {
                 protocol: ShieldedProtocol::Orchard,
             },
         )?;
+        let ironwood = self.ironwood.checked_add(additions.ironwood).ok_or(
+            ArtifactDeriveError::CountOverflow {
+                field: "Ironwood commitment tree size",
+            },
+        )?;
 
-        Ok(Self { sapling, orchard })
+        Ok(Self {
+            sapling,
+            orchard,
+            ironwood,
+        })
     }
 
     /// Lowers to the lightwalletd `ChainMetadata` wire shape.
@@ -258,6 +269,7 @@ impl CommitmentTreeSizes {
         ChainMetadata {
             sapling_commitment_tree_size: self.sapling,
             orchard_commitment_tree_size: self.orchard,
+            ironwood_commitment_tree_size: self.ironwood,
         }
     }
 
@@ -265,7 +277,7 @@ impl CommitmentTreeSizes {
     /// chain epoch.
     #[must_use]
     pub const fn tip_metadata(self) -> ChainTipMetadata {
-        ChainTipMetadata::new(self.sapling, self.orchard)
+        ChainTipMetadata::new(self.sapling, self.orchard, self.ironwood)
     }
 }
 
@@ -357,7 +369,6 @@ pub fn derive_block_with_raw_blob_policy(
         None
     };
     let partial_compact_block = CompactBlock {
-        proto_version: LIGHTWALLETD_COMPACT_BLOCK_PROTO_VERSION,
         height: u64::from(source_block.height.value()),
         hash: encode_internal_block_hash(source_block.hash).to_vec(),
         prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
@@ -617,6 +628,10 @@ fn compact_transactions(
         tree_size_additions = tree_size_additions.checked_add(CommitmentTreeSizes {
             sapling: count_to_u32(compact_transaction.outputs.len(), "Sapling output count")?,
             orchard: count_to_u32(compact_transaction.actions.len(), "Orchard action count")?,
+            ironwood: count_to_u32(
+                compact_transaction.ironwood_actions.len(),
+                "Ironwood action count",
+            )?,
         })?;
 
         if compact_transaction_has_payload(&compact_transaction) {
@@ -643,6 +658,7 @@ pub(crate) fn compact_transaction(
         spends: compact_sapling_spends(transaction),
         outputs: compact_sapling_outputs(transaction)?,
         actions: compact_orchard_actions(transaction)?,
+        ironwood_actions: compact_ironwood_actions(transaction)?,
         vin: compact_transparent_inputs(transaction),
         vout: compact_transparent_outputs(transaction),
     })
@@ -678,6 +694,23 @@ fn compact_orchard_actions(
 ) -> Result<Vec<CompactOrchardAction>, ArtifactDeriveError> {
     transaction
         .orchard_actions()
+        .map(|action| {
+            let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
+            Ok(CompactOrchardAction {
+                nullifier: <[u8; 32]>::from(action.nullifier).to_vec(),
+                cmx: <[u8; 32]>::from(action.cm_x).to_vec(),
+                ephemeral_key: <[u8; 32]>::from(action.ephemeral_key).to_vec(),
+                ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
+            })
+        })
+        .collect()
+}
+
+fn compact_ironwood_actions(
+    transaction: &ZebraTransaction,
+) -> Result<Vec<CompactOrchardAction>, ArtifactDeriveError> {
+    transaction
+        .ironwood_actions()
         .map(|action| {
             let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
             Ok(CompactOrchardAction {
@@ -765,6 +798,7 @@ fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
         || !transaction.actions.is_empty()
+        || !transaction.ironwood_actions.is_empty()
         || !transaction.vin.is_empty()
         || !transaction.vout.is_empty()
 }
@@ -782,7 +816,8 @@ mod tests {
     use std::error::Error;
 
     use super::{
-        ArtifactDeriveError, COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, compact_note_ciphertext_prefix,
+        ArtifactDeriveError, COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CompactOrchardAction, CompactTx,
+        compact_note_ciphertext_prefix, compact_transaction_has_payload,
     };
 
     #[test]
@@ -814,5 +849,31 @@ mod tests {
 
         assert_eq!(prefix, vec![1u8; COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN]);
         Ok(())
+    }
+
+    #[test]
+    fn has_payload_keeps_an_ironwood_only_transaction() {
+        let ironwood_only_transaction = CompactTx {
+            index: 0,
+            txid: vec![0u8; 32],
+            fee: 0,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: Vec::new(),
+            ironwood_actions: vec![CompactOrchardAction {
+                nullifier: vec![0u8; 32],
+                cmx: vec![0u8; 32],
+                ephemeral_key: vec![0u8; 32],
+                ciphertext: vec![0u8; 52],
+            }],
+            vin: Vec::new(),
+            vout: Vec::new(),
+        };
+
+        assert!(
+            compact_transaction_has_payload(&ironwood_only_transaction),
+            "a transaction with only Ironwood actions and no transparent, Sapling, or Orchard \
+             components must not be dropped from the compact block's transaction list"
+        );
     }
 }

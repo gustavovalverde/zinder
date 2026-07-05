@@ -29,7 +29,7 @@ use crate::{
 };
 
 use super::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, REBUILDABLE_STORE_SCHEMA_VERSION, STORE_SCHEMA_VERSION,
+    REBUILDABLE_STORE_SCHEMA_VERSION, REBUILT_ARTIFACT_SCHEMA_VERSION, STORE_SCHEMA_VERSION,
     address_output_row, decode_store_metadata, encode_store_metadata, read_chain_epoch,
     read_current_chain_epoch_id, transparent_retention_deleted_through_height_put,
     transparent_retention_swept_height_put,
@@ -232,7 +232,7 @@ impl ProjectionRebuild {
         }
         if let Some(chain_epoch) = current_chain_epoch {
             let migrated_chain_epoch = ChainEpoch {
-                artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+                artifact_schema_version: REBUILT_ARTIFACT_SCHEMA_VERSION,
                 ..chain_epoch
             };
             self.pending_puts.push(StoragePut {
@@ -313,7 +313,7 @@ mod tests {
         TransparentAddressScriptHash::from_bytes([61; 32]);
 
     #[test]
-    fn v10_store_rebuilds_to_the_exact_current_projection() -> Result<(), Box<dyn Error>> {
+    fn v10_store_rebuilds_projection_then_rejects_as_pre_ironwood() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let unspent_output = synthetic_output(BlockHeight::new(1), [1; 32]);
         let finalized_spent_output = synthetic_output(BlockHeight::new(1), [2; 32]);
@@ -338,15 +338,12 @@ mod tests {
             downgrade_to_v10_layout(&store, &outputs)?;
         }
 
-        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        assert_projection_matches_expected(
-            &store,
+        assert_v10_store_rebuilds_then_rejects(
+            tempdir.path(),
             &unspent_output,
             &finalized_spent_output,
             &in_window_spent_output,
-        )?;
-
-        Ok(())
+        )
     }
 
     #[test]
@@ -376,13 +373,22 @@ mod tests {
             downgrade_to_v10_layout(&store, &outputs)?;
         }
 
+        assert!(matches!(
+            PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests()),
+            Err(StoreError::SchemaTooOld { .. })
+        ));
+
+        // Simulate a crash that lost only the metadata flip: a rebuild that
+        // already swept and projected must re-run to the same end state from
+        // the unchanged source families.
         {
-            let store =
-                PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-            // Simulate a crash that lost only the metadata flip: a rebuild
-            // that already swept and projected must re-run to the same end
-            // state from the unchanged source families.
-            store.store.inner.write(vec![StoragePut {
+            let options = ChainStoreOptions::for_local_tests();
+            let inner = RocksChainStore::open_primary(
+                tempdir.path(),
+                options.sync_writes,
+                options.rocksdb_resource_budget,
+            )?;
+            inner.write(vec![StoragePut {
                 table: StorageTable::StorageControl,
                 key: StoreKey::store_metadata(),
                 value: encode_store_metadata_with_version(
@@ -392,15 +398,12 @@ mod tests {
             }])?;
         }
 
-        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        assert_projection_matches_expected(
-            &store,
+        assert_v10_store_rebuilds_then_rejects(
+            tempdir.path(),
             &unspent_output,
             &finalized_spent_output,
             &in_window_spent_output,
-        )?;
-
-        Ok(())
+        )
     }
 
     /// Rewrites the store into the version-10 shape: epoch-suffixed
@@ -453,14 +456,48 @@ mod tests {
         metadata
     }
 
-    fn assert_projection_matches_expected(
-        store: &PrimaryChainStore,
+    fn assert_v10_store_rebuilds_then_rejects(
+        path: &std::path::Path,
         unspent_output: &TransparentOutputArtifact,
         finalized_spent_output: &TransparentOutputArtifact,
         in_window_spent_output: &TransparentOutputArtifact,
     ) -> Result<(), Box<dyn Error>> {
-        let address_keys = raw_address_row_keys(store)?;
-        let expected_keys = [
+        // The store-schema rebuild runs and persists during open, but a
+        // version-10 store predates Ironwood, so the artifact-schema guard then
+        // rejects it: it carries no Ironwood action data and must be rebuilt
+        // from genesis.
+        assert!(matches!(
+            PrimaryChainStore::open(path, ChainStoreOptions::for_local_tests()),
+            Err(StoreError::SchemaTooOld { .. })
+        ));
+
+        let options = ChainStoreOptions::for_local_tests();
+        let inner = RocksChainStore::open_primary(
+            path,
+            options.sync_writes,
+            options.rocksdb_resource_budget,
+        )?;
+
+        let metadata_bytes =
+            inner.get(StorageTable::StorageControl, &StoreKey::store_metadata())?;
+        assert!(metadata_bytes.is_some());
+        if let Some(metadata_bytes) = metadata_bytes {
+            let metadata = decode_store_metadata(&StoreKey::store_metadata(), &metadata_bytes)?;
+            assert_eq!(metadata.schema_version, STORE_SCHEMA_VERSION);
+        }
+
+        let chain_epoch_id = read_current_chain_epoch_id(&inner)?;
+        assert!(chain_epoch_id.is_some());
+        if let Some(chain_epoch_id) = chain_epoch_id {
+            let chain_epoch = read_chain_epoch(&inner, chain_epoch_id)?;
+            assert_eq!(
+                chain_epoch.artifact_schema_version,
+                REBUILT_ARTIFACT_SCHEMA_VERSION
+            );
+        }
+
+        let address_keys = raw_address_row_keys(&inner)?;
+        let mut expected_keys = vec![
             StoreKey::address_output_index(
                 NETWORK,
                 unspent_output.address_script_hash,
@@ -476,44 +513,36 @@ mod tests {
             )
             .into_bytes(),
         ];
-        let mut expected_keys = expected_keys.to_vec();
         expected_keys.sort();
         assert_eq!(address_keys, expected_keys);
-
-        let reader = store.current_chain_epoch_reader()?;
-        let outpoints = [
-            unspent_output.outpoint,
+        let finalized_spent_key = StoreKey::address_output_index(
+            NETWORK,
+            finalized_spent_output.address_script_hash,
+            finalized_spent_output.block_height,
             finalized_spent_output.outpoint,
-            in_window_spent_output.outpoint,
-        ];
-        let resolved_outputs = reader.transparent_outputs_by_outpoints(&outpoints)?;
-        assert!(resolved_outputs.contains_key(&unspent_output.outpoint));
-        assert!(!resolved_outputs.contains_key(&finalized_spent_output.outpoint));
-        assert!(resolved_outputs.contains_key(&in_window_spent_output.outpoint));
-
-        let resolved_spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
-        assert!(!resolved_spends.contains_key(&finalized_spent_output.outpoint));
-        assert!(resolved_spends.contains_key(&in_window_spent_output.outpoint));
+        )
+        .into_bytes();
+        assert!(!address_keys.contains(&finalized_spent_key));
 
         assert_eq!(
-            read_transparent_retention_swept_height(store.store.inner.as_ref())?,
+            read_transparent_retention_swept_height(&inner)?,
             Some(BlockHeight::new(3))
         );
         // The migration deleted a finalized-spent fact, so it seeds the
         // deleted-through marker; a fresh spend projection then fails the ingest
         // guard rather than serving that swept spender as absent.
         assert_eq!(
-            read_transparent_retention_deleted_through_height(store.store.inner.as_ref())?,
+            read_transparent_retention_deleted_through_height(&inner)?,
             Some(BlockHeight::new(3))
         );
 
         Ok(())
     }
 
-    fn raw_address_row_keys(store: &PrimaryChainStore) -> Result<Vec<Vec<u8>>, StoreError> {
+    fn raw_address_row_keys(inner: &RocksChainStore) -> Result<Vec<Vec<u8>>, StoreError> {
         let prefix = StoreKey::address_output_index_prefix(NETWORK, ADDRESS_SCRIPT_HASH);
         let mut keys = Vec::new();
-        store.store.inner.scan_prefix(
+        inner.scan_prefix(
             StorageTable::AddressOutputIndex,
             &prefix,
             &mut |key_bytes, _| {
@@ -542,7 +571,7 @@ mod tests {
             visible_tip_hash: block_hash(5),
             settled_tip_height: BlockHeight::new(3),
             settled_tip_hash: block_hash(3),
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            artifact_schema_version: REBUILT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000),
         };

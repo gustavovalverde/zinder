@@ -158,22 +158,29 @@ pub struct ChainTipMetadata {
     pub sapling_commitment_tree_size: u32,
     /// Orchard note commitment tree size at the visible chain tip.
     pub orchard_commitment_tree_size: u32,
+    /// Ironwood note commitment tree size at the visible chain tip.
+    pub ironwood_commitment_tree_size: u32,
 }
 
 impl ChainTipMetadata {
     /// Creates chain-tip metadata from shielded note commitment tree sizes.
     #[must_use]
-    pub const fn new(sapling_commitment_tree_size: u32, orchard_commitment_tree_size: u32) -> Self {
+    pub const fn new(
+        sapling_commitment_tree_size: u32,
+        orchard_commitment_tree_size: u32,
+        ironwood_commitment_tree_size: u32,
+    ) -> Self {
         Self {
             sapling_commitment_tree_size,
             orchard_commitment_tree_size,
+            ironwood_commitment_tree_size,
         }
     }
 
     /// Returns empty chain-tip metadata for epochs with no shielded commitments.
     #[must_use]
     pub const fn empty() -> Self {
-        Self::new(0, 0)
+        Self::new(0, 0, 0)
     }
 
     /// Returns the note commitment tree size for `protocol`.

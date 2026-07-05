@@ -127,7 +127,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0);
+    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
@@ -586,7 +586,7 @@ struct WalletGrpcResponses {
 
 fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWalletArtifacts> {
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0);
+    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
     let tree_state =
         TreeStateArtifact::new(block.height, block.block_hash, b"tree-state-1".to_vec());
@@ -795,6 +795,7 @@ impl IngestControl for StaticIngestControl {
                     }),
                     sapling_commitment_tree_size: 0,
                     orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
                 }),
                 indexed_tip: None,
                 upstream_tip: None,
@@ -887,6 +888,7 @@ fn proxied_event_chain_epoch() -> wallet::ChainEpoch {
         }),
         sapling_commitment_tree_size: 0,
         orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 0,
     }
 }
 
