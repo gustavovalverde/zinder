@@ -310,7 +310,7 @@ pub async fn run_ingest_loop<Source>(
     mut tip_follow_subsystems: Option<TipFollowSubsystemsLauncher>,
 ) -> Result<(), IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let mut tip_subsystems: Option<TipFollowSubsystems> = None;
     let mut bulk_flush_state = BulkCatchupFlushState::default();
@@ -488,7 +488,7 @@ fn spawn_phase_change_watcher<Source>(
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     tokio::spawn(async move {
         loop {

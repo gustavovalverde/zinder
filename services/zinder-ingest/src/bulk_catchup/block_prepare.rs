@@ -55,7 +55,7 @@ pub(super) fn build_block_prepare_stream<'a, Source, F, Fut>(
     derive_fn: F,
 ) -> impl Stream<Item = Result<PreparedBlockArtifacts, IngestError>> + Send + 'a
 where
-    Source: NodeSource + 'a,
+    Source: NodeSource + Clone + 'a,
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
     Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
 {

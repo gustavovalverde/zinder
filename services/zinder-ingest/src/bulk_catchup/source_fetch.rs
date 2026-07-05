@@ -53,7 +53,7 @@ struct SourceBlockStreamState<'a, Source> {
     next_fetch_height: Option<BlockHeight>,
     next_emit_height: Option<BlockHeight>,
     in_flight_segments:
-        FuturesUnordered<BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>>,
+        FuturesUnordered<BoxFuture<'static, Result<PrefetchedSourceSegment, IngestError>>>,
     completed_segments: BTreeMap<BlockHeight, PrefetchedSourceSegment>,
     pending_blocks: VecDeque<SourceBlock>,
     last_connected_block_id: Option<BlockId>,
@@ -64,7 +64,7 @@ pub(super) fn build_source_block_stream<'a, Source>(
     config: BulkCatchupSourceFetchStreamConfig,
 ) -> impl Stream<Item = Result<SourceBlock, IngestError>> + Send + 'a
 where
-    Source: NodeSource + 'a,
+    Source: NodeSource + Clone + 'a,
 {
     let state = SourceBlockStreamState {
         source,
@@ -99,7 +99,7 @@ async fn next_source_block_from_segment<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
 ) -> Option<Result<SourceBlock, IngestError>>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     loop {
         if let Some(block) = state.pending_blocks.pop_front() {
@@ -140,7 +140,7 @@ where
 
 fn fill_source_segment_prefetch_queue<'a, Source>(state: &mut SourceBlockStreamState<'a, Source>)
 where
-    Source: NodeSource + 'a,
+    Source: NodeSource + Clone + 'a,
 {
     while state.in_flight_segments.len()
         < nonzero_u32_to_usize(state.source_fetch_max_in_flight_requests)
@@ -169,7 +169,7 @@ where
             .in_flight_segments
             .push(fetch_prefetched_chain_segment(SourceFetchRequest {
                 request_timeout: state.request_timeout,
-                source: state.source,
+                source: state.source.clone(),
                 start_height: next_height,
                 cursor,
                 max_connected_blocks: source_segment_max_blocks,
@@ -184,9 +184,9 @@ where
     }
 }
 
-struct SourceFetchRequest<'a, Source> {
+struct SourceFetchRequest<Source> {
     request_timeout: Duration,
-    source: &'a Source,
+    source: Source,
     start_height: BlockHeight,
     cursor: SourceChainCursor,
     max_connected_blocks: NonZeroU32,
@@ -204,11 +204,11 @@ struct PrefetchedSourceSegment {
     _reservation: ByteReservation,
 }
 
-fn fetch_prefetched_chain_segment<'a, Source>(
-    request: SourceFetchRequest<'a, Source>,
-) -> BoxFuture<'a, Result<PrefetchedSourceSegment, IngestError>>
+fn fetch_prefetched_chain_segment<Source>(
+    request: SourceFetchRequest<Source>,
+) -> BoxFuture<'static, Result<PrefetchedSourceSegment, IngestError>>
 where
-    Source: NodeSource + 'a,
+    Source: NodeSource + Clone,
 {
     let request_timeout = request.request_timeout;
     let source = request.source;
@@ -220,7 +220,9 @@ where
     let reserved_response_bytes = request.reserved_response_bytes;
     let reservation = request.reservation;
 
-    async move {
+    // Spawned so segment fetches and block decoding progress on runtime
+    // workers instead of only while the segment stream itself is polled.
+    let fetch_task = tokio::spawn(async move {
         let mut retry_state = IngestRetryState::default();
         let limits = SourceChainSegmentLimits::new(
             cursor,
@@ -229,7 +231,7 @@ where
             max_response_bytes.get(),
         );
         let segment =
-            fetch_chain_segment_with_retry(request_timeout, source, limits, &mut retry_state)
+            fetch_chain_segment_with_retry(request_timeout, &source, limits, &mut retry_state)
                 .await?;
         let queued_response_bytes = queued_source_segment_bytes(&segment, reserved_response_bytes);
         let mut reservation = reservation;
@@ -241,6 +243,15 @@ where
             queued_response_bytes,
             _reservation: reservation,
         })
+    });
+
+    async move {
+        match fetch_task.await {
+            Ok(segment_result) => segment_result,
+            Err(join_error) => Err(IngestError::SourceSegmentFetchTaskStopped {
+                reason: join_error.to_string(),
+            }),
+        }
     }
     .boxed()
 }

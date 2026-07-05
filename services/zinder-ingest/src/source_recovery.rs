@@ -195,6 +195,7 @@ pub(crate) fn decide_recovery(
         | IngestError::TimestampTooLarge
         | IngestError::ArtifactDerive(_)
         | IngestError::BlockingTaskFailed { .. }
+        | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::DeriveDispatch(_)
         | IngestError::DeriveStore(_)
         | IngestError::SpendProjectionBehindRetentionSweep { .. } => SourceRecoveryDecision::Exit,

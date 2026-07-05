@@ -85,6 +85,13 @@ pub enum IngestError {
         node_source: String,
     },
 
+    /// Background source segment fetch task stopped before returning a result.
+    #[error("source segment fetch task stopped unexpectedly: {reason}")]
+    SourceSegmentFetchTaskStopped {
+        /// Task join failure description.
+        reason: String,
+    },
+
     /// Node returned fewer subtree roots than committed tree sizes require.
     #[error(
         "{protocol:?} subtree roots are unavailable from {start_index:?}: expected {expected_count}, got {actual_count}"
@@ -1460,6 +1467,9 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
     match error {
         None => "none",
         Some(IngestError::UnknownNodeSource { .. }) => "unknown_node_source",
+        Some(IngestError::SourceSegmentFetchTaskStopped { .. }) => {
+            "source_segment_fetch_task_stopped"
+        }
         Some(IngestError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(IngestError::SubtreeRootCompletingBlockMissing { .. }) => {
             "subtree_root_completing_block_missing"
