@@ -1,12 +1,13 @@
 use std::time::Instant;
 
-use futures_util::{FutureExt, Stream, StreamExt, future::BoxFuture};
+use futures_util::{Stream, StreamExt};
 use zinder_core::{BlockId, ChainEpoch, ChainEpochId, Network, TreeStateArtifact};
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, PrimaryChainStore, ReorgWindowChange,
 };
 
+use super::abort_on_drop::AbortOnDropTask;
 use super::block_prepare::PreparedBlockArtifacts;
 use super::flush::flush_pending_bulk_catchup_writes;
 use super::watermark::{record_queue_depth, record_reorder_buffer};
@@ -38,7 +39,7 @@ pub(super) async fn run_commit_reassembly<Source>(
     completion_flush: BulkCatchupCompletionFlush,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
-    Source: NodeSource,
+    Source: NodeSource + Clone,
 {
     let mut chain_epoch_id = next_chain_epoch_id(run.store)?;
     let mut batch = CanonicalBatch::default();
@@ -182,7 +183,7 @@ where
         let commit_flush_state = loop_flush_state
             .take()
             .ok_or(IngestError::BulkCatchupProducedNoCommit)?;
-        let committed_batch = match commit_canonical_batch_with_attachments(
+        in_flight_commit = Some(commit_canonical_batch_with_attachments(
             run,
             CanonicalCommitRequest {
                 batch,
@@ -191,23 +192,19 @@ where
                 flush_state: commit_flush_state,
                 chain_epoch_id,
             },
-        )
-        .await
-        {
-            Ok(committed_batch) => committed_batch,
-            Err(failure) => {
-                loop_flush_state = Some(failure.flush_state);
-                restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
-                return Err(failure.error);
-            }
-        };
-        apply_committed_canonical_batch(
-            committed_batch,
+        ));
+        if let Err(error) = wait_for_in_flight_canonical_commit(
+            &mut in_flight_commit,
             &mut next_subtree_root_indexes,
             &mut retry_state,
             &mut loop_flush_state,
             &mut last_commit_outcome,
-        );
+        )
+        .await
+        {
+            restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
+            return Err(error);
+        }
     }
 
     let mut restored_flush_state = loop_flush_state
@@ -226,8 +223,19 @@ where
     last_commit_outcome.ok_or(IngestError::BulkCatchupProducedNoCommit)
 }
 
-type InFlightCanonicalCommit<'a> =
-    BoxFuture<'a, Result<CommittedCanonicalBatch, CanonicalCommitFailure>>;
+type InFlightCanonicalCommit =
+    AbortOnDropTask<Result<CommittedCanonicalBatch, CanonicalCommitFailure>>;
+
+/// Owned handles moved into a spawned canonical-commit task.
+///
+/// The commit runs on its own runtime task so the next batch keeps
+/// accumulating while it attaches metadata and writes; a spawned future must
+/// be `'static`, so it cannot borrow the run context.
+struct CommitDependencies<Source> {
+    config: BulkCatchupRunConfig,
+    source: Source,
+    store: PrimaryChainStore,
+}
 
 struct CommittedCanonicalBatch {
     commit_outcome: ChainEpochCommitOutcome,
@@ -250,84 +258,97 @@ struct CanonicalCommitRequest {
     chain_epoch_id: ChainEpochId,
 }
 
-fn commit_canonical_batch_with_attachments<'a, Source>(
-    run: &'a BulkCatchupRunContext<'_, Source>,
+fn commit_canonical_batch_with_attachments<Source>(
+    run: &BulkCatchupRunContext<'_, Source>,
     request: CanonicalCommitRequest,
-) -> InFlightCanonicalCommit<'a>
+) -> InFlightCanonicalCommit
+where
+    Source: NodeSource + Clone,
+{
+    let deps = CommitDependencies {
+        config: run.config.clone(),
+        source: run.source.clone(),
+        store: run.store.clone(),
+    };
+    AbortOnDropTask::spawn(commit_canonical_batch(deps, request))
+}
+
+async fn commit_canonical_batch<Source>(
+    deps: CommitDependencies<Source>,
+    request: CanonicalCommitRequest,
+) -> Result<CommittedCanonicalBatch, CanonicalCommitFailure>
 where
     Source: NodeSource,
 {
-    async move {
-        let mut batch = request.batch;
-        let mut retry_state = request.retry_state;
-        let mut flush_state = request.flush_state;
-        let updated_subtree_root_indexes = match populate_bulk_catchup_subtree_roots(
-            run,
-            &mut batch,
-            request.next_subtree_root_indexes,
-            &mut retry_state,
-        )
-        .await
-        {
-            Ok(updated_subtree_root_indexes) => updated_subtree_root_indexes,
-            Err(error) => {
-                return Err(CanonicalCommitFailure {
-                    error,
-                    retry_state,
-                    flush_state,
-                });
-            }
-        };
-
-        if let Err(error) =
-            populate_bulk_catchup_tree_state_checkpoint(run, &mut batch, &mut retry_state).await
-        {
+    let run = BulkCatchupRunContext::new(&deps.config, &deps.source, &deps.store);
+    let mut batch = request.batch;
+    let mut retry_state = request.retry_state;
+    let mut flush_state = request.flush_state;
+    let updated_subtree_root_indexes = match populate_bulk_catchup_subtree_roots(
+        &run,
+        &mut batch,
+        request.next_subtree_root_indexes,
+        &mut retry_state,
+    )
+    .await
+    {
+        Ok(updated_subtree_root_indexes) => updated_subtree_root_indexes,
+        Err(error) => {
             return Err(CanonicalCommitFailure {
                 error,
                 retry_state,
                 flush_state,
             });
         }
+    };
 
-        let commit_outcome = match commit_built_bulk_catchup_batch(
-            run.store,
-            run.config.node.network,
-            request.chain_epoch_id,
-            batch,
-        )
-        .await
-        {
-            Ok((commit_outcome, _drained_batch)) => commit_outcome,
-            Err(error) => {
-                return Err(CanonicalCommitFailure {
-                    error,
-                    retry_state,
-                    flush_state,
-                });
-            }
-        };
-
-        flush_state.record_committed_epoch();
-        if let Err(error) = flush_canonical_writes_if_due(run, &mut flush_state).await {
-            return Err(CanonicalCommitFailure {
-                error,
-                retry_state,
-                flush_state,
-            });
-        }
-
-        Ok(CommittedCanonicalBatch {
-            commit_outcome,
-            next_subtree_root_indexes: updated_subtree_root_indexes,
+    if let Err(error) =
+        populate_bulk_catchup_tree_state_checkpoint(&run, &mut batch, &mut retry_state).await
+    {
+        return Err(CanonicalCommitFailure {
+            error,
             retry_state,
             flush_state,
-        })
+        });
     }
-    .boxed()
+
+    let commit_outcome = match commit_built_bulk_catchup_batch(
+        run.store,
+        run.config.node.network,
+        request.chain_epoch_id,
+        batch,
+    )
+    .await
+    {
+        Ok((commit_outcome, _drained_batch)) => commit_outcome,
+        Err(error) => {
+            return Err(CanonicalCommitFailure {
+                error,
+                retry_state,
+                flush_state,
+            });
+        }
+    };
+
+    flush_state.record_committed_epoch();
+    if let Err(error) = flush_canonical_writes_if_due(&run, &mut flush_state).await {
+        return Err(CanonicalCommitFailure {
+            error,
+            retry_state,
+            flush_state,
+        });
+    }
+
+    Ok(CommittedCanonicalBatch {
+        commit_outcome,
+        next_subtree_root_indexes: updated_subtree_root_indexes,
+        retry_state,
+        flush_state,
+    })
 }
 
 async fn wait_for_in_flight_canonical_commit(
-    in_flight_commit: &mut Option<InFlightCanonicalCommit<'_>>,
+    in_flight_commit: &mut Option<InFlightCanonicalCommit>,
     next_subtree_root_indexes: &mut IngestSubtreeRootIndexes,
     retry_state: &mut Option<IngestRetryState>,
     flush_state: &mut Option<BulkCatchupFlushState>,
@@ -336,8 +357,8 @@ async fn wait_for_in_flight_canonical_commit(
     let Some(commit) = in_flight_commit.take() else {
         return Ok(());
     };
-    match commit.await {
-        Ok(committed_batch) => {
+    match commit.join().await {
+        Ok(Ok(committed_batch)) => {
             apply_committed_canonical_batch(
                 committed_batch,
                 next_subtree_root_indexes,
@@ -348,11 +369,17 @@ async fn wait_for_in_flight_canonical_commit(
             record_canonical_commit_active(false);
             Ok(())
         }
-        Err(failure) => {
+        Ok(Err(failure)) => {
             *retry_state = Some(failure.retry_state);
             *flush_state = Some(failure.flush_state);
             record_canonical_commit_active(false);
             Err(failure.error)
+        }
+        Err(join_error) => {
+            record_canonical_commit_active(false);
+            Err(IngestError::BlockingTaskFailed {
+                reason: join_error.to_string(),
+            })
         }
     }
 }

@@ -17,6 +17,7 @@ use zinder_core::{BlockHeight, TransparentOutPoint, TransparentOutputArtifact};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::PrimaryChainStore;
 
+use super::abort_on_drop::AbortOnDropTask;
 use super::source_fetch::{
     BulkCatchupSourceFetchStreamConfig, SourceSegmentSizer, build_source_block_stream,
 };
@@ -56,8 +57,8 @@ pub(super) fn build_block_prepare_stream<'a, Source, F, Fut>(
 ) -> impl Stream<Item = Result<PreparedBlockArtifacts, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
-    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
 {
     let BulkCatchupBlockPrepareStreamConfig {
         request_timeout,
@@ -123,7 +124,7 @@ struct QueuedDerivedBlock {
 struct BlockPrepareStreamState<'a, F> {
     source_blocks: BoxStream<'a, Result<SourceBlock, IngestError>>,
     in_flight_block_prepares:
-        FuturesUnordered<BoxFuture<'a, Result<PrefetchedDerivedBlock, IngestError>>>,
+        FuturesUnordered<BoxFuture<'static, Result<PrefetchedDerivedBlock, IngestError>>>,
     completed_block_prepares: BTreeMap<BlockHeight, QueuedDerivedBlock>,
     completed_block_prepare_bytes: u64,
     pending_source_blocks: VecDeque<SourceBlock>,
@@ -136,12 +137,12 @@ struct BlockPrepareStreamState<'a, F> {
     source_exhausted: bool,
 }
 
-async fn next_derived_block_from_block_prepare_stream<'a, F, Fut>(
-    state: &mut BlockPrepareStreamState<'a, F>,
+async fn next_derived_block_from_block_prepare_stream<F, Fut>(
+    state: &mut BlockPrepareStreamState<'_, F>,
 ) -> Option<Result<PreparedBlockArtifacts, IngestError>>
 where
-    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
 {
     loop {
         if let Some(next_emit_height) = state.next_emit_height
@@ -211,13 +212,13 @@ impl<F> BlockPrepareStreamState<'_, F> {
     }
 }
 
-fn schedule_block_prepare<'a, F, Fut>(
-    state: &BlockPrepareStreamState<'a, F>,
+fn schedule_block_prepare<F, Fut>(
+    state: &BlockPrepareStreamState<'_, F>,
     source_block: SourceBlock,
 ) -> Result<(), SourceBlock>
 where
-    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'a,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'a,
+    F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
 {
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return Err(source_block);
@@ -231,31 +232,41 @@ where
     };
     let derive_fn = state.derive_fn.clone();
     let store = state.store.clone();
+    // Spawned so per-block artifact derivation progresses on runtime workers
+    // instead of only while this stream is polled by the commit consumer.
+    let block_prepare_task = AbortOnDropTask::spawn(async move {
+        let height = source_block.height;
+        let block_prepare_started_at = Instant::now();
+        let block_prepare_outcome = async {
+            let derived = derive_fn(source_block).await?;
+            let prefetched_spent_transparent_outputs =
+                prefetch_spent_transparent_outputs(store, &derived).await?;
+            let prepared = PreparedBlockArtifacts {
+                derived,
+                prefetched_spent_transparent_outputs,
+            };
+            let artifact_bytes = prepared_block_artifact_bytes(&prepared);
+            let mut reservation = reservation;
+            reservation.resize(artifact_bytes);
+            Ok(PrefetchedDerivedBlock {
+                height,
+                prepared,
+                artifact_bytes,
+                reservation,
+            })
+        }
+        .await;
+        record_ingest_block_prepare_outcome(block_prepare_started_at, &block_prepare_outcome);
+        block_prepare_outcome
+    });
     state.in_flight_block_prepares.push(
         async move {
-            let height = source_block.height;
-            let block_prepare_started_at = Instant::now();
-            let block_prepare_outcome = async {
-                let derived = derive_fn(source_block).await?;
-                let prefetched_spent_transparent_outputs =
-                    prefetch_spent_transparent_outputs(store, &derived).await?;
-                let prepared = PreparedBlockArtifacts {
-                    derived,
-                    prefetched_spent_transparent_outputs,
-                };
-                let artifact_bytes = prepared_block_artifact_bytes(&prepared);
-                let mut reservation = reservation;
-                reservation.resize(artifact_bytes);
-                Ok(PrefetchedDerivedBlock {
-                    height,
-                    prepared,
-                    artifact_bytes,
-                    reservation,
-                })
+            match block_prepare_task.join().await {
+                Ok(block_prepare_outcome) => block_prepare_outcome,
+                Err(join_error) => Err(IngestError::BlockingTaskFailed {
+                    reason: join_error.to_string(),
+                }),
             }
-            .await;
-            record_ingest_block_prepare_outcome(block_prepare_started_at, &block_prepare_outcome);
-            block_prepare_outcome
         }
         .boxed(),
     );
