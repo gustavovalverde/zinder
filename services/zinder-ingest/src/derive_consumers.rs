@@ -887,8 +887,10 @@ fn dispatch_event_only_chain_event(
     let blocks = HashMap::<BlockHeight, Arc<BlockCommitContext>>::new();
     derive_store
         .write_chain_event_chunk_with_event_consumers(
-            &mut block_consumers,
-            &mut event_consumers,
+            zinder_derive::ChainEventDispatchConsumers {
+                block_consumers: &mut block_consumers,
+                event_consumers: &mut event_consumers,
+            },
             inputs,
             &blocks,
             true,

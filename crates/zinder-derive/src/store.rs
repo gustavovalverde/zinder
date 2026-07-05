@@ -312,6 +312,19 @@ pub struct ChainEventDispatchInputs<'event> {
     pub safe_tip_height: BlockHeight,
 }
 
+/// Consumers that participate in one chain-event derive-store write.
+pub struct ChainEventDispatchConsumers<
+    'block_slices,
+    'block_consumers,
+    'event_slices,
+    'event_consumers,
+> {
+    /// Block-keyed consumers that observe committed block contexts.
+    pub block_consumers: &'block_slices mut [&'block_consumers mut dyn BlockKeyedConsumer],
+    /// Direct consumers that observe the chain-event envelope.
+    pub event_consumers: &'event_slices mut [&'event_consumers mut dyn DeriveConsumer],
+}
+
 /// `RocksDB`-backed durable storage for the derive plane.
 ///
 /// Operations are atomic at the `RocksDB` `WriteBatch` granularity. Cursor
@@ -619,8 +632,10 @@ impl DeriveStore {
     {
         let mut event_consumers: [&mut dyn DeriveConsumer; 0] = [];
         self.write_chain_event_chunk_with_event_consumers(
-            consumers,
-            &mut event_consumers,
+            ChainEventDispatchConsumers {
+                block_consumers: consumers,
+                event_consumers: &mut event_consumers,
+            },
             inputs,
             blocks,
             true,
@@ -648,8 +663,10 @@ impl DeriveStore {
     {
         let mut event_consumers: [&mut dyn DeriveConsumer; 0] = [];
         self.write_chain_event_chunk_with_event_consumers(
-            consumers,
-            &mut event_consumers,
+            ChainEventDispatchConsumers {
+                block_consumers: consumers,
+                event_consumers: &mut event_consumers,
+            },
             inputs,
             blocks,
             advance_cursor,
@@ -665,8 +682,7 @@ impl DeriveStore {
     /// without advancing its replay cursor or vice versa.
     pub fn write_chain_event_chunk_with_event_consumers<S>(
         &self,
-        block_consumers: &mut [&mut dyn BlockKeyedConsumer],
-        event_consumers: &mut [&mut dyn DeriveConsumer],
+        consumers: ChainEventDispatchConsumers<'_, '_, '_, '_>,
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
         advance_cursor: bool,
@@ -674,6 +690,10 @@ impl DeriveStore {
     where
         S: BuildHasher,
     {
+        let ChainEventDispatchConsumers {
+            block_consumers,
+            event_consumers,
+        } = consumers;
         let mut batch = WriteBatch::default();
         let mut ctx = DeriveConsumerCtx {
             store: self,

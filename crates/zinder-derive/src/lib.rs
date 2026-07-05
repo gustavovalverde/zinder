@@ -82,6 +82,7 @@ pub use consumer::{
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
 pub use store::{
-    ChainEventDispatchInputs, ConsumerEntry, DERIVE_STORE_FORMAT_VERSION, DERIVE_STORE_SUBDIR,
-    DeriveCursorEntry, DeriveStore, DeriveStoreOptions, DeriveStoreTable,
+    ChainEventDispatchConsumers, ChainEventDispatchInputs, ConsumerEntry,
+    DERIVE_STORE_FORMAT_VERSION, DERIVE_STORE_SUBDIR, DeriveCursorEntry, DeriveStore,
+    DeriveStoreOptions, DeriveStoreTable,
 };

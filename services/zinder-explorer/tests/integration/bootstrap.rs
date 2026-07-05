@@ -383,6 +383,22 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
 #[tokio::test]
 async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
     let store_fixture = StoreFixture::open()?;
+    seed_recorded_chain_reorg(&store_fixture)?;
+
+    let seeded_derive_store = seeded_reorg_history_derive_store(&store_fixture).await?;
+    let (mut client, explorer_handle) =
+        spawn_explorer_query_server_with_derive_store(seeded_derive_store.secondary_store).await?;
+
+    assert_reorg_history_capability(&mut client).await?;
+    let reorg_cursor = assert_recorded_reorg_history_page(&mut client).await?;
+    assert_reorg_history_empty_after(&mut client, reorg_cursor).await?;
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    Ok(())
+}
+
+fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
     let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let settled_block = initial_chain
         .block_at(BlockHeight::new(1))
@@ -422,7 +438,12 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
             from_height: BlockHeight::new(2),
         }),
     )?;
+    Ok(())
+}
 
+async fn seeded_reorg_history_derive_store(
+    store_fixture: &StoreFixture,
+) -> Result<SeededDeriveStore> {
     let primary_derive_store = zinder_ingest::open_primary_derive_store_for_canonical(
         store_fixture.tempdir_path(),
         zinder_store::RocksDbResourceBudget::for_local_tests(),
@@ -449,9 +470,13 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
         },
     )?;
     derive_store.try_catch_up()?;
-    let (mut client, explorer_handle) =
-        spawn_explorer_query_server_with_derive_store(derive_store).await?;
+    Ok(SeededDeriveStore {
+        _tempdir: derive_secondary_tempdir,
+        secondary_store: derive_store,
+    })
+}
 
+async fn assert_reorg_history_capability(client: &mut ExplorerQueryClient<Channel>) -> Result<()> {
     let explorer_info = client
         .server_info(ServerInfoRequest {})
         .await?
@@ -463,7 +488,12 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
         .as_ref()
         .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
     assert_advertises_capability(&common.capabilities, EXPLORER_CHAIN_REORG_HISTORY_V1);
+    Ok(())
+}
 
+async fn assert_recorded_reorg_history_page(
+    client: &mut ExplorerQueryClient<Channel>,
+) -> Result<Vec<u8>> {
     let first_page = client
         .chain_reorg_history(ChainReorgHistoryRequest {
             max_events: 1,
@@ -485,8 +515,9 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
         .events
         .first()
         .ok_or_else(|| eyre!("reorg event missing"))?;
+    let reorg_cursor = reorg.cursor.clone();
     assert_eq!(reorg.event_sequence, 2);
-    assert!(!reorg.cursor.is_empty());
+    assert!(!reorg_cursor.is_empty());
     assert_eq!(reorg.chain_epoch_id, 2);
     assert_eq!(
         reorg
@@ -516,19 +547,22 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
         .ok_or_else(|| eyre!("reorg committed range missing"))?;
     assert_eq!(committed.start_height, 2);
     assert_eq!(committed.end_height, 2);
+    Ok(reorg_cursor)
+}
 
+async fn assert_reorg_history_empty_after(
+    client: &mut ExplorerQueryClient<Channel>,
+    cursor: Vec<u8>,
+) -> Result<()> {
     let empty_page = client
         .chain_reorg_history(ChainReorgHistoryRequest {
             max_events: 10,
-            from_cursor: reorg.cursor.clone(),
+            from_cursor: cursor,
         })
         .await?
         .into_inner();
     assert!(empty_page.events.is_empty());
     assert!(empty_page.next_cursor.is_empty());
-
-    explorer_handle.abort();
-    let _ = explorer_handle.await;
     Ok(())
 }
 
