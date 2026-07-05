@@ -1666,7 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_catchup_start_resumes_or_completes_from_current_tip() -> Result<(), Box<dyn Error>>
     {
-        let tip_metadata = ChainTipMetadata::new(123, 456);
+        let tip_metadata = ChainTipMetadata::new(123, 456, 0);
         let current_chain_epoch = test_chain_epoch(BlockHeight::new(9), tip_metadata);
 
         let contiguous_start = bulk_catchup_start(
@@ -1726,7 +1726,7 @@ mod tests {
         // Tree sizes well below SUBTREE_LEAF_COUNT so no subtree completes
         // during bulk catchup; the unit test validates the bootstrap + extend
         // round-trip without spawning a real source subtree path.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(0, 0);
+        let checkpoint_tip_metadata = ChainTipMetadata::new(0, 0, 0);
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 12, 1, true)?;
         config.checkpoint = Some(SourceChainCheckpoint::new(
             checkpoint_height,
@@ -1779,7 +1779,7 @@ mod tests {
         // batch range) and surface SubtreeRootCompletingBlockMissing. This
         // mirrors the live mainnet failure observed when calibrating against
         // a checkpoint at `tip - 1000`.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0);
+        let checkpoint_tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0);
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
         config.checkpoint = Some(SourceChainCheckpoint::new(
             checkpoint_height,
@@ -2442,7 +2442,6 @@ mod tests {
                 source_block.raw_block_bytes.clone(),
             )),
             partial_compact_block: LightwalletdCompactBlock {
-                proto_version: 1,
                 height: u64::from(source_block.height.value()),
                 hash: encode_internal_block_hash(source_block.hash).to_vec(),
                 prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
@@ -2454,6 +2453,7 @@ mod tests {
             tree_size_additions: CommitmentTreeSizes {
                 sapling: sapling_tree_size_addition,
                 orchard: orchard_tree_size_addition,
+                ironwood: 0,
             },
             block_transaction_index: Vec::new(),
             transaction_locations: Vec::new(),

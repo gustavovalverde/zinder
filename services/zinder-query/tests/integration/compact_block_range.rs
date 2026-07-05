@@ -290,7 +290,7 @@ async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missi
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0);
+    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
@@ -334,7 +334,7 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0);
+    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
     let subtree_root = SubtreeRootArtifact::new(
         ShieldedProtocol::Sapling,
@@ -403,7 +403,7 @@ async fn subtree_roots_response_uses_stored_tip_metadata_not_compact_block_paylo
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0);
+    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block =
         CompactBlockArtifact::new(block.height, block.block_hash, b"not-protobuf".to_vec());
     let subtree_root = SubtreeRootArtifact::new(
@@ -591,6 +591,9 @@ fn compact_block_range_chunk(
                 }),
                 sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
                 orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+                ironwood_commitment_tree_size: chain_epoch
+                    .tip_metadata
+                    .ironwood_commitment_tree_size,
             }),
             indexed_tip: None,
             upstream_tip: None,

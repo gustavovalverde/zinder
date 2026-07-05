@@ -148,6 +148,17 @@ secondary opened before the migration cannot replay the column-family drop,
 so the restart is required, matching the rolling-upgrade order in
 [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
+## Schema v12: rebuild from genesis (Ironwood/NU6.3)
+
+Schema version 12 adds the Ironwood shielded pool to `tip_metadata` and to
+each compact block's payload. Unlike v11, it is not repairable in place: the
+Ironwood action data a v11 store is missing was never derived from the source
+block. A v11 (or v10) store is rejected at open with `SchemaTooOld`, and the
+operator must wipe the volume and resync from the wallet-serving floor (or
+genesis), exactly as in the fresh-start procedure above. Deploy the v12 binary
+only after wiping the store; a redeploy over an un-wiped v11 store crash-loops
+on `open_storage` until the volume is cleared.
+
 ## Migrating from the legacy `zinder-data` volumes
 
 Earlier releases shipped three hardcoded volume names: `zinder-data` (the canonical RocksDB store), `zinder-prometheus-data` (TSDB samples), and `zinder-grafana-data` (Grafana's SQLite DB with user accounts, API keys, and any UI-created alert rules). The compose file now scopes all three per network (`zinder-<network>-data`, `zinder-<network>-prometheus`, `zinder-<network>-grafana`) so two stacks can coexist on one host. Operators with the legacy volumes should rename them before the first `up` against the new compose; otherwise each stack boots against empty volumes, and the canonical store re-syncs from cold.

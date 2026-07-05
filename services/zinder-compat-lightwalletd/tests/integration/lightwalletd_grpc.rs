@@ -1560,7 +1560,7 @@ where
 {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(1)
-        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0))
+        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0))
         .with_tree_state_checkpoint_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);
     let acceptance_block = base_fixture
         .block_at(ACCEPTANCE_BLOCK_HEIGHT)
@@ -1612,7 +1612,7 @@ where
 {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(1)
-        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0))
+        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0))
         .with_tree_state_checkpoint_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);
     let acceptance_block = base_fixture
         .block_at(ACCEPTANCE_BLOCK_HEIGHT)
@@ -1653,7 +1653,6 @@ fn acceptance_compact_block_payload(
     block_time_seconds: u32,
 ) -> Vec<u8> {
     lightwalletd::CompactBlock {
-        proto_version: 1,
         height: 1,
         hash: block_hash.as_bytes().to_vec(),
         prev_hash: parent_hash.as_bytes().to_vec(),
@@ -1675,6 +1674,7 @@ fn acceptance_compact_block_payload(
                 ephemeral_key: vec![11; 32],
                 ciphertext: vec![12; 52],
             }],
+            ironwood_actions: Vec::new(),
             vin: vec![lightwalletd::CompactTxIn {
                 prevout_txid: vec![8; 32],
                 prevout_index: 1,
@@ -1687,6 +1687,7 @@ fn acceptance_compact_block_payload(
         chain_metadata: Some(lightwalletd::ChainMetadata {
             sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
             orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
         }),
     }
     .encode_to_vec()

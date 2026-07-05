@@ -29,6 +29,16 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
 /// Capability advertised for `WalletQuery.CompactBlocksInRange`.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
+/// Field capability gating `ironwoodActions`/`ironwoodCommitmentTreeSize` on
+/// the vendored lightwalletd `CompactTx`/`ChainMetadata` carried in
+/// `CompactBlock.payload_bytes`.
+///
+/// Present on every deployment running this Ironwood-aware binary: absence of
+/// `ironwoodActions` on a block then means the block genuinely has no
+/// Ironwood actions. A server that does not advertise this capability
+/// predates Ironwood wallet-plane support, so a missing field is not
+/// authoritative and must not be read as "no Ironwood activity".
+pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V1: &str = "wallet.read.compact_block_ironwood_v1";
 /// Capability advertised for `WalletQuery.FullBlock`.
 ///
 /// The serialized block bytes are present only when the writer deployment
@@ -566,6 +576,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_COMPACT_BLOCK_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_COMPACT_BLOCK_IRONWOOD_V1,
+        CapabilitySurface::Wallet,
+        None,
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

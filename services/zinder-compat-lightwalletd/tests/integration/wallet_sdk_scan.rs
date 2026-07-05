@@ -170,7 +170,7 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
 fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(SDK_SCAN_BLOCK_COUNT)
-        .with_tip_metadata_override(ChainTipMetadata::new(SDK_SCAN_SAPLING_TREE_SIZE, 0));
+        .with_tip_metadata_override(ChainTipMetadata::new(SDK_SCAN_SAPLING_TREE_SIZE, 0, 0));
 
     let mut chain_fixture = base_fixture;
     for height_value in 1..=SDK_SCAN_BLOCK_COUNT {
@@ -215,7 +215,6 @@ fn sdk_scan_compact_block_payload(block: &FixtureBlock) -> eyre::Result<Vec<u8>>
     let header_bytes = zebra_header.zcash_serialize_to_vec()?;
 
     Ok(lightwalletd::CompactBlock {
-        proto_version: 1,
         height: u64::from(block.height.value()),
         hash: block.hash.as_bytes().to_vec(),
         prev_hash: block.parent_hash.as_bytes().to_vec(),
@@ -232,12 +231,14 @@ fn sdk_scan_compact_block_payload(block: &FixtureBlock) -> eyre::Result<Vec<u8>>
                 ciphertext: vec![0x33; 52],
             }],
             actions: Vec::new(),
+            ironwood_actions: Vec::new(),
             vin: Vec::new(),
             vout: Vec::new(),
         }],
         chain_metadata: Some(lightwalletd::ChainMetadata {
             sapling_commitment_tree_size: SDK_SCAN_SAPLING_TREE_SIZE,
             orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
         }),
     }
     .encode_to_vec())

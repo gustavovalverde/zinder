@@ -127,7 +127,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     assert_eq!(outcome.chain_epoch.settled_tip_height, source_block.height);
     assert_eq!(
         outcome.chain_epoch.tip_metadata,
-        ChainTipMetadata::new(1, 0)
+        ChainTipMetadata::new(1, 0, 0)
     );
     assert_eq!(fetched_heights.lock().as_slice(), [source_block.height]);
 
@@ -311,8 +311,8 @@ fn assert_block_summary_materialized(
 
 #[tokio::test]
 async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
-    let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0);
-    let expected_tip_metadata = ChainTipMetadata::new(107_796, 0);
+    let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0, 0);
+    let expected_tip_metadata = ChainTipMetadata::new(107_796, 0, 0);
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = SourceChainCheckpoint::new(

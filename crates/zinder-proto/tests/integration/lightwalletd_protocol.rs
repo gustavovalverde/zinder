@@ -10,6 +10,10 @@ use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_COMMIT};
 const LIGHTWALLETD_PROTOCOL_REPOSITORY: &str = "https://github.com/zcash/lightwallet-protocol";
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "this end-to-end wire round-trip test asserts every vendored lightwalletd field in one place"
+)]
 fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
     assert_eq!(
         LIGHTWALLETD_PROTOCOL_REPOSITORY,
@@ -17,13 +21,12 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
     );
     assert_eq!(
         LIGHTWALLETD_PROTOCOL_COMMIT,
-        "dd0ea2c3c5827a433e62c2f936b89efa2dec5a9a"
+        "ac7cee052a1bf5d430985a478d39e8b513fc4bd4"
     );
 
     let transaction_id = vec![0x42; 32];
     let transparent_output_transaction_id = vec![0x43; 32];
     let compact_block = lightwalletd::CompactBlock {
-        proto_version: 1,
         height: 42,
         hash: vec![0x44; 32],
         prev_hash: vec![0x45; 32],
@@ -45,6 +48,12 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
                 ephemeral_key: vec![0x52; 32],
                 ciphertext: vec![0x53; 52],
             }],
+            ironwood_actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![0x54; 32],
+                cmx: vec![0x55; 32],
+                ephemeral_key: vec![0x56; 32],
+                ciphertext: vec![0x57; 52],
+            }],
             vin: vec![lightwalletd::CompactTxIn {
                 prevout_txid: transparent_output_transaction_id.clone(),
                 prevout_index: 7,
@@ -57,6 +66,7 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
         chain_metadata: Some(lightwalletd::ChainMetadata {
             sapling_commitment_tree_size: 123,
             orchard_commitment_tree_size: 456,
+            ironwood_commitment_tree_size: 789,
         }),
     };
 
@@ -73,6 +83,10 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
         .vout
         .first()
         .ok_or_else(|| eyre!("decoded compact transaction is missing transparent output"))?;
+    let ironwood_action = compact_transaction
+        .ironwood_actions
+        .first()
+        .ok_or_else(|| eyre!("decoded compact transaction is missing Ironwood action"))?;
     let chain_metadata = decoded_compact_block
         .chain_metadata
         .ok_or_else(|| eyre!("decoded compact block is missing chain metadata"))?;
@@ -86,8 +100,13 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
     assert_eq!(transparent_input.prevout_index, 7);
     assert_eq!(transparent_output.value, 5_000);
     assert_eq!(transparent_output.script_pub_key, vec![0x76, 0xa9]);
+    assert_eq!(ironwood_action.nullifier, vec![0x54; 32]);
+    assert_eq!(ironwood_action.cmx, vec![0x55; 32]);
+    assert_eq!(ironwood_action.ephemeral_key, vec![0x56; 32]);
+    assert_eq!(ironwood_action.ciphertext, vec![0x57; 52]);
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 123);
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 456);
+    assert_eq!(chain_metadata.ironwood_commitment_tree_size, 789);
 
     Ok(())
 }
@@ -106,6 +125,7 @@ fn block_range_decodes_pool_type_filters() -> eyre::Result<()> {
         pool_types: vec![
             lightwalletd::PoolType::Sapling as i32,
             lightwalletd::PoolType::Orchard as i32,
+            lightwalletd::PoolType::Ironwood as i32,
         ],
     };
     let decoded_block_range = round_trip(&block_range)?;
@@ -115,6 +135,7 @@ fn block_range_decodes_pool_type_filters() -> eyre::Result<()> {
         vec![
             lightwalletd::PoolType::Sapling as i32,
             lightwalletd::PoolType::Orchard as i32,
+            lightwalletd::PoolType::Ironwood as i32,
         ]
     );
 
@@ -156,7 +177,7 @@ fn lightd_info_decodes_protocol_version_fields() -> eyre::Result<()> {
 }
 
 #[test]
-fn tree_state_decodes_sapling_and_orchard_tree_payloads() -> eyre::Result<()> {
+fn tree_state_decodes_sapling_orchard_and_ironwood_tree_payloads() -> eyre::Result<()> {
     let tree_state = lightwalletd::TreeState {
         network: "regtest".to_owned(),
         height: 2,
@@ -164,11 +185,13 @@ fn tree_state_decodes_sapling_and_orchard_tree_payloads() -> eyre::Result<()> {
         time: 1_774_670_400,
         sapling_tree: "sapling-tree".to_owned(),
         orchard_tree: "orchard-tree".to_owned(),
+        ironwood_tree: "ironwood-tree".to_owned(),
     };
     let decoded_tree_state = round_trip(&tree_state)?;
 
     assert_eq!(decoded_tree_state.sapling_tree, "sapling-tree");
     assert_eq!(decoded_tree_state.orchard_tree, "orchard-tree");
+    assert_eq!(decoded_tree_state.ironwood_tree, "ironwood-tree");
 
     Ok(())
 }
@@ -177,7 +200,7 @@ fn tree_state_decodes_sapling_and_orchard_tree_payloads() -> eyre::Result<()> {
 fn subtree_root_messages_decode_protocol_and_completion_fields() -> eyre::Result<()> {
     let subtree_request = lightwalletd::GetSubtreeRootsArg {
         start_index: 4,
-        shielded_protocol: lightwalletd::ShieldedProtocol::Orchard as i32,
+        shielded_protocol: lightwalletd::ShieldedProtocol::Ironwood as i32,
         max_entries: 16,
     };
     let decoded_subtree_request = round_trip(&subtree_request)?;
@@ -185,7 +208,7 @@ fn subtree_root_messages_decode_protocol_and_completion_fields() -> eyre::Result
     assert_eq!(decoded_subtree_request.start_index, 4);
     assert_eq!(
         decoded_subtree_request.shielded_protocol,
-        lightwalletd::ShieldedProtocol::Orchard as i32
+        lightwalletd::ShieldedProtocol::Ironwood as i32
     );
     assert_eq!(decoded_subtree_request.max_entries, 16);
 

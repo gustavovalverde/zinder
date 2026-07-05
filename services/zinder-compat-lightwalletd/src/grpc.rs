@@ -765,9 +765,14 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Each bool is an independent per-pool inclusion gate parsed from a request's poolTypes, not a state machine."
+)]
 struct CompactBlockPoolSelection {
     sapling: bool,
     orchard: bool,
+    ironwood: bool,
     transparent: bool,
 }
 
@@ -776,6 +781,7 @@ impl CompactBlockPoolSelection {
         Self {
             sapling: true,
             orchard: true,
+            ironwood: true,
             transparent: false,
         }
     }
@@ -837,6 +843,15 @@ fn prune_compact_transaction(
             action.ciphertext.clear();
         }
     }
+    if !pool_selection.ironwood {
+        transaction.ironwood_actions.clear();
+    } else if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
+        for action in &mut transaction.ironwood_actions {
+            action.cmx.clear();
+            action.ephemeral_key.clear();
+            action.ciphertext.clear();
+        }
+    }
     if !pool_selection.transparent || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
         transaction.vin.clear();
         transaction.vout.clear();
@@ -868,6 +883,7 @@ fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> boo
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
         || !transaction.actions.is_empty()
+        || !transaction.ironwood_actions.is_empty()
         || !transaction.vin.is_empty()
         || !transaction.vout.is_empty()
 }
@@ -880,12 +896,14 @@ fn pool_selection_from_request(pool_types: &[i32]) -> Result<CompactBlockPoolSel
     let mut pool_selection = CompactBlockPoolSelection {
         sapling: false,
         orchard: false,
+        ironwood: false,
         transparent: false,
     };
     for pool_type in pool_types {
         match lightwalletd::PoolType::try_from(*pool_type) {
             Ok(lightwalletd::PoolType::Sapling) => pool_selection.sapling = true,
             Ok(lightwalletd::PoolType::Orchard) => pool_selection.orchard = true,
+            Ok(lightwalletd::PoolType::Ironwood) => pool_selection.ironwood = true,
             Ok(lightwalletd::PoolType::Transparent) => pool_selection.transparent = true,
             Ok(lightwalletd::PoolType::Invalid) | Err(_) => {
                 return Err(Status::invalid_argument(
@@ -987,6 +1005,9 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     match lightwalletd::ShieldedProtocol::try_from(protocol) {
         Ok(lightwalletd::ShieldedProtocol::Sapling) => Ok(ShieldedProtocol::Sapling),
         Ok(lightwalletd::ShieldedProtocol::Orchard) => Ok(ShieldedProtocol::Orchard),
+        Ok(lightwalletd::ShieldedProtocol::Ironwood) => Err(Status::unimplemented(
+            "shieldedProtocol ironwood subtree roots are not yet served by this server",
+        )),
         Err(_) => Err(Status::invalid_argument("shieldedProtocol is unknown")),
     }
 }
@@ -1103,6 +1124,7 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeS
         time: tree_state_time(&payload)?,
         sapling_tree: tree_state_pool_final_state(&payload, "sapling")?,
         orchard_tree: tree_state_pool_final_state(&payload, "orchard")?,
+        ironwood_tree: tree_state_pool_final_state(&payload, "ironwood")?,
     })
 }
 
@@ -1431,5 +1453,65 @@ fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::R
         // uses GetLatestBlock for tip tracking; Zinder reports the chain
         // epoch's tip height recorded on the entry.
         height: u64::from(entry.first_seen_chain_epoch.visible_tip_height.value()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compact_tx_with_ironwood() -> lightwalletd::CompactTx {
+        lightwalletd::CompactTx {
+            index: 0,
+            txid: vec![1; 32],
+            fee: 0,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![9; 32],
+                cmx: vec![10; 32],
+                ephemeral_key: vec![11; 32],
+                ciphertext: vec![12; 52],
+            }],
+            ironwood_actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![20; 32],
+                cmx: vec![21; 32],
+                ephemeral_key: vec![22; 32],
+                ciphertext: vec![23; 52],
+            }],
+            vin: Vec::new(),
+            vout: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nullifiers_only_keeps_the_ironwood_nullifier_and_clears_the_rest() {
+        let pruned = prune_compact_transaction(
+            compact_tx_with_ironwood(),
+            CompactBlockPoolSelection::shielded(),
+            CompactBlockPayloadMode::NullifiersOnly,
+        );
+        assert_eq!(pruned.ironwood_actions.len(), 1);
+        let action = &pruned.ironwood_actions[0];
+        assert_eq!(action.nullifier, vec![20; 32]);
+        assert!(action.cmx.is_empty());
+        assert!(action.ephemeral_key.is_empty());
+        assert!(action.ciphertext.is_empty());
+    }
+
+    #[test]
+    fn deselecting_the_ironwood_pool_drops_ironwood_actions() {
+        let pruned = prune_compact_transaction(
+            compact_tx_with_ironwood(),
+            CompactBlockPoolSelection {
+                sapling: true,
+                orchard: true,
+                ironwood: false,
+                transparent: true,
+            },
+            CompactBlockPayloadMode::Full,
+        );
+        assert!(pruned.ironwood_actions.is_empty());
+        assert_eq!(pruned.actions.len(), 1);
     }
 }

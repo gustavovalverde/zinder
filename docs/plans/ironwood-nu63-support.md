@@ -31,6 +31,15 @@ not activated NU6.3 yet (activation height 4,134,000); all source and ingest
 read-side live tests pass pre-activation. Authentic public-testnet v6
 validation follows once the node crosses that height. Merge remains.
 
+Phase 5 (wallet-plane compact-block Ironwood support) is complete on the
+Zinder side; the full Default Validation Gate passes, and a live regtest
+`WalletQuery.CompactBlock` read against a real mined Ironwood transaction
+confirms `ironwoodActions` and `ironwoodCommitmentTreeSize` decode correctly
+from the served bytes. The zally live wallet-plane test that motivated this
+phase still fails, because `zcash_client_backend`'s compact-block scanner
+does not yet trial-decrypt Ironwood actions; that gap is in `librustzcash`,
+tracked separately from this plan.
+
 ## Decisions
 
 1. **`zebra-chain` moves from crates.io `9.0.0` to crates.io `11.0.0`.** The
@@ -71,6 +80,48 @@ validation follows once the node crosses that height. Merge remains.
    production deployment stay on a stable Zebra; the rc image is never pointed
    at them. The renamed 275 GB synced mainnet volume is reserved for a later
    mainnet stage gated on a stable Ironwood Zebra release.
+
+7. **Ironwood compact-block wallet-plane data rides inside the vendored
+   lightwalletd `payload_bytes` at the same wire tags a wallet's
+   `zcash_client_backend` already decodes**, reached by bumping the vendored
+   `compact_formats.proto`/`service.proto` pin from `dd0ea2c3…` (upstream
+   `zcash/lightwallet-protocol` v0.4.1) to `ac7cee05…` (v0.5.0), rather than
+   inventing a Zinder-native superset proto. `CompactTx.ironwoodActions`
+   (tag 9) carries `CompactOrchardAction` entries — Ironwood reuses the
+   Orchard action shape verbatim — and `ChainMetadata.ironwoodCommitmentTreeSize`
+   (tag 3) tracks the running tree size the same way the Sapling and Orchard
+   counters do. The native `zinder.v1.wallet.CompactBlock` envelope carries no
+   new field: it passes `payload_bytes` through unchanged, and a wallet
+   decodes Ironwood data from those bytes with its own generated types. The
+   `CompactBlock.protoVersion` field removal in v0.5.0 (now `reserved`)
+   ripples through every construction site that set it; `zinder-ingest` no
+   longer sets a proto version.
+
+8. **Ironwood subtree-root support is deferred**, not implemented in this
+   change. `ShieldedProtocol` (`crates/zinder-core/src/subtree_root.rs`) stays
+   two-variant (Sapling, Orchard); the ingest subtree-root fetch loop and the
+   two wire-mapping functions in `zinder-query` are untouched. A from-genesis
+   compact-block sync builds the Ironwood note-commitment-tree witness
+   incrementally from the `cmx` values already carried in compact blocks, the
+   same way it already does for Orchard; `GetSubtreeRoots` is a
+   frontier-bootstrap optimization for non-genesis birthdays, not a
+   prerequisite for detecting or spending a from-genesis Ironwood note.
+   `zinder-compat-lightwalletd`'s `shieldedProtocol` request handler returns
+   `UNIMPLEMENTED` for the Ironwood enum value rather than silently
+   misrouting it.
+
+9. **`ChainTipMetadata`/`CommitmentTreeSizes` gain a third `ironwood`
+   counter**, propagated through `zinder-ingest`, `zinder-store`'s
+   `ChainEpochRecord` (tag 11) and wire codec, and the native
+   `ChainEpoch.ironwood_commitment_tree_size` field (tag 9), so a wallet can
+   read the running Ironwood tree size without decoding compact-block
+   payloads. `CURRENT_ARTIFACT_SCHEMA_VERSION` bumps 11 → 12: a version-11
+   store has no Ironwood data to backfill (it was never derived from the
+   source block), so it is rejected at open rather than migrated in place. A
+   new field capability, `wallet.read.compact_block_ironwood_v1`, is
+   `AlwaysOn` for every deployment running Ironwood-aware ingest; its absence
+   tells a wallet that a server predates Ironwood support, so a missing
+   `ironwoodActions` there is not authoritative.
 
 ## Phases
 
@@ -162,3 +213,47 @@ ingest read-side; mining-dependent tests do not run against a public chain).
 
 Mainnet validation is deferred until a stable Ironwood Zebra release exists
 (Decision 6).
+
+### Phase 5: wallet-plane compact-block Ironwood support
+
+Extend the compact-block artifact so a native wallet-plane client (zally)
+sees Ironwood action data through the same compact-block sync path it
+already uses for Sapling and Orchard (Decisions 7-9).
+
+`services/zinder-ingest/src/artifact_builder.rs` gains `compact_ironwood_actions`,
+a near-verbatim copy of `compact_orchard_actions` calling
+`Transaction::ironwood_actions()` (identical `orchard::Action` type). Wire it
+into `compact_transaction`, extend `compact_transaction_has_payload` so an
+Ironwood-only transaction with no transparent, Sapling, or Orchard content is
+not silently dropped from the block's transaction list, and extend
+`CommitmentTreeSizes`/`ChainTipMetadata` with the third counter. Bump the
+vendored lightwalletd proto pin to v0.5.0 (Decision 7) and add the
+`wallet.read.compact_block_ironwood_v1` field capability (Decision 9).
+`zinder-compat-lightwalletd` gains a parallel `ironwood` pool-selection gate
+for `GetBlockRange` pruning and proxies Zebra's `z_gettreestate` `ironwood`
+field into the vendored `TreeState.ironwoodTree`.
+
+Gate: fixture and proto round-trip tests, then the full Default Validation
+Gate.
+
+Live regtest verification against a z3 `zfnd/zebra:6.0.0-rc.0` node (NU6.3
+active at height 6) confirms the fix at the wire level: `grpcurl` against
+`WalletQuery.CompactBlock` for a block containing a real mined Ironwood
+transaction, decoded with `protoc --decode` against the bumped vendored
+proto, shows `ironwoodActions` with two correctly-shaped actions and
+`chainMetadata.ironwoodCommitmentTreeSize` incrementing block over block.
+Zinder now derives, stores, and serves Ironwood compact-block data
+correctly.
+
+The end-to-end zally live test
+(`funded_wallet_syncs_sends_and_submits_pczt_with_zinder`) still fails at the
+same assertion ("expected Zally to observe its shielded self-send"), because
+the gap is one layer deeper than the compact-block wire format: the pinned
+`zcash_client_backend` fork's `scanning::scan_block` (the trial-decryption
+entry point `zcash_client_backend::data_api::chain::scan_cached_blocks`
+calls into) iterates only `CompactTx.outputs` (Sapling) and
+`CompactTx.actions` (Orchard); it does not yet iterate
+`CompactTx.ironwood_actions`, even though `zcash_client_sqlite` already has
+Ironwood note tables, tree-shard storage, and scan-range planning. Zinder now
+serves the data a wallet needs; the remaining gap is in `librustzcash`, out
+of scope for this repository and this plan.

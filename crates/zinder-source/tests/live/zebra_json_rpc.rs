@@ -29,7 +29,7 @@ async fn fetch_chain_checkpoint_at_tip_returns_zero_tree_sizes_on_regtest() -> R
     assert_eq!(checkpoint.height, tip);
     assert_eq!(
         checkpoint.tip_metadata,
-        ChainTipMetadata::new(0, 0),
+        ChainTipMetadata::new(0, 0, 0),
         "regtest blocks have no shielded payload; checkpoint tree sizes should be zero"
     );
     Ok(())

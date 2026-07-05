@@ -225,7 +225,7 @@ impl ZebraJsonRpcSource {
     /// This is the data Zinder needs to bootstrap canonical storage from a
     /// recent height instead of replaying the chain from genesis. The values
     /// come from Zebra's height-keyed `getblock` RPC at verbosity 1,
-    /// which exposes `trees.{sapling,orchard}.size` for every height.
+    /// which exposes `trees.{sapling,orchard,ironwood}.size` for every height.
     ///
     /// # Errors
     ///
@@ -265,6 +265,7 @@ impl ZebraJsonRpcSource {
             })?;
         let sapling = trees.sapling.size;
         let orchard = trees.orchard.size;
+        let ironwood = trees.ironwood.size;
         let sapling_size =
             u32::try_from(sapling).map_err(|_| SourceError::SourceProtocolMismatch {
                 reason: "sapling commitment tree size does not fit u32",
@@ -273,11 +274,15 @@ impl ZebraJsonRpcSource {
             u32::try_from(orchard).map_err(|_| SourceError::SourceProtocolMismatch {
                 reason: "orchard commitment tree size does not fit u32",
             })?;
+        let ironwood_size =
+            u32::try_from(ironwood).map_err(|_| SourceError::SourceProtocolMismatch {
+                reason: "ironwood commitment tree size does not fit u32",
+            })?;
         let block_hash = decode_rpc_block_hash(&block_response.hash)?;
         Ok(SourceChainCheckpoint::new(
             height,
             zinder_core::BlockHash::from_bytes(block_hash.as_bytes()),
-            zinder_core::ChainTipMetadata::new(sapling_size, orchard_size),
+            zinder_core::ChainTipMetadata::new(sapling_size, orchard_size, ironwood_size),
         ))
     }
 
@@ -1819,13 +1824,14 @@ struct ZebraNetworkUpgradeInfo {
     activation_height: u32,
 }
 
-/// Zebra omits `sapling`/`orchard` from `trees` on regtest blocks with no
-/// shielded payload, so both fields default to a zero-size pool.
+/// Zebra omits `sapling`/`orchard`/`ironwood` from `trees` on regtest blocks
+/// with no shielded payload, so all three fields default to a zero-size pool.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct ZebraTrees {
     sapling: ZebraTreeSize,
     orchard: ZebraTreeSize,
+    ironwood: ZebraTreeSize,
 }
 
 #[derive(Default, Deserialize)]

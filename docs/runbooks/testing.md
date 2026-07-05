@@ -794,6 +794,7 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v1
 wallet.read.compact_block_range_v1
+wallet.read.compact_block_ironwood_v1
 wallet.read.full_block_at_v1
 wallet.read.full_block_range_v1
 wallet.read.tree_state_at_height_v1

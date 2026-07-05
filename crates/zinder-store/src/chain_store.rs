@@ -164,9 +164,24 @@ const REBUILDABLE_STORE_SCHEMA_VERSION: u16 = 10;
 /// retention sweep. A version-10 store is migrated in place at primary
 /// open by a one-shot streaming rebuild of the projection from
 /// `transparent_output` and `transparent_spend_fact`; no resync is needed.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(11);
+///
+/// Version 12 adds the Ironwood (NU6.3) shielded pool: `ChainEpochRecord`
+/// carries `ironwood_commitment_tree_size`, and each compact block's
+/// `payload_bytes` carries `ironwoodActions`/`ironwoodCommitmentTreeSize` in
+/// the vendored lightwalletd wire shape. A version-11 store has neither field
+/// and cannot be repaired in place (the omitted Ironwood action data was
+/// never derived from the source block), so it is rejected at open and must
+/// be rebuilt from genesis.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(12);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
+/// Artifact schema the store-schema-10-to-11 rebuild produces.
+///
+/// The rebuild reshapes the transparent projection only and derives no
+/// Ironwood action data, so it stamps this pre-Ironwood version rather than the
+/// current one; an Ironwood-capable binary then rejects the store at open and
+/// rebuilds from genesis instead of serving absent Ironwood artifacts.
+const REBUILT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(11);
 
 /// Default maximum chain events returned by one history read.
 pub const DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
@@ -3920,7 +3935,7 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 11);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 12);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

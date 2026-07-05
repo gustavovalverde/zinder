@@ -210,9 +210,16 @@ impl TransactionComponentCounts {
     /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) logical-action
     /// count for this component shape.
     ///
-    /// Computed as `max(transparent_input_count, transparent_output_count,
-    /// max(sapling_spend_count, sapling_output_count), orchard_action_count) +
-    /// ironwood_action_count`.
+    /// The count is the sum of each pool's contribution:
+    /// `max(transparent_input_count, transparent_output_count) +
+    /// max(sapling_spend_count, sapling_output_count) + orchard_action_count +
+    /// ironwood_action_count`. The `max` folds inputs against outputs *within*
+    /// the transparent and Sapling pools; the pools themselves add.
+    ///
+    /// The transparent term approximates ZIP-317's byte-size formula
+    /// (`max(ceil(tx_in_size / 150), ceil(tx_out_size / 34))`) with input and
+    /// output counts, which is exact for standard P2PKH scripts.
+    ///
     /// The grace-actions floor (a fee-compute concept) is **not** applied
     /// here; this is the raw shape-derived count consumers surface on
     /// per-transaction views.
@@ -222,22 +229,20 @@ impl TransactionComponentCounts {
     /// logical actions to the Sapling/Orchard/Ironwood side.
     #[must_use]
     pub const fn logical_actions(self) -> u32 {
+        let transparent_logical = if self.transparent_input_count > self.transparent_output_count {
+            self.transparent_input_count
+        } else {
+            self.transparent_output_count
+        };
         let sapling_logical = if self.sapling_spend_count > self.sapling_output_count {
             self.sapling_spend_count
         } else {
             self.sapling_output_count
         };
-        let mut max_logical = self.transparent_input_count;
-        if self.transparent_output_count > max_logical {
-            max_logical = self.transparent_output_count;
-        }
-        if sapling_logical > max_logical {
-            max_logical = sapling_logical;
-        }
-        if self.orchard_action_count > max_logical {
-            max_logical = self.orchard_action_count;
-        }
-        max_logical.saturating_add(self.ironwood_action_count)
+        transparent_logical
+            .saturating_add(sapling_logical)
+            .saturating_add(self.orchard_action_count)
+            .saturating_add(self.ironwood_action_count)
     }
 
     /// Returns the [ZIP-317](https://zips.z.cash/zip-0317) conventional
@@ -477,12 +482,21 @@ mod tests {
     }
 
     #[test]
-    fn zip317_conventional_fee_uses_max_across_axes() {
+    fn zip317_conventional_fee_sums_pool_contributions() {
         // 1 transparent_in, 2 transparent_out, 1 sapling_spend, 0 sapling_out,
-        // 3 orchard_action -> logical_actions = max(1, 2, max(1, 0), 3) = 3.
-        // Conventional fee = 5_000 * 3 = 15_000 zatoshi.
+        // 3 orchard_action -> logical_actions = max(1, 2) + max(1, 0) + 3 = 6.
+        // Conventional fee = 5_000 * 6 = 30_000 zatoshi.
         let payload = counts([1, 2, 1, 0, 3, 0, 0]);
-        assert_eq!(payload.zip317_conventional_fee_zat(), 15_000);
+        assert_eq!(payload.logical_actions(), 6);
+        assert_eq!(payload.zip317_conventional_fee_zat(), 30_000);
+    }
+
+    #[test]
+    fn logical_actions_sums_pools_rather_than_max_folding() {
+        // 2 transparent_in, 2 orchard_action across two pools: the summed
+        // contributions give 2 + 2 = 4, not max(2, 2) = 2.
+        let payload = counts([2, 0, 0, 0, 2, 0, 0]);
+        assert_eq!(payload.logical_actions(), 4);
     }
 
     #[test]

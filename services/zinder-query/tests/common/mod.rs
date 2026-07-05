@@ -108,7 +108,7 @@ pub fn synthetic_chain_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(11),
+            artifact_schema_version: ArtifactSchemaVersion::new(12),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(height)),
         },
@@ -155,7 +155,7 @@ pub fn synthetic_multi_block_epoch(
         visible_tip_hash: block_hash_from_seed(visible_tip),
         settled_tip_height: BlockHeight::new(settled_tip),
         settled_tip_hash: block_hash_from_seed(settled_tip),
-        artifact_schema_version: ArtifactSchemaVersion::new(11),
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(visible_tip)),
     };
@@ -196,7 +196,6 @@ pub fn compact_block_with_tree_sizes(
     orchard_commitment_tree_size: u32,
 ) -> CompactBlockArtifact {
     let payload_bytes = LightwalletdCompactBlock {
-        proto_version: 1,
         height: u64::from(height.value()),
         hash: block_hash.as_bytes().into(),
         prev_hash: vec![0; 32],
@@ -206,6 +205,7 @@ pub fn compact_block_with_tree_sizes(
         chain_metadata: Some(ChainMetadata {
             sapling_commitment_tree_size,
             orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: 0,
         }),
     }
     .encode_to_vec();

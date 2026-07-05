@@ -37,8 +37,8 @@ that version. Do not call a surface "current lightwalletd-compatible" when the
 vendored proto is intentionally older.
 
 The current compatibility pin is `zcash/lightwallet-protocol` commit
-`dd0ea2c3c5827a433e62c2f936b89efa2dec5a9a`, verified on 2026-04-27. The
-machine-readable source provenance lives in
+`ac7cee052a1bf5d430985a478d39e8b513fc4bd4` (tag `v0.5.0`), verified on
+2026-07-05. The machine-readable source provenance lives in
 `crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`, and
 `crates/zinder-proto/tests/lightwalletd_protocol.rs` is the local golden decode
 guard for the current compatibility message shapes. The `vendored proto drift` CI

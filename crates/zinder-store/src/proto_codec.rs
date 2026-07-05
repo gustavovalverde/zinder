@@ -375,6 +375,7 @@ pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
         )),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
+        ironwood_commitment_tree_size: chain_epoch.tip_metadata.ironwood_commitment_tree_size,
     }
 }
 
@@ -512,6 +513,7 @@ pub fn chain_epoch_from_message(
         tip_metadata: ChainTipMetadata::new(
             message.sapling_commitment_tree_size,
             message.orchard_commitment_tree_size,
+            message.ironwood_commitment_tree_size,
         ),
         created_at: UnixTimestampMillis::new(message.created_at_millis),
     })

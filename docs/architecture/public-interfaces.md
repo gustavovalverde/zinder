@@ -676,12 +676,15 @@ The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/
 
 Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the wallet-plane `RequiresBroadcaster`, `RequiresChainEvents`, `RequiresChainValuePools`, `RequiresBlockBlobs`, and `RequiresTransactionBlobs`; and the explorer-plane readiness gates. `RequiresBlockBlobs` gates `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`; `RequiresTransactionBlobs` gates `wallet.read.transaction_bytes_v1` (the `MinedTransaction.raw_transaction_bytes` field). Both resolve against the store's persisted raw-blob retention, not against reader config: ingest persists the active `raw_blob_policy` into a `StorageControl` singleton on every primary open, and readers read it. A legacy store with no signal reads back as `none`, so a blob-serving capability is never advertised unless the store demonstrably retains the bytes. See [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md).
 
+`wallet.read.compact_block_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the `ironwoodActions`/`ironwoodCommitmentTreeSize` fields inside `CompactBlock.payload_bytes` (the vendored lightwalletd `CompactTx`/`ChainMetadata` shape, not a native `zinder.v1.wallet` field). A server advertising it has derived Ironwood action data for every block it serves, so an absent `ironwoodActions` on a given block means that block has no Ironwood activity. A server that does not advertise it predates Ironwood wallet-plane support: a missing `ironwoodActions` there is not authoritative, and a client must not read it as "no Ironwood activity".
+
 <!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
 - `wallet.read.block_id_by_selector_v1`
 - `wallet.read.block_header_by_selector_v1`
 - `wallet.read.compact_block_at_v1`
 - `wallet.read.compact_block_range_v1`
+- `wallet.read.compact_block_ironwood_v1`
 - `wallet.read.full_block_at_v1`
 - `wallet.read.full_block_range_v1`
 - `wallet.read.tree_state_at_height_v1`
@@ -923,7 +926,7 @@ Public shapes describe behavior that production code can actually reach.
 - Public event variants, error variants, API transitions, cursor fields, and proto surfaces must be produced, consumed, or explicitly reserved by the owning architecture document.
 - Delete unreachable public variants. Do not keep fallback variants only because they might be useful later.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
-- Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling and Orchard note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size` and `orchard_commitment_tree_size` directly.
+- Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling, Orchard, and Ironwood note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size`, `orchard_commitment_tree_size`, and `ironwood_commitment_tree_size` directly.
 - Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
 - Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zashi-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-safe-tip fixtures.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.

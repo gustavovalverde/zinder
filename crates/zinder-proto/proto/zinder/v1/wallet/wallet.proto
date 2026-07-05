@@ -47,6 +47,9 @@ message ChainEpoch {
 
   // Orchard note commitment tree size at the visible tip.
   uint32 orchard_commitment_tree_size = 8;
+
+  // Ironwood note commitment tree size at the visible tip.
+  uint32 ironwood_commitment_tree_size = 9;
 }
 
 // Highest block the derive projections have fully materialized.
