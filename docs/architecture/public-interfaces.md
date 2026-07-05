@@ -56,7 +56,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `ChainEpochReadApi` | Internal read API for epoch-bound canonical reads |
 | `ChainEvent` | Post-commit canonical transition emitted by `zinder-ingest` |
 | `ChainEventEnvelope` | Cursor-bound chain-event message carried over the ingest subscription plane and exposed natively on `WalletQuery.ChainEvents` |
-| `ChainTipMetadata` | Chain-derived counters at the visible tip (Sapling and Orchard tree sizes) |
+| `ChainTipMetadata` | Chain-derived counters at the visible tip (Sapling, Orchard, and Ironwood tree sizes) |
 | `BlockHeaderArtifact` | Durable typed block-header fact row |
 | `BlockBlobArtifact` | Optional raw block blob available only when raw blob policy stores blocks |
 | `CompactBlockArtifact` | Wallet-oriented compact block artifact |
