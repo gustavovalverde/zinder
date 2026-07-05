@@ -205,6 +205,14 @@ projection over canonical transaction, output, and spend facts; the shared
 `TransparentAddressTxIndexArtifact` row type remains the wallet/query response
 shape, but canonical ingest no longer writes or serves that projection.
 
+Schema version 12 adds the Ironwood (NU6.3) shielded pool to `tip_metadata` and
+to each compact block's payload. A version-11 store carries neither and cannot
+be repaired in place, because the omitted Ironwood action data was never derived
+from the source block; it is rejected at open with `StoreError::SchemaTooOld` and
+must be rebuilt from genesis. The version-10 in-place rebuild still runs, but it
+produces a version-11 projection, so a version-10 store is rejected by the same
+guard and rebuilt from genesis too.
+
 ## Checkpoints and Backups
 
 RocksDB checkpoints are used for backups (`zinder-ingest backup --to <path>`), fixture capture, offline repair, and immutable analytics replicas. The backup command checkpoints the canonical store and the bundled derive store together, installing the derive checkpoint under the canonical checkpoint's `derive` subdirectory. Restore is "stop, replace, start" (operator procedure, no online restore in v1).

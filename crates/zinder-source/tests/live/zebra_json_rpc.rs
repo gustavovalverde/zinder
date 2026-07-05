@@ -35,6 +35,10 @@ async fn fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes() -> Result
         checkpoint.tip_metadata.orchard_commitment_tree_size, 0,
         "coinbase-only regtest blocks should not advance the orchard tree"
     );
+    assert_eq!(
+        checkpoint.tip_metadata.ironwood_commitment_tree_size, 0,
+        "coinbase-only regtest blocks should not advance the ironwood tree"
+    );
     Ok(())
 }
 
