@@ -11,12 +11,21 @@
 //!
 //! Zebra's broadcast channel terminates the stream with `UNAVAILABLE` on
 //! `RecvError::Lagged`; the source treats this as a transient error and
-//! the consumer must reconnect and resnapshot the upstream mempool. The
-//! adapter does not buffer events across reconnects.
+//! the consumer must reconnect. `mempool_change` only reports transitions
+//! from the moment it opens, so every `events()` call also resnapshots the
+//! upstream mempool via `getrawmempool` and emits a synthetic `Added` for
+//! each already-present transaction; otherwise a transaction that entered
+//! the mempool before the (re)connect would never be observed. The
+//! resnapshot runs concurrently with, not before, draining the wire
+//! stream, so its `getrawtransaction` round trips never delay delivery of
+//! live deltas (which would risk a self-inflicted `Lagged`). Duplicate
+//! `Added` events the two passes both produce for the same txid are a
+//! safe no-op (`MempoolIndex::apply_added`).
 
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::stream::TryStreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -33,6 +42,13 @@ use crate::{
 };
 
 const ZEBRA_INDEXER_STREAMING_BACKEND_LABEL: &str = "zebra_indexer_streaming";
+
+/// Bounds concurrent `getrawtransaction` round trips during a resnapshot.
+///
+/// Applies while resnapshotting the mempool on `events()` (re)connect.
+/// Mirrors the polling backend's concurrency budget
+/// (`json_rpc_mempool::MEMPOOL_POLL_HYDRATION_CONCURRENCY`).
+const MEMPOOL_RESNAPSHOT_HYDRATION_CONCURRENCY: usize = 16;
 
 fn increment_streaming_hydration_failure(reason: MempoolHydrationFailureReason) {
     metrics::counter!(
@@ -155,6 +171,11 @@ impl MempoolSource for ZebraIndexerMempoolSource {
         let (event_sender, event_receiver) = mpsc::channel(self.options.event_channel_capacity);
         let hydration_json_rpc = self.hydration_json_rpc.clone();
 
+        tokio::spawn(resnapshot_current_mempool(
+            hydration_json_rpc.clone(),
+            event_sender.clone(),
+        ));
+
         tokio::spawn(async move {
             loop {
                 match wire_stream.message().await {
@@ -184,6 +205,48 @@ impl MempoolSource for ZebraIndexerMempoolSource {
 
         Ok(Box::pin(ReceiverStream::new(event_receiver)))
     }
+}
+
+/// Emits a synthetic `Added` event for every transaction already sitting in
+/// the upstream mempool at (re)connect time.
+///
+/// `mempool_change` only reports transitions from the moment it opens, so
+/// without this pass a subscriber that (re)connects mid-stream would never
+/// observe transactions that arrived before that point. Runs concurrently
+/// with the wire-stream drain rather than before it, so its
+/// `getrawtransaction` round trips never delay live delta delivery.
+async fn resnapshot_current_mempool(
+    hydration_json_rpc: ZebraJsonRpcSource,
+    event_sender: mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+) {
+    let observed_at = UnixTimestampMillis::now();
+    let transaction_ids = match hydration_json_rpc.fetch_raw_mempool_transaction_ids().await {
+        Ok(transaction_ids) => transaction_ids,
+        Err(source_error) => {
+            let _ = event_sender.send(Err(source_error)).await;
+            return;
+        }
+    };
+
+    let _ = futures_util::stream::iter(transaction_ids.into_iter().map(Ok::<_, ()>))
+        .try_for_each_concurrent(MEMPOOL_RESNAPSHOT_HYDRATION_CONCURRENCY, |transaction_id| {
+            let hydration_json_rpc = &hydration_json_rpc;
+            let event_sender = &event_sender;
+            async move {
+                let outcome =
+                    match build_added_event(hydration_json_rpc, transaction_id, None, observed_at)
+                        .await
+                    {
+                        Ok(source_event) => forward_event(source_event, event_sender).await,
+                        Err(source_error) => forward_error(source_error, event_sender).await,
+                    };
+                if matches!(outcome, ForwardOutcome::ChannelClosed) {
+                    return Err(());
+                }
+                Ok(())
+            }
+        })
+        .await;
 }
 
 /// Whether the consumer is still listening to the source-event channel.
@@ -368,5 +431,53 @@ mod tests {
         let wire_bytes = [0x55u8; 16];
         let auth_digest = decode_auth_digest(&wire_bytes);
         assert!(auth_digest.is_none());
+    }
+
+    // Regression coverage for the resnapshot-on-connect gap: `mempool_change`
+    // only reports transitions from the moment it opens, so without a
+    // resnapshot pass a transaction already in the mempool at (re)connect
+    // time was never observed (see the module doc's `# Reconnect contract`).
+    #[tokio::test]
+    async fn resnapshot_current_mempool_emits_added_for_preexisting_transaction() -> eyre::Result<()>
+    {
+        // All-same-byte txid sidesteps needing to know `getrawmempool`'s
+        // display-order byte reversal: reversing `[0x11; 32]` is a no-op.
+        let transaction_id = TransactionId::from_bytes([0x11; 32]);
+        let txid_hex = "11".repeat(32);
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!([txid_hex]),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!("deadbeef"),
+            )),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        resnapshot_current_mempool(hydration_json_rpc, event_sender).await;
+
+        let event = event_receiver
+            .recv()
+            .await
+            .ok_or_else(|| eyre::eyre!("expected a resnapshot event"))??;
+        let MempoolSourceEvent::Added(entry) = event else {
+            return Err(eyre::eyre!("expected an Added event, got {event:?}"));
+        };
+        assert_eq!(entry.transaction_id, transaction_id);
+        assert_eq!(
+            entry.raw_transaction_bytes.as_slice(),
+            [0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(
+            event_receiver.recv().await.is_none(),
+            "resnapshot must not emit more than one event per mempool entry"
+        );
+        Ok(())
     }
 }
