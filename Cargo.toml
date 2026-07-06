@@ -27,10 +27,10 @@ async-trait = "0.1.89"
 blake2b_simd = "1.0.4"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22.1"
-bytes = "1.11.0"
+bytes = "1.12.0"
 clap = "4.6.1"
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
-config = { version = "0.15.22", default-features = false, features = ["toml"] }
+config = { version = "0.15.25", default-features = false, features = ["toml"] }
 eyre = "0.6.12"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 hex = "0.4.3"
@@ -39,30 +39,30 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client"] }
-metrics = "0.24.4"
+metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
-prost = "0.14.3"
-prost-build = "0.14.3"
-prost-types = "0.14.3"
-rust-rocksdb = { version = "0.47.0", features = ["multi-threaded-cf"] }
+prost = "0.14.4"
+prost-build = "0.14.4"
+prost-types = "0.14.4"
+rust-rocksdb = { version = "0.51.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"
 serde = "1.0.228"
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 sha2 = "0.10.9"
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = { version = "1.52.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 toml = "1.1.2"
-tonic = { version = "0.14.5", features = ["tls-ring", "tls-native-roots"] }
-tonic-health = "0.14.5"
-tonic-prost = "0.14.5"
-tonic-prost-build = "0.14.5"
-tonic-reflection = "0.14.5"
-tonic-types = "0.14.5"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-native-roots"] }
+tonic-health = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tonic-reflection = "0.14.6"
+tonic-types = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 zebra-chain = "11.0.0"
