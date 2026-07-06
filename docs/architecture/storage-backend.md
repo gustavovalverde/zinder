@@ -117,6 +117,13 @@ advances, so a spend fact is deleted only after its spender identity is
 durably recorded elsewhere; a sweep that deletes at least one fact also
 advances the `transparent_retention_deleted_through_height` marker in the same
 batch ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
+One commit sweeps at most `retention_sweep_max_heights_per_commit` heights
+(default 25000). When the release floor jumps far ahead of the swept marker (a
+store rebuilt with derive paused, then un-paused at tip), the marker advances by
+that cap and the remaining backlog drains across later commits, so a
+multi-million-height sweep never blocks the commit path in one synchronous pass.
+A sweep that advances the marker or leaves a backlog logs a
+`retention_sweep_advanced` event; a zero-work sweep stays silent.
 In-window reverted spends need no machinery at all: their rows were never
 deleted, and the existing spend-fact repair un-hides them. Bulk catchup
 sweeps with one-batch lag because the spend facts a batch commits are not

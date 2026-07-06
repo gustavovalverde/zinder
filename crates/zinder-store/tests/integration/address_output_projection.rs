@@ -4,6 +4,7 @@
 )]
 
 use std::num::NonZeroU32;
+use std::path::Path;
 
 use eyre::eyre;
 use tempfile::tempdir;
@@ -537,8 +538,142 @@ fn utxo_set_summary_respects_the_pinned_epoch_settled_tip() -> eyre::Result<()> 
     Ok(())
 }
 
+#[test]
+fn sweep_backlog_larger_than_cap_advances_one_cap_per_commit() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = store_with_sweep_cap(tempdir.path(), 3)?;
+    let spent_low = output_at(BlockHeight::new(1), [101; 32]);
+    let spent_mid = output_at(BlockHeight::new(1), [102; 32]);
+    let spent_high = output_at(BlockHeight::new(1), [103; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 10)
+            .with_transparent_outputs_by_outpoint(vec![
+                spent_low.clone(),
+                spent_mid.clone(),
+                spent_high.clone(),
+            ])
+            .with_transparent_spend_facts(vec![
+                spend_at(BlockHeight::new(2), &spent_low),
+                spend_at(BlockHeight::new(5), &spent_mid),
+                spend_at(BlockHeight::new(8), &spent_high),
+            ]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(10))?;
+    let outpoints = [spent_low.outpoint, spent_mid.outpoint, spent_high.outpoint];
+
+    // Ceiling is 9, cap is 3: the first commit sweeps only heights 1..=3.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+    assert_eq!(
+        store.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(3))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+    assert!(!spends.contains_key(&spent_low.outpoint));
+    assert!(spends.contains_key(&spent_mid.outpoint));
+    assert!(spends.contains_key(&spent_high.outpoint));
+    drop(reader);
+
+    // The next commit resumes from the persisted marker: heights 4..=6.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(3, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(6))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+    assert!(!spends.contains_key(&spent_mid.outpoint));
+    assert!(spends.contains_key(&spent_high.outpoint));
+    drop(reader);
+
+    // The final commit drains the remaining backlog: heights 7..=9.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(4, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(9))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+    assert!(!spends.contains_key(&spent_high.outpoint));
+
+    Ok(())
+}
+
+#[test]
+fn sweep_backlog_within_cap_advances_to_the_full_ceiling() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = store_with_sweep_cap(tempdir.path(), 25_000)?;
+    let finalized_output = output_at(BlockHeight::new(1), [121; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![finalized_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_output)]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
+
+    // The ceiling of 3 is well within the cap, so one commit sweeps it all.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+    assert_eq!(
+        store.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(3))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&[finalized_output.outpoint])?;
+    assert!(!spends.contains_key(&finalized_output.outpoint));
+
+    Ok(())
+}
+
+#[test]
+fn capped_sweep_without_deletions_advances_marker_but_not_deleted_through() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = store_with_sweep_cap(tempdir.path(), 3)?;
+    let later_spent = output_at(BlockHeight::new(1), [111; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 10)
+            .with_transparent_outputs_by_outpoint(vec![later_spent.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(7), &later_spent)]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(10))?;
+
+    // The first cap window 1..=3 holds no spend, so the swept marker advances by
+    // the cap while the deleted-through marker stays unset.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(3))
+    );
+    assert_eq!(store.transparent_retention_deleted_through_height()?, None);
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&[later_spent.outpoint])?;
+    assert!(spends.contains_key(&later_spent.outpoint));
+
+    Ok(())
+}
+
 // Deterministic single-branch chain helpers: the block at height `h`
 // hashes to `block_hash(h)`.
+
+fn store_with_sweep_cap(path: &Path, cap: u32) -> eyre::Result<PrimaryChainStore> {
+    Ok(PrimaryChainStore::open(
+        path,
+        ChainStoreOptions {
+            retention_sweep_max_heights_per_commit: cap,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    )?)
+}
 
 fn output_at(height: BlockHeight, txid_seed: [u8; 32]) -> TransparentOutputArtifact {
     TransparentOutputArtifact::new(

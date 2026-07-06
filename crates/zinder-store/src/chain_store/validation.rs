@@ -19,6 +19,11 @@ pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result
             reason: "reorg window blocks must be greater than zero",
         });
     }
+    if options.retention_sweep_max_heights_per_commit == 0 {
+        return Err(StoreError::InvalidChainStoreOptions {
+            reason: "retention sweep max heights per commit must be greater than zero",
+        });
+    }
     options
         .rocksdb_resource_budget
         .validate()

@@ -112,6 +112,61 @@ pub(crate) fn read_visible_transparent_spend_fact_block_outpoints(
     Ok(outpoints.unwrap_or_default())
 }
 
+/// Reads the spent outpoints recorded for `height` from the current projection,
+/// skipping the visible-header seek [`read_visible_transparent_spend_fact_block_outpoints`]
+/// performs.
+///
+/// Correct only for finalized heights (at or below `settled_tip_height`): such
+/// blocks are immutable, so the highest-epoch block-index entry at or below the
+/// pinned epoch is the canonical one and no orphaned entry can outrank it. The
+/// reverse scan returns that entry directly, turning a block-header read plus a
+/// hash match into a single index seek.
+pub(crate) fn read_current_transparent_spend_fact_block_outpoints(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+) -> Result<Vec<TransparentOutPoint>, StoreError> {
+    let prefix = StoreKey::transparent_spend_fact_block_index_prefix(chain_epoch.network, height);
+    let mut outpoints = None;
+    let mut scan_error = None;
+    inner.scan_prefix_reverse(
+        StorageTable::TransparentSpendFactBlockIndex,
+        &prefix,
+        &mut |key_bytes, envelope_bytes| {
+            let Some(source_epoch) = StoreKey::transparent_artifact_chain_epoch_id(key_bytes)
+            else {
+                scan_error = Some(StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::TransparentSpendFact,
+                    key: prefix.clone().into(),
+                    reason: "transparent spend fact block index key is malformed",
+                });
+                return Ok(PrefixScanControl::Stop);
+            };
+            if source_epoch > chain_epoch.id {
+                return Ok(PrefixScanControl::Continue);
+            }
+
+            let key = StoreKey::from_raw_bytes(key_bytes);
+            match decode_transparent_spend_fact_block_index(&key, envelope_bytes) {
+                Ok((_, block_outpoints)) => {
+                    outpoints = Some(block_outpoints);
+                    Ok(PrefixScanControl::Stop)
+                }
+                Err(error) => {
+                    scan_error = Some(error);
+                    Ok(PrefixScanControl::Stop)
+                }
+            }
+        },
+    )?;
+
+    if let Some(error) = scan_error {
+        return Err(error);
+    }
+
+    Ok(outpoints.unwrap_or_default())
+}
+
 fn block_is_visible(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
