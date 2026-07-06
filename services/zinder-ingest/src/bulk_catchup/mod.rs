@@ -1139,8 +1139,10 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = block_prepare_stream.next().await {
-            observed_heights.push(next_block?.derived.block_header.height.value());
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1194,10 +1196,12 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
 
-        let prepared = block_prepare_stream
+        let mut prepared_chunk = block_prepare_stream
             .next()
             .await
-            .ok_or("missing prepared block")??;
+            .ok_or("missing prepared chunk")??;
+        assert_eq!(prepared_chunk.len(), 1);
+        let prepared = prepared_chunk.remove(0);
         assert_eq!(prepared.derived.block_header.height, BlockHeight::new(2));
         assert_eq!(
             prepared.prefetched_spent_transparent_outputs,
@@ -1254,8 +1258,10 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = block_prepare_stream.next().await {
-            observed_heights.push(next_block?.derived.block_header.height.value());
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1319,8 +1325,10 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = block_prepare_stream.next().await {
-            observed_heights.push(next_block?.derived.block_header.height.value());
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1384,8 +1392,10 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = block_prepare_stream.next().await {
-            observed_heights.push(next_block?.derived.block_header.height.value());
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1467,8 +1477,10 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
-        while let Some(next_block) = block_prepare_stream.next().await {
-            observed_heights.push(next_block?.derived.block_header.height.value());
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
@@ -1557,10 +1569,11 @@ mod tests {
         );
         futures_util::pin_mut!(block_prepare_stream);
 
-        let first_block = block_prepare_stream
+        let first_chunk = block_prepare_stream
             .next()
             .await
-            .ok_or("missing first prepared block")??;
+            .ok_or("missing first prepared chunk")??;
+        let first_block = first_chunk.first().ok_or("empty prepared chunk")?;
         assert_eq!(first_block.derived.block_header.height, BlockHeight::new(1));
 
         second_block_release.notify_one();

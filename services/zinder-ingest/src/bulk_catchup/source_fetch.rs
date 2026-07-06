@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    mem,
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
     time::{Duration, Instant},
@@ -55,14 +56,14 @@ struct SourceBlockStreamState<'a, Source> {
     in_flight_segments:
         FuturesUnordered<BoxFuture<'static, Result<PrefetchedSourceSegment, IngestError>>>,
     completed_segments: BTreeMap<BlockHeight, PrefetchedSourceSegment>,
-    pending_blocks: VecDeque<SourceBlock>,
+    pending_blocks: Vec<SourceBlock>,
     last_connected_block_id: Option<BlockId>,
 }
 
 pub(super) fn build_source_block_stream<'a, Source>(
     source: &'a Source,
     config: BulkCatchupSourceFetchStreamConfig,
-) -> impl Stream<Item = Result<SourceBlock, IngestError>> + Send + 'a
+) -> impl Stream<Item = Result<Vec<SourceBlock>, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
 {
@@ -85,25 +86,25 @@ where
         next_emit_height: Some(config.from_height),
         in_flight_segments: FuturesUnordered::new(),
         completed_segments: BTreeMap::new(),
-        pending_blocks: VecDeque::new(),
+        pending_blocks: Vec::new(),
         last_connected_block_id: None,
     };
 
     stream::unfold(state, |mut state| async move {
-        let next_block = next_source_block_from_segment(&mut state).await;
-        next_block.map(|block_result| (block_result, state))
+        let next_chunk = next_source_block_chunk(&mut state).await;
+        next_chunk.map(|chunk_result| (chunk_result, state))
     })
 }
 
-async fn next_source_block_from_segment<Source>(
+async fn next_source_block_chunk<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
-) -> Option<Result<SourceBlock, IngestError>>
+) -> Option<Result<Vec<SourceBlock>, IngestError>>
 where
     Source: NodeSource + Clone,
 {
     loop {
-        if let Some(block) = state.pending_blocks.pop_front() {
-            return Some(Ok(block));
+        if !state.pending_blocks.is_empty() {
+            return Some(Ok(mem::take(&mut state.pending_blocks)));
         }
 
         fill_source_segment_prefetch_queue(state);
@@ -366,7 +367,7 @@ where
                 state.last_connected_block_id = Some(BlockId::new(block.height, block.hash));
                 if block.height <= state.to_height {
                     connected_blocks = connected_blocks.saturating_add(1);
-                    state.pending_blocks.push_back(block);
+                    state.pending_blocks.push(block);
                 }
             }
             SourceChainUpdate::RevertedBlock { block_id, .. } => {

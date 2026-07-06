@@ -54,7 +54,7 @@ pub(super) fn build_block_prepare_stream<'a, Source, F, Fut>(
     source: &'a Source,
     config: BulkCatchupBlockPrepareStreamConfig,
     derive_fn: F,
-) -> impl Stream<Item = Result<PreparedBlockArtifacts, IngestError>> + Send + 'a
+) -> impl Stream<Item = Result<Vec<PreparedBlockArtifacts>, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
@@ -103,8 +103,8 @@ where
     };
 
     stream::unfold(state, |mut state| async move {
-        let next_derived_block = next_derived_block_from_block_prepare_stream(&mut state).await;
-        next_derived_block.map(|derived_result| (derived_result, state))
+        let next_chunk = next_block_prepare_chunk(&mut state).await;
+        next_chunk.map(|chunk_result| (chunk_result, state))
     })
 }
 
@@ -122,7 +122,7 @@ struct QueuedDerivedBlock {
 }
 
 struct BlockPrepareStreamState<'a, F> {
-    source_blocks: BoxStream<'a, Result<SourceBlock, IngestError>>,
+    source_blocks: BoxStream<'a, Result<Vec<SourceBlock>, IngestError>>,
     in_flight_block_prepares:
         FuturesUnordered<BoxFuture<'static, Result<PrefetchedDerivedBlock, IngestError>>>,
     completed_block_prepares: BTreeMap<BlockHeight, QueuedDerivedBlock>,
@@ -137,31 +137,18 @@ struct BlockPrepareStreamState<'a, F> {
     source_exhausted: bool,
 }
 
-async fn next_derived_block_from_block_prepare_stream<F, Fut>(
+async fn next_block_prepare_chunk<F, Fut>(
     state: &mut BlockPrepareStreamState<'_, F>,
-) -> Option<Result<PreparedBlockArtifacts, IngestError>>
+) -> Option<Result<Vec<PreparedBlockArtifacts>, IngestError>>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
 {
     loop {
-        if let Some(next_emit_height) = state.next_emit_height
-            && let Some(queued) = state.completed_block_prepares.remove(&next_emit_height)
-        {
-            state.next_emit_height = next_emit_height
-                .next()
-                .filter(|height| *height <= state.to_height);
-            let QueuedDerivedBlock {
-                prepared,
-                artifact_bytes,
-                reservation,
-            } = queued;
-            state.completed_block_prepare_bytes = state
-                .completed_block_prepare_bytes
-                .saturating_sub(artifact_bytes);
+        let ready_blocks = drain_contiguous_completed_block_prepares(state);
+        if !ready_blocks.is_empty() {
             record_block_prepare_reassembly_state(state);
-            drop(reservation);
-            return Some(Ok(prepared));
+            return Some(Ok(ready_blocks));
         }
 
         if let Some(source_block) = state.pending_source_blocks.pop_front() {
@@ -177,13 +164,9 @@ where
         }
 
         tokio::select! {
-            source_block_result = state.source_blocks.next(), if can_schedule_block_prepare => {
-                match source_block_result {
-                    Some(Ok(source_block)) => {
-                        if let Err(source_block) = schedule_block_prepare(state, source_block) {
-                            state.pending_source_blocks.push_front(source_block);
-                        }
-                    }
+            source_chunk_result = state.source_blocks.next(), if can_schedule_block_prepare => {
+                match source_chunk_result {
+                    Some(Ok(source_chunk)) => state.pending_source_blocks.extend(source_chunk),
                     Some(Err(error)) => return Some(Err(error)),
                     None => state.source_exhausted = true,
                 }
@@ -197,10 +180,34 @@ where
                 if let Err(error) = insert_completed_block_prepare(state, prefetched_derived) {
                     return Some(Err(error));
                 }
-                record_block_prepare_reassembly_state(state);
             }
         }
     }
+}
+
+fn drain_contiguous_completed_block_prepares<F>(
+    state: &mut BlockPrepareStreamState<'_, F>,
+) -> Vec<PreparedBlockArtifacts> {
+    let mut ready_blocks = Vec::new();
+    while let Some(next_emit_height) = state.next_emit_height {
+        let Some(queued) = state.completed_block_prepares.remove(&next_emit_height) else {
+            break;
+        };
+        state.next_emit_height = next_emit_height
+            .next()
+            .filter(|height| *height <= state.to_height);
+        let QueuedDerivedBlock {
+            prepared,
+            artifact_bytes,
+            reservation,
+        } = queued;
+        state.completed_block_prepare_bytes = state
+            .completed_block_prepare_bytes
+            .saturating_sub(artifact_bytes);
+        drop(reservation);
+        ready_blocks.push(prepared);
+    }
+    ready_blocks
 }
 
 impl<F> BlockPrepareStreamState<'_, F> {
