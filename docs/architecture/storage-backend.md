@@ -118,11 +118,15 @@ durably recorded elsewhere; a sweep that deletes at least one fact also
 advances the `transparent_retention_deleted_through_height` marker in the same
 batch ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 One commit sweeps at most `retention_sweep_max_heights_per_commit` heights
-(default 25000). When the release floor jumps far ahead of the swept marker (a
-store rebuilt with derive paused, then un-paused at tip), the marker advances by
-that cap and the remaining backlog drains across later commits, so a
-multi-million-height sweep never blocks the commit path in one synchronous pass.
-A sweep that advances the marker or leaves a backlog logs a
+(default 25000) and stops after the first fully-swept height that reaches
+`retention_sweep_max_outpoints_per_commit` outpoints (default 500000),
+whichever budget hits first. The outpoint budget bounds the delete batch held
+in memory through transaction-dense eras; the height cap bounds the scan
+through sparse ones. A height is never split across commits, and the swept
+marker advances only to the last fully-swept height, so when the release floor
+jumps far ahead of the marker (a store rebuilt with derive paused, then
+un-paused at tip) the backlog drains across later commits and no commit claims
+unswept ground. A sweep that advances the marker or leaves a backlog logs a
 `retention_sweep_advanced` event; a zero-work sweep stays silent.
 In-window reverted spends need no machinery at all: their rows were never
 deleted, and the existing spend-fact repair un-hides them. Bulk catchup

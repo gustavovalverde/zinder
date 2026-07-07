@@ -115,14 +115,22 @@ pub struct ChainStoreOptions {
     /// Raw-blob retention the primary writer persists on open.
     pub raw_blob_retention: RawBlobRetention,
     /// Maximum heights one commit sweeps when the safe-tip retention floor
-    /// jumps far ahead of the swept marker. Bounds a single synchronous sweep
-    /// so a multi-million-height backlog drains across commits instead of
-    /// blocking the commit path in one pass.
+    /// jumps far ahead of the swept marker. Bounds the scan through sparse
+    /// eras where few outpoints ever meet the outpoint budget.
     pub retention_sweep_max_heights_per_commit: u32,
+    /// Maximum outpoints one commit sweeps. Bounds the delete batch held in
+    /// memory through transaction-dense eras where a few heights carry
+    /// millions of spent outpoints. A single height is never split across
+    /// commits, so one commit may exceed the budget by at most the densest
+    /// height in its range.
+    pub retention_sweep_max_outpoints_per_commit: u64,
 }
 
 /// Default per-commit ceiling on safe-tip retention sweep heights.
 const DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT: u32 = 25_000;
+
+/// Default per-commit ceiling on safe-tip retention sweep outpoints.
+const DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT: u64 = 500_000;
 
 impl ChainStoreOptions {
     /// Returns durable production options anchored to `network` with fsync writes.
@@ -135,6 +143,8 @@ impl ChainStoreOptions {
             rocksdb_resource_budget: RocksDbResourceBudget::canonical_writer_defaults(),
             raw_blob_retention: RawBlobRetention::None,
             retention_sweep_max_heights_per_commit: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT,
+            retention_sweep_max_outpoints_per_commit:
+                DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT,
         }
     }
 
@@ -152,6 +162,8 @@ impl ChainStoreOptions {
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
             raw_blob_retention: RawBlobRetention::None,
             retention_sweep_max_heights_per_commit: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT,
+            retention_sweep_max_outpoints_per_commit:
+                DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT,
         }
     }
 }
@@ -997,6 +1009,7 @@ impl ChainStoreInner {
             &artifacts,
             current_chain_epoch,
             self.options.retention_sweep_max_heights_per_commit,
+            self.options.retention_sweep_max_outpoints_per_commit,
         )?;
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(&ChainEventEnvelopeInputs {
@@ -2760,16 +2773,20 @@ struct RetentionSweepAdvance {
 /// the startup guard can tell a real deletion apart from a checkpoint-bootstrap
 /// swept marker that deleted nothing.
 ///
-/// A single commit sweeps at most `max_heights_per_commit` heights. When the
-/// release floor jumps far ahead of the swept marker (a store rebuilt with
-/// derive paused, then un-paused at tip), the marker advances by the cap and the
-/// remaining backlog drains across later commits; capping the synchronous scan
-/// keeps the commit path from stalling on a multi-million-height pass.
+/// A single commit sweeps at most `max_heights_per_commit` heights and stops
+/// after the first fully-swept height that reaches
+/// `max_outpoints_per_commit`, whichever budget hits first. When the release
+/// floor jumps far ahead of the swept marker (a store rebuilt with derive
+/// paused, then un-paused at tip), the marker advances only to the last
+/// fully-swept height and the remaining backlog drains across later commits;
+/// the outpoint budget bounds the delete batch through transaction-dense
+/// eras, and the height cap bounds the scan through sparse ones.
 fn build_safe_tip_retention_sweep(
     inner: &impl RocksChainStoreRead,
     artifacts: &ChainEpochArtifacts,
     previous_chain_epoch: Option<ChainEpoch>,
     max_heights_per_commit: u32,
+    max_outpoints_per_commit: u64,
 ) -> Result<SafeTipRetentionSweep, StoreError> {
     if !matches!(
         artifacts.reorg_window_change,
@@ -2815,23 +2832,33 @@ fn build_safe_tip_retention_sweep(
     );
     let swept_from = BlockHeight::new(swept_through.value().saturating_add(1));
     let sweep_range = BlockHeightRange::inclusive(swept_from, capped_ceiling);
-    let (deletes, swept_outpoints) =
-        collect_settled_spend_sweep_deletes(inner, chain_epoch, previous_chain_epoch, sweep_range)?;
+    let settled_sweep = collect_settled_spend_sweep_deletes(
+        inner,
+        chain_epoch,
+        previous_chain_epoch,
+        sweep_range,
+        max_outpoints_per_commit,
+    )?;
+    let swept_outpoints = settled_sweep.swept_outpoints;
 
-    let mut puts = vec![transparent_retention_swept_height_put(capped_ceiling)];
+    let mut puts = vec![transparent_retention_swept_height_put(
+        settled_sweep.swept_through,
+    )];
     if swept_outpoints > 0 {
         puts.push(transparent_retention_deleted_through_height_put(
-            capped_ceiling,
+            settled_sweep.swept_through,
         ));
     }
-    let backlog_heights = sweep_ceiling.value().saturating_sub(capped_ceiling.value());
+    let backlog_heights = sweep_ceiling
+        .value()
+        .saturating_sub(settled_sweep.swept_through.value());
     Ok(SafeTipRetentionSweep {
         puts,
-        deletes,
+        deletes: settled_sweep.deletes,
         swept_outpoints,
         advance: Some(RetentionSweepAdvance {
             swept_from,
-            swept_through: capped_ceiling,
+            swept_through: settled_sweep.swept_through,
             sweep_ceiling,
             swept_outpoints,
             backlog_heights,
@@ -2839,17 +2866,32 @@ fn build_safe_tip_retention_sweep(
     })
 }
 
+struct SettledSpendSweepDeletes {
+    deletes: Vec<StorageDelete>,
+    swept_outpoints: u64,
+    /// Last height whose spends are fully covered by `deletes`.
+    swept_through: BlockHeight,
+}
+
 /// Collects the deletes for spend facts and spent-output rows finalized within
-/// `sweep_range`, returning them with the count of outpoints swept.
+/// `sweep_range`, stopping after the first fully-swept height that reaches
+/// `max_outpoints`.
+///
+/// A height is never split across commits: the budget is checked only after
+/// every spend at a height is collected, so `swept_through` always names a
+/// height whose deletes are complete and the marker may safely advance to it.
 fn collect_settled_spend_sweep_deletes(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     previous_chain_epoch: ChainEpoch,
     sweep_range: BlockHeightRange,
-) -> Result<(Vec<StorageDelete>, u64), StoreError> {
+    max_outpoints: u64,
+) -> Result<SettledSpendSweepDeletes, StoreError> {
     let mut deletes = Vec::new();
     let mut swept_outpoints = 0_u64;
+    let mut swept_through = sweep_range.start;
     for height in sweep_range {
+        swept_through = height;
         let outpoints = read_current_transparent_spend_fact_block_outpoints(
             inner,
             previous_chain_epoch,
@@ -2889,8 +2931,15 @@ fn collect_settled_spend_sweep_deletes(
             });
             swept_outpoints = swept_outpoints.saturating_add(1);
         }
+        if swept_outpoints >= max_outpoints {
+            break;
+        }
     }
-    Ok((deletes, swept_outpoints))
+    Ok(SettledSpendSweepDeletes {
+        deletes,
+        swept_outpoints,
+        swept_through,
+    })
 }
 
 fn encode_raw_blob_retention_signal(retention: RawBlobRetention) -> Vec<u8> {

@@ -662,6 +662,117 @@ fn capped_sweep_without_deletions_advances_marker_but_not_deleted_through() -> e
     Ok(())
 }
 
+#[test]
+fn sweep_outpoint_budget_stops_at_the_last_fully_swept_height() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = store_with_outpoint_budget(tempdir.path(), 2)?;
+    let dense_first = output_at(BlockHeight::new(1), [131; 32]);
+    let dense_second = output_at(BlockHeight::new(1), [132; 32]);
+    let spent_mid = output_at(BlockHeight::new(1), [133; 32]);
+    let spent_high = output_at(BlockHeight::new(1), [134; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 10)
+            .with_transparent_outputs_by_outpoint(vec![
+                dense_first.clone(),
+                dense_second.clone(),
+                spent_mid.clone(),
+                spent_high.clone(),
+            ])
+            .with_transparent_spend_facts(vec![
+                spend_at(BlockHeight::new(2), &dense_first),
+                spend_at(BlockHeight::new(2), &dense_second),
+                spend_at(BlockHeight::new(5), &spent_mid),
+                spend_at(BlockHeight::new(8), &spent_high),
+            ]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(10))?;
+    let outpoints = [
+        dense_first.outpoint,
+        dense_second.outpoint,
+        spent_mid.outpoint,
+        spent_high.outpoint,
+    ];
+
+    // Height 2 alone meets the budget of 2: the marker lands on 2, the last
+    // fully-swept height, not on the height-cap ceiling.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(2))
+    );
+    assert_eq!(
+        store.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(2))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+    assert!(!spends.contains_key(&dense_first.outpoint));
+    assert!(!spends.contains_key(&dense_second.outpoint));
+    assert!(spends.contains_key(&spent_mid.outpoint));
+    assert!(spends.contains_key(&spent_high.outpoint));
+    drop(reader);
+
+    // The next commit resumes from the marker, sweeps height 5, and stops
+    // again once height 8 meets the budget.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(3, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(8))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+    assert!(!spends.contains_key(&spent_mid.outpoint));
+    assert!(!spends.contains_key(&spent_high.outpoint));
+    drop(reader);
+
+    // The final commit drains the empty remainder up to the ceiling without
+    // touching the deleted-through marker.
+    store.commit_chain_epoch(advance_safe_tip_artifacts(4, 10, 9, 9))?;
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(9))
+    );
+    assert_eq!(
+        store.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(8))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sweep_never_splits_a_height_denser_than_the_outpoint_budget() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = store_with_outpoint_budget(tempdir.path(), 1)?;
+    let dense_first = output_at(BlockHeight::new(1), [141; 32]);
+    let dense_second = output_at(BlockHeight::new(1), [142; 32]);
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![dense_first.clone(), dense_second.clone()])
+            .with_transparent_spend_facts(vec![
+                spend_at(BlockHeight::new(2), &dense_first),
+                spend_at(BlockHeight::new(2), &dense_second),
+            ]),
+    )?;
+    store.set_transparent_retention_release_height(BlockHeight::new(5))?;
+    store.commit_chain_epoch(advance_safe_tip_artifacts(2, 5, 3, 3))?;
+
+    // Height 2 carries more outpoints than the budget of 1, but the marker
+    // may only name fully-swept heights, so both spends go in one commit.
+    assert_eq!(
+        store.transparent_retention_swept_height()?,
+        Some(BlockHeight::new(2))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    let spends = reader
+        .transparent_spend_facts_by_outpoints(&[dense_first.outpoint, dense_second.outpoint])?;
+    assert!(spends.is_empty());
+
+    Ok(())
+}
+
 // Deterministic single-branch chain helpers: the block at height `h`
 // hashes to `block_hash(h)`.
 
@@ -670,6 +781,16 @@ fn store_with_sweep_cap(path: &Path, cap: u32) -> eyre::Result<PrimaryChainStore
         path,
         ChainStoreOptions {
             retention_sweep_max_heights_per_commit: cap,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    )?)
+}
+
+fn store_with_outpoint_budget(path: &Path, budget: u64) -> eyre::Result<PrimaryChainStore> {
+    Ok(PrimaryChainStore::open(
+        path,
+        ChainStoreOptions {
+            retention_sweep_max_outpoints_per_commit: budget,
             ..ChainStoreOptions::for_local_tests()
         },
     )?)
