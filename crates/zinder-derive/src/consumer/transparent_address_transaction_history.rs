@@ -13,8 +13,8 @@ use zinder_core::wire::{
     encode_in_block_position,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint,
+    BlockHash, BlockHeight, TransactionFactsArtifact, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint,
 };
 use zinder_store::StreamCursorTokenV1;
 
@@ -103,6 +103,35 @@ impl TransparentAddressTransactionHistoryConsumer {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Returns an upper bound on rows this consumer can write for
+    /// `transactions`.
+    ///
+    /// Spend-side rows need canonical spend facts to resolve the spent
+    /// address. Replay uses this bound before those facts are read, so every
+    /// non-coinbase transparent input counts as one possible history row.
+    #[must_use]
+    pub fn projected_row_count_upper_bound_for_transactions(
+        transactions: &[TransactionFactsArtifact],
+    ) -> usize {
+        transactions
+            .iter()
+            .fold(0usize, |projected_rows, transaction| {
+                let receive_rows = transaction.transparent_outputs.len();
+                let spend_rows = transaction
+                    .transparent_inputs
+                    .iter()
+                    .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+                    .count();
+                projected_rows.saturating_add(receive_rows.saturating_add(spend_rows))
+            })
+    }
+
+    /// Returns an upper bound on rows this consumer can write for `block`.
+    #[must_use]
+    pub fn projected_row_count_upper_bound_for_block(block: &BlockCommitContext) -> usize {
+        Self::projected_row_count_upper_bound_for_transactions(&block.transactions)
     }
 
     /// Reads a transparent-address transaction-history page from a derive store.
@@ -807,6 +836,22 @@ mod tests {
         assert_eq!(page.artifacts[0].tx_index_in_block, 1);
         assert_eq!(page.artifacts[1].tx_index_in_block, 0);
         Ok(())
+    }
+
+    #[test]
+    fn projected_row_count_upper_bound_counts_transparent_fanout() {
+        assert_eq!(
+            TransparentAddressTransactionHistoryConsumer::projected_row_count_upper_bound_for_block(
+                &multi_receive_block()
+            ),
+            2
+        );
+        assert_eq!(
+            TransparentAddressTransactionHistoryConsumer::projected_row_count_upper_bound_for_block(
+                &spend_block()
+            ),
+            1
+        );
     }
 }
 

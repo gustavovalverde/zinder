@@ -169,8 +169,7 @@ fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
             123,
             block_height,
             block_hash,
-        ))
-        .with_transparent_address_tx_index(tx_history);
+        ));
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;

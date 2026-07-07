@@ -7,12 +7,12 @@ use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
-    DeriveStore, DeriveStoreOptions, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
-    describe_request_metrics,
+    DeriveStore, DeriveStoreError, DeriveStoreOptions, ExplorerQueryGrpcAdapter,
+    ExplorerServerInfoSettings, describe_request_metrics,
 };
 use zinder_runtime::{
-    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
+    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{ChainStoreOptions, SecondaryChainStore};
@@ -131,8 +131,8 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         }
     };
 
-    let store = match open_derive_store(&explorer_config) {
-        Ok(store) => store,
+    let derive_store = match open_derive_store(&explorer_config) {
+        Ok(derive_store) => derive_store,
         Err(error) => {
             start_api_phase.fail(&error);
             return Err(error);
@@ -142,11 +142,13 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
-    let catchup_handle = spawn_derive_catchup_task(store.clone(), cancel.clone());
+    let derive_catchup_handle = derive_store
+        .clone()
+        .map(|derive_store| spawn_derive_catchup_task(derive_store, cancel.clone()));
     let canonical_catchup_handle =
         spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
 
-    let grpc_adapter = build_grpc_adapter(&explorer_config, canonical_store, store);
+    let grpc_adapter = build_grpc_adapter(&explorer_config, canonical_store, derive_store);
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
@@ -185,6 +187,23 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         "explorer query gRPC server stopped"
     );
 
+    shutdown_background_tasks(
+        ops_handle,
+        upstream_observation_handle,
+        canonical_catchup_handle,
+        derive_catchup_handle,
+    )
+    .await;
+
+    server_result.map_err(ExplorerConfigError::Transport)
+}
+
+async fn shutdown_background_tasks(
+    ops_handle: Option<OpsEndpointHandle>,
+    upstream_observation_handle: Option<JoinHandle<()>>,
+    canonical_catchup_handle: JoinHandle<()>,
+    derive_catchup_handle: Option<JoinHandle<()>>,
+) {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
@@ -192,9 +211,9 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         let _ = handle.await;
     }
     let _ = canonical_catchup_handle.await;
-    let _ = catchup_handle.await;
-
-    server_result.map_err(ExplorerConfigError::Transport)
+    if let Some(handle) = derive_catchup_handle {
+        let _ = handle.await;
+    }
 }
 
 fn spawn_upstream_observation_probe(
@@ -272,7 +291,9 @@ fn open_canonical_store(
     }
 }
 
-fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, ExplorerConfigError> {
+fn open_derive_store(
+    explorer_config: &ExplorerConfig,
+) -> Result<Option<DeriveStore>, ExplorerConfigError> {
     let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage.path);
     let secondary_path = explorer_config.storage.secondary_path.join("derive");
     let open_storage_phase = StartupPhase::OpenStorage.start();
@@ -287,7 +308,17 @@ fn open_derive_store(explorer_config: &ExplorerConfig) -> Result<DeriveStore, Ex
     ) {
         Ok(handle) => {
             open_storage_phase.complete();
-            Ok(handle)
+            Ok(Some(handle))
+        }
+        Err(error @ DeriveStoreError::Open { .. }) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "derive_store_unavailable",
+                error = %error,
+                "derive store unavailable; derive-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            Ok(None)
         }
         Err(error) => {
             let wrapped = ExplorerConfigError::Store(error);
@@ -348,15 +379,18 @@ fn spawn_derive_catchup_task(
 fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     canonical_store: SecondaryChainStore,
-    store: DeriveStore,
+    derive_store: Option<DeriveStore>,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
+    let has_derive_store = derive_store.is_some();
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
         .with_canonical_store(canonical_store)
-        .with_derive_store(store)
-        .with_prevout_resolution_online(true);
+        .with_prevout_resolution_online(has_derive_store);
+    if let Some(derive_store) = derive_store {
+        grpc_adapter = grpc_adapter.with_derive_store(derive_store);
+    }
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }

@@ -1,8 +1,10 @@
 //! Zinder ingestion command-line entry point.
 
 use std::{
+    ffi::OsString,
+    fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -1107,7 +1109,7 @@ fn set_mempool_hydration_lagging(
 
 fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), IngestConfigError> {
     let backup_config = config::load_backup_config(config_path, args.into())?;
-    let store = PrimaryChainStore::open(
+    let canonical_store = PrimaryChainStore::open(
         &backup_config.storage_path,
         ChainStoreOptions {
             rocksdb_resource_budget: backup_config.canonical_rocksdb_budget,
@@ -1116,9 +1118,7 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
     )
     .map_err(IngestError::from)?;
     let started_at = Instant::now();
-    let backup_outcome = store
-        .create_checkpoint(&backup_config.to_path)
-        .map_err(IngestError::from)
+    let backup_outcome = create_backup_checkpoints(&backup_config, &canonical_store)
         .map_err(IngestConfigError::from);
     record_backup_outcome(backup_config.network, started_at, &backup_outcome);
     backup_outcome?;
@@ -1133,6 +1133,59 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
     );
 
     Ok(())
+}
+
+fn create_backup_checkpoints(
+    backup_config: &config::BackupCommandConfig,
+    canonical_store: &PrimaryChainStore,
+) -> Result<(), IngestError> {
+    let derive_storage_path =
+        zinder_derive::DeriveStore::path_for_canonical(&backup_config.storage_path);
+    if !derive_storage_path.exists() {
+        return Err(IngestError::DeriveStoreMissing {
+            path: derive_storage_path,
+        });
+    }
+    let derive_store = zinder_derive::DeriveStore::open(
+        &derive_storage_path,
+        zinder_derive::DeriveStoreOptions {
+            consumers: zinder_derive::DeriveStore::bundled_consumers(),
+            rocksdb_resource_budget: backup_config.derive_rocksdb_budget,
+            ..zinder_derive::DeriveStoreOptions::default()
+        },
+    )?;
+    let derive_checkpoint_staging_path = derive_checkpoint_staging_path(&backup_config.to_path);
+    let derive_checkpoint_path =
+        zinder_derive::DeriveStore::path_for_canonical(&backup_config.to_path);
+
+    if derive_checkpoint_staging_path.exists() {
+        return Err(IngestError::BackupDeriveCheckpointStagingExists {
+            path: derive_checkpoint_staging_path,
+        });
+    }
+    derive_store.create_checkpoint(&derive_checkpoint_staging_path)?;
+    canonical_store.create_checkpoint(&backup_config.to_path)?;
+    fs::rename(&derive_checkpoint_staging_path, &derive_checkpoint_path).map_err(|source| {
+        IngestError::BackupDeriveCheckpointInstall {
+            from_path: derive_checkpoint_staging_path,
+            to_path: derive_checkpoint_path,
+            source,
+        }
+    })?;
+
+    Ok(())
+}
+
+fn derive_checkpoint_staging_path(checkpoint_path: &Path) -> PathBuf {
+    let mut extension = checkpoint_path
+        .extension()
+        .map_or_else(|| OsString::from("derive"), OsString::from);
+    if checkpoint_path.extension().is_some() {
+        extension.push(".derive");
+    }
+    let mut staging_path = checkpoint_path.to_path_buf();
+    staging_path.set_extension(extension);
+    staging_path
 }
 
 fn record_backup_outcome(

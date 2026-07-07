@@ -113,6 +113,10 @@ Implementation rules:
 - Each derive consumer reads typed canonical facts, not raw block bytes.
 - Per-consumer projection may parallelize block work inside one event range,
   but cursor advancement stays serial and atomic.
+- Replay may hydrate one following committed range while dispatching the
+  current range, but cursor writes remain serial and atomic. The hydrate
+  read-ahead is bounded to one pending batch and is disabled under derive
+  memory pressure or dense projected fan-out.
 - A derive failure leaves canonical ingest healthy. Readiness and server-info
   surfaces report derive lag and capability freshness.
 - `zinder-explorer` is a stateless secondary reader. It does not run derive

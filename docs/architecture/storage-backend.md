@@ -176,27 +176,33 @@ Reorg semantics and event vocabulary live in [Chain events](chain-events.md). At
 
 Stores validate schema at open. A store written with an `artifact_schema_version` above `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` returns `StoreError::SchemaTooNew`; a network or layout mismatch returns the matching `SchemaMismatch` or `ChainEpochNetworkMismatch` variant. Both surface as `SchemaMismatch` at the service boundary and fail readiness with `schema_mismatch`. `zinder-query` never mutates canonical storage on schema mismatch; the operator recreates the store from a fresh ingest run or an offline checkpoint.
 
-Schema version 11 is the one exception to the wipe-and-resync posture: a
-version-10 store migrates in place at primary open. The writer rebuilds the
-`address_output_index` projection from `transparent_output` joined with
-`transparent_spend_fact`, drops the old column family, and flips the store
-metadata version only after the rebuild completes, so a crash mid-rebuild
-re-runs it on the next open. Secondary readers cannot replay a column-family
-drop; they must restart after the primary migrates, which the rolling-upgrade
-order in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) already
-requires.
+Store metadata migrations for versions 10 and 11 are limited exceptions to the
+wipe-and-resync posture and run in place at primary open.
+The version-10 path rebuilds the `address_output_index` projection from
+`transparent_output` joined with `transparent_spend_fact`; both paths drop the
+removed `transparent_address_tx_index` column family before flipping the store
+metadata version. A crash mid-migration re-runs the migration on the next open.
+Secondary readers cannot replay a column-family drop; they must restart after
+the primary migrates, which the rolling-upgrade order in
+[ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) already requires.
 
-Schema version 12 adds the Ironwood (NU6.3) shielded pool to `tip_metadata` and
-to each compact block's payload. A version-11 store carries neither and cannot
-be repaired in place, because the omitted Ironwood action data was never derived
-from the source block; it is rejected at open with `StoreError::SchemaTooOld` and
-must be rebuilt from genesis. The version-10 in-place rebuild still runs, but it
-produces a version-11 projection, so a version-10 store is rejected by the same
-guard and rebuilt from genesis too.
+Artifact schema version 12 adds the Ironwood (NU6.3) shielded pool to
+`tip_metadata` and to each compact block's payload. A version-11 artifact store
+carries neither and cannot be repaired in place, because the omitted Ironwood
+action data was never derived from the source block; it is rejected at open with
+`StoreError::SchemaTooOld` and must be rebuilt from genesis. The store metadata
+migrations above can normalize the RocksDB layout, but they cannot upgrade
+pre-Ironwood artifact payloads.
+
+Store schema version 12 removes the canonical `transparent_address_tx_index`
+column family. Transparent-address transaction history is a derive-plane
+projection over canonical transaction, output, and spend facts; the shared
+`TransparentAddressTxIndexArtifact` row type remains the wallet/query response
+shape, but canonical ingest no longer writes or serves that projection.
 
 ## Checkpoints and Backups
 
-RocksDB checkpoints are used for backups (`zinder-ingest backup --to <path>`), fixture capture, offline repair, and immutable analytics replicas. Restore is "stop, replace, start" (operator procedure, no online restore in v1).
+RocksDB checkpoints are used for backups (`zinder-ingest backup --to <path>`), fixture capture, offline repair, and immutable analytics replicas. The backup command checkpoints the canonical store and the bundled derive store together, installing the derive checkpoint under the canonical checkpoint's `derive` subdirectory. Restore is "stop, replace, start" (operator procedure, no online restore in v1).
 
 Checkpoint readers must open a documented manifest and validate store identity, network, schema versions, and visible epoch before serving data. They serve frozen snapshots; production read replicas instead open the live store as RocksDB-secondary per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and replay the writer's WAL.
 

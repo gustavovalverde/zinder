@@ -127,9 +127,9 @@ Append the capability string to `ZINDER_CAPABILITIES`. Format: `domain.subdomain
 | `wallet.events.*` | Streaming event families (chain, mempool) |
 | `wallet.snapshot.*` | Bounded snapshot reads |
 | `wallet.broadcast.*` | Write paths |
-| `derive.{consumer}.*` | Federated derive-plane methods (one consumer per namespace) |
+| `<product>.<noun>.*` | Federated explorer/analytics-plane methods (one product namespace per public surface) |
 
-Wallet-plane RPCs own `wallet.*`; derive-backed methods own `derive.*`. Mixing namespaces fails capability-coverage tests.
+Wallet-plane RPCs own `wallet.*`; derive-backed product methods own their product namespace, for example `explorer.*`. Mixing namespaces fails capability-coverage tests.
 
 ### Step 10 — Capability-coverage row
 
@@ -322,7 +322,7 @@ Each entry references the discipline gate that catches it.
 
 - **Adding a public method without a capability string.** Fails capability-coverage; capability_docs both. Add the string in the same commit.
 - **Adding a capability string without updating the docs mirrors.** Fails capability_docs. Update `public-interfaces.md` and `runbooks/testing.md`.
-- **Putting a federated method under `wallet.*` instead of `derive.{consumer}.*`.** Fails capability-coverage assertions.
+- **Putting a federated method under `wallet.*` instead of the owning product namespace.** Fails capability-coverage assertions.
 - **Computing `confirmations` or `block_time` from a re-read latest tip.** Violates the response enrichment rule. Use `MinedDetails::from_response_epoch` or analogous epoch-bound constructor.
 - **Returning a `tonic::Status` or `zinder_proto::*` type from `ChainIndex`.** Violates the rule that the trait takes / returns only `zinder-core` types. Add a `from_status` mapping at the adapter boundary.
 

@@ -198,6 +198,9 @@ pub(crate) fn decide_recovery(
         | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::DeriveDispatch(_)
         | IngestError::DeriveStore(_)
+        | IngestError::DeriveStoreMissing { .. }
+        | IngestError::BackupDeriveCheckpointStagingExists { .. }
+        | IngestError::BackupDeriveCheckpointInstall { .. }
         | IngestError::SpendProjectionBehindRetentionSweep { .. } => SourceRecoveryDecision::Exit,
     }
 }

@@ -40,9 +40,9 @@ The services must not share:
 
 `zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections and runs the derive tailer over retained canonical events. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
 
-`zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
+`zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They also open the bundled derive store as a secondary when serving derive-backed wallet reads such as transparent-address transaction history. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
 
-`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary and serves explorer reads from that snapshot. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary when it is available and serves explorer reads from that snapshot. If the derive store is absent, the explorer process still starts and advertises only capabilities that do not require derive storage. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
 
 ## Development Profile
 
@@ -69,7 +69,9 @@ zinder-ingest              -> canonical RocksDB (primary)
 zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
                            -> replica lag via ingest_control.addr
                            -> proxy subscriptions to the private ingest-control endpoint
-zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
+zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path)
+                           -> derive RocksDB (secondary, secondary_path/derive)
+                           -> WalletQueryApi
                            -> replica lag via ingest_control.addr
                            -> proxy only subscription-like RPCs present in CompactTxStreamer
                            -> CompactTxStreamer
@@ -81,8 +83,9 @@ Extended production deployment (adds derived plane):
 zinder-ingest              -> canonical RocksDB (primary)
                            -> derive RocksDB (primary, nested under canonical storage path)
 zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
-zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi -> CompactTxStreamer
-zinder-explorer            -> derive RocksDB (secondary, unique secondary_path) -> ExplorerQuery
+zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path)
+                           -> derive RocksDB (secondary, secondary_path/derive) -> WalletQueryApi -> CompactTxStreamer
+zinder-explorer            -> derive RocksDB (secondary when available, secondary_path/derive) -> ExplorerQuery
 ```
 
 Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).

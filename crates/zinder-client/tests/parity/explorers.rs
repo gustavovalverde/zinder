@@ -78,9 +78,7 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         transaction_id,
         block_hash,
     );
-    let chain_fixture = base_fixture
-        .with_address_output_index(utxo.clone())
-        .with_transparent_address_tx_index(tx_history);
+    let chain_fixture = base_fixture.with_address_output_index(utxo.clone());
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;

@@ -29,13 +29,14 @@ use crate::{
 };
 
 use super::{
-    REBUILDABLE_STORE_SCHEMA_VERSION, REBUILT_ARTIFACT_SCHEMA_VERSION, STORE_SCHEMA_VERSION,
-    address_output_row, decode_store_metadata, encode_store_metadata, read_chain_epoch,
-    read_current_chain_epoch_id, transparent_retention_deleted_through_height_put,
-    transparent_retention_swept_height_put,
+    ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION, REBUILT_ARTIFACT_SCHEMA_VERSION,
+    STORE_SCHEMA_VERSION, TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION, address_output_row,
+    decode_store_metadata, encode_store_metadata, read_chain_epoch, read_current_chain_epoch_id,
+    transparent_retention_deleted_through_height_put, transparent_retention_swept_height_put,
 };
 
 const REBUILD_WRITE_CHUNK_ROWS: usize = 4096;
+const TRANSPARENT_ADDRESS_TX_INDEX_COLUMN_FAMILY: &str = "transparent_address_tx_index";
 
 pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<(), StoreError> {
     let key = StoreKey::store_metadata();
@@ -43,17 +44,20 @@ pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<()
         return Ok(());
     };
     let metadata = decode_store_metadata(&key, &metadata_bytes)?;
-    if metadata.schema_version == STORE_SCHEMA_VERSION {
-        return Ok(());
-    }
-    if metadata.schema_version != REBUILDABLE_STORE_SCHEMA_VERSION {
-        return Err(StoreError::SchemaMismatch {
+    match metadata.schema_version {
+        STORE_SCHEMA_VERSION => Ok(()),
+        ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION => {
+            drop_transparent_address_tx_index_column_family(inner)?;
+            rebuild_address_output_projection(inner, metadata.network)
+        }
+        TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION => {
+            migrate_transparent_address_tx_index_column_family(inner, metadata.network)
+        }
+        _ => Err(StoreError::SchemaMismatch {
             persisted_version: metadata.schema_version,
             expected_version: STORE_SCHEMA_VERSION,
-        });
+        }),
     }
-
-    rebuild_address_output_projection(inner, metadata.network)
 }
 
 fn rebuild_address_output_projection(
@@ -72,7 +76,7 @@ fn rebuild_address_output_projection(
     tracing::info!(
         target: "zinder::store",
         event = "address_output_projection_rebuild_started",
-        from_schema_version = REBUILDABLE_STORE_SCHEMA_VERSION,
+        from_schema_version = ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION,
         to_schema_version = STORE_SCHEMA_VERSION,
         safe_tip_height = safe_tip_height.value(),
         "rebuilding the address-output projection in place"
@@ -101,6 +105,43 @@ fn rebuild_address_output_projection(
     );
 
     Ok(())
+}
+
+fn migrate_transparent_address_tx_index_column_family(
+    inner: &RocksChainStore,
+    network: Network,
+) -> Result<(), StoreError> {
+    let started_at = Instant::now();
+    let _control_guard = inner.lock_control();
+    tracing::info!(
+        target: "zinder::store",
+        event = "transparent_address_tx_index_column_family_drop_started",
+        from_schema_version = TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION,
+        to_schema_version = STORE_SCHEMA_VERSION,
+        "dropping the canonical transparent-address tx-history column family"
+    );
+
+    drop_transparent_address_tx_index_column_family(inner)?;
+    inner.write(vec![StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::store_metadata(),
+        value: encode_store_metadata(network),
+    }])?;
+
+    tracing::info!(
+        target: "zinder::store",
+        event = "transparent_address_tx_index_column_family_drop_completed",
+        duration_seconds = started_at.elapsed().as_secs_f64(),
+        "canonical transparent-address tx-history column family dropped"
+    );
+
+    Ok(())
+}
+
+fn drop_transparent_address_tx_index_column_family(
+    inner: &RocksChainStore,
+) -> Result<(), StoreError> {
+    inner.drop_column_family(TRANSPARENT_ADDRESS_TX_INDEX_COLUMN_FAMILY)
 }
 
 struct ProjectionRebuild {
@@ -392,7 +433,7 @@ mod tests {
                 table: StorageTable::StorageControl,
                 key: StoreKey::store_metadata(),
                 value: encode_store_metadata_with_version(
-                    REBUILDABLE_STORE_SCHEMA_VERSION,
+                    ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION,
                     NETWORK,
                 ),
             }])?;
@@ -425,7 +466,10 @@ mod tests {
         puts.push(StoragePut {
             table: StorageTable::StorageControl,
             key: StoreKey::store_metadata(),
-            value: encode_store_metadata_with_version(REBUILDABLE_STORE_SCHEMA_VERSION, NETWORK),
+            value: encode_store_metadata_with_version(
+                ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION,
+                NETWORK,
+            ),
         });
         store.store.inner.write(puts)
     }

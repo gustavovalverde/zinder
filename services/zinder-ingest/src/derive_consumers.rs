@@ -6,9 +6,10 @@
 //! Consumer writes and cursor advances land in one derive-store write batch
 //! per chain epoch.
 //!
-//! Reader processes (`zinder-explorer`) open the same derive store path in
-//! secondary mode (per [`zinder_derive::DeriveStore::open_secondary`]) and
-//! advance their view via [`zinder_derive::DeriveStore::try_catch_up`].
+//! Reader processes (`zinder-query`, `zinder-compat-lightwalletd`, and
+//! `zinder-explorer`) open the same derive store path in secondary mode (per
+//! [`zinder_derive::DeriveStore::open_secondary`]) and advance their view via
+//! [`zinder_derive::DeriveStore::try_catch_up`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -74,6 +75,20 @@ const DERIVE_STATUS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 /// lags by this interval only defers a sweep, which the design tolerates.
 const RETENTION_RELEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Internal cap on variable fan-out rows one derive replay chunk should stage.
+///
+/// `replay_batch_blocks` bounds block count, but `recent_transactions` and
+/// `transparent_address_transaction_history` scale with transaction/address
+/// fan-out. This cap keeps one derive write batch from growing with a dense
+/// multi-block event. A single dense block is still admitted because replay
+/// cannot split below the block boundary.
+const DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK: usize = 50_000;
+
+/// Read-ahead keeps at most one extra hydrated batch in memory, and only when
+/// the current batch is comfortably below the projection-row cap.
+const DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS: usize =
+    DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK / 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeriveReplayBudgetState {
     Normal,
@@ -101,6 +116,57 @@ struct EffectiveDeriveReplayLimits {
     batch_blocks: u32,
     memory_budget_bytes: Option<u64>,
     memory_pressure_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DeriveReplayProjectionRows {
+    recent_transactions: usize,
+    transparent_address_transaction_history: usize,
+}
+
+impl DeriveReplayProjectionRows {
+    const fn is_empty(self) -> bool {
+        self.recent_transactions == 0 && self.transparent_address_transaction_history == 0
+    }
+
+    const fn total(self) -> usize {
+        self.recent_transactions
+            .saturating_add(self.transparent_address_transaction_history)
+    }
+
+    const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            recent_transactions: self
+                .recent_transactions
+                .saturating_add(other.recent_transactions),
+            transparent_address_transaction_history: self
+                .transparent_address_transaction_history
+                .saturating_add(other.transparent_address_transaction_history),
+        }
+    }
+}
+
+fn projection_rows_for_transactions(
+    transactions: &[TransactionFactsArtifact],
+) -> DeriveReplayProjectionRows {
+    DeriveReplayProjectionRows {
+        recent_transactions: RecentTransactionsConsumer::projected_row_count_for_transactions(
+            transactions,
+        ),
+        transparent_address_transaction_history:
+            TransparentAddressTransactionHistoryConsumer::projected_row_count_upper_bound_for_transactions(
+                transactions,
+            ),
+    }
+}
+
+fn should_start_new_projection_chunk(
+    current_rows: DeriveReplayProjectionRows,
+    next_block_rows: DeriveReplayProjectionRows,
+) -> bool {
+    !current_rows.is_empty()
+        && current_rows.saturating_add(next_block_rows).total()
+            > DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -624,6 +690,51 @@ fn replay_empty_committed_event(
     Ok(envelope.cursor)
 }
 
+fn spawn_hydrate_committed_block_replay_batch(
+    chain_store: &PrimaryChainStore,
+    envelope: &ChainEventEnvelope,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    effective_limits: EffectiveDeriveReplayLimits,
+) -> JoinHandle<Result<CanonicalReplayBatch, IngestError>> {
+    let chain_store = chain_store.clone();
+    let envelope = envelope.clone();
+    tokio::task::spawn_blocking(move || {
+        let hydrate_started_at = Instant::now();
+        let replay_blocks_outcome = hydrate_committed_block_replay_batch(
+            &chain_store,
+            &envelope,
+            start_height,
+            end_height,
+            effective_limits,
+        );
+        record_derive_replay_stage(
+            DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS,
+            hydrate_started_at,
+            &replay_blocks_outcome,
+        );
+        replay_blocks_outcome
+    })
+}
+
+async fn await_hydrated_replay_batch(
+    handle: JoinHandle<Result<CanonicalReplayBatch, IngestError>>,
+) -> Result<CanonicalReplayBatch, IngestError> {
+    handle
+        .await
+        .map_err(|join_error| IngestError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        })?
+}
+
+fn should_read_ahead_derive_replay(
+    effective_limits: EffectiveDeriveReplayLimits,
+    projection_rows: DeriveReplayProjectionRows,
+) -> bool {
+    effective_limits.state == DeriveReplayBudgetState::Normal
+        && projection_rows.total() <= DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS
+}
+
 async fn replay_committed_event_to_derive_in_batches(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
@@ -633,54 +744,53 @@ async fn replay_committed_event_to_derive_in_batches(
 ) -> Result<DeriveReplayProgress, IngestError> {
     let block_count = block_height_range_len(committed_range);
     let mut next_height = committed_range.start;
+    let mut pending_replay_batch: Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>> =
+        None;
     while next_height <= committed_range.end {
         catch_up_event_only_chain_event_consumers_to_canonical(chain_store, derive_store)?;
         let effective_limits = evaluate_and_record_replay_budget(replay_budget);
         if effective_limits.state.is_paused() {
+            abort_pending_replay_batch(&mut pending_replay_batch);
             return Ok(DeriveReplayProgress::Yielded);
         }
 
-        let hydrate_started_at = Instant::now();
-        let replay_blocks_outcome = hydrate_committed_block_replay_batch(
-            chain_store,
-            &envelope,
-            next_height,
-            committed_range.end,
-            effective_limits,
-        );
-        record_derive_replay_stage(
-            DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS,
-            hydrate_started_at,
-            &replay_blocks_outcome,
-        );
-        let replay_batch = match replay_blocks_outcome {
-            Ok(replay_batch) => replay_batch,
-            Err(error) => {
-                record_derive_replay_event(block_count, Some(&error));
-                return Err(error);
-            }
-        };
+        let replay_batch_handle = pending_replay_batch.take().unwrap_or_else(|| {
+            spawn_hydrate_committed_block_replay_batch(
+                chain_store,
+                &envelope,
+                next_height,
+                committed_range.end,
+                effective_limits,
+            )
+        });
+        let replay_batch =
+            await_expected_replay_batch(replay_batch_handle, next_height, block_count).await?;
 
         let replay_range = replay_batch.block_range;
         let final_chunk = replay_range.end >= committed_range.end;
         let finalized = replay_range.end <= envelope.safe_tip_height;
         let chunk_event = committed_chain_event_chunk(&envelope.event, replay_range);
-        let resolve_started_at = Instant::now();
-        let contexts_outcome = build_block_contexts_from_committed_event(
+        let following_height = replay_range.end.next().ok_or_else(|| {
+            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
+        })?;
+        pending_replay_batch = maybe_spawn_read_ahead_replay_batch(ReadAheadReplayBatchInputs {
             chain_store,
-            envelope.chain_epoch.id,
-            replay_batch.blocks,
-            finalized,
-        )
-        .await;
-        record_derive_replay_stage(
-            DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS,
-            resolve_started_at,
-            &contexts_outcome,
-        );
+            replay_budget,
+            envelope: &envelope,
+            projection_rows: replay_batch.projection_rows,
+            following_height,
+            committed_end: committed_range.end,
+            final_chunk,
+            effective_limits,
+        });
+
+        let contexts_outcome =
+            build_contexts_for_replay_batch(chain_store, &envelope, replay_batch.blocks, finalized)
+                .await;
         let contexts = match contexts_outcome {
             Ok(contexts) => contexts,
             Err(error) => {
+                abort_pending_replay_batch(&mut pending_replay_batch);
                 record_derive_replay_event(block_count, Some(&error));
                 return Err(error);
             }
@@ -701,18 +811,102 @@ async fn replay_committed_event_to_derive_in_batches(
             &dispatch_outcome,
         );
         if let Err(error) = dispatch_outcome {
+            abort_pending_replay_batch(&mut pending_replay_batch);
             record_derive_replay_event(block_count, Some(&error));
             return Err(error);
         }
 
-        next_height = replay_range.end.next().ok_or_else(|| {
-            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
-        })?;
+        next_height = following_height;
     }
 
     record_derive_replay_event(block_count, None);
     record_committed_replay_progress(chain_store, committed_range.end)?;
     Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+}
+
+fn abort_pending_replay_batch(
+    pending_replay_batch: &mut Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>>,
+) {
+    if let Some(handle) = pending_replay_batch.take() {
+        handle.abort();
+    }
+}
+
+async fn await_expected_replay_batch(
+    replay_batch_handle: JoinHandle<Result<CanonicalReplayBatch, IngestError>>,
+    expected_start: BlockHeight,
+    block_count: usize,
+) -> Result<CanonicalReplayBatch, IngestError> {
+    let replay_batch = match await_hydrated_replay_batch(replay_batch_handle).await {
+        Ok(replay_batch) => replay_batch,
+        Err(error) => {
+            record_derive_replay_event(block_count, Some(&error));
+            return Err(error);
+        }
+    };
+    let replay_range = replay_batch.block_range;
+    if replay_range.start == expected_start {
+        return Ok(replay_batch);
+    }
+
+    let error = IngestError::DeriveDispatch(format!(
+        "derive replay read-ahead returned height {} while replay expected {}",
+        replay_range.start.value(),
+        expected_start.value()
+    ));
+    record_derive_replay_event(block_count, Some(&error));
+    Err(error)
+}
+
+fn maybe_spawn_read_ahead_replay_batch(
+    inputs: ReadAheadReplayBatchInputs<'_>,
+) -> Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>> {
+    let ReadAheadReplayBatchInputs {
+        chain_store,
+        replay_budget,
+        envelope,
+        projection_rows,
+        following_height,
+        committed_end,
+        final_chunk,
+        effective_limits,
+    } = inputs;
+    if final_chunk || !should_read_ahead_derive_replay(effective_limits, projection_rows) {
+        return None;
+    }
+    let read_ahead_limits = evaluate_and_record_replay_budget(replay_budget);
+    if read_ahead_limits.state.is_paused() {
+        return None;
+    }
+    Some(spawn_hydrate_committed_block_replay_batch(
+        chain_store,
+        envelope,
+        following_height,
+        committed_end,
+        read_ahead_limits,
+    ))
+}
+
+async fn build_contexts_for_replay_batch(
+    chain_store: &PrimaryChainStore,
+    envelope: &ChainEventEnvelope,
+    replay_blocks: Vec<CanonicalReplayBlock>,
+    finalized: bool,
+) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
+    let resolve_started_at = Instant::now();
+    let contexts_outcome = build_block_contexts_from_committed_event(
+        chain_store,
+        envelope.chain_epoch.id,
+        replay_blocks,
+        finalized,
+    )
+    .await;
+    record_derive_replay_stage(
+        DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS,
+        resolve_started_at,
+        &contexts_outcome,
+    );
+    contexts_outcome
 }
 
 fn evaluate_and_record_replay_budget(
@@ -1037,6 +1231,7 @@ fn hydrate_committed_block_replay_batch(
 
     // Phase 3: assemble each block's ordered transactions from the shared map.
     let mut replay_blocks = Vec::with_capacity(staged.len());
+    let mut projection_rows = DeriveReplayProjectionRows::default();
     for staged_block in staged {
         let mut transactions = Vec::with_capacity(staged_block.transaction_ids.len());
         for transaction_id in staged_block.transaction_ids {
@@ -1049,6 +1244,11 @@ fn hydrate_committed_block_replay_batch(
             };
             transactions.push(transaction);
         }
+        let block_projection_rows = projection_rows_for_transactions(&transactions);
+        if should_start_new_projection_chunk(projection_rows, block_projection_rows) {
+            break;
+        }
+        projection_rows = projection_rows.saturating_add(block_projection_rows);
         let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
         replay_blocks.push(CanonicalReplayBlock {
             height: staged_block.height,
@@ -1072,6 +1272,7 @@ fn hydrate_committed_block_replay_batch(
     Ok(CanonicalReplayBatch {
         block_range: BlockHeightRange::inclusive(first.height, last.height),
         blocks: replay_blocks,
+        projection_rows,
     })
 }
 
@@ -1288,6 +1489,18 @@ struct CanonicalReplayBlock {
 struct CanonicalReplayBatch {
     block_range: BlockHeightRange,
     blocks: Vec<CanonicalReplayBlock>,
+    projection_rows: DeriveReplayProjectionRows,
+}
+
+struct ReadAheadReplayBatchInputs<'event> {
+    chain_store: &'event PrimaryChainStore,
+    replay_budget: &'event mut DeriveReplayBudget,
+    envelope: &'event ChainEventEnvelope,
+    projection_rows: DeriveReplayProjectionRows,
+    following_height: BlockHeight,
+    committed_end: BlockHeight,
+    final_chunk: bool,
+    effective_limits: EffectiveDeriveReplayLimits,
 }
 
 fn transparent_spent_outpoints_for_transactions(
@@ -1737,5 +1950,67 @@ mod tests {
         assert_eq!(limits.memory_pressure_ratio, Some(0.875));
         assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(limits.batch_blocks, 50);
+    }
+
+    #[test]
+    fn projection_row_cap_keeps_at_least_one_block_per_chunk() {
+        let oversized_block_rows = DeriveReplayProjectionRows {
+            recent_transactions: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+                .saturating_add(1),
+            transparent_address_transaction_history: 0,
+        };
+
+        assert!(!should_start_new_projection_chunk(
+            DeriveReplayProjectionRows::default(),
+            oversized_block_rows,
+        ));
+    }
+
+    #[test]
+    fn projection_row_cap_closes_chunk_before_next_block_exceeds_limit() {
+        let current_rows = DeriveReplayProjectionRows {
+            recent_transactions: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+                .saturating_sub(1),
+            transparent_address_transaction_history: 0,
+        };
+        let next_block_rows = DeriveReplayProjectionRows {
+            recent_transactions: 2,
+            transparent_address_transaction_history: 0,
+        };
+
+        assert!(should_start_new_projection_chunk(
+            current_rows,
+            next_block_rows,
+        ));
+    }
+
+    #[test]
+    fn read_ahead_only_runs_for_normal_small_projection_batches() {
+        let normal_limits = EffectiveDeriveReplayLimits {
+            state: DeriveReplayBudgetState::Normal,
+            batch_blocks: 100,
+            memory_budget_bytes: None,
+            memory_pressure_ratio: None,
+        };
+        let degraded_limits = EffectiveDeriveReplayLimits {
+            state: DeriveReplayBudgetState::Degraded,
+            ..normal_limits
+        };
+        let small_rows = DeriveReplayProjectionRows {
+            recent_transactions: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS,
+            transparent_address_transaction_history: 0,
+        };
+        let dense_rows = DeriveReplayProjectionRows {
+            recent_transactions: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS
+                .saturating_add(1),
+            transparent_address_transaction_history: 0,
+        };
+
+        assert!(should_read_ahead_derive_replay(normal_limits, small_rows));
+        assert!(!should_read_ahead_derive_replay(normal_limits, dense_rows));
+        assert!(!should_read_ahead_derive_replay(
+            degraded_limits,
+            small_rows
+        ));
     }
 }

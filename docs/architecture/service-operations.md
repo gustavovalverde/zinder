@@ -521,8 +521,9 @@ token through `tokio::select!` instead of polling a boolean flag.
 
 `zinder-ingest backup --to <path>` uses `[network]` and `[storage]` plus a
 subcommand-specific `[backup] to_path` field when invoked through config. It
-opens the store as `PrimaryChainStore` and creates a RocksDB checkpoint; it
-does not connect to the upstream node.
+opens the canonical store as `PrimaryChainStore`, opens the bundled derive
+store as primary, and creates RocksDB checkpoints for both stores; it does not
+connect to the upstream node.
 
 ## Recovery
 

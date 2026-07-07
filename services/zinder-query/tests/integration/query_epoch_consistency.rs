@@ -306,11 +306,4 @@ impl ChainEpochReadApi for CommitAfterReaderReadApi {
     ) -> Result<zinder_store::AddressOutputIndexPage, StoreError> {
         self.store.address_output_index_page(request)
     }
-
-    fn transparent_address_tx_index_page(
-        &self,
-        request: zinder_store::TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<zinder_store::TransparentAddressTxIndexPage, StoreError> {
-        self.store.transparent_address_tx_index_page(request)
-    }
 }

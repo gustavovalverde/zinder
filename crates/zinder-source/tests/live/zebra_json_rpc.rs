@@ -5,8 +5,8 @@
 
 use eyre::{Result, eyre};
 use zinder_core::{
-    BlockHeight, ChainTipMetadata, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    BlockHeight, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceBackend,
@@ -17,7 +17,7 @@ use zinder_testkit::live::{init, require_live, require_live_for, require_live_ma
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn fetch_chain_checkpoint_at_tip_returns_zero_tree_sizes_on_regtest() -> Result<()> {
+async fn fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
@@ -28,9 +28,12 @@ async fn fetch_chain_checkpoint_at_tip_returns_zero_tree_sizes_on_regtest() -> R
 
     assert_eq!(checkpoint.height, tip);
     assert_eq!(
-        checkpoint.tip_metadata,
-        ChainTipMetadata::new(0, 0, 0),
-        "regtest blocks have no shielded payload; checkpoint tree sizes should be zero"
+        checkpoint.tip_metadata.sapling_commitment_tree_size, 0,
+        "coinbase-only regtest blocks should not advance the sapling tree"
+    );
+    assert_eq!(
+        checkpoint.tip_metadata.orchard_commitment_tree_size, 0,
+        "coinbase-only regtest blocks should not advance the orchard tree"
     );
     Ok(())
 }

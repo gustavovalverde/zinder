@@ -51,8 +51,6 @@ pub enum ArtifactFamily {
     TransparentOutput,
     /// Resolved transparent spend fact.
     TransparentSpendFact,
-    /// Transparent address tx-history index artifact.
-    TransparentAddressTxIndex,
     /// Best-chain block-hash to height index entry.
     BlockHashIndex,
     /// Mempool event envelope.
@@ -85,7 +83,6 @@ impl ArtifactFamily {
             Self::AddressOutputIndex => family::ADDRESS_OUTPUT_INDEX,
             Self::TransparentOutput => family::TRANSPARENT_OUTPUT,
             Self::TransparentSpendFact => family::TRANSPARENT_SPEND_FACT,
-            Self::TransparentAddressTxIndex => family::TRANSPARENT_ADDRESS_TX_INDEX,
             Self::BlockHashIndex => family::BLOCK_HASH_INDEX,
             Self::MempoolEvent => family::MEMPOOL_EVENT,
         }

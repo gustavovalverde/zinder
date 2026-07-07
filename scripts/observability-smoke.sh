@@ -44,11 +44,12 @@ RESTORE_QUERY_OPS_ADDR="${ZINDER_OBSERVABILITY_RESTORE_QUERY_OPS_ADDR:-0.0.0.0:9
 BULK_CATCHUP_BLOCKS="${ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS:-50}"
 CANONICAL_BATCH_MAX_BLOCKS="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS:-25}"
 CANONICAL_BATCH_MAX_ARTIFACT_BYTES="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_ARTIFACT_BYTES:-536870912}"
+CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE:-${CANONICAL_BATCH_MAX_BLOCKS}}"
 SOURCE_SEGMENT_MAX_BLOCKS="${ZINDER_OBSERVABILITY_SOURCE_SEGMENT_MAX_BLOCKS:-16}"
 SOURCE_SEGMENT_TARGET_RESPONSE_BYTES="${ZINDER_OBSERVABILITY_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES:-33554432}"
 SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS="${ZINDER_OBSERVABILITY_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS:-12}"
 SOURCE_FETCH_MAX_IN_FLIGHT_BYTES="${ZINDER_OBSERVABILITY_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES:-402653184}"
-FACT_BUILD_CONCURRENCY="${ZINDER_OBSERVABILITY_FACT_BUILD_CONCURRENCY:-16}"
+BLOCK_PREPARE_CONCURRENCY="${ZINDER_OBSERVABILITY_BLOCK_PREPARE_CONCURRENCY:-16}"
 TIP_FOLLOW_POLL_INTERVAL_MS="${ZINDER_OBSERVABILITY_TIP_FOLLOW_POLL_INTERVAL_MS:-1000}"
 GENERATE_BLOCKS="${ZINDER_OBSERVABILITY_GENERATE_BLOCKS:-1}"
 RESET_WORK_DIR="${ZINDER_OBSERVABILITY_RESET:-1}"
@@ -270,10 +271,9 @@ write_configs() {
 name = "${network}"
 
 [node]
-source = "zebra-json-rpc"
 json_rpc_addr = "${node_addr}"
 request_timeout_secs = 30
-max_response_bytes = 16777216
+max_response_bytes = 67108864
 
 [node.auth]
 method = "basic"
@@ -290,11 +290,12 @@ reorg_window_blocks = 100
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = ${CANONICAL_BATCH_MAX_BLOCKS}
 canonical_batch_max_artifact_bytes = ${CANONICAL_BATCH_MAX_ARTIFACT_BYTES}
+canonical_batch_min_blocks_before_estimated_write_close = ${CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE}
 source_segment_max_blocks = ${SOURCE_SEGMENT_MAX_BLOCKS}
 source_segment_target_response_bytes = ${SOURCE_SEGMENT_TARGET_RESPONSE_BYTES}
 source_fetch_max_in_flight_requests = ${SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS}
 source_fetch_max_in_flight_bytes = ${SOURCE_FETCH_MAX_IN_FLIGHT_BYTES}
-fact_build_concurrency = ${FACT_BUILD_CONCURRENCY}
+block_prepare_concurrency = ${BLOCK_PREPARE_CONCURRENCY}
 
 [ingest.tip_follow]
 poll_interval_ms = ${TIP_FOLLOW_POLL_INTERVAL_MS}
@@ -306,6 +307,12 @@ allow_near_tip_finalize = true
 
 [ingest_control]
 listen_addr = "${INGEST_CONTROL_ADDR}"
+
+[ops]
+listen_addr = ""
+
+[security]
+allow_public_bind = true
 EOF
 
   cat >"$QUERY_CONFIG" <<EOF
@@ -317,10 +324,15 @@ path = "${storage_path}"
 secondary_path = "${query_secondary_path}"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
-ingest_control_addr = "http://${INGEST_CONTROL_ADDR}"
+
+[ingest_control]
+addr = "http://${INGEST_CONTROL_ADDR}"
 
 [query]
 listen_addr = "${QUERY_GRPC_ADDR}"
+
+[ops]
+listen_addr = ""
 
 [node]
 json_rpc_addr = "${node_addr}"
@@ -331,6 +343,9 @@ max_response_bytes = 67108864
 method = "basic"
 username = "${node_username}"
 password = "${node_password}"
+
+[security]
+allow_public_bind = true
 EOF
 
   cat >"$COMPAT_CONFIG" <<EOF
@@ -342,10 +357,15 @@ path = "${storage_path}"
 secondary_path = "${compat_secondary_path}"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
-ingest_control_addr = "http://${INGEST_CONTROL_ADDR}"
+
+[ingest_control]
+addr = "http://${INGEST_CONTROL_ADDR}"
 
 [compat]
 listen_addr = "${COMPAT_GRPC_ADDR}"
+
+[ops]
+listen_addr = ""
 
 [node]
 json_rpc_addr = "${node_addr}"
@@ -356,6 +376,9 @@ max_response_bytes = 16777216
 method = "basic"
 username = "${node_username}"
 password = "${node_password}"
+
+[security]
+allow_public_bind = true
 EOF
 
   write_grpc_health_proto
@@ -389,10 +412,13 @@ EOF
 }
 
 write_restore_query_config() {
-  local restored_storage_path restore_secondary_path network
+  local restored_storage_path restore_secondary_path network node_addr node_username node_password
   restored_storage_path="$(toml_escape "$1")"
   restore_secondary_path="$(toml_escape "${WORK_DIR}/restore-query-secondary")"
   network="$(toml_escape "$NETWORK")"
+  node_addr="$(toml_escape "$NODE_ADDR")"
+  node_username="$(toml_escape "$NODE_AUTH_USERNAME")"
+  node_password="$(toml_escape "$NODE_AUTH_PASSWORD")"
 
   cat >"$RESTORE_QUERY_CONFIG" <<EOF
 [network]
@@ -403,10 +429,28 @@ path = "${restored_storage_path}"
 secondary_path = "${restore_secondary_path}"
 secondary_catchup_interval_ms = 250
 secondary_replica_lag_threshold_chain_epochs = 4
-ingest_control_addr = "http://${INGEST_CONTROL_ADDR}"
+
+[ingest_control]
+addr = "http://${INGEST_CONTROL_ADDR}"
 
 [query]
 listen_addr = "${RESTORE_QUERY_GRPC_ADDR}"
+
+[ops]
+listen_addr = ""
+
+[node]
+json_rpc_addr = "${node_addr}"
+request_timeout_secs = 30
+max_response_bytes = 67108864
+
+[node.auth]
+method = "basic"
+username = "${node_username}"
+password = "${node_password}"
+
+[security]
+allow_public_bind = true
 EOF
 }
 
@@ -742,9 +786,9 @@ generate_traffic() {
   run_grpc_call native-compact-block \
     wallet_grpc "{\"height\":${TARGET_TIP_HEIGHT}}" zinder.v1.wallet.WalletQuery/CompactBlock
   run_grpc_call native-compact-block-range \
-    wallet_grpc "{\"startHeight\":${range_start},\"endHeight\":${range_end}}" zinder.v1.wallet.WalletQuery/CompactBlockRange
+    wallet_grpc "{\"startHeight\":${range_start},\"endHeight\":${range_end}}" zinder.v1.wallet.WalletQuery/CompactBlocksInRange
   run_grpc_call native-latest-tree-state \
-    wallet_grpc '{}' zinder.v1.wallet.WalletQuery/LatestTreeState
+    wallet_grpc '{}' zinder.v1.wallet.WalletQuery/LatestTreeStateCheckpoint
   run_grpc_call native-server-info \
     wallet_grpc '{}' zinder.v1.wallet.WalletQuery/ServerInfo
   run_grpc_call native-health \

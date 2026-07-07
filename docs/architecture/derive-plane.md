@@ -19,12 +19,22 @@ A derive projection consumes canonical artifacts rather than upstream node RPCs
 directly. The bundled projection is hosted by `zinder-ingest`, which opens the
 derive store as primary and runs the derive tailer over retained canonical
 events. The tailer atomically writes consumer rows plus derive cursors.
-`zinder-explorer` is the stateless reader gateway: it opens the same derive
-store as a secondary and serves `ExplorerQuery`. Derived explorer or analytics
-indexes must be rebuildable from canonical artifacts and must not become a
-hidden dependency of wallet sync. The `Derive*` SDK abstractions (trait, store,
-federation primitive) describe the reusable pattern; see
-[ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` open the
+derive store as RocksDB secondaries when they serve derive-backed reads.
+`zinder-explorer` may start without an available derive store; in that state it
+advertises only canonical/federated capabilities and omits derive-backed
+capabilities. Derived explorer or analytics indexes must be rebuildable from
+canonical artifacts and must not become a hidden dependency of wallet sync. The
+`Derive*` SDK abstractions (trait, store, federation primitive) describe the
+reusable pattern; see [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+
+Bundled wallet-serving derive projections retain their replayed rows for the
+history they have processed unless their owning consumer schema is wiped or the
+operator rebuilds the derive store. Do not add a partial pruning knob for
+transparent-address history, recent transactions, or similar wallet-visible
+derive reads without also adding the public retention floor, cursor-expiry
+semantics, and tests proving readers fail explicitly instead of returning
+silent partial history.
 
 ## When to use the derive plane
 

@@ -7,6 +7,7 @@ use std::{error::Error, fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 use zinder_core::{ChainEpochId, Network};
+use zinder_derive::{BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
@@ -161,11 +162,13 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("backup-source-store");
     let checkpoint_path = tempdir.path().join("backup-checkpoint");
+    let derive_checkpoint_staging_path = checkpoint_path.with_extension("derive");
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or("chain fixture unexpectedly empty")?;
     let expected_chain_epoch = artifacts.chain_epoch;
+    let expected_derive_cursor = b"derive-cursor";
 
     {
         let store = PrimaryChainStore::open(
@@ -173,6 +176,14 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
         store.commit_chain_epoch(artifacts)?;
+        let derive_store = DeriveStore::open(
+            DeriveStore::path_for_canonical(&storage_path),
+            DeriveStoreOptions {
+                consumers: DeriveStore::bundled_consumers(),
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        derive_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, expected_derive_cursor)?;
     }
 
     let output = zinder_ingest_command()
@@ -196,6 +207,18 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
         checkpoint.current_chain_epoch()?,
         Some(expected_chain_epoch)
     );
+    let derive_checkpoint = DeriveStore::open(
+        DeriveStore::path_for_canonical(&checkpoint_path),
+        DeriveStoreOptions {
+            consumers: DeriveStore::bundled_consumers(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
+    assert_eq!(
+        derive_checkpoint.get_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME)?,
+        Some(expected_derive_cursor.to_vec())
+    );
+    assert!(!derive_checkpoint_staging_path.exists());
 
     Ok(())
 }

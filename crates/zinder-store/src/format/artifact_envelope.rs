@@ -26,9 +26,6 @@ pub(crate) enum PayloadFormat {
     ZinderTransparentUnspentOutputV1 = 6,
     /// Zinder protobuf payload for a resolved transparent spend fact.
     ZinderTransparentSpendFactV2 = 16,
-    /// Zinder protobuf payload for a transparent address tx-history index
-    /// artifact.
-    ZinderTransparentAddressTxIndexArtifactV1 = 8,
     /// Zinder protobuf payload for a transparent output artifact.
     ZinderTransparentOutputArtifactV1 = 9,
     /// Zinder protobuf payload for the transparent spend index.
@@ -54,7 +51,6 @@ impl PayloadFormat {
             4 => Some(Self::ZinderTreeStateArtifactV1),
             5 => Some(Self::ZinderSubtreeRootArtifactV1),
             6 => Some(Self::ZinderTransparentUnspentOutputV1),
-            8 => Some(Self::ZinderTransparentAddressTxIndexArtifactV1),
             9 => Some(Self::ZinderTransparentOutputArtifactV1),
             10 => Some(Self::ZinderTransparentOutputBlockIndexV1),
             11 => Some(Self::ZinderBlockBlobArtifactV1),

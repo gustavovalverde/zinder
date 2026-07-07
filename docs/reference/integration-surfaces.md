@@ -10,7 +10,7 @@ Zinder exposes three integration paths. Pick the path by the contract the client
 
 ## Lightwalletd Compatibility
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It does not call Zebra, write canonical storage, or build artifacts independently. Operators expose it when they need a lightwalletd-compatible endpoint for wallets such as Zodl or SDKs generated from the lightwalletd protos.
+`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It opens canonical and derive storage only through secondary readers. It does not call Zebra, write canonical storage, or build artifacts independently. Operators expose it when they need a lightwalletd-compatible endpoint for wallets such as Zodl or SDKs generated from the lightwalletd protos.
 
 Public deployments terminate TLS, authentication, rate limiting, and quota controls before traffic reaches Zinder. The compatibility process speaks plaintext h2c by default and should be bound behind the operator's proxy boundary.
 

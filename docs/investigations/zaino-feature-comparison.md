@@ -76,17 +76,15 @@ Recommendation: match Zaino's scheme exactly, behind the optional capability. Th
 
 **Goal.** Make `WalletQuery.TransparentAddressTxIdsInRange` return every transaction touching an address, including spends from the address (not only outputs to it).
 
-**Status today.** M4 Slice B shipped the `TransparentAddressTxIndex` artifact family (nibble `0x3`, capability `wallet.address.transparent_history_v1`), but the artifact builder indexes outputs only. The memory bank's M4 Slice B note records this explicitly as "Output-side indexing only; spending-side history is a known follow-up". Zaino's `getaddresstxids` passthrough to Zebra gives both sides because Zebra's address index does. To be a clean replacement, Zinder must close this gap.
+**Status today.** Transparent-address transaction history is derive-owned under capability `wallet.address.transparent_history_v1`. The derive consumer writes one row per `(address, transaction)` pair from canonical transaction facts, transparent outputs, and hydrated transparent spends. Zaino's `getaddresstxids` passthrough to Zebra gives both sides because Zebra's address index does; Zinder's replacement surface answers from the derive store instead of a canonical writer index.
 
 **Proposed shape.**
 
-- Extend the artifact builder for `TransparentAddressTxIndex` so each transparent **input** also produces an index entry. The script-hash key comes from the prevout's `transparent_output.address_script_hash`, which is already in canonical storage.
-- One open design point: whether to write two separate rows per address-spending tx (one per spending input) or one row keyed only by `(address_script_hash, height, tx_index)` deduplicated. Recommendation: one row per address-tx pair (dedup), matching the output-side shape; the multiplicity per tx is a separate concern.
-- No new capability needed; bump the artifact family version and the existing capability instead. Operators get the richer behaviour after they replay derive (no canonical rebuild needed if the spending-side index is a derive-plane projection, which it should be).
+- Keep the projection in `TransparentAddressTransactionHistoryConsumer`.
+- Preserve one row per address-tx pair, deduplicated by `(address_script_hash, height, tx_index)`.
+- Do not reintroduce a canonical `TransparentAddressTxIndex` column family; the derive plane is the chosen home for this surface.
 
-**Important re-question.** The output-side index landed on the canonical writer in M4 Slice B. The spending side may be a better fit for the derive plane because it is a projection over `transparent_spend_fact` plus `transparent_output.address_script_hash`. Splitting "produced-side on writer, spent-side on derive" creates a vocabulary mismatch ("which one answers `TransparentAddressTxIdsInRange`?"). The ADR for this slice should explicitly pick one home, not silently grow a second one.
-
-**Effort sizing.** Smaller than §1 if the spending-side index moves to the derive plane (one new derive consumer, one builder change, one capability bump). Larger if it stays on the writer (a canonical artifact change plus a one-shot backfill).
+**Effort sizing.** The remaining work is retention/product-contract work, not canonical indexing. If full history remains required, operators must budget derive storage for it explicitly; if bounded history is acceptable, the API and cursor contract need a visible retention floor.
 
 ### 3. CompactTx.vin/vout population in the lightwalletd-compat builder
 
@@ -107,7 +105,7 @@ Recommendation: match Zaino's scheme exactly, behind the optional capability. Th
 The following Zaino 0.3.1 surfaces are matched or exceeded today. No action needed beyond doc keeping.
 
 - **Spent-outpoint index as core data:** `transparent_spend_fact` is already in the canonical hot tables list in [`fact-first-indexer.md`](../architecture/fact-first-indexer.md).
-- **Local transparent-address indexing:** `address_output_index` table; artifacts `TransparentUtxoStreamFamily` (nibble `0x4`) and `TransparentAddressTxIndex` (nibble `0x3`); RPCs `WalletQuery.AddressOutputIndexStream`, `WalletQuery.TransparentAddressTxIdsInRange`, `WalletQuery.TransparentAddressBalance`, `WalletQuery.TransparentPrevouts`, `WalletQuery.TransparentMempoolPrevouts`, `ExplorerQuery.TransparentAddressActivity`. Zaino still routes the equivalent `ChainIndex` methods through `validator_connector` to Zebra ([`packages/zaino-state/src/chain_index.rs:2134-2174`](../../../zaino/packages/zaino-state/src/chain_index.rs)).
+- **Local transparent-address indexing:** canonical `address_output_index` table for unspent outputs plus derive-owned transparent-address transaction history; RPCs `WalletQuery.AddressOutputIndexStream`, `WalletQuery.TransparentAddressTxIdsInRange`, `WalletQuery.TransparentAddressBalance`, `WalletQuery.TransparentPrevouts`, `WalletQuery.TransparentMempoolPrevouts`, `ExplorerQuery.TransparentAddressActivity`. Zaino still routes the equivalent `ChainIndex` methods through `validator_connector` to Zebra ([`packages/zaino-state/src/chain_index.rs:2134-2174`](../../../zaino/packages/zaino-state/src/chain_index.rs)).
 - **Atomic reorg discipline at read time:** every read pins to a `ChainEpoch`; `commit_ingest_batch` is the only transition that makes a new epoch visible. See [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).
 - **Mempool surfaces:** `WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`, and `WalletQuery.TransparentMempoolPrevouts`. Zaino's non-finalised-state model overlaps in intent; Zinder's is more conservative about consistency.
 - **Capability negotiation:** per-feature capability strings federated across source, ingest, derive, and query layers; see [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md) and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md).

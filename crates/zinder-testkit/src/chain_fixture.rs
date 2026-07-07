@@ -18,10 +18,9 @@ use zinder_core::{
     ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, LockTime, Network,
     PrivacyShape, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
     TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
-    TransactionLocation, TransactionPublicFacts, TransactionVersion,
-    TransparentAddressTxIndexArtifact, TransparentOutputArtifact, TransparentSpendFact,
-    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
-    wire::encode_internal_block_hash,
+    TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentOutputArtifact,
+    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
+    UnsupportedSection, wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
@@ -249,7 +248,6 @@ pub struct ChainFixture {
     transaction_rows: Vec<FixtureTransactionRows>,
     transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     transparent_spend_facts: Vec<TransparentSpendFact>,
-    transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
 }
 
 impl ChainFixture {
@@ -265,7 +263,6 @@ impl ChainFixture {
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
-            transparent_address_tx_index: Vec::new(),
         }
     }
 
@@ -345,7 +342,6 @@ impl ChainFixture {
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
-            transparent_address_tx_index: Vec::new(),
         })
     }
 
@@ -450,18 +446,6 @@ impl ChainFixture {
         transparent_spend_fact: TransparentSpendFact,
     ) -> Self {
         self.transparent_spend_facts.push(transparent_spend_fact);
-        self
-    }
-
-    /// Attaches a [`TransparentAddressTxIndexArtifact`] to this fixture's
-    /// commit set.
-    #[must_use]
-    pub fn with_transparent_address_tx_index(
-        mut self,
-        transparent_address_tx_index: TransparentAddressTxIndexArtifact,
-    ) -> Self {
-        self.transparent_address_tx_index
-            .push(transparent_address_tx_index);
         self
     }
 
@@ -637,10 +621,6 @@ impl ChainFixture {
         if !self.transparent_spend_facts.is_empty() {
             chain_epoch_artifacts = chain_epoch_artifacts
                 .with_transparent_spend_facts(self.transparent_spend_facts.clone());
-        }
-        if !self.transparent_address_tx_index.is_empty() {
-            chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transparent_address_tx_index(self.transparent_address_tx_index.clone());
         }
         Some(chain_epoch_artifacts)
     }

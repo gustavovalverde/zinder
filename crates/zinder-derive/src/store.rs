@@ -21,6 +21,7 @@ use std::{
 
 use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+    checkpoint::Checkpoint,
 };
 use zinder_core::{BlockHeight, ChainEpoch};
 use zinder_store::{
@@ -566,6 +567,31 @@ impl DeriveStore {
             .map_err(|source| DeriveStoreError::Operation {
                 operation: "flush_wal",
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })
+    }
+
+    /// Creates a `RocksDB` checkpoint for backup or fixture capture.
+    ///
+    /// The checkpoint must be taken from a primary derive store. Secondary
+    /// readers may intentionally lag the primary, so checkpointing one would
+    /// produce a stale restore image with a cursor that does not represent the
+    /// writer's durable state.
+    pub fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), DeriveStoreError> {
+        if self.is_secondary {
+            return Err(DeriveStoreError::CheckpointRequiresPrimary {
+                path: self.storage_path.clone(),
+            });
+        }
+        let checkpoint =
+            Checkpoint::new(self.db.as_ref()).map_err(|source| DeriveStoreError::Checkpoint {
+                path: path.as_ref().to_path_buf(),
+                source,
+            })?;
+        checkpoint
+            .create_checkpoint(path.as_ref())
+            .map_err(|source| DeriveStoreError::Checkpoint {
+                path: path.as_ref().to_path_buf(),
                 source,
             })
     }
@@ -1743,6 +1769,25 @@ mod tests {
         assert_eq!(
             store.get_chain_event_cursor(TEST_CONSUMER)?,
             Some(vec![4, 5])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_preserves_cursor_rows() -> Result<()> {
+        let tempdir = tempdir()?;
+        let source_path = tempdir.path().join("derive-source");
+        let checkpoint_path = tempdir.path().join("derive-checkpoint");
+        {
+            let store = DeriveStore::open(&source_path, DeriveStoreOptions::default())?;
+            store.put_chain_event_cursor(TEST_CONSUMER, &[4, 5, 6])?;
+            store.create_checkpoint(&checkpoint_path)?;
+        }
+
+        let checkpoint = DeriveStore::open(&checkpoint_path, DeriveStoreOptions::default())?;
+        assert_eq!(
+            checkpoint.get_chain_event_cursor(TEST_CONSUMER)?,
+            Some(vec![4, 5, 6])
         );
         Ok(())
     }

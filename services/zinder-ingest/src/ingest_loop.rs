@@ -381,14 +381,18 @@ where
                 }
             }
             IngestPhase::BulkCatchup => {
-                let store_tip = store_tip.unwrap_or(0);
-                let Some(batch_target) = compute_bulk_catchup_target(
+                let store_tip = bulk_catchup_progress_tip(store_tip, config.modifiers.checkpoint);
+                let Some(batch_target) = compute_bulk_catchup_target(BulkCatchupTargetInput {
                     upstream_tip,
-                    store_tip,
-                    config.reorg_window_blocks,
-                    config.bulk_catchup.canonical_batch_max_blocks.get(),
-                    config.modifiers.target_height.map(BlockHeight::value),
-                ) else {
+                    progress_tip: store_tip,
+                    reorg_window_blocks: config.reorg_window_blocks,
+                    canonical_batch_max_blocks: config
+                        .bulk_catchup
+                        .canonical_batch_max_blocks
+                        .get(),
+                    allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
+                    target_height: config.modifiers.target_height.map(BlockHeight::value),
+                }) else {
                     // No height within the reorg window remains to be
                     // committed in bulk; let the next iteration re-
                     // classify (it will fall into `FollowingTip`).
@@ -433,10 +437,11 @@ where
                 let tip_follow_config =
                     build_tip_follow_config(config, Arc::clone(&network_upgrade_activations));
                 let phase_cancel = cancel.child_token();
-                let watcher_handle = spawn_phase_change_watcher(
+                let watcher_handle = spawn_following_tip_exit_watcher(
                     Arc::clone(&source),
                     store.clone(),
                     config.phases.catchup_threshold_blocks,
+                    config.modifiers.target_height,
                     phase_cancel.clone(),
                 );
                 let tip_follow_outcome = tip_follow_with_primary_store(
@@ -474,17 +479,19 @@ where
     }
 }
 
-/// Spawns the phase-change watcher that fires `cancel` when the
-/// classifier would bounce out of `FollowingTip`.
+/// Spawns the watcher that fires `cancel` when `FollowingTip` should return
+/// control to the unified loop.
 ///
 /// Runs alongside `tip_follow_with_primary_store`; the parent loop
-/// aborts the watcher's join handle as soon as the tip-follow handler
-/// returns. The watcher does not own readiness updates: it only
-/// signals the cancellation that lets the unified loop re-classify.
-fn spawn_phase_change_watcher<Source>(
+/// aborts the watcher's join handle as soon as the tip-follow handler returns.
+/// The watcher does not own readiness updates: it only signals the
+/// cancellation that lets the unified loop re-classify or honor
+/// `--target-height`.
+fn spawn_following_tip_exit_watcher<Source>(
     source: Arc<Source>,
     store: PrimaryChainStore,
     catchup_threshold_blocks: u32,
+    target_height: Option<BlockHeight>,
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 where
@@ -495,6 +502,16 @@ where
             tokio::select! {
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(PHASE_BOUNCE_BACK_WATCH_INTERVAL) => {}
+            }
+            if reached_target_height(target_height, &store) {
+                tracing::info!(
+                    target: "zinder::ingest",
+                    event = "ingest_loop_following_tip_target_reached",
+                    target_height = target_height.as_ref().map(|height| height.value()),
+                    "target height reached inside FollowingTip; cancelling inner loop"
+                );
+                cancel.cancel();
+                return;
             }
             let Ok(tip_id) = source.tip_id().await else {
                 continue;
@@ -522,24 +539,43 @@ where
 /// Returns `None` when no committable height remains inside the bulk
 /// window: either the upstream tip itself sits inside the reorg window
 /// or the operator-set `target_height` modifier is already covered.
-fn compute_bulk_catchup_target(
-    upstream_tip: u32,
-    store_tip: u32,
-    reorg_window_blocks: u32,
-    canonical_batch_max_blocks: u32,
-    target_height_modifier: Option<u32>,
-) -> Option<u32> {
-    let outside_reorg_window = upstream_tip.checked_sub(reorg_window_blocks)?;
-    let batch_ceiling = store_tip.checked_add(canonical_batch_max_blocks)?;
+fn compute_bulk_catchup_target(input: BulkCatchupTargetInput) -> Option<u32> {
+    let outside_reorg_window = if input.allow_near_tip_finalize {
+        input.upstream_tip
+    } else {
+        input.upstream_tip.checked_sub(input.reorg_window_blocks)?
+    };
+    let batch_ceiling = input
+        .progress_tip
+        .checked_add(input.canonical_batch_max_blocks)?;
     let mut target = outside_reorg_window.min(batch_ceiling);
-    if let Some(modifier_ceiling) = target_height_modifier {
+    if let Some(modifier_ceiling) = input.target_height {
         target = target.min(modifier_ceiling);
     }
-    if target <= store_tip {
+    if target <= input.progress_tip {
         None
     } else {
         Some(target)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BulkCatchupTargetInput {
+    upstream_tip: u32,
+    progress_tip: u32,
+    reorg_window_blocks: u32,
+    canonical_batch_max_blocks: u32,
+    allow_near_tip_finalize: bool,
+    target_height: Option<u32>,
+}
+
+fn bulk_catchup_progress_tip(
+    store_tip: Option<u32>,
+    checkpoint: Option<zinder_source::SourceChainCheckpoint>,
+) -> u32 {
+    store_tip
+        .or_else(|| checkpoint.map(|checkpoint| checkpoint.height.value()))
+        .unwrap_or(0)
 }
 
 fn build_bulk_catchup_batch_config(
@@ -783,7 +819,14 @@ mod tests {
         // store=0, upstream=10000, reorg=100, batch=1000:
         // outside_reorg = 9900, batch_ceiling = 1000 → target = 1000
         assert_eq!(
-            compute_bulk_catchup_target(10_000, 0, 100, 1_000, None),
+            compute_bulk_catchup_target(BulkCatchupTargetInput {
+                upstream_tip: 10_000,
+                progress_tip: 0,
+                reorg_window_blocks: 100,
+                canonical_batch_max_blocks: 1_000,
+                allow_near_tip_finalize: false,
+                target_height: None,
+            }),
             Some(1_000)
         );
     }
@@ -794,7 +837,14 @@ mod tests {
         // outside_reorg = 900, batch_ceiling = 1900 → target = 900
         // But 900 <= store_tip (900), so None.
         assert_eq!(
-            compute_bulk_catchup_target(1_000, 900, 100, 1_000, None),
+            compute_bulk_catchup_target(BulkCatchupTargetInput {
+                upstream_tip: 1_000,
+                progress_tip: 900,
+                reorg_window_blocks: 100,
+                canonical_batch_max_blocks: 1_000,
+                allow_near_tip_finalize: false,
+                target_height: None,
+            }),
             None
         );
     }
@@ -804,7 +854,14 @@ mod tests {
         // store=0, upstream=10000, reorg=100, batch=5000, modifier=2000:
         // outside_reorg = 9900, batch = 5000, modifier = 2000 → target = 2000
         assert_eq!(
-            compute_bulk_catchup_target(10_000, 0, 100, 5_000, Some(2_000)),
+            compute_bulk_catchup_target(BulkCatchupTargetInput {
+                upstream_tip: 10_000,
+                progress_tip: 0,
+                reorg_window_blocks: 100,
+                canonical_batch_max_blocks: 5_000,
+                allow_near_tip_finalize: false,
+                target_height: Some(2_000),
+            }),
             Some(2_000)
         );
     }
@@ -812,6 +869,47 @@ mod tests {
     #[test]
     fn bulk_catchup_target_returns_none_when_upstream_inside_reorg_window() {
         // upstream=50, reorg=100: subtraction underflows → None
-        assert_eq!(compute_bulk_catchup_target(50, 0, 100, 1_000, None), None);
+        assert_eq!(
+            compute_bulk_catchup_target(BulkCatchupTargetInput {
+                upstream_tip: 50,
+                progress_tip: 0,
+                reorg_window_blocks: 100,
+                canonical_batch_max_blocks: 1_000,
+                allow_near_tip_finalize: false,
+                target_height: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn bulk_catchup_target_honours_near_tip_finalize_override() {
+        assert_eq!(
+            compute_bulk_catchup_target(BulkCatchupTargetInput {
+                upstream_tip: 1_642,
+                progress_tip: 1_592,
+                reorg_window_blocks: 100,
+                canonical_batch_max_blocks: 25,
+                allow_near_tip_finalize: true,
+                target_height: Some(1_642),
+            }),
+            Some(1_617)
+        );
+    }
+
+    #[test]
+    fn bulk_catchup_progress_tip_uses_checkpoint_for_empty_store() {
+        let checkpoint = SourceChainCheckpoint::new(
+            BlockHeight::new(1_592),
+            BlockHash::from_bytes([0xAB; 32]),
+            ChainTipMetadata::empty(),
+        );
+
+        assert_eq!(bulk_catchup_progress_tip(None, Some(checkpoint)), 1_592);
+        assert_eq!(
+            bulk_catchup_progress_tip(Some(1_617), Some(checkpoint)),
+            1_617
+        );
+        assert_eq!(bulk_catchup_progress_tip(None, None), 0);
     }
 }

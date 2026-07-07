@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -146,6 +147,36 @@ pub enum IngestError {
     /// Derive-store open or operation failed.
     #[error(transparent)]
     DeriveStore(#[from] zinder_derive::DeriveStoreError),
+
+    /// Backup requires the derive store created by the ingest writer.
+    #[error(
+        "derive store is missing at {path:?}; backup would be incomplete without the derive checkpoint"
+    )]
+    DeriveStoreMissing {
+        /// Expected derive store path.
+        path: PathBuf,
+    },
+
+    /// Backup staging path already exists, so the command cannot know whether
+    /// replacing it would discard operator-owned data.
+    #[error("derive checkpoint staging path already exists at {path:?}")]
+    BackupDeriveCheckpointStagingExists {
+        /// Existing staging path.
+        path: PathBuf,
+    },
+
+    /// Backup could not move the staged derive checkpoint under the canonical
+    /// checkpoint directory.
+    #[error("failed to install derive checkpoint from {from_path:?} to {to_path:?}: {source}")]
+    BackupDeriveCheckpointInstall {
+        /// Temporary derive checkpoint path.
+        from_path: PathBuf,
+        /// Final derive checkpoint path under the canonical checkpoint.
+        to_path: PathBuf,
+        /// Filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
 
     /// The durable transparent-outpoint-spend projection is behind the
     /// canonical retention sweep, so swept spender identities can never be
@@ -1509,6 +1540,13 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
         Some(IngestError::DeriveStore(_)) => "derive_store",
+        Some(IngestError::DeriveStoreMissing { .. }) => "derive_store_missing",
+        Some(IngestError::BackupDeriveCheckpointStagingExists { .. }) => {
+            "backup_derive_checkpoint_staging_exists"
+        }
+        Some(IngestError::BackupDeriveCheckpointInstall { .. }) => {
+            "backup_derive_checkpoint_install"
+        }
         Some(IngestError::SpendProjectionBehindRetentionSweep { .. }) => {
             "spend_projection_behind_retention_sweep"
         }

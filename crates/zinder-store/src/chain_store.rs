@@ -17,8 +17,8 @@ use zinder_core::{
     BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
     TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputArtifact,
-    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::{
@@ -40,10 +40,9 @@ use crate::{
         encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
         encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
         encode_transaction_blob_artifact, encode_transaction_facts_artifact,
-        encode_transaction_location_artifact, encode_transparent_address_tx_index_artifact,
-        encode_transparent_output_artifact, encode_transparent_output_block_index,
-        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
-        encode_tree_state_artifact,
+        encode_transaction_location_artifact, encode_transparent_output_artifact,
+        encode_transparent_output_block_index, encode_transparent_spend_fact,
+        encode_transparent_spend_fact_block_index, encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
@@ -168,10 +167,13 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 11;
-/// Store schema version that the v11 startup rebuild accepts and migrates
-/// in place. See [`schema_migration`].
-const REBUILDABLE_STORE_SCHEMA_VERSION: u16 = 10;
+const STORE_SCHEMA_VERSION: u16 = 12;
+/// Store schema version that the address-output startup rebuild accepts and
+/// migrates in place. See [`schema_migration`].
+const ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION: u16 = 10;
+/// Store schema version that still carried the canonical transparent-address
+/// tx-history column family now owned by the derive plane.
+const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// Durable artifact schema version written by this binary.
 ///
 /// Version 10 carried the fact-first layout with every hash-shaped proto
@@ -195,6 +197,11 @@ const REBUILDABLE_STORE_SCHEMA_VERSION: u16 = 10;
 /// and cannot be repaired in place (the omitted Ironwood action data was
 /// never derived from the source block), so it is rejected at open and must
 /// be rebuilt from genesis.
+///
+/// Store schema version 12 removes the canonical
+/// `transparent_address_tx_index` column family. The typed
+/// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
+/// but materialization belongs to the derive plane.
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(12);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
@@ -222,38 +229,6 @@ pub struct ChainEventRetentionReport {
     pub retained_event_count: u64,
     /// Number of event rows deleted by this pass.
     pub pruned_event_count: u64,
-}
-
-/// Bounded transparent-address tx-history page request.
-#[derive(Clone, Copy, Debug)]
-pub struct TransparentAddressTxIndexPageRequest<'cursor> {
-    /// Optional chain epoch to pin the read to. `None` reads at the
-    /// currently visible epoch.
-    pub at_epoch: Option<ChainEpoch>,
-    /// SHA-256 of the transparent address scriptPubKey.
-    pub address_script_hash: TransparentAddressScriptHash,
-    /// Inclusive minimum block height. Ignored when `from_cursor` is
-    /// `Some`.
-    pub start_height: BlockHeight,
-    /// Inclusive maximum block height.
-    pub end_height: BlockHeight,
-    /// Server-bounded maximum entries per page.
-    pub max_entries: NonZeroU32,
-    /// Iteration direction.
-    pub descending: bool,
-    /// Optional cursor to resume strictly after.
-    pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
-}
-
-/// Bounded transparent-address tx-history page response.
-#[derive(Clone, Debug)]
-pub struct TransparentAddressTxIndexPage {
-    /// Chain epoch used to answer this page.
-    pub chain_epoch: ChainEpoch,
-    /// Tx-history artifacts in the requested order.
-    pub artifacts: Vec<TransparentAddressTxIndexArtifact>,
-    /// Resume cursor when the page reached `max_entries`.
-    pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
 /// Bounded transparent-address output read request.
@@ -470,14 +445,6 @@ pub trait ChainEpochReadApi {
         &self,
         request: AddressOutputIndexPageRequest<'_>,
     ) -> Result<AddressOutputIndexPage, StoreError>;
-
-    /// Reads a bounded page of transparent-address tx-history index
-    /// artifacts inside an inclusive height range, in ascending or
-    /// descending mined order.
-    fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError>;
 }
 
 impl PrimaryChainStore {
@@ -624,15 +591,6 @@ impl PrimaryChainStore {
         request: AddressOutputIndexPageRequest<'_>,
     ) -> Result<AddressOutputIndexPage, StoreError> {
         self.store.address_output_index_page(request)
-    }
-
-    /// Reads a bounded page of transparent-address tx-history index
-    /// artifacts.
-    pub fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
-        self.store.transparent_address_tx_index_page(request)
     }
 
     /// Builds an HMAC-authenticated next-page cursor for a `MempoolSnapshot`
@@ -852,15 +810,6 @@ impl SecondaryChainStore {
         request: AddressOutputIndexPageRequest<'_>,
     ) -> Result<AddressOutputIndexPage, StoreError> {
         self.store.address_output_index_page(request)
-    }
-
-    /// Reads a bounded page of transparent-address tx-history index
-    /// artifacts.
-    pub fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
-        self.store.transparent_address_tx_index_page(request)
     }
 
     /// Reads the current chain-event retention floor without pruning.
@@ -1196,90 +1145,6 @@ impl ChainStoreInner {
         })
     }
 
-    /// Reads a bounded page of transparent-address tx-history index
-    /// artifacts.
-    fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
-        let read_view = self.read_view();
-        let chain_epoch = match request.at_epoch {
-            Some(at_epoch) => {
-                let stored = read_chain_epoch(&read_view, at_epoch.id)?;
-                if stored != at_epoch {
-                    return Err(StoreError::ChainEpochMissing {
-                        chain_epoch: at_epoch.id,
-                    });
-                }
-                stored
-            }
-            None => require_current_chain_epoch(&read_view)?,
-        };
-
-        let resume_after = match request.from_cursor {
-            Some(cursor) => Some(
-                cursor
-                    .decode_transparent_history(chain_epoch.network, self.cursor_auth_key)
-                    .map_err(|_| StoreError::TransparentHistoryCursorInvalid {
-                        reason: "cursor token failed validation",
-                    })?,
-            ),
-            None => None,
-        };
-        let descending = resume_after.map_or(request.descending, |payload| payload.descending);
-        let resume_position = resume_after.map(|payload| {
-            crate::transparent_address_tx_index::TransparentHistoryResumePosition {
-                last_block_height: payload.last_block_height,
-                last_tx_index_in_block: payload.last_tx_index_in_block,
-            }
-        });
-
-        let artifacts =
-            crate::transparent_address_tx_index::read_transparent_address_tx_index_paged(
-                &read_view,
-                crate::transparent_address_tx_index::TransparentAddressTxIndexScan {
-                    chain_epoch,
-                    address_script_hash: request.address_script_hash,
-                    start_height: request.start_height,
-                    end_height: request.end_height,
-                    max_entries: request.max_entries,
-                    descending,
-                    resume_after: resume_position,
-                },
-            )?;
-
-        let next_cursor =
-            if artifacts.len() >= u32_to_usize(request.max_entries.get()) {
-                match artifacts.last() {
-                Some(artifact) => Some(
-                    StreamCursorTokenV1::transparent_history(
-                        crate::format::TransparentHistoryCursorAnchor {
-                            network: chain_epoch.network,
-                            family:
-                                crate::format::TransparentHistoryStreamFamily::TransparentHistory,
-                            last_block_height: artifact.block_height,
-                            last_tx_index_in_block: artifact.tx_index_in_block,
-                            descending,
-                        },
-                        self.cursor_auth_key,
-                    )
-                    .map_err(|_| StoreError::TransparentHistoryCursorInvalid {
-                        reason: "next-cursor encoding failed",
-                    })?,
-                ),
-                None => None,
-            }
-            } else {
-                None
-            };
-
-        Ok(TransparentAddressTxIndexPage {
-            chain_epoch,
-            artifacts,
-            next_cursor,
-        })
-    }
-
     fn chain_event_history_start_sequence(
         &self,
         inner: &impl RocksChainStoreRead,
@@ -1337,6 +1202,18 @@ impl ChainStoreInner {
         let Some(fork_point) =
             resolve_locator_fork_point(inner, *current_chain_epoch, &cursor_payload.locator)?
         else {
+            if retained_cursor_event_is_artifactless_checkpoint(
+                inner,
+                ArtifactlessCheckpointCursorInput {
+                    event_sequence: cursor_payload.event_sequence,
+                    oldest_retained_sequence: bounds.oldest_retained_sequence,
+                    cursor_locator_tip: cursor_payload.locator.tip(),
+                    family,
+                    cursor_auth_key: self.cursor_auth_key,
+                },
+            )? {
+                return resume_after_retained_cursor_event(family, cursor_payload.event_sequence);
+            }
             // No locator entry sits on the canonical chain: the divergence is
             // deeper than the cap or its block is unresolvable. The consumer
             // must re-derive from canonical artifacts.
@@ -2013,13 +1890,6 @@ impl ChainEpochReadApi for PrimaryChainStore {
     ) -> Result<AddressOutputIndexPage, StoreError> {
         self.store.address_output_index_page(request)
     }
-
-    fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
-        self.store.transparent_address_tx_index_page(request)
-    }
 }
 
 impl ChainEpochReadApi for SecondaryChainStore {
@@ -2054,13 +1924,6 @@ impl ChainEpochReadApi for SecondaryChainStore {
         request: AddressOutputIndexPageRequest<'_>,
     ) -> Result<AddressOutputIndexPage, StoreError> {
         self.store.address_output_index_page(request)
-    }
-
-    fn transparent_address_tx_index_page(
-        &self,
-        request: TransparentAddressTxIndexPageRequest<'_>,
-    ) -> Result<TransparentAddressTxIndexPage, StoreError> {
-        self.store.transparent_address_tx_index_page(request)
     }
 }
 
@@ -2290,6 +2153,75 @@ fn resolve_locator_fork_point(
     Ok(None)
 }
 
+fn cursor_event_is_retained(
+    inner: &impl RocksChainStoreRead,
+    event_sequence: u64,
+    oldest_retained_sequence: u64,
+) -> Result<bool, StoreError> {
+    Ok(event_sequence >= oldest_retained_sequence
+        && inner
+            .get(
+                StorageTable::ChainEvent,
+                &StoreKey::chain_event(event_sequence),
+            )?
+            .is_some())
+}
+
+fn retained_cursor_event_is_artifactless_checkpoint(
+    inner: &impl RocksChainStoreRead,
+    input: ArtifactlessCheckpointCursorInput,
+) -> Result<bool, StoreError> {
+    if input.event_sequence < input.oldest_retained_sequence {
+        return Ok(false);
+    }
+
+    let key = StoreKey::chain_event(input.event_sequence);
+    let Some(record_bytes) = inner.get(StorageTable::ChainEvent, &key)? else {
+        return Ok(false);
+    };
+    let event_envelope =
+        decode_chain_event_envelope(&key, &record_bytes, input.family, input.cursor_auth_key)?;
+    if !matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. }) {
+        return Ok(false);
+    }
+
+    let event_tip = ChainEventCursorAnchor {
+        height: event_envelope.chain_epoch.visible_tip_height,
+        hash: event_envelope.chain_epoch.visible_tip_hash,
+    };
+    if input.cursor_locator_tip != event_tip {
+        return Ok(false);
+    }
+
+    match read_block_header_artifact(inner, event_envelope.chain_epoch, event_tip.height) {
+        Ok(Some(_)) => Ok(false),
+        Ok(None) | Err(StoreError::ArtifactMissing { .. }) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactlessCheckpointCursorInput {
+    event_sequence: u64,
+    oldest_retained_sequence: u64,
+    cursor_locator_tip: ChainEventCursorAnchor,
+    family: ChainEventStreamFamily,
+    cursor_auth_key: [u8; 32],
+}
+
+fn resume_after_retained_cursor_event(
+    family: ChainEventStreamFamily,
+    event_sequence: u64,
+) -> Result<ChainEventResume, StoreError> {
+    Ok(ChainEventResume {
+        start_sequence: event_sequence
+            .checked_add(1)
+            .ok_or(StoreError::ChainEventSequenceOverflow)?,
+        family,
+        synthetic_reorg: None,
+    })
+}
+
 /// Resolves the resume position for a cursor whose branch was reorged out below
 /// its tip, following the reconnect-reorg rule.
 fn resolve_reorged_cursor_resume(
@@ -2316,24 +2248,10 @@ fn resolve_reorged_cursor_resume(
         });
     }
 
-    let cursor_event_retained = event_sequence >= bounds.oldest_retained_sequence
-        && inner
-            .get(
-                StorageTable::ChainEvent,
-                &StoreKey::chain_event(event_sequence),
-            )?
-            .is_some();
-    if cursor_event_retained {
+    if cursor_event_is_retained(inner, event_sequence, bounds.oldest_retained_sequence)? {
         // The real ChainReorged event still sits at or after the cursor;
         // replaying it from the next sequence delivers the reorg.
-        let start_sequence = event_sequence
-            .checked_add(1)
-            .ok_or(StoreError::ChainEventSequenceOverflow)?;
-        return Ok(ChainEventResume {
-            start_sequence,
-            family,
-            synthetic_reorg: None,
-        });
+        return resume_after_retained_cursor_event(family, event_sequence);
     }
 
     // The reorg event was pruned. Synthesize a ChainReorged reverted from the
@@ -2574,7 +2492,6 @@ fn build_chain_epoch_puts(
         subtree_roots,
         transparent_outputs_by_outpoint,
         transparent_spend_facts,
-        transparent_address_tx_index,
         reorg_window_change: _,
     } = artifacts;
 
@@ -2595,11 +2512,6 @@ fn build_chain_epoch_puts(
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
     push_transparent_output_artifact_puts(&mut puts, chain_epoch, transparent_outputs_by_outpoint)?;
     push_transparent_spend_fact_puts(&mut puts, chain_epoch, transparent_spend_facts)?;
-    push_transparent_address_tx_index_artifact_puts(
-        &mut puts,
-        chain_epoch,
-        transparent_address_tx_index,
-    )?;
     push_commit_control_puts(&mut puts, chain_epoch, event_envelope);
 
     Ok(puts)
@@ -3515,30 +3427,6 @@ fn push_transparent_spend_fact_puts(
                 chain_epoch.id,
             ),
             value: encode_transparent_spend_fact_block_index(block_hash, &spent_outpoints)?,
-        });
-    }
-
-    Ok(())
-}
-
-fn push_transparent_address_tx_index_artifact_puts(
-    puts: &mut Vec<StoragePut>,
-    chain_epoch: ChainEpoch,
-    transparent_address_tx_index: Vec<TransparentAddressTxIndexArtifact>,
-) -> Result<(), StoreError> {
-    for artifact in transparent_address_tx_index {
-        let key = StoreKey::transparent_address_tx_index(
-            chain_epoch.network,
-            artifact.address_script_hash,
-            artifact.block_height,
-            artifact.tx_index_in_block,
-            chain_epoch.id,
-        );
-        let encoded = encode_transparent_address_tx_index_artifact(artifact)?;
-        puts.push(StoragePut {
-            table: StorageTable::TransparentAddressTxIndex,
-            key,
-            value: encoded,
         });
     }
 

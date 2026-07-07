@@ -14,11 +14,11 @@
 //! optional batched fee lookup.
 
 use prost::Message as _;
-use zinder_core::BlockHeight;
 use zinder_core::wire::{
     encode_height_key_descending, encode_in_block_position, encode_rpc_block_hash_hex,
     encode_rpc_transaction_id_hex,
 };
+use zinder_core::{BlockHeight, TransactionFactsArtifact};
 use zinder_proto::v1::explorer::{
     RecentTransactionEntry, TransactionComponentCounts as WireComponentCounts,
 };
@@ -55,6 +55,20 @@ impl RecentTransactionsConsumer {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Returns the number of rows this consumer will write for `transactions`.
+    #[must_use]
+    pub fn projected_row_count_for_transactions(
+        transactions: &[TransactionFactsArtifact],
+    ) -> usize {
+        transactions.len()
+    }
+
+    /// Returns the number of rows this consumer will write for `block`.
+    #[must_use]
+    pub fn projected_row_count_for_block(block: &BlockCommitContext) -> usize {
+        Self::projected_row_count_for_transactions(&block.transactions)
     }
 
     /// Returns the storage key for one `(height, in_block_position)` row.
@@ -156,4 +170,51 @@ pub enum RecentTransactionsConsumerError {
     /// Storage encoding of the materialized entry failed.
     #[error("RecentTransactionEntry prost encode failed: {0}")]
     Encode(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::{
+        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+        TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
+        TransactionVersion,
+    };
+
+    use super::RecentTransactionsConsumer;
+
+    fn transaction(seed: u8, tx_index_in_block: u32) -> TransactionFactsArtifact {
+        let transaction_id = TransactionId::from_bytes([seed; 32]);
+        TransactionFactsArtifact::new(
+            TransactionLocation::new(
+                transaction_id,
+                BlockHeight::new(10),
+                BlockHash::from_bytes([0xA0; 32]),
+                tx_index_in_block,
+            ),
+            TransactionPublicFacts {
+                transaction_id,
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::V5,
+                consensus_branch_id: None,
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: 0,
+                counts: TransactionComponentCounts::EMPTY,
+                privacy_shape: PrivacyShape::Unclassified,
+                is_coinbase: false,
+                unsupported_sections: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn projected_row_count_matches_transaction_count() {
+        let transactions = vec![transaction(1, 0), transaction(2, 1), transaction(3, 2)];
+
+        assert_eq!(
+            RecentTransactionsConsumer::projected_row_count_for_transactions(&transactions),
+            3
+        );
+    }
 }

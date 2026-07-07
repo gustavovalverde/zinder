@@ -40,7 +40,7 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         "{stdout}"
     );
     assert!(stdout.contains("[storage.canonical.rocksdb]"), "{stdout}");
-    assert!(!stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
     assert!(stdout.contains("[ingest_control]"), "{stdout}");
     assert!(
         stdout.contains("addr = \"http://127.0.0.1:9100\""),
@@ -114,7 +114,7 @@ fn ingest_only_section_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn derive_storage_section_is_rejected() -> eyre::Result<()> {
+fn derive_storage_section_is_accepted() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-derive-store");
     let secondary_path = tempdir.path().join("compat-derive-secondary");
@@ -128,9 +128,12 @@ fn derive_storage_section_is_rejected() -> eyre::Result<()> {
         .args(["--print-config", "--config", path_str(&config_path)?])
         .output()?;
 
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("unknown field `derive`"), "{stderr}");
+    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(stdout.contains("block_cache_bytes = 134217728"), "{stdout}");
+    assert!(!stderr.contains("ERROR"), "{stderr}");
 
     Ok(())
 }

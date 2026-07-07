@@ -5,14 +5,15 @@ use std::{net::SocketAddr, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
+use zinder_derive::DeriveStoreError;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, SecuritySection, SecurityToml, ServiceIdentifier,
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlReaderToml,
+    IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
+    ResolvedIngestControlReader, ResolvedSecondaryStorage, SecondaryStorageSection,
+    SecondaryStorageToml, SecuritySection, SecurityToml, ServiceIdentifier,
     guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
-    resolve_ops_listen_addr,
+    resolve_allow_public_bind, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_secondary_storage,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::StoreError;
@@ -21,7 +22,7 @@ use zinder_store::StoreError;
 #[derive(Clone, Debug)]
 pub(crate) struct LightwalletdConfig {
     pub(crate) network: Network,
-    pub(crate) storage: ResolvedCanonicalSecondaryStorage,
+    pub(crate) storage: ResolvedSecondaryStorage,
     pub(crate) ingest_control_addr: String,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
@@ -52,6 +53,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    #[error(transparent)]
+    DeriveStore(#[from] DeriveStoreError),
 
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),
@@ -113,7 +117,7 @@ pub(crate) fn lightwalletd_config_toml(
 struct LightwalletdRawConfig {
     network: NetworkSection,
     ops: OpsSection,
-    storage: CanonicalSecondaryStorageSection,
+    storage: SecondaryStorageSection,
     ingest_control: IngestControlSection,
     compat: CompatSection,
     node: NodeSection,
@@ -130,7 +134,7 @@ fn resolve_lightwalletd_config(
     config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let network = config.network.resolve()?;
-    let storage = resolve_canonical_secondary_storage(config.storage)?;
+    let storage = resolve_secondary_storage(config.storage)?;
     let ResolvedIngestControlReader {
         addr: ingest_control_addr,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -163,7 +167,7 @@ struct LightwalletdConfigToml {
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
-    storage: CanonicalSecondaryStorageToml,
+    storage: SecondaryStorageToml,
     ingest_control: IngestControlReaderToml,
     compat: CompatToml,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,7 +180,7 @@ impl LightwalletdConfigToml {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
+            storage: SecondaryStorageToml::from_resolved(&config.storage),
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),
                 config.ingest_control_bearer_token_path.as_deref(),

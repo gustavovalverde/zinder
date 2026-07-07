@@ -156,6 +156,21 @@ pub enum DeriveStoreError {
         #[source]
         source: rust_rocksdb::Error,
     },
+    /// A checkpoint was requested from a secondary reader.
+    #[error("derive store checkpoint requires a primary store; opened secondary at {path:?}")]
+    CheckpointRequiresPrimary {
+        /// Derive store path opened by the secondary reader.
+        path: PathBuf,
+    },
+    /// `RocksDB` could not create a checkpoint at the requested path.
+    #[error("derive store checkpoint at {path:?} failed: {source}")]
+    Checkpoint {
+        /// Checkpoint destination path.
+        path: PathBuf,
+        /// Underlying `RocksDB` error.
+        #[source]
+        source: rust_rocksdb::Error,
+    },
 }
 
 /// Column-family identifier surfaced in `DeriveStoreError` variants.

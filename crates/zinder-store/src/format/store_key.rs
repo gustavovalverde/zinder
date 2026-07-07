@@ -20,7 +20,6 @@ const SUBTREE_ROOT_KEY_KIND: u8 = 5;
 const ADDRESS_OUTPUT_INDEX_KEY_KIND: u8 = 6;
 const TRANSPARENT_SPEND_FACT_KEY_KIND: u8 = 7;
 const MEMPOOL_EVENT_KEY_KIND: u8 = 8;
-const TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND: u8 = 9;
 const BLOCK_HASH_INDEX_KEY_KIND: u8 = 10;
 const TRANSPARENT_OUTPUT_KEY_KIND: u8 = 11;
 const TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND: u8 = 13;
@@ -337,42 +336,6 @@ impl StoreKey {
         Self(key)
     }
 
-    pub(crate) fn transparent_address_tx_index_address_prefix(
-        network: Network,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> Self {
-        let mut key = artifact_key_prefix(TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND);
-        key.extend_from_slice(&network.id().to_be_bytes());
-        key.extend_from_slice(&address_script_hash.as_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_address_tx_index_height_prefix(
-        network: Network,
-        address_script_hash: TransparentAddressScriptHash,
-        height: BlockHeight,
-    ) -> Self {
-        let mut key =
-            Self::transparent_address_tx_index_address_prefix(network, address_script_hash).0;
-        key.extend_from_slice(&height.value().to_be_bytes());
-        Self(key)
-    }
-
-    pub(crate) fn transparent_address_tx_index(
-        network: Network,
-        address_script_hash: TransparentAddressScriptHash,
-        height: BlockHeight,
-        tx_index_in_block: u32,
-        chain_epoch: ChainEpochId,
-    ) -> Self {
-        let mut key =
-            Self::transparent_address_tx_index_height_prefix(network, address_script_hash, height)
-                .0;
-        key.extend_from_slice(&tx_index_in_block.to_be_bytes());
-        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
-        Self(key)
-    }
-
     pub(crate) fn block_hash_index(network: Network, block_hash: BlockHash) -> Self {
         let mut key = artifact_key_prefix(BLOCK_HASH_INDEX_KEY_KIND);
         key.extend_from_slice(&network.id().to_be_bytes());
@@ -566,9 +529,7 @@ impl StoreKey {
         }
         if !matches!(
             key_bytes[1],
-            TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND
-                | TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND
-                | TRANSPARENT_ADDRESS_TX_INDEX_KEY_KIND
+            TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND | TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND
         ) {
             return None;
         }
@@ -659,13 +620,6 @@ mod tests {
                 zinder_core::TransparentOutPoint::new(transaction_id, 0),
             ),
             StoreKey::transparent_output_block_index(network, height, chain_epoch),
-            StoreKey::transparent_address_tx_index(
-                network,
-                zinder_core::TransparentAddressScriptHash::from_bytes([0x55; 32]),
-                height,
-                7,
-                chain_epoch,
-            ),
             StoreKey::mempool_event(99),
         ]
         .map(|key| key.as_bytes()[..2].to_vec());

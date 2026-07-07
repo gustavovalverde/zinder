@@ -3,9 +3,26 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::Path,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use tempfile::tempdir;
+use tokio::process::Command as TokioCommand;
+use tonic::transport::{Channel, Endpoint};
+use zinder_core::Network;
+use zinder_proto::{
+    capabilities::{
+        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+        EXPLORER_TRANSACTION_FEES_V1,
+    },
+    v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient},
+};
+use zinder_testkit::StoreFixture;
 
 #[test]
 fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
@@ -82,10 +99,138 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_starts_without_derive_store_and_omits_derive_capabilities() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let tempdir = tempdir()?;
+    let secondary_path = tempdir.path().join("explorer-secondary");
+    let config_path = tempdir.path().join("zinder-explorer.toml");
+    let listen_addr = unused_loopback_addr()?;
+    fs::write(
+        &config_path,
+        explorer_config_toml(store_fixture.tempdir_path(), &secondary_path, listen_addr)?,
+    )?;
+
+    let mut child = zinder_explorer_tokio_command()
+        .args(["--config", path_str(&config_path)?])
+        .spawn()?;
+
+    let channel = await_explorer_channel(listen_addr).await;
+    if channel.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let channel = channel?;
+    let mut client = ExplorerQueryClient::new(channel);
+    let server_info = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.server_info(ServerInfoRequest {}),
+    )
+    .await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    let explorer_info = server_info
+        .map_err(|_| eyre::eyre!("explorer ServerInfo request timed out"))??
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre::eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .ok_or_else(|| eyre::eyre!("server info missing common envelope"))?;
+
+    assert!(
+        common
+            .capabilities
+            .iter()
+            .any(|capability| capability == EXPLORER_TRANSACTION_DETAIL_V1),
+        "{:?}",
+        common.capabilities
+    );
+    assert!(
+        !common
+            .capabilities
+            .iter()
+            .any(|capability| capability == EXPLORER_BLOCK_SUMMARY_V1),
+        "{:?}",
+        common.capabilities
+    );
+    assert!(
+        !common
+            .capabilities
+            .iter()
+            .any(|capability| capability == EXPLORER_OVERVIEW_SNAPSHOT_V1),
+        "{:?}",
+        common.capabilities
+    );
+    assert!(
+        !common
+            .capabilities
+            .iter()
+            .any(|capability| capability == EXPLORER_TRANSACTION_FEES_V1),
+        "{:?}",
+        common.capabilities
+    );
+
+    Ok(())
+}
+
 fn zinder_explorer_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-explorer"));
     command.env_clear();
     command
+}
+
+fn zinder_explorer_tokio_command() -> TokioCommand {
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_zinder-explorer"));
+    command.env_clear();
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    command
+}
+
+fn explorer_config_toml(
+    storage_path: &Path,
+    secondary_path: &Path,
+    listen_addr: SocketAddr,
+) -> eyre::Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+
+[explorer]
+listen_addr = "{}"
+wallet_query_endpoint = "http://127.0.0.1:1"
+
+[ops]
+listen_addr = ""
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?,
+        listen_addr,
+    ))
+}
+
+fn unused_loopback_addr() -> eyre::Result<SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?)
+}
+
+async fn await_explorer_channel(listen_addr: SocketAddr) -> eyre::Result<Channel> {
+    let endpoint = format!("http://{listen_addr}");
+    for _ in 0..100 {
+        match Endpoint::from_shared(endpoint.clone())?.connect().await {
+            Ok(channel) => return Ok(channel),
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    Err(eyre::eyre!(
+        "explorer did not accept gRPC connections at {listen_addr}"
+    ))
 }
 
 fn path_str(path: &Path) -> eyre::Result<&str> {

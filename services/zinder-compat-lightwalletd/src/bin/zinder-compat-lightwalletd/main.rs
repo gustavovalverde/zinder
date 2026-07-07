@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
+use zinder_derive::{DeriveStore, DeriveStoreOptions};
 use zinder_runtime::{
     Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
     install_tracing_subscriber, spawn_ops_endpoint_for,
@@ -122,7 +123,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let store = match SecondaryChainStore::open(
+    let canonical_store = match SecondaryChainStore::open(
         &lightwalletd_config.storage.path,
         &lightwalletd_config.storage.secondary_path,
         zinder_store::ChainStoreOptions {
@@ -130,10 +131,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             ..zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network)
         },
     ) {
-        Ok(handle) => {
-            open_storage_phase.complete();
-            handle
-        }
+        Ok(handle) => handle,
         Err(error) => {
             let wrapped = LightwalletdConfigError::Store(error);
             open_storage_phase.fail(&wrapped);
@@ -141,7 +139,25 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(wrapped);
         }
     };
-    let visible_height = store
+    let derive_store = match DeriveStore::open_secondary(
+        DeriveStore::path_for_canonical(&lightwalletd_config.storage.path),
+        lightwalletd_config.storage.secondary_path.join("derive"),
+        DeriveStoreOptions {
+            sync_writes: false,
+            consumers: DeriveStore::bundled_consumers(),
+            rocksdb_resource_budget: lightwalletd_config.storage.derive_rocksdb_budget,
+        },
+    ) {
+        Ok(derive_store) => derive_store,
+        Err(error) => {
+            let wrapped = LightwalletdConfigError::DeriveStore(error);
+            open_storage_phase.fail(&wrapped);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
+    open_storage_phase.complete();
+    let visible_height = canonical_store
         .current_chain_epoch()
         .map_err(LightwalletdConfigError::Store)?
         .map(|epoch| epoch.visible_tip_height.value());
@@ -182,10 +198,11 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         }
     };
     let wallet_query = zinder_query::WalletQuery::new(
-        store.clone(),
+        canonical_store.clone(),
         broadcaster,
         network_upgrade_activations.clone(),
-    );
+    )
+    .with_derive_store(derive_store);
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let mempool_surface = Arc::new({
@@ -205,7 +222,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
-        store,
+        canonical_store,
         readiness.clone(),
         zinder_query::SecondaryCatchupOptions {
             interval: lightwalletd_config.storage.secondary_catchup_interval,

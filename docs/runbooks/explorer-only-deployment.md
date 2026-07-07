@@ -29,7 +29,7 @@ stay on a separate operational footprint (see
 | Variable | Required | Description |
 | -------- | -------- | ----------- |
 | `ZINDER_NETWORK__NAME` | Yes | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Must match the `zinder-query` deployment. |
-| `ZINDER_STORAGE__PATH` | Yes | Canonical store path; explorer opens the writer-owned derive store at its `derive` subdirectory. |
+| `ZINDER_STORAGE__PATH` | Yes | Canonical store path; explorer opens the writer-owned derive store at its `derive` subdirectory when available. |
 | `ZINDER_STORAGE__SECONDARY_PATH` | Yes | Process-unique RocksDB secondary metadata path for this explorer process. |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | Yes | gRPC listen address (e.g. `0.0.0.0:9087`). |
 | `ZINDER_OPS__LISTEN_ADDR` | Yes | HTTP listen address for `/healthz`, `/readyz`, `/metrics`. |

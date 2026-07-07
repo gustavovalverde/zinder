@@ -57,6 +57,46 @@ fn chain_event_history_resumes_after_persisted_cursor() -> eyre::Result<()> {
 }
 
 #[test]
+fn checkpoint_bootstrap_cursor_resumes_after_artifactless_anchor() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let checkpoint_height = BlockHeight::new(10);
+    let checkpoint_hash = block_hash(checkpoint_height.value());
+    let checkpoint_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: checkpoint_height,
+        visible_tip_hash: checkpoint_hash,
+        settled_tip_height: checkpoint_height,
+        settled_tip_hash: checkpoint_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_200_010),
+    };
+    let checkpoint_commit = store.commit_chain_epoch(
+        ChainEpochArtifacts::new(checkpoint_epoch, Vec::new(), Vec::new())
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
+                height: checkpoint_height,
+            }),
+    )?;
+    let (next_epoch, next_block, next_compact_block) = synthetic_epoch(2, 11);
+    let next_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        next_epoch,
+        vec![next_block],
+        vec![next_compact_block],
+    ))?;
+
+    let resumed_history = store.chain_event_history(ChainEventHistoryRequest::new(
+        Some(&checkpoint_commit.event_envelope.cursor),
+        NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
+    ))?;
+
+    assert_eq!(resumed_history, vec![next_commit.event_envelope]);
+
+    Ok(())
+}
+
+#[test]
 fn chain_event_history_returns_bounded_pages() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;

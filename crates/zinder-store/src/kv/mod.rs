@@ -27,7 +27,6 @@ pub(crate) enum StorageTable {
     TransparentOutputBlockIndex,
     TransparentSpendFact,
     TransparentSpendFactBlockIndex,
-    TransparentAddressTxIndex,
     BlockHashIndex,
     ReorgWindow,
     ChainEvent,
@@ -53,7 +52,6 @@ impl StorageTable {
             Self::TransparentOutputBlockIndex => "transparent_output_block_index",
             Self::TransparentSpendFact => "transparent_spend_fact",
             Self::TransparentSpendFactBlockIndex => "transparent_spend_fact_block_index",
-            Self::TransparentAddressTxIndex => "transparent_address_tx_index",
             Self::BlockHashIndex => "block_hash_index",
             Self::ReorgWindow => "reorg_window",
             Self::ChainEvent => "chain_event",
@@ -61,7 +59,7 @@ impl StorageTable {
         }
     }
 
-    pub(crate) const fn all() -> [Self; 21] {
+    pub(crate) const fn all() -> [Self; 20] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
@@ -79,7 +77,6 @@ impl StorageTable {
             Self::TransparentOutputBlockIndex,
             Self::TransparentSpendFact,
             Self::TransparentSpendFactBlockIndex,
-            Self::TransparentAddressTxIndex,
             Self::BlockHashIndex,
             Self::ReorgWindow,
             Self::ChainEvent,

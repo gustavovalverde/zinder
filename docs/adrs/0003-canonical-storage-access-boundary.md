@@ -109,7 +109,7 @@ Read-only RPCs are served directly from the local secondary store. Live writer-o
 
 ## Backup
 
-`zinder-ingest backup --to <path>` uses the RocksDB Checkpoint API to create a hardlinked point-in-time checkpoint of the canonical store while the writer is live. Restore is operator-driven in v1: stop all processes, replace the storage path with a checkpoint, start the primary, then let readers reopen and catch up.
+`zinder-ingest backup --to <path>` uses the RocksDB Checkpoint API to create hardlinked point-in-time checkpoints of both the canonical store and the bundled derive store while the writer is live. The derive checkpoint is staged first, the canonical checkpoint is created second, and the staged derive checkpoint is installed under `<path>/derive`; this ordering can leave restored derive state slightly behind canonical state, but never ahead of it. Restore is operator-driven in v1: stop all processes, replace the storage path with a checkpoint, start the primary, then let readers reopen and catch up.
 
 Checkpoint readers are separate from production readers. They open frozen snapshots and must validate store identity, network, schema version, and visible epoch before serving data.
 

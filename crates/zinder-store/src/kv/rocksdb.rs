@@ -1,4 +1,4 @@
-use std::{fs, path::Path, sync::Arc, time::Instant};
+use std::{collections::BTreeSet, fs, path::Path, sync::Arc, time::Instant};
 
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
@@ -12,6 +12,7 @@ type PrefixScanVisitor<'visitor> =
     &'visitor mut dyn FnMut(&[u8], &[u8]) -> Result<PrefixScanControl, StoreError>;
 
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
+const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
 
 /// Filesystem I/O mode resolved while opening a `RocksDB` instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,16 +210,35 @@ fn record_rocksdb_io_mode(role: RocksDbOpenRole<'_>, io_mode: RocksDbIoMode) {
 fn storage_column_family_descriptors(
     block_cache: &Cache,
     rocksdb_resource_budget: RocksDbResourceBudget,
+    existing_column_families: &[String],
 ) -> Vec<ColumnFamilyDescriptor> {
-    StorageTable::all()
+    let mut opened_names = BTreeSet::new();
+    let mut descriptors = StorageTable::all()
         .into_iter()
         .map(|table| {
+            opened_names.insert(table.column_family_name().to_owned());
             ColumnFamilyDescriptor::new(
                 table.column_family_name(),
                 column_family_options(table, block_cache, rocksdb_resource_budget),
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    for name in existing_column_families {
+        if name == ROCKSDB_DEFAULT_COLUMN_FAMILY || opened_names.contains(name) {
+            continue;
+        }
+        descriptors.push(ColumnFamilyDescriptor::new(
+            name,
+            extra_column_family_options(block_cache, rocksdb_resource_budget),
+        ));
+    }
+
+    descriptors
+}
+
+fn existing_column_family_names(path: &Path) -> Vec<String> {
+    DB::list_cf(&Options::default(), path).unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -238,12 +258,15 @@ impl RocksChainStore {
         sync_writes: bool,
         rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
+        let existing_column_families = existing_column_family_names(path.as_ref());
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary {
                 path: path.as_ref(),
             },
             rocksdb_resource_budget,
-            storage_column_family_descriptors,
+            |cache, resource_budget| {
+                storage_column_family_descriptors(cache, resource_budget, &existing_column_families)
+            },
         )
         .map_err(|source| StoreError::primary_open_failed(path.as_ref(), source))?;
 
@@ -267,13 +290,16 @@ impl RocksChainStore {
         sync_writes: bool,
         rocksdb_resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, StoreError> {
+        let existing_column_families = existing_column_family_names(primary_path.as_ref());
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Secondary {
                 primary_path: primary_path.as_ref(),
                 secondary_path: secondary_path.as_ref(),
             },
             rocksdb_resource_budget,
-            storage_column_family_descriptors,
+            |cache, resource_budget| {
+                storage_column_family_descriptors(cache, resource_budget, &existing_column_families)
+            },
         )
         .map_err(StoreError::storage_unavailable)?;
 
@@ -563,6 +589,16 @@ impl RocksChainStore {
         self.db
             .create_cf(name, &options)
             .map_err(StoreError::storage_unavailable)
+    }
+
+    /// Drops an extra column family opened only for schema migration.
+    pub(crate) fn drop_column_family(&self, name: &'static str) -> Result<(), StoreError> {
+        if self.db.cf_handle(name).is_some() {
+            self.db
+                .drop_cf(name)
+                .map_err(StoreError::storage_unavailable)?;
+        }
+        Ok(())
     }
 
     /// Walks two column families in one ordered pass, pairing rows whose
@@ -1398,6 +1434,19 @@ fn column_family_options(
         options.set_optimize_filters_for_hits(true);
     }
 
+    options
+}
+
+fn extra_column_family_options(
+    cache: &Cache,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+) -> Options {
+    let mut options = Options::default();
+    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+    options.set_write_buffer_size(
+        usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
+    );
+    options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
     options
 }
 

@@ -21,7 +21,7 @@ The decisions that govern this plane:
 
 `zinder-explorer` is a fourth deployable alongside `zinder-ingest`, `zinder-query`, and `zinder-compat-lightwalletd`. It:
 
-- **Consumes** the writer-owned derive store as a RocksDB secondary under `storage.path`, plus `WalletQuery` over gRPC for federated read paths.
+- **Consumes** the writer-owned derive store as a RocksDB secondary under `storage.path` when available, plus `WalletQuery` over gRPC for federated read paths.
 - **Owns** no primary RocksDB. `storage.path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
 - **Produces** the `ExplorerQuery` gRPC service.
 - **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret; does not serve any balance RPC.
@@ -242,7 +242,7 @@ The explorer plane fails independently from canonical state.
 
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
 - An explorer service crash does not stop `zinder-query`. `WalletQuery` continues serving wallet primitives. `WalletQuery.TransparentAddressBalance` is wallet-plane and unaffected by explorer state: it sums the canonical unspent-output index in-process and overlays the live mempool through the colocated `IngestControl` endpoint.
-- An explorer derive view becoming inconsistent does not corrupt canonical state. Operators drop the explorer store and rebuild from `WalletQuery.ChainEvents` at `cursor = None`.
+- An explorer derive view becoming inconsistent does not corrupt canonical state. Operators drop the derive store and rebuild from retained canonical events. When the derive store is absent, `zinder-explorer` starts with derive-backed capabilities omitted.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract

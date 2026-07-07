@@ -22,7 +22,6 @@ mod rocksdb_resource_budget;
 mod store_error;
 mod subtree_root;
 mod transaction_artifact;
-mod transparent_address_tx_index;
 mod transparent_output;
 mod transparent_spend_fact;
 mod tree_state;
@@ -43,7 +42,6 @@ pub use chain_store::{
     ChainEpochReadApi, ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
     DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
     PrimaryChainStore, RawBlobRetention, SecondaryCatchupOutcome, SecondaryChainStore,
-    TransparentAddressTxIndexPage, TransparentAddressTxIndexPageRequest,
 };
 pub use event_stream::{
     ChainEventStreamResume, EventEnvelope, EventStreamStartPosition, run_event_stream,
@@ -85,5 +83,4 @@ pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::{
     TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
 };
-pub use transparent_address_tx_index::TransparentAddressTxIndexStore;
 pub use tree_state::TreeStateStore;
