@@ -21,6 +21,9 @@
 //! - Native zinder protobuf `string` hash fields, JSON, log records, and
 //!   any human-facing surface carry RPC byte order hex. Use
 //!   [`encode_rpc_transaction_id_hex`] and [`decode_rpc_transaction_id_hex`].
+//! - Zebra's indexer gRPC (`zebra_indexer_rpc`) emits hash `bytes` fields
+//!   via `bytes_in_display_order`, i.e. RPC byte order carried as raw
+//!   bytes. Use [`decode_rpc_transaction_id_bytes`].
 
 use crate::TransactionId;
 use crate::wire::WireDecodeError;
@@ -106,6 +109,30 @@ pub fn decode_rpc_transaction_id_hex(input: &str) -> Result<TransactionId, WireD
     Ok(TransactionId::from_bytes(buffer))
 }
 
+/// Decode RPC byte order bytes into a [`TransactionId`].
+///
+/// The raw-bytes analogue of [`decode_rpc_transaction_id_hex`]. Zebra's
+/// indexer gRPC surface (`zebra_indexer_rpc`) fills hash `bytes` fields
+/// with `bytes_in_display_order`, so the input is reversed into internal
+/// byte order before constructing the domain value.
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
+///
+/// # Errors
+///
+/// Returns [`WireDecodeError::InvalidLength`] if the input is not exactly 32
+/// bytes.
+pub fn decode_rpc_transaction_id_bytes(bytes: &[u8]) -> Result<TransactionId, WireDecodeError> {
+    let mut buffer: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WireDecodeError::InvalidLength {
+            expected: TRANSACTION_ID_BYTE_COUNT,
+            actual: bytes.len(),
+        })?;
+    buffer.reverse();
+    Ok(TransactionId::from_bytes(buffer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +206,37 @@ mod tests {
         let decoded = decode_rpc_transaction_id_hex(TESTNET_TXID_RPC_HEX)?;
         assert_eq!(decoded.as_bytes(), TESTNET_TXID_INTERNAL_BYTES);
         Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_matches_storage_form_for_testnet_txid() -> TestResult {
+        let mut display_order_bytes = TESTNET_TXID_INTERNAL_BYTES;
+        display_order_bytes.reverse();
+        let decoded = decode_rpc_transaction_id_bytes(&display_order_bytes)?;
+        assert_eq!(decoded.as_bytes(), TESTNET_TXID_INTERNAL_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_agrees_with_rpc_hex_decode() -> TestResult {
+        let mut display_order_bytes = TESTNET_TXID_INTERNAL_BYTES;
+        display_order_bytes.reverse();
+        let from_bytes = decode_rpc_transaction_id_bytes(&display_order_bytes)?;
+        let from_hex = decode_rpc_transaction_id_hex(TESTNET_TXID_RPC_HEX)?;
+        assert_eq!(from_bytes, from_hex);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_rejects_wrong_length() {
+        let outcome = decode_rpc_transaction_id_bytes(&[0u8; 16]);
+        assert!(matches!(
+            outcome,
+            Err(WireDecodeError::InvalidLength {
+                expected: 32,
+                actual: 16,
+            })
+        ));
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //! the storage form and the lightwalletd-compat `bytes` boundary;
 //! `encode_rpc_*_hex` and `decode_rpc_*_hex` for the RPC byte order hex form
 //! every public wallet UI, block explorer, log record, and Zcash JSON-RPC
-//! reply uses.
+//! reply uses; `decode_rpc_*_bytes` for RPC byte order carried as raw bytes
+//! (Zebra's indexer gRPC fills hash `bytes` fields with
+//! `bytes_in_display_order`).
 //!
 //! RPC byte order is defined normatively in the Zcash protocol specification
 //! at protocol.tex:1127 (`\rpcByteOrder`) and used at protocol.tex:4036. It
@@ -44,12 +46,12 @@ pub use address_script_hash::{
     ADDRESS_SCRIPT_HASH_LEN, decode_address_script_hash, encode_address_script_hash,
 };
 pub use auth_digest::{
-    decode_internal_auth_digest, decode_rpc_auth_digest_hex, encode_internal_auth_digest,
-    encode_rpc_auth_digest_hex,
+    decode_internal_auth_digest, decode_rpc_auth_digest_bytes, decode_rpc_auth_digest_hex,
+    encode_internal_auth_digest, encode_rpc_auth_digest_hex,
 };
 pub use block_hash::{
-    decode_internal_block_hash, decode_rpc_block_hash_hex, encode_internal_block_hash,
-    encode_rpc_block_hash_hex,
+    decode_internal_block_hash, decode_rpc_block_hash_bytes, decode_rpc_block_hash_hex,
+    encode_internal_block_hash, encode_rpc_block_hash_hex,
 };
 pub use branch_id::{decode_branch_id_hex, encode_branch_id_hex};
 pub use chain_name::{
@@ -65,8 +67,8 @@ pub use in_block_position::{
 pub use merkle_root::{decode_rpc_merkle_root_hex, encode_rpc_merkle_root_hex};
 pub use outpoint_key::{OUTPOINT_KEY_LEN, decode_outpoint_key, encode_outpoint_key};
 pub use transaction_id::{
-    decode_internal_transaction_id, decode_rpc_transaction_id_hex, encode_internal_transaction_id,
-    encode_rpc_transaction_id_hex,
+    decode_internal_transaction_id, decode_rpc_transaction_id_bytes, decode_rpc_transaction_id_hex,
+    encode_internal_transaction_id, encode_rpc_transaction_id_hex,
 };
 pub use unix_seconds::{UNIX_SECONDS_KEY_LEN, decode_unix_seconds, encode_unix_seconds};
 pub use utxo_set_commitment::{

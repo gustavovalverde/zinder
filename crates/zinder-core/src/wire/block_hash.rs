@@ -98,6 +98,30 @@ pub fn decode_rpc_block_hash_hex(input: &str) -> Result<BlockHash, WireDecodeErr
     Ok(BlockHash::from_bytes(buffer))
 }
 
+/// Decode RPC byte order bytes into a [`BlockHash`].
+///
+/// The raw-bytes analogue of [`decode_rpc_block_hash_hex`]. Zebra's
+/// indexer gRPC surface (`zebra_indexer_rpc`) fills hash `bytes` fields
+/// with `bytes_in_display_order`, so the input is reversed into internal
+/// byte order before constructing the domain value.
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
+///
+/// # Errors
+///
+/// Returns [`WireDecodeError::InvalidLength`] if the input is not exactly 32
+/// bytes.
+pub fn decode_rpc_block_hash_bytes(bytes: &[u8]) -> Result<BlockHash, WireDecodeError> {
+    let mut buffer: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WireDecodeError::InvalidLength {
+            expected: BLOCK_HASH_BYTE_COUNT,
+            actual: bytes.len(),
+        })?;
+    buffer.reverse();
+    Ok(BlockHash::from_bytes(buffer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +195,27 @@ mod tests {
         let decoded = decode_rpc_block_hash_hex(TESTNET_BLOCK_HASH_RPC_HEX)?;
         assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
         Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_matches_storage_form_for_testnet_block() -> TestResult {
+        let mut display_order_bytes = TESTNET_BLOCK_HASH_INTERNAL_BYTES;
+        display_order_bytes.reverse();
+        let decoded = decode_rpc_block_hash_bytes(&display_order_bytes)?;
+        assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_rejects_wrong_length() {
+        let outcome = decode_rpc_block_hash_bytes(&[0u8; 8]);
+        assert!(matches!(
+            outcome,
+            Err(WireDecodeError::InvalidLength {
+                expected: 32,
+                actual: 8,
+            })
+        ));
     }
 
     #[test]

@@ -369,20 +369,27 @@ async fn build_added_event(
     }
 }
 
+/// Decodes a `MempoolChangeMessage.tx_hash` into a [`TransactionId`].
+///
+/// Zebra's indexer fills the field with `bytes_in_display_order`, so the
+/// wire bytes carry RPC byte order and must be reversed into internal
+/// order; a verbatim read yields a byte-reversed txid that fails every
+/// follow-up `getrawtransaction` hydration lookup.
 fn decode_transaction_id(wire_bytes: &[u8]) -> Result<TransactionId, SourceError> {
-    let byte_count = wire_bytes.len();
-    let id_bytes = <[u8; 32]>::try_from(wire_bytes)
-        .map_err(|_| SourceError::InvalidTransactionIdLength { byte_count })?;
-    Ok(TransactionId::from_bytes(id_bytes))
+    zinder_core::wire::decode_rpc_transaction_id_bytes(wire_bytes).map_err(|_| {
+        SourceError::InvalidTransactionIdLength {
+            byte_count: wire_bytes.len(),
+        }
+    })
 }
 
+/// Decodes a `MempoolChangeMessage.auth_digest` into an [`AuthDigest`].
+///
+/// Same `bytes_in_display_order` wire contract as the txid field. An
+/// absent or malformed digest reads as `None`; pre-v5 transactions carry
+/// no digest.
 fn decode_auth_digest(wire_bytes: &[u8]) -> Option<AuthDigest> {
-    if wire_bytes.is_empty() {
-        return None;
-    }
-    <[u8; 32]>::try_from(wire_bytes)
-        .ok()
-        .map(AuthDigest::from_bytes)
+    zinder_core::wire::decode_rpc_auth_digest_bytes(wire_bytes).ok()
 }
 
 #[cfg(test)]
@@ -394,11 +401,35 @@ mod tests {
 
     use super::*;
 
+    // Zebra's indexer fills `MempoolChangeMessage.tx_hash` and
+    // `auth_digest` with `bytes_in_display_order` (RPC byte order); the
+    // decoders must reverse into internal order or every hydration lookup
+    // built from the txid targets a byte-reversed transaction.
     #[test]
-    fn decode_transaction_id_accepts_32_byte_payload() -> Result<(), SourceError> {
-        let wire_bytes = [0x42u8; 32];
+    fn decode_transaction_id_reverses_display_order_wire_bytes() -> Result<(), SourceError> {
+        let mut wire_bytes = [0u8; 32];
+        for (index, slot) in wire_bytes.iter_mut().enumerate() {
+            *slot = u8::try_from(index).unwrap_or_default();
+        }
         let transaction_id = decode_transaction_id(&wire_bytes)?;
-        assert_eq!(transaction_id.as_bytes(), wire_bytes);
+        let mut internal_bytes = wire_bytes;
+        internal_bytes.reverse();
+        assert_eq!(transaction_id.as_bytes(), internal_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_transaction_id_matches_getrawmempool_display_hex_for_same_transaction()
+    -> eyre::Result<()> {
+        // The same txid arrives display-order-hex from `getrawmempool` and
+        // display-order-bytes from the indexer stream; both must decode to
+        // one internal-order id or stream hydration diverges from the
+        // resnapshot path.
+        let display_hex = "c3ca0ce69e0661792cbc65812eb351d0f5ba7238fdec2bb5dca3fc8ab7559436";
+        let wire_bytes = hex::decode(display_hex)?;
+        let from_stream = decode_transaction_id(&wire_bytes)?;
+        let from_rpc = zinder_core::wire::decode_rpc_transaction_id_hex(display_hex)?;
+        assert_eq!(from_stream, from_rpc);
         Ok(())
     }
 
@@ -419,10 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_auth_digest_returns_some_for_32_byte_payload() -> Result<(), &'static str> {
-        let wire_bytes = [0x55u8; 32];
+    fn decode_auth_digest_reverses_display_order_wire_bytes() -> Result<(), &'static str> {
+        let mut wire_bytes = [0u8; 32];
+        for (index, slot) in wire_bytes.iter_mut().enumerate() {
+            *slot = u8::try_from(index).unwrap_or_default();
+        }
         let auth_digest = decode_auth_digest(&wire_bytes).ok_or("32 byte payload decodes")?;
-        assert_eq!(auth_digest.as_bytes(), wire_bytes);
+        let mut internal_bytes = wire_bytes;
+        internal_bytes.reverse();
+        assert_eq!(auth_digest.as_bytes(), internal_bytes);
         Ok(())
     }
 

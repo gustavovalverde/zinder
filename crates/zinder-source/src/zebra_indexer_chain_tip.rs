@@ -34,7 +34,7 @@ use zinder_proto::external::zebra_indexer_rpc::{
     BlockHashAndHeight, Empty, indexer_client::IndexerClient,
 };
 
-use crate::{SourceError, ZebraIndexerSourceTarget, decode_rpc_block_hash};
+use crate::{SourceError, ZebraIndexerSourceTarget};
 
 /// A chain-tip change observed via Zebra's gRPC indexer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,17 +174,15 @@ impl ChainTipNotificationSource for ZebraIndexerChainTipSource {
 fn decode_chain_tip_message(
     wire_message: &BlockHashAndHeight,
 ) -> Result<ChainTipNotification, SourceError> {
-    if wire_message.hash.len() != 32 {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "Zebra chain_tip_change wire reported a block hash that was not 32 bytes",
-        });
-    }
-    // `BlockHashAndHeight.hash` arrives in display order per the proto
-    // contract, which matches what JSON-RPC consumers feed into
-    // `decode_rpc_block_hash` after hex-encoding. Reuse the same
-    // canonical decode path so internal byte ordering stays single-sourced.
-    let display_hash_hex = hex::encode(&wire_message.hash);
-    let hash = decode_rpc_block_hash(&display_hash_hex)?;
+    // `BlockHashAndHeight.hash` carries `bytes_in_display_order` (RPC byte
+    // order), the same wire contract as every hash field on the Zebra
+    // indexer surface.
+    let hash =
+        zinder_core::wire::decode_rpc_block_hash_bytes(&wire_message.hash).map_err(|_| {
+            SourceError::SourceProtocolMismatch {
+                reason: "Zebra chain_tip_change wire reported a block hash that was not 32 bytes",
+            }
+        })?;
     Ok(ChainTipNotification {
         tip_id: BlockId {
             height: BlockHeight::new(wire_message.height),

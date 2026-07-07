@@ -91,6 +91,30 @@ pub fn decode_rpc_auth_digest_hex(input: &str) -> Result<AuthDigest, WireDecodeE
     Ok(AuthDigest::from_bytes(buffer))
 }
 
+/// Decode RPC byte order bytes into an [`AuthDigest`].
+///
+/// The raw-bytes analogue of [`decode_rpc_auth_digest_hex`]. Zebra's
+/// indexer gRPC surface (`zebra_indexer_rpc`) fills digest `bytes` fields
+/// with `bytes_in_display_order`, so the input is reversed into internal
+/// byte order before constructing the domain value.
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
+///
+/// # Errors
+///
+/// Returns [`WireDecodeError::InvalidLength`] if the input is not exactly 32
+/// bytes.
+pub fn decode_rpc_auth_digest_bytes(bytes: &[u8]) -> Result<AuthDigest, WireDecodeError> {
+    let mut buffer: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WireDecodeError::InvalidLength {
+            expected: AUTH_DIGEST_BYTE_COUNT,
+            actual: bytes.len(),
+        })?;
+    buffer.reverse();
+    Ok(AuthDigest::from_bytes(buffer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +180,32 @@ mod tests {
         let auth_digest = AuthDigest::from_bytes([0xCD; 32]);
         let rpc_form = encode_rpc_auth_digest_hex(auth_digest);
         assert_eq!(rpc_form, "cd".repeat(32));
+    }
+
+    #[test]
+    fn rpc_bytes_decode_reverses_into_internal_order() -> TestResult {
+        let internal_bytes: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+        ];
+        let mut display_order_bytes = internal_bytes;
+        display_order_bytes.reverse();
+        let decoded = decode_rpc_auth_digest_bytes(&display_order_bytes)?;
+        assert_eq!(decoded.as_bytes(), internal_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_decode_rejects_wrong_length() {
+        let outcome = decode_rpc_auth_digest_bytes(&[0u8; 16]);
+        assert!(matches!(
+            outcome,
+            Err(WireDecodeError::InvalidLength {
+                expected: 32,
+                actual: 16,
+            })
+        ));
     }
 
     #[test]
