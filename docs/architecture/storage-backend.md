@@ -127,7 +127,12 @@ marker advances only to the last fully-swept height, so when the release floor
 jumps far ahead of the marker (a store rebuilt with derive paused, then
 un-paused at tip) the backlog drains across later commits and no commit claims
 unswept ground. A sweep that advances the marker or leaves a backlog logs a
-`retention_sweep_advanced` event; a zero-work sweep stays silent.
+`retention_sweep_advanced` event; a zero-work sweep stays silent. The sweep
+scan runs before the commit's control-lock critical section so control-plane
+reads (readiness, writer status, event history) stay responsive through a
+chunk; only the marker puts and deletes ride the locked `WriteBatch`, and the
+locked commit re-reads the swept marker first, discarding a precomputed sweep
+whose starting marker no longer matches.
 In-window reverted spends need no machinery at all: their rows were never
 deleted, and the existing spend-fact repair un-hides them. Bulk catchup
 sweeps with one-batch lag because the spend facts a batch commits are not

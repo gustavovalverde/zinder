@@ -928,6 +928,8 @@ impl ChainStoreInner {
         &self,
         artifacts: ChainEpochArtifacts,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
+        let precomputed_retention_sweep = self.precompute_retention_sweep(&artifacts)?;
+
         let _control_guard = self.inner.lock_control();
         validate_chain_epoch_artifacts(&artifacts)?;
         let store_metadata_put =
@@ -953,13 +955,12 @@ impl ChainStoreInner {
             .iter()
             .map(|spend| spend.spent_outpoint)
             .collect::<HashSet<_>>();
-        let retention_sweep = build_safe_tip_retention_sweep(
-            self.inner.as_ref(),
-            &artifacts,
-            current_chain_epoch,
-            self.options.retention_sweep_max_heights_per_commit,
-            self.options.retention_sweep_max_outpoints_per_commit,
-        )?;
+        let retention_sweep =
+            if precomputed_retention_sweep.swept_marker_unchanged(self.inner.as_ref())? {
+                precomputed_retention_sweep
+            } else {
+                SafeTipRetentionSweep::empty()
+            };
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(&ChainEventEnvelopeInputs {
             inner: self.inner.as_ref(),
@@ -1822,6 +1823,31 @@ impl ChainStoreInner {
         }
     }
 
+    /// Computes the retention sweep for a commit before the control lock is
+    /// taken.
+    ///
+    /// The scan is the dominant read cost of an `AdvanceSafeTipTo` commit;
+    /// running it unlocked keeps readiness and event-history reads responsive
+    /// through a full sweep chunk. See [`build_safe_tip_retention_sweep`] for
+    /// the soundness argument and the locked marker re-check that guards the
+    /// write.
+    fn precompute_retention_sweep(
+        &self,
+        artifacts: &ChainEpochArtifacts,
+    ) -> Result<SafeTipRetentionSweep, StoreError> {
+        let scanned_chain_epoch = match self.current_chain_epoch_id()? {
+            Some(chain_epoch_id) => Some(read_chain_epoch(self.inner.as_ref(), chain_epoch_id)?),
+            None => None,
+        };
+        build_safe_tip_retention_sweep(
+            self.inner.as_ref(),
+            artifacts,
+            scanned_chain_epoch,
+            self.options.retention_sweep_max_heights_per_commit,
+            self.options.retention_sweep_max_outpoints_per_commit,
+        )
+    }
+
     fn validate_commit_order(
         &self,
         chain_epoch: &ChainEpoch,
@@ -2640,6 +2666,9 @@ struct SafeTipRetentionSweep {
     deletes: Vec<StorageDelete>,
     swept_outpoints: u64,
     advance: Option<RetentionSweepAdvance>,
+    /// Swept marker the scan started from (0 when absent). The locked commit
+    /// re-reads the marker and discards the sweep when they differ.
+    observed_swept_height: BlockHeight,
 }
 
 impl SafeTipRetentionSweep {
@@ -2649,7 +2678,21 @@ impl SafeTipRetentionSweep {
             deletes: Vec::new(),
             swept_outpoints: 0,
             advance: None,
+            observed_swept_height: BlockHeight::new(0),
         }
+    }
+
+    /// Whether the persisted swept marker still matches the value the scan
+    /// started from, so the precomputed puts and deletes may be written.
+    ///
+    /// Always true for a sweep with nothing to write.
+    fn swept_marker_unchanged(&self, inner: &impl RocksChainStoreRead) -> Result<bool, StoreError> {
+        if self.puts.is_empty() && self.deletes.is_empty() {
+            return Ok(true);
+        }
+        let swept_height =
+            read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
+        Ok(swept_height == self.observed_swept_height)
     }
 }
 
@@ -2693,6 +2736,15 @@ struct RetentionSweepAdvance {
 /// fully-swept height and the remaining backlog drains across later commits;
 /// the outpoint budget bounds the delete batch through transaction-dense
 /// eras, and the height cap bounds the scan through sparse ones.
+///
+/// The scan runs outside the control lock so readiness and event-history
+/// reads stay responsive through a multi-minute chunk. This is sound because
+/// every row it reads is finalized: the range ends at or below the previous
+/// safe tip, `validate_reorg_window_change` floors every `Replace` at
+/// `safe_tip + 1`, and the swept marker is written only by this sweep inside
+/// serialized commits. The locked commit still re-checks the marker via
+/// [`SafeTipRetentionSweep::swept_marker_unchanged`] and discards the sweep on
+/// skew rather than writing markers derived from stale state.
 fn build_safe_tip_retention_sweep(
     inner: &impl RocksChainStoreRead,
     artifacts: &ChainEpochArtifacts,
@@ -2719,6 +2771,7 @@ fn build_safe_tip_retention_sweep(
                 deletes: Vec::new(),
                 swept_outpoints: 0,
                 advance: None,
+                observed_swept_height: BlockHeight::new(0),
             });
         }
         return Ok(SafeTipRetentionSweep::empty());
@@ -2775,6 +2828,7 @@ fn build_safe_tip_retention_sweep(
             swept_outpoints,
             backlog_heights,
         }),
+        observed_swept_height: swept_through,
     })
 }
 
