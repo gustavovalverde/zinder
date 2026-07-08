@@ -70,6 +70,14 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
     let channel = await_with_retry(server_addr).await?;
     let mut client = ExplorerQueryClient::new(channel);
     let response = client.server_info(ServerInfoRequest {}).await?.into_inner();
+    assert!(
+        response
+            .freshness
+            .as_ref()
+            .and_then(|freshness| freshness.chain_view.as_ref())
+            .is_none(),
+        "ServerInfo without a derive store or upstream probe carries no chain_view",
+    );
     let explorer_info = response
         .info
         .ok_or_else(|| eyre!("server info response missing info envelope"))?;
@@ -177,11 +185,10 @@ async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Re
     let (mut client, explorer_handle) =
         spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
 
-    let explorer_info = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
+    let server_info = client.server_info(ServerInfoRequest {}).await?.into_inner();
+    let explorer_info = server_info
         .info
+        .as_ref()
         .ok_or_else(|| eyre!("server info missing info envelope"))?;
     let common = explorer_info
         .common
@@ -189,6 +196,29 @@ async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Re
         .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
     assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_SUMMARY_V1);
     assert_advertises_capability(&common.capabilities, EXPLORER_TRANSACTION_FEES_V1);
+
+    let chain_view = server_info
+        .freshness
+        .as_ref()
+        .and_then(|freshness| freshness.chain_view.as_ref())
+        .ok_or_else(|| eyre!("ServerInfo freshness missing chain_view"))?;
+    assert!(
+        chain_view.chain_epoch.is_none(),
+        "ServerInfo makes no snapshot-consistency claim",
+    );
+    let indexed_tip = chain_view
+        .indexed_tip
+        .as_ref()
+        .and_then(|indexed_tip| indexed_tip.tip.as_ref())
+        .ok_or_else(|| eyre!("ServerInfo freshness missing indexed_tip"))?;
+    let fixture_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture block missing"))?;
+    assert_eq!(indexed_tip.height, 1);
+    assert_eq!(
+        indexed_tip.hash,
+        encode_rpc_block_hash_hex(fixture_block.hash)
+    );
 
     let response = client
         .block_summaries_in_range(BlockSummariesInRangeRequest {

@@ -286,10 +286,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         // bootstrap call, before any derive-backed capability is up.
         // During `bulk_catchup` this is the only explorer response that
         // is guaranteed to succeed; sync-progress UIs depend on it for
-        // an honest denominator. `chain_epoch` is left unset here: this
-        // response does not read the store and so cannot make a
-        // snapshot-consistency claim, and the upstream observation is
-        // the only freshness signal callers need from ServerInfo today.
+        // an honest denominator. `chain_epoch` is left unset here because
+        // ServerInfo resolves no canonical follower tip and so makes no
+        // snapshot-consistency claim; the derive-plane indexed tip and the
+        // upstream observation carry the rest of the freshness signal.
         let freshness = attach_upstream_observation(
             &self.upstream_observation_cache,
             build_explorer_freshness(self.derive_store.as_ref(), EXPLORER_SERVER_INFO_V1, None, 0)?,

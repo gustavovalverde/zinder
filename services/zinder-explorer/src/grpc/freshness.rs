@@ -134,32 +134,32 @@ pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<Inde
 /// (`chain_epoch`), the derive plane's indexed tip (the block the response
 /// actually reflects), and the persisted derive status. Consumers read index
 /// lag as `chain_view.chain_epoch.visible_tip.height -
-/// chain_view.indexed_tip.tip.height`. `derive_store` is optional so the
-/// bootstrap `ServerInfo` call and any response built before a derive store is
-/// wired leave `indexed_tip` and `derive` unset. The upstream tip is overlaid
-/// separately by [`attach_upstream_observation`]. A response with no resolved
-/// chain epoch leaves `chain_view` unset until the upstream observation overlay
-/// can add a tip-only view.
+/// chain_view.indexed_tip.tip.height`. The derive-plane identity (indexed tip
+/// and derive status) is carried whenever `derive_store` is wired, so the
+/// bootstrap `ServerInfo` call reports how far the projections have
+/// materialized even though its `chain_epoch` is absent because it makes no
+/// snapshot-consistency claim. `chain_view` stays unset only when the response
+/// resolves no chain epoch and no derive store is wired. The upstream tip is
+/// overlaid separately by [`attach_upstream_observation`].
 pub(crate) fn build_explorer_freshness(
     derive_store: Option<&DeriveStore>,
     capability_version: &str,
     chain_epoch: Option<wallet::ChainEpoch>,
     snapshot_age_millis: u64,
 ) -> Result<ExplorerFreshness, Status> {
-    let chain_view = match chain_epoch {
-        Some(chain_epoch) => {
-            let (indexed_tip, derive) = match derive_store {
-                Some(store) => (read_indexed_tip(store)?, read_derive_status(Some(store))?),
-                None => (None, None),
-            };
-            Some(ChainView {
-                chain_epoch: Some(chain_epoch),
-                indexed_tip,
-                upstream_tip: None,
-                derive,
-            })
-        }
-        None => None,
+    let (indexed_tip, derive) = match derive_store {
+        Some(store) => (read_indexed_tip(store)?, read_derive_status(Some(store))?),
+        None => (None, None),
+    };
+    let chain_view = if chain_epoch.is_some() || indexed_tip.is_some() || derive.is_some() {
+        Some(ChainView {
+            chain_epoch,
+            indexed_tip,
+            upstream_tip: None,
+            derive,
+        })
+    } else {
+        None
     };
     Ok(ExplorerFreshness {
         chain_view,
