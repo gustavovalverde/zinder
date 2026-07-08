@@ -681,6 +681,8 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 
 `wallet.read.compact_block_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the `ironwoodActions`/`ironwoodCommitmentTreeSize` fields inside `CompactBlock.payload_bytes` (the vendored lightwalletd `CompactTx`/`ChainMetadata` shape, not a native `zinder.v1.wallet` field). A server advertising it has derived Ironwood action data for every block it serves, so an absent `ironwoodActions` on a given block means that block has no Ironwood activity. A server that does not advertise it predates Ironwood wallet-plane support: a missing `ironwoodActions` there is not authoritative, and a client must not read it as "no Ironwood activity".
 
+`wallet.read.subtree_roots_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the Ironwood protocol on `WalletQuery.SubtreeRoots` and the lightwalletd-compat `GetSubtreeRoots` surface. A server that does not advertise it rejects Ironwood subtree-root requests; clients fall back to linear scanning of the Ironwood tree rather than reading an error (or an empty response from an older server) as "no completed subtrees".
+
 <!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
 - `wallet.read.block_id_by_selector_v1`
@@ -693,6 +695,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `wallet.read.tree_state_at_height_v1`
 - `wallet.read.latest_tree_state_checkpoint_v1`
 - `wallet.read.subtree_roots_in_range_v1`
+- `wallet.read.subtree_roots_ironwood_v1`
 - `wallet.read.transaction_by_id_v1`
 - `wallet.read.transaction_bytes_v1`
 - `wallet.read.server_info_v1`

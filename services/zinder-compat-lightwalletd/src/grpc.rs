@@ -1005,9 +1005,7 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     match lightwalletd::ShieldedProtocol::try_from(protocol) {
         Ok(lightwalletd::ShieldedProtocol::Sapling) => Ok(ShieldedProtocol::Sapling),
         Ok(lightwalletd::ShieldedProtocol::Orchard) => Ok(ShieldedProtocol::Orchard),
-        Ok(lightwalletd::ShieldedProtocol::Ironwood) => Err(Status::unimplemented(
-            "shieldedProtocol ironwood subtree roots are not yet served by this server",
-        )),
+        Ok(lightwalletd::ShieldedProtocol::Ironwood) => Ok(ShieldedProtocol::Ironwood),
         Err(_) => Err(Status::invalid_argument("shieldedProtocol is unknown")),
     }
 }

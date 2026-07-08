@@ -20,6 +20,8 @@ pub enum ShieldedProtocol {
     Sapling,
     /// Orchard note commitment tree.
     Orchard,
+    /// Ironwood note commitment tree.
+    Ironwood,
 }
 
 impl ShieldedProtocol {
@@ -29,6 +31,7 @@ impl ShieldedProtocol {
         match self {
             Self::Sapling => 1,
             Self::Orchard => 2,
+            Self::Ironwood => 3,
         }
     }
 
@@ -38,6 +41,7 @@ impl ShieldedProtocol {
         match protocol_id {
             1 => Some(Self::Sapling),
             2 => Some(Self::Orchard),
+            3 => Some(Self::Ironwood),
             _ => None,
         }
     }
@@ -48,6 +52,7 @@ impl ShieldedProtocol {
         match self {
             Self::Sapling => "sapling",
             Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
         }
     }
 }

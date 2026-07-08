@@ -290,13 +290,10 @@ fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre:
     Ok(())
 }
 
-/// Ironwood subtree roots are deliberately unimplemented.
-///
-/// The frontier a from-genesis compact-block sync needs is built
-/// incrementally from `cmx` values, so `GetSubtreeRoots` support is
-/// deferred rather than misrouted.
+/// Ironwood subtree-root requests are served like the other pools; an empty
+/// store yields an empty stream rather than an error.
 #[tokio::test]
-async fn get_subtree_roots_rejects_ironwood_as_unimplemented() -> eyre::Result<()> {
+async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -307,21 +304,19 @@ async fn get_subtree_roots_rejects_ironwood_as_unimplemented() -> eyre::Result<(
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let status = match adapter
+    let stream = adapter
         .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
             start_index: 0,
             shielded_protocol: lightwalletd::ShieldedProtocol::Ironwood as i32,
             max_entries: 1,
         }))
-        .await
-    {
-        Ok(_response) => {
-            return Err(eyre!("expected ironwood subtree roots to be unimplemented"));
-        }
-        Err(status) => status,
-    };
-
-    assert_eq!(status.code(), Code::Unimplemented);
+        .await?
+        .into_inner();
+    let subtree_roots = collect_stream(stream).await?;
+    assert!(
+        subtree_roots.is_empty(),
+        "an empty store must yield an empty ironwood subtree-root stream"
+    );
 
     Ok(())
 }

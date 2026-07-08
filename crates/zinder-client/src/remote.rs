@@ -1453,6 +1453,7 @@ fn shielded_protocol_to_message(
     match protocol {
         ShieldedProtocol::Sapling => Ok(wallet::ShieldedProtocol::Sapling),
         ShieldedProtocol::Orchard => Ok(wallet::ShieldedProtocol::Orchard),
+        ShieldedProtocol::Ironwood => Ok(wallet::ShieldedProtocol::Ironwood),
         _ => Err(IndexerError::invalid_request(
             "shielded protocol is unsupported by the native wallet protocol",
         )),
@@ -1463,6 +1464,7 @@ fn shielded_protocol_from_message(protocol: i32) -> Result<ShieldedProtocol, Ind
     match wallet::ShieldedProtocol::try_from(protocol) {
         Ok(wallet::ShieldedProtocol::Sapling) => Ok(ShieldedProtocol::Sapling),
         Ok(wallet::ShieldedProtocol::Orchard) => Ok(ShieldedProtocol::Orchard),
+        Ok(wallet::ShieldedProtocol::Ironwood) => Ok(ShieldedProtocol::Ironwood),
         Ok(wallet::ShieldedProtocol::Unspecified) => Err(IndexerError::malformed(
             "shielded_protocol",
             "protocol is unspecified",

@@ -910,6 +910,7 @@ fn native_shielded_protocol(
     match protocol {
         ShieldedProtocol::Sapling => Ok(wallet::ShieldedProtocol::Sapling),
         ShieldedProtocol::Orchard => Ok(wallet::ShieldedProtocol::Orchard),
+        ShieldedProtocol::Ironwood => Ok(wallet::ShieldedProtocol::Ironwood),
         _ => Err(QueryError::UnsupportedShieldedProtocol { protocol }),
     }
 }

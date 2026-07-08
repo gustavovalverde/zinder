@@ -540,6 +540,9 @@ enum ShieldedProtocol {
 
   // Orchard note commitment tree.
   SHIELDED_PROTOCOL_ORCHARD = 2;
+
+  // Ironwood note commitment tree.
+  SHIELDED_PROTOCOL_IRONWOOD = 3;
 }
 
 // Inclusive-start bounded subtree-root request.

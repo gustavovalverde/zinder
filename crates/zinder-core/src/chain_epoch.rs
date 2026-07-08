@@ -189,6 +189,7 @@ impl ChainTipMetadata {
         match protocol {
             ShieldedProtocol::Sapling => self.sapling_commitment_tree_size,
             ShieldedProtocol::Orchard => self.orchard_commitment_tree_size,
+            ShieldedProtocol::Ironwood => self.ironwood_commitment_tree_size,
         }
     }
 

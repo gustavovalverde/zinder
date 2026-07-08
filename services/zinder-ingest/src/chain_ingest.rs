@@ -630,6 +630,7 @@ impl CanonicalBatchCloseTrigger {
 pub(crate) struct IngestSubtreeRootIndexes {
     sapling: SubtreeRootIndex,
     orchard: SubtreeRootIndex,
+    ironwood: SubtreeRootIndex,
 }
 
 impl Default for IngestSubtreeRootIndexes {
@@ -637,6 +638,7 @@ impl Default for IngestSubtreeRootIndexes {
         Self {
             sapling: SubtreeRootIndex::new(0),
             orchard: SubtreeRootIndex::new(0),
+            ironwood: SubtreeRootIndex::new(0),
         }
     }
 }
@@ -649,6 +651,9 @@ impl IngestSubtreeRootIndexes {
             ),
             orchard: SubtreeRootIndex::new(
                 tip_metadata.completed_subtree_count(ShieldedProtocol::Orchard),
+            ),
+            ironwood: SubtreeRootIndex::new(
+                tip_metadata.completed_subtree_count(ShieldedProtocol::Ironwood),
             ),
         }
     }
@@ -664,6 +669,7 @@ impl IngestSubtreeRootIndexes {
         match protocol {
             ShieldedProtocol::Sapling => Ok(self.sapling),
             ShieldedProtocol::Orchard => Ok(self.orchard),
+            ShieldedProtocol::Ironwood => Ok(self.ironwood),
             _ => Err(IngestError::UnsupportedShieldedProtocol { protocol }),
         }
     }
@@ -680,6 +686,7 @@ impl IngestSubtreeRootIndexes {
         match protocol {
             ShieldedProtocol::Sapling => self.sapling = subtree_index,
             ShieldedProtocol::Orchard => self.orchard = subtree_index,
+            ShieldedProtocol::Ironwood => self.ironwood = subtree_index,
             _ => return Err(IngestError::UnsupportedShieldedProtocol { protocol }),
         }
 
@@ -974,6 +981,10 @@ where
         (
             ShieldedProtocol::Sapling,
             tip_metadata.completed_subtree_count(ShieldedProtocol::Sapling),
+        ),
+        (
+            ShieldedProtocol::Ironwood,
+            tip_metadata.completed_subtree_count(ShieldedProtocol::Ironwood),
         ),
         (
             ShieldedProtocol::Orchard,

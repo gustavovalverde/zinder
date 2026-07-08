@@ -60,6 +60,13 @@ pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
     "wallet.read.latest_tree_state_checkpoint_v1";
 /// Capability advertised for `WalletQuery.SubtreeRoots`.
 pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
+/// Field capability gating the Ironwood protocol on `WalletQuery.SubtreeRoots`
+/// (and the lightwalletd-compat `GetSubtreeRoots` ironwood arm).
+///
+/// A server that does not advertise this capability rejects Ironwood
+/// subtree-root requests; clients must fall back to linear scanning for the
+/// Ironwood tree rather than treating an empty response as authoritative.
+pub const WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1: &str = "wallet.read.subtree_roots_ironwood_v1";
 /// Capability advertised for `WalletQuery.Transaction`.
 ///
 /// Covers the typed transaction-status response. The RPC always works; the
@@ -628,6 +635,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.SubtreeRoots"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
+        CapabilitySurface::Wallet,
+        None,
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

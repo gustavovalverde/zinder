@@ -1056,6 +1056,7 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     match wallet::ShieldedProtocol::try_from(protocol) {
         Ok(wallet::ShieldedProtocol::Sapling) => Ok(ShieldedProtocol::Sapling),
         Ok(wallet::ShieldedProtocol::Orchard) => Ok(ShieldedProtocol::Orchard),
+        Ok(wallet::ShieldedProtocol::Ironwood) => Ok(ShieldedProtocol::Ironwood),
         Ok(wallet::ShieldedProtocol::Unspecified) => Err(Status::invalid_argument(
             "shielded_protocol must be specified",
         )),
