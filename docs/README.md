@@ -62,6 +62,7 @@ Current integration references and API support material:
 
 - [Server-side wallet pattern](reference/server-side-wallet-pattern.md): the canonical recipe for building a server-side Zcash wallet on Zinder + librustzcash.
 - [Integration surfaces](reference/integration-surfaces.md): supported client and operator integration paths.
+- [What Zinder adds by use case](reference/zinder-value-by-use-case.md): how Zinder fits with Zebra's indexed node state and Zaino for explorers, wallets, and payment facilitators.
 - [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 
 ## Investigations
