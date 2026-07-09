@@ -42,6 +42,7 @@ jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-cl
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
+orchard = "0.15.0-pre.2"
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
@@ -78,6 +79,18 @@ zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }
 zinder-store = { path = "crates/zinder-store" }
 zinder-testkit = { path = "crates/zinder-testkit" }
+
+# Tracks unreleased librustzcash API used by zinder-testkit's deterministic
+# transaction builder. Keep these Zcash-family crates on one source so their
+# path-resolved internal types do not split across the graph.
+[patch.crates-io]
+orchard = { git = "https://github.com/zcash/orchard", rev = "475ef0ff77d45aebff93cb039d639250d82518a3" }
+zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

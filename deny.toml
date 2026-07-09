@@ -47,4 +47,9 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    # Unreleased NU6.3/Ironwood API consumed by zinder-testkit.
+    "https://github.com/zcash/librustzcash.git",
+    # Patched by the same unreleased Zcash-family dependency stack.
+    "https://github.com/zcash/orchard",
+]

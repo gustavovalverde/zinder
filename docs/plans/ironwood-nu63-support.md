@@ -48,14 +48,16 @@ tracked separately from this plan.
    version-6 wire format. It is a normal registry dependency; no git source is
    used.
 
-2. **The librustzcash stack moves to the pre-release versions `zebra-chain
-   11.0.0` requires, all from crates.io.** It depends on `zcash_protocol
-   0.10.0-pre.0`, `zcash_primitives 0.29.0-pre.0`, `zcash_address 0.13.0-pre.0`,
-   `zcash_transparent 0.9.0-pre.0`, and `orchard 0.15.0-pre.1`. Zinder bumps its
-   own `zcash_address` (0.12), `zcash_protocol` (0.9), `zcash_primitives`
-   (0.28), and `zip32` (0.2) to the versions that unify with `zebra-chain 11`,
-   so no second copy of a librustzcash type exists at the `zebra-chain`
-   boundary. No `[patch]` section is introduced.
+2. **The librustzcash stack tracks the pre-release versions `zebra-chain
+   11.0.0` requires, temporarily pinned to upstream git while the matching
+   API is unreleased.** Zinder declares `zcash_protocol 0.10.0-pre.0`,
+   `zcash_primitives 0.29.0-pre.0`, `zcash_address 0.13.0-pre.0`,
+   `zcash_transparent 0.9.0-pre.0`, `orchard 0.15.0-pre.2`, and `zip32 0.2`.
+   The root manifest patches `zcash_address`, `zcash_protocol`,
+   `zcash_primitives`, `zcash_transparent`, `zcash_encoding`, and `equihash` to
+   the same `librustzcash` revision, and patches `orchard` to the companion
+   upstream revision. The patch is repo-wide so no second copy of a
+   librustzcash type exists at the `zebra-chain` boundary.
 
 3. **Version 6 is a first-class supported transaction version, not an
    `Unsupported` future header.** V6 transactions still carry transparent

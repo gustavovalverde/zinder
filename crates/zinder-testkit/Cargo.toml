@@ -15,6 +15,7 @@ publish = false
 async-trait.workspace = true
 color-eyre.workspace = true
 eyre.workspace = true
+orchard.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 rand = "0.8"
