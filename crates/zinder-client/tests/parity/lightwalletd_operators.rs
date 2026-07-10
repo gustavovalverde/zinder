@@ -9,23 +9,13 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
-use zebra_chain::{
-    parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
-};
-use zinder_client::{
-    ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentUnspentOutput,
-};
+use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
-use zinder_testkit::{
-    FixtureTransactionRows, StoreFixture, open_test_derive_store_for_canonical,
-    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
-};
+use zinder_testkit::sample_regtest_upgrade_activations;
 
-use super::{committed_store_fixture, parity_chain_fixture};
+use super::transparent_address_history_fixture;
 
 #[test]
 fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
@@ -50,7 +40,7 @@ fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
 
 #[tokio::test]
 async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<()> {
-    let fixture = public_operator_fixture()?;
+    let fixture = transparent_address_history_fixture()?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             fixture.store_fixture.chain_store().clone(),
@@ -100,8 +90,11 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
         first_streamed_utxo.script,
         fixture.script_pub_key.as_slice()
     );
-    assert_eq!(first_streamed_utxo.value_zat, 123);
-    assert_eq!(first_streamed_utxo.height, 1);
+    assert_eq!(first_streamed_utxo.value_zat, fixture.value_zat);
+    assert_eq!(
+        first_streamed_utxo.height,
+        u64::from(fixture.block_height.value())
+    );
 
     let txid_response = txids
         .next()
@@ -111,76 +104,20 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
         .next()
         .await
         .ok_or_else(|| eyre::eyre!("missing transparent transaction response"))??;
+    assert_eq!(txid_response.data, fixture.raw_transaction_bytes);
     assert_eq!(
-        txid_response.data,
-        fixture.transaction_id.as_bytes().to_vec()
+        txid_response.height,
+        u64::from(fixture.block_height.value())
     );
     assert_eq!(transaction_response.data, fixture.raw_transaction_bytes);
-    assert_eq!(transaction_response.height, 1);
+    assert_eq!(
+        transaction_response.height,
+        u64::from(fixture.block_height.value())
+    );
     assert!(txids.next().await.is_none());
     assert!(transactions.next().await.is_none());
 
     Ok(())
-}
-
-struct PublicOperatorFixture {
-    store_fixture: StoreFixture,
-    derive_store: zinder_derive::DeriveStore,
-    address: String,
-    script_pub_key: Vec<u8>,
-    transaction_id: TransactionId,
-    raw_transaction_bytes: Vec<u8>,
-}
-
-fn public_operator_fixture() -> eyre::Result<PublicOperatorFixture> {
-    let transparent_address =
-        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x11; 20]);
-    let address = transparent_address.to_string();
-    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-    let transaction_id = TransactionId::from_bytes([0x55; 32]);
-    let base_fixture = parity_chain_fixture(1);
-    let block = base_fixture
-        .block_at(zinder_client::BlockHeight::new(1))
-        .ok_or_else(|| eyre::eyre!("fixture must contain block 1"))?;
-    let block_height = block.height;
-    let block_hash = block.hash;
-    let raw_transaction_bytes = b"operator-transaction-payload".to_vec();
-    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
-        transaction_id,
-        block_height,
-        block_hash,
-        0,
-        raw_transaction_bytes.clone(),
-    );
-    let tx_history = TransparentAddressTxIndexArtifact::new(
-        address_script_hash,
-        block_height,
-        0,
-        transaction_id,
-        block_hash,
-    );
-    let chain_fixture = base_fixture
-        .with_transaction_rows(transaction_rows)
-        .with_address_output_index(TransparentUnspentOutput::new(
-            address_script_hash,
-            script_pub_key.clone(),
-            TransparentOutPoint::new(transaction_id, 0),
-            123,
-            block_height,
-            block_hash,
-        ));
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
-    seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
-    Ok(PublicOperatorFixture {
-        store_fixture,
-        derive_store,
-        address,
-        script_pub_key,
-        transaction_id,
-        raw_transaction_bytes,
-    })
 }
 
 fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {

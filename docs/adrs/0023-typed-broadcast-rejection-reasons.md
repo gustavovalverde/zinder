@@ -127,7 +127,7 @@ already has queued; nothing about the legacy-wire shape changes.
 
 ### What this enables
 
-- Downstream consumers (Zashi, fauzec, third-party wallets) dispatch on
+- Downstream consumers (Zodl, fauzec, third-party wallets) dispatch on
   a typed value instead of substring-checking a string they do not own.
 - Future Zebra wording changes (case, prefixed sentences, structured
   causes) do not break Zinder consumers: classification lives in one

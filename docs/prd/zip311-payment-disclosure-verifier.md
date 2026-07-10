@@ -182,4 +182,4 @@ Add the testnet live tests. Document the test vectors in `docs/reference/zip311-
 - Sprout disclosure support.
 - Persisting verification history.
 - Rate-limiting the verifier; that lives at the gRPC adapter / load balancer layer, not in the verifier itself.
-- Generating disclosures. The verifier consumes disclosures; production-grade disclosure generation belongs to wallet software (zally, Zashi, Zallet).
+- Generating disclosures. The verifier consumes disclosures; production-grade disclosure generation belongs to wallet software (zally, Zodl, Zallet).

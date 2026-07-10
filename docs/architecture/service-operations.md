@@ -600,7 +600,7 @@ The canonical store directory is a security boundary. Zinder stores cursor authe
 Wallet-serving history requirements are owned by
 [Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims).
 This page owns the transport part of that claim: Zinder binaries expose
-plaintext gRPC and HTTP, so production Zashi compatibility requires TLS
+plaintext gRPC and HTTP, so production Zodl compatibility requires TLS
 termination in front of `zinder-compat-lightwalletd`. A reverse proxy such as
 Caddy, nginx, or traefik terminates HTTPS and forwards h2c to the local compat
 process. Plaintext LAN endpoints are development-only for patched SDK demo apps

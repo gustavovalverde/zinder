@@ -199,6 +199,19 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The node changed its best chain while a tip observation was in flight.
+    ///
+    /// A JSON-RPC tip observation reads `getbestblockhash` and then reads the
+    /// returned hash's header. During a reorg, Zebra can acknowledge the hash
+    /// before that hash is no longer addressable as part of the best chain.
+    /// The adapter retries that bounded race internally before returning this
+    /// recoverable signal.
+    #[error("upstream best-chain view changed while observing the tip: {reason}")]
+    TipViewChanged {
+        /// Node error message from the stale best-chain observation.
+        reason: String,
+    },
+
     /// Concurrent observations of the same height disagreed.
     ///
     /// Produced when the JSON-RPC adapter's height-keyed `getblock` and
@@ -385,6 +398,7 @@ impl SourceError {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
             Self::SourceResponseTooLarge { .. } => SourceFailureClass::Configuration,
             Self::BlockUnavailable { .. }
+            | Self::TipViewChanged { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }
             | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,

@@ -308,6 +308,61 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
+    assert!(
+        stdout.contains("raw_blob_policy = \"transactions\""),
+        "{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
+        "[storage]\n",
+        "[storage]\nraw_blob_policy = \"none\"\n",
+        1,
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
+        ),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn wallet_serving_preserves_full_block_blob_retention() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
+        "[storage]\n",
+        "[storage]\nraw_blob_policy = \"all\"\n",
+        1,
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("raw_blob_policy = \"all\""), "{stdout}");
 
     Ok(())
 }

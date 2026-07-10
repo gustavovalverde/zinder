@@ -197,12 +197,18 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(wrapped);
         }
     };
-    let wallet_query = zinder_query::WalletQuery::new(
+    let tree_state_upstream = broadcaster
+        .as_ref()
+        .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
+    let mut wallet_query = zinder_query::WalletQuery::new(
         canonical_store.clone(),
         broadcaster,
         network_upgrade_activations.clone(),
     )
     .with_derive_store(derive_store);
+    if let Some(tree_state_upstream) = tree_state_upstream {
+        wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
+    }
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let mempool_surface = Arc::new({
@@ -219,6 +225,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         cancel.clone(),
     );
     let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
+        .with_transparent_address_support()
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
     let _refresh_handle = zinder_query::spawn_secondary_catchup(

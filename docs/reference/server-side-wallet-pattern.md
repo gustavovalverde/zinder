@@ -199,7 +199,7 @@ This pattern leaves these pieces to the consumer:
 ## When NOT to use this pattern
 
 - **You only need transparent receives** (no shielded support): drop `zcash_client_backend`/`zcash_client_sqlite` and integrate `zinder-client` directly against your own database.
-- **You are building a mobile app**: use the Zashi/Zodl SDK or `zinder-compat-lightwalletd` rather than directly integrating `zcash_client_backend`. Mobile constraints (battery, network) shape the integration enough that a dedicated SDK is the right path.
+- **You are building a mobile app**: use the Zodl SDK or `zinder-compat-lightwalletd` rather than directly integrating `zcash_client_backend`. Mobile constraints (battery, network) shape the integration enough that a dedicated SDK is the right path.
 - **You are building a desktop wallet**: consider Zallet directly. It is the full-node wallet process that already pairs with Zinder.
 
 ## References

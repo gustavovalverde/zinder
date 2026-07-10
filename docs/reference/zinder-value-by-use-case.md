@@ -44,7 +44,7 @@ This table compares public information surfaces, not private implementation deta
 | Transparent address value deltas | No | No | Yes: `getaddressdeltas` | Yes: `TransparentAddressDeltas` |
 | Transparent outpoint lookup | Partial: `gettxout` for unspent outputs | No | Partial: `gettxout` for unspent outputs | Yes: output, spend, and unspent-by-outpoint reads |
 | Transparent UTXO-set summary | No | No | Yes: `gettxoutsetinfo` | Partial: count, total value, optional commitment |
-| Value-pool summary | Yes: `getblockchaininfo` | No | Yes: `getblockchaininfo` | Yes: `ValuePoolSummary`, `ChainValuePoolsAtTip` |
+| Value-pool summary | Yes: `getblockchaininfo` | No | Yes: `getblockchaininfo` | Yes: source-backed `ValuePoolSummary`, `ChainValuePoolsAtTip` |
 | Mempool list and summary | Yes: `getrawmempool`, `getmempoolinfo` | Partial: `GetMempoolTx` snapshot stream, no count or size summary RPC | Yes: `GetMempoolTx`, `GetMempoolStream`, mempool RPCs | Yes: `MempoolSnapshot`, `MempoolSummary` |
 | Mempool event stream | Partial: indexer gRPC `MempoolChange` | Partial: `GetMempoolStream` closes on tip change | Partial: mempool streams close on tip change | Yes: cursor-resumable `MempoolEvents` |
 | Chain tip and non-finalized changes | Yes: indexer gRPC streams | Partial: unary `GetLatestBlock` poll only, no push stream | Partial: state library and service internals | Partial: committed `ChainEvents`, not non-finalized reads |
@@ -52,7 +52,7 @@ This table compares public information surfaces, not private implementation deta
 | Explorer block summaries and recent transactions | No | No | No | Yes: `BlockSummariesInRange`, `RecentTransactions` |
 | Explorer search and privacy refusal | No | No | No | Yes: typed `Search` responses |
 | Fee, mempool, and overview dashboards | No | No | No | Yes: `FeeSummary`, `MempoolSummary`, `OverviewSnapshot` |
-| Payment disclosure verification | No | No | No | Yes: optional `VerifyPaymentDisclosure` |
+| Payment disclosure verification | No | No | No | No: `VerifyPaymentDisclosure` is reserved but has no bundled verifier |
 | Feature discovery and freshness envelope | Partial: node RPC status | Partial: `GetLightdInfo` version and height fields, no capability negotiation | Partial: service and sync status | Yes: `ServerInfo`, capabilities, freshness |
 | Transaction broadcast | Yes: `sendrawtransaction` | Yes: `SendTransaction` | Yes: `SendTransaction`, `sendrawtransaction` | Yes: typed broadcast outcomes |
 
@@ -103,9 +103,9 @@ Wallets still own keys, trial decryption, note state, witnesses, account balance
 | Transparent wallet support | UTXOs, transaction history, transparent balances, and prevout resolution. | Address ownership, labels, and user notifications. |
 | Broadcast | Typed transaction outcomes. | Construction, signing, proofs, and fee policy. |
 | Reorg recovery | Chain events with committed and reverted ranges. | Wallet-specific rollbacks and rescans. |
-| Compatibility | A lightwalletd-compatible service over the same store. | Wallet UX, seed handling, and local storage. |
+| Compatibility | A lightwalletd protocol adapter over the same store. | Wallet UX, seed handling, and local storage. |
 
-A wallet that expects the LightWallet protocol is not limited to lightwalletd or Zaino: Zinder's `zinder-compat-lightwalletd` adapter serves the same `CompactTxStreamer` surface over its own store. Reach for lightwalletd specifically when the wallet needs the unmodified reference server as its compatibility baseline, or for Zaino when it also needs a raw zcashd JSON-RPC method that Zinder does not expose in any form, such as `getaddressdeltas` or `gettxoutsetinfo`. Zinder is the better fit when the wallet wants that same protocol plus typed errors, explicit feature negotiation, epoch-aware reads, and the same chain data contract used by other services.
+A wallet that expects the LightWallet protocol is not limited to lightwalletd or Zaino: Zinder's `zinder-compat-lightwalletd` adapter serves the same `CompactTxStreamer` surface over its own store. Reach for lightwalletd specifically when the wallet needs the unmodified reference server as its compatibility baseline, or for Zaino when an exact raw zcashd JSON-RPC method is a hard dependency. Zinder provides native semantic equivalents for `getaddressdeltas` (`ExplorerQuery.TransparentAddressDeltas`) and `gettxoutsetinfo` (`WalletQuery.TransparentUtxoSetSummary`); neither preserves the zcashd method name or raw response shape. The UTXO summary deliberately omits zcashd's format-dependent serialized-set hash and byte size. Zinder is the better fit when the wallet wants that same protocol plus typed errors, explicit feature negotiation, epoch-aware reads, and the same chain data contract used by other services.
 
 ## Payment Facilitators
 
@@ -117,7 +117,7 @@ Payment facilitators do not need to become wallets or full nodes. They need to p
 | Broadcast handling | Typed outcomes that make duplicate broadcasts idempotent and rejected transactions actionable. |
 | Confirmation tracking | Transaction lookup plus chain events. |
 | Reorg handling | A way to move a payment back from confirmed to pending when the chain reverts. |
-| Receipt verification | Transaction facts and optional payment-disclosure verification surfaces. |
+| Receipt verification | Transaction facts; payment-disclosure verification is not currently provided. |
 | Service boundary | A private gRPC dependency that lets the facilitator expose its own public HTTP API. |
 
 The difference from calling Zebra directly is lifecycle semantics. Zinder gives the facilitator chain data already shaped for expiry, broadcast, confirmation, settlement, and reorg correction.
@@ -126,7 +126,7 @@ The difference from calling Zebra directly is lifecycle semantics. Zinder gives 
 
 Use Zebra directly for node operation, mining, tools that work directly with validator behavior, indexed node RPCs, and low-level RPC workflows.
 
-Use lightwalletd directly when an integration wants the unmodified reference LightWallet gRPC server as its compatibility baseline. Use Zaino when a Rust reimplementation of that same protocol is preferred, or when a raw zcashd JSON-RPC method that Zinder does not expose in any form, such as `getaddressdeltas` or `gettxoutsetinfo`, is needed directly.
+Use lightwalletd directly when an integration wants the unmodified reference LightWallet gRPC server as its compatibility baseline. Use Zaino when a Rust reimplementation of that same protocol is preferred, or when a raw zcashd JSON-RPC method is needed directly. Zinder's typed address-delta and UTXO-summary reads are semantic equivalents, not zcashd RPC compatibility shims.
 
 Use a wallet library or wallet process for keys, viewing keys, account state, note detection, signing, labels, and user-specific policy.
 

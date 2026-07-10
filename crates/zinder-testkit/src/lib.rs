@@ -71,6 +71,7 @@ pub use network_upgrade_fixtures::{
 };
 pub use store_fixture::StoreFixture;
 pub use transparent_signer::{
-    LocalNetwork, P2pkhSpendArgs, TransparentAddress, TransparentSignerError, TransparentTestKey,
-    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, regtest_local_network,
+    LocalNetwork, P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress,
+    TransparentSignerError, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    regtest_local_network,
 };

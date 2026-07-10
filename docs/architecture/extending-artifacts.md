@@ -274,7 +274,9 @@ For the lightwalletd compatibility slice, the transparent output family is
 served natively by `WalletQuery.TransparentAddressUnspentOutputs` under
 `wallet.address.transparent_unspent_outputs_v1`. The lightwalletd
 `GetAddressUtxos[Stream]` adapter reads from the same stored transparent
-output artifacts and can therefore set `GetLightdInfo.taddrSupport=true`.
+output artifacts. The process may set `GetLightdInfo.taddrSupport=true` only
+after it also wires the derive-backed transparent transaction-history
+projection that serves the legacy `GetTaddress*` calls.
 
 ### Step 6 — Adapter wiring
 
@@ -357,7 +359,7 @@ transaction-history example uses `wallet.address.transparent_history_v1`.
 
    The cursor is a `StreamCursorTokenV1` token with the `TransparentHistory` family flag (nibble `0x3`); the body encodes `(network_id, address_script_hash, last_height, last_tx_index, descending_bit)`. Decoding follows the same HMAC-verify-then-parse pattern as `decode_chain_event` and `decode_mempool_event`; mismatched family produces `StreamCursorError::StreamFamilyMismatch`.
 
-6. **Adapters**: native gRPC adapter implements `transparent_address_tx_ids_in_range`. Compat shim adapter implements `GetTaddressTxids` and `GetTaddressTransactions` over the same native method: `GetTaddressTxids` emits each `TransactionId` as `RawTransaction { hash }`, and `GetTaddressTransactions` resolves each `TransactionId` through `WalletQueryApi::transaction` to fill `RawTransaction { data, height }`. The lightwalletd contract has no cursor; the compat shim drains the native stream within the requested height range and accepts the bounded result.
+6. **Adapters**: native gRPC adapter implements `transparent_address_tx_ids_in_range`. Compat shim adapter implements `GetTaddressTxids` and `GetTaddressTransactions` over the same native method: both legacy lightwalletd RPCs resolve each `TransactionId` through `WalletQueryApi::transaction` to fill `RawTransaction { data, height }`. This matches reference lightwalletd, where the deprecated `GetTaddressTxids` name is misleading because the method returns full raw transactions. The lightwalletd contract has no cursor; the compat shim drains the native stream within the requested height range and accepts the bounded result.
 
 7. **Tests, capability, docs**: new tests in store, query, compat (`tests/integration/`), and a live test under `services/zinder-ingest/tests/live/`. Capability added. `wallet-data-plane.md`, `storage-backend.md`, `public-interfaces.md` amended. The capability-coverage test in `crates/zinder-client/tests/integration/capability_coverage.rs` asserts the new `ChainIndex` method exists.
 

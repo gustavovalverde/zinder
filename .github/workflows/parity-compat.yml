@@ -1,8 +1,8 @@
 name: parity-compat
 
 # T3 (live) parity diff between Zinder's `zinder-compat-lightwalletd` and the
-# upstream `electriccoinco/lightwalletd` Go reference, both pointed at the
-# same regtest Zebra node. Lands as a recurring schedule plus manual
+# pinned upstream `electriccoinco/lightwalletd` Go reference, both pointed at
+# the same pinned regtest Zebra node. Lands as a recurring schedule plus manual
 # dispatch; per-PR gating is advisory until the harness has a stable
 # regression baseline.
 #
@@ -28,6 +28,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC_VERSION: "29.3"
+  REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.4.19@sha256:a3dfb04b4054b78ae3107dcc804c3a15a6e38d1f0dfcadeac48da482dd1d3448
+  ZEBRA_REFERENCE_IMAGE: docker.io/zfnd/zebra:6.0.0-rc.0@sha256:998178a61a67b4776ea7104d05c481d86f069a688595e99fcff7f090ae4b7e2b
+  PARITY_REGTEST_PREMINE_BLOCKS: "125"
+  PARITY_TRANSPARENT_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
   # Not prefixed `ZINDER_`: the binaries reject unknown `ZINDER_*` env vars as
   # invalid config keys, so a `ZINDER_*` port knob would crash them at startup.
   ZEBRA_RPC_URL: http://127.0.0.1:39232
@@ -39,20 +43,20 @@ jobs:
     timeout-minutes: 45
 
     services:
-      # Pinned to the image Z3 ships with its v1 platform contract. Coinbase
-      # pays to the broadcast-cycle test key so the shim and reference agree on
-      # real transaction data. The reference lightwalletd runs as a step below,
-      # not a service: its image entrypoint is `lightwalletd --help` with no
-      # env-var config, which a service container cannot override.
+      # Coinbase pays to the broadcast-cycle test key so the shim and
+      # reference agree on real transaction data. The reference
+      # lightwalletd runs as a step below, not a service: its image entrypoint
+      # is `lightwalletd --help` with no env-var config, which a service
+      # container cannot override.
       zebra:
-        image: zfnd/zebra:4.4.1
+        image: zfnd/zebra:6.0.0-rc.0@sha256:998178a61a67b4776ea7104d05c481d86f069a688595e99fcff7f090ae4b7e2b
         ports:
           - 39232:39232
         env:
           ZEBRA_NETWORK__NETWORK: Regtest
           ZEBRA_RPC__LISTEN_ADDR: 0.0.0.0:39232
           ZEBRA_RPC__ENABLE_COOKIE_AUTH: "false"
-          ZEBRA_MINING__MINER_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
+          ZEBRA_MINING__MINER_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
         options: >-
           --health-cmd "wget -q -O- http://localhost:39232 || true"
           --health-interval 10s
@@ -93,7 +97,7 @@ jobs:
             sleep 2
           done
           curl -sf -X POST -H 'content-type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"generate","params":[25]}' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"generate\",\"params\":[${PARITY_REGTEST_PREMINE_BLOCKS}]}" \
             "${ZEBRA_RPC_URL}" -o /dev/null
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
@@ -102,10 +106,11 @@ jobs:
           # The reference image cannot be configured as a service container, so
           # run it here on the host network to reach the mapped Zebra RPC port.
           docker run -d --name lightwalletd-reference --network host \
-            electriccoinco/lightwalletd:latest \
+            "${REFERENCE_LIGHTWALLETD_IMAGE}" \
             --grpc-bind-addr 0.0.0.0:9088 \
             --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
-            --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout
+            --no-tls-very-insecure --ping-very-insecure \
+            --data-dir /tmp/lwd --log-file /dev/stdout
           for _ in $(seq 1 60); do
             if docker logs lightwalletd-reference 2>&1 | grep -q "Waiting for block: $((tip + 1))"; then
               break
@@ -148,6 +153,25 @@ jobs:
             exit 1
           fi
           echo "ingest caught up to tip ${tip}"
+          control_ready=""
+          mempool_ready=""
+          for _ in $(seq 1 30); do
+            if grep -q "ingest_control_endpoint_started" .tmp/ingest.log; then
+              control_ready=yes
+            fi
+            if grep -q "mempool_source_selected" .tmp/ingest.log; then
+              mempool_ready=yes
+            fi
+            if [ -n "${control_ready}" ] && [ -n "${mempool_ready}" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "${control_ready}" ] || [ -z "${mempool_ready}" ]; then
+            echo "ingest control or mempool surface did not become ready in time; last ingest log lines:" >&2
+            tail -n 50 .tmp/ingest.log >&2 || true
+            exit 1
+          fi
           ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
             --storage-path .tmp/parity-store \
             --secondary-path .tmp/parity-secondary-compat \
@@ -171,9 +195,9 @@ jobs:
           ZINDER_NODE__AUTH__PASSWORD: zebra
           ZINDER_TEST_PARITY_ZINDER_ADDR: http://127.0.0.1:9087
           ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: http://127.0.0.1:9088
-        run: |
-          cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::parity_against_lightwalletd::/)'
+          ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
+        run: cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+          -E 'test(/^live::parity_against_lightwalletd::/)'
 
       - name: Dump pipeline logs on failure
         if: failure()

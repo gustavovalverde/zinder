@@ -28,6 +28,18 @@ talk to a node by accident.
 as a consumer-contract gate for request and error shapes, not as a
 replacement for live SDK, Zallet, or network validation.
 
+## Lightwalletd certification
+
+The compatibility adapter is certified in layers: vendored-protocol coverage,
+live parity against the pinned reference, an independent-client flow, then the
+actual public deployment. The required boundaries and reference pins live in
+[the certification plan](../plans/lightwalletd-compatibility-certification.md).
+
+Keep the evidence simple: retain the exact commands, image digests, client
+version, network, wallet-serving floor, and command output with the release.
+Do not generate a repository-specific report or manifest merely to restate
+those results.
+
 ## Default validation gate (T0 + T1 + T2 + format/lint/docs)
 
 Run before considering any change complete. This is the canonical gate; CI
@@ -69,7 +81,7 @@ cargo nextest run --profile=ci-parity
 Expected outcome: every `parity::` module exits zero and the report is archived
 with the release evidence. This profile is organized by consumer:
 
-- `parity/zashi.rs` covers the lightwalletd-compatible shapes Zashi/Zodl and the
+- `parity/zodl.rs` covers the lightwalletd-compatible shapes Zodl and the
   Android SDK hit today.
 - `parity/zallet.rs` covers the Zinder-native `WalletQuery` shape consumed by
   Zallet.
@@ -683,7 +695,7 @@ cargo run --release --bin zinder-compat-lightwalletd -- \
 ```bash
 # Terminal 3: a lightwalletd-compatible wallet or SDK pointing at the compat shim
 # Configure the endpoint to http://127.0.0.1:9067, then run the wallet/SDK
-# command (Zashi adb command, Android demo, zec-rocks-grpcurl probe, etc.):
+# command (Zodl adb command, Android demo, zec-rocks-grpcurl probe, etc.):
 #   ./run-wallet-against http://127.0.0.1:9067
 ```
 
@@ -696,7 +708,7 @@ What this catches that the deterministic test does not:
 - Real-world streaming and connection-reuse patterns the in-process test cannot
   reproduce.
 
-## External integration: Zashi / Android SDK
+## External integration: Zodl / Android SDK
 
 Same compat-shim path. The Android SDK speaks lightwalletd; point it
 at the running `zinder-compat-lightwalletd:9067`.
@@ -713,7 +725,7 @@ What to validate by hand:
   resulting `SendResponse.error_code` matches the documented scheme
   (`0`, `-22`, `-26`, `-27`, `-1`).
 
-For production Zashi/Zodl claims, keep the evidence stricter:
+For production Zodl claims, keep the evidence stricter:
 
 - Create-new-wallet bootstrap reaches the compat endpoint's advertised tip
   without protocol-shape errors.
@@ -941,7 +953,7 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] Full wallet-serving bulk-catchup and tip-follow phase evidence exists for the target
       network, including store floor, tip height, `/readyz`, and reader secondary
       state.
-- [ ] Zashi/Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
+- [ ] Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
       and mempool evidence is green when claiming lightwalletd-compatible wallet
       support.
 - [ ] Real Zallet binary gate is green when claiming Zallet support; the config

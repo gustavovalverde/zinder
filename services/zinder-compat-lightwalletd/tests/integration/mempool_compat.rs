@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt as _, wrappers::UnboundedReceiverStream};
-use tonic::Request;
+use tonic::{Code, Request};
 use zinder_compat_lightwalletd::{
     LightwalletdGrpcAdapter, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
     MempoolSurfaceError, TipChangeWatcher, TipChangeWatcherError,
@@ -48,6 +48,60 @@ async fn lightwalletd_get_mempool_tx_returns_unavailable_without_surface() -> ey
         .await;
     let status = outcome.err().ok_or_else(|| eyre!("expected unavailable"))?;
     assert_eq!(status.code(), tonic::Code::Unavailable);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_before_surface_lookup()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let outcome = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: vec![vec![0; 33]],
+            pool_types: Vec::new(),
+        }))
+        .await;
+    let status = outcome
+        .err()
+        .ok_or_else(|| eyre!("expected invalid excluded txid suffix"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "exclude txid 0 is larger than 32 bytes");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_rejects_invalid_pool_type_before_surface_lookup()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let outcome = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: vec![lightwalletd::PoolType::Invalid as i32],
+        }))
+        .await;
+    let status = outcome
+        .err()
+        .ok_or_else(|| eyre!("expected invalid pool type"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "invalid pool type requested");
     Ok(())
 }
 
@@ -107,8 +161,21 @@ async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_t
         }))
         .await?
         .into_inner();
-    let collected = collect_compact_txids(response).await?;
-    assert_eq!(collected, vec![[0xC2; 32].to_vec()]);
+    let mut transactions = response;
+    let transaction = transactions
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected transparent mempool transaction"))??;
+    assert_eq!(transaction.txid, [0xC2; 32]);
+    assert!(
+        transaction.vin.is_empty(),
+        "reference lightwalletd omits transparent mempool inputs"
+    );
+    assert_eq!(transaction.vout.len(), 1);
+    assert!(
+        transactions.next().await.is_none(),
+        "expected exactly one transparent mempool transaction"
+    );
     Ok(())
 }
 
@@ -295,11 +362,13 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
         .await
         .ok_or_else(|| eyre!("expected first snapshot raw transaction"))??;
     assert_eq!(first_raw.data, vec![0x10; 16]);
+    assert_eq!(first_raw.height, 0);
     let second_raw = response_stream
         .next()
         .await
         .ok_or_else(|| eyre!("expected second snapshot raw transaction"))??;
     assert_eq!(second_raw.data, vec![0x20; 16]);
+    assert_eq!(second_raw.height, 0);
 
     control.push_event(MempoolEvent::Added {
         entry: synthetic_entry(0x30, synthetic_chain_epoch()),
@@ -308,6 +377,7 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
         .await?
         .ok_or_else(|| eyre!("expected live raw transaction after the snapshot contents"))??;
     assert_eq!(live_raw.data, vec![0x30; 16]);
+    assert_eq!(live_raw.height, 0);
 
     let no_more = tokio::time::timeout(
         std::time::Duration::from_millis(300),

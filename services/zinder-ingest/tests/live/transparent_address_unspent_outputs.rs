@@ -10,8 +10,8 @@
 //! # Operator precondition
 //!
 //! Zebra's regtest sidecar must mine to the test address derived from
-//! [`BROADCAST_TEST_SEED`] (see `live::mempool_broadcast_cycle`). The exact
-//! address is logged by the test on startup.
+//! [`TRANSPARENT_BROADCAST_TEST_SEED`] (see `live::mempool_broadcast_cycle`).
+//! The exact address is logged by the test on startup.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -24,15 +24,13 @@ use zinder_core::{BlockHeight, Network};
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQuery, WalletQueryApi};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
-use zinder_testkit::TransparentTestKey;
 use zinder_testkit::live::{init, require_live_for};
+use zinder_testkit::{TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey};
 
 use crate::common::{
     fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
     regtest_generate_blocks, zebra_source_from_bulk_catchup,
 };
-
-const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
@@ -41,7 +39,7 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
-    let test_key = TransparentTestKey::from_seed(&BROADCAST_TEST_SEED)
+    let test_key = TransparentTestKey::from_seed(&TRANSPARENT_BROADCAST_TEST_SEED)
         .map_err(|error| eyre!("could not derive test key: {error}"))?;
     let test_address = test_key.address_base58();
     tracing::info!(

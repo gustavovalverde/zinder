@@ -59,6 +59,9 @@ jobs:
       - name: Test (unit + integration)
         run: cargo nextest run --profile=ci
 
+      - name: Test (consumer parity)
+        run: cargo nextest run --profile=ci-parity
+
       - name: Test (perf)
         run: cargo nextest run --profile=ci-perf
 

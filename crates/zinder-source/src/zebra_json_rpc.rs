@@ -109,6 +109,10 @@ const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
+/// Number of fresh tip observations after Zebra invalidates a just-observed tip hash.
+const TIP_VIEW_RETRY_COUNT: u8 = 2;
+/// Delay between fresh observations of Zebra's best-chain view.
+const TIP_VIEW_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// JSON-RPC error code for general transaction verification failures.
 ///
 /// Zebra collapses every mempool rejection into this code; the
@@ -925,27 +929,51 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let best_block_hash_hex: String = self
-            .call_typed("getbestblockhash", ArrayParams::new(), map_node_unavailable)
-            .await?;
-        let best_block_hash = decode_rpc_block_hash(&best_block_hash_hex)?;
-        let header: ZebraBlockHeader = self
-            .call_typed(
-                "getblockheader",
-                positional_params([Value::from(best_block_hash_hex), Value::from(true)])?,
-                map_node_unavailable,
-            )
-            .await?;
-        if decode_rpc_block_hash(&header.hash)? != best_block_hash {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "best block header hash does not match tip hash",
-            });
-        }
+        let mut retries_remaining = TIP_VIEW_RETRY_COUNT;
+        loop {
+            let best_block_hash_hex: String = self
+                .call_typed("getbestblockhash", ArrayParams::new(), map_node_unavailable)
+                .await?;
+            let best_block_hash = decode_rpc_block_hash(&best_block_hash_hex)?;
+            let header = self
+                .call_typed(
+                    "getblockheader",
+                    positional_params([Value::from(best_block_hash_hex), Value::from(true)])?,
+                    |error| {
+                        if error.is_best_chain_view_changed() {
+                            SourceError::TipViewChanged {
+                                reason: error.message,
+                            }
+                        } else {
+                            map_node_unavailable(error)
+                        }
+                    },
+                )
+                .await;
 
-        Ok(BlockId::new(
-            BlockHeight::new(header.height),
-            best_block_hash,
-        ))
+            let header: ZebraBlockHeader = match header {
+                Ok(header) => header,
+                Err(SourceError::TipViewChanged { reason }) => {
+                    if retries_remaining == 0 {
+                        return Err(SourceError::TipViewChanged { reason });
+                    }
+                    retries_remaining = retries_remaining.saturating_sub(1);
+                    tokio::time::sleep(TIP_VIEW_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if decode_rpc_block_hash(&header.hash)? != best_block_hash {
+                return Err(SourceError::SourceProtocolMismatch {
+                    reason: "best block header hash does not match tip hash",
+                });
+            }
+
+            return Ok(BlockId::new(
+                BlockHeight::new(header.height),
+                best_block_hash,
+            ));
+        }
     }
 
     async fn fetch_subtree_roots(
@@ -1345,6 +1373,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
+        Some(SourceError::TipViewChanged { .. }) => "tip_view_changed",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
@@ -1664,6 +1693,14 @@ impl JsonRpcCallError {
             self.code,
             Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE)
         )
+    }
+
+    /// Returns whether Zebra rejected a hash because its best-chain view
+    /// changed between `getbestblockhash` and `getblockheader`.
+    fn is_best_chain_view_changed(&self) -> bool {
+        self.message
+            .to_ascii_lowercase()
+            .contains("not in best chain")
     }
 }
 

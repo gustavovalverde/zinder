@@ -28,7 +28,7 @@ use crate::common::{
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn bulk_catchup_deep_chain_with_by_block_index_lookups() -> Result<()> {
+async fn bulk_catchup_deep_chain_with_by_txid_lookups() -> Result<()> {
     let _guard = init();
     // Bulk catching up [1, tip] only fits in CI budgets on regtest. Hosted networks
     // need the checkpoint-bounded bulk catchup (BulkCatchupRunConfig::checkpoint) before
@@ -72,27 +72,34 @@ async fn bulk_catchup_deep_chain_with_by_block_index_lookups() -> Result<()> {
         WalletQuery::new(store.clone(), (), Arc::clone(&activations)),
         Arc::clone(&activations),
     );
+    let reader = store.current_chain_epoch_reader()?;
 
     for height_value in [1_u32, 5, tip_height.value() / 2, tip_height.value()] {
+        let block = reader
+            .compact_block_at(BlockHeight::new(height_value))?
+            .ok_or_else(|| eyre!("missing compact block at height {height_value}"))?;
+        let lightwalletd_block = LightwalletdCompactBlock::decode(block.payload_bytes.as_slice())?;
+        let txid = lightwalletd_block
+            .vtx
+            .first()
+            .ok_or_else(|| eyre!("compact block at height {height_value} has no transactions"))?
+            .txid
+            .clone();
         let response = lightwalletd_adapter
             .get_transaction(Request::new(lightwalletd::TxFilter {
-                block: Some(lightwalletd::BlockId {
-                    height: u64::from(height_value),
-                    hash: Vec::new(),
-                }),
+                block: None,
                 index: 0,
-                hash: Vec::new(),
+                hash: txid,
             }))
             .await?
             .into_inner();
         assert_eq!(response.height, u64::from(height_value));
         assert!(
             !response.data.is_empty(),
-            "by-block-index transaction at height {height_value} returned empty payload"
+            "by-txid transaction at height {height_value} returned empty payload"
         );
     }
 
-    let reader = store.current_chain_epoch_reader()?;
     for height_value in 1..=tip_height.value() {
         let block = reader
             .compact_block_at(BlockHeight::new(height_value))?

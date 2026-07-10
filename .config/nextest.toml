@@ -62,8 +62,8 @@ junit = { path = "target/nextest/deploy.xml" }
 
 # Consumer-release certification tier. Per-consumer parity
 # assertions live under `tests/parity/` in each crate that surfaces a public
-# consumer contract. The release-tag pipeline runs this profile as a release
-# gate; per-PR runs are advisory.
+# consumer contract. The main PR pipeline runs this profile so consumer-shaped
+# regressions fail before a release-candidate certification run.
 [profile.ci-parity]
 default-filter = "test(/^parity::/)"
 slow-timeout = { period = "60s", terminate-after = 1 }
@@ -71,10 +71,25 @@ junit = { path = "target/nextest/parity.xml" }
 
 # Live tests that mutate node state share a single Docker container.
 # Read-only live tests (capability probes, tip fetches, broadcast-rejection
-# classification) run in parallel under the default group; only mutators join
-# this group via per-test override below.
+# classification) run in parallel under the default group unless they share a
+# fixture with a mutating test. The lightwalletd parity file serializes as a
+# unit because accepted-send parity mutates the shared regtest mempool.
 [test-groups]
 node-mutating = { max-threads = 1 }
+
+[[profile.ci-live.overrides]]
+# This test intentionally broadcasts into the shared regtest mempool. A retry
+# would replay the same spend against the same node state and fail as a
+# double-spend rather than exercising parity.
+filter = "test(accepted_send_transaction_surfaces_in_non_empty_mempool_methods)"
+retries = { count = 0, backoff = "fixed", delay = "0s" }
+
+[[profile.ci-live.overrides]]
+# The real-client flow creates a wallet, spends a unique UTXO, and mines
+# confirmations. Retrying after a failure would exercise a different chain
+# state, not the failed client interaction.
+filter = "test(zingolib_bootstrap_restore_shield_and_mempool_flow_certifies_zinder)"
+retries = { count = 0, backoff = "fixed", delay = "0s" }
 
 [[profile.ci-live.overrides]]
 # Tests that share or contend on the upstream node's process state must
@@ -83,7 +98,7 @@ node-mutating = { max-threads = 1 }
 # destructive container-restart test, so all indexer consumers join here.
 # `ingest_control_tip_change_publisher_fires_when_zebra_mines_block` mutates
 # regtest chain state via `generate`, so it joins too.
-filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::reorg_sweep::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block)"
+filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block)"
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]

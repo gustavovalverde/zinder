@@ -49,7 +49,7 @@ The concrete bindings are:
 
 - `IngestControlMempoolSurface` (in `services/zinder-compat-lightwalletd`) implements `MempoolSurface` over the `IngestControl.MempoolSnapshot` / `MempoolEvents` proxy methods.
 - `WalletQueryGrpcAdapter::with_ingest_control_proxy` makes the same proxy available to native `WalletQuery` consumers.
-- `spawn_ingest_control_tip_change_publisher` runs in the compat process and subscribes to `IngestControl.ChainEvents`. It feeds a `TipChangeWatcher` so `LightwalletdGrpcAdapter::with_tip_change_watcher` can race the mempool-event stream against tip changes and close the gRPC stream on each best-block change. This restores the lightwalletd Go contract that Zashi's `sync` loop relies on without making the compat process open its own upstream node connection.
+- `spawn_ingest_control_tip_change_publisher` runs in the compat process and subscribes to `IngestControl.ChainEvents`. It feeds a `TipChangeWatcher` so `LightwalletdGrpcAdapter::with_tip_change_watcher` can race the mempool-event stream against tip changes and close the gRPC stream on each best-block change. This restores the lightwalletd Go contract that Zodl's `sync` loop relies on without making the compat process open its own upstream node connection.
 
 ### Retention is two-tier with separately tunable windows
 

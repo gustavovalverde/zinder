@@ -5,15 +5,14 @@
 //! the live broadcast and reorg tests find a coinbase output they can
 //! spend.
 
-use zinder_testkit::TransparentTestKey;
+use zinder_testkit::{TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey};
 
 #[allow(
     clippy::print_stdout,
     reason = "operator-facing binary that emits one line of structured config data"
 )]
 fn main() -> eyre::Result<()> {
-    let test_seed = [0x42_u8; 32];
-    let key = TransparentTestKey::from_seed(&test_seed)
+    let key = TransparentTestKey::from_seed(&TRANSPARENT_BROADCAST_TEST_SEED)
         .map_err(|error| eyre::eyre!("could not derive test key: {error}"))?;
     println!("{}", key.address_base58());
     Ok(())

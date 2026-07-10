@@ -9,7 +9,7 @@
 
 ## Context
 
-A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwalletd smoke probes and a new-wallet happy path, then fail later when a wallet asks for historical artifacts. Android SDK and Zashi expose the issue first, but the gap is not Android-specific: the same wallet data-plane needs appear across the local ecosystem.
+A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwalletd smoke probes and a new-wallet happy path, then fail later when a wallet asks for historical artifacts. Android SDK and Zodl expose the issue first, but the gap is not Android-specific: the same wallet data-plane needs appear across the local ecosystem.
 
 - `lightwalletd` exposes `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos`, and `GetAddressUtxosStream` as first-class `CompactTxStreamer` methods.
 - Zallet's `wallet` code fetches birthday tree state at `birthday - 1`, loads Sapling and Orchard subtree roots from index `0`, and polls transparent UTXOs for wallet-owned transparent receivers.
@@ -42,7 +42,7 @@ The core contract is:
 
 `wallet-serving` is the operator-facing coverage profile for stores intended to serve wallet flows. It means the store was built with enough historical artifact coverage for wallet creation, recovery, rescan, imported-account, and transparent-UTXO flows supported by the published API.
 
-`wallet-serving` is not a Zashi profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. The bulk-catchup floor is derived from upstream-node-advertised shielded activation heights, because that is the simplest general rule that covers subtree roots from index `0` and historical tree-state anchors without encoding public-network constants into docs or config.
+`wallet-serving` is not a Zodl profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. The bulk-catchup floor is derived from upstream-node-advertised shielded activation heights, because that is the simplest general rule that covers subtree roots from index `0` and historical tree-state anchors without encoding public-network constants into docs or config.
 
 Serving coverage fails closed:
 

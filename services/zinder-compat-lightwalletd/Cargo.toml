@@ -39,10 +39,12 @@ zinder-store.workspace = true
 async-trait.workspace = true
 eyre.workspace = true
 parking_lot.workspace = true
+secrecy.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
+zcash_address = { version = "0.13.0-pre.0", default-features = false, features = ["std"] }
 zinder-ingest.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

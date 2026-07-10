@@ -7,7 +7,7 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 `zinder-query` owns the wallet data plane.
 
 Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
-this plane is consumer-neutral. Android SDK/Zashi, lightwalletd clients,
+this plane is consumer-neutral. Android SDK/Zodl, lightwalletd clients,
 Zallet, and future Rust consumers exercise different public contracts, but they
 all depend on the same canonical artifact families. Compatibility adapters may
 preserve lightwalletd wire names; the core vocabulary stays on artifact coverage,
@@ -20,7 +20,7 @@ It should provide:
 - Transaction lookup APIs where compatible with Zcash wallet expectations.
 - Tree state APIs required for wallet sync.
 - Sapling and Orchard subtree root APIs required for batched wallet scanning.
-- Transparent-address output APIs required by lightwalletd/Zashi compatibility,
+- Transparent-address output APIs required by lightwalletd/Zodl compatibility,
   backed by the stored transparent output artifact family.
 - Transaction broadcast.
 - Chain-event subscription per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription).
@@ -186,8 +186,10 @@ RPC. The field rides on the existing `wallet.read.transaction_by_id_v1`
 capability rather than a new one, because the bytes are not unconditionally
 present: ingest writes transaction blobs only when `raw_blob_policy` is
 `transactions` or `all`. When the policy is `none`, the field is empty and the
-location plus enrichment fields are still returned. A consumer that requires the
-serialized form runs against a deployment configured to retain transaction
+location plus enrichment fields are still returned. Wallet-serving ingest defaults
+an omitted policy to `transactions` and rejects an explicit `none`, because its
+lightwalletd transaction and transparent-history methods require retained bytes.
+A consumer that requires the serialized form runs against a deployment configured to retain transaction
 blobs.
 
 A response builder must not call the upstream node or latest tip again during
@@ -232,7 +234,7 @@ observed wallet-run details.
 | Ecosystem product | Zinder relationship | What the mempool surface enables | Required boundary |
 | ----------------- | ------------------- | ---------- | ----------------- |
 | Zallet (`zcash/wallet`) | Primary native Rust consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and chain-tip notifications separate from mempool stream lifecycle | `zinder-client::ChainIndex` plus native `WalletQuery`; no dependency on the lightwalletd compatibility adapter |
-| Zashi/Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
+| Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
 | Lightwalletd clients and operators | Compatibility consumers | Backend option for clients that speak `CompactTxStreamer`, including mempool methods and transaction submission behavior | Compatibility adapter only; no upstream node calls, no independent storage, and no Zinder-only method extensions in the lightwalletd proto |
 | Block explorers and analytics | Application or `zinder-explorer` consumers | Live mempool pages, pending transaction lifecycle, pending transparent address/outpoint overlays, and "mempool in sync" status | Native `WalletQuery` or replayable `zinder-explorer` views; full explorer parity also needs transparent history and balance |
 | Zebra | Upstream node source, not a Zinder client | Keeps wallet and explorer indexing outside the node while reusing Zebra's verified mempool observations | `zinder-source` consumes Zebra `MempoolChange` when available, or falls back to `getrawmempool` polling |
@@ -243,7 +245,7 @@ Three architectural consequences follow from that map:
 - Source observations must become hydrated `MempoolEntry` records before they reach public APIs. Zebra's streaming mempool event carries transaction hash and auth digest, so raw transaction fetching and compact-transaction construction belong in the source/ingest path, not in `zinder-compat-lightwalletd`.
 - The native mempool surface does not inherit lightwalletd's stream-close lifecycle. `MempoolEvents` stream end means disconnect or shutdown. Chain-tip changes are delivered through `ChainEvents`.
 - The public server-observed type is `MempoolEntry`, not `PendingTransaction`. A pending transaction is a wallet-local UX state: it can include a transaction that was created locally but never accepted by the network.
-- Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zashi/Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means the mempool surface plus the transparent history and balance surfaces needed for address-oriented views.
+- Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means the mempool surface plus the transparent history and balance surfaces needed for address-oriented views.
 
 The native protocol exposes two complementary mempool methods:
 
@@ -332,8 +334,10 @@ indexed state, or materializing an unbounded address result before truncating
 it. Missing indexed state is a readiness or artifact-availability failure; it
 is not a reason to bypass the wallet data plane.
 
-`GetLightdInfo.taddr_support` is `true` only when the adapter reads from stored
-transparent output artifacts. It is a product contract for lightwalletd
+`GetLightdInfo.taddr_support` is `true` only when the adapter is explicitly
+configured to advertise transparent-address support after the serving process
+has wired stored transparent output artifacts and the derive-backed transparent
+transaction-history projection. It is a product contract for lightwalletd
 clients, not a way to silence Android SDK logs.
 
 The native `WalletQuery` proto exposes the same artifact-backed read through
@@ -380,12 +384,13 @@ must restart the page rather than resume from a non-terminal item; bounded
 history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
-`taddr_support=true` when the store was produced with the wallet-serving
-coverage profile (`ingest.coverage = "wallet-serving"` or
-`zinder-ingest --wallet-serving`). A recent-checkpoint or tip-bootstrapped
-store may have the address-output index family enabled but still lack the historical
-rows needed by wallet birthdays and resync anchors; that deployment posture is
-not wallet-serving.
+`taddr_support=true` when the serving process explicitly opts in after opening
+a store produced with the wallet-serving coverage profile
+(`ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) and
+the derive-backed transparent transaction-history projection. A
+recent-checkpoint or tip-bootstrapped store may have the address-output index
+family enabled but still lack the historical rows needed by wallet birthdays and
+resync anchors; that deployment posture is not wallet-serving.
 
 `GetAddressUtxos.maxEntries` is an aggregate response budget across the
 requested address set. The compatibility adapter may make several internal
@@ -475,7 +480,7 @@ The address list is capped at 256 per request (`MAX_TRANSPARENT_ADDRESS_BALANCE_
 
 The mempool live state is not chain-epoch-pinnable. `at_epoch_id` pins only the canonical confirmed read; the mempool overlay always reads live state, and the response binds to the chain epoch the confirmed read answered against. Historical balance at an arbitrary height is out of scope.
 
-The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` by calling the wallet primitive and projecting it into one `int64 value_zat` (confirmed total minus pending outflows, saturating to zero, capped at `i64::MAX`); the lightwalletd `Balance { value_zat: int64 }` proto carries no overlay slot. `GetTaddressBalanceStream` is a per-address loop over the unary form for compatibility clients and exists only for the lightwalletd contract.
+The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` by calling the wallet primitive and projecting it into one `int64 value_zat` (confirmed total minus pending outflows, saturating to zero, capped at `i64::MAX`); pending inflows are ignored because the legacy lightwalletd balance field is confirmed-shaped and carries no overlay slot. `GetTaddressBalanceStream` collects the streamed addresses and uses the same projection as the unary call; it exists only for the lightwalletd contract.
 
 The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` returning `TransparentAddressBalance`. `LocalChainIndex` and `RemoteChainIndex` both implement it; the capability-coverage test asserts the method exists for the `wallet.address.transparent_balance_v1` capability.
 
@@ -525,7 +530,21 @@ claims. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 the contract is consumer-neutral: client-specific validation belongs in test
 evidence, while this document owns the durable serving criteria.
 
-A deployment may claim Android SDK or Zashi compatibility only when:
+Zinder compatibility claims use these levels:
+
+| Level | Meaning | Required evidence |
+| --- | --- | --- |
+| `protocol-compatible` | Zinder builds and serves the pinned `lightwallet-protocol` messages without local schema drift. | Vendored proto drift check, generated client smoke tests, and protocol field golden tests. |
+| `reference-parity-compatible` | Zinder behavior matches reference `lightwalletd` for the claimed RPC set, with documented allow-listed operator differences. | Live parity suite against pinned reference inputs. |
+| `client-compatible` | Real lightwalletd-compatible wallet clients can create, restore, resync, send, and observe mempool behavior through Zinder. | Android SDK and Zodl evidence for the claimed network and wallet-serving floor. |
+| `public-operator-compatible` | A public deployment can safely expose the compatible endpoint. | TLS/proxy, bind, rate-limit, redaction, readiness, metrics, and operational runbook evidence. |
+
+A release or deployment may advertise only the highest level whose required
+evidence is current. Do not use unqualified "full compatibility" or "drop-in
+replacement" language without naming the protocol pin, claimed RPC set, and
+certification level.
+
+A deployment may claim Android SDK or Zodl compatibility only when:
 
 - The serving store contains the subtree-root history required by fresh wallet
   bootstrap and tree-state history for every anchor height a supported wallet
@@ -536,16 +555,16 @@ A deployment may claim Android SDK or Zashi compatibility only when:
 - The transparent output surface in [§Transparent Address Outputs](#transparent-address-outputs)
   is implemented end-to-end.
 - The transport requirement in [Service operations](service-operations.md#deployment-guidance)
-  is satisfied for real Zashi endpoint tests.
+  is satisfied for real Zodl endpoint tests.
 
 The upstream Go `lightwalletd/testclient` remains smoke coverage for the basic
-compat surface. It is not a substitute for an Android SDK or Zashi bootstrap
+compat surface. It is not a substitute for an Android SDK or Zodl bootstrap
 test when the release claim names those clients.
 
-A deployment may claim Android SDK or Zashi/Zodl mempool compatibility only
+A deployment may claim Android SDK or Zodl mempool compatibility only
 when `GetMempoolStream` and `GetMempoolTx` are mapped over the native mempool
 index and event log, and an SDK or app flow has observed mempool transactions
-against that endpoint. A sync-only Zashi proof does not establish
+against that endpoint. A sync-only Zodl proof does not establish
 pending-transaction UX.
 
 ## Query Consistency

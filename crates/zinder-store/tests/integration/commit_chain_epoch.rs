@@ -50,6 +50,38 @@ fn commit_chain_epoch_writes_artifacts_and_visible_epoch_atomically() -> eyre::R
 }
 
 #[test]
+fn commit_chain_epoch_can_publish_genesis_artifacts() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 0);
+
+    let committed = store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block.clone()],
+            vec![compact_block.clone()],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(0)),
+        }),
+    )?;
+
+    assert_eq!(committed.chain_epoch, chain_epoch);
+    assert_eq!(
+        committed.block_range,
+        BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(0))
+    );
+    let reader = store.current_chain_epoch_reader()?;
+    assert_eq!(reader.block_header_at(BlockHeight::new(0))?, Some(block));
+    assert_eq!(
+        reader.compact_block_at(BlockHeight::new(0))?,
+        Some(compact_block)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn empty_store_has_no_current_chain_epoch() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;

@@ -4,7 +4,7 @@ This page is the first link a new integrator should follow. It says, in plain la
 
 ## In one paragraph
 
-Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a future compatible source), commits typed artifacts to local storage, and serves wallet-shaped reads over gRPC. It runs as a single-operator service. It never holds keys, never decrypts shielded outputs, and never maintains per-consumer wallet state. A consumer that needs key custody, shielded scanning, or per-account state pairs Zinder with a wallet library (typically `zcash_client_backend` + `zcash_client_sqlite` from librustzcash) or with a wallet process (Zallet, Zashi, Zodl).
+Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a future compatible source), commits typed artifacts to local storage, and serves wallet-shaped reads over gRPC. It runs as a single-operator service. It never holds keys, never decrypts shielded outputs, and never maintains per-consumer wallet state. A consumer that needs key custody, shielded scanning, or per-account state pairs Zinder with a wallet library (typically `zcash_client_backend` + `zcash_client_sqlite` from librustzcash) or with a wallet process (Zallet, Zodl).
 
 ## Zinder does this
 
@@ -19,7 +19,7 @@ Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a
 - **Transaction broadcast**: forwards raw transactions to the upstream node.
 - **Chain-event subscription**: cursor-resumable committed/reorged stream with optional address-invalidation hint ([Chain events §Address Filters](chain-events.md#address-filters)).
 - **Capability discovery**: `ServerInfo` advertises which RPCs and features the deployment serves.
-- **Lightwalletd compatibility**: the `zinder-compat-lightwalletd` binary speaks the vendored lightwalletd protocol so Zashi/Zodl and the Android SDK integrate without changes.
+- **Lightwalletd compatibility**: the `zinder-compat-lightwalletd` binary speaks the vendored lightwalletd protocol so Zodl and the Android SDK integrate without changes.
 
 The native Rust client (`zinder-client`) splits this list across two traits. The canonical and derive-store reads (compact blocks, tree state, subtree roots, transparent-address outputs and tx-history, prevout resolution, the confirmed transparent-address balance) live on `ChainIndex`, which both the gRPC `RemoteChainIndex` and the colocated RocksDB-secondary `LocalChainIndex` serve identically. Broadcast, the chain-event stream, live-mempool reads, and chain value-pools need a live ingest-control endpoint, so they live on the `EndpointBackedIndex` extension that only `RemoteChainIndex` implements. A colocated reader without an endpoint is rejected at compile time, not at the call. This makes the two-RocksDB-secondary reader topology explicit in the type system without changing the [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) ChainEpoch-token model.
 
@@ -51,7 +51,7 @@ flowchart LR
     LibProofs[zcash_proofs<br/>Sapling/Orchard proving]:::outOfScope
 
     Zallet[Zallet<br/>full-node wallet process]:::outOfScope
-    ZashiSdk[Zashi/Zodl SDK<br/>mobile wallets]:::outOfScope
+    ZodlSdk[Zodl SDK<br/>mobile wallets]:::outOfScope
 
     Wallet -->|compact blocks<br/>tree state| Zinder
     Wallet -->|broadcast tx| Zinder
@@ -61,7 +61,7 @@ flowchart LR
     LibPrim --> LibProofs
 
     Zinder -->|JSON-RPC| Zebra
-    Zinder -->|lightwalletd protocol| ZashiSdk
+    Zinder -->|lightwalletd protocol| ZodlSdk
     Wallet -.alternative.-> Zallet
 ```
 
@@ -72,7 +72,7 @@ flowchart LR
 | Transaction building | [`zcash_primitives`](https://crates.io/crates/zcash_primitives) |
 | Sapling/Orchard proving | [`zcash_proofs`](https://crates.io/crates/zcash_proofs) |
 | Full-node wallet process (RPC-shaped) | [Zallet](https://github.com/zcash/wallet) |
-| Mobile wallet integration | Zashi/Zodl, via `zinder-compat-lightwalletd` |
+| Mobile wallet integration | Zodl, via `zinder-compat-lightwalletd` |
 | TLS, auth, rate limiting | Operator-supplied reverse proxy (Caddy, Nginx, Cloudflare) |
 
 ## Why this boundary exists

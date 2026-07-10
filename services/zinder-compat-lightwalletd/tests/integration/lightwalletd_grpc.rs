@@ -16,15 +16,17 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown,
-    ChainEpochId, ChainTipMetadata, Network, RawTransactionBytes, SUBTREE_LEAF_COUNT,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockSelector, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
+    BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, RawTransactionBytes, SUBTREE_LEAF_COUNT, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary,
+    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, UnixTimestampMillis,
+    wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -39,12 +41,13 @@ use zinder_query::{
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
 };
 use zinder_store::{
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, StreamCursorTokenV1,
+    ChainEpochArtifacts, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
+    ReorgWindowChange, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
     open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
-    seed_transparent_address_transaction_history,
+    seed_transparent_address_transaction_history, synthetic_transaction_public_facts,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -152,6 +155,10 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT
     );
     assert!(
+        !lightd_info.taddr_support,
+        "the generic adapter must not advertise transparent-address support unless the caller opts in"
+    );
+    assert!(
         !lightd_info.upgrade_name.is_empty(),
         "upgrade_name must be populated from NetworkUpgrade::current"
     );
@@ -160,6 +167,265 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         "upgrade_height must reflect the active upgrade activation; got {}",
         lightd_info.upgrade_height
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let status = match adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: 2,
+            hash: Vec::new(),
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected unknown-height error, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::OutOfRange);
+
+    let status = match adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: Vec::new(),
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected height-zero error, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let status = match adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: vec![0xff; 32],
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected hash-mismatch error, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let status = match adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: vec![0xff; 31],
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected malformed-hash error, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_block_nullifiers_reports_future_height_like_lightwalletd() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let status = match adapter
+        .get_block_nullifiers(Request::new(lightwalletd::BlockId {
+            height: 2,
+            hash: Vec::new(),
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected future-height error, got {response:?}")),
+        Err(status) => status,
+    };
+
+    assert_eq!(status.code(), Code::OutOfRange);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_block_range_methods_report_future_height_like_lightwalletd() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let request = || lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: 2,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+
+    let Err(status) = adapter.get_block_range(Request::new(request())).await else {
+        return Err(eyre!("expected future-height error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::OutOfRange);
+
+    let Err(status) = adapter
+        .get_block_range_nullifiers(Request::new(request()))
+        .await
+    else {
+        return Err(eyre!("expected future-height error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::OutOfRange);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_block_range_methods_serve_genesis_when_artifacts_are_retained() -> eyre::Result<()> {
+    let store_fixture = genesis_store_fixture()?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let request = || lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: 0,
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: 0,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+
+    let blocks = collect_stream(
+        adapter
+            .get_block_range(Request::new(request()))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].height, 0);
+
+    let nullifier_blocks = collect_stream(
+        adapter
+            .get_block_range_nullifiers(Request::new(request()))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(nullifier_blocks.len(), 1);
+    assert_eq!(nullifier_blocks[0].height, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let Err(status) = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: None,
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!("expected missing-start error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let Err(status) = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: None,
+            pool_types: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!("expected missing-end error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let Err(status) = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 0,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!("expected height-zero error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: vec![999],
+        }))
+        .await
+    else {
+        return Err(eyre!("expected unknown-pool error, got a block stream"));
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
 
     Ok(())
 }
@@ -321,12 +587,62 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Result<()> {
+    let (store_fixture, completing_block_hash) = subtree_root_store_fixture()?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let orchard_stream = adapter
+        .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Orchard as i32,
+            max_entries: 1,
+        }))
+        .await?
+        .into_inner();
+    let ironwood_stream = adapter
+        .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Ironwood as i32,
+            max_entries: 1,
+        }))
+        .await?
+        .into_inner();
+    let orchard_roots = collect_stream(orchard_stream).await?;
+    let ironwood_roots = collect_stream(ironwood_stream).await?;
+
+    assert_eq!(orchard_roots.len(), 1);
+    assert_eq!(orchard_roots[0].root_hash, vec![0x18; 32]);
+    assert_eq!(
+        orchard_roots[0].completing_block_hash,
+        encode_internal_block_hash(completing_block_hash).to_vec()
+    );
+    assert_eq!(orchard_roots[0].completing_block_height, 1);
+    assert_eq!(ironwood_roots.len(), 1);
+    assert_eq!(ironwood_roots[0].root_hash, vec![0x19; 32]);
+    assert_eq!(
+        ironwood_roots[0].completing_block_hash,
+        encode_internal_block_hash(completing_block_hash).to_vec()
+    );
+    assert_eq!(ironwood_roots[0].completing_block_height, 1);
+
+    Ok(())
+}
+
 /// Records the `at_epoch_id` argument of every canonical read so a test can
 /// assert one handler pins all of its reads to a single chain epoch.
 #[derive(Clone)]
 struct EpochPinRecorder<Inner> {
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
+    transparent_address_balance: Option<TransparentAddressBalance>,
 }
 
 impl<Inner> EpochPinRecorder<Inner> {
@@ -334,7 +650,16 @@ impl<Inner> EpochPinRecorder<Inner> {
         Self {
             inner,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
+            transparent_address_balance: None,
         }
+    }
+
+    fn with_transparent_address_balance(
+        mut self,
+        transparent_address_balance: TransparentAddressBalance,
+    ) -> Self {
+        self.transparent_address_balance = Some(transparent_address_balance);
+        self
     }
 
     fn record(&self, at_epoch_id: Option<ChainEpochId>) {
@@ -514,6 +839,9 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
         self.record(at_epoch_id);
+        if let Some(transparent_address_balance) = self.transparent_address_balance {
+            return Ok(transparent_address_balance);
+        }
         self.inner
             .transparent_address_balance(addresses, at_epoch_id)
             .await
@@ -672,6 +1000,242 @@ async fn tree_state_returns_not_found_for_non_checkpoint_height() -> eyre::Resul
 }
 
 #[tokio::test]
+async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let status = match adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 2,
+            hash: Vec::new(),
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected future-height error, got {response:?}")),
+        Err(status) => status,
+    };
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the wallet-serving floor contract is a cross-RPC lightwalletd compatibility claim"
+)]
+async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
+    let (store_fixture, wallet_serving_floor_height) = wallet_serving_floor_store_fixture()?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let floor_height = u64::from(wallet_serving_floor_height.value());
+
+    let Err(status) = adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: floor_height,
+            hash: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetBlock to report unavailable wallet-serving floor bytes"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_block_nullifiers(Request::new(lightwalletd::BlockId {
+            height: floor_height,
+            hash: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetBlockNullifiers to report unavailable wallet-serving floor bytes"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: floor_height,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: floor_height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetBlockRange to report unavailable wallet-serving floor bytes"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_block_range_nullifiers(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: floor_height,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: floor_height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetBlockRangeNullifiers to report unavailable wallet-serving floor bytes"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: floor_height,
+            hash: Vec::new(),
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetTreeState to report unavailable wallet-serving floor tree state"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+            max_entries: 1,
+        }))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetSubtreeRoots to report unavailable wallet-serving floor subtree root"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    let Err(status) = adapter
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await
+    else {
+        return Err(eyre!(
+            "expected GetLatestTreeState to report unavailable wallet-serving floor tree state"
+        ));
+    };
+    assert_eq!(status.code(), Code::NotFound);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_block_methods_serve_first_retained_block_above_wallet_serving_floor()
+-> eyre::Result<()> {
+    let boundary_fixture = wallet_serving_boundary_store_fixture()?;
+    let retained_block = lightwalletd::CompactBlock::decode(
+        boundary_fixture
+            .retained_compact_block
+            .payload_bytes
+            .as_slice(),
+    )?;
+    let retained_height = u64::from(boundary_fixture.retained_compact_block.height.value());
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            boundary_fixture.store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let block = adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: retained_height,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let block_range = adapter
+        .get_block_range(Request::new(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: retained_height,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: retained_height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let ranged_blocks = collect_stream(block_range).await?;
+
+    assert_eq!(block, retained_block);
+    assert_eq!(ranged_blocks, vec![retained_block]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_methods_serve_first_retained_checkpoint_above_wallet_serving_floor()
+-> eyre::Result<()> {
+    let boundary_fixture = wallet_serving_boundary_store_fixture()?;
+    let retained_height = u64::from(boundary_fixture.retained_compact_block.height.value());
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            boundary_fixture.store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let tree_state = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: retained_height,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let latest_tree_state = adapter
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert_eq!(tree_state.height, retained_height);
+    assert_eq!(latest_tree_state.height, retained_height);
+    assert_eq!(tree_state.sapling_tree, "aabbcc");
+    assert_eq!(tree_state.orchard_tree, "ddeeff");
+    assert_eq!(tree_state.ironwood_tree, "112233");
+    assert_eq!(latest_tree_state, tree_state);
+
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "the compatibility fixture keeps transparent output and spend fact rows together"
@@ -734,6 +1298,8 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
+    let adapter = adapter.with_transparent_address_support();
+
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
         start_height: 1,
@@ -762,6 +1328,74 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
     assert_eq!(streamed_utxos[0].value_zat, 12);
     assert_eq!(streamed_utxos[0].height, 1);
     assert!(lightd_info.taddr_support);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_address_utxos_honors_start_height_floor() -> eyre::Result<()> {
+    let transparent_address =
+        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x12; 20]);
+    let address = transparent_address.to_string();
+    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
+    let before_floor_transaction_id = TransactionId::from_bytes([0x12; 32]);
+    let at_floor_transaction_id = TransactionId::from_bytes([0x13; 32]);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let before_floor_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("start-height fixture must include height 1"))?
+        .clone();
+    let at_floor_block = chain_fixture
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("start-height fixture must include height 2"))?
+        .clone();
+    let chain_fixture = chain_fixture
+        .with_address_output_index(TransparentUnspentOutput::new(
+            address_script_hash,
+            script_pub_key.clone(),
+            TransparentOutPoint::new(before_floor_transaction_id, 0),
+            12,
+            before_floor_block.height,
+            before_floor_block.hash,
+        ))
+        .with_address_output_index(TransparentUnspentOutput::new(
+            address_script_hash,
+            script_pub_key,
+            TransparentOutPoint::new(at_floor_transaction_id, 1),
+            13,
+            at_floor_block.height,
+            at_floor_block.hash,
+        ));
+    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let request = lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address],
+        start_height: 2,
+        max_entries: 10,
+    };
+
+    let list_response = adapter
+        .get_address_utxos(Request::new(request.clone()))
+        .await?
+        .into_inner();
+    let stream_response = adapter
+        .get_address_utxos_stream(Request::new(request))
+        .await?
+        .into_inner();
+    let streamed_utxos = collect_stream(stream_response).await?;
+
+    assert_eq!(list_response.address_utxos, streamed_utxos);
+    assert_eq!(streamed_utxos.len(), 1);
+    assert_eq!(streamed_utxos[0].height, 2);
+    assert_eq!(streamed_utxos[0].txid, at_floor_transaction_id.as_bytes());
 
     Ok(())
 }
@@ -979,23 +1613,277 @@ async fn get_taddress_history_drains_native_pages() -> eyre::Result<()> {
     );
     let request = transparent_address_block_filter(address);
 
-    let txids = adapter
+    let deprecated_transactions = adapter
         .get_taddress_txids(Request::new(request.clone()))
         .await?
         .into_inner();
-    let txids = collect_stream(txids).await?;
+    let deprecated_transactions = collect_stream(deprecated_transactions).await?;
     let transactions = adapter
         .get_taddress_transactions(Request::new(request))
         .await?
         .into_inner();
     let transactions = collect_stream(transactions).await?;
 
-    assert_eq!(txids.len(), 1001);
+    assert_eq!(deprecated_transactions.len(), 1001);
     assert_eq!(transactions.len(), 1001);
-    assert_eq!(txids[0].data, tx_id_for_index(0).as_bytes().to_vec());
-    assert_eq!(txids[1000].data, tx_id_for_index(1000).as_bytes().to_vec());
+    assert_eq!(deprecated_transactions[0].data, tx_payload_for_index(0));
+    assert_eq!(
+        deprecated_transactions[1000].data,
+        tx_payload_for_index(1000)
+    );
     assert_eq!(transactions[0].data, tx_payload_for_index(0));
     assert_eq!(transactions[1000].data, tx_payload_for_index(1000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_transaction_returns_not_found_when_blob_is_unretained() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x32; 32]);
+    let store_fixture = acceptance_store_fixture_with_transaction_rows(
+        DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        |block| vec![transaction_rows_without_blob(transaction_id, block)],
+    )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let by_hash_status = match adapter
+        .get_transaction(Request::new(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: transaction_id.as_bytes().to_vec(),
+        }))
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected missing raw blob, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(by_hash_status.code(), Code::NotFound);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction() -> eyre::Result<()>
+{
+    let store_fixture = StoreFixture::open()?;
+    let transaction_id = TransactionId::from_bytes([0x33; 32]);
+    let reorged_height = BlockHeight::new(2);
+    let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let safe_tip_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("reorg fixture must include safe-tip block"))?
+        .clone();
+    let reorged_block = chain_fixture
+        .block_at(reorged_height)
+        .ok_or_else(|| eyre!("reorg fixture must include replaced block"))?
+        .clone();
+    chain_fixture =
+        chain_fixture.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            reorged_block.height,
+            reorged_block.hash,
+            0,
+            b"raw-reorged-transaction".to_vec(),
+        ));
+    let mut initial_artifacts = chain_fixture
+        .chain_epoch_artifacts(ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("reorg fixture must build an initial chain epoch"))?;
+    initial_artifacts.chain_epoch.settled_tip_height = safe_tip_block.height;
+    initial_artifacts.chain_epoch.settled_tip_hash = safe_tip_block.hash;
+    store_fixture
+        .chain_store()
+        .commit_chain_epoch(initial_artifacts)?;
+
+    store_fixture.chain_store().commit_chain_epoch(
+        reorg_replacement_artifacts(safe_tip_block.hash, reorged_height).with_reorg_window_change(
+            ReorgWindowChange::Replace {
+                from_height: reorged_height,
+            },
+        ),
+    )?;
+
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let by_hash_status = match adapter
+        .get_transaction(Request::new(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: transaction_id.as_bytes().to_vec(),
+        }))
+        .await
+    {
+        Ok(response) => {
+            return Err(eyre!(
+                "expected reorged transaction to disappear, got {response:?}"
+            ));
+        }
+        Err(status) => status,
+    };
+    assert_eq!(by_hash_status.code(), Code::NotFound);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn taddress_history_returns_not_found_when_blob_is_unretained() -> eyre::Result<()> {
+    let transparent_address =
+        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x32; 20]);
+    let address = transparent_address.to_string();
+    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
+    let transaction_id = TransactionId::from_bytes([0x32; 32]);
+    let (store_fixture, derive_store) =
+        acceptance_store_fixture_with_transaction_rows_and_tx_history(
+            DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+            |block| vec![transaction_rows_without_blob(transaction_id, block)],
+            |block| {
+                vec![TransparentAddressTxIndexArtifact::new(
+                    address_script_hash,
+                    block.height,
+                    0,
+                    transaction_id,
+                    block.hash,
+                )]
+            },
+        )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        )
+        .with_derive_store(derive_store),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let deprecated_history_status = raw_transaction_stream_status(
+        adapter
+            .get_taddress_txids(Request::new(transparent_address_block_filter(
+                address.clone(),
+            )))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    let history_status = raw_transaction_stream_status(
+        adapter
+            .get_taddress_transactions(Request::new(transparent_address_block_filter(address)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+
+    assert_eq!(deprecated_history_status.code(), Code::NotFound);
+    assert_eq!(history_status.code(), Code::NotFound);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two-block fixture keeps raw transaction rows and derive rows together"
+)]
+async fn taddress_history_honors_requested_block_range_floor() -> eyre::Result<()> {
+    let transparent_address =
+        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x34; 20]);
+    let address = transparent_address.to_string();
+    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
+    let before_floor_transaction_id = TransactionId::from_bytes([0x34; 32]);
+    let at_floor_transaction_id = TransactionId::from_bytes([0x35; 32]);
+    let before_floor_payload = b"before-floor-transparent-history".to_vec();
+    let at_floor_payload = b"at-floor-transparent-history".to_vec();
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let before_floor_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("transparent-history fixture must include height 1"))?
+        .clone();
+    let at_floor_block = chain_fixture
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("transparent-history fixture must include height 2"))?
+        .clone();
+    let chain_fixture = chain_fixture
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            before_floor_transaction_id,
+            before_floor_block.height,
+            before_floor_block.hash,
+            0,
+            before_floor_payload,
+        ))
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            at_floor_transaction_id,
+            at_floor_block.height,
+            at_floor_block.hash,
+            0,
+            at_floor_payload.clone(),
+        ));
+    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
+    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    seed_transparent_address_transaction_history(
+        &derive_store,
+        &[
+            TransparentAddressTxIndexArtifact::new(
+                address_script_hash,
+                before_floor_block.height,
+                0,
+                before_floor_transaction_id,
+                before_floor_block.hash,
+            ),
+            TransparentAddressTxIndexArtifact::new(
+                address_script_hash,
+                at_floor_block.height,
+                0,
+                at_floor_transaction_id,
+                at_floor_block.hash,
+            ),
+        ],
+    )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        )
+        .with_derive_store(derive_store),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let request = transparent_address_block_filter_for_range(address, 2, 2);
+
+    let deprecated_transactions = adapter
+        .get_taddress_txids(Request::new(request.clone()))
+        .await?
+        .into_inner();
+    let deprecated_transactions = collect_stream(deprecated_transactions).await?;
+    let transactions = adapter
+        .get_taddress_transactions(Request::new(request))
+        .await?
+        .into_inner();
+    let transactions = collect_stream(transactions).await?;
+
+    assert_eq!(deprecated_transactions.len(), 1);
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(deprecated_transactions[0].height, 2);
+    assert_eq!(transactions[0].height, 2);
+    assert_eq!(
+        deprecated_transactions[0].data.as_slice(),
+        at_floor_payload.as_slice()
+    );
+    assert_eq!(transactions[0].data.as_slice(), at_floor_payload.as_slice());
 
     Ok(())
 }
@@ -1183,6 +2071,62 @@ async fn send_transaction_reports_broadcast_disabled() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clients()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let wallet_query =
+        WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone());
+    let latest_block = wallet_query.latest_block(None).await?;
+    let query_api = EpochPinRecorder::new(wallet_query).with_transparent_address_balance(
+        TransparentAddressBalance {
+            confirmed_zat: 1_000,
+            unconfirmed_delta_zat: -375,
+            address_count: 1,
+            chain_epoch: latest_block.chain_epoch,
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let adapter = LightwalletdGrpcAdapter::new(query_api, activations).into_server();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(adapter)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    {
+        let mut client = CompactTxStreamerClient::connect(format!("http://{server_addr}")).await?;
+        let transparent_address =
+            ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x41; 20]);
+        let address = transparent_address.to_string();
+        let unary_balance = client
+            .get_taddress_balance(lightwalletd::AddressList {
+                addresses: vec![address.clone()],
+            })
+            .await?
+            .into_inner();
+        let stream_balance = client
+            .get_taddress_balance_stream(tokio_stream::iter(vec![lightwalletd::Address {
+                address,
+            }]))
+            .await?
+            .into_inner();
+
+        assert_eq!(unary_balance.value_zat, 625);
+        assert_eq!(unary_balance, stream_balance);
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn generated_lightwalletd_client_streams_over_grpc_transport() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1305,7 +2249,7 @@ async fn tree_state_rejects_zero_empty_block_id_without_reader_fallback() -> eyr
         Err(status) => status,
     };
 
-    assert_eq!(status.code(), Code::NotFound);
+    assert_eq!(status.code(), Code::InvalidArgument);
 
     Ok(())
 }
@@ -1523,20 +2467,8 @@ async fn ping_returns_zero_entry_and_exit() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn get_transaction_by_block_index_returns_indexed_transaction() -> eyre::Result<()> {
-    let acceptance_txid_bytes = [2u8; 32];
-    let store_fixture = acceptance_store_fixture_with_transaction_rows(
-        DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
-        |block| {
-            vec![FixtureTransactionRows::from_raw_transaction(
-                TransactionId::from_bytes(acceptance_txid_bytes),
-                block.height,
-                block.hash,
-                0,
-                b"acceptance-transaction-bytes".to_vec(),
-            )]
-        },
-    )?;
+async fn get_transaction_rejects_block_index_without_txid_like_lightwalletd() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -1546,7 +2478,7 @@ async fn get_transaction_by_block_index_returns_indexed_transaction() -> eyre::R
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let response = adapter
+    let status = match adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
             block: Some(lightwalletd::BlockId {
                 height: 1,
@@ -1555,17 +2487,20 @@ async fn get_transaction_by_block_index_returns_indexed_transaction() -> eyre::R
             index: 0,
             hash: Vec::new(),
         }))
-        .await?
-        .into_inner();
+        .await
+    {
+        Ok(response) => return Err(eyre!("expected invalid argument, got {response:?}")),
+        Err(status) => status,
+    };
 
-    assert_eq!(response.height, 1);
-    assert_eq!(response.data, b"acceptance-transaction-bytes");
-
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "GetTransaction: specify a txid");
     Ok(())
 }
 
 #[tokio::test]
-async fn get_transaction_by_block_index_returns_not_found_for_unknown_index() -> eyre::Result<()> {
+async fn get_transaction_rejects_unknown_block_index_without_txid_like_lightwalletd()
+-> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -1593,7 +2528,8 @@ async fn get_transaction_by_block_index_returns_not_found_for_unknown_index() ->
         Err(status) => status,
     };
 
-    assert_eq!(status.code(), Code::NotFound);
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "GetTransaction: specify a txid");
 
     Ok(())
 }
@@ -1609,6 +2545,260 @@ where
         values.push(stream_item?);
     }
     Ok(values)
+}
+
+async fn raw_transaction_stream_status<Stream>(stream: Stream) -> eyre::Result<tonic::Status>
+where
+    Stream: tonic::codegen::tokio_stream::Stream<
+            Item = Result<lightwalletd::RawTransaction, tonic::Status>,
+        > + Unpin,
+{
+    match collect_stream(stream).await {
+        Ok(transactions) => Err(eyre!(
+            "expected missing raw blob stream error, got {} transactions",
+            transactions.len()
+        )),
+        Err(status) => Ok(status),
+    }
+}
+
+fn transaction_rows_without_blob(
+    transaction_id: TransactionId,
+    block: &zinder_testkit::FixtureBlock,
+) -> FixtureTransactionRows {
+    let location = TransactionLocation::new(transaction_id, block.height, block.hash, 0);
+    FixtureTransactionRows::from_public_facts(
+        location,
+        synthetic_transaction_public_facts(transaction_id, 128),
+    )
+}
+
+fn subtree_root_store_fixture() -> eyre::Result<(StoreFixture, BlockHash)> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(1)
+        .with_tip_metadata_override(ChainTipMetadata::new(
+            SUBTREE_LEAF_COUNT,
+            SUBTREE_LEAF_COUNT,
+            SUBTREE_LEAF_COUNT,
+        ));
+    let completing_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("subtree-root fixture must include the completing block"))?
+        .clone();
+    let mut artifacts = chain_fixture
+        .chain_epoch_artifacts(ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("subtree-root fixture must build a chain epoch"))?;
+    artifacts.subtree_roots = vec![
+        SubtreeRootArtifact::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            SubtreeRootHash::from_bytes([0x17; 32]),
+            completing_block.height,
+            completing_block.hash,
+        ),
+        SubtreeRootArtifact::new(
+            ShieldedProtocol::Orchard,
+            SubtreeRootIndex::new(0),
+            SubtreeRootHash::from_bytes([0x18; 32]),
+            completing_block.height,
+            completing_block.hash,
+        ),
+        SubtreeRootArtifact::new(
+            ShieldedProtocol::Ironwood,
+            SubtreeRootIndex::new(0),
+            SubtreeRootHash::from_bytes([0x19; 32]),
+            completing_block.height,
+            completing_block.hash,
+        ),
+    ];
+
+    let store_fixture = StoreFixture::open()?;
+    store_fixture.chain_store().commit_chain_epoch(artifacts)?;
+    Ok((store_fixture, completing_block.hash))
+}
+
+fn genesis_store_fixture() -> eyre::Result<StoreFixture> {
+    let store_fixture = StoreFixture::open()?;
+    let height = BlockHeight::new(0);
+    let block_hash = BlockHash::from_bytes([0x01; 32]);
+    let parent_hash = BlockHash::from_bytes([0x00; 32]);
+    let block_time_seconds = 1_296_684_800;
+    let chain_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: height,
+        visible_tip_hash: block_hash,
+        settled_tip_height: height,
+        settled_tip_hash: block_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_000),
+    };
+    let block_header = BlockHeaderArtifact::new(
+        height,
+        block_hash,
+        parent_hash,
+        [0x02; 32],
+        [0x03; 32],
+        i64::from(block_time_seconds),
+        0x1f00_ffff,
+        [0x04; 32],
+        4,
+        128,
+    );
+    let compact_block = CompactBlockArtifact::new(
+        height,
+        block_hash,
+        acceptance_compact_block_payload_at(height, block_hash, parent_hash, block_time_seconds),
+    );
+
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(chain_epoch, vec![block_header], vec![compact_block])
+            .with_reorg_window_change(ReorgWindowChange::Extend {
+                block_range: BlockHeightRange::inclusive(height, height),
+            }),
+    )?;
+
+    Ok(store_fixture)
+}
+
+fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeight)> {
+    let store_fixture = StoreFixture::open()?;
+    let wallet_serving_floor_height = BlockHeight::new(1_000);
+    let wallet_serving_floor_hash = BlockHash::from_bytes([0x42; 32]);
+    let chain_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: wallet_serving_floor_height,
+        visible_tip_hash: wallet_serving_floor_hash,
+        settled_tip_height: wallet_serving_floor_height,
+        settled_tip_hash: wallet_serving_floor_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0),
+        created_at: UnixTimestampMillis::new(1_774_668_000_000),
+    };
+
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
+            ReorgWindowChange::AdvanceSafeTipTo {
+                height: wallet_serving_floor_height,
+            },
+        ),
+    )?;
+
+    Ok((store_fixture, wallet_serving_floor_height))
+}
+
+struct WalletServingBoundaryFixture {
+    store_fixture: StoreFixture,
+    retained_compact_block: CompactBlockArtifact,
+}
+
+fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundaryFixture> {
+    let store_fixture = StoreFixture::open()?;
+    let wallet_serving_floor_height = BlockHeight::new(1);
+    let retained_height = BlockHeight::new(2);
+    let retained_tree_state_payload = br#"{"hash":"020202","height":2,"time":1296694003,"sapling":{"commitments":{"finalState":"aabbcc"}},"orchard":{"commitments":{"finalState":"ddeeff"}},"ironwood":{"commitments":{"finalState":"112233"}}}"#
+        .to_vec();
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_tree_state_checkpoint_payload_at(retained_height, retained_tree_state_payload);
+    let floor_block = chain_fixture
+        .block_at(wallet_serving_floor_height)
+        .ok_or_else(|| eyre!("compact-block boundary fixture must include the floor block"))?
+        .clone();
+    let retained_block = chain_fixture
+        .block_at(retained_height)
+        .ok_or_else(|| eyre!("compact-block boundary fixture must include the retained block"))?
+        .clone();
+    let retained_compact_block = chain_fixture
+        .block_at(retained_height)
+        .ok_or_else(|| eyre!("compact-block boundary fixture must include the retained block"))?
+        .compact_block_artifact();
+    let floor_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: floor_block.height,
+        visible_tip_hash: floor_block.hash,
+        settled_tip_height: floor_block.height,
+        settled_tip_hash: floor_block.hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_000),
+    };
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(floor_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
+            ReorgWindowChange::AdvanceSafeTipTo {
+                height: wallet_serving_floor_height,
+            },
+        ),
+    )?;
+
+    let retained_epoch = ChainEpoch {
+        id: ChainEpochId::new(2),
+        network: Network::ZcashRegtest,
+        visible_tip_height: retained_block.height,
+        visible_tip_hash: retained_block.hash,
+        settled_tip_height: retained_block.height,
+        settled_tip_hash: retained_block.hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_010),
+    };
+    store_fixture.chain_store().commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            retained_epoch,
+            vec![retained_block.block_header_artifact()],
+            vec![retained_compact_block.clone()],
+        )
+        .with_tree_states(vec![retained_block.tree_state_checkpoint_artifact()])
+        .with_reorg_window_change(ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(retained_height, retained_height),
+        }),
+    )?;
+
+    Ok(WalletServingBoundaryFixture {
+        store_fixture,
+        retained_compact_block,
+    })
+}
+
+fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> ChainEpochArtifacts {
+    let replacement_hash = BlockHash::from_bytes([0x99; 32]);
+    let replacement_epoch = ChainEpoch {
+        id: ChainEpochId::new(2),
+        network: Network::ZcashRegtest,
+        visible_tip_height: height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: BlockHeight::new(height.value() - 1),
+        settled_tip_hash: parent_hash,
+        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1_774_668_000_020),
+    };
+    let replacement_block = BlockHeaderArtifact::new(
+        height,
+        replacement_hash,
+        parent_hash,
+        [0; 32],
+        [0; 32],
+        0,
+        0,
+        [0; 32],
+        0,
+        0,
+    );
+    let replacement_compact_block = CompactBlockArtifact::new(
+        height,
+        replacement_hash,
+        b"replacement-compact-block".to_vec(),
+    );
+
+    ChainEpochArtifacts::new(
+        replacement_epoch,
+        vec![replacement_block],
+        vec![replacement_compact_block],
+    )
 }
 
 fn acceptance_store_fixture(tree_state_payload: Vec<u8>) -> eyre::Result<StoreFixture> {
@@ -1734,8 +2924,22 @@ fn acceptance_compact_block_payload(
     parent_hash: BlockHash,
     block_time_seconds: u32,
 ) -> Vec<u8> {
+    acceptance_compact_block_payload_at(
+        ACCEPTANCE_BLOCK_HEIGHT,
+        block_hash,
+        parent_hash,
+        block_time_seconds,
+    )
+}
+
+fn acceptance_compact_block_payload_at(
+    height: BlockHeight,
+    block_hash: BlockHash,
+    parent_hash: BlockHash,
+    block_time_seconds: u32,
+) -> Vec<u8> {
     lightwalletd::CompactBlock {
-        height: 1,
+        height: u64::from(height.value()),
         hash: block_hash.as_bytes().to_vec(),
         prev_hash: parent_hash.as_bytes().to_vec(),
         time: block_time_seconds,
@@ -1783,15 +2987,23 @@ fn acceptance_compact_block_payload(
 fn transparent_address_block_filter(
     address: String,
 ) -> lightwalletd::TransparentAddressBlockFilter {
+    transparent_address_block_filter_for_range(address, 1, 1)
+}
+
+fn transparent_address_block_filter_for_range(
+    address: String,
+    start_height: u64,
+    end_height: u64,
+) -> lightwalletd::TransparentAddressBlockFilter {
     lightwalletd::TransparentAddressBlockFilter {
         address,
         range: Some(lightwalletd::BlockRange {
             start: Some(lightwalletd::BlockId {
-                height: 1,
+                height: start_height,
                 hash: Vec::new(),
             }),
             end: Some(lightwalletd::BlockId {
-                height: 1,
+                height: end_height,
                 hash: Vec::new(),
             }),
             pool_types: Vec::new(),

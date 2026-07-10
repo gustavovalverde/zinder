@@ -127,6 +127,7 @@ Startup validates required capabilities before ingestion mutates state. Missing 
 - `NodeUnavailable`
 - `SourceProtocolMismatch`
 - `BlockUnavailable`
+- `TipViewChanged` when Zebra invalidates the just-observed best hash before its header can be read; the adapter performs bounded fresh observations before returning it.
 - `TransactionBroadcastDisabled` for the no-op broadcaster path.
 
 Source errors describe what the upstream did; lifecycle decisions are owned by the writer loops, not by this boundary. `SourceError::upstream_classification()` returns a [`SourceFailureClass`](../adrs/0013-source-failure-recovery-topology.md) (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) that the recovery primitive in `zinder-ingest` consumes to select backoff and populate the `node_unavailable` readiness payload. Every source-shaped failure is loop-recoverable; storage and reorg-window failures are the only ingest-exit paths.
@@ -136,7 +137,7 @@ Operators triaging a `/readyz` response with `cause.node_unavailable.failure_cla
 | `failure_class` | Meaning | Operator action |
 | --- | --- | --- |
 | `node_unreachable` | Zebra is down or unreachable | Investigate Zebra liveness, connection limits, transport |
-| `upstream_view_changed` | Best-chain race; height was valid but the chain moved | None (normal during reorgs and node restarts) |
+| `upstream_view_changed` | Best-chain race; a height or just-observed tip moved out of the best chain | None (normal during reorgs and node restarts) |
 | `stream_disconnected` | Chain-tip or mempool subscription dropped | Self-heals; check indexer endpoint if persistent |
 | `capability_missing` | Zebra is missing a required RPC method | Upgrade Zebra or switch source |
 | `protocol_mismatch` | Zebra response shape does not match expectations | Investigate Zebra version mismatch |

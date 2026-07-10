@@ -27,8 +27,12 @@ use std::{num::NonZeroU32, sync::Arc};
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
+use zebra_chain::parameters::NetworkKind as ZebraNetworkKind;
 use zebra_chain::serialization::ZcashDeserializeInto;
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
+use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
     BlockHash, BlockHeight, Network, NetworkUpgradeActivations, TransactionId,
@@ -37,6 +41,9 @@ use zinder_core::{
 use zinder_ingest::{
     DeriveReplayPolicy, IngestDeriveConfig, catch_up_derive_store_to_canonical,
     open_primary_derive_store_for_canonical, run_bulk_catchup,
+};
+use zinder_proto::compat::lightwalletd::{
+    self, compact_tx_streamer_server::CompactTxStreamer as LightwalletdCompactTxStreamer,
 };
 use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQuery,
@@ -86,11 +93,24 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
         },
     )?;
     derive_secondary.try_catch_up()?;
-    let wallet_query = WalletQuery::new(store, (), activations).with_derive_store(derive_secondary);
+    let wallet_query =
+        WalletQuery::new(store, (), Arc::clone(&activations)).with_derive_store(derive_secondary);
 
     assert_utxo_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_round_trip(&wallet_query, &sample).await?;
     assert_tx_history_descending_matches_ascending(&wallet_query, &sample).await?;
+    let raw_transaction_bytes = assert_raw_transaction_blob_round_trip(&wallet_query, &sample)
+        .await?
+        .transaction
+        .raw_transaction_bytes;
+
+    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, activations);
+    assert_lightwalletd_transparent_history_round_trip(
+        &grpc_adapter,
+        &sample,
+        &raw_transaction_bytes,
+    )
+    .await?;
 
     tracing::info!(
         target: "zinder::live",
@@ -104,6 +124,7 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
 
 #[derive(Clone, Debug)]
 struct SampledCoinbase {
+    transparent_address: String,
     address_script_hash: TransparentAddressScriptHash,
     script_pub_key: Vec<u8>,
     transaction_id: TransactionId,
@@ -155,7 +176,8 @@ async fn bulk_catchup_and_sample_tip_coinbase(
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let block_at_tip = source.fetch_block_at(tip_height).await?;
-    let sample = sample_first_coinbase_output(&block_at_tip, from_height, tip_height)?;
+    let sample =
+        sample_first_coinbase_output(&block_at_tip, env.network(), from_height, tip_height)?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
     let derive_primary = open_primary_derive_store_for_canonical(
@@ -186,6 +208,7 @@ fn derive_replay_config() -> Result<IngestDeriveConfig> {
 
 fn sample_first_coinbase_output(
     block: &SourceBlock,
+    network: Network,
     bulk_catchup_from_height: BlockHeight,
     tip_height: BlockHeight,
 ) -> Result<SampledCoinbase> {
@@ -208,7 +231,10 @@ fn sample_first_coinbase_output(
     let mut hasher = Sha256::new();
     hasher.update(&script_pub_key);
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
+    let transparent_address =
+        transparent_address_from_script_pub_key(network, &script_pub_key)?.to_string();
     Ok(SampledCoinbase {
+        transparent_address,
         address_script_hash,
         script_pub_key,
         transaction_id: TransactionId::from_bytes(coinbase_tx.hash().0),
@@ -219,6 +245,45 @@ fn sample_first_coinbase_output(
         bulk_catchup_from_height,
         tip_height,
     })
+}
+
+fn transparent_address_from_script_pub_key(
+    network: Network,
+    script_pub_key: &[u8],
+) -> Result<ZebraTransparentAddress> {
+    let network_kind = zebra_network_kind(network)?;
+    match script_pub_key {
+        [0x76, 0xa9, 0x14, pub_key_hash @ .., 0x88, 0xac] if pub_key_hash.len() == 20 => {
+            let mut hash_bytes = [0u8; 20];
+            hash_bytes.copy_from_slice(pub_key_hash);
+            Ok(ZebraTransparentAddress::from_pub_key_hash(
+                network_kind,
+                hash_bytes,
+            ))
+        }
+        [0xa9, 0x14, script_hash @ .., 0x87] if script_hash.len() == 20 => {
+            let mut hash_bytes = [0u8; 20];
+            hash_bytes.copy_from_slice(script_hash);
+            Ok(ZebraTransparentAddress::from_script_hash(
+                network_kind,
+                hash_bytes,
+            ))
+        }
+        _ => Err(eyre!(
+            "sampled coinbase output script is not a transparent P2PKH or P2SH address"
+        )),
+    }
+}
+
+fn zebra_network_kind(network: Network) -> Result<ZebraNetworkKind> {
+    match network {
+        Network::ZcashMainnet => Ok(ZebraNetworkKind::Mainnet),
+        Network::ZcashTestnet => Ok(ZebraNetworkKind::Testnet),
+        Network::ZcashRegtest => Ok(ZebraNetworkKind::Regtest),
+        other => Err(eyre!(
+            "unsupported network for transparent address live test: {other:?}"
+        )),
+    }
 }
 
 async fn assert_utxo_round_trip(
@@ -322,6 +387,123 @@ async fn assert_tx_history_descending_matches_ascending(
         assert_eq!(asc.block_height, desc.block_height);
         assert_eq!(asc.tx_index_in_block, desc.tx_index_in_block);
     }
+    Ok(())
+}
+
+async fn assert_raw_transaction_blob_round_trip(
+    wallet_query: &WalletQuery<PrimaryChainStore>,
+    sample: &SampledCoinbase,
+) -> Result<zinder_query::RawTransaction> {
+    let raw_transaction = wallet_query
+        .raw_transaction(sample.transaction_id, None)
+        .await?;
+    assert_eq!(
+        raw_transaction.transaction.location.transaction_id,
+        sample.transaction_id
+    );
+    assert_eq!(
+        raw_transaction.transaction.location.block_height,
+        sample.block_height
+    );
+    assert!(
+        !raw_transaction.transaction.raw_transaction_bytes.is_empty(),
+        "sampled coinbase raw transaction bytes must be retained"
+    );
+    Ok(raw_transaction)
+}
+
+async fn assert_lightwalletd_transparent_history_round_trip(
+    grpc_adapter: &LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>>,
+    sample: &SampledCoinbase,
+    expected_raw_transaction_bytes: &[u8],
+) -> Result<()> {
+    let deprecated_transactions = LightwalletdCompactTxStreamer::get_taddress_txids(
+        grpc_adapter,
+        Request::new(transparent_address_block_filter(sample)),
+    )
+    .await?
+    .into_inner();
+    let deprecated_transactions = collect_raw_transaction_stream(deprecated_transactions).await?;
+
+    let transactions = LightwalletdCompactTxStreamer::get_taddress_transactions(
+        grpc_adapter,
+        Request::new(transparent_address_block_filter(sample)),
+    )
+    .await?
+    .into_inner();
+    let transactions = collect_raw_transaction_stream(transactions).await?;
+
+    assert_raw_transactions_include_sample(
+        &deprecated_transactions,
+        sample,
+        expected_raw_transaction_bytes,
+        "GetTaddressTxids",
+    )?;
+    assert_raw_transactions_include_sample(
+        &transactions,
+        sample,
+        expected_raw_transaction_bytes,
+        "GetTaddressTransactions",
+    )?;
+    Ok(())
+}
+
+fn transparent_address_block_filter(
+    sample: &SampledCoinbase,
+) -> lightwalletd::TransparentAddressBlockFilter {
+    lightwalletd::TransparentAddressBlockFilter {
+        address: sample.transparent_address.clone(),
+        range: Some(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: u64::from(sample.bulk_catchup_from_height.value()),
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: u64::from(sample.tip_height.value()),
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    }
+}
+
+async fn collect_raw_transaction_stream<Stream>(
+    mut stream: Stream,
+) -> Result<Vec<lightwalletd::RawTransaction>>
+where
+    Stream: tonic::codegen::tokio_stream::Stream<
+            Item = Result<lightwalletd::RawTransaction, tonic::Status>,
+        > + Unpin,
+{
+    use tonic::codegen::tokio_stream::StreamExt;
+
+    let mut transactions = Vec::new();
+    while let Some(stream_item) = stream.next().await {
+        transactions.push(stream_item?);
+    }
+    Ok(transactions)
+}
+
+fn assert_raw_transactions_include_sample(
+    transactions: &[lightwalletd::RawTransaction],
+    sample: &SampledCoinbase,
+    expected_raw_transaction_bytes: &[u8],
+    rpc_name: &str,
+) -> Result<()> {
+    let matched = transactions
+        .iter()
+        .find(|transaction| {
+            transaction.height == u64::from(sample.block_height.value())
+                && transaction.data == expected_raw_transaction_bytes
+        })
+        .ok_or_else(|| {
+            eyre!(
+                "{rpc_name} did not return the sampled raw transaction; returned_count={} sample_height={}",
+                transactions.len(),
+                sample.block_height.value()
+            )
+        })?;
+    assert_eq!(matched.data, expected_raw_transaction_bytes);
     Ok(())
 }
 

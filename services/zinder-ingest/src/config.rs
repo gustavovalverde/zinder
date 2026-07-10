@@ -351,10 +351,6 @@ pub(crate) fn load_ingest_config(
             "ingest.modifiers.coverage",
             DEFAULT_INGEST_COVERAGE.as_kebab_case(),
         )?
-        .with_default(
-            "storage.raw_blob_policy",
-            DEFAULT_RAW_BLOB_POLICY.as_kebab_case(),
-        )?
         .with_ops_section(ServiceIdentifier::Ingest)?
         .with_security_section()?
         .with_file(config_path)
@@ -662,10 +658,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .clone()
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
-    let raw_blob_policy = config
-        .storage
-        .raw_blob_policy
-        .unwrap_or(DEFAULT_RAW_BLOB_POLICY);
+    let configured_raw_blob_policy = config.storage.raw_blob_policy;
     let ResolvedPrimaryStorage {
         path: storage_path,
         canonical_rocksdb_budget,
@@ -839,6 +832,17 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     )?;
 
     let coverage = config.ingest.modifiers.coverage.unwrap_or_default();
+    let raw_blob_policy = match (coverage, configured_raw_blob_policy) {
+        (IngestCoverage::WalletServing, None) => RawBlobPolicy::Transactions,
+        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => {
+            return Err(ConfigError::invalid(
+                "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
+            )
+            .into());
+        }
+        (_, Some(raw_blob_policy)) => raw_blob_policy,
+        (_, None) => DEFAULT_RAW_BLOB_POLICY,
+    };
 
     let allow_near_tip_finalize = require_field(
         config.ingest.modifiers.allow_near_tip_finalize,

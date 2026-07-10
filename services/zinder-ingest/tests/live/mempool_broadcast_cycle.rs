@@ -14,8 +14,8 @@
 //! # Operator precondition
 //!
 //! Zebra's regtest sidecar must mine to the test address derived from
-//! [`BROADCAST_TEST_SEED`]. The exact address is logged by the test on
-//! startup and printed in the failure path; configure
+//! [`TRANSPARENT_BROADCAST_TEST_SEED`]. The exact address is logged by the test
+//! on startup and printed in the failure path; configure
 //! `[mining] miner_address = "<that address>"` in `zebrad.toml` and restart
 //! the sidecar before running.
 //!
@@ -39,16 +39,11 @@ use zinder_source::{
 };
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{
-    P2pkhSpendArgs, TransparentAddress, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
-    local_network_from_activations,
+    P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,
+    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, local_network_from_activations,
 };
 
 use crate::common::{regtest_generate_blocks, rpc_invalidate_block, rpc_reconsider_block};
-
-/// Test seed used to derive the regtest broadcast cycle's transparent
-/// account key. Operators configure their Zebra `miner_address` to the
-/// matching p2pkh address; see the module docstring.
-const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 
 /// Maximum time we wait for the polling mempool source to emit the broadcast
 /// transaction's `Added` event after `sendrawtransaction` returns.
@@ -81,7 +76,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
-        &BROADCAST_TEST_SEED,
+        &TRANSPARENT_BROADCAST_TEST_SEED,
         local_network_from_activations(&schedule),
     )
     .map_err(|error| eyre!("could not derive test key: {error}"))?;
@@ -97,10 +92,8 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
 
     let mut last_known_rejection = None;
     for attempt in 0_u64..3 {
-        let recipient_address = scratch_recipient_address(
-            &test_key,
-            UnixTimestampMillis::now().value().saturating_add(attempt),
-        );
+        let recipient_address = test_key
+            .scratch_recipient_address(UnixTimestampMillis::now().value().saturating_add(attempt));
         let raw_tx = test_key
             .build_p2pkh_spend(&P2pkhSpendArgs {
                 coinbase_txid_be: coinbase.txid_be,
@@ -351,22 +344,6 @@ fn is_known_transaction_rejection(outcome: &TransactionBroadcastResult) -> bool 
     )
 }
 
-/// Returns a deterministic recipient address distinct from the funded test
-/// address so that the spend's outputs are unambiguously identifiable.
-fn scratch_recipient_address(test_key: &TransparentTestKey, salt: u64) -> TransparentAddress {
-    // Take the funded address's pubkey hash and XOR every byte with 0xFF so
-    // the recipient differs but stays a valid p2pkh.
-    let funded_hash = match test_key.address() {
-        TransparentAddress::PublicKeyHash(hash) | TransparentAddress::ScriptHash(hash) => *hash,
-    };
-    let salt_bytes = salt.to_le_bytes();
-    let mut scratch = [0_u8; 20];
-    for (index, byte) in funded_hash.iter().enumerate() {
-        scratch[index] = byte ^ 0xFF ^ salt_bytes[index % salt_bytes.len()];
-    }
-    TransparentAddress::PublicKeyHash(scratch)
-}
-
 async fn wait_for_added(
     event_stream: &mut zinder_source::MempoolSourceEventStream,
     expected_txid: TransactionId,
@@ -460,7 +437,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         .await
         .map_err(|error| eyre!("could not fetch node-advertised upgrade schedule: {error}"))?;
     let test_key = TransparentTestKey::from_seed_with_local_network(
-        &BROADCAST_TEST_SEED,
+        &TRANSPARENT_BROADCAST_TEST_SEED,
         local_network_from_activations(&schedule),
     )
     .map_err(|error| eyre!("could not derive test key: {error}"))?;
@@ -474,8 +451,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
 
     let coinbase = locate_spendable_test_coinbase(&env, &json_rpc, &test_address).await?;
 
-    let recipient_address =
-        scratch_recipient_address(&test_key, UnixTimestampMillis::now().value());
+    let recipient_address = test_key.scratch_recipient_address(UnixTimestampMillis::now().value());
     let raw_tx = test_key
         .build_p2pkh_spend(&P2pkhSpendArgs {
             coinbase_txid_be: coinbase.txid_be,

@@ -68,7 +68,11 @@ Current integration references and API support material:
 ## Investigations
 
 - [Bulk-catchup throughput](investigations/bulk-catchup-throughput.md): mainnet catchup runs roughly one order of magnitude below the design target and slower than the source Zebra node it reads from. Cause: single-threaded consumer pipeline. Three candidate fixes ranked by burden.
-- [Zaino feature comparison](investigations/zaino-feature-comparison.md): per-feature audit against zainod 0.3.1. Three inheritance candidates (UTXO-set summary as a derive consumer, spending-side transparent history, lightwalletd v0.4.0 `vin`/`vout` builder audit), the surfaces Zinder already covers, and the items deliberately not inherited.
+- [Zaino feature comparison](investigations/zaino-feature-comparison.md): public-surface audit against zainod 0.3.1, including native equivalents, raw-RPC differences, and deliberate non-goals.
+
+## Plans
+
+- [Lightwalletd compatibility certification](plans/lightwalletd-compatibility-certification.md): bounded, evidence-backed replacement claims for the compatibility adapter.
 
 ## Runbooks
 

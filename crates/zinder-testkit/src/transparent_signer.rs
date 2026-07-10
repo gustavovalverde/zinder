@@ -49,6 +49,13 @@ pub use zcash_protocol::local_consensus::LocalNetwork;
 pub use zcash_transparent::address::TransparentAddress;
 use zip32::AccountId;
 
+/// Test seed for live regtest transparent-broadcast gates.
+///
+/// Operators configure Zebra's regtest miner address to the address derived
+/// from this seed, so live tests can find a mature transparent coinbase output
+/// they are allowed to spend.
+pub const TRANSPARENT_BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
+
 /// Exact fee charged for a v5 transaction with one transparent input and
 /// one transparent output under ZIP-317's `FeeRule::standard()`.
 ///
@@ -205,6 +212,25 @@ impl TransparentTestKey {
             TransparentAddress::PublicKeyHash(hash) | TransparentAddress::ScriptHash(hash) => hash,
         };
         ZcashAddress::from_transparent_p2pkh(NetworkType::Regtest, pubkey_hash).encode()
+    }
+
+    /// Returns a deterministic recipient address distinct from this key's
+    /// funded address.
+    ///
+    /// Live tests use this to spend a miner-address UTXO without sending the
+    /// change back to the same script, making the test transaction's output
+    /// shape easy to recognize.
+    #[must_use]
+    pub fn scratch_recipient_address(&self, salt: u64) -> TransparentAddress {
+        let funded_hash = match self.address {
+            TransparentAddress::PublicKeyHash(hash) | TransparentAddress::ScriptHash(hash) => hash,
+        };
+        let salt_bytes = salt.to_le_bytes();
+        let mut scratch = [0_u8; 20];
+        for (index, byte) in funded_hash.iter().enumerate() {
+            scratch[index] = byte ^ 0xFF ^ salt_bytes[index % salt_bytes.len()];
+        }
+        TransparentAddress::PublicKeyHash(scratch)
     }
 
     /// Builds and signs a v5 transparent transaction that spends one P2PKH

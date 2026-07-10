@@ -40,9 +40,10 @@ The current compatibility pin is `zcash/lightwallet-protocol` commit
 `ac7cee052a1bf5d430985a478d39e8b513fc4bd4` (tag `v0.5.0`), verified on
 2026-07-05. The machine-readable source provenance lives in
 `crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`, and
-`crates/zinder-proto/tests/lightwalletd_protocol.rs` is the local golden decode
-guard for the current compatibility message shapes. The `vendored proto drift` CI
-job compares the normalized vendored files with that pinned upstream commit so
+`crates/zinder-proto/tests/integration/lightwalletd_protocol.rs` is the local
+golden decode guard for the current compatibility message shapes. The
+`vendored proto drift` CI job compares the normalized vendored files with that
+pinned upstream commit so
 drift is a deliberate compatibility update, not an accidental edit.
 
 Storage-control protobuf records that never cross a service or API boundary may live in `zinder-store`, not `zinder-proto`. The rule is ownership, not file extension: service protocols belong to `zinder-proto`; storage-private control records belong to storage.
@@ -160,6 +161,13 @@ The exact RPC method names can differ if the proto review finds clearer names, b
 
 `zinder-compat-lightwalletd` adapts `WalletQueryApi` to the vendored `CompactTxStreamer` schema.
 
+Adapter-level claims stop at `protocol-compatible` or
+`reference-parity-compatible`. `client-compatible` and
+`public-operator-compatible` claims also require wallet-serving storage,
+real-client evidence, and deployment evidence from
+[Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims)
+and [Testing runbook §External certification procedures](../runbooks/testing.md#external-certification-procedures).
+
 It may:
 
 - Translate request and response shapes.
@@ -204,12 +212,14 @@ The minimum lightwalletd-compatible read-sync surface is:
 - `GetAddressUtxos`
 - `GetAddressUtxosStream`
 
-Android/Zashi compatibility claims are governed by
+Android/Zodl compatibility claims are governed by
 [Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims).
-`GetLightdInfo.taddrSupport` may be true only when `GetAddressUtxos[Stream]`
-reads from stored transparent output artifacts. The compatibility service must
-not claim broader Zashi compatibility until the full external-wallet contract
-is satisfied.
+`GetLightdInfo.taddrSupport` may be true only when the adapter is explicitly
+configured to advertise transparent-address support after the serving process
+has wired both the stored transparent output artifacts and the derive-backed
+transparent transaction-history projection. The compatibility service must not
+claim broader Zodl compatibility until the full external-wallet contract is
+satisfied.
 
 `SendTransaction` forwards `request.data` to
 `WalletQueryApi::broadcast_transaction` and maps each
@@ -285,7 +295,7 @@ Protocol changes require tests at the right boundary:
   may use `zcash_client_backend` only when that SDK graph passes the dependency
   policy gate; SDK scanning must run locally without sending wallet secrets to
   Zinder.
-- Android SDK/Zashi compatibility tests must satisfy the canonical external
+- Android SDK/Zodl compatibility tests must satisfy the canonical external
   wallet contract in [Wallet data plane](wallet-data-plane.md#external-wallet-compatibility-claims).
 - Error mapping tests prove typed Zinder errors reach clients as stable wire responses.
 - Cursor tests prove cross-network, expired, and tampered cursors fail closed.

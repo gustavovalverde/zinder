@@ -418,6 +418,75 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
 }
 
 #[tokio::test]
+async fn tip_id_reobserves_after_zebra_invalidates_the_observed_tip() -> eyre::Result<()> {
+    let fixture = fixture_block()?;
+    let stale_tip_hash = "ab".repeat(32);
+    let server = JsonRpcTestServer::start([
+        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
+        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
+        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
+        method("getblockheader").reply(RpcReply::result(json!({
+            "hash": fixture["hash"],
+            "height": fixture["height"],
+            "previousblockhash": fixture["previousblockhash"],
+            "time": fixture["time"],
+        }))),
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let tip_id = source.tip_id().await?;
+
+    assert_eq!(tip_id.height, BlockHeight::new(1));
+    assert_eq!(
+        tip_id.hash,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
+    );
+    assert_eq!(server.requests_for("getbestblockhash")?.len(), 2);
+    assert_eq!(server.requests_for("getblockheader")?.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_id_classifies_an_unstable_best_chain_view_as_recoverable() -> eyre::Result<()> {
+    let stale_tip_hash = "ab".repeat(32);
+    let server = JsonRpcTestServer::start([
+        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
+        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
+        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
+        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
+        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
+        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let error = match source.tip_id().await {
+        Ok(tip_id) => return Err(eyre!("expected tip error, got {tip_id:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, SourceError::TipViewChanged { .. }));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
+    assert_eq!(server.requests_for("getbestblockhash")?.len(), 3);
+    assert_eq!(server.requests_for("getblockheader")?.len(), 3);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!("not-hex")))])?;
