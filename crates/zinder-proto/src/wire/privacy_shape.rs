@@ -28,6 +28,26 @@ pub const fn encode_privacy_shape(shape: PrivacyShape) -> WirePrivacyShape {
     }
 }
 
+/// Translates a generated privacy-shape enum value into the native classifier.
+///
+/// Returns `None` for the wire-only `UNSPECIFIED` marker and unknown numeric
+/// values. Callers must preserve that absence rather than inventing a privacy
+/// classification.
+#[must_use]
+pub fn decode_privacy_shape(wire_privacy_shape: i32) -> Option<PrivacyShape> {
+    match WirePrivacyShape::try_from(wire_privacy_shape).ok()? {
+        WirePrivacyShape::TransparentOnly => Some(PrivacyShape::TransparentOnly),
+        WirePrivacyShape::Shielding => Some(PrivacyShape::Shielding),
+        WirePrivacyShape::Deshielding => Some(PrivacyShape::Deshielding),
+        WirePrivacyShape::ShieldedOnly => Some(PrivacyShape::ShieldedOnly),
+        WirePrivacyShape::Mixed => Some(PrivacyShape::Mixed),
+        WirePrivacyShape::Coinbase => Some(PrivacyShape::Coinbase),
+        WirePrivacyShape::ShieldedCoinbase => Some(PrivacyShape::ShieldedCoinbase),
+        WirePrivacyShape::Unclassified => Some(PrivacyShape::Unclassified),
+        WirePrivacyShape::Unspecified => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +74,22 @@ mod tests {
             encode_privacy_shape(PrivacyShape::ShieldedCoinbase),
             WirePrivacyShape::ShieldedCoinbase
         );
+    }
+
+    #[test]
+    fn transparent_only_decodes_from_wire() {
+        assert_eq!(
+            decode_privacy_shape(WirePrivacyShape::TransparentOnly as i32),
+            Some(PrivacyShape::TransparentOnly)
+        );
+    }
+
+    #[test]
+    fn unspecified_and_unknown_values_do_not_invent_a_shape() {
+        assert_eq!(
+            decode_privacy_shape(WirePrivacyShape::Unspecified as i32),
+            None
+        );
+        assert_eq!(decode_privacy_shape(i32::MAX), None);
     }
 }

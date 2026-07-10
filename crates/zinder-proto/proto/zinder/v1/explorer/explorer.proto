@@ -260,18 +260,43 @@ enum TransparentDeltaKind {
   TRANSPARENT_DELTA_KIND_SPENT = 2;
 }
 
-// Per-input transparent prevout value carried on `TransactionDetail`.
+// Storage-only per-input transparent prevout value materialized by
+// `TransactionFeesConsumer`.
 //
-// `input_index` is the zero-based position of the input in the
-// transaction's transparent input list. `value_zat` is populated when the
-// prevout could be resolved through the wallet plane's transparent prevout
-// index; it is absent for inputs whose source transaction is not in the
-// canonical index (for example, an old transaction the deployment's
-// retention has dropped). Shielded spends are not emitted here at all:
-// their values are encrypted by protocol and never derivable.
-message TransparentInputDetail {
+// This record deliberately excludes the prevout script: fee projection rows
+// need only the value, while `TransactionDetail` resolves the complete prevout
+// from retained canonical parent facts at request time.
+message TransparentInputValueRecord {
   uint32 input_index = 1;
   optional uint64 value_zat = 2;
+}
+
+// One ordered transparent input carried by `TransactionDetail`.
+//
+// `spent_outpoint` identifies the output consumed by this input. `value_zat`
+// and `script_pub_key` are independently optional: retained parent facts can
+// recover both, while a compatible historical fee row may preserve the value
+// after the parent script is unavailable. Absence must not be interpreted as a
+// zero value or an empty script. Shielded spends are not represented because
+// their values and receivers are encrypted by protocol.
+message TransparentInput {
+  uint32 input_index = 1;
+  zinder.v1.wallet.OutPoint spent_outpoint = 2;
+  optional uint64 value_zat = 3;
+  optional bytes script_pub_key = 4;
+}
+
+// One ordered transparent output carried by `TransactionDetail`.
+//
+// `output` contains the intrinsic value and scriptPubKey created by this
+// transaction. `spent_by` is populated only when a canonical transaction has
+// consumed the outpoint at the response's chain epoch; absence means unspent
+// on that canonical chain. Mempool spends remain a separate wallet-plane
+// relation and do not change this field.
+message TransparentOutput {
+  uint32 output_index = 1;
+  zinder.v1.wallet.TransparentOutput output = 2;
+  zinder.v1.wallet.TransparentSpend spent_by = 3;
 }
 
 // `ExplorerQuery.TransactionDetail` request.
@@ -297,18 +322,38 @@ message TransactionDetailRequest {
 // `WalletQuery.Transaction` returns, so a consumer writes one match shape
 // for both surfaces and TransactionDetail carries the `conflicting` arm.
 //
-// `paid_fee_zat`, `prevout_resolution_status`, and `transparent_inputs`
-// are populated when the explorer advertises
-// `EXPLORER_TRANSACTION_FEES_V1` and the `TransactionFeesConsumer` has
-// materialized a row for `facts.transaction_id`. Otherwise the consumer
-// falls back to `TransactionPublicFacts.counts.zip317_conventional_fee_zat`.
+// `transparent_inputs` is populated for mined transactions from their
+// canonical transaction fact and retained parent facts. Each entry combines
+// input identity and optional prevout resolution so callers do not have to
+// correlate parallel arrays. `prevout_resolution_status` and `paid_fee_zat`
+// remain fee-projection fields advertised by `EXPLORER_TRANSACTION_FEES_V1`.
+// The handler merges a projected fee row with values recovered from the same
+// parent facts used by `transparent_inputs`.
+// `paid_fee_zat` additionally requires `facts.privacy_shape ==
+// TRANSPARENT_ONLY`; shielded and unclassified transactions omit it because
+// canonical facts do not retain the value balances needed to prove their
+// actual fee. Consumers fall back to
+// `TransactionPublicFacts.counts.zip317_conventional_fee_zat` when absent.
+//
+// `transparent_inputs` and `transparent_outputs` are ordered public facts for
+// mined and mempool transactions. Mined inputs may carry retained parent values
+// and scripts; mempool inputs carry their transaction-local index and outpoint
+// without implying prevout resolution. Outputs always carry their intrinsic
+// value and script. Only mined outputs may carry a canonical `spent_by` relation;
+// mempool-spend state remains a separate wallet-plane relation. Conflicting
+// transactions have no payload and therefore return empty lists. Addresses
+// remain an edge concern derived from standard scripts; Zinder returns
+// scriptPubKey bytes.
 message TransactionDetailResponse {
   ExplorerFreshness freshness = 1;
   TransactionPublicFacts facts = 2;
   zinder.v1.wallet.TransactionLocation location = 3;
   optional uint64 paid_fee_zat = 5;
   PrevoutResolutionStatus prevout_resolution_status = 6;
-  repeated TransparentInputDetail transparent_inputs = 7;
+  repeated TransparentInput transparent_inputs = 7;
+  reserved 8;
+  reserved "transparent_input_outpoints";
+  repeated TransparentOutput transparent_outputs = 9;
 }
 
 // Compact summary of one canonical block.
@@ -425,6 +470,111 @@ message BlockSummariesInRangeResponse {
   repeated BlockSummary summaries = 2;
 }
 
+// One canonical block-production observation.
+//
+// `summary` carries the reusable transaction, fee, size, reward, and component
+// facts already exposed by `BlockSummariesInRange`. `bits` adds the compact
+// difficulty target from the canonical block header. Consumers can derive
+// difficulty, inter-block intervals, and rolling production rates without
+// requiring a second per-height header lookup.
+message BlockProductionPoint {
+  BlockSummary summary = 1;
+
+  // Compact difficulty target (`nBits`) from the canonical block header.
+  // This is the same unsigned integer exposed as
+  // `zinder.v1.wallet.BlockHeaderInfo.bits`.
+  uint32 bits = 2;
+
+  // Canonical coinbase facts when the transaction fact artifact is retained.
+  // Absence means the canonical fact is unavailable; a present summary with
+  // no transparent outputs is a valid shielded-only coinbase. Address and pool
+  // attribution remain product-edge concerns.
+  CoinbaseTransactionSummary coinbase = 3;
+}
+
+// Public facts for the canonical coinbase transaction of one production point.
+message CoinbaseTransactionSummary {
+  // Canonical transaction id in RPC byte order.
+  string transaction_id = 1;
+
+  // Intrinsic transparent coinbase outputs in ascending output-index order.
+  repeated zinder.v1.wallet.TransparentOutput transparent_outputs = 2;
+
+  // True when the coinbase also creates Sapling, Orchard, Ironwood, or Sprout
+  // shielded outputs. Shielded values and receivers remain encrypted.
+  bool has_shielded_outputs = 3;
+}
+
+// `ExplorerQuery.BlockProductionSeries` request.
+//
+// Returns points over the inclusive height range `[start_height, end_height]`.
+// The range is bounded server-side. `at_epoch_id` optionally pins canonical
+// header visibility to one chain epoch; derive rows are joined only when their
+// block hash and time agree with that canonical header.
+message BlockProductionSeriesRequest {
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+  optional uint64 at_epoch_id = 3;
+}
+
+// `ExplorerQuery.BlockProductionSeries` response.
+//
+// Points are ordered by ascending block height. `covered_block_count` counts
+// heights where both the block-summary row and canonical header were present
+// and agreed. `missing_block_count` makes partial local retention, derive lag,
+// and concurrent reorg mismatches explicit instead of emitting fabricated
+// zero-valued observations.
+message BlockProductionSeriesResponse {
+  ExplorerFreshness freshness = 1;
+  uint32 start_height = 2;
+  uint32 end_height = 3;
+  uint32 covered_block_count = 4;
+  uint32 missing_block_count = 5;
+  repeated BlockProductionPoint points = 6;
+}
+
+// `ExplorerQuery.BlockActivityDistribution` request.
+//
+// Aggregates the existing materialized block-summary rows over the inclusive
+// height range `[start_height, end_height]`. The range is bounded server-side;
+// consumers that need longer-lived history must request an explicit durable
+// projection rather than treating this request-time aggregate as unbounded.
+message BlockActivityDistributionRequest {
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+}
+
+// One fixed weekday/hour activity bucket.
+//
+// `weekday` follows the PostgreSQL and JavaScript convention: Sunday is zero,
+// Monday is one, through Saturday at six. Rows are ordered by weekday then
+// hour and include zero-valued buckets so consumers never need to synthesize a
+// missing grid cell.
+message BlockActivityBucket {
+  uint32 weekday = 1;
+  uint32 hour = 2;
+  uint64 transaction_count = 3;
+  uint32 block_count = 4;
+}
+
+// `ExplorerQuery.BlockActivityDistribution` response.
+//
+// The response reports the requested height range separately from the number
+// of materialized rows read. A nonzero `missing_block_count` means the derive
+// store does not cover the entire requested range, so a caller must present
+// the returned window as partial rather than a complete history.
+message BlockActivityDistributionResponse {
+  ExplorerFreshness freshness = 1;
+  uint32 start_height = 2;
+  uint32 end_height = 3;
+  uint32 materialized_block_count = 4;
+  uint32 missing_block_count = 5;
+  optional int64 first_block_time_unix_seconds = 6;
+  optional int64 last_block_time_unix_seconds = 7;
+  uint64 transaction_count = 8;
+  repeated BlockActivityBucket buckets = 9;
+}
+
 // `ExplorerQuery.BlockDetail` request.
 //
 // Either `block_height` or `block_hash` resolves the target block. Hash
@@ -458,6 +608,54 @@ message BlockDetailResponse {
   // hex characters in RPC byte order). The leading entry is the coinbase.
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
   repeated string transaction_ids = 3;
+}
+
+// One public transaction row in `ExplorerQuery.BlockTransactions`.
+//
+// `transaction_id` and `transaction_index` are always present because they
+// come from the materialized canonical block record. `public_facts` is absent
+// when a deployment has no canonical fact artifact for that transaction; an
+// absent message is unavailable data, never an all-zero transaction. The
+// transparent outputs are in ascending output-index order. Shielded output
+// values are encrypted and are intentionally not represented here.
+message BlockTransaction {
+  // Zero-based position in canonical block order. The leading row is the
+  // coinbase transaction.
+  uint32 transaction_index = 1;
+
+  // Canonical transaction id in RPC byte order (64 lowercase hex characters).
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string transaction_id = 2;
+
+  // Parsed public facts, when the canonical fact artifact is retained.
+  TransactionPublicFacts public_facts = 3;
+
+  // Transparent outputs in ascending output-index order. The index is the
+  // zero-based position in this array; each entry carries its amount and raw
+  // scriptPubKey but no inferred address label.
+  repeated zinder.v1.wallet.TransparentOutput transparent_outputs = 4;
+
+  reserved 5;
+  reserved "transparent_input_outpoints";
+
+  // Transparent inputs in ascending input-index order. Each entry identifies
+  // the spent outpoint and independently carries its retained value and
+  // scriptPubKey when the parent transaction fact is available. Missing parent
+  // facts remain absent, never zero or an empty script. Address decoding stays
+  // at the product edge.
+  repeated TransparentInput transparent_inputs = 6;
+}
+
+// `ExplorerQuery.BlockTransactions` response.
+//
+// A page-ready bounded aggregate over the existing canonical block and
+// transaction-fact artifacts. This is deliberately separate from
+// `BlockDetail`: callers needing only ids avoid output-script payloads, while
+// explorer pages avoid one `TransactionDetail` RPC per row.
+message BlockTransactionsResponse {
+  ExplorerFreshness freshness = 1;
+  BlockSummary summary = 2;
+  repeated BlockTransaction transactions = 3;
 }
 
 // Per-arm privacy refusal payload returned for shielded receivers,
@@ -753,6 +951,42 @@ message MempoolSummaryResponse {
   uint64 newest_entry_age_millis = 7;
 }
 
+// Summary facts derived from one observed mempool snapshot.
+//
+// The fields deliberately mirror `MempoolSummaryResponse` without its
+// response-level freshness envelope so a paged snapshot can return its global
+// totals and rows from one source read.
+message MempoolSnapshotSummary {
+  uint32 transaction_count = 1;
+  uint64 total_size_bytes = 2;
+  repeated PrivacyShapeCount privacy_shape_distribution = 3;
+  repeated TransactionVersionCount version_distribution = 4;
+  uint64 oldest_entry_age_millis = 5;
+  uint64 newest_entry_age_millis = 6;
+}
+
+// `ExplorerQuery.MempoolSnapshot` request.
+//
+// Selects one bounded page from the same current mempool observation used for
+// the returned summary. The cursor is opaque and has the same transient
+// semantics as `MempoolActivityRequest`.
+message MempoolSnapshotRequest {
+  uint32 max_entries = 1;
+  bytes from_cursor = 2;
+}
+
+// `ExplorerQuery.MempoolSnapshot` response.
+//
+// `summary`, `entries`, and `next_cursor` are all derived from one
+// `WalletQuery.MempoolSnapshot` response. This avoids combining global totals
+// with a page that may have been read after a transaction was mined or added.
+message MempoolSnapshotResponse {
+  ExplorerFreshness freshness = 1;
+  MempoolSnapshotSummary summary = 2;
+  repeated MempoolActivityEntry entries = 3;
+  bytes next_cursor = 4;
+}
+
 // `ExplorerQuery.MempoolActivity` request.
 //
 // Returns the current mempool entries sorted by newest-first observation
@@ -796,6 +1030,16 @@ message MempoolActivityEntry {
   // input; surfaced separately so consumers can render fee-per-action
   // without re-deriving from the component counts.
   uint32 logical_actions = 8;
+
+  // Parsed transaction component counts. These are derived from the live
+  // entry's raw transaction bytes at request time; no durable mempool
+  // projection is involved.
+  TransactionComponentCounts component_counts = 9;
+
+  // Sum of every transparent output created by this transaction, in
+  // zatoshis. Shielded output values are encrypted and are deliberately not
+  // included.
+  uint64 transparent_output_total_zat = 10;
 }
 
 // `ExplorerQuery.MempoolActivity` response.
@@ -1173,7 +1417,7 @@ service ExplorerQuery {
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
 
   // Returns a typed read model for one transaction. Capability:
-  // `explorer.transaction.detail_v1`.
+  // `explorer.transaction.detail_v3`.
   rpc TransactionDetail(TransactionDetailRequest)
       returns (TransactionDetailResponse);
 
@@ -1183,9 +1427,24 @@ service ExplorerQuery {
   rpc BlockSummariesInRange(BlockSummariesInRangeRequest)
       returns (BlockSummariesInRangeResponse);
 
+  // Joins existing block-summary rows to canonical header difficulty bits over
+  // one bounded height range. Capability:
+  // `explorer.block.production_series_v2`.
+  rpc BlockProductionSeries(BlockProductionSeriesRequest)
+      returns (BlockProductionSeriesResponse);
+
+  // Aggregates canonical block activity by weekday and hour across one bounded
+  // height range. Capability: `explorer.block.activity_distribution_v1`.
+  rpc BlockActivityDistribution(BlockActivityDistributionRequest)
+      returns (BlockActivityDistributionResponse);
+
   // Returns one `BlockSummary` plus the canonical-ordered transaction ids
   // for the requested block. Capability: `explorer.block.detail_v1`.
   rpc BlockDetail(BlockDetailRequest) returns (BlockDetailResponse);
+
+  // Returns page-ready public transaction rows for one canonical block.
+  // Capability: `explorer.block.transactions_v2`.
+  rpc BlockTransactions(BlockDetailRequest) returns (BlockTransactionsResponse);
 
   // Classifies a raw user input string into typed search candidates per
   // [ADR-0012](../../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
@@ -1199,6 +1458,10 @@ service ExplorerQuery {
   // version distribution, and freshness extremes. Capability:
   // `explorer.mempool.summary_v1`.
   rpc MempoolSummary(MempoolSummaryRequest) returns (MempoolSummaryResponse);
+
+  // Returns aggregate facts and one page from the same observed mempool
+  // snapshot. Capability: `explorer.mempool.snapshot_v1`.
+  rpc MempoolSnapshot(MempoolSnapshotRequest) returns (MempoolSnapshotResponse);
 
   // Returns the current mempool entries sorted by newest-first
   // observation time, paged with an opaque cursor. Mempool state is
@@ -1439,15 +1702,16 @@ message TransparentAddressActivityRecord {
 //
 // Storage-only: never returned directly on the wire. The
 // `TransactionDetail` handler reads this record and projects the values
-// onto `TransactionDetailResponse`; the `MempoolActivity` handler reads
+// onto `TransactionDetailResponse`; the `RecentTransactions` handler reads
 // it to populate the per-entry `paid_fee_zat`. One record per non-
 // coinbase transaction the consumer has indexed; the key is the canonical
 // 32-byte transaction id.
 message TransactionFeesRecord {
   // Paid fee in zatoshis (`sum(transparent_input_value) -
-  // sum(transparent_output_value)` for transparent-only transactions;
-  // unset for transactions with any shielded inputs since the shielded
-  // contribution stays inside the protocol pools).
+  // sum(transparent_output_value)`). Set only for fully resolved
+  // transparent-only transactions. Shielded and unclassified transactions
+  // leave it unset because canonical facts do not retain the value balances
+  // required to distinguish shielded transfers from the actual paid fee.
   optional uint64 paid_fee_zat = 1;
 
   // Status of the prevout resolution that produced `paid_fee_zat`.
@@ -1456,7 +1720,7 @@ message TransactionFeesRecord {
   // Per-input transparent prevout values, indexed by transparent input
   // position. Coinbase inputs are not represented (coinbase transactions
   // do not appear in this column family).
-  repeated TransparentInputDetail transparent_inputs = 3;
+  repeated TransparentInputValueRecord transparent_inputs = 3;
 
   // ZIP-317 logical-action count, mirrored from the parsed component
   // counts so the mempool path can populate `MempoolActivityEntry.logical_actions`
@@ -1499,9 +1763,9 @@ message RecentTransactionsChunk {
 //   rather than paying fees; treating zero as "no fee" would conflate
 //   "coinbase reward path" with "paid no fee", and a `Some(0)` sentinel
 //   would force readers to special-case coinbase anyway.)
-// - `paid_fee_zat` is set only when the consumer resolved every
-//   transparent prevout via `WalletQuery.TransparentOutputsByOutpoint` AND the
-//   transaction has no shielded inputs.
+// - `paid_fee_zat` is set only when the consumer resolved every transparent
+//   prevout via `WalletQuery.TransparentOutputsByOutpoint` AND the transaction
+//   is classified `TRANSPARENT_ONLY`.
 message RecentTransactionEntry {
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.

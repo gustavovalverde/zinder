@@ -12,7 +12,9 @@ upstream state the operator may or may not have wired:
 
 - `TransactionDetailResponse.paid_fee_zat` requires the wallet plane's
   transparent prevout resolution (capability
-  `wallet.read.transparent_outputs_by_outpoint_v1`) to be online.
+  `wallet.read.transparent_outputs_by_outpoint_v1`) to be online and the
+  transaction to be classified `TransparentOnly`. Canonical facts do not
+  retain the value balances needed to prove shielded transaction fees.
 - `MempoolActivityEntry.paid_fee_zat` requires the same upstream
   capability plus a per-mempool-tx lookup path.
 - `BlockSummary.paid_fees_collected_zat` requires the
@@ -86,7 +88,7 @@ convention. Specifically:
 | `BlockSummary.paid_fees_collected_zat` | `explorer.transaction.fees_v1` (advertised when the consumer is wired and prevouts are online) | (none; the row carries `fees_collected_zat` as the ZIP-317 floor always) |
 | `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
-| `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not resolved") |
+| `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
 | `MinedTransaction.raw_transaction_bytes` | `wallet.read.transaction_bytes_v1` | (none; absence means "transaction blob not retained") |
 
 `MinedTransaction.raw_transaction_bytes` is the wallet-surface example.
@@ -120,7 +122,9 @@ bump: `StorageControl` is an unstructured key-value bag.
 
 - Consumers branch on proto field presence (`response.paid_fee_zat
   .is_some()`) and on the capability list returned by
-  `ServerInfo.capabilities`, never on sentinel comparisons.
+  `ServerInfo.capabilities`, never on sentinel comparisons. The capability
+  means the fee projection and transparent-input resolution are online; it
+  does not promise an actual fee for shielded or unclassified transactions.
 - Adding a new field of this shape requires three diff sites in the
   same change: the proto, the capability constant + uniqueness/coverage
   tests, and the handler that populates it. When the field needs a
@@ -135,6 +139,9 @@ bump: `StorageControl` is an unstructured key-value bag.
 
 ## Revision history
 
+- 2026-07-10: Restricted `paid_fee_zat` to fully resolved
+  `TransparentOnly` transactions. Shielded and unclassified rows keep the
+  field absent because their value balances are not retained canonical facts.
 - 2026-06-25: Added the wallet-surface field capability
   `wallet.read.transaction_bytes_v1` gating `MinedTransaction
   .raw_transaction_bytes` (`bytes` to `optional bytes`), the

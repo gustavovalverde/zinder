@@ -69,21 +69,32 @@ impl AsRef<[u8]> for DeriveConsumerName {
 /// A derive consumer's on-disk schema declaration.
 ///
 /// One declaration binds a consumer's stable [`DeriveConsumerName`] to the
-/// version of its column-family layout and the set of column families it
-/// owns. The derive store records the declared version per consumer and
-/// scopes wipe-and-rebuild to the single consumer whose declared version no
-/// longer matches the recorded one, leaving every other consumer's rows and
-/// cursor untouched. Bumping [`schema_version`](Self::schema_version) is the
-/// signal to drop and rebuild this consumer's column families.
+/// version of its persisted row contract and the set of column families it
+/// owns. The derive store records the declared version per consumer and scopes
+/// reconciliation to the single consumer whose declaration changed, leaving
+/// every other consumer's rows and cursor untouched.
+///
+/// A version change rebuilds the consumer by default. A reader-compatible
+/// semantic change can explicitly name older
+/// [`row_compatible_versions`](Self::row_compatible_versions); the store then
+/// adopts those rows and advances the manifest without clearing them or
+/// resetting the cursor. This exception is valid only when the owned column
+/// families and payload encoding are unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct DeriveConsumerSchema {
     /// Stable consumer identity, shared with the consumer's cursor rows.
     pub name: DeriveConsumerName,
-    /// Version of this consumer's column-family layout and payload encoding.
+    /// Version of this consumer's persisted row contract.
     pub schema_version: u16,
     /// Column families this consumer reads and writes.
     pub column_families: &'static [&'static str],
+    /// Older schema versions whose rows this binary can interpret safely.
+    ///
+    /// Compatibility preserves the rows and cursor while advancing the
+    /// manifest. Every listed version must use the same column-family set and
+    /// payload encoding as [`schema_version`](Self::schema_version).
+    pub row_compatible_versions: &'static [u16],
 }
 
 impl DeriveConsumerSchema {
@@ -100,7 +111,22 @@ impl DeriveConsumerSchema {
             name,
             schema_version,
             column_families,
+            row_compatible_versions: &[],
         }
+    }
+
+    /// Declares older row contracts that this schema can read without a
+    /// projection rebuild.
+    ///
+    /// Use this only for semantic migrations whose reader handles both the old
+    /// and new meanings safely. Layout or payload changes must rebuild instead.
+    #[must_use]
+    pub const fn with_row_compatible_versions(
+        mut self,
+        row_compatible_versions: &'static [u16],
+    ) -> Self {
+        self.row_compatible_versions = row_compatible_versions;
+        self
     }
 }
 

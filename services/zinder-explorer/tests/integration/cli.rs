@@ -17,7 +17,7 @@ use tonic::transport::{Channel, Endpoint};
 use zinder_core::Network;
 use zinder_proto::{
     capabilities::{
-        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSACTION_DETAIL_V1,
+        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSACTION_DETAIL_V3,
         EXPLORER_TRANSACTION_FEES_V1,
     },
     v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient},
@@ -144,7 +144,7 @@ async fn runtime_starts_without_derive_store_and_omits_derive_capabilities() -> 
         common
             .capabilities
             .iter()
-            .any(|capability| capability == EXPLORER_TRANSACTION_DETAIL_V1),
+            .any(|capability| capability == EXPLORER_TRANSACTION_DETAIL_V3),
         "{:?}",
         common.capabilities
     );

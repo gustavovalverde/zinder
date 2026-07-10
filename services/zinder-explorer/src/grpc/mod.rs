@@ -1,6 +1,7 @@
 //! gRPC adapters served by the explorer plane.
 
 mod adapter;
+mod block_activity;
 mod block_view;
 mod chain_reorg_history;
 mod error;
@@ -16,10 +17,24 @@ mod search;
 mod transaction_detail;
 mod transparent_address_activity;
 mod transparent_address_deltas;
+mod transparent_input;
 mod utxo_set_summary;
 mod value_pool_summary;
 
 pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
+
+fn require_matching_chain_epoch(
+    expected: zinder_core::ChainEpoch,
+    actual: zinder_core::ChainEpoch,
+) -> Result<(), tonic::Status> {
+    if actual != expected {
+        return Err(error::ExplorerError::internal(format!(
+            "WalletQuery chain epoch identity mismatch: expected {expected:?}, received {actual:?}",
+        ))
+        .into());
+    }
+    Ok(())
+}
 
 /// Clamps a caller-requested page size to a default and a hard cap.
 ///

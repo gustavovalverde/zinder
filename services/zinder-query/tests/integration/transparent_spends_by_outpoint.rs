@@ -98,6 +98,29 @@ async fn transparent_spends_by_outpoint_resolves_a_confirmed_spend() -> eyre::Re
 }
 
 #[tokio::test]
+async fn transparent_spends_by_outpoint_respects_the_pinned_epoch() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (spent_outpoint, spend) = commit_spent_outpoint_fixture(&store)?;
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+
+    let before_spend = wallet_query
+        .transparent_spends_by_outpoint(vec![spent_outpoint], Some(ChainEpochId::new(1)))
+        .await?;
+    let after_spend = wallet_query
+        .transparent_spends_by_outpoint(vec![spent_outpoint], Some(ChainEpochId::new(2)))
+        .await?;
+
+    assert!(before_spend.spends.is_empty());
+    assert_eq!(after_spend.spends.len(), 1);
+    assert_eq!(
+        after_spend.spends[0].spending_transaction_id,
+        spend.spending_transaction_id
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_spends_by_outpoint_returns_no_entry_for_unspent_outpoint() -> eyre::Result<()>
 {
     let store_fixture = StoreFixture::open()?;
@@ -298,6 +321,27 @@ async fn transparent_spends_by_outpoint_refuses_when_derive_trails_the_sweep() -
         }
         other => return Err(eyre!("expected a derive-lag refusal, got {other:?}")),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_refuses_swept_miss_without_derive() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    commit_real_sweep_to_deleted_through_two(&store)?;
+
+    let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x45; 32]), 0);
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let outcome = wallet_query
+        .transparent_spends_by_outpoint(vec![missing_outpoint], None::<ChainEpochId>)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(QueryError::DeriveUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1,
+        })
+    ));
     Ok(())
 }
 

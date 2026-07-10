@@ -781,8 +781,10 @@ cargo run --release --bin zinder-query -- \
 
 When `zinder-ingest` runs with `IngestControl` enabled (auth token, etc.),
 also pass `--ingest-control-addr` and `--ingest-control-token-path` so
-`ChainEvents` and `MempoolSnapshot`/`MempoolEvents` proxy correctly through
-the writer (per the conventions above).
+`ChainEvents`, `MempoolSnapshot`/`MempoolEvents`, and unpinned
+`WalletQuery.Transaction` live-mempool fall-through proxy correctly through
+the writer (per the conventions above). A transaction request carrying
+`at_epoch_id` never consults transient mempool state.
 
 ### Capability descriptor (sanity check)
 
@@ -833,11 +835,15 @@ wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
 explorer.server_info_v1
-explorer.transaction.detail_v1
+explorer.transaction.detail_v3
 explorer.block.summary_v1
+explorer.block.production_series_v2
 explorer.block.detail_v1
+explorer.block.transactions_v2
+explorer.block.activity_distribution_v1
 explorer.search_v1
 explorer.mempool.summary_v1
+explorer.mempool.snapshot_v1
 explorer.mempool.activity_v1
 explorer.transparent_address.activity_v1
 explorer.transparent_address.deltas_v1

@@ -25,7 +25,7 @@ rust-version = "1.95"
 arc-swap = "1.7"
 async-trait = "0.1.89"
 blake2b_simd = "1.0.4"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22.1"
 bytes = "1.12.0"
 clap = "4.6.1"
@@ -54,6 +54,7 @@ sha2 = "0.10.9"
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
+time = { version = "0.3.53", features = ["formatting"] }
 tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
@@ -64,6 +65,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tonic-reflection = "0.14.6"
 tonic-types = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 zebra-chain = "11.0.0"

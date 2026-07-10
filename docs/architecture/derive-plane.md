@@ -138,7 +138,7 @@ A derive service follows the same naming spine as canonical services ([Public In
 
 - Crate name: `zinder-{product}` (e.g. `zinder-explorer`). The product is the deployable name.
 - Service name: `{Product}Query` for read-only views (no `Service`/`Manager`/`Handler` suffix). Today: `ExplorerQuery`.
-- Capability prefix: `{product}.{noun}.{capability}_v{N}` (e.g. `explorer.transaction.detail_v1`). Per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md), capability namespaces match the deployable name.
+- Capability prefix: `{product}.{noun}.{capability}_v{N}` (e.g. `explorer.transaction.detail_v3`). Per [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md), capability namespaces match the deployable name.
 - Storage path: a derive-store subdirectory under the canonical storage path for writer and secondary-reader coordination; the store itself remains a separate RocksDB instance and keyspace.
 
 ## Failure isolation
@@ -158,23 +158,24 @@ propagate to wallet sync correctness.
 
 ## Replayability
 
-Every derive view is rebuildable. The contract:
+Every derive view has a declared deterministic recovery path. The contract:
 
-- The view's state is a deterministic function of `ChainEvents` plus canonical artifacts up to some cursor. Views that include unconfirmed activity may also include `MempoolEvents`.
+- The view's state is a deterministic function of `ChainEvents` plus named canonical artifacts up to some cursor. Views that include unconfirmed activity may also include `MempoolEvents`.
 - Given the same input stream, the view produces the same output. No wall-clock dependence, no entropy, no non-determinism.
 - The view's storage carries its own schema fingerprint. Schema changes in the derive view are independent of canonical schema changes.
+- Before an incompatible migration clears rows, tests must prove that the named recovery inputs cover the persisted history. Event retention alone is not evidence of recoverability when a consumer joins shorter-lived canonical projections.
 
-This contract is what distinguishes derive from canonical. A canonical artifact, once written, is the source of truth. A derive view, once written, is just one possible projection; if the projection logic changes, the operator drops and rebuilds.
+This contract is what distinguishes derive from canonical. A canonical artifact, once written, is the source of truth. A derive view is one possible projection, but operators drop and rebuild it only when its declared recovery source still covers the rows being replaced.
 
-The replayability rule has a corollary for testing: every derive consumer ships a test that exercises full rebuild from `cursor = None` against a deterministic event stream. The test is the contract assertion; it fails if the view becomes accidentally non-deterministic.
+The recovery rule has a corollary for testing: an incompatible schema change must exercise full rebuild from its oldest supported recovery point, while a row-compatible change must prove that predecessor rows and cursors survive and that the new reader safely interprets them. A `cursor = None` replay over only the current retention window is not proof of complete historical recovery.
 
 ## Schema versioning
 
 Derive views version their schemas independently from canonical artifacts and from each other. A derive consumer's schema-version field has nothing to do with `ChainEpoch::artifact_schema_version`.
 
-Each consumer declares its schema version alongside its name and column families in one `DeriveConsumerSchema`. The derive store persists a per-consumer manifest and, on primary open, scopes wipe-and-rebuild to exactly the consumers whose declared version moved: that consumer's column-family rows are cleared and its cursor reset, while every other consumer's rows and cursor are untouched. A consumer in the manifest but no longer registered has its rows cleared, its cursor reset, and its manifest entry removed. Reconciliation clears rows with range tombstones rather than dropping the column family in place, because a `drop_cf` edit crashes a secondary reader replaying it during catch-up; an emptied orphan family is reclaimed physically only when a container-format change wipes the derive directory. The manifest layout, the crash-safe reconciliation ordering, the secondary-reader validation rule, and the narrowed `DERIVE_STORE_FORMAT_VERSION` container gate are defined in [ADR-0028](../adrs/0028-per-consumer-derive-schema-versioning.md).
+Each consumer declares its schema version alongside its name, column families, and explicitly compatible older row versions in one `DeriveConsumerSchema`. The manifest records both the latest writer and every row schema still present. Exact matches and cumulative compatible predecessors with unchanged column-family ownership preserve rows and cursors; incompatible forward changes rebuild only that consumer. A persisted newer version, missing compatibility for any retained row version, or an undeclared manifest consumer fails closed. Secondary readers revalidate this contract after every catch-up. Reconciliation clears rows with range tombstones rather than dropping a column family in place, because a `drop_cf` edit crashes a secondary reader replaying it during catch-up. The manifest layout, compatibility rule, deployment ordering, crash-safe reconciliation, secondary-reader validation, and narrowed `DERIVE_STORE_FORMAT_VERSION` container gate are defined in [ADR-0028](../adrs/0028-per-consumer-derive-schema-versioning.md).
 
-The rebuild path is the failsafe, with one exception. Scoping rebuild to the one consumer whose version moved keeps an unrelated consumer's data intact, which matters because canonical retention is clamped to durable derive progress: a whole-store rebuild would otherwise force a from-genesis canonical re-ingest. The `transparent_outpoint_spend` consumer is the exception: the canonical safe-tip sweep deletes its source rows behind its durable height, so its own schema bump rebuilds only from still-retained facts and can escalate to a full canonical re-ingest ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
+The rebuild path is conditional, not a failsafe. Scoping rebuild to one consumer keeps unrelated data intact, but the consumer must still prove its source coverage. `TransactionFeesConsumer` version 2 is row-compatible with version 1: new writes omit unprovable shielded fees, readers suppress legacy values, and missing or partial input rows recover from retained parent transaction facts without clearing the projection. The `transparent_outpoint_spend` consumer has a stricter limit: the canonical safe-tip sweep deletes source rows behind its durable height, so an incompatible schema bump can escalate to a full canonical re-ingest ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 
 This lets explorers iterate on dashboards without touching canonical storage and without coordinating with wallet sync.
 

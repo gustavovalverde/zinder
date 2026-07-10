@@ -1,10 +1,11 @@
-//! `ExplorerQuery.MempoolSummary` and `ExplorerQuery.MempoolActivity`.
+//! `ExplorerQuery` mempool summary, activity, and coherent snapshot views.
 //!
-//! Both handlers compose `WalletQuery.MempoolSnapshot` at request time;
-//! no derive consumer is required. The summary aggregates every entry
-//! into one explorer-shaped page; the activity feed projects the same
-//! entries into typed rows ordered by newest-first observation time and
-//! paginates with an opaque cursor that encodes
+//! Each handler composes `WalletQuery.MempoolSnapshot` at request time;
+//! no derive consumer is required. `MempoolSnapshot` derives global summary
+//! facts and its requested page from one wallet response. The summary
+//! aggregates every entry into one explorer-shaped page; the activity feed
+//! projects the same entries into typed rows ordered by newest-first
+//! observation time and paginates with an opaque cursor that encodes
 //! `(first_seen_unix_millis, transaction_id)`.
 
 use std::collections::BTreeMap;
@@ -18,12 +19,14 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
-    MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSummaryRequest,
-    MempoolSummaryResponse, PrivacyShapeCount, TransactionVersion as WireVersion,
-    TransactionVersionCount, TransactionVersionKind,
+    MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
+    MempoolSnapshotResponse, MempoolSnapshotSummary, MempoolSummaryRequest, MempoolSummaryResponse,
+    PrivacyShapeCount, TransactionVersion as WireVersion, TransactionVersionCount,
+    TransactionVersionKind,
 };
 use zinder_proto::v1::wallet::{
-    self, MempoolEntry, MempoolSnapshotRequest, wallet_query_client::WalletQueryClient,
+    self, MempoolEntry, MempoolSnapshotRequest as WalletMempoolSnapshotRequest,
+    wallet_query_client::WalletQueryClient,
 };
 use zinder_proto::wire::encode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
@@ -33,6 +36,7 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::transaction_detail::encode_component_counts;
 use zinder_derive::DeriveStore;
 
 /// Hard cap on the mempool entries the summary aggregates in one call.
@@ -67,6 +71,77 @@ const DEFAULT_MEMPOOL_ACTIVITY_ENTRIES: u32 = 64;
 /// 4-byte prefix is sufficient given the per-request cap.
 const CURSOR_BYTES: usize = 12;
 
+#[derive(Default)]
+struct MempoolSummaryBuilder {
+    total_size_bytes: u64,
+    transaction_count: u32,
+    privacy_counts: BTreeMap<i32, u32>,
+    version_counts: BTreeMap<i32, u32>,
+    oldest_first_seen: Option<u64>,
+    newest_first_seen: Option<u64>,
+}
+
+impl MempoolSummaryBuilder {
+    fn observe(&mut self, entry: &MempoolEntry, facts: &CoreFacts) {
+        self.transaction_count = self.transaction_count.saturating_add(1);
+        self.total_size_bytes = self
+            .total_size_bytes
+            .saturating_add(u64::from(facts.size_bytes));
+        *self
+            .privacy_counts
+            .entry(encode_privacy_shape(facts.privacy_shape) as i32)
+            .or_insert(0) += 1;
+        *self
+            .version_counts
+            .entry(encode_transaction_version_kind(facts.version) as i32)
+            .or_insert(0) += 1;
+
+        let first_seen = entry.first_seen_unix_millis;
+        self.oldest_first_seen = Some(
+            self.oldest_first_seen
+                .map_or(first_seen, |prior| prior.min(first_seen)),
+        );
+        self.newest_first_seen = Some(
+            self.newest_first_seen
+                .map_or(first_seen, |prior| prior.max(first_seen)),
+        );
+    }
+
+    fn finish(self, now_unix_millis: u64) -> MempoolSnapshotSummary {
+        MempoolSnapshotSummary {
+            transaction_count: self.transaction_count,
+            total_size_bytes: self.total_size_bytes,
+            privacy_shape_distribution: self
+                .privacy_counts
+                .into_iter()
+                .map(|(shape, count)| PrivacyShapeCount { shape, count })
+                .collect(),
+            version_distribution: self
+                .version_counts
+                .into_iter()
+                .map(|(kind, count)| TransactionVersionCount { kind, count })
+                .collect(),
+            oldest_entry_age_millis: self
+                .oldest_first_seen
+                .map_or(0, |first_seen| now_unix_millis.saturating_sub(first_seen)),
+            newest_entry_age_millis: self
+                .newest_first_seen
+                .map_or(0, |first_seen| now_unix_millis.saturating_sub(first_seen)),
+        }
+    }
+}
+
+struct ParsedMempoolEntry<'entry> {
+    entry: &'entry MempoolEntry,
+    facts: CoreFacts,
+}
+
+struct MempoolSnapshotPage {
+    summary: MempoolSnapshotSummary,
+    entries: Vec<MempoolActivityEntry>,
+    next_cursor: Vec<u8>,
+}
+
 /// Executes one `ExplorerQuery.MempoolSummary` request.
 pub(crate) async fn handle_mempool_summary(
     derive_store: Option<&DeriveStore>,
@@ -79,31 +154,12 @@ pub(crate) async fn handle_mempool_summary(
     let snapshot = fetch_mempool_snapshot(wallet_client).await?;
     let now_unix_millis = current_unix_millis();
     let activations = NetworkUpgradeActivations::empty(network);
-
-    let mut total_size_bytes: u64 = 0;
-    let mut transaction_count: u32 = 0;
-    let mut privacy_counts: BTreeMap<i32, u32> = BTreeMap::new();
-    let mut version_counts: BTreeMap<i32, u32> = BTreeMap::new();
-    let mut oldest_first_seen: Option<u64> = None;
-    let mut newest_first_seen: Option<u64> = None;
-
+    let mut summary = MempoolSummaryBuilder::default();
     for entry in &snapshot.entries {
         let facts = parse_facts(entry, &activations)?;
-        transaction_count = transaction_count.saturating_add(1);
-        total_size_bytes = total_size_bytes.saturating_add(u64::from(facts.size_bytes));
-        *privacy_counts
-            .entry(encode_privacy_shape(facts.privacy_shape) as i32)
-            .or_insert(0) += 1;
-        *version_counts
-            .entry(encode_transaction_version_kind(facts.version) as i32)
-            .or_insert(0) += 1;
-
-        let first_seen = entry.first_seen_unix_millis;
-        oldest_first_seen =
-            Some(oldest_first_seen.map_or(first_seen, |prior| prior.min(first_seen)));
-        newest_first_seen =
-            Some(newest_first_seen.map_or(first_seen, |prior| prior.max(first_seen)));
+        summary.observe(entry, &facts);
     }
+    let summary = summary.finish(now_unix_millis);
 
     let chain_epoch = snapshot
         .chain_view
@@ -125,21 +181,118 @@ pub(crate) async fn handle_mempool_summary(
 
     Ok(Response::new(MempoolSummaryResponse {
         freshness: Some(freshness),
-        transaction_count,
-        total_size_bytes,
-        privacy_shape_distribution: privacy_counts
-            .into_iter()
-            .map(|(shape, count)| PrivacyShapeCount { shape, count })
-            .collect(),
-        version_distribution: version_counts
-            .into_iter()
-            .map(|(kind, count)| TransactionVersionCount { kind, count })
-            .collect(),
-        oldest_entry_age_millis: oldest_first_seen
-            .map_or(0, |first_seen| now_unix_millis.saturating_sub(first_seen)),
-        newest_entry_age_millis: newest_first_seen
-            .map_or(0, |first_seen| now_unix_millis.saturating_sub(first_seen)),
+        transaction_count: summary.transaction_count,
+        total_size_bytes: summary.total_size_bytes,
+        privacy_shape_distribution: summary.privacy_shape_distribution,
+        version_distribution: summary.version_distribution,
+        oldest_entry_age_millis: summary.oldest_entry_age_millis,
+        newest_entry_age_millis: summary.newest_entry_age_millis,
     }))
+}
+
+/// Executes one `ExplorerQuery.MempoolSnapshot` request.
+pub(crate) async fn handle_mempool_snapshot(
+    derive_store: Option<&DeriveStore>,
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    network: zinder_core::Network,
+    upstream_observation_cache: &UpstreamObservationCache,
+    request: Request<MempoolSnapshotRequest>,
+) -> Result<Response<MempoolSnapshotResponse>, Status> {
+    let request = request.into_inner();
+    let max_entries = clamp_max_entries(
+        request.max_entries,
+        DEFAULT_MEMPOOL_ACTIVITY_ENTRIES,
+        MAX_MEMPOOL_ACTIVITY_ENTRIES_PER_REQUEST,
+    );
+    let cursor = decode_activity_cursor(&request.from_cursor)?;
+    let snapshot = fetch_mempool_snapshot(wallet_client).await?;
+    let now_unix_millis = current_unix_millis();
+    let activations = NetworkUpgradeActivations::empty(network);
+    let page = build_mempool_snapshot_page(
+        &snapshot,
+        &activations,
+        max_entries,
+        cursor,
+        now_unix_millis,
+    )?;
+    let chain_epoch = snapshot
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| {
+            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
+        })?;
+    let freshness = attach_upstream_observation(
+        upstream_observation_cache,
+        build_explorer_freshness(
+            derive_store,
+            zinder_proto::capabilities::EXPLORER_MEMPOOL_SNAPSHOT_V1,
+            Some(chain_epoch),
+            snapshot.snapshot_age_millis,
+        )?,
+    )
+    .await;
+
+    Ok(Response::new(MempoolSnapshotResponse {
+        freshness: Some(freshness),
+        summary: Some(page.summary),
+        entries: page.entries,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+fn build_mempool_snapshot_page(
+    snapshot: &wallet::MempoolSnapshotResponse,
+    activations: &NetworkUpgradeActivations,
+    max_entries: u32,
+    cursor: Option<(u64, u32)>,
+    now_unix_millis: u64,
+) -> Result<MempoolSnapshotPage, Status> {
+    let mut summary = MempoolSummaryBuilder::default();
+    let mut parsed_entries = Vec::with_capacity(snapshot.entries.len());
+
+    for entry in &snapshot.entries {
+        let facts = parse_facts(entry, activations)?;
+        summary.observe(entry, &facts);
+        parsed_entries.push(ParsedMempoolEntry { entry, facts });
+    }
+
+    parsed_entries.sort_by(|left, right| {
+        right
+            .entry
+            .first_seen_unix_millis
+            .cmp(&left.entry.first_seen_unix_millis)
+            .then_with(|| {
+                transaction_id_tail(&right.entry.transaction_id)
+                    .cmp(&transaction_id_tail(&left.entry.transaction_id))
+            })
+    });
+
+    let mut entries = Vec::with_capacity(max_entries as usize);
+    let mut last_emitted: Option<(u64, u32)> = None;
+    for parsed in parsed_entries {
+        let position = (
+            parsed.entry.first_seen_unix_millis,
+            transaction_id_tail(&parsed.entry.transaction_id),
+        );
+        if let Some((cursor_millis, cursor_tail)) = cursor
+            && (position.0, position.1) >= (cursor_millis, cursor_tail)
+        {
+            continue;
+        }
+        entries.push(build_mempool_activity_entry(parsed.entry, &parsed.facts));
+        last_emitted = Some(position);
+        if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
+            break;
+        }
+    }
+
+    Ok(MempoolSnapshotPage {
+        summary: summary.finish(now_unix_millis),
+        entries,
+        next_cursor: last_emitted
+            .map(|(millis, tail)| encode_activity_cursor(millis, tail))
+            .unwrap_or_default(),
+    })
 }
 
 /// Executes one `ExplorerQuery.MempoolActivity` request.
@@ -184,19 +337,10 @@ pub(crate) async fn handle_mempool_activity(
         {
             continue;
         }
-        let facts = parse_facts(entry, &activations)?;
-        let counts = facts.counts;
-        let logical_actions = counts.logical_actions();
-        entries.push(MempoolActivityEntry {
-            transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
-            first_seen_unix_millis: entry.first_seen_unix_millis,
-            size_bytes: facts.size_bytes,
-            privacy_shape: encode_privacy_shape(facts.privacy_shape) as i32,
-            version: Some(encode_transaction_version(facts.version)),
-            zip317_conventional_fee_zat: counts.zip317_conventional_fee_zat(),
-            paid_fee_zat: None,
-            logical_actions,
-        });
+        entries.push(build_mempool_activity_entry(
+            entry,
+            &parse_facts(entry, &activations)?,
+        ));
         last_emitted = Some(position);
         if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
             break;
@@ -234,7 +378,7 @@ async fn fetch_mempool_snapshot(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<wallet::MempoolSnapshotResponse, Status> {
     Ok(wallet_client
-        .mempool_snapshot(Request::new(MempoolSnapshotRequest {
+        .mempool_snapshot(Request::new(WalletMempoolSnapshotRequest {
             max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
             from_cursor: Vec::new(),
         }))
@@ -248,6 +392,27 @@ fn parse_facts(
 ) -> Result<CoreFacts, Status> {
     zinder_source::parse_transaction_public_facts(&entry.raw_transaction_bytes, None, activations)
         .map_err(|error| ExplorerError::internal(error.to_string()).into())
+}
+
+fn build_mempool_activity_entry(entry: &MempoolEntry, facts: &CoreFacts) -> MempoolActivityEntry {
+    let counts = facts.counts;
+    MempoolActivityEntry {
+        transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
+        first_seen_unix_millis: entry.first_seen_unix_millis,
+        size_bytes: facts.size_bytes,
+        privacy_shape: encode_privacy_shape(facts.privacy_shape) as i32,
+        version: Some(encode_transaction_version(facts.version)),
+        zip317_conventional_fee_zat: counts.zip317_conventional_fee_zat(),
+        paid_fee_zat: None,
+        logical_actions: counts.logical_actions(),
+        component_counts: Some(encode_component_counts(counts)),
+        transparent_output_total_zat: entry
+            .transparent_outputs
+            .iter()
+            .fold(0_u64, |total, output| {
+                total.saturating_add(output.value_zat)
+            }),
+    }
 }
 
 const fn encode_transaction_version_kind(
@@ -333,4 +498,143 @@ fn current_unix_millis() -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use super::{build_mempool_activity_entry, build_mempool_snapshot_page};
+    use zinder_core::{Network, TransactionId, wire::encode_rpc_transaction_id_hex};
+    use zinder_proto::v1::wallet;
+    use zinder_source::parse_transaction_public_facts;
+
+    #[test]
+    fn mempool_activity_entry_uses_parsed_counts_and_live_output_total()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let raw_transaction_bytes = transparent_transaction_bytes();
+        let facts = parse_transaction_public_facts(&raw_transaction_bytes, None, &activations)?;
+        let transaction_id = facts.transaction_id;
+        let entry = wallet::MempoolEntry {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            auth_digest: String::new(),
+            raw_transaction_bytes,
+            compact_transaction_bytes: Vec::new(),
+            first_seen_unix_millis: 1_700_000_000_000,
+            first_seen_chain_epoch: None,
+            transparent_outputs: vec![
+                transparent_output(transaction_id, 0, 1_000, vec![0x51]),
+                transparent_output(transaction_id, 1, 2_500, vec![0x52]),
+            ],
+            transparent_spends: Vec::new(),
+        };
+
+        let activity = build_mempool_activity_entry(&entry, &facts);
+        let counts = activity.component_counts.ok_or_else(|| {
+            std::io::Error::other("mempool activity entry must carry component counts")
+        })?;
+
+        assert_eq!(counts.transparent_input_count, 1);
+        assert_eq!(counts.transparent_output_count, 2);
+        assert_eq!(counts.sapling_spend_count, 0);
+        assert_eq!(counts.sapling_output_count, 0);
+        assert_eq!(counts.orchard_action_count, 0);
+        assert_eq!(counts.ironwood_action_count, 0);
+        assert_eq!(activity.transparent_output_total_zat, 3_500);
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_snapshot_page_keeps_full_totals_with_a_bounded_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let first = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let mut newer_bytes = transparent_transaction_bytes();
+        let lock_time_offset = newer_bytes.len().saturating_sub(4);
+        newer_bytes[lock_time_offset..].copy_from_slice(&1_u32.to_le_bytes());
+        let newer = mempool_entry(newer_bytes, 1_700_000_000_100, &activations)?;
+
+        let page = build_mempool_snapshot_page(
+            &wallet::MempoolSnapshotResponse {
+                entries: vec![first, newer],
+                ..Default::default()
+            },
+            &activations,
+            1,
+            None,
+            1_700_000_001_000,
+        )?;
+
+        assert_eq!(page.summary.transaction_count, 2);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].first_seen_unix_millis, 1_700_000_000_100);
+        assert_eq!(
+            page.summary.total_size_bytes,
+            u64::from(page.entries[0].size_bytes).saturating_mul(2)
+        );
+        assert_eq!(
+            page.summary.oldest_entry_age_millis, 1_000,
+            "the summary must include entries excluded from the bounded page",
+        );
+        assert!(!page.next_cursor.is_empty());
+        Ok(())
+    }
+
+    fn transparent_transaction_bytes() -> Vec<u8> {
+        let mut bytes = vec![1, 0, 0, 0, 1];
+        bytes.extend_from_slice(&[0xA5; 32]);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(2);
+        for (value_zat, script_pub_key) in [(1_000_u64, 0x51_u8), (2_500_u64, 0x52_u8)] {
+            bytes.extend_from_slice(&value_zat.to_le_bytes());
+            bytes.extend_from_slice(&[1, script_pub_key]);
+        }
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes
+    }
+
+    fn mempool_entry(
+        raw_transaction_bytes: Vec<u8>,
+        first_seen_unix_millis: u64,
+        activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<wallet::MempoolEntry, Box<dyn std::error::Error>> {
+        let facts = parse_transaction_public_facts(&raw_transaction_bytes, None, activations)?;
+        Ok(wallet::MempoolEntry {
+            transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
+            auth_digest: String::new(),
+            raw_transaction_bytes,
+            compact_transaction_bytes: Vec::new(),
+            first_seen_unix_millis,
+            first_seen_chain_epoch: None,
+            transparent_outputs: Vec::new(),
+            transparent_spends: Vec::new(),
+        })
+    }
+
+    fn transparent_output(
+        transaction_id: TransactionId,
+        output_index: u32,
+        value_zat: u64,
+        script_pub_key: Vec<u8>,
+    ) -> wallet::TransparentMempoolOutput {
+        wallet::TransparentMempoolOutput {
+            address_script_hash: vec![0xA5; 32],
+            script_pub_key,
+            outpoint: Some(wallet::OutPoint {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                output_index,
+            }),
+            value_zat,
+        }
+    }
 }

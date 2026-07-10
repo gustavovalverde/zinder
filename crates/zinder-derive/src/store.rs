@@ -75,7 +75,9 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 /// manifest layout, the cursor encoding, and the metadata column family.
 /// Per-consumer column-family layouts version themselves through
 /// [`DeriveConsumerSchema::schema_version`]; a consumer changing its own
-/// layout bumps its own version and only its own data rebuilds. This
+/// persisted row contract bumps its own version. Incompatible changes rebuild
+/// only that consumer, while explicitly row-compatible changes preserve its
+/// rows and cursor. This
 /// constant bumps only when the shared container changes, which forces a
 /// whole-store wipe because no consumer's data survives a container change.
 /// The version is persisted in the `consumer_metadata` column family on
@@ -141,10 +143,10 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
 /// Builds the open-time column-family descriptors.
 ///
 /// Every store family and every declared consumer family is opened, plus any
-/// column family already on disk that neither list covers. Opening those
-/// on-disk orphans is what lets reconciliation drop a deleted consumer's
-/// column families, since `RocksDB` refuses to open a store while leaving an
-/// existing column family unlisted.
+/// column family already on disk that neither list covers. `RocksDB` refuses
+/// to open a store while leaving an existing column family unlisted, so unknown
+/// families must be opened before manifest validation can reject an undeclared
+/// consumer without mutating it.
 fn column_family_descriptors(
     cache: &Cache,
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -550,7 +552,9 @@ impl DeriveStore {
                 operation: "try_catch_up_with_primary",
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
                 source,
-            })
+            })?;
+        self.require_matching_store_format_version()?;
+        self.validate_secondary_consumer_schemas()
     }
 
     /// Flushes the write-ahead log to disk so every prior write is durable.
@@ -1177,23 +1181,26 @@ impl DeriveStore {
         }
     }
 
-    /// Rejects a secondary open whose declared consumer versions disagree with
+    /// Rejects a secondary open whose consumer declaration cannot safely read
     /// the persisted manifest.
     ///
-    /// A secondary reader cannot rebuild a consumer's column families, so it
-    /// refuses to read rows written under a different consumer layout and lets
-    /// the primary reconcile first. Callers retry the open once the primary
-    /// rewrites the manifest.
+    /// A secondary reader cannot rebuild a consumer's column families. It may
+    /// read an exact schema match or an explicitly row-compatible older
+    /// version with the same column-family set; every other mismatch waits for
+    /// the primary to reconcile first.
     fn validate_secondary_consumer_schemas(&self) -> Result<(), DeriveStoreError> {
         let recorded = self.read_consumer_manifest()?;
+        self.reject_undeclared_recorded_consumers(&recorded)?;
         for consumer in self.consumers {
-            let persisted = recorded
-                .get(consumer.name.as_str())
-                .map(|entry| entry.schema_version);
-            if persisted != Some(consumer.schema_version) {
+            let entry = recorded.get(consumer.name.as_str());
+            let compatible = entry.is_some_and(|entry| {
+                Self::consumer_manifest_is_exact(consumer, entry)
+                    || Self::consumer_manifest_is_row_compatible(consumer, entry)
+            });
+            if !compatible {
                 return Err(DeriveStoreError::ConsumerSchemaMismatch {
                     consumer: consumer.name.as_str(),
-                    persisted,
+                    persisted: entry.map(|entry| entry.schema_version),
                     running: consumer.schema_version,
                 });
             }
@@ -1316,25 +1323,42 @@ impl DeriveStore {
     /// Reconciles each declared consumer's schema version against the
     /// persisted manifest.
     ///
-    /// A consumer whose declared version matches keeps its column families
-    /// and cursor. A consumer whose version moved has every row in its column
-    /// families cleared and its cursor reset. A consumer recorded in the
-    /// manifest but no longer declared has its rows cleared and its manifest
-    /// entry removed. A newly declared consumer has its column families cleared
-    /// and is then recorded at its declared version, so a family that
-    /// previously belonged to another consumer starts empty rather than serving
-    /// the prior owner's rows behind a fresh cursor. Reconciliation never drops
-    /// a column family in place: a
+    /// An exact match keeps its column families and cursor. An explicitly
+    /// row-compatible older version with the same column-family set is adopted
+    /// by advancing the manifest while retaining every row version still
+    /// present. Every other older version has its rows cleared and cursor
+    /// reset. A newer persisted version or undeclared recorded consumer fails
+    /// closed so an older binary cannot destroy rows it does not understand. A
+    /// newly declared consumer has its column
+    /// families cleared and is then recorded at its declared version, so a
+    /// family that previously belonged to another consumer starts empty rather
+    /// than serving the prior owner's rows behind a fresh cursor.
+    /// Reconciliation never drops a column family in place: a
     /// range-tombstone clear replays safely on an attached secondary, while a
     /// `drop_cf`/`create_cf` edit crashes a secondary mid-catchup. An emptied
     /// orphan family is reclaimed physically only when a container-format
     /// change wipes the whole derive directory.
     fn reconcile_consumer_schemas(&self) -> Result<(), DeriveStoreError> {
         let recorded = self.read_consumer_manifest()?;
-        self.drop_unregistered_consumers(&recorded)?;
+        self.reject_undeclared_recorded_consumers(&recorded)?;
+        self.reject_newer_consumer_schemas(&recorded)?;
         for consumer in self.consumers {
             match recorded.get(consumer.name.as_str()) {
-                Some(entry) if entry.schema_version == consumer.schema_version => {}
+                Some(entry) if Self::consumer_manifest_is_exact(consumer, entry) => {}
+                Some(entry) if Self::consumer_manifest_is_row_compatible(consumer, entry) => {
+                    self.adopt_row_compatible_consumer(consumer, entry)?;
+                }
+                Some(entry)
+                    if entry.schema_version < consumer.schema_version
+                        && Self::consumer_column_families_match(consumer, entry)
+                        && !consumer.row_compatible_versions.is_empty() =>
+                {
+                    return Err(DeriveStoreError::ConsumerSchemaMismatch {
+                        consumer: consumer.name.as_str(),
+                        persisted: Some(entry.schema_version),
+                        running: consumer.schema_version,
+                    });
+                }
                 Some(entry) => self.rebuild_consumer(consumer, entry)?,
                 None => self.initialize_new_consumer(consumer)?,
             }
@@ -1342,7 +1366,7 @@ impl DeriveStore {
         Ok(())
     }
 
-    fn drop_unregistered_consumers(
+    fn reject_undeclared_recorded_consumers(
         &self,
         recorded: &BTreeMap<String, ConsumerManifestEntry>,
     ) -> Result<(), DeriveStoreError> {
@@ -1350,24 +1374,93 @@ impl DeriveStore {
             if self
                 .consumers
                 .iter()
-                .any(|schema| schema.name.as_str() == name.as_str())
+                .all(|consumer| consumer.name.as_str() != name)
             {
-                continue;
+                return Err(DeriveStoreError::ConsumerNotDeclared {
+                    consumer: name.clone(),
+                    persisted_schema_version: entry.schema_version,
+                });
             }
-            tracing::warn!(
-                target: "zinder::derive",
-                event = "consumer_dropped",
-                consumer = name.as_str(),
-                recorded_schema_version = entry.schema_version,
-                "derive consumer no longer declared; resetting its cursor and clearing its column families"
-            );
-            self.reset_consumer_cursors(name)?;
-            for column_family in &entry.column_families {
-                self.clear_consumer_column_family(column_family)?;
-            }
-            self.delete_consumer_manifest_entry(name)?;
         }
         Ok(())
+    }
+
+    fn reject_newer_consumer_schemas(
+        &self,
+        recorded: &BTreeMap<String, ConsumerManifestEntry>,
+    ) -> Result<(), DeriveStoreError> {
+        for consumer in self.consumers {
+            let Some(entry) = recorded.get(consumer.name.as_str()) else {
+                continue;
+            };
+            if entry.schema_version > consumer.schema_version {
+                return Err(DeriveStoreError::ConsumerSchemaMismatch {
+                    consumer: consumer.name.as_str(),
+                    persisted: Some(entry.schema_version),
+                    running: consumer.schema_version,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn consumer_manifest_is_exact(
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> bool {
+        recorded.schema_version == consumer.schema_version
+            && Self::consumer_column_families_match(consumer, recorded)
+            && Self::consumer_supports_recorded_row_versions(consumer, recorded)
+    }
+
+    fn consumer_manifest_is_row_compatible(
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> bool {
+        recorded.schema_version < consumer.schema_version
+            && Self::consumer_column_families_match(consumer, recorded)
+            && Self::consumer_supports_recorded_row_versions(consumer, recorded)
+    }
+
+    fn consumer_column_families_match(
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> bool {
+        let declared: BTreeSet<&str> = consumer.column_families.iter().copied().collect();
+        let persisted: BTreeSet<&str> = recorded
+            .column_families
+            .iter()
+            .map(String::as_str)
+            .collect();
+        consumer.column_families.len() == recorded.column_families.len() && declared == persisted
+    }
+
+    fn consumer_supports_recorded_row_versions(
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> bool {
+        recorded.row_schema_versions.iter().all(|version| {
+            *version == consumer.schema_version
+                || consumer.row_compatible_versions.contains(version)
+        })
+    }
+
+    fn adopt_row_compatible_consumer(
+        &self,
+        consumer: &DeriveConsumerSchema,
+        recorded: &ConsumerManifestEntry,
+    ) -> Result<(), DeriveStoreError> {
+        let mut row_schema_versions = recorded.row_schema_versions.clone();
+        row_schema_versions.insert(consumer.schema_version);
+        tracing::info!(
+            target: "zinder::derive",
+            event = "consumer_schema_rows_preserved",
+            consumer = consumer.name.as_str(),
+            from_schema_version = recorded.schema_version,
+            to_schema_version = consumer.schema_version,
+            "derive consumer schema version moved compatibly; preserving its rows and cursor"
+        );
+        self.write_consumer_manifest_entry_with_row_versions(consumer, &row_schema_versions)
     }
 
     fn rebuild_consumer(
@@ -1486,21 +1579,28 @@ impl DeriveStore {
         &self,
         consumer: &DeriveConsumerSchema,
     ) -> Result<(), DeriveStoreError> {
-        let key = consumer_schema_manifest_key(consumer.name.as_str());
-        let payload = encode_manifest_entry(consumer.schema_version, consumer.column_families)
-            .map_err(|reason| DeriveStoreError::SchemaReconcile {
-                operation: "encode_manifest_entry",
-                reason,
-            })?;
-        self.put(DeriveStoreTable::ConsumerMetadata, &key, &payload)
+        self.write_consumer_manifest_entry_with_row_versions(
+            consumer,
+            &BTreeSet::from([consumer.schema_version]),
+        )
     }
 
-    fn delete_consumer_manifest_entry(&self, name: &str) -> Result<(), DeriveStoreError> {
-        let key = consumer_schema_manifest_key(name);
-        let column_family = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
-        let mut batch = WriteBatch::default();
-        batch.delete_cf(&column_family, &key);
-        self.write_batch(&batch)
+    fn write_consumer_manifest_entry_with_row_versions(
+        &self,
+        consumer: &DeriveConsumerSchema,
+        row_schema_versions: &BTreeSet<u16>,
+    ) -> Result<(), DeriveStoreError> {
+        let key = consumer_schema_manifest_key(consumer.name.as_str());
+        let payload = encode_manifest_entry(
+            consumer.schema_version,
+            consumer.column_families,
+            row_schema_versions,
+        )
+        .map_err(|reason| DeriveStoreError::SchemaReconcile {
+            operation: "encode_manifest_entry",
+            reason,
+        })?;
+        self.put(DeriveStoreTable::ConsumerMetadata, &key, &payload)
     }
 
     fn get(
@@ -1651,6 +1751,7 @@ fn decode_store_format_version(bytes: &[u8]) -> Result<u16, String> {
 struct ConsumerManifestEntry {
     schema_version: u16,
     column_families: Vec<String>,
+    row_schema_versions: BTreeSet<u16>,
 }
 
 fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
@@ -1660,7 +1761,11 @@ fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
     key
 }
 
-fn encode_manifest_entry(schema_version: u16, column_families: &[&str]) -> Result<Vec<u8>, String> {
+fn encode_manifest_entry(
+    schema_version: u16,
+    column_families: &[&str],
+    row_schema_versions: &BTreeSet<u16>,
+) -> Result<Vec<u8>, String> {
     let count = u16::try_from(column_families.len()).map_err(|_| {
         format!(
             "consumer declares {} column families; the manifest holds at most {}",
@@ -1683,6 +1788,17 @@ fn encode_manifest_entry(schema_version: u16, column_families: &[&str]) -> Resul
         bytes.extend_from_slice(&name_len.to_be_bytes());
         bytes.extend_from_slice(name_bytes);
     }
+    let row_version_count = u16::try_from(row_schema_versions.len()).map_err(|_| {
+        format!(
+            "consumer has {} row schema versions; the manifest holds at most {}",
+            row_schema_versions.len(),
+            u16::MAX
+        )
+    })?;
+    bytes.extend_from_slice(&row_version_count.to_be_bytes());
+    for version in row_schema_versions {
+        bytes.extend_from_slice(&version.to_be_bytes());
+    }
     Ok(bytes)
 }
 
@@ -1704,9 +1820,31 @@ fn decode_manifest_entry(bytes: &[u8]) -> Result<ConsumerManifestEntry, String> 
             .push(String::from_utf8(name_bytes.to_vec()).map_err(|error| error.to_string())?);
         offset = end;
     }
+    let row_schema_versions = if offset == bytes.len() {
+        BTreeSet::from([schema_version])
+    } else {
+        let row_version_count = read_manifest_u16(bytes, offset)?;
+        offset += 2;
+        let mut versions = BTreeSet::new();
+        for _ in 0..row_version_count {
+            let version = read_manifest_u16(bytes, offset)?;
+            if !versions.insert(version) {
+                return Err("consumer manifest has duplicate row schema versions".to_owned());
+            }
+            offset += 2;
+        }
+        if offset != bytes.len() {
+            return Err("consumer manifest entry has trailing bytes".to_owned());
+        }
+        if versions.is_empty() || versions.iter().any(|version| *version > schema_version) {
+            return Err("consumer manifest row schema versions are invalid".to_owned());
+        }
+        versions
+    };
     Ok(ConsumerManifestEntry {
         schema_version,
         column_families,
+        row_schema_versions,
     })
 }
 
@@ -1888,11 +2026,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_entry_round_trips_version_and_column_families() -> Result<()> {
-        let encoded = encode_manifest_entry(3, &["alpha", "beta_index"])
+    fn manifest_entry_round_trips_writer_row_versions_and_column_families() -> Result<()> {
+        let row_schema_versions = BTreeSet::from([1, 2, 3]);
+        let encoded = encode_manifest_entry(3, &["alpha", "beta_index"], &row_schema_versions)
             .map_err(|reason| eyre::eyre!(reason))?;
         let decoded = decode_manifest_entry(&encoded).map_err(|reason| eyre::eyre!(reason))?;
         assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.row_schema_versions, row_schema_versions);
         assert_eq!(
             decoded.column_families,
             vec!["alpha".to_owned(), "beta_index".to_owned()]
@@ -1903,15 +2043,44 @@ mod tests {
     #[test]
     fn encoding_a_manifest_entry_rejects_more_column_families_than_the_count_field_holds() {
         let column_families = vec!["x"; usize::from(u16::MAX) + 1];
-        let outcome = encode_manifest_entry(1, &column_families);
+        let outcome = encode_manifest_entry(1, &column_families, &BTreeSet::from([1]));
         assert!(matches!(outcome, Err(reason) if reason.contains("column families")));
     }
 
     #[test]
     fn encoding_a_manifest_entry_rejects_a_column_family_name_longer_than_the_length_field_holds() {
         let overlong = "a".repeat(usize::from(u16::MAX) + 1);
-        let outcome = encode_manifest_entry(1, &[overlong.as_str()]);
+        let outcome = encode_manifest_entry(1, &[overlong.as_str()], &BTreeSet::from([1]));
         assert!(matches!(outcome, Err(reason) if reason.contains("column family name")));
+    }
+
+    #[test]
+    fn legacy_manifest_without_row_versions_uses_writer_version_as_provenance() -> Result<()> {
+        let mut encoded = encode_manifest_entry(3, &["alpha"], &BTreeSet::from([3]))
+            .map_err(|reason| eyre::eyre!(reason))?;
+        encoded.truncate(encoded.len().saturating_sub(4));
+
+        let decoded = decode_manifest_entry(&encoded).map_err(|reason| eyre::eyre!(reason))?;
+
+        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.row_schema_versions, BTreeSet::from([3]));
+        Ok(())
+    }
+
+    #[test]
+    fn decoding_a_manifest_entry_rejects_duplicate_row_versions() -> Result<()> {
+        let mut encoded = encode_manifest_entry(2, &["alpha"], &BTreeSet::from([1, 2]))
+            .map_err(|reason| eyre::eyre!(reason))?;
+        let duplicate_version_offset = encoded.len().saturating_sub(2);
+        encoded.extend_from_within(duplicate_version_offset..);
+        let row_version_count_offset = 2 + 2 + 2 + "alpha".len();
+        encoded[row_version_count_offset..row_version_count_offset + 2]
+            .copy_from_slice(&3_u16.to_be_bytes());
+
+        let outcome = decode_manifest_entry(&encoded);
+
+        assert!(matches!(outcome, Err(reason) if reason.contains("duplicate row schema")));
+        Ok(())
     }
 
     #[test]

@@ -25,16 +25,18 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::{
     explorer::{
-        BlockDetailRequest, BlockDetailResponse, BlockSummariesInRangeRequest,
-        BlockSummariesInRangeResponse, ChainReorgHistoryRequest, ChainReorgHistoryResponse,
-        ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse, MempoolActivityRequest,
-        MempoolActivityResponse, MempoolEventCountsRequest, MempoolEventCountsResponse,
-        MempoolSummaryRequest, MempoolSummaryResponse, MigrationCohortsRequest,
-        MigrationCohortsResponse, MigrationDenominationsRequest, MigrationDenominationsResponse,
-        MigrationOverviewRequest, MigrationOverviewResponse, NetworkUpgradeStatusRequest,
-        NetworkUpgradeStatusResponse, OverviewSnapshotRequest, OverviewSnapshotResponse,
-        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
-        ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
+        BlockActivityDistributionRequest, BlockActivityDistributionResponse, BlockDetailRequest,
+        BlockDetailResponse, BlockProductionSeriesRequest, BlockProductionSeriesResponse,
+        BlockSummariesInRangeRequest, BlockSummariesInRangeResponse, BlockTransactionsResponse,
+        ChainReorgHistoryRequest, ChainReorgHistoryResponse, ExplorerServerInfo, FeeSummaryRequest,
+        FeeSummaryResponse, MempoolActivityRequest, MempoolActivityResponse,
+        MempoolEventCountsRequest, MempoolEventCountsResponse, MempoolSnapshotRequest,
+        MempoolSnapshotResponse, MempoolSummaryRequest, MempoolSummaryResponse,
+        MigrationCohortsRequest, MigrationCohortsResponse, MigrationDenominationsRequest,
+        MigrationDenominationsResponse, MigrationOverviewRequest, MigrationOverviewResponse,
+        NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse, OverviewSnapshotRequest,
+        OverviewSnapshotResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
+        ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
         TransparentAddressActivityRequest, TransparentAddressActivityResponse,
         TransparentAddressDeltasRequest, TransparentAddressDeltasResponse, UtxoSetSummaryRequest,
         UtxoSetSummaryResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
@@ -56,7 +58,11 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
     "zinder_explorer_request_total",
 );
 
-use super::block_view::{handle_block_detail, handle_block_summaries_in_range};
+use super::block_activity::handle_block_activity_distribution;
+use super::block_view::{
+    handle_block_detail, handle_block_production_series, handle_block_summaries_in_range,
+    handle_block_transactions,
+};
 use super::chain_reorg_history::handle_chain_reorg_history;
 use super::error::ExplorerError;
 use super::fee_summary::handle_fee_summary;
@@ -64,7 +70,7 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
     read_derive_status, spawn_upstream_observation_probe_task,
 };
-use super::mempool::{handle_mempool_activity, handle_mempool_summary};
+use super::mempool::{handle_mempool_activity, handle_mempool_snapshot, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
 use super::migration::{
     handle_migration_cohorts, handle_migration_denominations, handle_migration_overview,
@@ -391,6 +397,56 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn block_production_series(
+        &self,
+        request: Request<BlockProductionSeriesRequest>,
+    ) -> Result<Response<BlockProductionSeriesResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "BlockProductionSeries",
+            metric: "block_production_series",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            handle_block_production_series(
+                derive_store,
+                canonical_store,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn block_activity_distribution(
+        &self,
+        request: Request<BlockActivityDistributionRequest>,
+    ) -> Result<Response<BlockActivityDistributionResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "BlockActivityDistribution",
+            metric: "block_activity_distribution",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_block_activity_distribution(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     async fn block_detail(
         &self,
         request: Request<BlockDetailRequest>,
@@ -404,6 +460,33 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_block_detail(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn block_transactions(
+        &self,
+        request: Request<BlockDetailRequest>,
+    ) -> Result<Response<BlockTransactionsResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "BlockTransactions",
+            metric: "block_transactions",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_block_transactions(
+                canonical_store,
                 derive_store,
                 &mut client,
                 &self.upstream_observation_cache,
@@ -453,6 +536,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
             handle_mempool_summary(
+                self.derive_store.as_ref(),
+                &mut client,
+                self.settings.network,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn mempool_snapshot(
+        &self,
+        request: Request<MempoolSnapshotRequest>,
+    ) -> Result<Response<MempoolSnapshotResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "MempoolSnapshot",
+            metric: "mempool_snapshot",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_mempool_snapshot(
                 self.derive_store.as_ref(),
                 &mut client,
                 self.settings.network,
@@ -721,6 +829,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let mut client = self.wallet_client(OP.method).await?;
             handle_recent_transactions(
                 derive_store,
+                self.canonical_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -870,6 +979,18 @@ impl ExplorerQueryGrpcAdapter {
             ExplorerError::dependency_not_configured(format!(
                 "{method} requires the BlockSummary derive view; configure \
                  --storage-path and start the explorer with the consumer wired"
+            ))
+            .into()
+        })
+    }
+
+    fn require_canonical_store(
+        &self,
+        method: &'static str,
+    ) -> Result<&SecondaryChainStore, Status> {
+        self.canonical_store.as_ref().ok_or_else(|| {
+            ExplorerError::dependency_not_configured(format!(
+                "{method} requires the canonical fact store; configure --storage-path"
             ))
             .into()
         })

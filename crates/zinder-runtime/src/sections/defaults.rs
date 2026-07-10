@@ -20,6 +20,7 @@ pub const fn default_ops_listen_addr(service: ServiceIdentifier) -> &'static str
         ServiceIdentifier::Ingest => "127.0.0.1:9105",
         ServiceIdentifier::Query => "127.0.0.1:9106",
         ServiceIdentifier::CompatLightwalletd => "127.0.0.1:9107",
+        ServiceIdentifier::CompatCipherscan => "127.0.0.1:9108",
         ServiceIdentifier::Explorer => "127.0.0.1:9069",
     }
 }
@@ -35,7 +36,7 @@ pub const fn default_grpc_listen_addr(service: ServiceIdentifier) -> Option<&'st
         ServiceIdentifier::Query => Some("127.0.0.1:9101"),
         ServiceIdentifier::CompatLightwalletd => Some("127.0.0.1:9067"),
         ServiceIdentifier::Explorer => Some("127.0.0.1:9068"),
-        ServiceIdentifier::Ingest => None,
+        ServiceIdentifier::CompatCipherscan | ServiceIdentifier::Ingest => None,
     }
 }
 
@@ -57,15 +58,16 @@ mod tests {
             default_ops_listen_addr(ServiceIdentifier::Ingest),
             default_ops_listen_addr(ServiceIdentifier::Query),
             default_ops_listen_addr(ServiceIdentifier::CompatLightwalletd),
+            default_ops_listen_addr(ServiceIdentifier::CompatCipherscan),
             default_ops_listen_addr(ServiceIdentifier::Explorer),
         ]
         .into_iter()
         .collect();
         assert_eq!(
             ports.len(),
-            4,
+            5,
             "per-service ops ports must be distinct so a single host can run \
-             all four binaries without port conflicts",
+             all five binaries without port conflicts",
         );
     }
 }

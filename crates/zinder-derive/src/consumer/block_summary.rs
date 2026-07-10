@@ -13,7 +13,9 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{BlockHeight, TransactionFactsArtifact};
-use zinder_proto::capabilities::{EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1};
+use zinder_proto::capabilities::{
+    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1,
+};
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
 use crate::consumer::{
@@ -33,8 +35,11 @@ pub const BLOCK_SUMMARY_CONSUMER_NAME: DeriveConsumerName =
     DeriveConsumerName::from_static("block_summary");
 
 /// Capability strings the consumer's read surface lights up once caught up.
-pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] =
-    &[EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_DETAIL_V1];
+pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] = &[
+    EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_DETAIL_V1,
+    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
+];
 
 /// On-disk schema declaration for the block-summary derive consumer.
 pub const BLOCK_SUMMARY_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(

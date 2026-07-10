@@ -14,7 +14,7 @@ use tonic::{Request, Response, Status, transport::Server};
 use zinder_core::Network;
 use zinder_proto::v1::{
     ingest::{
-        WriterStatusRequest, WriterStatusResponse,
+        MempoolTransactionRequest, WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     wallet,
@@ -363,6 +363,15 @@ impl IngestControl for SharedWriterStatus {
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
         Err(Status::unimplemented(
             "readiness_refresh test stub does not implement MempoolSnapshot",
+        ))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        _request: Request<MempoolTransactionRequest>,
+    ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "readiness_refresh test stub does not implement MempoolTransaction",
         ))
     }
 

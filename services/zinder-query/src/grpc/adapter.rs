@@ -4,7 +4,7 @@ use std::{collections::HashMap, num::NonZeroU32, pin::Pin, sync::Arc, time::Inst
 
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
     encode_rpc_transaction_id_hex,
@@ -16,7 +16,7 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_proto::v1::{
-    ingest::ingest_control_client::IngestControlClient,
+    ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
     wallet::{self, wallet_query_server},
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
@@ -54,6 +54,9 @@ type TransparentUnspentOutputsStream = WalletGrpcStream<wallet::TransparentUnspe
 type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddressTxIdsChunk>;
 type CompactBlocksInRangeStream = WalletGrpcStream<wallet::CompactBlocksInRangeChunk>;
 type FullBlocksInRangeStream = WalletGrpcStream<wallet::FullBlocksInRangeChunk>;
+
+const TRANSACTION_NOT_FOUND_REASON: &str =
+    "transaction is not visible in the canonical chain or live mempool";
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
@@ -232,18 +235,39 @@ where
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
         let request = request.into_inner();
         let transaction_id = transaction_id_from_request(&request.transaction_id)?;
+        let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
+        let canonical_response = transaction_response(&self.query_api, transaction_id, at_epoch_id)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
 
-        transaction_response(
-            &self.query_api,
-            transaction_id,
-            chain_epoch_id_from_request(request.at_epoch_id),
-        )
-        .await
-        .map_err(|error| status_from_query_error(&error))?
-        .ok_or_else(|| {
-            Status::not_found("transaction is not visible in the canonical chain or live mempool")
-        })
-        .map(Response::new)
+        if let Some(response) = canonical_response {
+            return Ok(Response::new(response));
+        }
+        if at_epoch_id.is_some() || self.ingest_control_proxy_endpoint.is_none() {
+            return Err(Status::not_found(TRANSACTION_NOT_FOUND_REASON));
+        }
+
+        let mut client = self
+            .ingest_control_client(
+                "live transaction lookup requires the ingest-control proxy; \
+                 configure the writer endpoint",
+            )
+            .await?;
+        let started_at = Instant::now();
+        let proxy_outcome = client
+            .mempool_transaction(Request::new(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            }))
+            .await;
+        record_proxy_outcome("mempool_transaction", started_at, &proxy_outcome);
+
+        match proxy_outcome {
+            Ok(response) => Ok(Response::new(response.into_inner())),
+            Err(status) if status.code() == Code::NotFound => {
+                Err(Status::not_found(TRANSACTION_NOT_FOUND_REASON))
+            }
+            Err(status) => Err(status),
+        }
     }
 
     async fn compact_blocks_in_range(

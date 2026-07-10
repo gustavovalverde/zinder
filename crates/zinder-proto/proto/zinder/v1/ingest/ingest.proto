@@ -85,6 +85,12 @@ message WriterStatusResponse {
   optional zinder.v1.ops.UpstreamNotReadyDetail upstream_not_ready = 8;
 }
 
+// Private point lookup for one transaction in the writer's live mempool
+// index. Transaction ids use canonical RPC byte order.
+message MempoolTransactionRequest {
+  string transaction_id = 1;
+}
+
 // Private ingest control-plane RPCs for colocated read replicas.
 service IngestControl {
   // Returns the writer's identity and capability set in the cross-service
@@ -103,6 +109,12 @@ service IngestControl {
   // through RocksDB-secondary catchup, so the wallet data plane proxies
   // mempool snapshots through this control RPC.
   rpc MempoolSnapshot(zinder.v1.wallet.MempoolSnapshotRequest) returns (zinder.v1.wallet.MempoolSnapshotResponse);
+
+  // Returns one transaction from the writer's live mempool index. The
+  // response uses the public wallet transaction-status shape so
+  // `WalletQuery.Transaction` can preserve one location contract across
+  // canonical and transient state without scanning a snapshot.
+  rpc MempoolTransaction(MempoolTransactionRequest) returns (zinder.v1.wallet.TransactionStatusResponse);
 
   // Streams mempool events from the writer's mempool event log.
   rpc MempoolEvents(zinder.v1.wallet.MempoolEventsRequest) returns (stream zinder.v1.wallet.MempoolEventEnvelope);

@@ -2,7 +2,7 @@
 //!
 //! Single typed value the explorer plane returns when rendering a
 //! transaction page. Parsed once at the source boundary
-//! (`zinder_source::parse_transaction_public_facts`) from raw serialized
+//! (`zinder_source::parse_transaction_public_fact_set`) from raw serialized
 //! transaction bytes plus the node-discovered network upgrade table.
 //! Carries everything the wallet plane already publishes plus the
 //! ZIP-aware version, lock-time, expiry-height, component counts, and
@@ -283,7 +283,7 @@ impl TransactionComponentCounts {
 
 /// Read-model carrying every public fact the explorer renders for a transaction.
 ///
-/// Constructed once by `zinder_source::parse_transaction_public_facts` and
+/// Constructed once by `zinder_source::parse_transaction_public_fact_set` and
 /// surfaced verbatim on `ExplorerQuery.TransactionDetail`. Wallet ingest and
 /// the mempool entry hydration path will adopt the same struct in subsequent
 /// slices so all three call sites share one parse. Adding a new field is a

@@ -9,10 +9,21 @@
 
 ## Context
 
-Every derive projection is rebuildable from retained canonical events; that is
-the plane's defining invariant. The schema gate that protects those
-projections must therefore decide only *what* rebuilds, never *whether*
-rebuild is possible.
+Every derive projection must have a deterministic recovery path, but retained
+canonical events are not sufficient for every projection at every height.
+Some consumers join event-scoped rows to canonical facts with shorter
+retention. A projection row can therefore outlive one of the inputs that first
+produced it. Before clearing a consumer, the schema gate must establish both
+*what* rebuilds and whether the declared recovery source can reproduce the
+preserved history.
+
+`TransactionFeesConsumer` exposed the concrete failure mode. Its version-1
+rows retained resolved transparent input values below the transparent-spend
+retention floor. Clearing those rows and replaying retained events produced
+`PARTIAL` replacements because the event hydration path no longer found the
+short-lived spend facts. The immutable parent `TransactionFactsArtifact` rows
+could still reconstruct those values, but the blanket clear-first migration
+discarded useful data before proving that fallback.
 
 A single store-global derive schema version couples that decision to the
 wrong granularity. One consumer changing its key or payload layout invalidates
@@ -29,17 +40,21 @@ versioning unit should match the ownership unit.
 
 ## Decision
 
-Each derive consumer versions its own on-disk layout. The store persists a
-per-consumer schema manifest and, at open time, scopes wipe-and-rebuild to
-exactly the consumers whose declared version moved. A store-global
-container-format version remains, narrowed to the parts every consumer
-shares.
+Each derive consumer versions its own persisted row contract. The store
+persists a per-consumer schema manifest and defaults incompatible forward
+changes to a scoped rebuild. A consumer may explicitly declare older row
+contracts compatible when the column-family set and payload encoding are
+unchanged and the new reader safely interprets both meanings. Compatible
+upgrades preserve rows and cursors while advancing the manifest. A
+store-global container-format version remains, narrowed to the parts every
+consumer shares.
 
 ### Registration declares name, version, and column families together
 
 `DeriveConsumerSchema` is the registration unit: a consumer's stable
-`DeriveConsumerName`, its `schema_version` (`u16`), and the column families it
-owns. `DeriveStoreOptions::consumers` takes a slice of these declarations;
+`DeriveConsumerName`, its `schema_version` (`u16`), the column families it
+owns, and optional older `row_compatible_versions`.
+`DeriveStoreOptions::consumers` takes a slice of these declarations;
 `DeriveStore::bundled_consumers()` returns the bundled set, each starting at
 version 1. The constructor requires the version, so a column family cannot be
 registered without one.
@@ -55,30 +70,42 @@ impossible.
 
 The `consumer_metadata` column family holds one manifest row per consumer,
 keyed by a reserved prefix plus the consumer name. The payload is
-length-prefixed: the consumer's schema version (`u16` big-endian), a column
-family count (`u16`), then each owned column-family name as a `u16` length
-plus bytes. Encoding rejects a declaration that exceeds the count or length
-fields; decoding rejects a truncated entry instead of silently reading a
-partial column-family list, so a torn manifest row fails the open loudly
-rather than leaking a column family past reconciliation.
+length-prefixed: the latest writer schema version (`u16` big-endian), a column
+family count (`u16`), each owned column-family name as a `u16` length plus
+bytes, then the sorted set of row schema versions still present. Legacy rows
+without the final set decode as containing only their recorded writer version.
+Encoding rejects declarations that exceed the count or length fields;
+decoding rejects truncation, trailing bytes, an empty provenance set, or a row
+version newer than the writer.
 
 The manifest records the column families the consumer owned *when the row was
-written*, which is what lets a later open find and drop families the current
-binary no longer declares.
+written*, which lets a later open distinguish a layout change from harmless
+declaration reordering and reject an undeclared owner without touching it.
 
 ### Open-time reconciliation (primary)
 
 After validating the container-format version, the primary open compares each
 declared consumer against the manifest:
 
-- **Version matches.** The consumer's column families and cursor are
-  byte-preserved.
-- **Version moved.** The consumer rebuilds, in this order: reset its chain and
+- **Version and column-family set match.** The consumer's column families and
+  cursor are byte-preserved.
+- **Older row-compatible version with the same column-family set.** Rows and
+  cursors are byte-preserved. Write the current writer version plus the union
+  of prior row versions and the current version. Compatibility must cover every
+  persisted row version, not only the immediately preceding writer. The
+  manifest-only promotion is idempotent and crash-safe.
+- **Older incompatible version or changed column-family set.** The consumer
+  rebuilds, in this order: reset its chain and
   mempool cursors, clear the rows of manifest-recorded column families it no
   longer declares, clear the rows of its declared column families, then write
   the manifest entry at the new version last.
-- **Recorded but no longer declared.** Reset its cursors, clear the rows of its
-  recorded column families, then remove its manifest entry last.
+- **Persisted version newer than the running binary.** Fail with
+  `ConsumerSchemaMismatch` before reconciliation mutates the store. A rollback
+  must never reinterpret a newer row contract as permission to rebuild it.
+- **Recorded but no longer declared.** Fail with `ConsumerNotDeclared` before
+  mutation. Absence may mean rollback or configuration drift; it is not an
+  explicit destructive migration. Consumer removal is deferred until a real
+  removal use case defines its own operator-visible contract.
 - **Declared but not recorded.** Clear the rows of its declared column
   families, then write its manifest entry at the declared version. Clearing
   starts the consumer from an empty projection, so a family that previously
@@ -107,31 +134,30 @@ derive directory.
 
 Every on-disk column family must be listed to open the database: `RocksDB`
 refuses to open while leaving an existing column family unlisted. Open
-therefore lists the on-disk column families and includes any not covered by
-the store tables or the declared consumers, so an emptied orphan keeps opening
-across restarts without being re-recorded in the manifest. A column family
-whose owning consumer changes is cleared for the new owner, not handed off with
-its rows: the new owner starts from an empty projection and rebuilds from
-retained events. Cross-consumer row migration is deliberately not an affordance,
-because retained rows behind a fresh cursor would double-apply a non-idempotent
-projection and never rebuild a differing key or payload layout.
+therefore includes unknown on-disk families long enough to read the manifest
+and fail closed without clearing them. Transferring a family between consumer
+names is rejected for the same reason. Cross-consumer migration is deliberately
+not inferred from declarations.
 
-Both reconciliation outcomes that destroy state emit a `tracing` warning
-(`consumer_schema_rebuild`, `consumer_dropped`) naming the consumer and the
-version transition, so an operator-visible rebuild is never silent.
+An incompatible reconciliation emits `consumer_schema_rebuild`, naming the
+consumer and version transition, so an operator-visible rebuild is never
+silent. A compatible promotion emits `consumer_schema_rows_preserved` at info
+level and persists cumulative row provenance.
 
 ### Secondary readers validate, never reconcile
 
 A secondary reader cannot write
-([ADR-0003](0003-canonical-storage-access-boundary.md)), so it cannot
-rebuild. Secondary
-open requires the persisted container version to equal
-`DERIVE_STORE_FORMAT_VERSION` and every declared consumer's version to equal
-its manifest entry. A divergence fails with `SchemaMismatch` or
-`ConsumerSchemaMismatch` (carrying the persisted version, or `None` when the
-primary has not recorded the consumer), and the caller retries until the
-primary has reconciled and rewritten the manifest. A reader never decodes
-rows written under a layout it does not declare.
+([ADR-0003](0003-canonical-storage-access-boundary.md)), so it cannot rebuild.
+Open and every later `try_catch_up` require the persisted container version to
+equal `DERIVE_STORE_FORMAT_VERSION`. Each declared consumer must accept every
+row version in its manifest and own the same column-family set. Unknown
+manifest consumers and every other divergence fail with `SchemaMismatch`,
+`ConsumerNotDeclared`, or `ConsumerSchemaMismatch`. A reader never continues
+after catching up into rows it did not explicitly declare safe.
+
+The first deployment of this rule remains reader-first because binaries from
+before this ADR revision do not revalidate after catch-up. Once all readers run
+this contract, future incompatible changes fail on the catch-up call itself.
 
 ### Container-format version, narrowed
 
@@ -140,6 +166,13 @@ layout, the cursor encoding, and the metadata column family. Bumping it wipes
 the whole derive store, because no consumer's data survives a change to the
 shared format. A consumer changing its own key or payload layout bumps its
 own `schema_version` and never the container version.
+
+The cumulative row-version trailer is an optional extension to the existing
+manifest row: the new decoder accepts both legacy rows and the extended form,
+so introducing it does not invalidate any consumer payload or require a
+container rebuild. New writes include the trailer. This is why the first
+deployment must update readers before the writer rather than bumping the
+container version and deleting the derive store.
 
 The primary open performs that wipe itself, and only forward. A persisted
 container version older than the running one deletes the derive directory and
@@ -162,26 +195,26 @@ version 7 onward, per-consumer scoping applies.
 
 ## Consequences
 
-- **A consumer schema bump rebuilds only that consumer's projection.** Its
+- **An incompatible consumer schema bump rebuilds only that consumer's projection.** Its
   cursor resets and its column families' rows clear and replay from the
   earliest retained canonical event; every other consumer's rows and cursor
   are untouched. The derive store as a whole is wiped only by a
   container-format change.
-- **Deleting a consumer clears its rows immediately and reclaims its physical
-  storage at the next container rebuild.** A consumer removed from the
-  declaration set has its rows cleared, its cursor reset, and its manifest
-  entry removed on the next primary open, so it no longer serves reads. Its now
-  empty column family stays on disk as an orphan until a container-format
-  change wipes the whole derive directory, because dropping the family in place
-  would crash any attached secondary reader.
+- **Removing or renaming a consumer fails closed.** The running declaration
+  must account for every manifest entry. A future removal feature must be an
+  explicit migration rather than interpreting absence as permission to delete.
 - **Consumer error variants change.** `SchemaMismatch` describes only the
   container version; `ConsumerSchemaMismatch` and `SchemaReconcile` cover
   per-consumer divergence and reconciliation failures.
-- **Rebuild depth is bounded by canonical retention.** A scoped rebuild
-  replays retained canonical events; a consumer that must rebuild past the
-  retention floor still requires the operator cold-start path in the
-  [derive plane](../architecture/derive-plane.md). Scoping does not change
-  that bound; it changes how many consumers pay it at once.
-- **Version numbers move forward by convention, not mechanism.** The store
-  rebuilds on any inequality, so an accidental downgrade also rebuilds.
-  Consumers only ever increment their version.
+- **A row-compatible semantic upgrade preserves useful historical rows and
+  their provenance.** The new reader must sanitize or translate every row
+  version recorded in the manifest before values cross a public boundary.
+  Compatibility is cumulative and is never inferred from equal protobuf wire
+  layout alone.
+- **Rebuild depth is bounded by the consumer's proven recovery source.** A
+  scoped rebuild may use retained events, canonical artifacts, or an explicit
+  checkpoint. If the source does not cover the projection's persisted history,
+  the migration must preserve compatible rows or require the operator cold-start
+  path in the [derive plane](../architecture/derive-plane.md).
+- **Consumer versions are monotonic in mechanism.** A persisted newer version
+  fails closed; an accidental downgrade does not clear rows or cursors.

@@ -107,6 +107,13 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// A transaction component index cannot be represented on public wires.
+    #[error("{component} index exceeds u32")]
+    TransactionComponentIndexOverflow {
+        /// Component whose zero-based index overflowed.
+        component: &'static str,
+    },
+
     /// Parsed raw block did not contain a coinbase height.
     #[error("raw block is missing its coinbase height")]
     RawBlockCoinbaseHeightMissing,
@@ -420,6 +427,7 @@ impl SourceError {
             | Self::InvalidSubtreeRootLength { .. }
             | Self::RawBlockParseFailed { .. }
             | Self::RawTransactionParseFailed { .. }
+            | Self::TransactionComponentIndexOverflow { .. }
             | Self::RawBlockCoinbaseHeightMissing
             | Self::RawBlockHeightMismatch { .. }
             | Self::RawBlockTimeOutOfRange

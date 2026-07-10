@@ -9,7 +9,7 @@ use eyre::Result;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
+use tonic::{Code, transport::Server};
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
     AuthDigest, BlockHash, MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes,
@@ -18,10 +18,11 @@ use zinder_core::{
 };
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolApplyOutcome, MempoolIndex};
 use zinder_proto::v1::{
-    ingest::ingest_control_client::IngestControlClient,
+    ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
     wallet::{
         MempoolEventStreamFamily, MempoolEventsRequest,
         MempoolSnapshotRequest as ControlMempoolSnapshotRequest, mempool_event_envelope,
+        transaction_location,
     },
 };
 use zinder_store::{
@@ -170,6 +171,64 @@ async fn ingest_control_serves_mempool_snapshot_and_events() -> Result<()> {
             .ok_or_else(|| eyre::eyre!("second envelope event missing"))?,
         mempool_event_envelope::Event::Invalidated(_)
     ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_control_serves_mempool_transaction_by_id() -> Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let chain_epoch = *store_fixture
+        .committed_chain_epoch()
+        .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
+    let store = store_fixture.chain_store().clone();
+    let mempool_index = MempoolIndex::new();
+    let entry = synthetic_entry(0xAB, chain_epoch);
+    let added_envelope = append_mempool_event(
+        &store,
+        MempoolEvent::Added {
+            entry: entry.clone(),
+        },
+    )?;
+    assert_eq!(
+        mempool_index.apply_added(entry.clone(), added_envelope.position()),
+        MempoolApplyOutcome::Applied
+    );
+
+    let listen_addr = spawn_ingest_control(store, mempool_index).await?;
+    let mut client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+    let response = client
+        .mempool_transaction(MempoolTransactionRequest {
+            transaction_id: encode_rpc_transaction_id_hex(entry.transaction_id),
+        })
+        .await?
+        .into_inner();
+    let response_epoch = response
+        .chain_view
+        .and_then(|chain_view| chain_view.chain_epoch)
+        .ok_or_else(|| eyre::eyre!("response.chain_view.chain_epoch is missing"))?;
+    assert_eq!(response_epoch.chain_epoch_id, chain_epoch.id.value());
+    let location = response
+        .location
+        .and_then(|location| location.location)
+        .ok_or_else(|| eyre::eyre!("response.location is missing"))?;
+    let transaction_location::Location::InMempool(mempool_transaction) = location else {
+        return Err(eyre::eyre!("expected in-mempool transaction location"));
+    };
+    assert_eq!(
+        mempool_transaction.payload_bytes,
+        entry.raw_transaction_bytes.as_slice()
+    );
+    assert_eq!(mempool_transaction.first_seen_unix_seconds, 1_700_000_000);
+
+    let Err(missing_status) = client
+        .mempool_transaction(MempoolTransactionRequest {
+            transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes([0xCD; 32])),
+        })
+        .await
+    else {
+        return Err(eyre::eyre!("unknown transaction unexpectedly resolved"));
+    };
+    assert_eq!(missing_status.code(), Code::NotFound);
     Ok(())
 }
 

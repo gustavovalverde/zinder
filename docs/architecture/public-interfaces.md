@@ -101,6 +101,8 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `LatestBlockResponse` | Native wallet protocol response for latest visible block metadata |
 | `CompactBlocksInRangeChunk` | Native wallet protocol stream item for one compact block bound to one chain epoch |
 | `FullBlocksInRangeChunk` | Native wallet protocol stream item for one serialized full block bound to one chain epoch |
+| `TransactionRequest` | Native wallet protocol request for one transaction id. Without `at_epoch_id`, `WalletQuery.Transaction` resolves canonical state first and then the writer's live mempool index; a pinned request is canonical-only. |
+| `TransactionStatusResponse` | Native wallet protocol response carrying one typed `mined`, `in_mempool`, or `conflicting` location. A miss is gRPC `NOT_FOUND`. |
 | `TreeStateResponse` | Native wallet protocol response for one commitment tree-state artifact |
 | `SubtreeRootsResponse` | Native wallet protocol response for Sapling or Orchard subtree roots |
 | `BroadcastTransactionRequest` | Native wallet protocol request to submit a raw transaction |
@@ -716,11 +718,15 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `wallet.address.transparent_history_v1`
 - `wallet.address.transparent_balance_v1`
 - `explorer.server_info_v1`
-- `explorer.transaction.detail_v1`
+- `explorer.transaction.detail_v3`
 - `explorer.block.summary_v1`
+- `explorer.block.production_series_v2`
 - `explorer.block.detail_v1`
+- `explorer.block.transactions_v2`
+- `explorer.block.activity_distribution_v1`
 - `explorer.search_v1`
 - `explorer.mempool.summary_v1`
+- `explorer.mempool.snapshot_v1`
 - `explorer.mempool.activity_v1`
 - `explorer.transparent_address.activity_v1`
 - `explorer.transparent_address.deltas_v1`

@@ -149,7 +149,7 @@ existing early-return path. The transparent, Sapling, and Orchard accessors in
 `ShieldedDataV6` wrapper through `orchard_actions()`), so
 `transaction_component_counts` reports those components without change. Add a v6
 fixture round-trip test in `crates/zinder-proto/tests/` and a
-`parse_transaction_public_facts` test.
+`parse_transaction_public_fact_set` test.
 
 Gate: facts and wire-invariant tests; `capability_string_uniqueness`.
 

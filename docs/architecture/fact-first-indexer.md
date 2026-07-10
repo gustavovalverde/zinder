@@ -184,7 +184,7 @@ Capability rules:
 - Wallet capability names stay under `wallet.read.*`, `wallet.mempool.*`, and
   `wallet.write.*`.
 - Explorer capability names use `explorer.<domain>.<view>_vN`, for example
-  `explorer.transaction.detail_v1` and `explorer.block.summary_v1`.
+  `explorer.transaction.detail_v3` and `explorer.block.summary_v1`.
 - Raw bytes are explicit capabilities, not fields quietly attached to typed
   reads.
 

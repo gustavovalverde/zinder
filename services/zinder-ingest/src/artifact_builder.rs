@@ -15,8 +15,7 @@ use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
     ChainTipMetadata, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
     TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentOutputFact,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 
@@ -26,7 +25,7 @@ use zinder_proto::compat::lightwalletd::{
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
 };
 use zinder_source::{
-    SourceBlock, block_header_info_from_raw_block_bytes, parse_transaction_public_facts,
+    SourceBlock, block_header_info_from_raw_block_bytes, parse_transaction_public_fact_set,
 };
 use zinder_store::RawBlobRetention;
 
@@ -469,22 +468,24 @@ fn derive_transaction_artifacts_from_parsed(
             source_block.hash,
             tx_index_in_block,
         );
-        let public_facts =
-            parse_transaction_public_facts(&payload_bytes, Some(source_block.height), activations)
-                .map_err(|source| ArtifactDeriveError::TransactionFactsParseFailed {
-                    reason: source.to_string(),
-                })?;
+        let fact_set = parse_transaction_public_fact_set(
+            &payload_bytes,
+            Some(source_block.height),
+            activations,
+        )
+        .map_err(|source| ArtifactDeriveError::TransactionFactsParseFailed {
+            reason: source.to_string(),
+        })?;
         block_transaction_index.push(BlockTransactionIndexArtifact::new(
             source_block.height,
             tx_index_in_block,
             transaction_id,
             source_block.hash,
         ));
-        let (transparent_inputs, transparent_outputs) = transaction_transparent_facts(transaction)?;
         transaction_locations.push(location);
         transaction_facts.push(
-            TransactionFactsArtifact::new(location, public_facts)
-                .with_transparent_facts(transparent_inputs, transparent_outputs),
+            TransactionFactsArtifact::new(location, fact_set.public_facts)
+                .with_transparent_facts(fact_set.transparent_inputs, fact_set.transparent_outputs),
         );
         if raw_blob_policy.writes_transaction_blobs() {
             transaction_blobs.push(TransactionBlobArtifact::new(location, payload_bytes));
@@ -499,42 +500,6 @@ fn derive_transaction_artifacts_from_parsed(
         transaction_facts,
         transaction_blobs,
     })
-}
-
-fn transaction_transparent_facts(
-    transaction: &ZebraTransaction,
-) -> Result<(Vec<TransparentInputFact>, Vec<TransparentOutputFact>), ArtifactDeriveError> {
-    let mut inputs = Vec::new();
-    for (input_index, input) in transaction.inputs().iter().enumerate() {
-        let input_index =
-            u32::try_from(input_index).map_err(|_| ArtifactDeriveError::CountOverflow {
-                field: "transparent input index",
-            })?;
-        let ZebraTransparentInput::PrevOut { outpoint, .. } = input else {
-            continue;
-        };
-        inputs.push(TransparentInputFact::new(
-            input_index,
-            TransparentOutPoint::new(TransactionId::from_bytes(outpoint.hash.0), outpoint.index),
-        ));
-    }
-
-    let mut outputs = Vec::new();
-    for (output_index, output) in transaction.outputs().iter().enumerate() {
-        let output_index =
-            u32::try_from(output_index).map_err(|_| ArtifactDeriveError::CountOverflow {
-                field: "transparent output index",
-            })?;
-        let script_pub_key = output.lock_script.as_raw_bytes().to_vec();
-        outputs.push(TransparentOutputFact::new(
-            output_index,
-            u64::from(output.value()),
-            script_pub_key.clone(),
-            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
-        ));
-    }
-
-    Ok((inputs, outputs))
 }
 
 fn record_raw_blob_disabled(table: &'static str, row_count: u64) {

@@ -20,7 +20,7 @@ use zinder_core::{
 use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
 use zinder_proto::v1::{
     ingest::{
-        WriterPhase, WriterStatusRequest, WriterStatusResponse,
+        MempoolTransactionRequest, WriterPhase, WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
@@ -515,6 +515,78 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
 }
 
 #[tokio::test]
+async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x89; 32]);
+    let mempool_status = wallet::TransactionStatusResponse {
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(proxied_event_chain_epoch()),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }),
+        location: Some(wallet::TransactionLocation {
+            location: Some(wallet::transaction_location::Location::InMempool(
+                wallet::MempoolTransaction {
+                    payload_bytes: vec![0x01, 0x02, 0x03],
+                    first_seen_unix_seconds: 1_700_000_000,
+                },
+            )),
+        }),
+    };
+    let ingest_control = StaticIngestControl::new(wallet::ChainEventEnvelope::default())
+        .with_mempool_transaction_response(mempool_status);
+    let (ingest_control_addr, cancel, server_handle) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let store_fixture = StoreFixture::open()?;
+    let stored_artifacts = commit_wallet_artifacts(store_fixture.chain_store())?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
+        wallet_query,
+        ServerInfoSettings::default(),
+        format!("http://{ingest_control_addr}"),
+    );
+
+    let response = WalletQueryService::transaction(
+        &grpc_adapter,
+        Request::new(wallet::TransactionRequest {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            at_epoch_id: None,
+        }),
+    )
+    .await?
+    .into_inner();
+    assert!(matches!(
+        response.location.and_then(|location| location.location),
+        Some(wallet::transaction_location::Location::InMempool(transaction))
+            if transaction.payload_bytes == [0x01, 0x02, 0x03]
+                && transaction.first_seen_unix_seconds == 1_700_000_000
+    ));
+
+    let Err(pinned_status) = WalletQueryService::transaction(
+        &grpc_adapter,
+        Request::new(wallet::TransactionRequest {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            at_epoch_id: Some(stored_artifacts.chain_epoch.id.value()),
+        }),
+    )
+    .await
+    else {
+        return Err(eyre!(
+            "pinned canonical miss unexpectedly read live mempool state"
+        ));
+    };
+    assert_eq!(pinned_status.code(), Code::NotFound);
+
+    cancel.cancel();
+    server_handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let read_only_query = WalletQuery::new(
@@ -750,11 +822,23 @@ type StaticChainEventsStream =
 #[derive(Clone)]
 struct StaticIngestControl {
     event: wallet::ChainEventEnvelope,
+    mempool_transaction_response: Option<wallet::TransactionStatusResponse>,
 }
 
 impl StaticIngestControl {
     fn new(event: wallet::ChainEventEnvelope) -> Self {
-        Self { event }
+        Self {
+            event,
+            mempool_transaction_response: None,
+        }
+    }
+
+    fn with_mempool_transaction_response(
+        mut self,
+        response: wallet::TransactionStatusResponse,
+    ) -> Self {
+        self.mempool_transaction_response = Some(response);
+        self
     }
 }
 
@@ -824,6 +908,16 @@ impl IngestControl for StaticIngestControl {
         Err(Status::unimplemented(
             "test scaffold does not stub MempoolSnapshot",
         ))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        _request: Request<MempoolTransactionRequest>,
+    ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        self.mempool_transaction_response
+            .clone()
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found("transaction is not in the test mempool"))
     }
 
     async fn mempool_events(

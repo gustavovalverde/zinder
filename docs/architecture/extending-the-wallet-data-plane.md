@@ -245,7 +245,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 | `wallet.events.*` | Streaming event families | `wallet.events.chain_v1` |
 | `wallet.snapshot.*` | Bounded snapshot reads | `wallet.snapshot.mempool_v1` |
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
-| `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transaction.detail_v1` |
+| `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transaction.detail_v3` |
 
 Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests.
 

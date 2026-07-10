@@ -73,6 +73,7 @@ services:
       ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:8230}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
+      ZINDER_STORAGE__RAW_BLOB_POLICY: ${ZINDER_STORAGE__RAW_BLOB_POLICY:-none}
       # Operators switching to basic auth export ZINDER_NODE__AUTH__METHOD=basic
       # plus ZINDER_NODE__AUTH__USERNAME/PASSWORD (or AUTH__COOKIE for an
       # inline cookie). Empty values aren't safe to emit alongside cookie auth;

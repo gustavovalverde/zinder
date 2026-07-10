@@ -53,10 +53,14 @@ ARG TARGETVARIANT
 
 COPY . .
 
+# A persisted target cache can contain prost output newer than Docker's copied
+# source mtimes. Clean only this package so every image regenerates native
+# contracts while retaining dependency and downstream compilation caches.
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
-    cargo build --locked --release \
+    cargo clean --release -p zinder-proto \
+    && cargo build --locked --release \
         --bin zinder-ingest \
         --bin zinder-query \
         --bin zinder-explorer \

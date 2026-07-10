@@ -153,10 +153,11 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
 ///
 /// Signals that the response carries the full `TransactionPublicFacts` shape
-/// per [ADR-0010](../../../docs/adrs/0010-transaction-public-facts.md). The
-/// always-on wallet capability for raw transaction lookup remains
+/// plus ordered transparent inputs that combine their spent outpoint with
+/// independently resolved canonical prevout values and scripts. The always-on
+/// wallet capability for raw transaction lookup remains
 /// [`WALLET_READ_TRANSACTION_BY_ID_V1`].
-pub const EXPLORER_TRANSACTION_DETAIL_V1: &str = "explorer.transaction.detail_v1";
+pub const EXPLORER_TRANSACTION_DETAIL_V3: &str = "explorer.transaction.detail_v3";
 /// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
 ///
 /// Signals that the explorer plane is materializing the `BlockSummary`
@@ -165,6 +166,13 @@ pub const EXPLORER_TRANSACTION_DETAIL_V1: &str = "explorer.transaction.detail_v1
 /// `transaction_count`, `previous_block_hash`). The companion
 /// [`EXPLORER_BLOCK_DETAIL_V1`] covers the per-block transaction-id list.
 pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
+/// Capability advertised for `ExplorerQuery.BlockProductionSeries`.
+///
+/// Signals that the explorer can join a bounded range of existing
+/// `BlockSummary` rows to canonical block-header difficulty bits. The series is
+/// assembled at request time and reports missing coverage explicitly; it does
+/// not imply a new durable projection.
+pub const EXPLORER_BLOCK_PRODUCTION_SERIES_V2: &str = "explorer.block.production_series_v2";
 /// Capability advertised for `ExplorerQuery.BlockDetail`.
 ///
 /// Signals that the explorer plane materialized the per-block transaction
@@ -172,6 +180,20 @@ pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
 /// [`EXPLORER_BLOCK_SUMMARY_V1`]; both are advertised together by the same
 /// `BlockSummaryConsumer` derive view.
 pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
+/// Capability advertised for `ExplorerQuery.BlockTransactions`.
+///
+/// Signals that the explorer plane can batch-read the public transaction facts
+/// and transparent output scripts already retained for one materialized block.
+/// The response avoids a consumer-side `BlockDetail` plus per-transaction
+/// `TransactionDetail` fan-out and does not imply raw-byte retention.
+pub const EXPLORER_BLOCK_TRANSACTIONS_V2: &str = "explorer.block.transactions_v2";
+/// Capability advertised for `ExplorerQuery.BlockActivityDistribution`.
+///
+/// Signals that the explorer aggregates a bounded height range of existing
+/// materialized `BlockSummary` rows into a fixed weekday/hour activity grid.
+/// The aggregate is a request-time read, not a durable time-series
+/// projection; its response exposes missing materialized rows explicitly.
+pub const EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1: &str = "explorer.block.activity_distribution_v1";
 /// Capability advertised for `ExplorerQuery.Search`.
 ///
 /// Signals that the explorer plane classifies a raw user input string
@@ -189,6 +211,13 @@ pub const EXPLORER_SEARCH_V1: &str = "explorer.search_v1";
 /// version distributions, freshness extremes) at request time. Composed
 /// from `WalletQuery.MempoolSnapshot`; no derive consumer required.
 pub const EXPLORER_MEMPOOL_SUMMARY_V1: &str = "explorer.mempool.summary_v1";
+/// Capability advertised for `ExplorerQuery.MempoolSnapshot`.
+///
+/// Signals that the explorer derives one global summary and one requested page
+/// from the same `WalletQuery.MempoolSnapshot` observation. This avoids the
+/// cross-request race inherent in composing `MempoolSummary` and
+/// `MempoolActivity` independently. No derive consumer is required.
+pub const EXPLORER_MEMPOOL_SNAPSHOT_V1: &str = "explorer.mempool.snapshot_v1";
 /// Capability advertised for `ExplorerQuery.MempoolActivity`.
 ///
 /// Signals that the explorer plane projects the live mempool entries
@@ -255,11 +284,13 @@ pub const EXPLORER_UTXO_SET_COMMITMENT_V1: &str = "explorer.utxo_set.commitment_
 ///
 /// Signals that the explorer plane has transparent-output facts online and
 /// the `TransactionFeesConsumer` has materialized per-transaction fee rows.
-/// When advertised, `TransactionDetail` responses populate `paid_fee_zat` and
-/// `transparent_inputs[].value_zat`; absent, those fields stay default and
-/// consumers fall back to `zip317_conventional_fee_zat` with a
-/// `prevout_resolution_status` chip. Gates fields on `TransactionDetail`
-/// rather than a dedicated RPC.
+/// When advertised, `TransactionDetail` responses populate resolved
+/// `transparent_inputs[].value_zat`. They populate `paid_fee_zat` only for
+/// transparent-only transactions because canonical facts do not retain the
+/// value balances required to prove shielded fees. Consumers fall back to
+/// `zip317_conventional_fee_zat` when the paid fee is absent and use
+/// `prevout_resolution_status` for transparent-input resolution. Gates fields
+/// on `TransactionDetail` rather than a dedicated RPC.
 pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
 /// Capability advertised for `ExplorerQuery.RecentTransactions`.
 ///
@@ -334,6 +365,8 @@ pub const INGEST_CONTROL_WRITER_STATUS_V1: &str = "ingest.control.writer_status_
 pub const INGEST_CONTROL_CHAIN_EVENTS_V1: &str = "ingest.control.chain_events_v1";
 /// Capability advertised for `IngestControl.MempoolSnapshot`.
 pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1: &str = "ingest.control.mempool_snapshot_v1";
+/// Capability advertised for `IngestControl.MempoolTransaction`.
+pub const INGEST_CONTROL_MEMPOOL_TRANSACTION_V1: &str = "ingest.control.mempool_transaction_v1";
 /// Capability advertised for `IngestControl.MempoolEvents`.
 pub const INGEST_CONTROL_MEMPOOL_EVENTS_V1: &str = "ingest.control.mempool_events_v1";
 /// Capability advertised for `IngestControl.TransparentMempoolOutputsByAddress`.
@@ -405,6 +438,12 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when both the derive store and a `WalletQuery`
     /// endpoint are online.
     RequiresDeriveStoreAndWalletQuery,
+    /// Explorer: advertised when both the derive store and canonical secondary
+    /// store are online.
+    RequiresDeriveStoreAndCanonicalStore,
+    /// Explorer: advertised when the derive store, canonical secondary store,
+    /// and `WalletQuery` endpoint are all online.
+    RequiresDeriveStoreWalletQueryAndCanonicalStore,
     /// Explorer: advertised when the transparent-output prevout resolution
     /// path is online (which itself requires a `WalletQuery` endpoint).
     RequiresPrevoutResolution,
@@ -444,6 +483,8 @@ impl AdvertisePolicy {
             | Self::RequiresDeriveStore
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
+            | Self::RequiresDeriveStoreAndCanonicalStore
+            | Self::RequiresDeriveStoreWalletQueryAndCanonicalStore
             | Self::RequiresPrevoutResolution
             | Self::RequiresPaymentDisclosureVerifier => false,
         }
@@ -465,6 +506,14 @@ impl AdvertisePolicy {
             }
             Self::RequiresDeriveStoreAndWalletQuery => {
                 readiness.derive_store_online && readiness.wallet_query_online
+            }
+            Self::RequiresDeriveStoreAndCanonicalStore => {
+                readiness.derive_store_online && readiness.canonical_store_online
+            }
+            Self::RequiresDeriveStoreWalletQueryAndCanonicalStore => {
+                readiness.derive_store_online
+                    && readiness.wallet_query_online
+                    && readiness.canonical_store_online
             }
             Self::RequiresPrevoutResolution => readiness.prevout_resolution_online,
             Self::RequiresPaymentDisclosureVerifier => readiness.payment_disclosure_verifier_online,
@@ -493,6 +542,8 @@ impl AdvertisePolicy {
             | Self::RequiresWalletQuery
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresDeriveStoreAndWalletQuery
+            | Self::RequiresDeriveStoreAndCanonicalStore
+            | Self::RequiresDeriveStoreWalletQueryAndCanonicalStore
             | Self::RequiresPrevoutResolution
             | Self::RequiresPaymentDisclosureVerifier
             | Self::RequiresBlockBlobs
@@ -790,7 +841,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        EXPLORER_TRANSACTION_DETAIL_V1,
+        EXPLORER_TRANSACTION_DETAIL_V3,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
         AdvertisePolicy::RequiresWalletQueryAndCanonicalStore,
@@ -802,9 +853,27 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
+        EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.BlockProductionSeries"),
+        AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
         EXPLORER_BLOCK_DETAIL_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockDetail"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_BLOCK_TRANSACTIONS_V2,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.BlockTransactions"),
+        AdvertisePolicy::RequiresDeriveStoreWalletQueryAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.BlockActivityDistribution"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
@@ -817,6 +886,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_MEMPOOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolSummary"),
+        AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_MEMPOOL_SNAPSHOT_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.MempoolSnapshot"),
         AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
@@ -943,6 +1018,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolSnapshot"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        INGEST_CONTROL_MEMPOOL_TRANSACTION_V1,
+        CapabilitySurface::Ingest,
+        Some("zinder.v1.ingest.IngestControl.MempoolTransaction"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

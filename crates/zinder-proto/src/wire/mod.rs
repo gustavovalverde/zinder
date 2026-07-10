@@ -15,7 +15,7 @@ mod privacy_shape;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
 
-pub use privacy_shape::encode_privacy_shape;
+pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use transparent_delta_kind::{
     TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,
     UnknownTransparentDeltaKindByte, decode_transparent_delta_kind,

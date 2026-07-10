@@ -771,18 +771,20 @@ where
                 }
             }
 
-            if let Some(derive_store) = derive_store.as_ref()
-                && !canonical_misses.is_empty()
-            {
-                for entry in resolve_swept_spends_from_derive(
-                    derive_store,
-                    &reader,
-                    chain_epoch.settled_tip_height,
-                    &canonical_misses,
-                )? {
-                    if seen.insert(entry.spent_outpoint) {
-                        spends.push(entry);
+            if !canonical_misses.is_empty() {
+                if let Some(derive_store) = derive_store.as_ref() {
+                    for entry in resolve_swept_spends_from_derive(
+                        derive_store,
+                        &reader,
+                        chain_epoch.settled_tip_height,
+                        &canonical_misses,
+                    )? {
+                        if seen.insert(entry.spent_outpoint) {
+                            spends.push(entry);
+                        }
                     }
+                } else {
+                    ensure_spend_lookup_complete_without_derive(&reader)?;
                 }
             }
 
@@ -1416,6 +1418,26 @@ fn resolve_swept_spends_from_derive(
         }
     }
     Ok(resolved)
+}
+
+/// Refuses an ambiguous canonical miss after retention has deleted spend facts.
+///
+/// Before the first real deletion, a canonical miss proves that no spend fact
+/// exists at the pinned epoch. Afterwards, only the durable derive projection
+/// can distinguish an old spent outpoint from an unspent one.
+fn ensure_spend_lookup_complete_without_derive(
+    reader: &zinder_store::ChainEpochReader<'_>,
+) -> Result<(), QueryError> {
+    if reader
+        .transparent_retention_deleted_through_height()
+        .map_err(QueryError::Store)?
+        .is_some()
+    {
+        return Err(QueryError::DeriveUnavailable {
+            capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
+        });
+    }
+    Ok(())
 }
 
 /// Confirms a projection spend row still names the canonical block at its

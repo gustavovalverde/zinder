@@ -1395,6 +1395,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::InvalidSubtreeRootLength { .. }
             | SourceError::RawBlockParseFailed { .. }
             | SourceError::RawTransactionParseFailed { .. }
+            | SourceError::TransactionComponentIndexOverflow { .. }
             | SourceError::RawBlockCoinbaseHeightMissing
             | SourceError::RawBlockHeightMismatch { .. }
             | SourceError::RawBlockTimeOutOfRange,
@@ -1621,6 +1622,12 @@ fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastResu
                 message,
             })
         }
+        _ if is_duplicate_transaction_message(&message) => {
+            TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+                error_code,
+                message,
+            })
+        }
         _ => {
             if is_already_queued_message(&message) {
                 TransactionBroadcastResult::Queued(BroadcastQueued { message })
@@ -1634,6 +1641,18 @@ fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastResu
             }
         }
     }
+}
+
+/// Returns whether the upstream node reported a transaction already in its mempool.
+///
+/// Zebra versions do not consistently use the legacy `-27` code for this state.
+/// Current nodes can return general code `-1` with this message, so the source
+/// boundary classifies the stable semantic phrase before downstream consumers see it.
+fn is_duplicate_transaction_message(message: &str) -> bool {
+    let lowercased_message = message.to_ascii_lowercase();
+    lowercased_message.contains("already exists in mempool")
+        || lowercased_message.contains("already in mempool")
+        || lowercased_message.contains("transaction is already in state")
 }
 
 /// Returns whether the upstream node reported the broadcast as queued.

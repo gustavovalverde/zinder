@@ -56,7 +56,7 @@ Sample response:
   "network": "zcash-mainnet",
   "capabilities": [
     "explorer.server_info_v1",
-    "explorer.transaction.detail_v1",
+    "explorer.transaction.detail_v3",
     "explorer.search_v1",
     "explorer.mempool.summary_v1",
     "explorer.mempool.activity_v1",

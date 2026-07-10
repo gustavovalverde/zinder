@@ -824,6 +824,66 @@ async fn broadcast_transaction_classifies_duplicate() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn broadcast_transaction_classifies_mempool_duplicate_message() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([
+            method("sendrawtransaction").reply(RpcReply::error_with_code(
+                -1,
+                "transaction already exists in mempool",
+            )),
+        ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let broadcast_result = source
+        .broadcast_transaction(RawTransactionBytes::new([0x01]))
+        .await?;
+
+    assert!(matches!(
+        broadcast_result,
+        TransactionBroadcastResult::Duplicate(duplicate)
+            if duplicate.error_code == Some(-1)
+                && duplicate.message == "transaction already exists in mempool"
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_transaction_classifies_state_duplicate_message() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([
+            method("sendrawtransaction").reply(RpcReply::error_with_code(
+                -25,
+                "failed to validate tx: WtxId(\"private\"), error: transaction is already in state",
+            )),
+        ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let broadcast_result = source
+        .broadcast_transaction(RawTransactionBytes::new([0x01]))
+        .await?;
+
+    assert!(matches!(
+        broadcast_result,
+        TransactionBroadcastResult::Duplicate(duplicate)
+            if duplicate.error_code == Some(-25)
+                && duplicate.message.ends_with("transaction is already in state")
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn broadcast_transaction_does_not_classify_unknown_as_duplicate() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("sendrawtransaction")
         .reply(RpcReply::error_with_code(-8, "transaction unknown to node"))])?;

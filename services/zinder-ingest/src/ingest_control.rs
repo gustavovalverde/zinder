@@ -14,8 +14,8 @@ use zinder_core::{
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
 use zinder_proto::v1::{
     ingest::{
-        ServerInfoRequest, ServerInfoResponse, WriterPhase, WriterStatusRequest,
-        WriterStatusResponse,
+        MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterPhase,
+        WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     ops, wallet,
@@ -294,6 +294,40 @@ impl IngestControl for IngestControlGrpcAdapter {
             snapshot_age_millis,
             entries,
             next_cursor,
+        }))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        request: Request<MempoolTransactionRequest>,
+    ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        let mempool_index = self
+            .mempool_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?;
+        let transaction_id = transaction_id_from_rpc_hex(&request.into_inner().transaction_id)?;
+        let entry = mempool_index.entry_for(transaction_id).ok_or_else(|| {
+            Status::not_found("transaction is not visible in the live mempool index")
+        })?;
+        let chain_epoch = self
+            .store
+            .current_chain_epoch()
+            .map_err(|error| status_from_store_error(&error))?
+            .ok_or_else(|| Status::unavailable("writer has no visible chain epoch"))?;
+
+        Ok(Response::new(wallet::TransactionStatusResponse {
+            chain_view: Some(chain_view_message(chain_epoch)),
+            location: Some(wallet::TransactionLocation {
+                location: Some(wallet::transaction_location::Location::InMempool(
+                    wallet::MempoolTransaction {
+                        payload_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
+                        first_seen_unix_seconds: i64::try_from(
+                            entry.first_seen_unix_millis.value() / 1_000,
+                        )
+                        .unwrap_or(i64::MAX),
+                    },
+                )),
+            }),
         }))
     }
 

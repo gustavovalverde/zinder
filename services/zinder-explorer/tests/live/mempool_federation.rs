@@ -1,8 +1,7 @@
-//! Live federation tests for [`ExplorerQuery::MempoolSummary`] and
-//! [`ExplorerQuery::MempoolActivity`].
+//! Live federation tests for the `ExplorerQuery` mempool views.
 //!
 //! Both handlers compose `WalletQuery.MempoolSnapshot` at request time
-//! and parse every entry via `zinder_source::parse_transaction_public_facts`.
+//! and parse every entry via `zinder_source::parse_transaction_public_fact_set`.
 //! The tests stand up the wallet plane in process, drive a known
 //! mempool state via the upstream node (or accept an empty mempool on
 //! testnet/mainnet), and assert the wire shape, freshness envelope, and
@@ -23,9 +22,12 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
-use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
+use zinder_proto::capabilities::{
+    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
+};
 use zinder_proto::v1::explorer::{
-    MempoolActivityRequest, MempoolActivityResponse, MempoolSummaryRequest, MempoolSummaryResponse,
+    MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
+    MempoolSnapshotResponse, MempoolSummaryRequest, MempoolSummaryResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
@@ -42,7 +44,7 @@ const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn mempool_summary_and_activity_return_freshness_envelope() -> Result<()> {
+async fn mempool_views_return_freshness_envelope() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[
         Network::ZcashRegtest,
@@ -57,13 +59,16 @@ async fn mempool_summary_and_activity_return_freshness_envelope() -> Result<()> 
     assert_summary_freshness(&summary)?;
     let activity = fixture.activity(0).await?;
     assert_activity_freshness(&activity)?;
+    let snapshot = fixture.snapshot(0).await?;
+    assert_snapshot_freshness(&snapshot)?;
 
     tracing::info!(
         target: "zinder::live",
-        event = "mempool_summary_and_activity_validated",
+        event = "mempool_views_validated",
         network = %encode_zinder_native_chain_name(fixture.network),
         transaction_count = summary.transaction_count,
         activity_entries = activity.entries.len(),
+        snapshot_entries = snapshot.entries.len(),
         "explorer mempool views validated against live node",
     );
 
@@ -164,6 +169,19 @@ impl MempoolFixture {
         self.activity_with_cursor(max_entries, Vec::new()).await
     }
 
+    async fn snapshot(&self, max_entries: u32) -> Result<MempoolSnapshotResponse> {
+        let response = ExplorerQueryService::mempool_snapshot(
+            &self.explorer_adapter,
+            Request::new(MempoolSnapshotRequest {
+                max_entries,
+                from_cursor: Vec::new(),
+            }),
+        )
+        .await?
+        .into_inner();
+        Ok(response)
+    }
+
     async fn activity_with_cursor(
         &self,
         max_entries: u32,
@@ -233,8 +251,27 @@ fn assert_activity_freshness(response: &MempoolActivityResponse) -> Result<()> {
                 "MempoolActivity must be ordered newest-first",
             );
         }
+        assert!(
+            entry.component_counts.is_some(),
+            "a hydrated mempool entry must expose parsed component counts",
+        );
         prior_first_seen = Some(entry.first_seen_unix_millis);
     }
+    Ok(())
+}
+
+fn assert_snapshot_freshness(response: &MempoolSnapshotResponse) -> Result<()> {
+    let freshness = response
+        .freshness
+        .as_ref()
+        .ok_or_else(|| eyre!("MempoolSnapshot response missing freshness"))?;
+    assert_eq!(freshness.capability_version, EXPLORER_MEMPOOL_SNAPSHOT_V1);
+    let summary = response
+        .summary
+        .as_ref()
+        .ok_or_else(|| eyre!("MempoolSnapshot response missing summary"))?;
+    assert!(response.entries.len() <= usize::from(256_u16));
+    assert!(summary.transaction_count >= u32::try_from(response.entries.len())?);
     Ok(())
 }
 

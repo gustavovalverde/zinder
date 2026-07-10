@@ -75,7 +75,7 @@ message ExplorerFreshness {
 
 Every `ExplorerQuery` response carries `ExplorerFreshness freshness = 1;` as its first field. The chain-state axes (epoch, tips, upstream, derive) live on `chain_view`; this envelope keeps only the metadata that genuinely varies per explorer call.
 
-`capability_version` carries the exact string from `ZINDER_CAPABILITIES` that produced the response (e.g. `explorer.transaction.detail_v1`). When a future `_v2` ships alongside `_v1`, clients can branch on which version a particular response uses without parsing the descriptor again.
+`capability_version` carries the exact string from `ZINDER_CAPABILITIES` that produced the response (e.g. `explorer.transaction.detail_v3`). When a future `_v4` replaces `_v3`, clients can branch on which contract produced a response without parsing the descriptor again.
 
 `chain_view.upstream_tip` carries the upstream node's view of the chain at response-construction time, mirroring `committed_height` and `estimated_height` from `UpstreamHealthSnapshot`. The axis is optional because the source-plane probe is async; a response that fires before the first probe leaves it unset. Consumers MUST treat the absence as "unknown", not zero. This lets explorer consumers render an honest sync-progress UI ("block X of Y") against the real chain tip without reinventing protocol invariants (block-time math) client-side.
 

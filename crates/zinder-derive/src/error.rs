@@ -94,10 +94,11 @@ pub enum DeriveStoreError {
         /// Store-format version the running binary expects.
         running: u16,
     },
-    /// A declared consumer's persisted schema version disagrees with the
-    /// running binary. Secondary readers reject this rather than decode rows
-    /// written under a different consumer layout; the primary rebuilds the
-    /// consumer and rewrites the manifest before the reader can proceed.
+    /// A declared consumer's persisted schema contract cannot be read safely
+    /// by the running binary. Secondary readers reject this rather than decode
+    /// incompatible rows. A primary rebuilds older incompatible versions but
+    /// rejects newer persisted versions so rollback never destroys that
+    /// consumer's newer rows.
     /// `persisted` is `None` when the primary has not recorded the consumer.
     #[error(
         "derive store consumer `{consumer}` schema version mismatch: persisted={persisted:?}, running={running}"
@@ -109,6 +110,20 @@ pub enum DeriveStoreError {
         persisted: Option<u16>,
         /// Schema version the running binary declares.
         running: u16,
+    },
+    /// The manifest contains a consumer the running binary did not declare.
+    ///
+    /// Consumer removal is destructive and therefore cannot be inferred from
+    /// absence in an older or differently configured binary. The store fails
+    /// closed until an explicit removal migration exists.
+    #[error(
+        "derive store manifest contains undeclared consumer `{consumer}` at schema version {persisted_schema_version}"
+    )]
+    ConsumerNotDeclared {
+        /// Consumer name persisted in the manifest.
+        consumer: String,
+        /// Latest writer schema version recorded for that consumer.
+        persisted_schema_version: u16,
     },
     /// Per-consumer schema reconciliation failed while opening the store.
     ///

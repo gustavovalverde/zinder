@@ -174,7 +174,7 @@ enum PrevoutResolutionStatus {
 
 `paid_fee_zat` is set when every transparent input is resolved and zero shielded balance is in play (the shielded-net contribution stays inside the protocol pools and the consumer must not infer it). Otherwise the consumer falls back to displaying the conventional floor with the existing qualifier and a chip set from `prevout_resolution_status`.
 
-Capability: `explorer.transaction.detail_v2` advertised when prevout resolution is online. `_v1` stays as the always-on shape.
+Capability: `explorer.transaction.detail_v3` is the current transaction-detail contract. It covers mined prevout enrichment and transaction-intrinsic mempool rows; older semantic versions are not advertised in parallel.
 
 #### R-TX-2. `RecentTransactions(limit)` composite RPC
 
@@ -441,7 +441,7 @@ Proposed change: extend `/healthz` JSON:
     "explorer.server_info_v1",
     "explorer.block.summary_v1",
     "explorer.block.detail_v1",
-    "explorer.transaction.detail_v1",
+    "explorer.transaction.detail_v3",
     "explorer.mempool.summary_v1",
     "explorer.mempool.activity_v1",
     "explorer.search_v1",
@@ -474,7 +474,7 @@ Document this in the explorer-plane architecture doc and surface it as `CursorEx
 | Capability string | Owner method | Phase |
 | ----- | ----- | ----- |
 | `explorer.block.summary_v2` | `BlockSummariesInRange` (extended payload) | 1 |
-| `explorer.transaction.detail_v2` | `TransactionDetail` (paid fee, prevout status) | 2 |
+| `explorer.transaction.detail_v3` | `TransactionDetail` (paid fee, prevout status) | 2 |
 | `explorer.transaction.recent_v1` | `RecentTransactions` | 3 |
 | `explorer.transparent_address.activity_v1` | `TransparentAddressActivity` | 2 |
 | `explorer.mempool.activity_v2` | `MempoolActivity` (entry fees) | 2 |
