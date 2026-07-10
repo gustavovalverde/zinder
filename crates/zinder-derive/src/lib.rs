@@ -27,6 +27,12 @@ pub use consumer::block_summary::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
     BLOCK_SUMMARY_SCHEMA, BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
 };
+pub use consumer::ironwood_migration::{
+    IRONWOOD_MIGRATION_COLUMN_FAMILIES, IRONWOOD_MIGRATION_CONSUMER_NAME,
+    IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY, IRONWOOD_MIGRATION_SCHEMA,
+    IRONWOOD_MIGRATIONS_COLUMN_FAMILY, IronwoodMigrationConsumer, IronwoodMigrationConsumerError,
+    Migration, MigrationPoolTotals,
+};
 pub use consumer::mempool_event_counts::{
     MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
     MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS, MEMPOOL_EVENT_COUNTS_SCHEMA,

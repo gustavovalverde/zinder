@@ -726,6 +726,7 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `explorer.transparent_address.deltas_v1`
 - `explorer.fee.summary_v1`
 - `explorer.value_pool.summary_v1`
+- `explorer.network_upgrade.status_v1`
 - `explorer.utxo_set.summary_v1`
 - `explorer.utxo_set.commitment_v1`
 - `explorer.chain.reorg_history_v1`
@@ -734,6 +735,9 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `explorer.transaction.recent_v1`
 - `explorer.payment_disclosure.verify_v1`
 - `explorer.overview.snapshot_v1`
+- `explorer.migration.overview_v1`
+- `explorer.migration.cohorts_v1`
+- `explorer.migration.denominations_v1`
 <!-- capability-list:public-interfaces:end -->
 
 `wallet.broadcast.transaction_v1` is deployment-gated: binaries support the RPC, but `ServerInfo` advertises it only when a transaction broadcaster is configured and its source probe reports `transaction_broadcast`. Read-only query deployments return `FailedPrecondition` from the RPC and omit the capability.

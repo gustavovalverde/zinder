@@ -2630,7 +2630,7 @@ fn genesis_store_fixture() -> eyre::Result<StoreFixture> {
         visible_tip_hash: block_hash,
         settled_tip_height: height,
         settled_tip_hash: block_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2673,7 +2673,7 @@ fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeig
         visible_tip_hash: wallet_serving_floor_hash,
         settled_tip_height: wallet_serving_floor_height,
         settled_tip_hash: wallet_serving_floor_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2722,7 +2722,7 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         visible_tip_hash: floor_block.hash,
         settled_tip_height: floor_block.height,
         settled_tip_hash: floor_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2741,7 +2741,7 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         visible_tip_hash: retained_block.hash,
         settled_tip_height: retained_block.height,
         settled_tip_hash: retained_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_010),
     };
@@ -2772,7 +2772,7 @@ fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> C
         visible_tip_hash: replacement_hash,
         settled_tip_height: BlockHeight::new(height.value() - 1),
         settled_tip_hash: parent_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };

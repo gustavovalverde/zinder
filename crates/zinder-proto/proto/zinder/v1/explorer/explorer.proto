@@ -1017,6 +1017,156 @@ message FeeSummaryResponse {
   uint64 max_zip317_conventional_fee_zat = 6;
 }
 
+// `ExplorerQuery.MigrationOverview` request.
+//
+// Aggregates the Orchard-to-Ironwood migration facts the derive plane
+// materializes. Both bounds absent aggregates the full indexed history;
+// present bounds restrict the aggregate to the inclusive block range
+// `[start_height, end_height]`.
+message MigrationOverviewRequest {
+  // First block height to aggregate (inclusive). Absent starts from genesis.
+  optional uint32 start_height = 1;
+
+  // Last block height to aggregate (inclusive). Absent runs to the indexed tip.
+  optional uint32 end_height = 2;
+}
+
+// `ExplorerQuery.MigrationOverview` response.
+//
+// `total_migrated_ironwood_zat` counts only loose-predicate migrations, so it
+// tracks migrated value rather than raw Ironwood inflow. `orchard_outflow_zat`
+// and `ironwood_inflow_zat` are the two-sided pool audit: they sum the two
+// value balances independently and should closely track each other net of
+// fees, which is what makes a divergence detectable.
+message MigrationOverviewResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Sum of migrated Ironwood output amounts across the range, in zatoshi,
+  // restricted to loose-predicate migrations.
+  uint64 total_migrated_ironwood_zat = 2;
+
+  // Number of migrations counted into `total_migrated_ironwood_zat`.
+  uint32 migration_count = 3;
+
+  // First block height carrying a counted migration. Absent when the range
+  // contains no counted migration.
+  optional uint32 first_height = 4;
+
+  // Last block height carrying a counted migration. Absent when the range
+  // contains no counted migration.
+  optional uint32 last_height = 5;
+
+  // Sum of `orchard_value_balance_zat` across the range: the value leaving the
+  // chain-wide Orchard pool. Pairs with `ironwood_inflow_zat` net of fees.
+  uint64 orchard_outflow_zat = 6;
+
+  // Sum of the absolute Ironwood value balances across the range: the value
+  // entering the chain-wide Ironwood pool. Should track `orchard_outflow_zat`
+  // net of fees.
+  uint64 ironwood_inflow_zat = 7;
+}
+
+// `ExplorerQuery.MigrationCohorts` request.
+//
+// Groups migrations in the inclusive block range `[start_height, end_height]`
+// by shared Orchard anchor.
+message MigrationCohortsRequest {
+  // First block height to group (inclusive).
+  uint32 start_height = 1;
+
+  // Last block height to group (inclusive). The span
+  // `end_height - start_height + 1` may not exceed 4096 blocks; the handler
+  // rejects wider ranges so one request bounds the derive-store scan, matching
+  // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
+  uint32 end_height = 2;
+
+  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
+  optional uint64 at_epoch_id = 3;
+}
+
+// One anchor-sharing migration cohort.
+//
+// Migrations that spend from the same Orchard anchor form a cohort; a larger
+// cohort is a larger anonymity set. `conformant_member_count` narrows the
+// count to members whose migration shape is genuinely privacy-preserving, so a
+// client can show how much of a cohort is real cover.
+message MigrationCohort {
+  // The shared Orchard anchor: 32 raw bytes in canonical wire order (the
+  // internal little-endian representation, not the reversed RPC-display form).
+  bytes orchard_anchor = 1;
+
+  // Number of migrations in the cohort.
+  uint32 member_count = 2;
+
+  // Sum of migrated Ironwood output amounts across the cohort, in zatoshi.
+  uint64 total_migrated_zat = 3;
+
+  // Members whose migration shape is conformant (genuinely privacy-
+  // preserving). Always `<= member_count`.
+  uint32 conformant_member_count = 4;
+}
+
+// `ExplorerQuery.MigrationCohorts` response.
+message MigrationCohortsResponse {
+  ExplorerFreshness freshness = 1;
+
+  // One entry per distinct Orchard anchor observed in the range.
+  repeated MigrationCohort cohorts = 2;
+
+  // Number of cohorts, equal to `cohorts` length.
+  uint32 cohort_count = 3;
+
+  // Average cohort member count across the range, zero when there are no
+  // cohorts.
+  uint32 avg_member_count = 4;
+
+  // Smallest cohort member count, zero when there are no cohorts.
+  uint32 min_member_count = 5;
+
+  // Largest cohort member count, zero when there are no cohorts.
+  uint32 max_member_count = 6;
+}
+
+// `ExplorerQuery.MigrationDenominations` request.
+//
+// Bins conformant migrations in the inclusive block range `[start_height,
+// end_height]` by the power-of-ten magnitude of their Ironwood output amount.
+message MigrationDenominationsRequest {
+  // First block height to bin (inclusive).
+  uint32 start_height = 1;
+
+  // Last block height to bin (inclusive). The span
+  // `end_height - start_height + 1` may not exceed 4096 blocks; the handler
+  // rejects wider ranges so one request bounds the derive-store scan, matching
+  // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
+  uint32 end_height = 2;
+
+  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
+  optional uint64 at_epoch_id = 3;
+}
+
+// One power-of-ten denomination bucket.
+message MigrationDenominationBin {
+  // The bucket's representative amount: the power-of-ten floor of its members'
+  // Ironwood output amount, in zatoshi.
+  uint64 denomination_zat = 1;
+
+  // Number of conformant migrations whose amount falls in this bucket.
+  uint32 count = 2;
+}
+
+// `ExplorerQuery.MigrationDenominations` response.
+message MigrationDenominationsResponse {
+  ExplorerFreshness freshness = 1;
+
+  // One entry per populated power-of-ten bucket, ascending by
+  // `denomination_zat`.
+  repeated MigrationDenominationBin bins = 2;
+
+  // Total conformant migrations binned across the range.
+  uint32 total_tx = 3;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
@@ -1083,6 +1233,13 @@ service ExplorerQuery {
   // `explorer.value_pool.summary_v1`.
   rpc ValuePoolSummary(ValuePoolSummaryRequest) returns (ValuePoolSummaryResponse);
 
+  // Returns the node-advertised network-upgrade activation table alongside
+  // the canonical tip height, so a client can tell whether an upgrade is
+  // active and, if not, how far the tip is from its activation height.
+  // Capability: `explorer.network_upgrade.status_v1`.
+  rpc NetworkUpgradeStatus(NetworkUpgradeStatusRequest)
+      returns (NetworkUpgradeStatusResponse);
+
   // Returns the chain-wide transparent UTXO-set summary: the count and total
   // value of unspent transparent outputs at the settled tip. Composed from
   // `WalletQuery.TransparentUtxoSetSummary`. Capability:
@@ -1127,6 +1284,24 @@ service ExplorerQuery {
   // `explorer.overview.snapshot_v1`.
   rpc OverviewSnapshot(OverviewSnapshotRequest)
       returns (OverviewSnapshotResponse);
+
+  // Aggregates Orchard-to-Ironwood migration facts over an optional block
+  // range into the two-sided pool audit plus the migrated-value total.
+  // Capability: `explorer.migration.overview_v1`.
+  rpc MigrationOverview(MigrationOverviewRequest)
+      returns (MigrationOverviewResponse);
+
+  // Groups migrations in the inclusive block range by shared Orchard anchor,
+  // reporting per-cohort size, migrated value, and conformant-member share.
+  // Capability: `explorer.migration.cohorts_v1`.
+  rpc MigrationCohorts(MigrationCohortsRequest)
+      returns (MigrationCohortsResponse);
+
+  // Bins conformant migrations in the inclusive block range by the
+  // power-of-ten magnitude of their Ironwood output amount. Capability:
+  // `explorer.migration.denominations_v1`.
+  rpc MigrationDenominations(MigrationDenominationsRequest)
+      returns (MigrationDenominationsResponse);
 }
 
 // `ExplorerQuery.ValuePoolSummary` request.
@@ -1147,6 +1322,55 @@ message ValuePoolSummaryResponse {
 
   // Tip height the upstream node observed when computing the pools.
   uint32 tip_height = 3;
+}
+
+// `ExplorerQuery.NetworkUpgradeStatus` request.
+message NetworkUpgradeStatusRequest {}
+
+// One network-upgrade activation entry projected for explorer consumers.
+//
+// Sourced from the node-advertised activation table
+// (`getblockchaininfo.upgrades`). `active` is `true` when
+// `activation_height <= tip_height` in the enclosing response.
+message NetworkUpgradeEntry {
+  // Upgrade name as reported by the node (for example `"Sapling"`, `"NU5"`,
+  // `"NU6"`), carried verbatim so unknown future upgrades still render.
+  string name = 1;
+
+  // Consensus branch id in the canonical 8-character lowercase hex form
+  // (per the BIP70 / Zebra convention).
+  string branch_id_hex = 2;
+
+  // Block height at which this upgrade's rules first apply on the node's
+  // network.
+  uint32 activation_height = 3;
+
+  // `true` when `activation_height <= tip_height`.
+  bool active = 4;
+}
+
+// `ExplorerQuery.NetworkUpgradeStatus` response.
+//
+// Carries the node-advertised upgrade table ordered by ascending activation
+// height, the canonical tip height the `active` flags are computed against,
+// and the currently-active upgrade's name and branch id for convenience.
+message NetworkUpgradeStatusResponse {
+  ExplorerFreshness freshness = 1;
+
+  // Canonical tip height the `active` flags and countdown are computed
+  // against.
+  uint32 tip_height = 2;
+
+  // One entry per advertised upgrade, ordered by ascending activation height.
+  repeated NetworkUpgradeEntry upgrades = 3;
+
+  // Name of the upgrade active at `tip_height`, empty when no advertised
+  // upgrade has activated yet.
+  string active_upgrade_name = 4;
+
+  // Branch id of the upgrade active at `tip_height` in 8-character lowercase
+  // hex, empty when no advertised upgrade has activated yet.
+  string active_upgrade_branch_id_hex = 5;
 }
 
 // `ExplorerQuery.UtxoSetSummary` request.

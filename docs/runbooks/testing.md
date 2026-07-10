@@ -843,6 +843,7 @@ explorer.transparent_address.activity_v1
 explorer.transparent_address.deltas_v1
 explorer.fee.summary_v1
 explorer.value_pool.summary_v1
+explorer.network_upgrade.status_v1
 explorer.utxo_set.summary_v1
 explorer.utxo_set.commitment_v1
 explorer.chain.reorg_history_v1
@@ -851,6 +852,9 @@ explorer.transaction.fees_v1
 explorer.transaction.recent_v1
 explorer.payment_disclosure.verify_v1
 explorer.overview.snapshot_v1
+explorer.migration.overview_v1
+explorer.migration.cohorts_v1
+explorer.migration.denominations_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 

@@ -45,6 +45,21 @@ pub fn parse_transaction_public_facts(
             })?;
     let version = classify_transaction_version(&transaction);
     let counts = transaction_component_counts(&transaction);
+    let orchard_value_balance_zat = transaction.orchard_shielded_data().map(|_| {
+        transaction
+            .orchard_value_balance()
+            .orchard_amount()
+            .zatoshis()
+    });
+    let orchard_anchor = transaction
+        .orchard_shielded_data()
+        .map(|shielded_data| <[u8; 32]>::from(&shielded_data.shared_anchor));
+    let ironwood_value_balance_zat = transaction.ironwood_shielded_data().map(|_| {
+        transaction
+            .ironwood_value_balance()
+            .ironwood_amount()
+            .zatoshis()
+    });
     let is_coinbase = transaction.is_coinbase();
     let unsupported_sections = if version.is_supported() {
         Vec::new()
@@ -70,6 +85,9 @@ pub fn parse_transaction_public_facts(
         expiry_height,
         size_bytes,
         counts,
+        orchard_value_balance_zat,
+        orchard_anchor,
+        ironwood_value_balance_zat,
         privacy_shape,
         is_coinbase,
         unsupported_sections,

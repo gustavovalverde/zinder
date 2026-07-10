@@ -6,6 +6,8 @@
 use eyre::eyre;
 use prost::Message;
 use zinder_proto::capabilities::{
+    EXPLORER_MIGRATION_COHORTS_V1, EXPLORER_MIGRATION_DENOMINATIONS_V1,
+    EXPLORER_MIGRATION_OVERVIEW_V1, EXPLORER_NETWORK_UPGRADE_STATUS_V1,
     EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
     EXPLORER_UTXO_SET_SUMMARY_V1,
 };
@@ -319,6 +321,186 @@ fn utxo_set_summary_request_round_trips_the_epoch_pin() -> eyre::Result<()> {
     let decoded = round_trip(&request)?;
 
     assert_eq!(decoded.at_epoch_id, Some(77));
+    Ok(())
+}
+
+#[test]
+fn migration_overview_request_round_trips_absent_bounds() -> eyre::Result<()> {
+    let full_history = explorer::MigrationOverviewRequest::default();
+    let decoded_full = round_trip(&full_history)?;
+    assert!(decoded_full.start_height.is_none());
+    assert!(decoded_full.end_height.is_none());
+
+    let bounded = explorer::MigrationOverviewRequest {
+        start_height: Some(2_500_000),
+        end_height: Some(2_530_000),
+    };
+    let decoded_bounded = round_trip(&bounded)?;
+    assert_eq!(decoded_bounded.start_height, Some(2_500_000));
+    assert_eq!(decoded_bounded.end_height, Some(2_530_000));
+    Ok(())
+}
+
+#[test]
+fn migration_overview_response_round_trips_the_two_sided_audit() -> eyre::Result<()> {
+    let response = explorer::MigrationOverviewResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_MIGRATION_OVERVIEW_V1.to_owned(),
+            ..Default::default()
+        }),
+        total_migrated_ironwood_zat: 4_200_000_000,
+        migration_count: 17,
+        first_height: Some(2_500_010),
+        last_height: Some(2_529_990),
+        orchard_outflow_zat: 4_200_010_000,
+        ironwood_inflow_zat: 4_200_000_000,
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.total_migrated_ironwood_zat, 4_200_000_000);
+    assert_eq!(decoded.migration_count, 17);
+    assert_eq!(decoded.first_height, Some(2_500_010));
+    assert_eq!(decoded.last_height, Some(2_529_990));
+    assert_eq!(decoded.orchard_outflow_zat, 4_200_010_000);
+    assert_eq!(decoded.ironwood_inflow_zat, 4_200_000_000);
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_MIGRATION_OVERVIEW_V1
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_cohorts_response_round_trips_anchor_and_summary() -> eyre::Result<()> {
+    let anchor = vec![0xab; 32];
+    let response = explorer::MigrationCohortsResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_MIGRATION_COHORTS_V1.to_owned(),
+            ..Default::default()
+        }),
+        cohorts: vec![explorer::MigrationCohort {
+            orchard_anchor: anchor.clone(),
+            member_count: 9,
+            total_migrated_zat: 1_800_000_000,
+            conformant_member_count: 7,
+        }],
+        cohort_count: 1,
+        avg_member_count: 9,
+        min_member_count: 9,
+        max_member_count: 9,
+    };
+    let decoded = round_trip(&response)?;
+
+    let cohort = decoded
+        .cohorts
+        .first()
+        .ok_or_else(|| eyre!("cohort missing after round-trip"))?;
+    assert_eq!(cohort.orchard_anchor, anchor);
+    assert_eq!(cohort.member_count, 9);
+    assert_eq!(cohort.conformant_member_count, 7);
+    assert_eq!(cohort.total_migrated_zat, 1_800_000_000);
+    assert_eq!(decoded.cohort_count, 1);
+    assert_eq!(decoded.max_member_count, 9);
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_MIGRATION_COHORTS_V1
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_denominations_response_round_trips_bins() -> eyre::Result<()> {
+    let response = explorer::MigrationDenominationsResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_MIGRATION_DENOMINATIONS_V1.to_owned(),
+            ..Default::default()
+        }),
+        bins: vec![
+            explorer::MigrationDenominationBin {
+                denomination_zat: 100_000_000,
+                count: 5,
+            },
+            explorer::MigrationDenominationBin {
+                denomination_zat: 1_000_000_000,
+                count: 2,
+            },
+        ],
+        total_tx: 7,
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.bins.len(), 2);
+    assert_eq!(decoded.total_tx, 7);
+    assert_eq!(
+        decoded
+            .bins
+            .first()
+            .ok_or_else(|| eyre!("first bin missing"))?
+            .denomination_zat,
+        100_000_000
+    );
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_MIGRATION_DENOMINATIONS_V1
+    );
+    Ok(())
+}
+
+#[test]
+fn network_upgrade_status_response_round_trips_entries_and_active_pointer() -> eyre::Result<()> {
+    let response = explorer::NetworkUpgradeStatusResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_NETWORK_UPGRADE_STATUS_V1.to_owned(),
+            ..Default::default()
+        }),
+        tip_height: 2_530_000,
+        upgrades: vec![
+            explorer::NetworkUpgradeEntry {
+                name: "NU5".to_owned(),
+                branch_id_hex: "c2d6d0b4".to_owned(),
+                activation_height: 1_842_420,
+                active: true,
+            },
+            explorer::NetworkUpgradeEntry {
+                name: "NU6.3".to_owned(),
+                branch_id_hex: "37a5165b".to_owned(),
+                activation_height: 3_000_000,
+                active: false,
+            },
+        ],
+        active_upgrade_name: "NU5".to_owned(),
+        active_upgrade_branch_id_hex: "c2d6d0b4".to_owned(),
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded.tip_height, 2_530_000);
+    assert_eq!(decoded.upgrades.len(), 2);
+    let pending = decoded
+        .upgrades
+        .get(1)
+        .ok_or_else(|| eyre!("pending upgrade entry missing"))?;
+    assert_eq!(pending.name, "NU6.3");
+    assert_eq!(pending.branch_id_hex, "37a5165b");
+    assert_eq!(pending.activation_height, 3_000_000);
+    assert!(!pending.active);
+    assert_eq!(decoded.active_upgrade_name, "NU5");
+    assert_eq!(decoded.active_upgrade_branch_id_hex, "c2d6d0b4");
+    assert_eq!(
+        decoded
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing"))?
+            .capability_version,
+        EXPLORER_NETWORK_UPGRADE_STATUS_V1
+    );
     Ok(())
 }
 

@@ -228,6 +228,14 @@ pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
 /// `ChainValuePoolsAtTip` primitive. The response preserves upstream pool ids
 /// instead of projecting into a fixed list of known pools.
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
+/// Capability advertised for `ExplorerQuery.NetworkUpgradeStatus`.
+///
+/// Signals that the explorer plane can surface the node-advertised
+/// network-upgrade activation table alongside the canonical tip height, so a
+/// consumer can render whether an upgrade is active and how far the tip is
+/// from a not-yet-active activation. The tip height rides on the wallet-plane
+/// `LatestBlock` primitive.
+pub const EXPLORER_NETWORK_UPGRADE_STATUS_V1: &str = "explorer.network_upgrade.status_v1";
 /// Capability advertised for `ExplorerQuery.UtxoSetSummary`.
 ///
 /// Signals that the explorer plane can surface the chain-wide transparent
@@ -299,6 +307,24 @@ pub const EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1: &str = "explorer.payment_disclo
 /// `wallet_query_endpoint` both being online (same precondition as the
 /// derive-backed cards the bundle composes).
 pub const EXPLORER_OVERVIEW_SNAPSHOT_V1: &str = "explorer.overview.snapshot_v1";
+/// Capability advertised for `ExplorerQuery.MigrationOverview`.
+///
+/// Signals that the explorer plane materializes the Orchard-to-Ironwood
+/// migration facts and can aggregate them into the two-sided pool audit
+/// (`orchard_outflow_zat`, `ironwood_inflow_zat`) plus the migrated-value
+/// total over a block range.
+pub const EXPLORER_MIGRATION_OVERVIEW_V1: &str = "explorer.migration.overview_v1";
+/// Capability advertised for `ExplorerQuery.MigrationCohorts`.
+///
+/// Signals that the explorer plane groups migrations by shared Orchard anchor
+/// and reports per-cohort size, migrated value, and conformant-member share
+/// alongside the average, smallest, and largest cohort sizes.
+pub const EXPLORER_MIGRATION_COHORTS_V1: &str = "explorer.migration.cohorts_v1";
+/// Capability advertised for `ExplorerQuery.MigrationDenominations`.
+///
+/// Signals that the explorer plane bins conformant migrations by the
+/// power-of-ten magnitude of their Ironwood output amount.
+pub const EXPLORER_MIGRATION_DENOMINATIONS_V1: &str = "explorer.migration.denominations_v1";
 
 /// Capability advertised for `IngestControl.ServerInfo`.
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
@@ -824,6 +850,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
+        EXPLORER_NETWORK_UPGRADE_STATUS_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.NetworkUpgradeStatus"),
+        AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
         EXPLORER_UTXO_SET_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.UtxoSetSummary"),
@@ -869,6 +901,24 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_OVERVIEW_SNAPSHOT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.OverviewSnapshot"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_MIGRATION_OVERVIEW_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.MigrationOverview"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_MIGRATION_COHORTS_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.MigrationCohorts"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_MIGRATION_DENOMINATIONS_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.MigrationDenominations"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(

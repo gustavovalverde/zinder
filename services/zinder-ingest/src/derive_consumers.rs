@@ -27,10 +27,11 @@ use zinder_core::{
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
-    ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, MempoolConsumerEvent,
-    MempoolConsumerEventVariant, MempoolEventCountsConsumer, RecentTransactionsConsumer,
-    ReorgIncidentsConsumer, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-    TransactionFeesConsumer, TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, IronwoodMigrationConsumer,
+    MempoolConsumerEvent, MempoolConsumerEventVariant, MempoolEventCountsConsumer,
+    RecentTransactionsConsumer, ReorgIncidentsConsumer,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionFeesConsumer,
+    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
     TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
     TransparentSpendFacts,
 };
@@ -1347,14 +1348,16 @@ pub(crate) fn dispatch_chain_event(
     advance_cursor: bool,
 ) -> Result<(), IngestError> {
     let mut block_summary = BlockSummaryConsumer::new();
+    let mut ironwood_migration = IronwoodMigrationConsumer::new();
     let mut transaction_fees = TransactionFeesConsumer::new();
     let mut recent_transactions = RecentTransactionsConsumer::new();
     let mut transparent_activity = TransparentAddressActivityConsumer::new();
     let mut transparent_deltas = TransparentAddressDeltasConsumer::new();
     let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
     let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
-    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 7] = [
+    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 8] = [
         &mut block_summary,
+        &mut ironwood_migration,
         &mut transaction_fees,
         &mut recent_transactions,
         &mut transparent_activity,

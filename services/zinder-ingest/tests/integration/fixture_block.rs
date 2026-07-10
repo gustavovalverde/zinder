@@ -123,7 +123,7 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         visible_tip_hash: source_block.hash,
         settled_tip_height: source_block.height,
         settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -197,7 +197,7 @@ fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), 
         visible_tip_hash: source_block.hash,
         settled_tip_height: source_block.height,
         settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };

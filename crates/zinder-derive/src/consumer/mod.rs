@@ -13,6 +13,7 @@
 pub(crate) mod address_value_event;
 pub(crate) mod block_commit_context;
 pub(crate) mod block_summary;
+pub(crate) mod ironwood_migration;
 pub(crate) mod mempool_event_counts;
 pub(crate) mod recent_transactions;
 pub(crate) mod reorg_incidents;

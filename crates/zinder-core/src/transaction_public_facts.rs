@@ -315,6 +315,30 @@ pub struct TransactionPublicFacts {
     pub size_bytes: u32,
     /// Component counts feeding the privacy classifier and wire surface.
     pub counts: TransactionComponentCounts,
+    /// Signed Orchard value balance in zatoshis; `Some` only when the
+    /// transaction carries an Orchard bundle.
+    ///
+    /// Positive means net value leaves the chain-wide Orchard pool through this
+    /// transaction (its bundle's spends exceed its outputs); negative means net
+    /// value enters the pool. A legitimate bundle can balance to `Some(0)`.
+    pub orchard_value_balance_zat: Option<i64>,
+    /// `anchorOrchard`: the Orchard bundle's shared note-commitment-tree root
+    /// that its spends prove membership against; `Some` only when the
+    /// transaction carries an Orchard bundle.
+    ///
+    /// Conformant Orchard-to-Ironwood migration transactions from many
+    /// different wallets share this exact root when broadcast in the same
+    /// network-wide anchor-height bucket (per the draft ZIP "Orchard to
+    /// Ironwood Migration"), which lets a later consumer group them into
+    /// privacy cohorts.
+    pub orchard_anchor: Option<[u8; 32]>,
+    /// Signed Ironwood value balance in zatoshis; `Some` only when the
+    /// transaction carries an Ironwood bundle.
+    ///
+    /// Positive means net value leaves the chain-wide Ironwood pool through this
+    /// transaction (its bundle's spends exceed its outputs); negative means net
+    /// value enters the pool. A legitimate bundle can balance to `Some(0)`.
+    pub ironwood_value_balance_zat: Option<i64>,
     /// Coarse privacy classification.
     pub privacy_shape: PrivacyShape,
     /// `true` when the transaction is a coinbase row.

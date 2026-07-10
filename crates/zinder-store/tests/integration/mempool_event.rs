@@ -458,7 +458,7 @@ fn synthetic_chain_epoch(chain_epoch_id: u64) -> ChainEpoch {
         visible_tip_hash: BlockHash::from_bytes([0x42; 32]),
         settled_tip_height: BlockHeight::new(1),
         settled_tip_hash: BlockHash::from_bytes([0x42; 32]),
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_700_000_000_000),
     }

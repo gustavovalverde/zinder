@@ -1351,6 +1351,11 @@ fn transaction_facts_artifact_record(
             .into_iter()
             .map(transparent_output_fact_record)
             .collect(),
+        orchard_value_balance_zat: facts.orchard_value_balance_zat,
+        orchard_anchor: facts
+            .orchard_anchor
+            .map_or_else(Vec::new, |anchor| anchor.to_vec()),
+        ironwood_value_balance_zat: facts.ironwood_value_balance_zat,
     }
 }
 
@@ -1387,6 +1392,18 @@ fn decode_transaction_facts_artifact_record(
         expiry_height: record.expiry_height.map(BlockHeight::new),
         size_bytes: record.size_bytes,
         counts: decode_transaction_component_counts_record(counts),
+        orchard_value_balance_zat: record.orchard_value_balance_zat,
+        orchard_anchor: if record.orchard_anchor.is_empty() {
+            None
+        } else {
+            Some(decode_fixed_32(
+                ArtifactFamily::TransactionFacts,
+                key,
+                &record.orchard_anchor,
+                "orchard anchor must be 32 bytes",
+            )?)
+        },
+        ironwood_value_balance_zat: record.ironwood_value_balance_zat,
         privacy_shape: decode_privacy_shape_id(key, record.privacy_shape)?,
         is_coinbase: record.is_coinbase,
         unsupported_sections: record
@@ -2209,6 +2226,12 @@ struct TransactionFactsArtifactRecord {
     transparent_inputs: Vec<TransparentInputFactRecord>,
     #[prost(message, repeated, tag = "17")]
     transparent_outputs: Vec<TransparentOutputFactRecord>,
+    #[prost(sint64, optional, tag = "18")]
+    orchard_value_balance_zat: Option<i64>,
+    #[prost(bytes, tag = "19")]
+    orchard_anchor: Vec<u8>,
+    #[prost(sint64, optional, tag = "20")]
+    ironwood_value_balance_zat: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]

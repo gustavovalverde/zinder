@@ -788,7 +788,7 @@ fn synthetic_epoch(
             visible_tip_hash: hash,
             settled_tip_height: BlockHeight::new(safe_tip_height),
             settled_tip_hash: block_hash(safe_tip_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(12),
+            artifact_schema_version: ArtifactSchemaVersion::new(13),
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),
         },

@@ -19,7 +19,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{Network, wire::encode_zinder_native_chain_name};
+use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     CapabilitySurface, EXPLORER_SERVER_INFO_V1, ExplorerReadiness, capabilities_for_surface,
 };
@@ -29,9 +29,12 @@ use zinder_proto::v1::{
         BlockSummariesInRangeResponse, ChainReorgHistoryRequest, ChainReorgHistoryResponse,
         ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse, MempoolActivityRequest,
         MempoolActivityResponse, MempoolEventCountsRequest, MempoolEventCountsResponse,
-        MempoolSummaryRequest, MempoolSummaryResponse, OverviewSnapshotRequest,
-        OverviewSnapshotResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
-        ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
+        MempoolSummaryRequest, MempoolSummaryResponse, MigrationCohortsRequest,
+        MigrationCohortsResponse, MigrationDenominationsRequest, MigrationDenominationsResponse,
+        MigrationOverviewRequest, MigrationOverviewResponse, NetworkUpgradeStatusRequest,
+        NetworkUpgradeStatusResponse, OverviewSnapshotRequest, OverviewSnapshotResponse,
+        RecentTransactionsRequest, SearchRequest, SearchResponse, ServerInfoRequest,
+        ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
         TransparentAddressActivityRequest, TransparentAddressActivityResponse,
         TransparentAddressDeltasRequest, TransparentAddressDeltasResponse, UtxoSetSummaryRequest,
         UtxoSetSummaryResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
@@ -63,6 +66,10 @@ use super::freshness::{
 };
 use super::mempool::{handle_mempool_activity, handle_mempool_summary};
 use super::mempool_event_counts::handle_mempool_event_counts;
+use super::migration::{
+    handle_migration_cohorts, handle_migration_denominations, handle_migration_overview,
+};
+use super::network_upgrade_status::handle_network_upgrade_status;
 use super::overview_snapshot::handle_overview_snapshot;
 use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
 use super::search::handle_search;
@@ -103,6 +110,7 @@ pub struct ExplorerQueryGrpcAdapter {
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
     derive_store: Option<DeriveStore>,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
     payment_disclosure_verifier_online: bool,
@@ -120,6 +128,9 @@ impl ExplorerQueryGrpcAdapter {
             bearer_token: None,
             canonical_store: None,
             derive_store: None,
+            network_upgrade_activations: Arc::new(NetworkUpgradeActivations::empty(
+                settings.network,
+            )),
             wallet_channel: Arc::new(OnceCell::new()),
             prevout_resolution_online: false,
             payment_disclosure_verifier_online: false,
@@ -141,6 +152,17 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn with_canonical_store(mut self, store: SecondaryChainStore) -> Self {
         self.canonical_store = Some(store);
+        self
+    }
+
+    /// Wires the node-advertised network-upgrade activation table the
+    /// `NetworkUpgradeStatus` handler projects onto the wire.
+    #[must_use]
+    pub fn with_network_upgrade_activations(
+        mut self,
+        activations: Arc<NetworkUpgradeActivations>,
+    ) -> Self {
+        self.network_upgrade_activations = activations;
         self
     }
 
@@ -578,6 +600,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn network_upgrade_status(
+        &self,
+        request: Request<NetworkUpgradeStatusRequest>,
+    ) -> Result<Response<NetworkUpgradeStatusResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "NetworkUpgradeStatus",
+            metric: "network_upgrade_status",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_network_upgrade_status(
+                self.derive_store.as_ref(),
+                &self.network_upgrade_activations,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     async fn utxo_set_summary(
         &self,
         request: Request<UtxoSetSummaryRequest>,
@@ -698,6 +745,81 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_overview_snapshot(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn migration_overview(
+        &self,
+        request: Request<MigrationOverviewRequest>,
+    ) -> Result<Response<MigrationOverviewResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "MigrationOverview",
+            metric: "migration_overview",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_migration_overview(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn migration_cohorts(
+        &self,
+        request: Request<MigrationCohortsRequest>,
+    ) -> Result<Response<MigrationCohortsResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "MigrationCohorts",
+            metric: "migration_cohorts",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_migration_cohorts(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn migration_denominations(
+        &self,
+        request: Request<MigrationDenominationsRequest>,
+    ) -> Result<Response<MigrationDenominationsResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "MigrationDenominations",
+            metric: "migration_denominations",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_migration_denominations(
                 derive_store,
                 &mut client,
                 &self.upstream_observation_cache,

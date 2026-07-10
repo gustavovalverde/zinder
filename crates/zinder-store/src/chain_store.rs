@@ -198,11 +198,16 @@ const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// never derived from the source block), so it is rejected at open and must
 /// be rebuilt from genesis.
 ///
+/// Version 13 adds the signed Orchard and Ironwood value balances and the
+/// Orchard shared anchor to `TransactionFactsArtifactRecord`. A version-12
+/// store has none of these fields (the data was never derived from the source
+/// block), so it is rejected at open and must be rebuilt from genesis.
+///
 /// Store schema version 12 removes the canonical
 /// `transparent_address_tx_index` column family. The typed
 /// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
 /// but materialization belongs to the derive plane.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(12);
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(13);
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 /// Artifact schema the store-schema-10-to-11 rebuild produces.
@@ -3992,7 +3997,7 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 12);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 13);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

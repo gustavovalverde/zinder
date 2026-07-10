@@ -199,6 +199,12 @@ action data was never derived from the source block; it is rejected at open with
 migrations above can normalize the RocksDB layout, but they cannot upgrade
 pre-Ironwood artifact payloads.
 
+Artifact schema version 13 adds the signed Orchard and Ironwood value balances
+and the Orchard shared anchor to `TransactionFactsArtifactRecord`. A version-12
+artifact store carries none of these fields, because they were never derived
+from the source block; it is rejected at open with `StoreError::SchemaTooOld`
+and must be rebuilt from genesis.
+
 Store schema version 12 removes the canonical `transparent_address_tx_index`
 column family. Transparent-address transaction history is a derive-plane
 projection over canonical transaction, output, and spend facts; the shared

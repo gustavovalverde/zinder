@@ -8,6 +8,8 @@ mod fee_summary;
 mod freshness;
 mod mempool;
 mod mempool_event_counts;
+mod migration;
+mod network_upgrade_status;
 mod overview_snapshot;
 mod recent_transactions;
 mod search;
