@@ -161,4 +161,4 @@ When a change alters a service boundary, public API, storage byte layout, protoc
 
 ## Ironwood Dependency Pins
 
-`zebra-chain` is pinned to `11.0.0`, the first release that decodes Ironwood (NU6.3) version-6 transactions. It requires the librustzcash stack (`zcash_address`, `zcash_protocol`, `zcash_primitives`, `zcash_transparent`, `orchard`) at pre-release versions; Zinder matches those exact versions so no duplicate librustzcash type exists at the `zebra-chain` boundary. These pins move to stable releases once the NU6.3 stack stabilizes upstream. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.
+`zebra-chain` is pinned to `11.0.0`, the first release that decodes Ironwood (NU6.3) version-6 transactions. Zinder uses the matching stable librustzcash stack (`zcash_address 0.13.0`, `zcash_protocol 0.10.0`, `zcash_primitives 0.29.0`, `zcash_transparent 0.9.0`, and `orchard 0.15.0`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.

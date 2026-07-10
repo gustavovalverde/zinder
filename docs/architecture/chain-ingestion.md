@@ -51,7 +51,7 @@ Artifact bytes follow [ADR-0002](../adrs/0002-boundary-specific-serialization.md
 - Durable storage-control records use storage-specific protobuf messages, not RPC messages.
 - Derived read caches may experiment with `rkyv` only after the validation gate in ADR-0002.
 
-Artifact builders consume normalized source values. They must not hand-parse consensus-critical block headers, transaction bytes, or compact-block wire payloads. Parsing belongs behind maintained Zcash consensus primitives inside `zinder-source` or ingestion adapters; generated protocol payloads belong in `zinder-proto`. The current parser boundary is `zebra-chain`, with root-manifest patches only to keep the unreleased Ironwood-era `librustzcash` and `orchard` dependency stack on one source.
+Artifact builders consume normalized source values. They must not hand-parse consensus-critical block headers, transaction bytes, or compact-block wire payloads. Parsing belongs behind maintained Zcash consensus primitives inside `zinder-source` or ingestion adapters; generated protocol payloads belong in `zinder-proto`. The current parser boundary is `zebra-chain`, with the stable Ironwood-era `librustzcash` and `orchard` crates resolved from crates.io.
 
 ## Real Compact Block Construction
 

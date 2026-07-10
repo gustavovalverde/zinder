@@ -205,12 +205,9 @@ ZINDER_NODE__AUTH__COOKIE__PATH=/var/lib/zebra/.cookie
 
 Source adapters parse upstream-node responses using Zebra-compatible primitives. The parser boundary is `zebra-chain`. `zinder-source` uses Zebra to derive source block metadata from raw block bytes, and `zinder-ingest` uses Zebra to derive compact-block artifacts. Ingest artifact builders do not parse raw block headers, transaction bytes, or compact-block wire messages by hand.
 
-The current dependency compromise is resolver-only: Zinder declares the
-pre-release Zcash-family versions needed for Ironwood, but the root manifest
-temporarily patches unreleased `librustzcash` crates and the companion
-`orchard` revision through `[patch.crates-io]`. `deny.toml` allows only those
-Zcash git sources in addition to crates.io. Remove the patches when the
-matching crates.io releases expose the same API.
+The current dependency boundary is resolver-only: Zinder uses the stable
+Zcash-family releases required for Ironwood, all from crates.io. No git
+patches or source exceptions are needed.
 
 The allowed flow is:
 
