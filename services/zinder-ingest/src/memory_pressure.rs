@@ -139,6 +139,77 @@ pub fn spawn_runtime_memory_metrics_task(
     })
 }
 
+/// Backoff applied once when memory pressure sits between the configured
+/// degrade and pause ratios before the next bulk-catchup batch starts.
+const BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Poll interval while memory pressure holds at or above the configured
+/// pause ratio, waiting for it to drop back below the resume ratio.
+const BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Holds the caller between bulk-catchup batches while memory pressure is
+/// elevated, using the same degrade/pause/resume ratios
+/// [`crate::IngestDeriveConfig`] applies to derive replay.
+///
+/// Canonical bulk-catchup batches previously ran back-to-back with no yield
+/// point between them, so a container approaching its cgroup memory ceiling
+/// never got a chance to flush and reclaim before the next batch started
+/// accumulating more. At or above `pause_ratio`, this polls until pressure
+/// drops back below `resume_ratio`; between `degrade_ratio` and
+/// `pause_ratio`, it applies one short backoff. Below `degrade_ratio` it
+/// returns immediately.
+pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
+    degrade_ratio: f64,
+    pause_ratio: f64,
+    resume_ratio: f64,
+    cancel: &CancellationToken,
+) {
+    let Some(mut pressure_ratio) = RuntimeMemorySnapshot::sample().pressure_ratio() else {
+        return;
+    };
+    if pressure_ratio >= pause_ratio {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "bulk_catchup_memory_pressure_paused",
+            pressure_ratio,
+            pause_ratio,
+            resume_ratio,
+            "memory pressure at or above the pause threshold; holding bulk catchup until it recovers"
+        );
+        loop {
+            if cancellable_sleep(BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL, cancel).await {
+                return;
+            }
+            let Some(sampled) = RuntimeMemorySnapshot::sample().pressure_ratio() else {
+                return;
+            };
+            pressure_ratio = sampled;
+            if pressure_ratio < resume_ratio {
+                break;
+            }
+        }
+    }
+    if pressure_ratio >= degrade_ratio {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "bulk_catchup_memory_pressure_degraded",
+            pressure_ratio,
+            degrade_ratio,
+            "memory pressure elevated before the next bulk-catchup batch; backing off briefly"
+        );
+        let _ = cancellable_sleep(BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF, cancel).await;
+    }
+}
+
+/// Sleeps for `duration` or returns early when `cancel` fires; returns
+/// whether the sleep was cut short by cancellation.
+async fn cancellable_sleep(duration: Duration, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        () = cancel.cancelled() => true,
+        () = tokio::time::sleep(duration) => false,
+    }
+}
+
 /// Number of `interval` ticks between operational memory log lines.
 ///
 /// The gauge sampler runs every second; logging every sample would flood the

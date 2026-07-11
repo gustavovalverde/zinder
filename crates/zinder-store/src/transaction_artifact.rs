@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use zinder_core::{
-    BlockHeight, ChainEpoch, TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionLocation,
+    BlockHeaderArtifact, BlockHeight, ChainEpoch, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionLocation,
 };
 
 use crate::{
@@ -79,9 +79,32 @@ pub(crate) fn read_transaction_facts_artifacts_batch(
     chain_epoch: ChainEpoch,
     transaction_ids: &[TransactionId],
 ) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
-    // Seek phase: per unique id, locate the visibility row and derive the
-    // Transaction-CF key. The visibility lookup is per-id because the seek
-    // prefix differs; RocksDB has no batched `seek_for_prev`.
+    read_transaction_facts_artifacts_batch_with_known_headers(
+        inner,
+        chain_epoch,
+        transaction_ids,
+        &HashMap::new(),
+    )
+}
+
+/// Keys to `multi_get` from the transaction-facts seek phase, alongside
+/// every input id's seek outcome (`None` when the id has no visible row).
+type TransactionFactsSeekResult = (Vec<StoreKey>, Vec<(TransactionId, Option<StoreKey>)>);
+
+/// Seek phase shared by the transaction-facts batch readers.
+///
+/// Per unique id, locates the visibility row and derives the
+/// Transaction-CF key. The visibility lookup is per-id because the seek
+/// prefix differs; `RocksDB` has no batched `seek_for_prev`.
+///
+/// Returns the keys to `multi_get` (in visibility-hit order) alongside every
+/// input id's seek outcome (`None` when the id has no visible row), so the
+/// caller can zip the `multi_get` results back onto their originating id.
+fn seek_transaction_facts_keys(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    transaction_ids: &[TransactionId],
+) -> Result<TransactionFactsSeekResult, StoreError> {
     let mut unique_ids: Vec<TransactionId> = Vec::with_capacity(transaction_ids.len());
     let mut seen: HashSet<TransactionId> = HashSet::with_capacity(transaction_ids.len());
     for &transaction_id in transaction_ids {
@@ -116,6 +139,26 @@ pub(crate) fn read_transaction_facts_artifacts_batch(
         transaction_keys.push(key.clone());
         seek_outcomes.push((*transaction_id, Some(key)));
     }
+    Ok((transaction_keys, seek_outcomes))
+}
+
+/// Reads transaction facts for many ids in one batched store read, reusing
+/// block headers the caller already fetched for the reorg-safety
+/// cross-check instead of re-reading them.
+///
+/// Equivalent to [`read_transaction_facts_artifacts_batch`], but the block
+/// dedup phase looks a needed height up in `known_block_headers` first and
+/// only falls back to a fresh store read for heights not present there.
+/// Callers that stage every needed height's header up front (as derive
+/// replay does) pay zero extra block reads in the common case.
+pub(crate) fn read_transaction_facts_artifacts_batch_with_known_headers(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    transaction_ids: &[TransactionId],
+    known_block_headers: &HashMap<BlockHeight, BlockHeaderArtifact>,
+) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
+    let (transaction_keys, seek_outcomes) =
+        seek_transaction_facts_keys(inner, chain_epoch, transaction_ids)?;
 
     // Transaction batch read: one `multi_get` for every visibility hit.
     let mut transaction_values = inner
@@ -150,12 +193,17 @@ pub(crate) fn read_transaction_facts_artifacts_batch(
         decoded.push((transaction_id, Some(transaction)));
     }
 
-    // Block dedup phase: one canonical-block read per unique height. The
-    // reorg-safety invariant from `read_transaction_artifact` is preserved
-    // below by comparing each transaction's recorded `block_hash` against
-    // the canonical block fetched here.
+    // Block dedup phase: one canonical-block read per unique height not
+    // already supplied by the caller. The reorg-safety invariant from
+    // `read_transaction_artifact` is preserved below by comparing each
+    // transaction's recorded `block_hash` against the canonical block
+    // resolved here.
     let mut canonical_blocks_by_height = HashMap::with_capacity(needed_heights.len());
     for height in needed_heights {
+        if let Some(block) = known_block_headers.get(&height) {
+            canonical_blocks_by_height.insert(height, block.clone());
+            continue;
+        }
         if let Some(block) = read_block_header_artifact(inner, chain_epoch, height)? {
             canonical_blocks_by_height.insert(height, block);
         }

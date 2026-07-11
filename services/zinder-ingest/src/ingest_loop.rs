@@ -39,6 +39,7 @@ use crate::bulk_catchup::{
     BulkCatchupFlushState, BulkCatchupRunContext, flush_pending_bulk_catchup_writes,
     run_bulk_catchup_until_complete_with_flush_state,
 };
+use crate::memory_pressure::wait_for_bulk_catchup_memory_headroom;
 use crate::{
     BulkCatchupRunConfig, IngestError, MempoolReadyGate, NodeSourceKind, RawBlobPolicy,
     TipFollowConfig, classify_phase, current_chain_height, tip_follow_with_primary_store,
@@ -282,8 +283,11 @@ pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems +
 ///   [`TipFollowPhaseConfig::poll_interval`].
 /// - [`IngestPhase::BulkCatchup`] computes the per-batch target
 ///   `min(upstream_tip - reorg_window_blocks,
-///       store_tip + canonical_batch_max_blocks)` and calls
-///   `run_bulk_catchup_until_complete_with_flush_state` for one batch.
+///       store_tip + canonical_batch_max_blocks)`, calls
+///   `run_bulk_catchup_until_complete_with_flush_state` for one batch, then
+///   calls `wait_for_bulk_catchup_memory_headroom` so back-to-back batches
+///   yield a flush-and-reclaim window once memory pressure reaches the
+///   configured derive-replay degrade/pause ratios.
 /// - [`IngestPhase::FollowingTip`] calls
 ///   [`tip_follow_with_primary_store`] with a child cancel token; a
 ///   parallel watcher task fires the child token if re-classification
@@ -421,6 +425,13 @@ where
                     &mut bulk_flush_state,
                 )
                 .await?;
+                wait_for_bulk_catchup_memory_headroom(
+                    config.derive.memory_degrade_ratio,
+                    config.derive.memory_pause_ratio,
+                    config.derive.memory_resume_ratio,
+                    &cancel,
+                )
+                .await;
             }
             IngestPhase::FollowingTip => {
                 if tip_subsystems.is_none()

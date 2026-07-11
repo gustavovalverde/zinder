@@ -1224,11 +1224,19 @@ fn hydrate_committed_block_replay_batch(
     // Phase 1: read each block's header and ordered transaction ids.
     let (staged, batch_transaction_ids) =
         stage_committed_replay_blocks(&reader, envelope, start_height, end_height, max_blocks)?;
+    let staged_headers_by_height: HashMap<BlockHeight, BlockHeaderArtifact> = staged
+        .iter()
+        .map(|staged_block| (staged_block.height, staged_block.header.clone()))
+        .collect();
 
     // Phase 2: one batched facts read for the whole replay batch. Canonical
     // transaction ids are chain-unique, so a single map distributes back to
-    // each block without collision.
-    let mut facts_by_id = reader.transaction_facts_by_ids(&batch_transaction_ids)?;
+    // each block without collision. The reorg-safety cross-check reuses the
+    // headers staged above instead of re-reading them per unique height.
+    let mut facts_by_id = reader.transaction_facts_by_ids_with_known_headers(
+        &batch_transaction_ids,
+        &staged_headers_by_height,
+    )?;
 
     // Phase 3: assemble each block's ordered transactions from the shared map.
     let mut replay_blocks = Vec::with_capacity(staged.len());
@@ -1303,7 +1311,9 @@ fn hydrate_committed_block(
         )));
     };
     let transaction_ids = reader.transaction_ids_at_height(height)?;
-    let mut facts_by_id = reader.transaction_facts_by_ids(&transaction_ids)?;
+    let known_block_headers = HashMap::from([(height, header.clone())]);
+    let mut facts_by_id = reader
+        .transaction_facts_by_ids_with_known_headers(&transaction_ids, &known_block_headers)?;
     let mut transactions = Vec::with_capacity(transaction_ids.len());
     for transaction_id in transaction_ids {
         let Some(transaction) = facts_by_id.remove(&transaction_id).flatten() else {

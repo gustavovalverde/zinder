@@ -28,7 +28,8 @@ use crate::{
     transaction_artifact::{
         TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
         read_transaction_blob_artifact, read_transaction_facts_artifact,
-        read_transaction_facts_artifacts_batch, read_transaction_location,
+        read_transaction_facts_artifacts_batch,
+        read_transaction_facts_artifacts_batch_with_known_headers, read_transaction_location,
     },
     transparent_output::{
         read_current_transparent_outputs_by_outpoints,
@@ -168,6 +169,22 @@ impl<'store> ChainEpochReader<'store> {
         transaction_ids: &[TransactionId],
     ) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
         read_transaction_facts_artifacts_batch(&self.read_view, self.chain_epoch, transaction_ids)
+    }
+
+    /// Reads transaction facts for many ids, reusing block headers the
+    /// caller already holds for the reorg-safety cross-check instead of
+    /// re-reading them from the store.
+    pub fn transaction_facts_by_ids_with_known_headers(
+        &self,
+        transaction_ids: &[TransactionId],
+        known_block_headers: &HashMap<BlockHeight, BlockHeaderArtifact>,
+    ) -> Result<HashMap<TransactionId, Option<TransactionFactsArtifact>>, StoreError> {
+        read_transaction_facts_artifacts_batch_with_known_headers(
+            &self.read_view,
+            self.chain_epoch,
+            transaction_ids,
+            known_block_headers,
+        )
     }
 
     /// Reads a transaction location by transaction id.
