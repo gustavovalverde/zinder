@@ -434,9 +434,21 @@ impl Readiness {
         }
     }
 
-    /// Replaces the current readiness state with `state`.
+    /// Replaces the readiness cause and heights, preserving the ingest loop
+    /// phase.
+    ///
+    /// `phase` is orthogonal to [`ReadinessCause`] and owned by the ingest
+    /// classifier via [`Self::set_phase`]; cause writers (bulk-catchup batch
+    /// boundary, upstream-outage backoff, retention warnings) build a fresh
+    /// [`ReadinessState`] with no phase, so retaining the last-stamped phase
+    /// keeps `/readyz` and the derive replay phase gate stable between
+    /// classifier stamps. An explicit [`ReadinessState::with_phase`] on
+    /// `state` overrides.
     pub fn set(&self, state: ReadinessState) {
-        *self.inner.lock() = state;
+        let mut guard = self.inner.lock();
+        let phase = state.phase.or(guard.phase);
+        *guard = state;
+        guard.phase = phase;
     }
 
     /// Atomically mutates the current readiness state.
@@ -1342,5 +1354,36 @@ mod tests {
         assert!(matches!(readiness.report().cause, ReadinessCause::Starting));
         readiness.set(ReadinessState::ready(Some(7)));
         assert!(matches!(readiness.report().cause, ReadinessCause::Ready));
+    }
+
+    #[test]
+    fn set_preserves_stamped_phase() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::BulkCatchup);
+
+        readiness.set(ReadinessState::syncing(Some(5), Some(10), Some(15)));
+        assert_eq!(readiness.report().phase, Some(IngestPhase::BulkCatchup));
+
+        readiness.set(ReadinessState::node_unavailable_with_detail(
+            NodeUnavailableDetail::first_iteration("node_unreachable", "connection refused"),
+            Some(10),
+        ));
+        assert_eq!(readiness.report().phase, Some(IngestPhase::BulkCatchup));
+    }
+
+    #[test]
+    fn set_with_explicit_phase_overrides_stamped_phase() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::BulkCatchup);
+
+        readiness.set(ReadinessState::ready(Some(20)).with_phase(IngestPhase::FollowingTip));
+        assert_eq!(readiness.report().phase, Some(IngestPhase::FollowingTip));
+    }
+
+    #[test]
+    fn set_leaves_phase_unset_for_reader_binaries() {
+        let readiness = Readiness::default();
+        readiness.set(ReadinessState::ready(Some(3)));
+        assert_eq!(readiness.report().phase, None);
     }
 }

@@ -472,18 +472,12 @@ pub fn spawn_derive_tailer_task(
 
         let mut replay_budget =
             DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
-        let mut last_phase_gate_engaged: Option<bool> = None;
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
                 derive_config.replay_policy,
                 effective_limits,
                 poll_interval,
-            );
-            log_phase_gate_transition(
-                derive_config.replay_policy,
-                &mut last_phase_gate_engaged,
-                effective_limits.phase_gate_engaged,
             );
             persist_derive_status(&chain_store, &derive_store, effective_limits.state);
             if effective_limits.state.is_paused() {
@@ -588,9 +582,13 @@ fn log_phase_gate_transition(
 
 /// Spawns the derive replay budget metric sampler.
 ///
-/// The derive tailer can spend multiple seconds replaying retained events. This
-/// task keeps replay budget gauges tied to current memory pressure instead of
-/// to the tailer's next scheduling boundary.
+/// The derive tailer can stay inside one replay pass for a whole bulk catch-up
+/// (hours), so its outer scheduling boundary is the wrong place to observe
+/// phase-gate transitions. This task samples the budget on `sample_interval`,
+/// keeping the replay budget gauges tied to current memory pressure and
+/// emitting the phase-gate engage/disengage log within one sample of the flip
+/// regardless of the tailer's progress. Owning both the gauge and the
+/// transition log here keeps them from disagreeing.
 #[must_use = "drop the handle to detach the derive replay budget sampler or await it for symmetric shutdown"]
 pub fn spawn_derive_replay_budget_metrics_task(
     derive_config: IngestDeriveConfig,
@@ -602,12 +600,18 @@ pub fn spawn_derive_replay_budget_metrics_task(
     tokio::spawn(async move {
         let mut replay_budget =
             DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
+        let mut last_phase_gate_engaged: Option<bool> = None;
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
                 derive_config.replay_policy,
                 effective_limits,
                 poll_interval,
+            );
+            log_phase_gate_transition(
+                derive_config.replay_policy,
+                &mut last_phase_gate_engaged,
+                effective_limits.phase_gate_engaged,
             );
 
             tokio::select! {
@@ -2196,6 +2200,29 @@ mod tests {
         assert!(!disengaged.phase_gate_engaged);
         assert_eq!(disengaged.state, DeriveReplayBudgetState::Normal);
         assert_eq!(disengaged.batch_blocks, 100);
+    }
+
+    #[test]
+    fn phase_gate_survives_readiness_cause_replacement() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::BulkCatchup);
+        let mut budget = DeriveReplayBudget::with_phase_gate(
+            continuous_config(),
+            PhaseGateSignal::new(readiness.clone()),
+        );
+
+        // Bulk catch-up replaces the readiness cause on every committed batch
+        // and every upstream-outage backoff; the gate must keep reading
+        // BulkCatchup rather than fail open to unthrottled replay.
+        readiness.set(zinder_runtime::ReadinessState::syncing(
+            Some(1_500_000),
+            Some(100),
+            Some(1_500_100),
+        ));
+
+        let limits = budget.evaluate_current();
+        assert!(limits.phase_gate_engaged);
+        assert_ne!(limits.state, DeriveReplayBudgetState::Normal);
     }
 
     #[test]
