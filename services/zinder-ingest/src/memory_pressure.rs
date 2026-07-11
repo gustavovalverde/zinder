@@ -203,13 +203,12 @@ fn decide_pause_step(
 /// elevated, using the same degrade/pause/resume ratios
 /// [`crate::IngestDeriveConfig`] applies to derive replay.
 ///
-/// Canonical bulk-catchup batches previously ran back-to-back with no yield
-/// point between them, so a container approaching its cgroup memory ceiling
-/// never got a chance to flush and reclaim before the next batch started
-/// accumulating more. At or above `pause_ratio`, this holds until pressure
-/// drops back below `resume_ratio` or the reclaim budget elapses without
-/// meaningful reclaim; between `degrade_ratio` and `pause_ratio`, it applies
-/// one short backoff. Below `degrade_ratio` it returns immediately.
+/// The yield point gives a container approaching its cgroup memory ceiling
+/// a chance to flush and reclaim before the next batch accumulates more.
+/// At or above `pause_ratio`, this holds until pressure drops back below
+/// `resume_ratio` or the reclaim budget elapses without meaningful reclaim;
+/// between `degrade_ratio` and `pause_ratio`, it applies one short backoff.
+/// Below `degrade_ratio` it returns immediately.
 pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
     degrade_ratio: f64,
     pause_ratio: f64,
@@ -239,7 +238,7 @@ async fn run_bulk_catchup_headroom(
             pressure_ratio,
             pause_ratio,
             resume_ratio,
-            "memory pressure at or above the pause threshold; holding bulk catchup until it recovers"
+            "memory pressure at or above the pause threshold; holding bulk catchup until it recovers or the reclaim budget expires"
         );
         return hold_bulk_catchup_until_reclaim(
             pressure_ratio,
