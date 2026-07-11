@@ -91,7 +91,8 @@ const DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK: usize = 50_000;
 const DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS: usize =
     DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK / 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Variant order is throttle severity; `Ord` picks the stricter state.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum DeriveReplayBudgetState {
     Normal,
     Degraded,
@@ -110,22 +111,6 @@ impl DeriveReplayBudgetState {
     const fn is_paused(self) -> bool {
         matches!(self, Self::Paused)
     }
-
-    const fn severity(self) -> u8 {
-        match self {
-            Self::Normal => 0,
-            Self::Degraded => 1,
-            Self::Paused => 2,
-        }
-    }
-
-    const fn max_severity(self, other: Self) -> Self {
-        if other.severity() > self.severity() {
-            other
-        } else {
-            self
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,27 +120,6 @@ struct EffectiveDeriveReplayLimits {
     memory_budget_bytes: Option<u64>,
     memory_pressure_ratio: Option<f64>,
     phase_gate_engaged: bool,
-}
-
-/// Live source of the ingest loop phase for the derive replay phase gate.
-///
-/// The unified ingest loop stamps [`IngestPhase`] on the shared readiness
-/// handle every iteration; the derive tailer runs as an independent task and
-/// reads the current phase through this handle to decide whether canonical
-/// bulk catch-up should own the storage budget.
-#[derive(Clone, Debug)]
-struct PhaseGateSignal {
-    readiness: Readiness,
-}
-
-impl PhaseGateSignal {
-    const fn new(readiness: Readiness) -> Self {
-        Self { readiness }
-    }
-
-    fn phase(&self) -> Option<IngestPhase> {
-        self.readiness.phase()
-    }
 }
 
 /// Returns whether the current ingest phase cedes the storage budget to
@@ -224,7 +188,10 @@ struct DeriveReplayBudget {
     config: IngestDeriveConfig,
     memory_state: DeriveReplayBudgetState,
     applied_state: DeriveReplayBudgetState,
-    phase_gate: Option<PhaseGateSignal>,
+    /// Live source of the ingest loop phase for the canonical-phase gate; the
+    /// unified ingest loop stamps [`IngestPhase`] on this shared handle every
+    /// iteration.
+    phase_gate: Option<Readiness>,
 }
 
 impl DeriveReplayBudget {
@@ -237,17 +204,17 @@ impl DeriveReplayBudget {
         }
     }
 
-    const fn with_phase_gate(config: IngestDeriveConfig, phase_gate: PhaseGateSignal) -> Self {
+    const fn with_phase_gate(config: IngestDeriveConfig, readiness: Readiness) -> Self {
         Self {
             config,
             memory_state: DeriveReplayBudgetState::Normal,
             applied_state: DeriveReplayBudgetState::Normal,
-            phase_gate: Some(phase_gate),
+            phase_gate: Some(readiness),
         }
     }
 
     fn evaluate_current(&mut self) -> EffectiveDeriveReplayLimits {
-        let phase = self.phase_gate.as_ref().and_then(PhaseGateSignal::phase);
+        let phase = self.phase_gate.as_ref().and_then(Readiness::phase);
         self.evaluate(RuntimeMemorySnapshot::sample(), phase)
     }
 
@@ -356,7 +323,7 @@ fn compose_replay_state(
     } else {
         DeriveReplayBudgetState::Normal
     };
-    applied_memory_state.max_severity(gate_floor)
+    applied_memory_state.max(gate_floor)
 }
 
 fn effective_replay_batch_blocks(
@@ -470,8 +437,7 @@ pub fn spawn_derive_tailer_task(
             "derive chain-event tailer started"
         );
 
-        let mut replay_budget =
-            DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
+        let mut replay_budget = DeriveReplayBudget::with_phase_gate(derive_config, readiness);
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
@@ -598,8 +564,7 @@ pub fn spawn_derive_replay_budget_metrics_task(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut replay_budget =
-            DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
+        let mut replay_budget = DeriveReplayBudget::with_phase_gate(derive_config, readiness);
         let mut last_phase_gate_engaged: Option<bool> = None;
         loop {
             let effective_limits = replay_budget.evaluate_current();
@@ -2206,10 +2171,8 @@ mod tests {
     fn phase_gate_survives_readiness_cause_replacement() {
         let readiness = Readiness::default();
         readiness.set_phase(IngestPhase::BulkCatchup);
-        let mut budget = DeriveReplayBudget::with_phase_gate(
-            continuous_config(),
-            PhaseGateSignal::new(readiness.clone()),
-        );
+        let mut budget =
+            DeriveReplayBudget::with_phase_gate(continuous_config(), readiness.clone());
 
         // Bulk catch-up replaces the readiness cause on every committed batch
         // and every upstream-outage backoff; the gate must keep reading
