@@ -331,6 +331,7 @@ pub(crate) struct RocksChainStore {
     io_mode: RocksDbIoMode,
     resource_budget: RocksDbResourceBudget,
     store_role: StoreRole,
+    resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
 }
 
 impl RocksChainStore {
@@ -361,6 +362,7 @@ impl RocksChainStore {
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
             store_role: StoreRole::CanonicalPrimary,
+            resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
         store.record_rocksdb_properties();
 
@@ -396,6 +398,7 @@ impl RocksChainStore {
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
             store_role: StoreRole::CanonicalSecondary,
+            resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
         store.record_rocksdb_properties();
 
@@ -662,7 +665,7 @@ impl RocksChainStore {
                 .map_err(StoreError::storage_unavailable)
         })();
         record_write_batch_outcome(started_at, &write_outcome);
-        if write_outcome.is_ok() {
+        if write_outcome.is_ok() && self.resource_gauge_throttle.should_sample() {
             self.record_rocksdb_properties();
         }
 
