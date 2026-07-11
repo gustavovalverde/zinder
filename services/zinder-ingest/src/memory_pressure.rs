@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -147,6 +147,58 @@ const BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF: Duration = Duration::from_secs(2);
 /// pause ratio, waiting for it to drop back below the resume ratio.
 const BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Wall-clock a pause holds without meaningful reclaim before it expires.
+///
+/// Long enough for in-flight `RocksDB` flush and compaction memory to drain,
+/// short enough that allocator or cache retention pinning the ratio cannot
+/// stall a from-genesis rebuild. A drop of at least
+/// [`BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA`] resets the budget.
+const BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET: Duration = Duration::from_mins(1);
+
+/// Pressure-ratio drop since the last reset that counts as real reclaim and
+/// extends the pause; smaller drift does not.
+const BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA: f64 = 0.02;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkCatchupHeadroomOutcome {
+    Clear,
+    DegradeBackoff,
+    PauseRecovered,
+    PauseExpired,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PauseStep {
+    Recovered,
+    Reclaimed,
+    Expired,
+    Wait,
+}
+
+/// Decides what a paused caller does with one memory sample.
+///
+/// Recovery and genuine reclaim take priority over the elapsed budget: an
+/// improvement of at least [`BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA`] resets
+/// the deadline even once it has passed, so a pause that is actually freeing
+/// memory keeps waiting, while one pinned by retention expires.
+fn decide_pause_step(
+    pressure_ratio: f64,
+    reference_pressure: f64,
+    resume_ratio: f64,
+    reclaim_budget_elapsed: bool,
+) -> PauseStep {
+    if pressure_ratio < resume_ratio {
+        PauseStep::Recovered
+    } else if pressure_ratio <= reference_pressure - BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA {
+        PauseStep::Reclaimed
+    } else if reclaim_budget_elapsed {
+        PauseStep::Expired
+    } else {
+        PauseStep::Wait
+    }
+}
+
 /// Holds the caller between bulk-catchup batches while memory pressure is
 /// elevated, using the same degrade/pause/resume ratios
 /// [`crate::IngestDeriveConfig`] applies to derive replay.
@@ -154,18 +206,31 @@ const BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2)
 /// Canonical bulk-catchup batches previously ran back-to-back with no yield
 /// point between them, so a container approaching its cgroup memory ceiling
 /// never got a chance to flush and reclaim before the next batch started
-/// accumulating more. At or above `pause_ratio`, this polls until pressure
-/// drops back below `resume_ratio`; between `degrade_ratio` and
-/// `pause_ratio`, it applies one short backoff. Below `degrade_ratio` it
-/// returns immediately.
+/// accumulating more. At or above `pause_ratio`, this holds until pressure
+/// drops back below `resume_ratio` or the reclaim budget elapses without
+/// meaningful reclaim; between `degrade_ratio` and `pause_ratio`, it applies
+/// one short backoff. Below `degrade_ratio` it returns immediately.
 pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
     degrade_ratio: f64,
     pause_ratio: f64,
     resume_ratio: f64,
     cancel: &CancellationToken,
 ) {
-    let Some(mut pressure_ratio) = RuntimeMemorySnapshot::sample().pressure_ratio() else {
-        return;
+    run_bulk_catchup_headroom(degrade_ratio, pause_ratio, resume_ratio, cancel, || {
+        RuntimeMemorySnapshot::sample().pressure_ratio()
+    })
+    .await;
+}
+
+async fn run_bulk_catchup_headroom(
+    degrade_ratio: f64,
+    pause_ratio: f64,
+    resume_ratio: f64,
+    cancel: &CancellationToken,
+    mut sample: impl FnMut() -> Option<f64>,
+) -> BulkCatchupHeadroomOutcome {
+    let Some(pressure_ratio) = sample() else {
+        return BulkCatchupHeadroomOutcome::Clear;
     };
     if pressure_ratio >= pause_ratio {
         tracing::warn!(
@@ -176,18 +241,14 @@ pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
             resume_ratio,
             "memory pressure at or above the pause threshold; holding bulk catchup until it recovers"
         );
-        loop {
-            if cancellable_sleep(BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL, cancel).await {
-                return;
-            }
-            let Some(sampled) = RuntimeMemorySnapshot::sample().pressure_ratio() else {
-                return;
-            };
-            pressure_ratio = sampled;
-            if pressure_ratio < resume_ratio {
-                break;
-            }
-        }
+        return hold_bulk_catchup_until_reclaim(
+            pressure_ratio,
+            pause_ratio,
+            resume_ratio,
+            cancel,
+            &mut sample,
+        )
+        .await;
     }
     if pressure_ratio >= degrade_ratio {
         tracing::warn!(
@@ -197,7 +258,54 @@ pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
             degrade_ratio,
             "memory pressure elevated before the next bulk-catchup batch; backing off briefly"
         );
-        let _ = cancellable_sleep(BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF, cancel).await;
+        if cancellable_sleep(BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF, cancel).await {
+            return BulkCatchupHeadroomOutcome::Cancelled;
+        }
+        return BulkCatchupHeadroomOutcome::DegradeBackoff;
+    }
+    BulkCatchupHeadroomOutcome::Clear
+}
+
+async fn hold_bulk_catchup_until_reclaim(
+    mut reference_pressure: f64,
+    pause_ratio: f64,
+    resume_ratio: f64,
+    cancel: &CancellationToken,
+    sample: &mut impl FnMut() -> Option<f64>,
+) -> BulkCatchupHeadroomOutcome {
+    let mut reclaim_deadline = Instant::now() + BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET;
+    loop {
+        if cancellable_sleep(BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL, cancel).await {
+            return BulkCatchupHeadroomOutcome::Cancelled;
+        }
+        let Some(pressure_ratio) = sample() else {
+            return BulkCatchupHeadroomOutcome::Clear;
+        };
+        match decide_pause_step(
+            pressure_ratio,
+            reference_pressure,
+            resume_ratio,
+            Instant::now() >= reclaim_deadline,
+        ) {
+            PauseStep::Recovered => return BulkCatchupHeadroomOutcome::PauseRecovered,
+            PauseStep::Reclaimed => {
+                reference_pressure = pressure_ratio;
+                reclaim_deadline = Instant::now() + BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET;
+            }
+            PauseStep::Expired => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "bulk_catchup_memory_pressure_pause_expired",
+                    pressure_ratio,
+                    pause_ratio,
+                    resume_ratio,
+                    reclaim_budget_secs = BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET.as_secs(),
+                    "memory pressure held at or above the pause threshold without reclaiming; idle waiting is not freeing memory, so proceeding with the next bulk-catchup batch"
+                );
+                return BulkCatchupHeadroomOutcome::PauseExpired;
+            }
+            PauseStep::Wait => {}
+        }
     }
 }
 
@@ -543,5 +651,42 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
         assert_eq!(container_memory_budget_from_snapshot(snapshot), None);
+    }
+
+    #[test]
+    fn pause_step_recovers_below_resume_ratio() {
+        assert_eq!(
+            decide_pause_step(0.60, 0.85, 0.65, true),
+            PauseStep::Recovered
+        );
+    }
+
+    #[test]
+    fn pause_step_expires_when_static_pressure_burns_the_budget() {
+        assert_eq!(
+            decide_pause_step(0.85, 0.85, 0.65, true),
+            PauseStep::Expired
+        );
+    }
+
+    #[test]
+    fn pause_step_waits_before_the_budget_elapses() {
+        assert_eq!(decide_pause_step(0.85, 0.85, 0.65, false), PauseStep::Wait);
+    }
+
+    #[test]
+    fn pause_step_resets_deadline_on_genuine_improvement_even_after_budget() {
+        assert_eq!(
+            decide_pause_step(0.82, 0.86, 0.65, true),
+            PauseStep::Reclaimed
+        );
+    }
+
+    #[tokio::test]
+    async fn headroom_pause_exits_promptly_on_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = run_bulk_catchup_headroom(0.75, 0.85, 0.65, &cancel, || Some(0.90)).await;
+        assert_eq!(outcome, BulkCatchupHeadroomOutcome::Cancelled);
     }
 }
