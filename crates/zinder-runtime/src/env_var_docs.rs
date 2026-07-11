@@ -706,8 +706,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Derive replay pressure policy. `canonical-first` pauses rebuildable derive \
                       replay under memory pressure so canonical ingest keeps the process budget. \
-                      `continuous` replays retained chain events whenever they are available. \
-                      Defaults to `canonical-first`.",
+                      `continuous` replays retained chain events whenever they are available while \
+                      the writer is at tip; during bulk catch-up a canonical-phase gate still \
+                      throttles it to residual capacity. Defaults to `canonical-first`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES",

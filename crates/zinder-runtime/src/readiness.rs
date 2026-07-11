@@ -460,6 +460,15 @@ impl Readiness {
         self.inner.lock().phase = Some(phase);
     }
 
+    /// Returns the current [`IngestPhase`] without cloning the readiness cause.
+    ///
+    /// Cheaper than [`Self::report`] for hot readers that only need the phase,
+    /// such as the derive replay phase gate that samples it per replayed event.
+    #[must_use]
+    pub fn phase(&self) -> Option<IngestPhase> {
+        self.inner.lock().phase
+    }
+
     /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
     /// preserving the writer's last visible `current_height` and any
     /// concurrently-set ingest phase. Used by the upstream-health probe.

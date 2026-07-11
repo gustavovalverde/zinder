@@ -36,6 +36,7 @@ use zinder_derive::{
     TransparentSpendFacts,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
+use zinder_runtime::{IngestPhase, Readiness};
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
     PrimaryChainStore, RocksDbResourceBudget, StoreReadCaller, StreamCursorTokenV1,
@@ -109,6 +110,22 @@ impl DeriveReplayBudgetState {
     const fn is_paused(self) -> bool {
         matches!(self, Self::Paused)
     }
+
+    const fn severity(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Degraded => 1,
+            Self::Paused => 2,
+        }
+    }
+
+    const fn max_severity(self, other: Self) -> Self {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +134,38 @@ struct EffectiveDeriveReplayLimits {
     batch_blocks: u32,
     memory_budget_bytes: Option<u64>,
     memory_pressure_ratio: Option<f64>,
+    phase_gate_engaged: bool,
+}
+
+/// Live source of the ingest loop phase for the derive replay phase gate.
+///
+/// The unified ingest loop stamps [`IngestPhase`] on the shared readiness
+/// handle every iteration; the derive tailer runs as an independent task and
+/// reads the current phase through this handle to decide whether canonical
+/// bulk catch-up should own the storage budget.
+#[derive(Clone, Debug)]
+struct PhaseGateSignal {
+    readiness: Readiness,
+}
+
+impl PhaseGateSignal {
+    const fn new(readiness: Readiness) -> Self {
+        Self { readiness }
+    }
+
+    fn phase(&self) -> Option<IngestPhase> {
+        self.readiness.phase()
+    }
+}
+
+/// Returns whether the current ingest phase cedes the storage budget to
+/// canonical work, throttling derive replay to residual capacity.
+///
+/// [`IngestPhase::BulkCatchup`] is entered precisely when the canonical gap
+/// exceeds `ingest.phases.catchup_threshold_blocks`, so it is the
+/// canonical-lag-exceeds-threshold signal the gate needs.
+const fn phase_engages_replay_gate(phase: Option<IngestPhase>) -> bool {
+    matches!(phase, Some(IngestPhase::BulkCatchup))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -170,25 +219,43 @@ fn should_start_new_projection_chunk(
             > DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct DeriveReplayBudget {
     config: IngestDeriveConfig,
-    state: DeriveReplayBudgetState,
+    memory_state: DeriveReplayBudgetState,
+    applied_state: DeriveReplayBudgetState,
+    phase_gate: Option<PhaseGateSignal>,
 }
 
 impl DeriveReplayBudget {
     const fn new(config: IngestDeriveConfig) -> Self {
         Self {
             config,
-            state: DeriveReplayBudgetState::Normal,
+            memory_state: DeriveReplayBudgetState::Normal,
+            applied_state: DeriveReplayBudgetState::Normal,
+            phase_gate: None,
+        }
+    }
+
+    const fn with_phase_gate(config: IngestDeriveConfig, phase_gate: PhaseGateSignal) -> Self {
+        Self {
+            config,
+            memory_state: DeriveReplayBudgetState::Normal,
+            applied_state: DeriveReplayBudgetState::Normal,
+            phase_gate: Some(phase_gate),
         }
     }
 
     fn evaluate_current(&mut self) -> EffectiveDeriveReplayLimits {
-        self.evaluate(RuntimeMemorySnapshot::sample())
+        let phase = self.phase_gate.as_ref().and_then(PhaseGateSignal::phase);
+        self.evaluate(RuntimeMemorySnapshot::sample(), phase)
     }
 
-    fn evaluate(&mut self, memory_snapshot: RuntimeMemorySnapshot) -> EffectiveDeriveReplayLimits {
+    fn evaluate(
+        &mut self,
+        memory_snapshot: RuntimeMemorySnapshot,
+        phase: Option<IngestPhase>,
+    ) -> EffectiveDeriveReplayLimits {
         let memory_budget_bytes = self
             .config
             .memory_budget_bytes
@@ -201,28 +268,34 @@ impl DeriveReplayBudget {
                 (budget_bytes > 0).then(|| u64_to_f64(current_bytes) / u64_to_f64(budget_bytes))
             },
         );
-        self.state = next_budget_state(self.config, self.state, memory_pressure_ratio);
+        self.memory_state =
+            next_memory_budget_state(self.config, self.memory_state, memory_pressure_ratio);
+        let phase_gate_engaged = phase_engages_replay_gate(phase);
+        let state = compose_replay_state(self.config, self.memory_state, phase_gate_engaged);
+        self.applied_state = state;
         EffectiveDeriveReplayLimits {
-            state: self.state,
+            state,
             batch_blocks: effective_replay_batch_blocks(
                 self.config,
-                self.state,
+                state,
                 memory_pressure_ratio,
+                phase_gate_engaged,
             ),
             memory_budget_bytes,
             memory_pressure_ratio,
+            phase_gate_engaged,
         }
     }
 }
 
-fn next_budget_state(
+/// Advances the memory-pressure hysteresis machine independent of policy and
+/// phase, so a later gate engagement inherits a warm state instead of a cold
+/// `Normal`.
+fn next_memory_budget_state(
     config: IngestDeriveConfig,
     current_state: DeriveReplayBudgetState,
     memory_pressure_ratio: Option<f64>,
 ) -> DeriveReplayBudgetState {
-    if config.replay_policy == DeriveReplayPolicy::Continuous {
-        return DeriveReplayBudgetState::Normal;
-    }
     let Some(pressure_ratio) = memory_pressure_ratio else {
         return DeriveReplayBudgetState::Normal;
     };
@@ -257,10 +330,40 @@ fn next_budget_state(
     }
 }
 
+/// Composes the applied replay state from the memory hysteresis machine and the
+/// canonical-phase gate, letting the stricter of the two win.
+///
+/// The gate throttles derive replay to residual (a [`DeriveReplayBudgetState::Degraded`]
+/// floor) during canonical bulk catch-up for every policy, so `continuous`
+/// keeps its meaning only as an at-tip override. Memory pressure still applies
+/// whenever the policy is `canonical-first` or the gate is engaged, and can
+/// escalate to [`DeriveReplayBudgetState::Paused`] below the gate's residual
+/// level.
+fn compose_replay_state(
+    config: IngestDeriveConfig,
+    memory_state: DeriveReplayBudgetState,
+    phase_gate_engaged: bool,
+) -> DeriveReplayBudgetState {
+    let memory_applies =
+        config.replay_policy == DeriveReplayPolicy::CanonicalFirst || phase_gate_engaged;
+    let applied_memory_state = if memory_applies {
+        memory_state
+    } else {
+        DeriveReplayBudgetState::Normal
+    };
+    let gate_floor = if phase_gate_engaged {
+        DeriveReplayBudgetState::Degraded
+    } else {
+        DeriveReplayBudgetState::Normal
+    };
+    applied_memory_state.max_severity(gate_floor)
+}
+
 fn effective_replay_batch_blocks(
     config: IngestDeriveConfig,
     state: DeriveReplayBudgetState,
     memory_pressure_ratio: Option<f64>,
+    phase_gate_engaged: bool,
 ) -> u32 {
     let configured_blocks = config.replay_batch_blocks.get();
     let min_blocks = config.min_replay_batch_blocks.get();
@@ -269,6 +372,9 @@ fn effective_replay_batch_blocks(
     }
     if state == DeriveReplayBudgetState::Paused {
         return 0;
+    }
+    if phase_gate_engaged {
+        return min_blocks;
     }
     let midpoint = config.memory_degrade_ratio
         + ((config.memory_pause_ratio - config.memory_degrade_ratio) / 2.0);
@@ -331,12 +437,17 @@ pub fn ensure_spend_projection_not_behind_retention_sweep(
 /// view: canonical commits have already succeeded before the tailer sees an
 /// event, so a derive failure is exposed through lag/error metrics and logs
 /// without blocking new chain facts from being indexed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the tailer binds two stores, the derive config, the poll cadence, the shared readiness handle for the canonical-phase gate, and the cancel token; a spec struct would only relay bindings the binary already holds"
+)]
 #[must_use = "drop the handle to detach the derive tailer or await it for symmetric shutdown"]
 pub fn spawn_derive_tailer_task(
     chain_store: PrimaryChainStore,
     derive_store: DeriveStore,
     derive_config: IngestDeriveConfig,
     poll_interval: Duration,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -359,13 +470,20 @@ pub fn spawn_derive_tailer_task(
             "derive chain-event tailer started"
         );
 
-        let mut replay_budget = DeriveReplayBudget::new(derive_config);
+        let mut replay_budget =
+            DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
+        let mut last_phase_gate_engaged: Option<bool> = None;
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
                 derive_config.replay_policy,
                 effective_limits,
                 poll_interval,
+            );
+            log_phase_gate_transition(
+                derive_config.replay_policy,
+                &mut last_phase_gate_engaged,
+                effective_limits.phase_gate_engaged,
             );
             persist_derive_status(&chain_store, &derive_store, effective_limits.state);
             if effective_limits.state.is_paused() {
@@ -377,17 +495,8 @@ pub fn spawn_derive_tailer_task(
                     memory_pressure_ratio = ?effective_limits.memory_pressure_ratio,
                     "derive replay paused so canonical ingest keeps the memory budget"
                 );
-
-                tokio::select! {
-                    () = cancel.cancelled() => {
-                        tracing::info!(
-                            target: "zinder::ingest",
-                            event = "derive_tailer_cancelled",
-                            "derive chain-event tailer cancelled"
-                        );
-                        return;
-                    }
-                    () = tokio::time::sleep(poll_interval) => {}
+                if derive_tailer_sleep_or_cancelled(poll_interval, &cancel).await {
+                    return;
                 }
                 continue;
             }
@@ -409,19 +518,72 @@ pub fn spawn_derive_tailer_task(
                 );
             }
 
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    tracing::info!(
-                        target: "zinder::ingest",
-                        event = "derive_tailer_cancelled",
-                        "derive chain-event tailer cancelled"
-                    );
-                    return;
-                }
-                () = tokio::time::sleep(poll_interval) => {}
+            if derive_tailer_sleep_or_cancelled(poll_interval, &cancel).await {
+                return;
             }
         }
     })
+}
+
+/// Sleeps for `poll_interval` or returns early on cancellation.
+///
+/// Returns `true` when the tailer was cancelled and should stop.
+async fn derive_tailer_sleep_or_cancelled(
+    poll_interval: Duration,
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        () = cancel.cancelled() => {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "derive_tailer_cancelled",
+                "derive chain-event tailer cancelled"
+            );
+            true
+        }
+        () = tokio::time::sleep(poll_interval) => false,
+    }
+}
+
+/// Logs the canonical-phase gate engage/disengage transition once per flip.
+///
+/// A `continuous` policy is configured never to throttle, so its engagement is
+/// a `WARN` that the configured behavior is overridden while canonical bulk
+/// catch-up owns the storage budget; every other transition is an `INFO`.
+fn log_phase_gate_transition(
+    replay_policy: DeriveReplayPolicy,
+    last_engaged: &mut Option<bool>,
+    engaged: bool,
+) {
+    if *last_engaged == Some(engaged) {
+        return;
+    }
+    let had_prior_state = last_engaged.is_some();
+    *last_engaged = Some(engaged);
+    if engaged {
+        if replay_policy == DeriveReplayPolicy::Continuous {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "derive_replay_phase_gate_engaged",
+                replay_policy = replay_policy.as_kebab_case(),
+                "continuous derive replay throttled to residual capacity while canonical bulk catch-up owns the storage budget"
+            );
+        } else {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "derive_replay_phase_gate_engaged",
+                replay_policy = replay_policy.as_kebab_case(),
+                "derive replay throttled to residual capacity while canonical bulk catch-up owns the storage budget"
+            );
+        }
+    } else if had_prior_state {
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "derive_replay_phase_gate_disengaged",
+            replay_policy = replay_policy.as_kebab_case(),
+            "derive replay resumed full scheduling after canonical bulk catch-up completed"
+        );
+    }
 }
 
 /// Spawns the derive replay budget metric sampler.
@@ -434,10 +596,12 @@ pub fn spawn_derive_replay_budget_metrics_task(
     derive_config: IngestDeriveConfig,
     poll_interval: Duration,
     sample_interval: Duration,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut replay_budget = DeriveReplayBudget::new(derive_config);
+        let mut replay_budget =
+            DeriveReplayBudget::with_phase_gate(derive_config, PhaseGateSignal::new(readiness));
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
@@ -539,7 +703,7 @@ async fn catch_up_derive_store_to_canonical_with_budget(
                     maybe_persist_derive_status(
                         chain_store,
                         derive_store,
-                        replay_budget.state,
+                        replay_budget.applied_state,
                         &mut last_status_persist,
                     );
                 }
@@ -1807,6 +1971,13 @@ fn record_derive_replay_budget(
             0.0
         },
     );
+    metrics::gauge!("zinder_ingest_derive_replay_phase_gate").set(
+        if effective_limits.phase_gate_engaged {
+            1.0
+        } else {
+            0.0
+        },
+    );
     metrics::gauge!("zinder_ingest_derive_replay_budget_seconds").set(
         if effective_limits.state.is_paused() {
             0.0
@@ -1890,19 +2061,19 @@ mod tests {
     fn replay_budget_degrades_batch_before_pause() {
         let mut budget = DeriveReplayBudget::new(replay_config());
 
-        let normal = budget.evaluate(memory_snapshot(800));
+        let normal = budget.evaluate(memory_snapshot(800), None);
         assert_eq!(normal.state, DeriveReplayBudgetState::Normal);
         assert_eq!(normal.batch_blocks, 100);
 
-        let degraded = budget.evaluate(memory_snapshot(875));
+        let degraded = budget.evaluate(memory_snapshot(875), None);
         assert_eq!(degraded.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(degraded.batch_blocks, 50);
 
-        let minimum = budget.evaluate(memory_snapshot(925));
+        let minimum = budget.evaluate(memory_snapshot(925), None);
         assert_eq!(minimum.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(minimum.batch_blocks, 10);
 
-        let paused = budget.evaluate(memory_snapshot(950));
+        let paused = budget.evaluate(memory_snapshot(950), None);
         assert_eq!(paused.state, DeriveReplayBudgetState::Paused);
         assert_eq!(paused.batch_blocks, 0);
     }
@@ -1912,19 +2083,19 @@ mod tests {
         let mut budget = DeriveReplayBudget::new(replay_config());
 
         assert_eq!(
-            budget.evaluate(memory_snapshot(960)).state,
+            budget.evaluate(memory_snapshot(960), None).state,
             DeriveReplayBudgetState::Paused
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(900)).state,
+            budget.evaluate(memory_snapshot(900), None).state,
             DeriveReplayBudgetState::Degraded
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(800)).state,
+            budget.evaluate(memory_snapshot(800), None).state,
             DeriveReplayBudgetState::Degraded
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(700)).state,
+            budget.evaluate(memory_snapshot(700), None).state,
             DeriveReplayBudgetState::Normal
         );
     }
@@ -1941,7 +2112,7 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
 
-        let limits = budget.evaluate(snapshot);
+        let limits = budget.evaluate(snapshot, None);
 
         assert_eq!(limits.memory_pressure_ratio, Some(0.2));
         assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
@@ -1961,11 +2132,87 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
 
-        let limits = budget.evaluate(snapshot);
+        let limits = budget.evaluate(snapshot, None);
 
         assert_eq!(limits.memory_pressure_ratio, Some(0.875));
         assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(limits.batch_blocks, 50);
+    }
+
+    fn continuous_config() -> IngestDeriveConfig {
+        IngestDeriveConfig {
+            replay_policy: DeriveReplayPolicy::Continuous,
+            ..replay_config()
+        }
+    }
+
+    #[test]
+    fn continuous_bulk_catchup_engages_residual_replay() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let limits = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
+
+        assert!(limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(limits.batch_blocks, 10);
+    }
+
+    #[test]
+    fn continuous_following_tip_stays_unthrottled_under_memory_pressure() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let limits = budget.evaluate(memory_snapshot(950), Some(IngestPhase::FollowingTip));
+
+        assert!(!limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
+        assert_eq!(limits.batch_blocks, 100);
+    }
+
+    #[test]
+    fn canonical_first_composes_memory_pause_with_bulk_catchup_gate() {
+        let mut budget = DeriveReplayBudget::new(replay_config());
+
+        let residual = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
+        assert!(residual.phase_gate_engaged);
+        assert_eq!(residual.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(residual.batch_blocks, 10);
+
+        let paused = budget.evaluate(memory_snapshot(950), Some(IngestPhase::BulkCatchup));
+        assert!(paused.phase_gate_engaged);
+        assert_eq!(paused.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(paused.batch_blocks, 0);
+    }
+
+    #[test]
+    fn phase_gate_disengages_when_phase_leaves_bulk_catchup() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let engaged = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
+        assert!(engaged.phase_gate_engaged);
+        assert_eq!(engaged.state, DeriveReplayBudgetState::Degraded);
+        assert_eq!(engaged.batch_blocks, 10);
+
+        let disengaged = budget.evaluate(memory_snapshot(800), Some(IngestPhase::FollowingTip));
+        assert!(!disengaged.phase_gate_engaged);
+        assert_eq!(disengaged.state, DeriveReplayBudgetState::Normal);
+        assert_eq!(disengaged.batch_blocks, 100);
+    }
+
+    #[test]
+    fn phase_gate_transition_logs_once_per_flip() {
+        let mut last_engaged = None;
+
+        log_phase_gate_transition(DeriveReplayPolicy::Continuous, &mut last_engaged, false);
+        assert_eq!(last_engaged, Some(false));
+
+        log_phase_gate_transition(DeriveReplayPolicy::Continuous, &mut last_engaged, true);
+        assert_eq!(last_engaged, Some(true));
+
+        log_phase_gate_transition(DeriveReplayPolicy::Continuous, &mut last_engaged, true);
+        assert_eq!(last_engaged, Some(true));
+
+        log_phase_gate_transition(DeriveReplayPolicy::Continuous, &mut last_engaged, false);
+        assert_eq!(last_engaged, Some(false));
     }
 
     #[test]
@@ -2007,6 +2254,7 @@ mod tests {
             batch_blocks: 100,
             memory_budget_bytes: None,
             memory_pressure_ratio: None,
+            phase_gate_engaged: false,
         };
         let degraded_limits = EffectiveDeriveReplayLimits {
             state: DeriveReplayBudgetState::Degraded,

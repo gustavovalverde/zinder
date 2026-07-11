@@ -474,6 +474,7 @@ async fn run_ingest(
         derive_store.clone(),
         command_config.loop_config.derive,
         DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
+        readiness.clone(),
         cancel.clone(),
     );
     let memory_metrics_handle =
@@ -482,6 +483,7 @@ async fn run_ingest(
         command_config.loop_config.derive,
         DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
         DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
+        readiness.clone(),
         cancel.clone(),
     );
     open_storage_phase.complete();
