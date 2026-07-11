@@ -10,6 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, SliceTransform,
     Snapshot, WriteBatch, WriteBufferManager, WriteOptions, checkpoint::Checkpoint,
+    statistics::Ticker,
 };
 
 use crate::{RocksDbResourceBudget, StoreError, format::StoreKey, kv::StorageTable};
@@ -155,6 +156,9 @@ pub struct BoundedRocksDbOpen {
     pub write_buffer_manager: WriteBufferManager,
     /// Resolved filesystem I/O mode.
     pub io_mode: RocksDbIoMode,
+    /// Statistics-bearing open options retained so the DB-wide tickers enabled
+    /// at open stay readable for metric export after the DB is opened.
+    pub statistics: Arc<Options>,
 }
 
 /// Opens a bounded `RocksDB` instance with direct I/O when the platform supports it.
@@ -180,13 +184,14 @@ pub fn open_bounded_rocksdb(
     };
 
     match open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Direct) {
-        Ok(db) => {
+        Ok((db, statistics)) => {
             record_rocksdb_io_mode(role, RocksDbIoMode::Direct);
             Ok(BoundedRocksDbOpen {
                 db,
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Direct,
+                statistics: Arc::new(statistics),
             })
         }
         Err(direct_error) => {
@@ -198,13 +203,15 @@ pub fn open_bounded_rocksdb(
                 error = %direct_error,
                 "RocksDB direct I/O open failed; retrying with buffered I/O"
             );
-            let db = open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
+            let (db, statistics) =
+                open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
             record_rocksdb_io_mode(role, RocksDbIoMode::Buffered);
             Ok(BoundedRocksDbOpen {
                 db,
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Buffered,
+                statistics: Arc::new(statistics),
             })
         }
     }
@@ -224,7 +231,7 @@ where
 fn open_bounded_rocksdb_once<BuildColumnFamilies>(
     open_attempt: &BoundedRocksDbOpenAttempt<'_, '_, BuildColumnFamilies>,
     io_mode: RocksDbIoMode,
-) -> Result<DB, rust_rocksdb::Error>
+) -> Result<(DB, Options), rust_rocksdb::Error>
 where
     BuildColumnFamilies: Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
 {
@@ -251,7 +258,7 @@ where
         open_attempt.rocksdb_resource_budget,
     );
 
-    match open_attempt.role {
+    let db = match open_attempt.role {
         RocksDbOpenRole::Primary { path } => {
             DB::open_cf_descriptors(&db_options, path, column_families)
         }
@@ -264,7 +271,8 @@ where
             secondary_path,
             column_families,
         ),
-    }
+    }?;
+    Ok((db, db_options))
 }
 
 fn record_rocksdb_io_mode(role: RocksDbOpenRole<'_>, io_mode: RocksDbIoMode) {
@@ -319,6 +327,7 @@ pub(crate) struct RocksChainStore {
     sync_writes: bool,
     block_cache: Cache,
     write_buffer_manager: WriteBufferManager,
+    statistics: Arc<Options>,
     io_mode: RocksDbIoMode,
     resource_budget: RocksDbResourceBudget,
     store_role: StoreRole,
@@ -348,6 +357,7 @@ impl RocksChainStore {
             sync_writes,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
+            statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
             store_role: StoreRole::CanonicalPrimary,
@@ -382,6 +392,7 @@ impl RocksChainStore {
             sync_writes,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
+            statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
             store_role: StoreRole::CanonicalSecondary,
@@ -825,6 +836,7 @@ impl RocksChainStore {
             column_family_names: &column_family_names,
             block_cache: &self.block_cache,
             write_buffer_manager: &self.write_buffer_manager,
+            statistics: &self.statistics,
             io_mode: self.io_mode,
             resource_budget: self.resource_budget,
         });
@@ -843,6 +855,8 @@ pub struct RocksDbResourceGaugeInputs<'sample> {
     pub block_cache: &'sample Cache,
     /// Shared write-buffer manager retained for the database lifetime.
     pub write_buffer_manager: &'sample WriteBufferManager,
+    /// Statistics-bearing open options whose DB-wide tickers are exported.
+    pub statistics: &'sample Options,
     /// Resolved filesystem I/O mode.
     pub io_mode: RocksDbIoMode,
     /// Bounded resource budget applied at open.
@@ -921,6 +935,9 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
         .set(u64_to_f64(inputs.resource_budget.block_cache_bytes));
     metrics::gauge!("zinder_store_block_cache_usage_bytes", "store_role" => store_role)
         .set(usize_to_f64(inputs.block_cache.get_usage()));
+    metrics::gauge!("zinder_store_block_cache_pinned_usage_bytes", "store_role" => store_role)
+        .set(usize_to_f64(inputs.block_cache.get_pinned_usage()));
+    record_rocksdb_ticker_gauges(inputs.statistics, store_role);
     metrics::gauge!("zinder_store_memtable_budget_bytes", "store_role" => store_role)
         .set(usize_to_f64(inputs.write_buffer_manager.get_buffer_size()));
     metrics::gauge!("zinder_store_memtable_budget_usage_bytes", "store_role" => store_role)
@@ -931,6 +948,44 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
         "store_role" => store_role
     )
     .set(1.0);
+}
+
+/// DB-wide `RocksDB` statistics tickers exported as monotonic gauges.
+///
+/// Every ticker is aggregated across all column families of one store; the
+/// bloom entries reflect only `transparent_output` because it is the sole
+/// column family with a filter policy.
+const EXPORTED_TICKERS: &[Ticker] = &[
+    Ticker::BloomFilterUseful,
+    Ticker::BloomFilterFullPositive,
+    Ticker::BloomFilterFullTruePositive,
+    Ticker::BlockCacheDataHit,
+    Ticker::BlockCacheDataMiss,
+    Ticker::BlockCacheIndexHit,
+    Ticker::BlockCacheIndexMiss,
+    Ticker::BlockCacheFilterHit,
+    Ticker::BlockCacheFilterMiss,
+    Ticker::NumberMultigetCalls,
+    Ticker::NumberMultigetKeysRead,
+    Ticker::NumberMultigetBytesRead,
+    Ticker::BytesRead,
+    Ticker::BytesWritten,
+    Ticker::StallMicros,
+    Ticker::CompactReadBytes,
+    Ticker::CompactWriteBytes,
+];
+
+/// Publishes [`EXPORTED_TICKERS`] under `zinder_store_rocksdb_ticker`, keyed by
+/// the upstream `RocksDB` ticker name and the store role.
+fn record_rocksdb_ticker_gauges(statistics: &Options, store_role: &'static str) {
+    for ticker in EXPORTED_TICKERS {
+        metrics::gauge!(
+            "zinder_store_rocksdb_ticker",
+            "ticker" => ticker.name(),
+            "store_role" => store_role
+        )
+        .set(u64_to_f64(statistics.get_ticker_count(*ticker)));
+    }
 }
 
 /// Sampling cadence for the resource-gauge sweep on the write path.
@@ -1660,7 +1715,14 @@ fn column_family_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Options {
     let mut options = Options::default();
-    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+    let mut table_factory = build_block_based_table_factory(cache);
+
+    if table == StorageTable::TransparentOutput {
+        table_factory.set_bloom_filter(10.0, false);
+        options.set_memtable_batch_lookup_optimization(true);
+    }
+
+    options.set_block_based_table_factory(&table_factory);
     options.set_write_buffer_size(write_buffer_bytes_for_table(table, rocksdb_resource_budget));
     options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
 
@@ -1739,5 +1801,39 @@ mod tests {
         let throttle = ResourceGaugeThrottle::new(Duration::ZERO);
         assert!(throttle.should_sample());
         assert!(throttle.should_sample());
+    }
+
+    #[test]
+    fn transparent_output_cf_enables_memtable_batch_lookup() {
+        let cache = build_block_cache(RocksDbResourceBudget::for_local_tests().block_cache_bytes);
+        let budget = RocksDbResourceBudget::for_local_tests();
+
+        let transparent_output =
+            column_family_options(StorageTable::TransparentOutput, &cache, budget);
+        assert!(transparent_output.get_memtable_batch_lookup_optimization());
+
+        for table in StorageTable::all() {
+            if table == StorageTable::TransparentOutput {
+                continue;
+            }
+            let options = column_family_options(table, &cache, budget);
+            assert!(
+                !options.get_memtable_batch_lookup_optimization(),
+                "{} must not enable memtable batch lookup",
+                table.column_family_name()
+            );
+        }
+    }
+
+    #[test]
+    fn ticker_export_runs_on_an_open_store() -> Result<(), StoreError> {
+        let store_dir = tempfile::tempdir().map_err(StoreError::storage_unavailable)?;
+        let store = RocksChainStore::open_primary(
+            store_dir.path(),
+            false,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        store.record_rocksdb_properties();
+        Ok(())
     }
 }

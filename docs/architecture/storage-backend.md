@@ -94,8 +94,14 @@ depending on implicit column-family context to disambiguate byte prefixes.
 
 The `reorg_window` column family is opened with a visibility-prefix extractor so
 height, transaction, and subtree-root visibility seeks can use prefix bloom
-filtering. Other column families stay on default options until a measured access
-pattern justifies table-specific tuning.
+filtering. The `transparent_output` column family carries a full 10-bits-per-key
+whole-key Bloom filter and RocksDB's memtable batch-lookup optimization, matching
+its hot access shape of sorted batched point lookups over `(network, outpoint)`
+keys. Its filter blocks are charged to the same shared bounded block cache as
+every other block. Bloom filters attach only to newly written SST files, so an
+existing store acquires them as compaction rewrites its files; no migration or
+volume wipe is required. Other column families stay on default options until a
+measured access pattern justifies table-specific tuning.
 
 Readers must revalidate branch identity before returning data from a visibility lookup. For example, transaction lookup can find an older same-transaction-id row from a reorged branch, so the reader checks that the artifact's block hash still matches the visible block at that height before returning it.
 
@@ -257,11 +263,21 @@ Readiness causes and operational metrics are owned by [Service operations](servi
   configured role-scoped RocksDB `max_wal_bytes`). Both feed
   `ZinderStoreWalGrowth` per [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md).
 - Block-cache capacity and usage through dedicated gauges
-  `zinder_store_block_cache_capacity_bytes` and
-  `zinder_store_block_cache_usage_bytes`. These are the canonical signals;
-  the same numbers are not republished as `zinder_store_rocksdb_property`
-  labels. These and the memtable-budget, WAL, and I/O-mode gauges carry the
-  same `store_role` label.
+  `zinder_store_block_cache_capacity_bytes`,
+  `zinder_store_block_cache_usage_bytes`, and
+  `zinder_store_block_cache_pinned_usage_bytes`. Pinned usage exposes blocks
+  held above capacity by live references, which total usage alone hides. These
+  are the canonical signals; the same numbers are not republished as
+  `zinder_store_rocksdb_property` labels. These and the memtable-budget, WAL,
+  and I/O-mode gauges carry the same `store_role` label.
+- DB-wide RocksDB statistics tickers through `zinder_store_rocksdb_ticker`,
+  labeled by the upstream ticker name and `store_role`. The exported set covers
+  Bloom filter useful/full-positive/full-true-positive counts, block-cache
+  data/index/filter hits and misses, MultiGet call/key/byte counts, total bytes
+  read and written, stall micros, and compaction bytes read and written. Each
+  ticker aggregates across all column families of one store; the Bloom entries
+  reflect only `transparent_output` because it is the sole filtered column
+  family.
 - Resource-footprint sampling cadence. The sweep that publishes the property,
   WAL, block-cache, memtable, and I/O-mode gauges runs on the write path but is
   throttled to at most once per second, so a burst of small commits (one per

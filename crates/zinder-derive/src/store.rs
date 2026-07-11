@@ -348,6 +348,7 @@ pub struct DeriveStore {
     is_secondary: bool,
     block_cache: Cache,
     write_buffer_manager: rust_rocksdb::WriteBufferManager,
+    statistics: Arc<Options>,
     io_mode: RocksDbIoMode,
     resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
 }
@@ -464,6 +465,7 @@ impl DeriveStore {
             is_secondary: false,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
+            statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
@@ -534,6 +536,7 @@ impl DeriveStore {
             is_secondary: true,
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
+            statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
@@ -1670,6 +1673,7 @@ impl DeriveStore {
             column_family_names: &column_family_names,
             block_cache: &self.block_cache,
             write_buffer_manager: &self.write_buffer_manager,
+            statistics: &self.statistics,
             io_mode: self.io_mode,
             resource_budget: self.rocksdb_resource_budget,
         });
