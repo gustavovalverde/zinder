@@ -881,7 +881,7 @@ mod tests {
         SourceChainSegmentLimits, SourceChainSegmentStats, SourceError, SourceSubtreeRoot,
         SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
-    use zinder_store::ChainEventHistoryRequest;
+    use zinder_store::{ChainEventHistoryRequest, StoreReadCaller};
 
     use crate::ArtifactDeriveError;
 
@@ -1207,6 +1207,7 @@ mod tests {
             prepared.prefetched_spent_transparent_outputs,
             store
                 .transparent_outputs_by_outpoints_for_writer_commit(
+                    StoreReadCaller::BlockPrefetch,
                     store
                         .current_chain_epoch()?
                         .ok_or("missing current epoch")?,

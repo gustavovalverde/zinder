@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, fs, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
@@ -32,6 +38,71 @@ impl RocksDbIoMode {
         match self {
             Self::Direct => "direct",
             Self::Buffered => "buffered",
+        }
+    }
+}
+
+/// Pipeline stage that issued a canonical-store read.
+///
+/// Carried by a read view or snapshot at construction so
+/// `zinder_store_read_duration_seconds` and the `multi_get` key counters
+/// attribute I/O to the stage that drove it. The set is fixed so the metric
+/// label stays bounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreReadCaller {
+    /// Public read paths (`zinder-query`, `zinder-explorer`) and any read not
+    /// attributed to a more specific stage.
+    Query,
+    /// Bulk-catchup block-prepare spent-transparent-output prefetch.
+    BlockPrefetch,
+    /// Writer-commit spend-fact resolution and reorg-window projection repairs.
+    CommitFallback,
+    /// Safe-tip retention sweep scans.
+    RetentionSweep,
+    /// Derive-replay spend-fact and block/transaction hydration.
+    DeriveHydration,
+}
+
+impl StoreReadCaller {
+    /// Stable label used in metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::BlockPrefetch => "block_prefetch",
+            Self::CommitFallback => "commit_fallback",
+            Self::RetentionSweep => "retention_sweep",
+            Self::DeriveHydration => "derive_hydration",
+        }
+    }
+}
+
+/// Store domain and open posture used to label `RocksDB` resource gauges.
+///
+/// The canonical chain store and the derive store share one process, so the
+/// cache, memtable, WAL, and per-CF gauges carry a `store_role` label to keep
+/// their resident footprints distinguishable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreRole {
+    /// Canonical chain store opened as the primary writer.
+    CanonicalPrimary,
+    /// Canonical chain store opened as a secondary reader.
+    CanonicalSecondary,
+    /// Derive store opened as the primary writer.
+    DerivePrimary,
+    /// Derive store opened as a secondary reader.
+    DeriveSecondary,
+}
+
+impl StoreRole {
+    /// Stable label used in metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalPrimary => "canonical_primary",
+            Self::CanonicalSecondary => "canonical_secondary",
+            Self::DerivePrimary => "derive_primary",
+            Self::DeriveSecondary => "derive_secondary",
         }
     }
 }
@@ -250,6 +321,7 @@ pub(crate) struct RocksChainStore {
     write_buffer_manager: WriteBufferManager,
     io_mode: RocksDbIoMode,
     resource_budget: RocksDbResourceBudget,
+    store_role: StoreRole,
 }
 
 impl RocksChainStore {
@@ -278,6 +350,7 @@ impl RocksChainStore {
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
+            store_role: StoreRole::CanonicalPrimary,
         };
         store.record_rocksdb_properties();
 
@@ -311,6 +384,7 @@ impl RocksChainStore {
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
             resource_budget: rocksdb_resource_budget,
+            store_role: StoreRole::CanonicalSecondary,
         };
         store.record_rocksdb_properties();
 
@@ -323,6 +397,7 @@ impl RocksChainStore {
 
     pub(crate) fn get(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         key: &StoreKey,
     ) -> Result<Option<Vec<u8>>, StoreError> {
@@ -332,28 +407,39 @@ impl RocksChainStore {
             .db
             .get_cf(&column_family, key.as_bytes())
             .map_err(StoreError::storage_unavailable);
-        record_store_read_outcome("get", table, started_at, &read_outcome);
+        record_store_read_outcome("get", caller, table, started_at, &read_outcome);
 
         read_outcome
     }
 
-    pub(crate) fn snapshot(&self) -> RocksChainStoreSnapshot<'_> {
+    pub(crate) fn snapshot(&self, caller: StoreReadCaller) -> RocksChainStoreSnapshot<'_> {
         RocksChainStoreSnapshot {
             store: self,
             snapshot: Snapshot::new(self.db.as_ref()),
+            caller,
         }
     }
 
-    pub(crate) fn direct_read_view(&self) -> RocksChainStoreReadView<'_> {
-        RocksChainStoreReadView::Direct(self)
+    pub(crate) fn direct_read_view_for(
+        &self,
+        caller: StoreReadCaller,
+    ) -> RocksChainStoreReadView<'_> {
+        RocksChainStoreReadView::Direct {
+            store: self,
+            caller,
+        }
     }
 
-    pub(crate) fn snapshot_read_view(&self) -> RocksChainStoreReadView<'_> {
-        RocksChainStoreReadView::Snapshot(self.snapshot())
+    pub(crate) fn snapshot_read_view_for(
+        &self,
+        caller: StoreReadCaller,
+    ) -> RocksChainStoreReadView<'_> {
+        RocksChainStoreReadView::Snapshot(self.snapshot(caller))
     }
 
     pub(crate) fn multi_get(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
@@ -365,13 +451,14 @@ impl RocksChainStore {
             .into_iter()
             .map(|rocksdb_result| rocksdb_result.map_err(StoreError::storage_unavailable))
             .collect();
-        record_store_multi_get_outcome(table, started_at, keys.len(), &read_outcome);
+        record_store_multi_get_outcome(caller, table, started_at, keys.len(), &read_outcome);
 
         read_outcome
     }
 
     pub(crate) fn sorted_multi_get(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
@@ -387,13 +474,14 @@ impl RocksChainStore {
                     .map_err(StoreError::storage_unavailable)
             })
             .collect();
-        record_store_multi_get_outcome(table, started_at, keys.len(), &read_outcome);
+        record_store_multi_get_outcome(caller, table, started_at, keys.len(), &read_outcome);
 
         read_outcome
     }
 
     pub(crate) fn get_previous_by_prefix(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
@@ -420,13 +508,14 @@ impl RocksChainStore {
 
             Ok(Some(index_value.to_vec()))
         })();
-        record_store_read_outcome("seek_for_prev", table, started_at, &read_outcome);
+        record_store_read_outcome("seek_for_prev", caller, table, started_at, &read_outcome);
 
         read_outcome
     }
 
     pub(crate) fn scan_prefix(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         prefix: &StoreKey,
         visit: PrefixScanVisitor<'_>,
@@ -453,13 +542,14 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
 
     pub(crate) fn scan_prefix_reverse(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         prefix: &StoreKey,
         visit: PrefixScanVisitor<'_>,
@@ -494,13 +584,14 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
 
     pub(crate) fn scan_forward(
         &self,
+        caller: StoreReadCaller,
         table: StorageTable,
         start_key: &StoreKey,
         visit: PrefixScanVisitor<'_>,
@@ -524,7 +615,7 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -701,28 +792,6 @@ impl RocksChainStore {
             .map_err(|source| StoreError::checkpoint_unavailable(path.as_ref(), source))
     }
 
-    /// Walks the on-disk WAL files and returns their combined size in
-    /// bytes. Returns `None` when the store path is unreadable; the metric
-    /// scrape treats that as "no sample" rather than failing closed.
-    fn wal_size_bytes(&self) -> Option<u64> {
-        let entries = fs::read_dir(self.db.path()).ok()?;
-        let mut total_bytes = 0_u64;
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let Some(extension) = entry_path.extension().and_then(|ext| ext.to_str()) else {
-                continue;
-            };
-            if !extension.eq_ignore_ascii_case("log") {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            total_bytes = total_bytes.saturating_add(metadata.len());
-        }
-        Some(total_bytes)
-    }
-
     #[cfg(test)]
     pub(crate) fn delete(&self, table: StorageTable, key: &StoreKey) -> Result<(), StoreError> {
         let column_family = self.column_family(table)?;
@@ -746,42 +815,170 @@ impl RocksChainStore {
     }
 
     fn record_rocksdb_properties(&self) {
-        for table in StorageTable::all() {
-            let Ok(column_family) = self.column_family(table) else {
+        let column_family_names = StorageTable::all()
+            .into_iter()
+            .map(StorageTable::column_family_name)
+            .collect::<Vec<_>>();
+        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
+            db: &self.db,
+            store_role: self.store_role,
+            column_family_names: &column_family_names,
+            block_cache: &self.block_cache,
+            write_buffer_manager: &self.write_buffer_manager,
+            io_mode: self.io_mode,
+            resource_budget: self.resource_budget,
+        });
+    }
+}
+
+/// Inputs for [`record_rocksdb_resource_gauges`].
+pub struct RocksDbResourceGaugeInputs<'sample> {
+    /// Opened database whose properties are sampled.
+    pub db: &'sample DB,
+    /// Store domain and open posture, emitted as the `store_role` label.
+    pub store_role: StoreRole,
+    /// Column families to probe for the per-CF integer properties.
+    pub column_family_names: &'sample [&'static str],
+    /// Shared block cache retained for the database lifetime.
+    pub block_cache: &'sample Cache,
+    /// Shared write-buffer manager retained for the database lifetime.
+    pub write_buffer_manager: &'sample WriteBufferManager,
+    /// Resolved filesystem I/O mode.
+    pub io_mode: RocksDbIoMode,
+    /// Bounded resource budget applied at open.
+    pub resource_budget: RocksDbResourceBudget,
+}
+
+/// Walks the on-disk WAL files and returns their combined size in bytes.
+///
+/// Returns `None` when the store path is unreadable; the metric scrape treats
+/// that as "no sample" rather than failing closed.
+fn wal_size_bytes(db: &DB) -> Option<u64> {
+    let entries = fs::read_dir(db.path()).ok()?;
+    let mut total_bytes = 0_u64;
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Some(extension) = entry_path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !extension.eq_ignore_ascii_case("log") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        total_bytes = total_bytes.saturating_add(metadata.len());
+    }
+    Some(total_bytes)
+}
+
+/// Publishes the bounded-`RocksDB` resource gauges under a `store_role` label.
+///
+/// Shared by the canonical chain store and the derive store so both instances
+/// contribute distinguishable cache, memtable, WAL, and per-CF footprints to
+/// the same series. `store_role` keeps the aggregate resident set attributable
+/// to each instance.
+pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
+    let store_role = inputs.store_role.as_str();
+    for cf_name in inputs.column_family_names {
+        let Some(column_family) = inputs.db.cf_handle(cf_name) else {
+            continue;
+        };
+        for property in PER_CF_INT_PROPERTIES {
+            let Ok(Some(property_sample)) =
+                inputs.db.property_int_value_cf(&column_family, property)
+            else {
                 continue;
             };
-            for property in PER_CF_INT_PROPERTIES {
-                let Ok(Some(property_sample)) =
-                    self.db.property_int_value_cf(&column_family, property)
-                else {
-                    continue;
-                };
-                metrics::gauge!(
-                    "zinder_store_rocksdb_property",
-                    "property" => property,
-                    "cf" => table.column_family_name()
-                )
-                .set(u64_to_f64(property_sample));
-            }
+            metrics::gauge!(
+                "zinder_store_rocksdb_property",
+                "property" => property,
+                "cf" => *cf_name,
+                "store_role" => store_role
+            )
+            .set(u64_to_f64(property_sample));
         }
-        if let Some(wal_bytes) = self.wal_size_bytes() {
-            metrics::gauge!("zinder_store_wal_bytes").set(u64_to_f64(wal_bytes));
-        }
-        metrics::gauge!("zinder_store_wal_bytes_limit")
-            .set(u64_to_f64(self.resource_budget.max_wal_bytes));
-        metrics::gauge!("zinder_store_block_cache_capacity_bytes")
-            .set(u64_to_f64(self.resource_budget.block_cache_bytes));
-        metrics::gauge!("zinder_store_block_cache_usage_bytes")
-            .set(usize_to_f64(self.block_cache.get_usage()));
-        metrics::gauge!("zinder_store_memtable_budget_bytes")
-            .set(usize_to_f64(self.write_buffer_manager.get_buffer_size()));
-        metrics::gauge!("zinder_store_memtable_budget_usage_bytes")
-            .set(usize_to_f64(self.write_buffer_manager.get_usage()));
+    }
+    for property in DB_INT_PROPERTIES {
+        let Ok(Some(property_sample)) = inputs.db.property_int_value(property) else {
+            continue;
+        };
         metrics::gauge!(
-            "zinder_store_rocksdb_io_mode",
-            "mode" => self.io_mode.as_str()
+            "zinder_store_rocksdb_property",
+            "property" => property,
+            "cf" => DB_LEVEL_PROPERTY_CF,
+            "store_role" => store_role
         )
-        .set(1.0);
+        .set(u64_to_f64(property_sample));
+    }
+    if let Some(wal_bytes) = wal_size_bytes(inputs.db) {
+        metrics::gauge!("zinder_store_wal_bytes", "store_role" => store_role)
+            .set(u64_to_f64(wal_bytes));
+    }
+    metrics::gauge!("zinder_store_wal_bytes_limit", "store_role" => store_role)
+        .set(u64_to_f64(inputs.resource_budget.max_wal_bytes));
+    metrics::gauge!("zinder_store_block_cache_capacity_bytes", "store_role" => store_role)
+        .set(u64_to_f64(inputs.resource_budget.block_cache_bytes));
+    metrics::gauge!("zinder_store_block_cache_usage_bytes", "store_role" => store_role)
+        .set(usize_to_f64(inputs.block_cache.get_usage()));
+    metrics::gauge!("zinder_store_memtable_budget_bytes", "store_role" => store_role)
+        .set(usize_to_f64(inputs.write_buffer_manager.get_buffer_size()));
+    metrics::gauge!("zinder_store_memtable_budget_usage_bytes", "store_role" => store_role)
+        .set(usize_to_f64(inputs.write_buffer_manager.get_usage()));
+    metrics::gauge!(
+        "zinder_store_rocksdb_io_mode",
+        "mode" => inputs.io_mode.as_str(),
+        "store_role" => store_role
+    )
+    .set(1.0);
+}
+
+/// Sampling cadence for the resource-gauge sweep on the write path.
+///
+/// Sits below the 15s Prometheus scrape interval so scrapes always read a
+/// fresh sample while a commit burst probes the sweep at most once per second.
+const RESOURCE_GAUGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Rate-limits the `RocksDB` resource-gauge sweep so a burst of small commits
+/// probes every property at most once per interval instead of once per write.
+///
+/// The sweep in [`record_rocksdb_resource_gauges`] acquires the `RocksDB` DB
+/// mutex for per-column-family properties and reads the WAL directory, so
+/// running it per commit couples that cost to write rate on a store whose
+/// smallest write unit is a single mempool event.
+pub struct ResourceGaugeThrottle {
+    interval: Duration,
+    last_sampled_at: Mutex<Option<Instant>>,
+}
+
+impl ResourceGaugeThrottle {
+    /// Builds a throttle that admits one sample per `interval`.
+    #[must_use]
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_sampled_at: Mutex::new(None),
+        }
+    }
+
+    /// Returns `true` when a sweep is due, recording the sample instant.
+    ///
+    /// The first call always admits; a later call admits only once `interval`
+    /// has elapsed since the last admitted sample.
+    pub fn should_sample(&self) -> bool {
+        let now = Instant::now();
+        let mut last_sampled_at = self.last_sampled_at.lock();
+        if last_sampled_at.is_some_and(|previous| now.duration_since(previous) < self.interval) {
+            return false;
+        }
+        *last_sampled_at = Some(now);
+        true
+    }
+}
+
+impl Default for ResourceGaugeThrottle {
+    fn default() -> Self {
+        Self::new(RESOURCE_GAUGE_SAMPLE_INTERVAL)
     }
 }
 
@@ -938,7 +1135,7 @@ fn key_suffix(key: &[u8]) -> &[u8] {
 
 impl RocksChainStoreRead for RocksChainStore {
     fn get(&self, table: StorageTable, key: &StoreKey) -> Result<Option<Vec<u8>>, StoreError> {
-        Self::get(self, table, key)
+        Self::get(self, StoreReadCaller::Query, table, key)
     }
 
     fn multi_get(
@@ -946,7 +1143,7 @@ impl RocksChainStoreRead for RocksChainStore {
         table: StorageTable,
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        Self::multi_get(self, table, keys)
+        Self::multi_get(self, StoreReadCaller::Query, table, keys)
     }
 
     fn sorted_multi_get(
@@ -954,7 +1151,7 @@ impl RocksChainStoreRead for RocksChainStore {
         table: StorageTable,
         keys: &[StoreKey],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        Self::sorted_multi_get(self, table, keys)
+        Self::sorted_multi_get(self, StoreReadCaller::Query, table, keys)
     }
 
     fn get_previous_by_prefix(
@@ -963,7 +1160,7 @@ impl RocksChainStoreRead for RocksChainStore {
         prefix: &StoreKey,
         seek_key: &StoreKey,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        Self::get_previous_by_prefix(self, table, prefix, seek_key)
+        Self::get_previous_by_prefix(self, StoreReadCaller::Query, table, prefix, seek_key)
     }
 
     fn scan_prefix(
@@ -972,7 +1169,7 @@ impl RocksChainStoreRead for RocksChainStore {
         prefix: &StoreKey,
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
-        Self::scan_prefix(self, table, prefix, visit)
+        Self::scan_prefix(self, StoreReadCaller::Query, table, prefix, visit)
     }
 
     fn scan_prefix_reverse(
@@ -981,7 +1178,7 @@ impl RocksChainStoreRead for RocksChainStore {
         prefix: &StoreKey,
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
-        Self::scan_prefix_reverse(self, table, prefix, visit)
+        Self::scan_prefix_reverse(self, StoreReadCaller::Query, table, prefix, visit)
     }
 
     fn scan_forward(
@@ -990,25 +1187,29 @@ impl RocksChainStoreRead for RocksChainStore {
         start_key: &StoreKey,
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
-        Self::scan_forward(self, table, start_key, visit)
+        Self::scan_forward(self, StoreReadCaller::Query, table, start_key, visit)
     }
 }
 
 pub(crate) struct RocksChainStoreSnapshot<'store> {
     store: &'store RocksChainStore,
     snapshot: Snapshot<'store>,
+    caller: StoreReadCaller,
 }
 
 pub(crate) enum RocksChainStoreReadView<'store> {
     Snapshot(RocksChainStoreSnapshot<'store>),
-    Direct(&'store RocksChainStore),
+    Direct {
+        store: &'store RocksChainStore,
+        caller: StoreReadCaller,
+    },
 }
 
 impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     fn get(&self, table: StorageTable, key: &StoreKey) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.get(table, key),
-            Self::Direct(store) => store.get(table, key),
+            Self::Direct { store, caller } => store.get(*caller, table, key),
         }
     }
 
@@ -1019,7 +1220,7 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.multi_get(table, keys),
-            Self::Direct(store) => store.multi_get(table, keys),
+            Self::Direct { store, caller } => store.multi_get(*caller, table, keys),
         }
     }
 
@@ -1030,7 +1231,7 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.multi_get(table, keys),
-            Self::Direct(store) => store.sorted_multi_get(table, keys),
+            Self::Direct { store, caller } => store.sorted_multi_get(*caller, table, keys),
         }
     }
 
@@ -1042,7 +1243,9 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.get_previous_by_prefix(table, prefix, seek_key),
-            Self::Direct(store) => store.get_previous_by_prefix(table, prefix, seek_key),
+            Self::Direct { store, caller } => {
+                store.get_previous_by_prefix(*caller, table, prefix, seek_key)
+            }
         }
     }
 
@@ -1054,7 +1257,7 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<(), StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_prefix(table, prefix, visit),
-            Self::Direct(store) => store.scan_prefix(table, prefix, visit),
+            Self::Direct { store, caller } => store.scan_prefix(*caller, table, prefix, visit),
         }
     }
 
@@ -1066,7 +1269,9 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<(), StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_prefix_reverse(table, prefix, visit),
-            Self::Direct(store) => store.scan_prefix_reverse(table, prefix, visit),
+            Self::Direct { store, caller } => {
+                store.scan_prefix_reverse(*caller, table, prefix, visit)
+            }
         }
     }
 
@@ -1078,7 +1283,7 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
     ) -> Result<(), StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_forward(table, start_key, visit),
-            Self::Direct(store) => store.scan_forward(table, start_key, visit),
+            Self::Direct { store, caller } => store.scan_forward(*caller, table, start_key, visit),
         }
     }
 }
@@ -1091,7 +1296,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             .snapshot
             .get_cf(&column_family, key.as_bytes())
             .map_err(StoreError::storage_unavailable);
-        record_store_read_outcome("get", table, started_at, &read_outcome);
+        record_store_read_outcome("get", self.caller, table, started_at, &read_outcome);
 
         read_outcome
     }
@@ -1109,7 +1314,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             .into_iter()
             .map(|rocksdb_result| rocksdb_result.map_err(StoreError::storage_unavailable))
             .collect();
-        record_store_multi_get_outcome(table, started_at, keys.len(), &read_outcome);
+        record_store_multi_get_outcome(self.caller, table, started_at, keys.len(), &read_outcome);
 
         read_outcome
     }
@@ -1142,7 +1347,13 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
 
             Ok(Some(index_value.to_vec()))
         })();
-        record_store_read_outcome("seek_for_prev", table, started_at, &read_outcome);
+        record_store_read_outcome(
+            "seek_for_prev",
+            self.caller,
+            table,
+            started_at,
+            &read_outcome,
+        );
 
         read_outcome
     }
@@ -1174,7 +1385,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -1215,7 +1426,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -1244,7 +1455,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(table, started_at, &scan_outcome);
+        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -1268,8 +1479,19 @@ const PER_CF_INT_PROPERTIES: [&str; 7] = [
     "rocksdb.num-running-compactions",
 ];
 
+/// Write-controller properties reported by the whole database instance rather
+/// than per column family.
+const DB_INT_PROPERTIES: [&str; 2] = [
+    "rocksdb.actual-delayed-write-rate",
+    "rocksdb.is-write-stopped",
+];
+
+/// `cf` label value for DB-level properties, which have no owning column family.
+const DB_LEVEL_PROPERTY_CF: &str = "__db__";
+
 fn record_store_read_outcome(
     operation: &'static str,
+    caller: StoreReadCaller,
     table: StorageTable,
     started_at: Instant,
     read_outcome: &Result<Option<Vec<u8>>, StoreError>,
@@ -1278,6 +1500,7 @@ fn record_store_read_outcome(
         "zinder_store_read_duration_seconds",
         "operation" => operation,
         "table" => table.column_family_name(),
+        "caller" => caller.as_str(),
         "status" => outcome_status(read_outcome)
     )
     .record(started_at.elapsed());
@@ -1293,6 +1516,7 @@ fn record_store_read_outcome(
 }
 
 fn record_store_multi_get_outcome(
+    caller: StoreReadCaller,
     table: StorageTable,
     started_at: Instant,
     key_count: usize,
@@ -1302,6 +1526,7 @@ fn record_store_multi_get_outcome(
         "zinder_store_read_duration_seconds",
         "operation" => "multi_get",
         "table" => table.column_family_name(),
+        "caller" => caller.as_str(),
         "status" => outcome_status(read_outcome)
     )
     .record(started_at.elapsed());
@@ -1311,8 +1536,21 @@ fn record_store_multi_get_outcome(
         "status" => outcome_status(read_outcome)
     )
     .record(usize_to_u32_saturating(key_count));
+    metrics::counter!(
+        "zinder_store_multi_get_keys_total",
+        "table" => table.column_family_name(),
+        "caller" => caller.as_str()
+    )
+    .increment(usize_to_u64(key_count));
 
     if let Ok(read_items) = read_outcome {
+        let resolved_count = read_items.iter().filter(|row| row.is_some()).count();
+        metrics::counter!(
+            "zinder_store_multi_get_resolved_total",
+            "table" => table.column_family_name(),
+            "caller" => caller.as_str()
+        )
+        .increment(usize_to_u64(resolved_count));
         let byte_count = read_items
             .iter()
             .flatten()
@@ -1328,6 +1566,7 @@ fn record_store_multi_get_outcome(
 }
 
 fn record_store_scan_outcome(
+    caller: StoreReadCaller,
     table: StorageTable,
     started_at: Instant,
     scan_outcome: &Result<(), StoreError>,
@@ -1336,6 +1575,7 @@ fn record_store_scan_outcome(
         "zinder_store_read_duration_seconds",
         "operation" => "scan_prefix",
         "table" => table.column_family_name(),
+        "caller" => caller.as_str(),
         "status" => outcome_status(scan_outcome)
     )
     .record(started_at.elapsed());
@@ -1480,4 +1720,24 @@ pub(crate) struct StoragePut {
 pub(crate) struct StorageDelete {
     pub(crate) table: StorageTable,
     pub(crate) key: StoreKey,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_gauge_throttle_admits_first_sample_then_holds_within_interval() {
+        let throttle = ResourceGaugeThrottle::new(Duration::from_hours(1));
+        assert!(throttle.should_sample());
+        assert!(!throttle.should_sample());
+        assert!(!throttle.should_sample());
+    }
+
+    #[test]
+    fn resource_gauge_throttle_readmits_after_interval() {
+        let throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        assert!(throttle.should_sample());
+        assert!(throttle.should_sample());
+    }
 }

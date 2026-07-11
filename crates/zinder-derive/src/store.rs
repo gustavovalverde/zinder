@@ -25,8 +25,9 @@ use rust_rocksdb::{
 };
 use zinder_core::{BlockHeight, ChainEpoch};
 use zinder_store::{
-    ChainEvent, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, open_bounded_rocksdb,
+    ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
+    RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory, open_bounded_rocksdb,
+    record_rocksdb_resource_gauges,
 };
 
 use crate::{
@@ -348,6 +349,7 @@ pub struct DeriveStore {
     block_cache: Cache,
     write_buffer_manager: rust_rocksdb::WriteBufferManager,
     io_mode: RocksDbIoMode,
+    resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
 }
 
 impl fmt::Debug for DeriveStore {
@@ -370,7 +372,7 @@ impl fmt::Debug for DeriveStore {
                 "memtable_budget_usage_bytes",
                 &self.write_buffer_manager.get_usage(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -463,9 +465,11 @@ impl DeriveStore {
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
+            resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
         store.validate_or_initialize_store_format_version()?;
         store.reconcile_consumer_schemas()?;
+        store.record_rocksdb_properties();
         Ok(store)
     }
 
@@ -531,9 +535,11 @@ impl DeriveStore {
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             io_mode: bounded_open.io_mode,
+            resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
         };
         store.require_matching_store_format_version()?;
         store.validate_secondary_consumer_schemas()?;
+        store.record_rocksdb_properties();
         Ok(store)
     }
 
@@ -1638,7 +1644,35 @@ impl DeriveStore {
     fn write(&self, batch: &WriteBatch) -> Result<(), rust_rocksdb::Error> {
         let mut write_options = WriteOptions::default();
         write_options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &write_options)
+        self.db.write_opt(batch, &write_options)?;
+        if self.resource_gauge_throttle.should_sample() {
+            self.record_rocksdb_properties();
+        }
+        Ok(())
+    }
+
+    fn record_rocksdb_properties(&self) {
+        let mut column_family_names = DeriveStoreTable::all()
+            .into_iter()
+            .map(DeriveStoreTable::column_family_name)
+            .collect::<Vec<_>>();
+        for consumer in self.consumers {
+            column_family_names.extend_from_slice(consumer.column_families);
+        }
+        let store_role = if self.is_secondary {
+            StoreRole::DeriveSecondary
+        } else {
+            StoreRole::DerivePrimary
+        };
+        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
+            db: &self.db,
+            store_role,
+            column_family_names: &column_family_names,
+            block_cache: &self.block_cache,
+            write_buffer_manager: &self.write_buffer_manager,
+            io_mode: self.io_mode,
+            resource_budget: self.rocksdb_resource_budget,
+        });
     }
 }
 

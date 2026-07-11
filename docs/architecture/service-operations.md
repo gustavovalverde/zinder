@@ -128,6 +128,7 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before a derive tailer catch-up pass. |
 | `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store by the tailer. |
 | `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between replay progress and canonical tip. |
+| `zinder_ingest_canonical_lag_blocks` | gauge | `zinder-ingest` | Chain-catchup lag between the upstream tip and the canonical writer tip, saturating at zero. Distinct from `zinder_ingest_derive_replay_lag_blocks`, which measures derive-vs-canonical freshness, not chain catchup. |
 | `zinder_ingest_derive_replay_budget_state` | gauge | `zinder-ingest` | Current derive replay memory-budget state by state label: `normal`, `degraded`, or `paused`. |
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
 | `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
@@ -179,14 +180,17 @@ Implemented baseline metrics:
 | `zinder_query_writer_status_chain_epoch_id` | gauge | `zinder-query` | Latest writer chain-epoch id observed through writer status. |
 | `zinder_query_writer_status_tip_height` | gauge | `zinder-query` | Latest writer tip height observed through writer status. |
 | `zinder_query_writer_status_safe_tip_height` | gauge | `zinder-query` | Latest writer safe tip height observed through writer status. |
-| `zinder_store_read_duration_seconds` | histogram | `zinder-store` | RocksDB read latency by operation, column family, and status. |
+| `zinder_store_read_duration_seconds` | histogram | `zinder-store` | RocksDB read latency by operation, column family, caller, and status. The `caller` label attributes the read to the pipeline stage that issued it: `query`, `block_prefetch`, `commit_fallback`, `retention_sweep`, or `derive_hydration`. |
 | `zinder_store_read_bytes_total` | counter | `zinder-store` | Bytes returned from successful RocksDB reads. |
 | `zinder_store_multi_get_key_count` | histogram | `zinder-store` | Key fanout for `multi_get` reads. |
+| `zinder_store_multi_get_keys_total` | counter | `zinder-store` | Requested `multi_get` keys by column family and caller. Denominator for serial-seek wall-time analysis under concurrency. |
+| `zinder_store_multi_get_resolved_total` | counter | `zinder-store` | Resolved (non-empty) `multi_get` rows by column family and caller. |
 | `zinder_store_write_batch_duration_seconds` | histogram | `zinder-store` | RocksDB write-batch latency by status. |
 | `zinder_store_write_batch_rows_total` | counter | `zinder-store` | Write-batch row count by put/delete kind and column family. |
 | `zinder_store_write_batch_bytes_total` | counter | `zinder-store` | Write-batch payload bytes by put/delete kind and column family. |
 | `zinder_store_visibility_seek_total` | counter | `zinder-store` | Visibility-index reverse seeks by artifact family. |
-| `zinder_store_rocksdb_property` | gauge | `zinder-store` | Curated RocksDB integer properties by column family and property name. |
+| `zinder_store_rocksdb_property` | gauge | `zinder-store` | Curated RocksDB integer properties by column family, property name, and store role. The `store_role` label separates the canonical and derive stores that share the process (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`). DB-level write-controller properties (`rocksdb.actual-delayed-write-rate`, `rocksdb.is-write-stopped`) carry `cf="__db__"`. |
+| `zinder_store_wal_bytes`, `zinder_store_wal_bytes_limit`, `zinder_store_block_cache_capacity_bytes`, `zinder_store_block_cache_usage_bytes`, `zinder_store_memtable_budget_bytes`, `zinder_store_memtable_budget_usage_bytes`, `zinder_store_rocksdb_io_mode` | gauge | `zinder-store` | Bounded-RocksDB resource footprints, each labeled by `store_role` so the canonical and derive stores are attributable within one process. |
 | `zinder_mempool_hydration_failures_total` | counter | `zinder-source` | Mempool `Added` observations the source could not hydrate by reason (transient JSON-RPC failure, payload too large, unknown txid races). |
 | `zinder_mempool_source_errors_total` | counter | `zinder-source` | Mempool source error items by kind (`stream_item`, `connect`); a non-zero rate is the input signal for `mempool_source_unavailable` readiness. |
 | `zinder_mempool_events_pruned_total` | counter | `zinder-store` | Mempool events pruned by the retention worker by kind (`added`, `invalidated`, `mined`); the cumulative health signal for two-tier retention. |

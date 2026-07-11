@@ -38,7 +38,7 @@ use zinder_derive::{
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
-    PrimaryChainStore, RocksDbResourceBudget, StreamCursorTokenV1,
+    PrimaryChainStore, RocksDbResourceBudget, StoreReadCaller, StreamCursorTokenV1,
 };
 
 use crate::{
@@ -1213,7 +1213,8 @@ fn hydrate_committed_block_replay_batch(
     end_height: BlockHeight,
     effective_limits: EffectiveDeriveReplayLimits,
 ) -> Result<CanonicalReplayBatch, IngestError> {
-    let reader = chain_store.chain_epoch_reader_at(envelope.chain_epoch.id)?;
+    let reader = chain_store
+        .chain_epoch_reader_at_for(StoreReadCaller::DeriveHydration, envelope.chain_epoch.id)?;
     let max_blocks = usize::try_from(effective_limits.batch_blocks).unwrap_or(usize::MAX);
     if max_blocks == 0 {
         return Err(IngestError::DeriveDispatch(
@@ -1290,7 +1291,8 @@ fn hydrate_committed_blocks_for_reorg_event(
     envelope: &ChainEventEnvelope,
     committed_range: BlockHeightRange,
 ) -> Result<Vec<CanonicalReplayBlock>, IngestError> {
-    let reader = chain_store.chain_epoch_reader_at(envelope.chain_epoch.id)?;
+    let reader = chain_store
+        .chain_epoch_reader_at_for(StoreReadCaller::DeriveHydration, envelope.chain_epoch.id)?;
     let mut replay_blocks = Vec::with_capacity(committed_range.into_iter().len());
     for height in committed_range {
         replay_blocks.push(hydrate_committed_block(&reader, envelope, height)?);
@@ -1562,7 +1564,8 @@ async fn resolve_spend_facts_concurrently(
         let chunk = chunk.to_vec();
         let store = chain_store.clone();
         handles.push(tokio::task::spawn_blocking(move || {
-            let reader = store.chain_epoch_reader_at(chain_epoch_id)?;
+            let reader = store
+                .chain_epoch_reader_at_for(StoreReadCaller::DeriveHydration, chain_epoch_id)?;
             if finalized {
                 reader.current_transparent_spend_facts_by_outpoints(&chunk)
             } else {

@@ -1,8 +1,9 @@
 mod rocksdb;
 
 pub use rocksdb::{
-    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, build_block_based_table_factory,
-    open_bounded_rocksdb,
+    BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
+    RocksDbResourceGaugeInputs, StoreReadCaller, StoreRole, build_block_based_table_factory,
+    open_bounded_rocksdb, record_rocksdb_resource_gauges,
 };
 pub(crate) use rocksdb::{
     MergedTableRow, PrefixScanControl, RocksChainStore, RocksChainStoreRead,

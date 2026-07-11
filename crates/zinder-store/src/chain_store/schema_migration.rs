@@ -25,7 +25,9 @@ use crate::{
         StoreKey, decode_transparent_output_artifact, decode_transparent_spend_fact,
         encode_address_output_index_artifact, encode_chain_epoch,
     },
-    kv::{MergedTableRow, RocksChainStore, StorageDelete, StoragePut, StorageTable},
+    kv::{
+        MergedTableRow, RocksChainStore, StorageDelete, StoragePut, StorageTable, StoreReadCaller,
+    },
 };
 
 use super::{
@@ -40,7 +42,9 @@ const TRANSPARENT_ADDRESS_TX_INDEX_COLUMN_FAMILY: &str = "transparent_address_tx
 
 pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<(), StoreError> {
     let key = StoreKey::store_metadata();
-    let Some(metadata_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
+    let Some(metadata_bytes) =
+        inner.get(StoreReadCaller::Query, StorageTable::StorageControl, &key)?
+    else {
         return Ok(());
     };
     let metadata = decode_store_metadata(&key, &metadata_bytes)?;
@@ -522,8 +526,11 @@ mod tests {
             options.rocksdb_resource_budget,
         )?;
 
-        let metadata_bytes =
-            inner.get(StorageTable::StorageControl, &StoreKey::store_metadata())?;
+        let metadata_bytes = inner.get(
+            StoreReadCaller::Query,
+            StorageTable::StorageControl,
+            &StoreKey::store_metadata(),
+        )?;
         assert!(metadata_bytes.is_some());
         if let Some(metadata_bytes) = metadata_bytes {
             let metadata = decode_store_metadata(&StoreKey::store_metadata(), &metadata_bytes)?;
@@ -587,6 +594,7 @@ mod tests {
         let prefix = StoreKey::address_output_index_prefix(NETWORK, ADDRESS_SCRIPT_HASH);
         let mut keys = Vec::new();
         inner.scan_prefix(
+            StoreReadCaller::Query,
             StorageTable::AddressOutputIndex,
             &prefix,
             &mut |key_bytes, _| {

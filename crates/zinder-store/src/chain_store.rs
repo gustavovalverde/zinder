@@ -46,7 +46,7 @@ use crate::{
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
-        StorageTable,
+        StorageTable, StoreReadCaller,
     },
     transparent_output::read_current_transparent_outputs_by_outpoints,
     transparent_spend_fact::{
@@ -555,6 +555,16 @@ impl PrimaryChainStore {
         self.store.chain_epoch_reader_at(chain_epoch)
     }
 
+    /// Opens a reader pinned to a specific chain epoch, attributing its reads
+    /// to `caller`.
+    pub fn chain_epoch_reader_at_for(
+        &self,
+        caller: StoreReadCaller,
+        chain_epoch: ChainEpochId,
+    ) -> Result<ChainEpochReader<'_>, StoreError> {
+        self.store.chain_epoch_reader_at_for(caller, chain_epoch)
+    }
+
     /// Resolves transparent outputs on the primary writer's direct read path.
     ///
     /// This skips snapshot pinning and visibility filtering because the writer
@@ -562,11 +572,12 @@ impl PrimaryChainStore {
     /// visible epoch. External readers must use [`ChainEpochReader`] instead.
     pub fn transparent_outputs_by_outpoints_for_writer_commit(
         &self,
+        caller: StoreReadCaller,
         chain_epoch: ChainEpoch,
         outpoints: &[TransparentOutPoint],
     ) -> Result<HashMap<TransparentOutPoint, TransparentOutputArtifact>, StoreError> {
         read_current_transparent_outputs_by_outpoints(
-            &self.store.inner.direct_read_view(),
+            &self.store.inner.direct_read_view_for(caller),
             chain_epoch,
             outpoints,
         )
@@ -923,7 +934,17 @@ impl ChainStoreInner {
         &self,
         chain_epoch: ChainEpochId,
     ) -> Result<ChainEpochReader<'_>, StoreError> {
-        let read_view = self.read_view();
+        self.chain_epoch_reader_at_for(StoreReadCaller::Query, chain_epoch)
+    }
+
+    /// Opens a reader pinned to a specific chain epoch, attributing its reads
+    /// to `caller`.
+    fn chain_epoch_reader_at_for(
+        &self,
+        caller: StoreReadCaller,
+        chain_epoch: ChainEpochId,
+    ) -> Result<ChainEpochReader<'_>, StoreError> {
+        let read_view = self.read_view_for(caller);
         let chain_epoch = read_chain_epoch(&read_view, chain_epoch)?;
         Ok(ChainEpochReader::at_epoch(chain_epoch, read_view))
     }
@@ -936,6 +957,9 @@ impl ChainStoreInner {
         let precomputed_retention_sweep = self.precompute_retention_sweep(&artifacts)?;
 
         let _control_guard = self.inner.lock_control();
+        let commit_read_view = self
+            .inner
+            .direct_read_view_for(StoreReadCaller::CommitFallback);
         validate_chain_epoch_artifacts(&artifacts)?;
         let store_metadata_put =
             validate_store_metadata_for_commit(&self.inner, artifacts.chain_epoch.network)?;
@@ -961,14 +985,14 @@ impl ChainStoreInner {
             .map(|spend| spend.spent_outpoint)
             .collect::<HashSet<_>>();
         let retention_sweep =
-            if precomputed_retention_sweep.swept_marker_unchanged(self.inner.as_ref())? {
+            if precomputed_retention_sweep.swept_marker_unchanged(&commit_read_view)? {
                 precomputed_retention_sweep
             } else {
                 SafeTipRetentionSweep::empty()
             };
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(&ChainEventEnvelopeInputs {
-            inner: self.inner.as_ref(),
+            inner: &commit_read_view,
             event_sequence,
             committed,
             previous_chain_epoch: current_chain_epoch,
@@ -980,7 +1004,7 @@ impl ChainStoreInner {
             puts.push(store_metadata_put);
         }
         let projection_repairs = build_reorg_window_projection_repairs(
-            self.inner.as_ref(),
+            &commit_read_view,
             TransparentOutputProjectionRepairInputs {
                 previous_chain_epoch: current_chain_epoch,
                 chain_epoch,
@@ -989,7 +1013,7 @@ impl ChainStoreInner {
             },
         )?;
         let spend_projection_repairs = build_reorg_window_spend_fact_projection_repairs(
-            self.inner.as_ref(),
+            &commit_read_view,
             TransparentSpendFactProjectionRepairInputs {
                 previous_chain_epoch: current_chain_epoch,
                 chain_epoch,
@@ -1334,7 +1358,10 @@ impl ChainStoreInner {
         let mut event_sequence = oldest_retained_sequence;
         while event_sequence < current_event_sequence {
             let key = StoreKey::chain_event(event_sequence);
-            let Some(record_bytes) = self.inner.get(StorageTable::ChainEvent, &key)? else {
+            let Some(record_bytes) =
+                self.inner
+                    .get(StoreReadCaller::Query, StorageTable::ChainEvent, &key)?
+            else {
                 event_sequence = event_sequence
                     .checked_add(1)
                     .ok_or(StoreError::ChainEventSequenceOverflow)?;
@@ -1822,9 +1849,13 @@ impl ChainStoreInner {
     }
 
     fn read_view(&self) -> crate::kv::RocksChainStoreReadView<'_> {
+        self.read_view_for(StoreReadCaller::Query)
+    }
+
+    fn read_view_for(&self, caller: StoreReadCaller) -> crate::kv::RocksChainStoreReadView<'_> {
         match self.read_posture {
-            ChainStoreReadPosture::Snapshot => self.inner.snapshot_read_view(),
-            ChainStoreReadPosture::Direct => self.inner.direct_read_view(),
+            ChainStoreReadPosture::Snapshot => self.inner.snapshot_read_view_for(caller),
+            ChainStoreReadPosture::Direct => self.inner.direct_read_view_for(caller),
         }
     }
 
@@ -1840,12 +1871,15 @@ impl ChainStoreInner {
         &self,
         artifacts: &ChainEpochArtifacts,
     ) -> Result<SafeTipRetentionSweep, StoreError> {
+        let sweep_read_view = self
+            .inner
+            .direct_read_view_for(StoreReadCaller::RetentionSweep);
         let scanned_chain_epoch = match self.current_chain_epoch_id()? {
-            Some(chain_epoch_id) => Some(read_chain_epoch(self.inner.as_ref(), chain_epoch_id)?),
+            Some(chain_epoch_id) => Some(read_chain_epoch(&sweep_read_view, chain_epoch_id)?),
             None => None,
         };
         build_safe_tip_retention_sweep(
-            self.inner.as_ref(),
+            &sweep_read_view,
             artifacts,
             scanned_chain_epoch,
             self.options.retention_sweep_max_heights_per_commit,
@@ -2018,7 +2052,9 @@ fn validate_store_metadata_for_commit(
     expected_network: Network,
 ) -> Result<Option<StoragePut>, StoreError> {
     let key = StoreKey::store_metadata();
-    if let Some(metadata_bytes) = inner.get(StorageTable::StorageControl, &key)? {
+    if let Some(metadata_bytes) =
+        inner.get(StoreReadCaller::Query, StorageTable::StorageControl, &key)?
+    {
         let store_metadata = decode_current_store_metadata(&key, &metadata_bytes)?;
         if store_metadata.network != expected_network {
             return Err(StoreError::ChainEpochNetworkMismatch {
@@ -4184,7 +4220,7 @@ mod tests {
             let present = store
                 .store
                 .inner
-                .get(StorageTable::ReorgWindow, key)?
+                .get(StoreReadCaller::Query, StorageTable::ReorgWindow, key)?
                 .is_some();
             assert_eq!(present, expected_present);
         }

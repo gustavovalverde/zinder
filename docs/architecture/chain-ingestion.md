@@ -142,7 +142,7 @@ Source capability detection happens before processing starts. If the selected so
 
 ### Phase transitions
 
-The classifier reads two inputs each iteration: the store's `current_chain_epoch.tip_height` (cached, cheap) and the upstream tip (one `NodeSource::tip_id` call). The decision rule:
+The classifier reads two inputs each iteration: the store's `current_chain_epoch.tip_height` (cached, cheap) and the upstream tip (one `NodeSource::tip_id` call). Their saturating difference is exported as `zinder_ingest_canonical_lag_blocks`, the chain-catchup gauge that sits beside the derive-vs-canonical `zinder_ingest_derive_replay_lag_blocks`. The classifier refreshes it on each iteration; during `TipFollow` the loop parks inside the tip-follow handler, so the phase bounce-back watcher refreshes the same gauge on its poll interval and steady-state lag stays live. The decision rule:
 
 - `gap_blocks > ingest.phases.catchup_threshold_blocks` (defaults to `reorg_window_blocks`): `BulkCatchup`. The source adapter returns bounded `SourceChainSegment`s with up to `ingest.bulk_catchup.source_segment_max_blocks` connected raw blocks, while the writer adapts the requested count from observed source response bytes and consensus-branch changes. Batches are bounded by block count, artifact bytes, and canonical work cost, and the commit transition is `FinalizeThrough { tip_height: target }` against `min(upstream_tip - reorg_window, store_tip + canonical_batch_max_blocks)`.
 - `gap_blocks <= ingest.phases.catchup_threshold_blocks` and upstream tip above the catch-up floor: `TipFollow`. Serial fetches, one block per commit, transition `Extend` or `Replace`. `finalize_tip_if_ready` advances the finalized boundary once a tip is older than `reorg_window_blocks`.

@@ -360,6 +360,8 @@ where
         };
 
         let store_tip = current_chain_height(&store);
+        metrics::gauge!("zinder_ingest_canonical_lag_blocks")
+            .set(canonical_lag_blocks(upstream_tip, store_tip));
         let phase = classify_phase(
             store_tip,
             upstream_tip,
@@ -528,6 +530,8 @@ where
                 continue;
             };
             let store_tip = current_chain_height(&store);
+            metrics::gauge!("zinder_ingest_canonical_lag_blocks")
+                .set(canonical_lag_blocks(tip_id.height.value(), store_tip));
             let phase = classify_phase(store_tip, tip_id.height.value(), catchup_threshold_blocks);
             if !matches!(phase, IngestPhase::FollowingTip) {
                 tracing::info!(
@@ -663,6 +667,14 @@ fn reached_target_height(target: Option<BlockHeight>, store: &PrimaryChainStore)
         return false;
     };
     current >= target.value()
+}
+
+/// Blocks the canonical writer trails the upstream tip by, saturating at zero.
+///
+/// A missing `store_tip` (no committed chain yet) counts as height zero, so the
+/// gap is the full upstream tip.
+fn canonical_lag_blocks(upstream_tip: u32, store_tip: Option<u32>) -> f64 {
+    f64::from(upstream_tip.saturating_sub(store_tip.unwrap_or(0)))
 }
 
 enum CancelOutcome {

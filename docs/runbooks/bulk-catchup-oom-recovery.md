@@ -216,9 +216,9 @@ Stay on the defaults for the four above. The improvements come from the WAL ceil
 The metric set shipped alongside the bounded resource budget catches the trap before it becomes operational:
 
 - `zinder_store_wal_bytes` — sum of `*.log` file sizes inside the store path. Scraped at every commit.
-- `zinder_store_wal_bytes_limit` — the configured `max_wal_bytes`. The alert `ZinderStoreWalGrowth` fires when the ratio exceeds 75% for five minutes.
+- `zinder_store_wal_bytes_limit` — the configured `max_wal_bytes`. The alert `ZinderStoreWalGrowth` fires when the ratio exceeds 75% for five minutes, evaluated per `store_role`.
 - `zinder_store_block_cache_capacity_bytes` and `zinder_store_block_cache_usage_bytes` — block cache size and current usage. These are the canonical signals for cache pressure; the same numbers are not republished as `zinder_store_rocksdb_property` labels.
-- `zinder_store_rocksdb_property` (gauge, labels `property`, `cf`) gained `rocksdb.cur-size-active-mem-table` so an oversized memtable shows up alongside the WAL gauge.
+- `zinder_store_rocksdb_property` (gauge, labels `property`, `cf`, `store_role`) gained `rocksdb.cur-size-active-mem-table` so an oversized memtable shows up alongside the WAL gauge, plus the DB-level write-controller properties `rocksdb.actual-delayed-write-rate` and `rocksdb.is-write-stopped` (reported under `cf="__db__"`) that name a write stall directly. Every resource gauge above carries a `store_role` label (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`); the canonical and derive stores share the process, so sum across `store_role` for total footprint and split by it to attribute pressure.
 - `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — the alert `ZinderStartupOpenStorageSlow` fires when `open_storage` p95 exceeds 60 seconds, the shape this trap takes during the restart loop.
 - `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` distinguish active source/fact reservations from completed out-of-order backlog.
 - `zinder_ingest_derive_replay_budget_state{state}` and `zinder_ingest_derive_replay_effective_batch_blocks` show whether derive replay is normal, degraded, or paused under memory pressure.

@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use prost::Message as _;
 use zinder_core::{BlockHeight, TransparentOutPoint, TransparentOutputArtifact};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
-use zinder_store::PrimaryChainStore;
+use zinder_store::{PrimaryChainStore, StoreReadCaller};
 
 use super::abort_on_drop::AbortOnDropTask;
 use super::source_fetch::{
@@ -363,8 +363,11 @@ async fn prefetch_spent_transparent_outputs(
         let Some(chain_epoch) = store.current_chain_epoch()? else {
             return Ok(Vec::new());
         };
-        let resolved_outputs = store
-            .transparent_outputs_by_outpoints_for_writer_commit(chain_epoch, &spent_outpoints)?;
+        let resolved_outputs = store.transparent_outputs_by_outpoints_for_writer_commit(
+            StoreReadCaller::BlockPrefetch,
+            chain_epoch,
+            &spent_outpoints,
+        )?;
         Ok(resolved_outputs.into_values().collect())
     })
     .await

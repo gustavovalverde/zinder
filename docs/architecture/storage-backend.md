@@ -246,7 +246,12 @@ Readiness causes and operational metrics are owned by [Service operations](servi
 - Curated RocksDB property gauges through `zinder_store_rocksdb_property`,
   including live data size, SST size, memtable size, table-reader memory,
   pending compaction bytes, running compaction count, and per-CF
-  active-memtable size.
+  active-memtable size. DB-level write-controller properties
+  (`rocksdb.actual-delayed-write-rate`, `rocksdb.is-write-stopped`) are
+  exported under `cf="__db__"`. Every sample carries a `store_role` label
+  (`canonical_primary`, `canonical_secondary`, `derive_primary`,
+  `derive_secondary`) so the canonical and derive stores, which share one
+  process, stay attributable in aggregate resident-set analysis.
 - WAL ceiling diagnostics through `zinder_store_wal_bytes` (live `*.log`
   bytes inside the store path) and `zinder_store_wal_bytes_limit` (the
   configured role-scoped RocksDB `max_wal_bytes`). Both feed
@@ -255,12 +260,23 @@ Readiness causes and operational metrics are owned by [Service operations](servi
   `zinder_store_block_cache_capacity_bytes` and
   `zinder_store_block_cache_usage_bytes`. These are the canonical signals;
   the same numbers are not republished as `zinder_store_rocksdb_property`
-  labels.
+  labels. These and the memtable-budget, WAL, and I/O-mode gauges carry the
+  same `store_role` label.
+- Resource-footprint sampling cadence. The sweep that publishes the property,
+  WAL, block-cache, memtable, and I/O-mode gauges runs on the write path but is
+  throttled to at most once per second, so a burst of small commits (one per
+  mempool event on the derive store) does not probe RocksDB properties per
+  write. The interval sits below the 15s scrape so every scrape reads a fresh
+  sample.
 - Startup-phase duration through `zinder_startup_phase_duration_seconds`,
   labeled by `phase`, `outcome`, and `service`. Cold WAL replay durations
   feed `ZinderStartupOpenStorageSlow`.
 - RocksDB read latency through `zinder_store_read_duration_seconds`, labeled by
-  operation, column family, and status.
+  operation, column family, status, and `caller`. The `caller` label
+  attributes each read to the pipeline stage that issued it (`query`,
+  `block_prefetch`, `commit_fallback`, `retention_sweep`, `derive_hydration`),
+  and `zinder_store_multi_get_keys_total` / `zinder_store_multi_get_resolved_total`
+  carry the same label to size serial-seek wall time under concurrency.
 - Visibility-index seek count through `zinder_store_visibility_seek_total`,
   labeled by artifact family. This identifies fanout-heavy wallet scans before
   adding new indexes or caches.

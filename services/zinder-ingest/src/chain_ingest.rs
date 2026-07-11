@@ -29,7 +29,7 @@ use zinder_source::{
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
-    StoreError,
+    StoreError, StoreReadCaller,
 };
 
 use crate::ArtifactDeriveError;
@@ -1183,6 +1183,7 @@ fn resolve_transparent_spend_facts(
         && let Some(current_chain_epoch) = store.current_chain_epoch()?
     {
         let store_outputs = store.transparent_outputs_by_outpoints_for_writer_commit(
+            StoreReadCaller::CommitFallback,
             current_chain_epoch,
             &missing_store_outpoints,
         )?;
