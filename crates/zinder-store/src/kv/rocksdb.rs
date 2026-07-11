@@ -156,8 +156,8 @@ pub struct BoundedRocksDbOpen {
     pub write_buffer_manager: WriteBufferManager,
     /// Resolved filesystem I/O mode.
     pub io_mode: RocksDbIoMode,
-    /// Statistics-bearing open options retained so the DB-wide tickers enabled
-    /// at open stay readable for metric export after the DB is opened.
+    /// Open options retained so the DB-wide statistics tickers stay readable
+    /// for metric export.
     pub statistics: Arc<Options>,
 }
 
@@ -1808,12 +1808,12 @@ mod tests {
 
     #[test]
     fn transparent_output_cf_enables_memtable_batch_lookup() {
-        let cache = build_block_cache(RocksDbResourceBudget::for_local_tests().block_cache_bytes);
         let budget = RocksDbResourceBudget::for_local_tests();
+        let cache = build_block_cache(budget.block_cache_bytes);
 
-        let transparent_output =
+        let transparent_output_options =
             column_family_options(StorageTable::TransparentOutput, &cache, budget);
-        assert!(transparent_output.get_memtable_batch_lookup_optimization());
+        assert!(transparent_output_options.get_memtable_batch_lookup_optimization());
 
         for table in StorageTable::all() {
             if table == StorageTable::TransparentOutput {
