@@ -33,6 +33,11 @@ if [ -n "${ZINDER_WIPE_PRIMARY_ON_BOOT:-}" ]; then
     [ -d /var/lib/zinder/explorer-secondary ] && mv /var/lib/zinder/explorer-secondary "/var/lib/zinder/explorer-secondary.archived-${ts}" || true
 fi
 
+# Every ZINDER_-prefixed var reaches the strict config loader, which rejects
+# any key it does not recognize. Drop this shell-only recovery knob before
+# exec so it can't crash load_config after the archive step above has run.
+unset ZINDER_WIPE_PRIMARY_ON_BOOT
+
 # Remove a stale RocksDB primary LOCK file left by an unclean shutdown.
 # Safe in this single-container image because exactly one writer ever
 # runs in this PID namespace. RocksDB clears stale POSIX locks only when

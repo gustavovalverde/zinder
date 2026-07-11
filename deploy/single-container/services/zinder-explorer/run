@@ -44,6 +44,11 @@ unset $(env | sed -n -e 's/^\(ZINDER_INGEST__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_INGEST_CONTROL__[^=]*\)=.*/\1/p' \
                      -e 's/^\(ZINDER_QUERY__[^=]*\)=.*/\1/p') 2>/dev/null || true
 
+# Shell-only ingest recovery knob shared through the container env; no
+# binary schema recognizes it, so drop it before exec to avoid crashing
+# load_config.
+unset ZINDER_WIPE_PRIMARY_ON_BOOT
+
 # Default the wallet-query endpoint to the bundled wallet-query plane.
 # The single-container image runs zinder-query on localhost:9101; the
 # explorer must point at it for `advertised_capabilities()` to emit

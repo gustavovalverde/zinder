@@ -76,6 +76,8 @@ The single-container image accepts the cookie content inline through `ZINDER_NOD
 
 Railway's secret-handling UI marks every variable with a leaf name in `{password, secret, cookie, token, private_key}` as sensitive in its console. Treat the variables above accordingly.
 
+> **Set only `ZINDER_*` variables that map to a real config field.** Every binary strict-parses its environment. Any `ZINDER_`-prefixed variable that does not resolve to a known config key is rejected at `load_config`, and the service crash-loops before it opens storage. This covers stray marker or note variables, and typos such as a single `_` where the schema expects `__`. The startup error names the offending variable and the config key it produced. Reserve the `ZINDER_` prefix for real configuration; put any bookkeeping variable under a different prefix so the binaries ignore it. The one exception is the shell-only recovery knob `ZINDER_WIPE_PRIMARY_ON_BOOT` (see [Destructive recovery](#destructive-recovery)), which the s6 run scripts consume and strip before launching any binary.
+
 ### 4. Set the health check
 
 Railway's "Healthcheck" tab:
@@ -139,10 +141,17 @@ For pinned-tag deploys, change the image tag back to the prior version and redep
 - Railway charges by CPU + memory time + egress. Most of the cost for steady-state Zinder is egress; the deployment serves compact blocks at scale to subscribers.
 - The single-container image runs the writer and reader in the same process tree; you pay for one container's resources. Splitting into separate Railway services per process is supported via the per-service targets in `deploy/Dockerfile` but doubles the fixed cost.
 
+## Destructive recovery
+
+On PaaS hosts that reschedule the container across machines, a leaked OFD lock can pin the RocksDB primary's `LOCK` inode so every fresh ingest fails with `primary store is already open`. To recover, set `ZINDER_WIPE_PRIMARY_ON_BOOT=1` on the service and redeploy. On the next boot the ingest run script archives the existing `store/`, `secondary/`, and `explorer-secondary/` directories to timestamped siblings on the same volume, then starts a fresh sync from genesis. The run scripts strip this variable from the environment handed to every binary, so it never reaches the strict config loader.
+
+Remove `ZINDER_WIPE_PRIMARY_ON_BOOT` from the service as soon as the container boots cleanly. It is not a one-shot flag at the container level: while it stays set, every restart re-archives the store and resyncs from genesis, discarding all progress since the last boot. The archived directories stay on the volume until you delete them; prune them once the fresh sync is healthy to reclaim space.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
+| Container crash-loops before `open_storage`; log names a rejected `ZINDER_*` variable | An env var does not map to a config field (stray marker, typo, single `_` where the schema expects `__`) | Remove or correct the variable; see [step 3](#3-inject-configuration-via-environment-variables) |
 | Container restarts repeatedly | Health check fails during initial sync | Increase initial delay to 300s for fresh mainnet sync |
 | `/readyz` stays `node_unavailable` | Zebra not reachable from Railway | Ensure the Zebra service is in the same Railway project, or that the public endpoint resolves from Railway egress IPs |
 | `/readyz` is `node_capability_missing` | Zebra too old | Upgrade Zebra to the version pinned in this Zinder release |
