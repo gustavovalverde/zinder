@@ -6991,7 +6991,7 @@ fn cipherscan_transaction_detail_rows(
             let outpoint = input.spent_outpoint.as_ref();
             json!({
                 "vout_index": input.input_index,
-                "value": input.value_zat,
+                "value": input.value_zat.map(|value_zat| value_zat.to_string()),
                 "address": input.script_pub_key.as_ref().and_then(|script_pub_key| {
                     cipherscan_transparent_address(network, script_pub_key)
                 }),
@@ -14356,7 +14356,7 @@ mod tests {
             json!("ab".repeat(32))
         );
         assert_eq!(transaction["inputs"][0]["prev_vout"], json!(4));
-        assert_eq!(transaction["inputs"][0]["value"], json!(200_000_000));
+        assert_eq!(transaction["inputs"][0]["value"], json!("200000000"));
         assert_eq!(
             transaction["inputs"][0]["address"],
             json!("tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd")
