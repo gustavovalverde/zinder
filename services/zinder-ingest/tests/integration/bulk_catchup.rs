@@ -275,7 +275,19 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
 
     assert_chain_event_cursors_advanced(&derive_store)?;
     assert_block_summary_materialized(&derive_store, source_block.height)?;
+    assert_paid_fee_live_tail_seeded(&derive_store, source_block.height)?;
 
+    Ok(())
+}
+
+fn assert_paid_fee_live_tail_seeded(
+    derive_store: &zinder_derive::DeriveStore,
+    block_height: BlockHeight,
+) -> Result<()> {
+    let tail = zinder_derive::PaidFeeDistributionConsumer::tail_coverage(derive_store)?
+        .ok_or_else(|| eyre!("derive replay did not seed the paid-fee live tail"))?;
+    assert_eq!(tail.boundary_height, block_height);
+    assert_eq!(tail.complete_through_height, Some(block_height));
     Ok(())
 }
 

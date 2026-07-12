@@ -336,7 +336,7 @@ async fn reconcile_settled_tail_or_retry(
     cancel: &CancellationToken,
 ) -> bool {
     match reconcile_settled_tail(config, context).await {
-        Ok(Some(range)) => {
+        Ok(SettledTailReconciliation::Reconciled(range)) => {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "paid_fee_distribution_settled_tail_reconciled",
@@ -347,7 +347,19 @@ async fn reconcile_settled_tail_or_retry(
             );
             false
         }
-        Ok(None) => false,
+        Ok(SettledTailReconciliation::UpToDate) => false,
+        Ok(SettledTailReconciliation::AwaitingSeededTail) => {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "paid_fee_distribution_awaiting_seeded_tail",
+                retry_delay_seconds = BACKFILL_RETRY_INTERVAL.as_secs(),
+                "paid-fee settled-tail reconciliation is waiting for derive replay to seed the live-tail boundary"
+            );
+            if !sleep_or_cancel(BACKFILL_RETRY_INTERVAL, cancel).await {
+                return true;
+            }
+            false
+        }
         Err(error) => {
             tracing::warn!(
                 target: "zinder::ingest",
@@ -434,6 +446,13 @@ struct ReconciledTailRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettledTailReconciliation {
+    Reconciled(ReconciledTailRange),
+    AwaitingSeededTail,
+    UpToDate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SettledTailReconciliationCoverage {
     complete_from_height: BlockHeight,
     complete_through_height: BlockHeight,
@@ -442,18 +461,15 @@ struct SettledTailReconciliationCoverage {
 async fn reconcile_settled_tail(
     config: PaidFeeDistributionBackfillConfig,
     context: &PaidFeeDistributionBackfillContext,
-) -> Result<Option<ReconciledTailRange>, IngestError> {
-    let tail =
-        PaidFeeDistributionConsumer::tail_coverage(&context.derive_store)?.ok_or_else(|| {
-            IngestError::DeriveDispatch(
-                "paid-fee settled-tail reconciliation requires a seeded tail".to_owned(),
-            )
-        })?;
+) -> Result<SettledTailReconciliation, IngestError> {
+    let Some(tail) = PaidFeeDistributionConsumer::tail_coverage(&context.derive_store)? else {
+        return Ok(SettledTailReconciliation::AwaitingSeededTail);
+    };
     let Some(tail_complete) = tail.complete_through_height else {
-        return Ok(None);
+        return Ok(SettledTailReconciliation::UpToDate);
     };
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
-        return Ok(None);
+        return Ok(SettledTailReconciliation::UpToDate);
     };
     let target = tail_complete.min(chain_epoch.settled_tip_height);
     let coverage = read_settled_tail_reconciliation_coverage(&context.derive_store)?;
@@ -463,7 +479,7 @@ async fn reconcile_settled_tail(
         coverage,
         config.batch_blocks,
     ) else {
-        return Ok(None);
+        return Ok(SettledTailReconciliation::UpToDate);
     };
 
     let (_expectations, missing) =
@@ -483,7 +499,7 @@ async fn reconcile_settled_tail(
             complete_through_height: through_height,
         },
     )?;
-    Ok(Some(ReconciledTailRange {
+    Ok(SettledTailReconciliation::Reconciled(ReconciledTailRange {
         from_height,
         through_height,
         fetched_blocks,
@@ -579,7 +595,7 @@ async fn backfill_next_batch(
                 "paid-fee distribution backfill requires a seeded live-tail boundary".to_owned(),
             )
         })?;
-    let Some(batch_end) = next_prepend_end(coverage, tail.boundary_height, target_floor)? else {
+    let Some(batch_end) = next_prepend_end(coverage, tail.boundary_height, target_floor) else {
         return Ok(BackfillProgress::Complete {
             complete_from_height: coverage.map(|coverage| coverage.complete_from_height),
         });
@@ -1206,15 +1222,19 @@ fn next_prepend_end(
     coverage: Option<PaidFeeDistributionBackfillCoverage>,
     tail_boundary: BlockHeight,
     target_floor: BlockHeight,
-) -> Result<Option<BlockHeight>, IngestError> {
+) -> Option<BlockHeight> {
     let next = match coverage {
-        Some(coverage) if coverage.complete_from_height <= target_floor => return Ok(None),
-        Some(coverage) => coverage.complete_from_height.value().checked_sub(1),
-        None => tail_boundary.value().checked_sub(1),
+        Some(coverage) if coverage.complete_from_height <= target_floor => return None,
+        Some(coverage) => coverage.complete_from_height.value().checked_sub(1)?,
+        None => {
+            let next = tail_boundary.value().checked_sub(1)?;
+            if next < target_floor.value() {
+                return None;
+            }
+            next
+        }
     };
-    next.map(BlockHeight::new).map(Some).ok_or_else(|| {
-        IngestError::DeriveDispatch("paid-fee distribution prepend height underflow".to_owned())
-    })
+    Some(BlockHeight::new(next))
 }
 
 fn backward_batch_start(
@@ -1266,16 +1286,15 @@ mod tests {
     }
 
     #[test]
-    fn first_batch_ends_immediately_before_live_tail() -> Result<(), IngestError> {
+    fn first_batch_ends_immediately_before_live_tail() {
         assert_eq!(
-            next_prepend_end(None, BlockHeight::new(1_001), BlockHeight::new(100))?,
+            next_prepend_end(None, BlockHeight::new(1_001), BlockHeight::new(100)),
             Some(BlockHeight::new(1_000))
         );
-        Ok(())
     }
 
     #[test]
-    fn subsequent_batch_prepends_existing_coverage() -> Result<(), IngestError> {
+    fn subsequent_batch_prepends_existing_coverage() {
         let coverage = PaidFeeDistributionBackfillCoverage::new(
             BlockHeight::new(900),
             BlockHeight::new(1_000),
@@ -1286,15 +1305,14 @@ mod tests {
             next_prepend_end(
                 Some(coverage),
                 BlockHeight::new(1_001),
-                BlockHeight::new(100),
-            )?,
+                BlockHeight::new(100)
+            ),
             Some(BlockHeight::new(899))
         );
-        Ok(())
     }
 
     #[test]
-    fn backfill_stops_after_reaching_durable_floor() -> Result<(), IngestError> {
+    fn backfill_stops_after_reaching_durable_floor() {
         let coverage = PaidFeeDistributionBackfillCoverage::new(
             BlockHeight::new(100),
             BlockHeight::new(1_000),
@@ -1305,11 +1323,34 @@ mod tests {
             next_prepend_end(
                 Some(coverage),
                 BlockHeight::new(1_001),
-                BlockHeight::new(100),
-            )?,
+                BlockHeight::new(100)
+            ),
             None
         );
-        Ok(())
+    }
+
+    #[test]
+    fn genesis_tail_boundary_completes_instead_of_underflowing() {
+        assert_eq!(
+            next_prepend_end(None, BlockHeight::new(0), BlockHeight::new(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_boundary_at_or_below_floor_completes_without_inverting_the_batch() {
+        assert_eq!(
+            next_prepend_end(None, BlockHeight::new(1), BlockHeight::new(1)),
+            None
+        );
+        assert_eq!(
+            next_prepend_end(None, BlockHeight::new(1), BlockHeight::new(5)),
+            None
+        );
+        assert_eq!(
+            next_prepend_end(None, BlockHeight::new(10), BlockHeight::new(5)),
+            Some(BlockHeight::new(9))
+        );
     }
 
     #[test]

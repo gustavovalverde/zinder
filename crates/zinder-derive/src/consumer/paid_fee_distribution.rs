@@ -336,7 +336,7 @@ impl PaidFeeDistributionConsumer {
         store: &DeriveStore,
     ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
         let Some(mut coverage) = Self::backfill_coverage(store)? else {
-            return Ok(None);
+            return Self::tail_interval_coverage(store);
         };
         let Some(tail) = Self::tail_coverage(store)? else {
             return Ok(Some(coverage));
@@ -354,6 +354,37 @@ impl PaidFeeDistributionConsumer {
                 })?;
         }
         Ok(Some(coverage))
+    }
+
+    /// Synthesizes coverage from the live tail when no backfill has run.
+    fn tail_interval_coverage(
+        store: &DeriveStore,
+    ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
+        let Some(tail) = Self::tail_coverage(store)? else {
+            return Ok(None);
+        };
+        let Some(through_height) = tail.complete_through_height else {
+            return Ok(None);
+        };
+        let through_time = tail.complete_through_time_unix_seconds.ok_or_else(|| {
+            store_decode_error(&PaidFeeDistributionConsumerError::MalformedTailCoverage)
+        })?;
+        let (from_time, _) =
+            height_contribution_after_batch(store, &BTreeMap::new(), tail.boundary_height)
+                .map_err(|error| store_decode_error(&error))?
+                .ok_or_else(|| {
+                    store_decode_error(
+                        &PaidFeeDistributionConsumerError::MissingIndexedContribution {
+                            height: tail.boundary_height.value(),
+                        },
+                    )
+                })?;
+        Ok(Some(PaidFeeDistributionBackfillCoverage::new(
+            tail.boundary_height,
+            through_height,
+            from_time,
+            through_time,
+        )))
     }
 
     /// Initializes the first height owned by a seeded live tail.
@@ -490,8 +521,17 @@ impl PaidFeeDistributionConsumer {
         &self,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let Some(mut tail) = Self::tail_coverage(ctx.store)? else {
-            return Ok(());
+        let mut tail = if let Some(tail) = Self::tail_coverage(ctx.store)? {
+            tail
+        } else {
+            let Some(boundary_height) = self
+                .pending_height_keys
+                .iter()
+                .find_map(|(height, key)| key.map(|_| *height))
+            else {
+                return Ok(());
+            };
+            PaidFeeDistributionTailCoverage::from_boundary(boundary_height)
         };
         while let Some(through) = tail.complete_through_height {
             if height_contribution_after_batch(ctx.store, &self.pending_height_keys, through)?
@@ -2008,6 +2048,54 @@ mod tests {
                 transaction_count: 1,
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_replay_self_initializes_and_advances_the_live_tail() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = PaidFeeDistributionConsumer::new();
+        assert!(PaidFeeDistributionConsumer::tail_coverage(&store)?.is_none());
+
+        write_blocks(&store, &mut consumer, &[block(100, 1, 10, &[Some(10_000)])])?;
+        let seeded = PaidFeeDistributionConsumer::tail_coverage(&store)?
+            .ok_or("replay must self-initialize the live tail")?;
+        assert_eq!(seeded.boundary_height, BlockHeight::new(100));
+        assert_eq!(seeded.complete_through_height, Some(BlockHeight::new(100)));
+
+        write_blocks(&store, &mut consumer, &[block(101, 2, 20, &[Some(20_000)])])?;
+        let advanced = PaidFeeDistributionConsumer::tail_coverage(&store)?
+            .ok_or("the live tail must persist across replay batches")?;
+        assert_eq!(advanced.boundary_height, BlockHeight::new(100));
+        assert_eq!(
+            advanced.complete_through_height,
+            Some(BlockHeight::new(101))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_falls_back_to_the_live_tail_without_backfill() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = PaidFeeDistributionConsumer::new();
+        assert!(PaidFeeDistributionConsumer::coverage(&store)?.is_none());
+
+        write_blocks(
+            &store,
+            &mut consumer,
+            &[
+                block(1, 1, 1_700_000_000, &[Some(10_000)]),
+                block(2, 2, 1_700_000_600, &[Some(20_000)]),
+            ],
+        )?;
+        assert!(PaidFeeDistributionConsumer::backfill_coverage(&store)?.is_none());
+
+        let coverage = PaidFeeDistributionConsumer::coverage(&store)?
+            .ok_or("coverage must fall back to the live tail")?;
+        assert_eq!(coverage.complete_from_height, BlockHeight::new(1));
+        assert_eq!(coverage.complete_through_height, BlockHeight::new(2));
+        assert_eq!(coverage.complete_from_time_unix_seconds, 1_700_000_000);
+        assert_eq!(coverage.complete_through_time_unix_seconds, 1_700_000_600);
         Ok(())
     }
 

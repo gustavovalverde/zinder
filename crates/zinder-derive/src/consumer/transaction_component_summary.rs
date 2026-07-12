@@ -567,7 +567,7 @@ impl TransactionComponentSummaryConsumer {
         store: &DeriveStore,
     ) -> Result<Option<TransactionComponentBackfillCoverage>, DeriveStoreError> {
         let Some(mut coverage) = Self::backfill_coverage(store)? else {
-            return Ok(None);
+            return Self::tail_interval_coverage(store);
         };
         let Some(tail) = Self::tail_coverage(store)? else {
             return Ok(Some(coverage));
@@ -589,6 +589,41 @@ impl TransactionComponentSummaryConsumer {
                 })?;
         }
         Ok(Some(coverage))
+    }
+
+    /// Synthesizes coverage from the live tail when no backfill has run.
+    fn tail_interval_coverage(
+        store: &DeriveStore,
+    ) -> Result<Option<TransactionComponentBackfillCoverage>, DeriveStoreError> {
+        let Some(tail) = Self::tail_coverage(store)? else {
+            return Ok(None);
+        };
+        let Some(through_height) = tail.complete_through_height else {
+            return Ok(None);
+        };
+        let through_time = tail.complete_through_time_unix_seconds.ok_or_else(|| {
+            store_decode_error(
+                &TransactionComponentSummaryConsumerError::MalformedTailCoverage {
+                    bytes: TAIL_COVERAGE_VALUE_LEN,
+                },
+            )
+        })?;
+        let (from_time, _) =
+            height_contribution_after_batch(store, &BTreeMap::new(), tail.boundary_height)
+                .map_err(|error| store_decode_error(&error))?
+                .ok_or_else(|| {
+                    store_decode_error(
+                        &TransactionComponentSummaryConsumerError::MissingIndexedContribution {
+                            height: tail.boundary_height.value(),
+                        },
+                    )
+                })?;
+        Ok(Some(TransactionComponentBackfillCoverage::new(
+            tail.boundary_height,
+            through_height,
+            from_time,
+            through_time,
+        )))
     }
 
     /// Atomically writes an ordered historical block batch and coverage.
@@ -708,8 +743,17 @@ impl TransactionComponentSummaryConsumer {
         &self,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let Some(mut tail) = Self::tail_coverage(ctx.store)? else {
-            return Ok(());
+        let mut tail = if let Some(tail) = Self::tail_coverage(ctx.store)? {
+            tail
+        } else {
+            let Some(boundary_height) = self
+                .pending_height_keys
+                .iter()
+                .find_map(|(height, key)| key.map(|_| *height))
+            else {
+                return Ok(());
+            };
+            TransactionComponentTailCoverage::from_boundary(boundary_height)
         };
         while let Some(through_height) = tail.complete_through_height {
             if height_contribution_after_batch(
@@ -2488,6 +2532,40 @@ mod tests {
 
         let outcome = write_blocks(&store, &mut consumer, &[block(101, 2, 20, &[counts])]);
         assert!(outcome.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_replay_self_initializes_the_tail_and_backs_coverage() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransactionComponentSummaryConsumer::new();
+        assert!(TransactionComponentSummaryConsumer::tail_coverage(&store)?.is_none());
+        assert!(TransactionComponentSummaryConsumer::coverage(&store)?.is_none());
+
+        let counts = TransactionComponentCounts {
+            sapling_output_count: 1,
+            ..TransactionComponentCounts::EMPTY
+        };
+        write_blocks(
+            &store,
+            &mut consumer,
+            &[
+                block(1, 1, 1_700_000_000, &[counts]),
+                block(2, 2, 1_700_000_600, &[counts]),
+            ],
+        )?;
+        let tail = TransactionComponentSummaryConsumer::tail_coverage(&store)?
+            .ok_or("replay must self-initialize the live tail")?;
+        assert_eq!(tail.boundary_height, BlockHeight::new(1));
+        assert_eq!(tail.complete_through_height, Some(BlockHeight::new(2)));
+        assert!(TransactionComponentSummaryConsumer::backfill_coverage(&store)?.is_none());
+
+        let coverage = TransactionComponentSummaryConsumer::coverage(&store)?
+            .ok_or("coverage must fall back to the live tail")?;
+        assert_eq!(coverage.complete_from_height, BlockHeight::new(1));
+        assert_eq!(coverage.complete_through_height, BlockHeight::new(2));
+        assert_eq!(coverage.complete_from_time_unix_seconds, 1_700_000_000);
+        assert_eq!(coverage.complete_through_time_unix_seconds, 1_700_000_600);
         Ok(())
     }
 }
