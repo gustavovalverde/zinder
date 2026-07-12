@@ -13,4 +13,12 @@ exit_code="${1:-0}"
 # Tell s6-overlay to shut the container down and inherit the exit code.
 # 125 is a documented s6 convention meaning "do not restart this service;
 # stop the supervisor instead".
+# s6 reports a signal death as 256; clamp to 137 so the container exit
+# code stays in the 0-255 range Railway's ON_FAILURE policy can see.
+if [ "${exit_code}" -ge 256 ] 2>/dev/null; then
+    exit_code=137
+fi
+mkdir -p /run/s6-linux-init-container-results
+printf '%s' "${exit_code}" > /run/s6-linux-init-container-results/exitcode
+
 exec s6-svscanctl -t /run/service
