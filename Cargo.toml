@@ -10,6 +10,7 @@ members = [
     "crates/zinder-testkit",
     "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
+    "services/zinder-compat-cipherscan",
     "services/zinder-explorer",
     "services/zinder-ingest",
     "services/zinder-query",
@@ -47,6 +48,7 @@ orchard = "0.15.0"
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.51.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"
 serde = "1.0.228"
@@ -72,6 +74,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zebra-chain = "11.0.0"
 zinder-core = { path = "crates/zinder-core" }
 zinder-client = { path = "crates/zinder-client" }
+zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
 zinder-derive = { path = "crates/zinder-derive" }
 zinder-explorer = { path = "services/zinder-explorer" }

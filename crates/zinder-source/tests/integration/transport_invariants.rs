@@ -8,15 +8,19 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, eyre};
 
-/// The two files that own transport construction across the workspace.
+/// The two files that own Zebra and intra-Zinder transport construction.
 ///
 /// `zinder-runtime::transport` owns intra-Zinder gRPC channels;
 /// `zinder-source::transport` owns every long-lived client to a Zebra
 /// full node. ADR-0019 codifies the split.
-const TRANSPORT_OWNERSHIP: &[&str] = &[
+const CORE_TRANSPORT_OWNERSHIP: &[&str] = &[
     "crates/zinder-runtime/src/transport.rs",
     "crates/zinder-source/src/transport.rs",
 ];
+
+/// Service-owned transports that call external product dependencies.
+const EXTERNAL_PRODUCT_HTTP_TRANSPORT_OWNERSHIP: &[&str] =
+    &["services/zinder-compat-cipherscan/src/market_price.rs"];
 
 const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
 
@@ -28,6 +32,7 @@ const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
 struct BannedPattern {
     needle: &'static str,
     explanation: &'static str,
+    allowed_owners: &'static [&'static str],
 }
 
 const BANNED_TRANSPORT_PATTERNS: &[BannedPattern] = &[
@@ -36,18 +41,20 @@ const BANNED_TRANSPORT_PATTERNS: &[BannedPattern] = &[
         explanation: "use zinder_runtime::connect_zinder_grpc for intra-Zinder channels, \
              zinder_source::connect_zebra_indexer_channel for Zebra Indexer gRPC, \
              or zinder_runtime::validate_zinder_grpc_endpoint to validate a URL at config load",
+        allowed_owners: CORE_TRANSPORT_OWNERSHIP,
     },
     BannedPattern {
         needle: "HttpClientBuilder",
         explanation: "use zinder_source::build_zebra_json_rpc_client to construct the Zebra \
              JSON-RPC client; ResilientClient wraps it so the underlying connection \
              rebuilds after transport-class failures",
+        allowed_owners: CORE_TRANSPORT_OWNERSHIP,
     },
     BannedPattern {
         needle: "reqwest::Client::builder",
-        explanation: "no reqwest-based client exists today; if one becomes necessary it \
-             must live in zinder_source::transport so the keep-alive policy and \
-             ResilientClient wrapping stay co-located with the other Zebra clients",
+        explanation: "Zebra HTTP clients belong in zinder_source::transport; external-product \
+             HTTP clients must live in an explicitly owned service transport module",
+        allowed_owners: EXTERNAL_PRODUCT_HTTP_TRANSPORT_OWNERSHIP,
     },
 ];
 
@@ -111,7 +118,8 @@ fn transport_construction_lives_only_in_transport_modules() -> Result<()> {
             let contents = fs::read_to_string(&source_path)?;
             for line in code_lines(&contents) {
                 for pattern in BANNED_TRANSPORT_PATTERNS {
-                    let is_allowed_owner = TRANSPORT_OWNERSHIP
+                    let is_allowed_owner = pattern
+                        .allowed_owners
                         .iter()
                         .any(|owner| root.join(owner) == source_path);
                     if line.contains(pattern.needle) && !is_allowed_owner {
