@@ -5,6 +5,7 @@
 //! belong to `zinder-store`.
 
 mod artifact_builder;
+pub mod bench_support;
 mod bulk_catchup;
 mod chain_ingest;
 mod commitment_root_backfill;

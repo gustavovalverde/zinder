@@ -5065,6 +5065,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-bench"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "eyre",
+ "futures-util",
+ "hex",
+ "metrics-exporter-prometheus",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zinder-core",
+ "zinder-derive",
+ "zinder-ingest",
+ "zinder-source",
+ "zinder-store",
+ "zinder-testkit",
+]
+
+[[package]]
 name = "zinder-client"
 version = "0.1.0"
 dependencies = [

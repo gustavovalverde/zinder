@@ -8,6 +8,7 @@ members = [
     "crates/zinder-source",
     "crates/zinder-store",
     "crates/zinder-testkit",
+    "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
     "services/zinder-explorer",
     "services/zinder-ingest",
