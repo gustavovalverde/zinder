@@ -82,6 +82,9 @@ pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_i
 pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
 pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
+/// Capability advertised for `WalletQuery.NetworkUpgradeActivations`.
+pub const WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1: &str =
+    "wallet.read.network_upgrade_activations_v1";
 /// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
 pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_outputs_by_outpoint_v1";
@@ -850,6 +853,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_SERVER_INFO_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ServerInfo"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.NetworkUpgradeActivations"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

@@ -83,6 +83,13 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
             .root_hash,
         stored_artifacts.subtree_root.root_hash.as_bytes()
     );
+    assert!(
+        grpc_responses
+            .network_upgrade_activations
+            .activations
+            .iter()
+            .any(|activation| activation.name == "NU6.2")
+    );
 
     Ok(())
 }
@@ -654,6 +661,7 @@ struct WalletGrpcResponses {
     explicit_tree_state: wallet::TreeStateResponse,
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
+    network_upgrade_activations: wallet::NetworkUpgradeActivationsResponse,
 }
 
 fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWalletArtifacts> {
@@ -733,6 +741,12 @@ async fn read_wallet_grpc_responses(
     )
     .await?
     .into_inner();
+    let network_upgrade_activations = WalletQueryService::network_upgrade_activations(
+        grpc_adapter,
+        Request::new(wallet::NetworkUpgradeActivationsRequest {}),
+    )
+    .await?
+    .into_inner();
 
     Ok(WalletGrpcResponses {
         latest_block,
@@ -740,6 +754,7 @@ async fn read_wallet_grpc_responses(
         explicit_tree_state,
         latest_tree_state_checkpoint,
         subtree_roots,
+        network_upgrade_activations,
     })
 }
 

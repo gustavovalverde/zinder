@@ -335,6 +335,21 @@ fn transaction_status_response_carries_conflicting_location() -> eyre::Result<()
 }
 
 #[test]
+fn network_upgrade_activations_round_trip_through_prost() -> eyre::Result<()> {
+    let response = wallet::NetworkUpgradeActivationsResponse {
+        activations: vec![wallet::NetworkUpgradeActivation {
+            consensus_branch_id: 0xc8e7_1055,
+            name: "NU6".to_owned(),
+            activation_height: 2,
+        }],
+    };
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded, response);
+    Ok(())
+}
+
+#[test]
 fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
     let response = wallet::ChainEventEnvelope {
         cursor: vec![0x99; 82],

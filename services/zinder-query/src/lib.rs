@@ -45,8 +45,9 @@ pub use grpc::{
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
     build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
-    latest_block_response, latest_tree_state_checkpoint_response, status_from_query_error,
-    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    latest_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
     tree_state_at_response,
@@ -64,6 +65,10 @@ pub use readiness_refresh::{
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
+    /// Returns the network-upgrade activation table advertised by the
+    /// configured upstream node.
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError>;
+
     /// Reads latest visible block metadata.
     async fn latest_block(
         &self,
@@ -460,6 +465,10 @@ where
     ReadApi: ChainEpochReadApi + Clone + Send + Sync + 'static,
     Broadcaster: TransactionBroadcaster + Clone,
 {
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
+        Ok((*self.network_upgrade_activations).clone())
+    }
+
     async fn latest_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,

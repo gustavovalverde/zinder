@@ -19,11 +19,11 @@ use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
     BlockSelector, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
     BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, Network, RawTransactionBytes, SUBTREE_LEAF_COUNT, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendFact,
+    CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
+    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastResult, TransactionId, TransactionLocation,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, UnixTimestampMillis,
     wire::encode_internal_block_hash,
@@ -673,6 +673,10 @@ impl<Inner> EpochPinRecorder<Inner> {
 
 #[async_trait]
 impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
+        self.inner.network_upgrade_activations().await
+    }
+
     async fn latest_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
