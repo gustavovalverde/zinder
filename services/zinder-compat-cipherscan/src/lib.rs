@@ -73,7 +73,8 @@ use zinder_proto::capabilities::{
     EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
     EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2, EXPLORER_TRANSACTION_HISTORY_V2,
     EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1, EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
-    EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
+    EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
+    EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1, EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
     EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
 };
 use zinder_proto::v1::{
@@ -90,7 +91,8 @@ use zinder_proto::v1::{
         TransparentAddressRankingRequest, TransparentAddressRankingResponse,
         ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
         ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
-        ValuePoolFlowDirection, ValuePoolFlowFilter, ValuePoolFlowHistoryRequest,
+        ValuePoolFlowDirection, ValuePoolFlowEventsInRangeRequest,
+        ValuePoolFlowEventsInRangeResponse, ValuePoolFlowFilter, ValuePoolFlowHistoryRequest,
         ValuePoolFlowHistoryResponse, ValuePoolFlowPool, ValuePoolFlowRoundedAmountSummaryRequest,
         ValuePoolFlowRoundedAmountSummaryResponse, ValuePoolFlowSummaryRequest,
         ValuePoolFlowSummaryResolution, ValuePoolSummaryRequest, block_detail_request,
@@ -166,6 +168,16 @@ const MAX_TRANSACTION_HISTORY_OFFSET: u32 = 100_000;
 const MAX_ORCHARD_CANDIDATE_SCAN_PAGES: usize = 32;
 const MAX_ADDRESS_ACTIVITY_OFFSET: u32 = 100_000;
 const VALUE_POOL_FLOW_NATIVE_PAGE_SIZE: u32 = 256;
+const LINKABILITY_LOOKBACK_DAYS: i64 = 30;
+const LINKABILITY_MAX_PAIR_AGE_SECONDS: i64 = 90 * 86_400;
+const LINKABILITY_MINIMUM_AMOUNT_ZAT: u64 = 100_000;
+const LINKABILITY_DEFAULT_TOLERANCE_ZEC: f64 = 0.001;
+const LINKABILITY_MINIMUM_TOLERANCE_ZEC: f64 = 0.0001;
+const LINKABILITY_MAXIMUM_TOLERANCE_ZEC: f64 = 0.1;
+const LINKABILITY_NATIVE_EVENT_LIMIT: u32 = 1_024;
+const LINKABILITY_MINIMUM_CONFIDENCE_SCORE: u32 = 35;
+const LINKABILITY_HIGH_WARNING_SCORE: u32 = 75;
+const LINKABILITY_MEDIUM_WARNING_SCORE: u32 = 55;
 const CIPHERSCAN_FLOW_TRANSACTION_INDEX_FACTOR: u64 = 1_000_000;
 const MAX_CIPHERSCAN_FLOW_TRANSACTION_INDEX: u32 = 999_999;
 const CIPHERSCAN_VALUE_POOL_IDS: [&str; 6] = [
@@ -2372,6 +2384,13 @@ struct ShieldedFlowQuery {
     min_zec: Option<f64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TransactionLinkabilityQuery {
+    limit: Option<String>,
+    tolerance: Option<String>,
+}
+
 impl CipherscanPoolFlowRequest {
     fn from_query(query: &PageQuery) -> Result<Self, CipherscanRestError> {
         let (period, days) = match query.period.as_deref() {
@@ -3198,30 +3217,40 @@ async fn raw_transaction(
 async fn transaction_linkability(
     State(adapter): State<CipherscanRestAdapter>,
     Path(transaction_id): Path<String>,
+    Query(query): Query<TransactionLinkabilityQuery>,
 ) -> Result<Response, CipherscanRestError> {
     if !is_rpc_transaction_id(&transaction_id) {
         return Ok(invalid_txid_path_parameters_response());
     }
 
     let normalized_transaction_id = transaction_id.to_ascii_lowercase();
-    match adapter
-        .explorer_client()
-        .transaction_detail(TransactionDetailRequest {
-            transaction_id: normalized_transaction_id.clone(),
-            at_epoch_id: None,
-        })
-        .await
-    {
-        Ok(_) => Ok(json_response(
-            StatusCode::OK,
-            transaction_linkability_json(&normalized_transaction_id),
-        )),
-        Err(status) if status.code() == Code::NotFound => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            transaction_linkability_not_found_json(),
-        )),
-        Err(status) => Err(status.into()),
-    }
+    adapter
+        .require_explorer_capability(EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1)
+        .await?;
+    let request = CipherscanLinkabilityRequest::from_query(&query);
+    adapter
+        .fetch_transaction_linkability(
+            &normalized_transaction_id,
+            request,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await?
+        .map_or_else(
+            || {
+                Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    transaction_linkability_not_found_json(),
+                ))
+            },
+            |outcome| match outcome {
+                CipherscanLinkabilityOutcome::Available(response) => {
+                    Ok(json_response(StatusCode::OK, response))
+                }
+                CipherscanLinkabilityOutcome::Unavailable(response) => {
+                    Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, response))
+                }
+            },
+        )
 }
 
 async fn verbose_transaction(
@@ -8159,31 +8188,833 @@ fn calendar_date_from_unix_seconds(unix_seconds: i64) -> String {
     )
 }
 
-fn transaction_linkability_json(transaction_id: &str) -> Value {
-    json!({
-        "success": true,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CipherscanLinkabilityRequest {
+    limit: u32,
+    tolerance_zat: u64,
+}
+
+impl CipherscanLinkabilityRequest {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Cipherscan accepts a bounded decimal ZEC tolerance and rounds it into zatoshis."
+    )]
+    fn from_query(query: &TransactionLinkabilityQuery) -> Self {
+        let tolerance_zec = query
+            .tolerance
+            .as_deref()
+            .and_then(parse_javascript_float)
+            .filter(|tolerance| tolerance.is_finite() && *tolerance != 0.0)
+            .unwrap_or(LINKABILITY_DEFAULT_TOLERANCE_ZEC)
+            .clamp(
+                LINKABILITY_MINIMUM_TOLERANCE_ZEC,
+                LINKABILITY_MAXIMUM_TOLERANCE_ZEC,
+            );
+        Self {
+            limit: parse_cipherscan_bounded_integer(query.limit.as_deref(), 5, 1, 20),
+            tolerance_zat: (tolerance_zec * ZATOSHIS_PER_ZEC).round() as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CipherscanLinkabilityFlow {
+    transaction_id: String,
+    direction: ValuePoolFlowDirection,
+    amount_zat: u64,
+    block_height: u32,
+    block_time_unix_seconds: i64,
+    pool: ValuePoolFlowPool,
+    transparent_addresses: Vec<String>,
+}
+
+enum CipherscanLinkabilitySource {
+    Flow(CipherscanLinkabilityFlow),
+    NoFlow,
+    Unavailable(&'static str),
+}
+
+enum CipherscanLinkabilityOutcome {
+    Available(Value),
+    Unavailable(Value),
+}
+
+impl CipherscanRestAdapter {
+    async fn fetch_transaction_linkability(
+        &self,
+        transaction_id: &str,
+        request: CipherscanLinkabilityRequest,
+        now_unix_seconds: i64,
+    ) -> Result<Option<CipherscanLinkabilityOutcome>, CipherscanRestError> {
+        for _ in 0..3 {
+            let detail = match self
+                .explorer_client()
+                .transaction_detail(TransactionDetailRequest {
+                    transaction_id: transaction_id.to_owned(),
+                    at_epoch_id: None,
+                })
+                .await
+            {
+                Ok(response) => response.into_inner(),
+                Err(status) if status.code() == Code::NotFound => return Ok(None),
+                Err(status) => return Err(status.into()),
+            };
+            let detail_epoch = explorer_chain_epoch_id(detail.freshness.as_ref()).ok_or(
+                CipherscanRestError::MissingUpstreamField(
+                    "transaction_detail.freshness.chain_epoch",
+                ),
+            )?;
+            let source = match cipherscan_linkability_source(self.network, &detail)? {
+                CipherscanLinkabilitySource::Flow(source) => source,
+                CipherscanLinkabilitySource::NoFlow => {
+                    return Ok(Some(CipherscanLinkabilityOutcome::Available(
+                        transaction_linkability_no_flow_json(transaction_id),
+                    )));
+                }
+                CipherscanLinkabilitySource::Unavailable(reason) => {
+                    return Ok(Some(transaction_linkability_unavailable_outcome(
+                        transaction_id,
+                        None,
+                        reason,
+                    )));
+                }
+            };
+            let cutoff =
+                now_unix_seconds.saturating_sub(LINKABILITY_LOOKBACK_DAYS * UNIX_SECONDS_PER_DAY);
+            if source.block_time_unix_seconds <= cutoff {
+                return Ok(Some(transaction_linkability_unavailable_outcome(
+                    transaction_id,
+                    Some(&source),
+                    "Transaction linkability is available only for the completely indexed rolling 30-day flow window.",
+                )));
+            }
+            let minimum_amount_zat = source
+                .amount_zat
+                .saturating_sub(request.tolerance_zat)
+                .max(LINKABILITY_MINIMUM_AMOUNT_ZAT);
+            let maximum_amount_zat = source.amount_zat.saturating_add(request.tolerance_zat);
+            let range = self
+                .explorer_client()
+                .value_pool_flow_events_in_range(ValuePoolFlowEventsInRangeRequest {
+                    start_time_unix_seconds: cutoff.saturating_add(1),
+                    end_time_unix_seconds: now_unix_seconds.saturating_add(1),
+                    directions: Vec::new(),
+                    pools: Vec::new(),
+                    minimum_amount_zat,
+                    maximum_amount_zat: Some(maximum_amount_zat),
+                    max_events: LINKABILITY_NATIVE_EVENT_LIMIT,
+                })
+                .await?
+                .into_inner();
+            let range_epoch = explorer_chain_epoch_id(range.freshness.as_ref()).ok_or(
+                CipherscanRestError::MissingUpstreamField(
+                    "value_pool_flow_events_in_range.freshness.chain_epoch",
+                ),
+            )?;
+            if detail_epoch != range_epoch {
+                continue;
+            }
+            return Ok(Some(
+                self.transaction_linkability_from_range(source, request, range, range_epoch)
+                    .await?,
+            ));
+        }
+        Ok(Some(transaction_linkability_unavailable_outcome(
+            transaction_id,
+            None,
+            "Transaction detail and value-pool flow history did not stabilize on one chain epoch.",
+        )))
+    }
+
+    async fn transaction_linkability_from_range(
+        &self,
+        source: CipherscanLinkabilityFlow,
+        request: CipherscanLinkabilityRequest,
+        range: ValuePoolFlowEventsInRangeResponse,
+        chain_epoch_id: u64,
+    ) -> Result<CipherscanLinkabilityOutcome, CipherscanRestError> {
+        let coverage = range
+            .coverage
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "value_pool_flow_events_in_range.coverage",
+            ))?;
+        if !coverage.requested_range_complete
+            || range.scan_limit_reached
+            || range.event_limit_reached
+        {
+            return Ok(transaction_linkability_unavailable_outcome(
+                &source.transaction_id,
+                Some(&source),
+                "The bounded value-pool flow range is incomplete or truncated.",
+            ));
+        }
+        for event in &range.events {
+            validate_value_pool_flow_event(event)?;
+        }
+        if !range
+            .events
+            .iter()
+            .any(|event| cipherscan_linkability_event_matches_source(event, &source))
+        {
+            return Ok(transaction_linkability_unavailable_outcome(
+                &source.transaction_id,
+                Some(&source),
+                "The source transaction is not present in the complete value-pool flow range.",
+            ));
+        }
+        let candidates = cipherscan_linkability_candidates(
+            &source,
+            &range.events,
+            request.tolerance_zat,
+            request.limit,
+        )?;
+        let candidates = self
+            .hydrate_linkability_candidate_addresses(candidates, chain_epoch_id)
+            .await?;
+        Ok(CipherscanLinkabilityOutcome::Available(
+            transaction_linkability_json(&source, &candidates),
+        ))
+    }
+
+    async fn hydrate_linkability_candidate_addresses(
+        &self,
+        candidates: Vec<CipherscanLinkabilityCandidate>,
+        chain_epoch_id: u64,
+    ) -> Result<Vec<CipherscanLinkabilityCandidate>, CipherscanRestError> {
+        let mut hydrated = Vec::with_capacity(candidates.len());
+        for mut candidate in candidates {
+            let detail = self
+                .explorer_client()
+                .transaction_detail(TransactionDetailRequest {
+                    transaction_id: candidate.flow.transaction_id.clone(),
+                    at_epoch_id: Some(chain_epoch_id),
+                })
+                .await?
+                .into_inner();
+            if explorer_chain_epoch_id(detail.freshness.as_ref()) != Some(chain_epoch_id) {
+                return Err(CipherscanRestError::InvalidUpstreamField(
+                    "transaction_detail.freshness.chain_epoch",
+                ));
+            }
+            candidate.flow.transparent_addresses =
+                cipherscan_linkability_addresses(self.network, candidate.flow.direction, &detail);
+            hydrated.push(candidate);
+        }
+        Ok(hydrated)
+    }
+}
+
+fn transaction_linkability_unavailable_json(
+    transaction_id: &str,
+    source: Option<&CipherscanLinkabilityFlow>,
+    has_shielded_activity: bool,
+    reason: &'static str,
+) -> Value {
+    let mut response = json!({
+        "success": false,
         "txid": transaction_id,
         "flowType": Value::Null,
-        "amount": 0,
+        "amount": Value::Null,
         "amountZat": Value::Null,
         "blockHeight": Value::Null,
         "blockTime": Value::Null,
         "pool": Value::Null,
-        "hasShieldedActivity": false,
+        "hasShieldedActivity": has_shielded_activity,
         "transparentAddresses": [],
         "linkedTransactions": [],
-        "totalMatches": 0,
-        "warningLevel": "LOW",
-        "highestScore": 0,
         "algorithm": {
             "version": "2.0",
             "note": "Scores combine amount similarity, timing, amount rarity, weird-amount detection, and ambiguity penalties.",
         },
         "degraded": true,
-        "unavailable": [
-            "Transaction linkability scoring requires Cipherscan shielded-flow sidecar analytics."
-        ],
+        "unavailable": [reason],
+    });
+    if let Some(source) = source {
+        response["flowType"] =
+            json!(cipherscan_flow_direction(source.direction as i32).unwrap_or("unknown"));
+        response["amount"] = json!(zec_from_unsigned_zatoshis(source.amount_zat));
+        response["amountZat"] = json!(source.amount_zat);
+        response["blockHeight"] = json!(source.block_height);
+        response["blockTime"] = json!(source.block_time_unix_seconds);
+        response["pool"] = json!(cipherscan_flow_pool(source.pool as i32).unwrap_or("unknown"));
+        response["transparentAddresses"] = json!(source.transparent_addresses);
+    }
+    response
+}
+
+fn transaction_linkability_unavailable_outcome(
+    transaction_id: &str,
+    source: Option<&CipherscanLinkabilityFlow>,
+    reason: &'static str,
+) -> CipherscanLinkabilityOutcome {
+    CipherscanLinkabilityOutcome::Unavailable(transaction_linkability_unavailable_json(
+        transaction_id,
+        source,
+        true,
+        reason,
+    ))
+}
+
+fn transaction_linkability_no_flow_json(transaction_id: &str) -> Value {
+    json!({
+        "success": true,
+        "txid": transaction_id,
+        "flowType": Value::Null,
+        "hasShieldedActivity": false,
+        "linkedTransactions": [],
+        "message": "This transaction has no shielding or deshielding activity",
     })
+}
+
+fn cipherscan_linkability_source(
+    network: Network,
+    detail: &explorer::TransactionDetailResponse,
+) -> Result<CipherscanLinkabilitySource, CipherscanRestError> {
+    let facts = detail
+        .facts
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.facts",
+        ))?;
+    let counts = facts
+        .counts
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.facts.counts",
+        ))?;
+    let has_shielded = has_shielded_components(Some(counts));
+    let has_transparent = has_transparent_components(Some(counts));
+    if !has_shielded || !has_transparent || facts.is_coinbase {
+        return Ok(CipherscanLinkabilitySource::NoFlow);
+    }
+    let Some(balances) = detail.intrinsic_value_balances.as_ref() else {
+        return Ok(CipherscanLinkabilitySource::Unavailable(
+            "Transaction-intrinsic value-pool balances are unavailable.",
+        ));
+    };
+    let net_zat = balances
+        .sprout_zat
+        .checked_add(balances.sapling_zat)
+        .and_then(|total| total.checked_add(balances.orchard_zat))
+        .and_then(|total| total.checked_add(balances.ironwood_zat))
+        .ok_or(CipherscanRestError::InvalidUpstreamField(
+            "transaction_detail.intrinsic_value_balances",
+        ))?;
+    if net_zat == 0 {
+        return Ok(CipherscanLinkabilitySource::NoFlow);
+    }
+    let mined = mined_location(detail.location.as_ref()).ok_or(
+        CipherscanRestError::MissingUpstreamField("transaction_detail.location.mined"),
+    )?;
+    let block_location =
+        mined
+            .location
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "transaction_detail.location.mined.location",
+            ))?;
+    let mined_details = mined
+        .details
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.location.mined.details",
+        ))?;
+    validate_transaction_detail_outputs(facts, detail)?;
+    let direction = if net_zat < 0 {
+        ValuePoolFlowDirection::Shield
+    } else {
+        ValuePoolFlowDirection::Deshield
+    };
+    let pool = cipherscan_linkability_pool(balances);
+    Ok(CipherscanLinkabilitySource::Flow(
+        CipherscanLinkabilityFlow {
+            transaction_id: facts.transaction_id.clone(),
+            direction,
+            amount_zat: net_zat.unsigned_abs(),
+            block_height: block_location.block_height,
+            block_time_unix_seconds: mined_details.block_time,
+            pool,
+            transparent_addresses: cipherscan_linkability_addresses(network, direction, detail),
+        },
+    ))
+}
+
+fn cipherscan_linkability_pool(
+    balances: &explorer::TransactionIntrinsicValueBalances,
+) -> ValuePoolFlowPool {
+    let pools = [
+        (balances.sprout_zat, ValuePoolFlowPool::Sprout),
+        (balances.sapling_zat, ValuePoolFlowPool::Sapling),
+        (balances.orchard_zat, ValuePoolFlowPool::Orchard),
+        (balances.ironwood_zat, ValuePoolFlowPool::Ironwood),
+    ];
+    let mut nonzero_pools = pools
+        .into_iter()
+        .filter_map(|(balance, pool)| (balance != 0).then_some(pool));
+    let first = nonzero_pools.next().unwrap_or(ValuePoolFlowPool::Mixed);
+    if nonzero_pools.next().is_some() {
+        ValuePoolFlowPool::Mixed
+    } else {
+        first
+    }
+}
+
+fn cipherscan_linkability_addresses(
+    network: Network,
+    direction: ValuePoolFlowDirection,
+    detail: &explorer::TransactionDetailResponse,
+) -> Vec<String> {
+    let scripts: Vec<&[u8]> = match direction {
+        ValuePoolFlowDirection::Shield => detail
+            .transparent_inputs
+            .iter()
+            .filter_map(|input| input.script_pub_key.as_deref())
+            .collect(),
+        ValuePoolFlowDirection::Deshield => detail
+            .transparent_outputs
+            .iter()
+            .filter_map(|output| {
+                output
+                    .output
+                    .as_ref()
+                    .map(|output| output.script_pub_key.as_slice())
+            })
+            .collect(),
+        ValuePoolFlowDirection::Unspecified => Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    scripts
+        .into_iter()
+        .filter_map(|script| cipherscan_transparent_address(network, script))
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
+}
+
+fn cipherscan_linkability_event_matches_source(
+    event: &explorer::ValuePoolFlowEvent,
+    source: &CipherscanLinkabilityFlow,
+) -> bool {
+    event.transaction_id == source.transaction_id
+        && event.direction == source.direction as i32
+        && event.amount_zat == source.amount_zat
+        && event.block_height == source.block_height
+        && event.block_time_unix_seconds == source.block_time_unix_seconds
+        && event.pool == source.pool as i32
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CipherscanLinkabilityScoreBreakdown {
+    amount_similarity: u32,
+    time_proximity: u32,
+    amount_rarity: u32,
+    weird_amount: u32,
+    pool_match: u32,
+    ambiguity_penalty: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CipherscanLinkabilityCandidate {
+    flow: CipherscanLinkabilityFlow,
+    time_delta_seconds: i64,
+    linkability_score: u32,
+    warning_level: &'static str,
+    ambiguity_score: u32,
+    confidence_margin: u32,
+    score_breakdown: CipherscanLinkabilityScoreBreakdown,
+}
+
+#[derive(Clone, Copy)]
+struct CipherscanLinkabilityPair<'a> {
+    shield: &'a CipherscanLinkabilityFlow,
+    deshield: &'a CipherscanLinkabilityFlow,
+    preliminary_score: u32,
+    occurrence_count: u32,
+}
+
+fn cipherscan_linkability_candidates(
+    source: &CipherscanLinkabilityFlow,
+    events: &[explorer::ValuePoolFlowEvent],
+    tolerance_zat: u64,
+    limit: u32,
+) -> Result<Vec<CipherscanLinkabilityCandidate>, CipherscanRestError> {
+    let flows = events
+        .iter()
+        .map(cipherscan_linkability_flow_from_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    let occurrence_count_by_amount = flows.iter().fold(HashMap::new(), |mut counts, flow| {
+        let count = counts.entry(flow.amount_zat).or_insert(0_u32);
+        *count = count.saturating_add(1);
+        counts
+    });
+    let shields = flows
+        .iter()
+        .filter(|flow| flow.direction == ValuePoolFlowDirection::Shield)
+        .collect::<Vec<_>>();
+    let deshields = flows
+        .iter()
+        .filter(|flow| flow.direction == ValuePoolFlowDirection::Deshield)
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for deshield in deshields {
+        let mut pairs = shields
+            .iter()
+            .copied()
+            .filter(|shield| {
+                cipherscan_linkability_pair_is_eligible(shield, deshield, tolerance_zat)
+            })
+            .map(|shield| {
+                let occurrence_count = occurrence_count_by_amount
+                    .get(&shield.amount_zat)
+                    .copied()
+                    .unwrap_or(1);
+                CipherscanLinkabilityPair {
+                    shield,
+                    deshield,
+                    preliminary_score: cipherscan_linkability_preliminary_score(
+                        shield,
+                        deshield,
+                        occurrence_count,
+                    ),
+                    occurrence_count,
+                }
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable_by(|left, right| {
+            right
+                .preliminary_score
+                .cmp(&left.preliminary_score)
+                .then_with(|| {
+                    right
+                        .shield
+                        .block_time_unix_seconds
+                        .cmp(&left.shield.block_time_unix_seconds)
+                })
+        });
+        let pair_count = pairs.len();
+        for (index, pair) in pairs
+            .iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .enumerate()
+        {
+            if pair.shield.transaction_id != source.transaction_id
+                && pair.deshield.transaction_id != source.transaction_id
+            {
+                continue;
+            }
+            let next_score = pairs
+                .get(index.saturating_add(1))
+                .map_or(0, |next| next.preliminary_score);
+            let margin = pair.preliminary_score.saturating_sub(next_score);
+            if let Some(candidate) = cipherscan_linkability_candidate(
+                source,
+                *pair,
+                u32::try_from(pair_count).unwrap_or(u32::MAX),
+                margin,
+            ) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    Ok(rank_cipherscan_linkability_candidates(candidates, limit))
+}
+
+fn rank_cipherscan_linkability_candidates(
+    mut candidates: Vec<CipherscanLinkabilityCandidate>,
+    limit: u32,
+) -> Vec<CipherscanLinkabilityCandidate> {
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .linkability_score
+            .cmp(&left.linkability_score)
+            .then_with(|| {
+                right
+                    .flow
+                    .block_time_unix_seconds
+                    .cmp(&left.flow.block_time_unix_seconds)
+            })
+    });
+    candidates.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    candidates
+}
+
+fn cipherscan_linkability_flow_from_event(
+    event: &explorer::ValuePoolFlowEvent,
+) -> Result<CipherscanLinkabilityFlow, CipherscanRestError> {
+    validate_value_pool_flow_event(event)?;
+    Ok(CipherscanLinkabilityFlow {
+        transaction_id: event.transaction_id.clone(),
+        direction: ValuePoolFlowDirection::try_from(event.direction).map_err(|_| {
+            CipherscanRestError::InvalidUpstreamField(
+                "value_pool_flow_events_in_range.events.direction",
+            )
+        })?,
+        amount_zat: event.amount_zat,
+        block_height: event.block_height,
+        block_time_unix_seconds: event.block_time_unix_seconds,
+        pool: ValuePoolFlowPool::try_from(event.pool).map_err(|_| {
+            CipherscanRestError::InvalidUpstreamField("value_pool_flow_events_in_range.events.pool")
+        })?,
+        transparent_addresses: Vec::new(),
+    })
+}
+
+fn cipherscan_linkability_pair_is_eligible(
+    shield: &CipherscanLinkabilityFlow,
+    deshield: &CipherscanLinkabilityFlow,
+    tolerance_zat: u64,
+) -> bool {
+    deshield.block_time_unix_seconds > shield.block_time_unix_seconds
+        && deshield.block_time_unix_seconds
+            < shield
+                .block_time_unix_seconds
+                .saturating_add(LINKABILITY_MAX_PAIR_AGE_SECONDS)
+        && shield.amount_zat.abs_diff(deshield.amount_zat) <= tolerance_zat
+}
+
+fn cipherscan_linkability_preliminary_score(
+    shield: &CipherscanLinkabilityFlow,
+    deshield: &CipherscanLinkabilityFlow,
+    occurrence_count: u32,
+) -> u32 {
+    cipherscan_linkability_amount_similarity_score(shield.amount_zat.abs_diff(deshield.amount_zat))
+        + cipherscan_linkability_time_score(
+            deshield
+                .block_time_unix_seconds
+                .saturating_sub(shield.block_time_unix_seconds),
+        )
+        + cipherscan_linkability_rarity_score(occurrence_count)
+        + cipherscan_linkability_weird_amount_score(shield.amount_zat, occurrence_count)
+        + u32::from(shield.pool == deshield.pool) * 4
+}
+
+fn cipherscan_linkability_candidate(
+    source: &CipherscanLinkabilityFlow,
+    pair: CipherscanLinkabilityPair<'_>,
+    candidate_count: u32,
+    margin: u32,
+) -> Option<CipherscanLinkabilityCandidate> {
+    let ambiguity_score = cipherscan_linkability_ambiguity_score(candidate_count, margin);
+    let ambiguity_penalty = ambiguity_score.saturating_add(2) / 4;
+    let linkability_score = pair
+        .preliminary_score
+        .saturating_sub(ambiguity_penalty)
+        .min(100);
+    if linkability_score < LINKABILITY_MINIMUM_CONFIDENCE_SCORE {
+        return None;
+    }
+    let linked_flow = if source.direction == ValuePoolFlowDirection::Shield {
+        pair.deshield
+    } else {
+        pair.shield
+    };
+    Some(CipherscanLinkabilityCandidate {
+        flow: linked_flow.clone(),
+        time_delta_seconds: linked_flow
+            .block_time_unix_seconds
+            .saturating_sub(source.block_time_unix_seconds),
+        linkability_score,
+        warning_level: cipherscan_linkability_warning_level(linkability_score),
+        ambiguity_score,
+        confidence_margin: margin,
+        score_breakdown: CipherscanLinkabilityScoreBreakdown {
+            amount_similarity: cipherscan_linkability_amount_similarity_score(
+                pair.shield.amount_zat.abs_diff(pair.deshield.amount_zat),
+            ),
+            time_proximity: cipherscan_linkability_time_score(
+                pair.deshield
+                    .block_time_unix_seconds
+                    .saturating_sub(pair.shield.block_time_unix_seconds),
+            ),
+            amount_rarity: cipherscan_linkability_rarity_score(pair.occurrence_count),
+            weird_amount: cipherscan_linkability_weird_amount_score(
+                pair.shield.amount_zat,
+                pair.occurrence_count,
+            ),
+            pool_match: u32::from(pair.shield.pool == pair.deshield.pool) * 4,
+            ambiguity_penalty,
+        },
+    })
+}
+
+fn transaction_linkability_json(
+    source: &CipherscanLinkabilityFlow,
+    candidates: &[CipherscanLinkabilityCandidate],
+) -> Value {
+    let highest_score = candidates
+        .first()
+        .map_or(0, |candidate| candidate.linkability_score);
+    json!({
+        "success": true,
+        "txid": source.transaction_id,
+        "flowType": cipherscan_flow_direction(source.direction as i32).unwrap_or("unknown"),
+        "amount": zec_from_unsigned_zatoshis(source.amount_zat),
+        "amountZat": source.amount_zat,
+        "blockHeight": source.block_height,
+        "blockTime": source.block_time_unix_seconds,
+        "pool": cipherscan_flow_pool(source.pool as i32).unwrap_or("unknown"),
+        "hasShieldedActivity": true,
+        "transparentAddresses": source.transparent_addresses,
+        "linkedTransactions": candidates.iter().map(cipherscan_linkability_candidate_json).collect::<Vec<_>>(),
+        "totalMatches": candidates.len(),
+        "warningLevel": cipherscan_linkability_warning_level(highest_score),
+        "highestScore": highest_score,
+        "algorithm": {
+            "version": "2.0",
+            "note": "Scores combine amount similarity, timing, amount rarity, weird-amount detection, and ambiguity penalties.",
+        },
+    })
+}
+
+fn cipherscan_linkability_candidate_json(candidate: &CipherscanLinkabilityCandidate) -> Value {
+    json!({
+        "txid": candidate.flow.transaction_id,
+        "flowType": cipherscan_flow_direction(candidate.flow.direction as i32).unwrap_or("unknown"),
+        "amount": zec_from_unsigned_zatoshis(candidate.flow.amount_zat),
+        "amountZat": candidate.flow.amount_zat,
+        "blockHeight": candidate.flow.block_height,
+        "blockTime": candidate.flow.block_time_unix_seconds,
+        "pool": cipherscan_flow_pool(candidate.flow.pool as i32).unwrap_or("unknown"),
+        "timeDelta": cipherscan_linkability_time_delta(candidate.time_delta_seconds),
+        "timeDeltaSeconds": candidate.time_delta_seconds,
+        "linkabilityScore": candidate.linkability_score,
+        "warningLevel": candidate.warning_level,
+        "ambiguityScore": candidate.ambiguity_score,
+        "confidenceMargin": candidate.confidence_margin,
+        "transparentAddresses": candidate.flow.transparent_addresses,
+        "scoreBreakdown": {
+            "amountSimilarity": candidate.score_breakdown.amount_similarity,
+            "timeProximity": candidate.score_breakdown.time_proximity,
+            "amountRarity": candidate.score_breakdown.amount_rarity,
+            "weirdAmount": candidate.score_breakdown.weird_amount,
+            "poolMatch": candidate.score_breakdown.pool_match,
+            "ambiguityPenalty": candidate.score_breakdown.ambiguity_penalty,
+        },
+    })
+}
+
+fn cipherscan_linkability_amount_similarity_score(amount_difference_zat: u64) -> u32 {
+    match amount_difference_zat {
+        0 => 35,
+        1..=10_000 => 32,
+        10_001..=50_000 => 28,
+        50_001..=100_000 => 24,
+        100_001..=250_000 => 16,
+        250_001..=500_000 => 8,
+        _ => 0,
+    }
+}
+
+fn cipherscan_linkability_time_score(seconds: i64) -> u32 {
+    match seconds {
+        ..900 => 25,
+        900..3_600 => 20,
+        3_600..7_200 => 16,
+        7_200..21_600 => 12,
+        21_600..86_400 => 8,
+        86_400..259_200 => 5,
+        259_200..604_800 => 3,
+        _ => 1,
+    }
+}
+
+fn cipherscan_linkability_rarity_score(occurrence_count: u32) -> u32 {
+    match occurrence_count {
+        0 | 1 => 24,
+        2 | 3 => 20,
+        4..=10 => 15,
+        11..=25 => 10,
+        26..=100 => 4,
+        _ => 0,
+    }
+}
+
+fn cipherscan_linkability_weird_amount_score(amount_zat: u64, occurrence_count: u32) -> u32 {
+    let roundness_score = cipherscan_linkability_roundness_score(amount_zat);
+    match (occurrence_count, roundness_score) {
+        (0..=3, 0) => 18,
+        (4..=10, 0) => 12,
+        (0..=3, _) => 6,
+        (4..=10, _) => 2,
+        _ => 0,
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Cipherscan scores display-denominated round amounts with JavaScript numbers."
+)]
+fn cipherscan_linkability_roundness_score(amount_zat: u64) -> u32 {
+    let amount_zec = amount_zat as f64 / ZATOSHIS_PER_ZEC;
+    for (minimum, multiple, score) in [
+        (1_000.0, 1_000.0, 14),
+        (500.0, 500.0, 12),
+        (100.0, 100.0, 10),
+        (50.0, 50.0, 8),
+        (10.0, 10.0, 6),
+        (1.0, 1.0, 4),
+    ] {
+        let remainder = amount_zec.rem_euclid(multiple);
+        if amount_zec >= minimum && remainder.min(multiple - remainder) <= 0.001 {
+            return score;
+        }
+    }
+    0
+}
+
+fn cipherscan_linkability_ambiguity_score(candidate_count: u32, margin: u32) -> u32 {
+    let count_penalty = candidate_count.saturating_sub(1).saturating_mul(12);
+    let margin_penalty = match margin {
+        12.. => 0,
+        8..=11 => 8,
+        4..=7 => 16,
+        _ => 24,
+    };
+    count_penalty.saturating_add(margin_penalty).min(100)
+}
+
+fn cipherscan_linkability_warning_level(score: u32) -> &'static str {
+    if score >= LINKABILITY_HIGH_WARNING_SCORE {
+        "HIGH"
+    } else if score >= LINKABILITY_MEDIUM_WARNING_SCORE {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Cipherscan formats human-readable time deltas with JavaScript Math.round."
+)]
+fn cipherscan_linkability_time_delta(seconds: i64) -> String {
+    let absolute_seconds = seconds.saturating_abs();
+    let suffix = if seconds > 0 { "after" } else { "before" };
+    if absolute_seconds < 60 {
+        return format!("{absolute_seconds} seconds {suffix}");
+    }
+    if absolute_seconds < 3_600 {
+        return format!(
+            "{} minutes {suffix}",
+            (absolute_seconds as f64 / 60.0).round() as u64
+        );
+    }
+    if absolute_seconds < 86_400 {
+        return format!(
+            "{} hours {suffix}",
+            (absolute_seconds as f64 / 3_600.0).round() as u64
+        );
+    }
+    if absolute_seconds < 604_800 {
+        return format!("{:.1} days {suffix}", absolute_seconds as f64 / 86_400.0);
+    }
+    format!(
+        "{} weeks {suffix}",
+        (absolute_seconds as f64 / 604_800.0).round() as u64
+    )
 }
 
 fn transaction_linkability_not_found_json() -> Value {
@@ -18817,18 +19648,139 @@ mod tests {
     }
 
     #[test]
-    fn transaction_linkability_json_preserves_no_activity_shape() {
-        let response = transaction_linkability_json(SAMPLE_TRANSACTION_ID);
+    fn transaction_linkability_unavailable_json_preserves_degraded_shape() {
+        let source = CipherscanLinkabilityFlow {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            direction: ValuePoolFlowDirection::Shield,
+            amount_zat: 1_124_945_000,
+            block_height: 4_157_695,
+            block_time_unix_seconds: 1_783_697_187,
+            pool: ValuePoolFlowPool::Sapling,
+            transparent_addresses: vec!["tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".to_owned()],
+        };
+        let response = transaction_linkability_unavailable_json(
+            SAMPLE_TRANSACTION_ID,
+            Some(&source),
+            true,
+            "range unavailable",
+        );
 
-        assert_eq!(response["success"], json!(true));
+        assert_eq!(response["success"], json!(false));
         assert_eq!(response["txid"], json!(SAMPLE_TRANSACTION_ID));
-        assert_eq!(response["flowType"], Value::Null);
-        assert_eq!(response["hasShieldedActivity"], json!(false));
+        assert_eq!(response["flowType"], json!("shield"));
+        assert_eq!(response["amountZat"], json!(1_124_945_000_u64));
+        assert_eq!(response["hasShieldedActivity"], json!(true));
         assert_eq!(response["linkedTransactions"], json!([]));
-        assert_eq!(response["totalMatches"], json!(0));
+        assert!(response.get("totalMatches").is_none());
+        assert!(response.get("warningLevel").is_none());
+        assert!(response.get("highestScore").is_none());
+        assert_eq!(response["degraded"], json!(true));
+    }
+
+    #[test]
+    fn transaction_linkability_query_matches_cipherscan_coercion() {
+        assert_eq!(
+            CipherscanLinkabilityRequest::from_query(&TransactionLinkabilityQuery::default()),
+            CipherscanLinkabilityRequest {
+                limit: 5,
+                tolerance_zat: 100_000,
+            }
+        );
+        assert_eq!(
+            CipherscanLinkabilityRequest::from_query(&TransactionLinkabilityQuery {
+                limit: Some("-2suffix".to_owned()),
+                tolerance: Some("-1suffix".to_owned()),
+            }),
+            CipherscanLinkabilityRequest {
+                limit: 1,
+                tolerance_zat: 10_000,
+            }
+        );
+    }
+
+    #[test]
+    fn transaction_linkability_scoring_matches_cipherscan_boundaries() {
+        assert_eq!(cipherscan_linkability_amount_similarity_score(0), 35);
+        assert_eq!(cipherscan_linkability_amount_similarity_score(10_000), 32);
+        assert_eq!(cipherscan_linkability_amount_similarity_score(10_001), 28);
+        assert_eq!(cipherscan_linkability_time_score(899), 25);
+        assert_eq!(cipherscan_linkability_time_score(900), 20);
+        assert_eq!(cipherscan_linkability_rarity_score(3), 20);
+        assert_eq!(cipherscan_linkability_rarity_score(4), 15);
+        assert_eq!(cipherscan_linkability_ambiguity_score(1, 12), 0);
+        assert_eq!(cipherscan_linkability_ambiguity_score(3, 3), 48);
+    }
+
+    #[test]
+    fn transaction_linkability_complete_zero_match_preserves_public_shape() {
+        let source = CipherscanLinkabilityFlow {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            direction: ValuePoolFlowDirection::Shield,
+            amount_zat: 1_124_945_000,
+            block_height: 4_157_695,
+            block_time_unix_seconds: 1_783_697_187,
+            pool: ValuePoolFlowPool::Sapling,
+            transparent_addresses: vec!["tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".to_owned()],
+        };
+        let response = transaction_linkability_json(&source, &[]);
+
+        assert_eq!(response["flowType"], json!("shield"));
+        assert_eq!(response["amount"], json!(11.24945));
+        assert_eq!(response["amountZat"], json!(1_124_945_000_u64));
+        assert_eq!(response["blockHeight"], json!(4_157_695));
+        assert_eq!(response["pool"], json!("sapling"));
+        assert_eq!(response["hasShieldedActivity"], json!(true));
+        assert_eq!(response["linkedTransactions"], json!([]));
         assert_eq!(response["warningLevel"], json!("LOW"));
         assert_eq!(response["highestScore"], json!(0));
-        assert_eq!(response["degraded"], json!(true));
+        assert!(response.get("degraded").is_none());
+    }
+
+    #[test]
+    fn transaction_linkability_ranks_an_exact_fast_same_pool_pair()
+    -> Result<(), CipherscanRestError> {
+        let source = CipherscanLinkabilityFlow {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            direction: ValuePoolFlowDirection::Shield,
+            amount_zat: 1_124_945_000,
+            block_height: 100,
+            block_time_unix_seconds: 1_000,
+            pool: ValuePoolFlowPool::Sapling,
+            transparent_addresses: Vec::new(),
+        };
+        let events = vec![
+            explorer::ValuePoolFlowEvent {
+                transaction_id: source.transaction_id.clone(),
+                block_height: source.block_height,
+                block_time_unix_seconds: source.block_time_unix_seconds,
+                transaction_index_in_block: 1,
+                direction: source.direction as i32,
+                pool: source.pool as i32,
+                amount_zat: source.amount_zat,
+                pool_balances: None,
+            },
+            explorer::ValuePoolFlowEvent {
+                transaction_id: "ab".repeat(32),
+                block_height: 101,
+                block_time_unix_seconds: 1_600,
+                transaction_index_in_block: 1,
+                direction: ValuePoolFlowDirection::Deshield as i32,
+                pool: ValuePoolFlowPool::Sapling as i32,
+                amount_zat: source.amount_zat,
+                pool_balances: None,
+            },
+        ];
+
+        let candidates = cipherscan_linkability_candidates(&source, &events, 100_000, 5)?;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].flow.transaction_id, "ab".repeat(32));
+        assert_eq!(candidates[0].linkability_score, 100);
+        assert_eq!(candidates[0].warning_level, "HIGH");
+        assert_eq!(candidates[0].ambiguity_score, 0);
+        assert_eq!(candidates[0].time_delta_seconds, 600);
+        assert_eq!(cipherscan_linkability_time_delta(600), "10 minutes after");
+        Ok(())
     }
 
     #[test]
