@@ -12,6 +12,16 @@
 
 set -eu
 
+# Operator-set escape hatch for from-genesis rebuilds: the reader plane
+# serves nothing useful while ingest is still bulk-catching-up, but its
+# RocksDB secondary still holds block cache and replay threads inside the
+# shared cgroup. ZREBUILD_READERS is deliberately not ZINDER_-prefixed so
+# it never reaches the strict config loader.
+if [ "${ZREBUILD_READERS:-}" = "off" ]; then
+    echo "zinder-query/run: ZREBUILD_READERS=off; parking the reader plane instead of starting zinder-query" >&2
+    exec sleep infinity
+fi
+
 INGEST_CONTROL_HOST=127.0.0.1
 INGEST_CONTROL_PORT=9100
 # Cold-boot startup (store open, schema validation, optional recovery)

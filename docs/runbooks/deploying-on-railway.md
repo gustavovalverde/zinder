@@ -152,6 +152,14 @@ On PaaS hosts that reschedule the container across machines, a leaked OFD lock c
 
 Remove `ZINDER_WIPE_PRIMARY_ON_BOOT` from the service as soon as the container boots cleanly. It is not a one-shot flag at the container level: while it stays set, every restart re-archives the store and resyncs from genesis, discarding all progress since the last boot. The archived directories stay on the volume until you delete them; prune them once the fresh sync is healthy to reclaim space.
 
+## Reader-plane parking during rebuilds
+
+A from-genesis rebuild is ingest-bound: `zinder-query`, `zinder-explorer`, and the nginx multiplexer serve nothing useful while ingest is still bulk-catching-up, but their RocksDB secondaries and idle worker threads still occupy resident memory and CPU inside the container's shared cgroup. Set `ZREBUILD_READERS=off` on the service to park all three: each run script logs one line and execs `sleep infinity` instead of starting its binary. Ingest is unaffected and starts normally.
+
+`ZREBUILD_READERS` is deliberately not `ZINDER_`-prefixed so the strict config loader never sees it. Parking the multiplexer takes down the container's only externally routed port, including the `/readyz` and freshness/operator endpoints normally used to watch rebuild progress; fall back to ingest's private ops port (9105, `/metrics`) over `railway ssh` or an equivalent private-network shell while readers are parked.
+
+Remove `ZREBUILD_READERS` (or set it to anything other than `off`) and redeploy once the rebuild clears the dense band, so the reader plane resumes serving traffic.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

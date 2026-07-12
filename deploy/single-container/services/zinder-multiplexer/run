@@ -12,6 +12,15 @@
 
 set -eu
 
+# Operator-set escape hatch for from-genesis rebuilds: query and explorer
+# park under the same flag, so waiting on their ports here would block
+# forever. ZREBUILD_READERS is deliberately not ZINDER_-prefixed so it
+# never reaches the strict config loader.
+if [ "${ZREBUILD_READERS:-}" = "off" ]; then
+    echo "zinder-multiplexer/run: ZREBUILD_READERS=off; parking the multiplexer instead of starting nginx" >&2
+    exec sleep infinity
+fi
+
 QUERY_HOST=127.0.0.1
 QUERY_PORT=9101
 EXPLORER_HOST=127.0.0.1
