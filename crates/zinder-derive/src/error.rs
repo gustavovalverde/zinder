@@ -86,6 +86,23 @@ pub enum DeriveStoreError {
         /// Operator-facing reason describing the decode failure.
         reason: String,
     },
+    /// A writer staged consumer projection coverage whose bounds violate the
+    /// `complete_from_height <= complete_through_height <= projection_tip_height`
+    /// ordering the on-disk record requires. The store refuses to persist it so
+    /// no reader can later decode an undecodable record.
+    #[error(
+        "derive store consumer `{consumer}` projection coverage bounds are invalid: complete_from_height={complete_from_height}, complete_through_height={complete_through_height}, projection_tip_height={projection_tip_height}"
+    )]
+    InvalidProjectionCoverage {
+        /// Consumer whose coverage bounds were rejected.
+        consumer: &'static str,
+        /// Staged first verified height.
+        complete_from_height: u32,
+        /// Staged last verified height.
+        complete_through_height: u32,
+        /// Staged projection tip height.
+        projection_tip_height: u32,
+    },
     /// Persisted store-format version is incompatible with the running binary.
     #[error("derive store format version mismatch: persisted={persisted}, running={running}")]
     SchemaMismatch {

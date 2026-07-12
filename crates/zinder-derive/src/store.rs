@@ -461,7 +461,7 @@ impl DeriveStoreReadSnapshot<'_> {
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
                 source,
             })?
-            .map(|payload| decode_consumer_projection_state(&payload))
+            .map(|payload| decode_consumer_projection_state(consumer, &payload))
             .transpose()
     }
 
@@ -1326,7 +1326,7 @@ impl DeriveStore {
     ) -> Result<Option<ConsumerProjectionState>, DeriveStoreError> {
         let key = consumer_projection_state_key(consumer.as_str());
         self.get(DeriveStoreTable::ConsumerMetadata, &key)?
-            .map(|payload| decode_consumer_projection_state(&payload))
+            .map(|payload| decode_consumer_projection_state(consumer, &payload))
             .transpose()
     }
 
@@ -1337,6 +1337,7 @@ impl DeriveStore {
         consumer: DeriveConsumerName,
         state: ConsumerProjectionState,
     ) -> Result<(), DeriveStoreError> {
+        validate_projection_coverage_bounds(consumer, &state)?;
         let column_family = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
         batch.put_cf(
             &column_family,
@@ -2402,6 +2403,33 @@ fn consumer_projection_state_key(name: &str) -> Vec<u8> {
     key
 }
 
+fn projection_coverage_bounds_valid(
+    coverage: ConsumerProjectionCoverage,
+    projection_tip_height: BlockHeight,
+) -> bool {
+    let ordered = coverage.complete_from_height <= coverage.complete_through_height;
+    let within_tip = coverage.complete_through_height <= projection_tip_height;
+    ordered && within_tip
+}
+
+fn validate_projection_coverage_bounds(
+    consumer: DeriveConsumerName,
+    state: &ConsumerProjectionState,
+) -> Result<(), DeriveStoreError> {
+    let Some(coverage) = state.coverage else {
+        return Ok(());
+    };
+    if projection_coverage_bounds_valid(coverage, state.projection_tip_height) {
+        return Ok(());
+    }
+    Err(DeriveStoreError::InvalidProjectionCoverage {
+        consumer: consumer.as_str(),
+        complete_from_height: coverage.complete_from_height.value(),
+        complete_through_height: coverage.complete_through_height.value(),
+        projection_tip_height: state.projection_tip_height.value(),
+    })
+}
+
 fn encode_consumer_projection_state(
     state: ConsumerProjectionState,
 ) -> [u8; CONSUMER_PROJECTION_STATE_LEN] {
@@ -2432,6 +2460,7 @@ fn encode_consumer_projection_state(
 }
 
 fn decode_consumer_projection_state(
+    consumer: DeriveConsumerName,
     payload: &[u8],
 ) -> Result<ConsumerProjectionState, DeriveStoreError> {
     let bytes: [u8; CONSUMER_PROJECTION_STATE_LEN] = payload.try_into().map_err(|_| {
@@ -2484,14 +2513,19 @@ fn decode_consumer_projection_state(
                 ));
             }
         };
-    if coverage.is_some_and(|coverage| {
-        coverage.complete_from_height > coverage.complete_through_height
-            || coverage.complete_through_height > projection_tip_height
-    }) {
-        return Err(projection_state_decode_error(
-            "consumer projection coverage bounds are invalid",
-        ));
-    }
+    let coverage = match coverage {
+        Some(coverage) if !projection_coverage_bounds_valid(coverage, projection_tip_height) => {
+            tracing::warn!(
+                consumer = consumer.as_str(),
+                complete_from_height = coverage.complete_from_height.value(),
+                complete_through_height = coverage.complete_through_height.value(),
+                projection_tip_height = projection_tip_height.value(),
+                "dropping consumer projection coverage with invalid bounds; the consumer re-derives its coverage"
+            );
+            None
+        }
+        other => other,
+    };
     Ok(ConsumerProjectionState {
         projection_epoch_id,
         projection_tip_height,
@@ -3051,14 +3085,17 @@ mod tests {
             }),
         };
 
-        let decoded = decode_consumer_projection_state(&encode_consumer_projection_state(state))?;
+        let decoded = decode_consumer_projection_state(
+            TEST_CONSUMER,
+            &encode_consumer_projection_state(state),
+        )?;
 
         assert_eq!(decoded, state);
         Ok(())
     }
 
     #[test]
-    fn consumer_projection_state_rejects_coverage_past_projection_tip() {
+    fn decoding_coverage_past_projection_tip_drops_coverage() -> Result<()> {
         let state = ConsumerProjectionState {
             projection_epoch_id: ChainEpochId::new(42),
             projection_tip_height: BlockHeight::new(10),
@@ -3071,11 +3108,15 @@ mod tests {
             }),
         };
 
-        let outcome = decode_consumer_projection_state(&encode_consumer_projection_state(state));
+        let decoded = decode_consumer_projection_state(
+            TEST_CONSUMER,
+            &encode_consumer_projection_state(state),
+        )?;
 
-        assert!(
-            matches!(outcome, Err(DeriveStoreError::Decode { reason, .. }) if reason.contains("coverage bounds"))
-        );
+        assert_eq!(decoded.coverage, None);
+        assert_eq!(decoded.projection_tip_height, BlockHeight::new(10));
+        assert_eq!(decoded.revision, 7);
+        Ok(())
     }
 
     #[test]
@@ -3150,6 +3191,79 @@ mod tests {
             Err(DeriveStoreError::InvalidOptions { reason })
                 if reason.contains("max_open_files")
         ));
+        Ok(())
+    }
+
+    fn projection_state_with_coverage(
+        projection_tip_height: u32,
+        complete_from_height: u32,
+        complete_through_height: u32,
+    ) -> ConsumerProjectionState {
+        ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(1),
+            projection_tip_height: BlockHeight::new(projection_tip_height),
+            projection_tip_hash: BlockHash::from_bytes([0x11; 32]),
+            revision: 7,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(complete_from_height),
+                complete_through_height: BlockHeight::new(complete_through_height),
+                complete_through_hash: BlockHash::from_bytes([0x22; 32]),
+            }),
+        }
+    }
+
+    #[test]
+    fn staging_projection_coverage_with_inverted_bounds_is_rejected() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
+
+        let inverted = projection_state_with_coverage(200, 150, 100);
+        match store.put_consumer_projection_state(TEST_CONSUMER, inverted) {
+            Err(DeriveStoreError::InvalidProjectionCoverage {
+                consumer,
+                complete_from_height,
+                complete_through_height,
+                projection_tip_height,
+            }) => {
+                assert_eq!(consumer, TEST_CONSUMER.as_str());
+                assert_eq!(complete_from_height, 150);
+                assert_eq!(complete_through_height, 100);
+                assert_eq!(projection_tip_height, 200);
+            }
+            other => {
+                return Err(eyre::eyre!(
+                    "expected InvalidProjectionCoverage, got {other:?}"
+                ));
+            }
+        }
+
+        assert!(store.consumer_projection_state(TEST_CONSUMER)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_projection_coverage_beyond_tip_is_rejected() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
+
+        let beyond_tip = projection_state_with_coverage(180_256, 1, 180_512);
+        match store.put_consumer_projection_state(TEST_CONSUMER, beyond_tip) {
+            Err(DeriveStoreError::InvalidProjectionCoverage {
+                complete_through_height,
+                projection_tip_height,
+                ..
+            }) => {
+                assert_eq!(complete_through_height, 180_512);
+                assert_eq!(projection_tip_height, 180_256);
+            }
+            other => {
+                return Err(eyre::eyre!(
+                    "expected InvalidProjectionCoverage, got {other:?}"
+                ));
+            }
+        }
+
+        assert!(store.consumer_projection_state(TEST_CONSUMER)?.is_none());
         Ok(())
     }
 }

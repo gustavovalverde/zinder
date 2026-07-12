@@ -212,6 +212,13 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
         let current = ctx
             .store
             .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?;
+        // Re-applied committed chunks must not regress the fence a later chunk advanced.
+        if let Some(state) = current
+            && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
+            && projection_tip_height < state.projection_tip_height
+        {
+            return Ok(());
+        }
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
             .ok_or(TransactionHistoryConsumerError::ProjectionRevisionOverflow)?;
@@ -349,13 +356,133 @@ pub enum TransactionHistoryConsumerError {
 
 #[cfg(test)]
 mod tests {
+    use eyre::Result;
+    use rust_rocksdb::WriteBatch;
+    use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
+        ChainTipMetadata, LockTime, Network, PrivacyShape, TransactionComponentCounts,
         TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion,
+        TransactionVersion, UnixTimestampMillis,
     };
+    use zinder_store::{ChainEpochCommitted, ChainEvent};
 
-    use super::TransactionHistoryConsumer;
+    use super::{
+        BlockProjectionCheckpoint, ConsumerProjectionCoverage, ConsumerProjectionState,
+        TRANSACTION_HISTORY_CONSUMER_NAME, TransactionHistoryConsumer,
+    };
+    use crate::consumer::{BlockKeyedConsumer, DeriveConsumerCtx};
+    use crate::store::{DeriveStore, DeriveStoreOptions};
+
+    fn chain_epoch(id: u64, tip: u32) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(id),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(tip),
+            visible_tip_hash: BlockHash::from_bytes([0x66; 32]),
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: BlockHash::from_bytes([0x01; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1_774_668_200_000 + id),
+        }
+    }
+
+    fn committed_chunk_event(chain_epoch: ChainEpoch, start: u32, end: u32) -> ChainEvent {
+        ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(start),
+                    BlockHeight::new(end),
+                ),
+            },
+        }
+    }
+
+    fn seed_projection_state(
+        store: &DeriveStore,
+        tip: u32,
+        complete_through_height: u32,
+    ) -> Result<ConsumerProjectionState> {
+        let state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(1),
+            projection_tip_height: BlockHeight::new(tip),
+            projection_tip_hash: BlockHash::from_bytes([0x33; 32]),
+            revision: 5,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(complete_through_height),
+                complete_through_hash: BlockHash::from_bytes([0x44; 32]),
+            }),
+        };
+        store.put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
+        Ok(state)
+    }
+
+    fn stage_and_commit_checkpoint(
+        store: &DeriveStore,
+        chain_epoch: ChainEpoch,
+        chunk_event: &ChainEvent,
+        tip: u32,
+    ) -> Result<()> {
+        let checkpoint = BlockProjectionCheckpoint {
+            chain_epoch,
+            chain_event: chunk_event,
+            projection_tip_height: Some(BlockHeight::new(tip)),
+            projection_tip_hash: Some(BlockHash::from_bytes([0x55; 32])),
+        };
+        let mut batch = WriteBatch::default();
+        let mut ctx = DeriveConsumerCtx {
+            store,
+            batch: &mut batch,
+        };
+        TransactionHistoryConsumer::new()
+            .stage_chain_event_checkpoint(checkpoint, &mut ctx)
+            .map_err(|error| eyre::eyre!("{error}"))?;
+        store.write_batch(&batch)?;
+        Ok(())
+    }
+
+    #[test]
+    fn re_applied_lower_committed_chunk_preserves_advanced_coverage() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
+        let armed = seed_projection_state(&store, 180_512, 180_512)?;
+
+        let epoch = chain_epoch(1, 180_512);
+        let re_applied_chunk = committed_chunk_event(epoch, 180_001, 180_256);
+        stage_and_commit_checkpoint(&store, epoch, &re_applied_chunk, 180_256)?;
+
+        let stored = store
+            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("expected the seeded projection state to survive"))?;
+        assert_eq!(stored, armed);
+        Ok(())
+    }
+
+    #[test]
+    fn contiguous_committed_chunk_advances_coverage_to_tip() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
+        seed_projection_state(&store, 180_256, 180_256)?;
+
+        let epoch = chain_epoch(1, 180_512);
+        let next_chunk = committed_chunk_event(epoch, 180_257, 180_512);
+        stage_and_commit_checkpoint(&store, epoch, &next_chunk, 180_512)?;
+
+        let stored = store
+            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("expected an advanced projection state"))?;
+        assert_eq!(stored.projection_tip_height, BlockHeight::new(180_512));
+        let coverage = stored
+            .coverage
+            .ok_or_else(|| eyre::eyre!("expected verified coverage to advance"))?;
+        assert_eq!(coverage.complete_from_height, BlockHeight::new(1));
+        assert_eq!(coverage.complete_through_height, BlockHeight::new(180_512));
+        assert_eq!(stored.revision, 6);
+        Ok(())
+    }
 
     fn transaction(seed: u8, tx_index_in_block: u32) -> TransactionFactsArtifact {
         let transaction_id = TransactionId::from_bytes([seed; 32]);
