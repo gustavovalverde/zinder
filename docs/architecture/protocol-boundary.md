@@ -239,8 +239,9 @@ satisfied.
 
 - `CompactBlock(CompactBlockRequest) returns (CompactBlockResponse)` — fetch one indexed compact block by height.
 - `Transaction(TransactionRequest) returns (TransactionResponse)` — fetch one indexed transaction by transaction id.
+- `NetworkUpgradeActivations(NetworkUpgradeActivationsRequest) returns (NetworkUpgradeActivationsResponse)` — fetch the node-discovered consensus schedule used by the query process.
 
-Both responses are bound to one `ChainEpoch` so wallets cannot mix epochs across follow-up requests. The lightwalletd compat adapter routes `GetBlock` to `compact_block_at` and `GetTransaction` to `transaction`. The compat layer translates between the lightwalletd surface's byte conventions and Zinder's storage types: display-form hex strings such as `TreeState.hash` and `SendResponse.error_message` go through `encode_rpc_*_hex` / `decode_rpc_*_hex`; compact-block `bytes txid` fields stay as internal-order bytes per the lightwalletd `// MUST be in protocol order and MUST NOT be reversed` convention in `compat/lightwalletd/compact_formats.proto`.
+The compact-block and transaction responses are bound to one `ChainEpoch` so wallets cannot mix epochs across follow-up requests. The lightwalletd compat adapter routes `GetBlock` to `compact_block_at` and `GetTransaction` to `transaction`. The compat layer translates between the lightwalletd surface's byte conventions and Zinder's storage types: display-form hex strings such as `TreeState.hash` and `SendResponse.error_message` go through `encode_rpc_*_hex` / `decode_rpc_*_hex`; compact-block `bytes txid` fields stay as internal-order bytes per the lightwalletd `// MUST be in protocol order and MUST NOT be reversed` convention in `compat/lightwalletd/compact_formats.proto`.
 
 The defaults reuse Bitcoin/Zcash JSON-RPC error-code conventions so wallet
 clients that already track those codes do not need a Zinder-specific table.

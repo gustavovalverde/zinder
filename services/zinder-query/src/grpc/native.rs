@@ -40,6 +40,24 @@ use zinder_store::{
     transparent_spend_message,
 };
 
+/// Encodes the configured node's advertised network-upgrade schedule.
+pub async fn network_upgrade_activations_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+) -> Result<wallet::NetworkUpgradeActivationsResponse, QueryError> {
+    let activations = query_api.network_upgrade_activations().await?;
+    Ok(wallet::NetworkUpgradeActivationsResponse {
+        activations: activations
+            .activations()
+            .iter()
+            .map(|activation| wallet::NetworkUpgradeActivation {
+                consensus_branch_id: activation.branch_id.value(),
+                name: activation.name.clone(),
+                activation_height: activation.activation_height.value(),
+            })
+            .collect(),
+    })
+}
+
 /// Operator-configured snapshot used to build the `WalletServerInfo` descriptor.
 ///
 /// Populated once at startup; the adapter does not call config-rs on each

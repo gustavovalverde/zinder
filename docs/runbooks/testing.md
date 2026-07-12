@@ -811,6 +811,7 @@ wallet.read.subtree_roots_ironwood_v1
 wallet.read.transaction_by_id_v1
 wallet.read.transaction_bytes_v1
 wallet.read.server_info_v1
+wallet.read.network_upgrade_activations_v1
 wallet.broadcast.transaction_v1
 wallet.events.chain_v1
 wallet.snapshot.mempool_v1

@@ -40,10 +40,11 @@ use super::native::{
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
     full_block_response, latest_block_response, latest_safe_block_response,
-    latest_tree_state_checkpoint_response, subtree_roots_response, transaction_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    transparent_utxo_set_summary_response, tree_state_at_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
+    tree_state_at_response,
 };
 use super::status_from_query_error;
 
@@ -742,6 +743,16 @@ where
         Ok(Response::new(wallet::ServerInfoResponse {
             info: Some(wallet_info),
         }))
+    }
+
+    async fn network_upgrade_activations(
+        &self,
+        _request: Request<wallet::NetworkUpgradeActivationsRequest>,
+    ) -> Result<Response<wallet::NetworkUpgradeActivationsResponse>, Status> {
+        network_upgrade_activations_response(&self.query_api)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
     }
 }
 

@@ -175,6 +175,14 @@ field always reflects a real node-discovered table at request time; see
 read from the stored `BlockHeaderArtifact` and falls back to `0` only when the
 typed header row is unavailable.
 
+`WalletQuery.NetworkUpgradeActivations` exposes that same immutable,
+node-discovered schedule to native wallet backends under capability
+`wallet.read.network_upgrade_activations_v1`. Each row carries the consensus
+branch id, node-reported name, and activation height. Wallets compare it with
+their configured consensus parameters before opening or migrating wallet state;
+they derive active versus pending status against the epoch-pinned latest block
+rather than trusting a second node query.
+
 The mined arm also carries `raw_transaction_bytes`: the serialized consensus
 transaction bytes, symmetric with the mempool arm's `payload_bytes`. This makes
 `WalletQuery.Transaction` a verbose mined-transaction read that returns the
