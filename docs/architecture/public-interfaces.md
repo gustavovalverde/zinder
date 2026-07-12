@@ -39,7 +39,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `zinder-query` | Production service that serves wallet and application APIs from epoch-bound indexed state |
 | `zinder-compat-lightwalletd` | Compatibility adapter that serves vendored lightwalletd gRPC over `WalletQueryApi` |
 | `zinder-explorer` | Optional service for explorer-shaped reads and replayable derived indexes ([ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)) |
-| `zinder-client` | Library crate exporting the typed Rust client surface for in-process consumers (Zallet) and Rust integrations |
+| `zinder-client` | Library crate exporting the typed Rust client surface for Rust integrations |
 | `PrimaryChainStore` | `zinder-store` handle that opens canonical RocksDB as the only writer |
 | `SecondaryChainStore` | `zinder-store` handle that opens canonical RocksDB as a RocksDB secondary reader |
 
@@ -965,11 +965,11 @@ let blocks = wallet
     .await?;
 ```
 
-### Rust integrators (Zallet, future SDKs)
+### Rust integrators
 
-Rust consumers depend on `zinder-client`, which exports the typed `ChainIndex` trait with two implementations: `LocalChainIndex` for colocated consumers (RocksDB-secondary reads plus an explicit subscription endpoint), and `RemoteChainIndex` for cross-host consumers (full gRPC). Both implement the same trait; the consumer picks by deployment topology.
+Rust consumers can depend on `zinder-client`, which exports the typed `ChainIndex` trait with two implementations: `LocalChainIndex` for colocated canonical reads through RocksDB secondaries, and `RemoteChainIndex` for consumers that need the full gRPC and endpoint-backed surface. Applications select an implementation by the operations and topology they require.
 
-Colocated Zallet (running on the same host as the Zinder cluster):
+Colocated read-only application:
 
 ```rust
 use zinder_client::{ChainIndex, LocalChainIndex, LocalOpenOptions, BlockHeight};
@@ -978,7 +978,7 @@ use tokio_stream::StreamExt as _;
 
 let chain = LocalChainIndex::open(LocalOpenOptions {
     storage_path: "/var/lib/zinder".into(),
-    secondary_path: "/var/lib/zinder/zallet-secondary".into(),
+    secondary_path: "/var/lib/zinder/application-secondary".into(),
     network: zinder_client::Network::ZcashTestnet,
     canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
     derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::derive_reader_defaults(),
@@ -997,7 +997,7 @@ while let Some(envelope) = events.next().await {
 
 `subscription_endpoint` points at the colocated `zinder-query` proxy when the consumer also needs `ServerInfo` or `BroadcastTransaction`; direct ingest subscription endpoints are reserved for event-only colocated consumers once the private ingest subscription server lands.
 
-Cross-host Zallet (running on a different host from the Zinder cluster):
+Remote Rust application:
 
 ```rust
 use zinder_client::{ChainIndex, RemoteChainIndex, RemoteOpenOptions};
@@ -1007,9 +1007,11 @@ let chain = RemoteChainIndex::connect(RemoteOpenOptions {
     network: zinder_client::Network::ZcashTestnet,
 }).await?;
 
-// Same trait methods as LocalChainIndex; consumer code is identical.
+// Canonical read methods share the ChainIndex vocabulary.
 let tip = chain.latest_block().await?;
 ```
+
+Consumers that cannot link `zinder-client` can vendor the `WalletQuery` protocol and generate client stubs with their own toolchain. This wire-only boundary avoids coupling the consumer to Zinder's Rust dependency graph while preserving the same `ChainEpoch` and capability contracts.
 
 [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape) defines the `zinder-client` shape. [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) owns the multi-process model that makes both implementations necessary.
 

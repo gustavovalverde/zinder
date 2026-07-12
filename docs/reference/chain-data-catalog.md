@@ -1,6 +1,6 @@
-# Zinder Information by Use Case
+# Chain Data Catalog
 
-This catalog is the single reference for public chain information gathered or derived by Zinder. It describes native Zinder data, not compatibility adapters or competitor parity. A row represents an information family rather than an individual RPC.
+This catalog is the single reference for public chain information gathered or derived by Zinder. It answers what data Zinder can serve after a consumer has selected an [integration surface](integration-surfaces.md); it does not compare deployment architectures, compatibility adapters, or competing products. A row represents an information family rather than an individual RPC.
 
 Availability is part of the contract. Consumers must use capability discovery, freshness envelopes, canonical artifact versions, and per-projection coverage instead of inferring completeness from a successful response.
 

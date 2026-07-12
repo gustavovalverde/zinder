@@ -568,45 +568,29 @@ M x zinder-explorer
 
 Only one ingest writer should own a canonical storage namespace unless leader election and write fencing are explicitly designed.
 
-### Zallet with Zinder
+### Native wallet clients
 
-The default Zallet deployment uses `zinder-client::RemoteChainIndex` over a
-separately run `zinder-query` process:
+A wallet that implements the native `WalletQuery` protocol connects to a
+separately run `zinder-query` process over gRPC:
 
 ```text
 1 x zinder-ingest
 1 x zinder-query
-1 x Zallet using RemoteChainIndex -> zinder-query
+1 x native wallet client -> zinder-query
 ```
 
 This is the recommended operator recipe because the wallet and the indexer do
 not share a store path. `zinder-query` owns RocksDB secondary catchup,
 writer-status checks, public `WalletQuery` gRPC, chain-event subscriptions,
-mempool proxying, `ServerInfo`, and broadcast forwarding. Zallet only needs the
-query endpoint and the configured network. The same readiness, metrics, TLS, and
-reverse-proxy guidance that applies to other wallet clients applies to the
-Zallet endpoint.
+mempool proxying, `ServerInfo`, and broadcast forwarding. The wallet adapter
+only needs the query endpoint, configured network, and the native methods its
+backend abstraction consumes.
 
-`LocalChainIndex` is an advanced colocated optimization, not the baseline
-recipe. It is appropriate only when the operator intentionally runs Zallet on
-the same host as the canonical store and accepts these responsibilities:
-
-- Zallet opens a RocksDB secondary against the canonical store path and owns a
-  separate secondary path.
-- The service account running Zallet has read access to the canonical store but
-  must not obtain writer permissions.
-- The operator monitors secondary catchup and schema-version compatibility as
-  part of wallet readiness.
-- Zallet still needs a subscription endpoint for chain and mempool events; use a
-  colocated `zinder-query` proxy unless the deployment is explicitly event-only
-  and wired to a private ingest subscription surface.
-- `ServerInfo`, transaction broadcast, and any future query-plane federation
-  still come from `zinder-query`.
-
-If a deployment starts on `RemoteChainIndex`, it can later move selected reads to
-`LocalChainIndex` without changing Zinder's public contract. Treat that as an
-operator optimization after the Zallet integration is already correct, not as
-the first production recipe.
+Zinder's native channel is plaintext and unauthenticated by default, so a
+wallet either connects over loopback or a trusted LAN, or implements the TLS and
+authentication expected by the operator's proxy. `LocalChainIndex` remains
+available to colocated read-only Rust applications, but it cannot replace the
+endpoint-backed event, mempool, and broadcast methods a full wallet may need.
 
 The canonical store directory is a security boundary. Zinder stores cursor authentication material inside the store so cursors fail closed when tampered with or replayed against another store. An actor with read access to the RocksDB directory can forge local cursor tokens, so production deployments must restrict filesystem permissions to the service operator account and backup system.
 
@@ -674,7 +658,7 @@ Tests are organized into four tiers by **runtime mechanism**. Network choice (re
 | T1 integration | fixture-driven, no external state | `tests/integration/` | every PR |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
 | T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra |
-| T3 Zallet live | real Zallet binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | release / integration certification |
+| T3 Zallet adapter | externally supplied Zallet adapter binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | adapter development / integration certification |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
 

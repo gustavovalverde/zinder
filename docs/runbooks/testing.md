@@ -13,7 +13,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions for lightwalletd-compatible wallets, Zallet, public lightwalletd operators, and explorers |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
-| T3 Zallet live | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | Release / integration certification | Real Zallet binary using Zinder's native contract |
+| T3 Zallet adapter | `crates/zinder-client/tests/live/zallet.rs` | `ci-zallet-live` | Adapter development / integration certification | Externally supplied Zallet binary using Zinder's native contract |
 | External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
 
 `default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/) and not test(/^deploy::/)"`
@@ -534,19 +534,19 @@ cargo mutants --workspace --all-features \
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
 gate on whether you actually changed trust-sensitive code.
 
-## T3: Real Zallet binary gate
+## T3: Future Zallet adapter gate
 
-Zallet compatibility is a native-client claim, not a lightwalletd-compat claim.
-The gate must exercise a Zallet binary and configuration that target Zinder's
-native contract. A validator-only configuration is not a Zinder certification
-path because it bypasses `zinder-query` and the `ChainIndex` client surface.
+Zallet's existing `Chain` and `ChainView` traits provide a native adapter seam,
+but Zinder `main` does not assume that an adapter exists. The gate is a harness
+for a future Zallet binary and configuration that target Zinder's native
+contract. A validator-only configuration is not a Zinder certification path
+because it bypasses `zinder-query`.
 
 The automated Zallet gate lives in
 `crates/zinder-client/tests/live/zallet.rs` and runs under the
 `ci-zallet-live` profile. It is intentionally separate from the regular
 `ci-live` sweep because it needs a Zallet build and config that target Zinder's
-native contract, for example a Zallet branch wired to `RemoteChainIndex` over
-`zinder-query`.
+native contract through an adapter supplied outside this repository.
 
 The gate fails closed when enabled:
 
@@ -563,24 +563,10 @@ The gate fails closed when enabled:
 - `ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN` must appear in stdout or stderr from
   that command.
 
-Example shape once a Zinder-native Zallet build exists:
-
-```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
-  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  ZINDER_TEST_ZALLET=1 \
-  ZINDER_TEST_ZALLET_BIN=/path/to/zallet \
-  ZINDER_TEST_ZALLET_CONFIG=/path/to/zallet.toml \
-  ZINDER_TEST_ZALLET_CONFIG_MUST_CONTAIN='zinder_query_addr = "http://127.0.0.1:9101"' \
-  ZINDER_TEST_ZALLET_ARGS='--datadir /tmp/zallet --config /path/to/zallet.toml rpc getblockchaininfo' \
-  ZINDER_TEST_ZALLET_OUTPUT_MUST_CONTAIN='regtest' \
-  cargo nextest run --profile=ci-zallet-live --run-ignored=all
-```
+There is no canonical config marker or command example until an adapter lands on
+Zallet `main`. The supplied command should exercise the wallet's sync path, not
+only an informational RPC, because the harness is only as strong as the command
+and output marker provided by the caller.
 
 This profile does not start `zinder-query` or Zallet for you. The test is the
 certification check over a running integration setup, so the failure output
@@ -708,10 +694,17 @@ What this catches that the deterministic test does not:
 - Real-world streaming and connection-reuse patterns the in-process test cannot
   reproduce.
 
-## External integration: Zodl / Android SDK
+## External integration: Android SDK clients
 
 Same compat-shim path. The Android SDK speaks lightwalletd; point it
 at the running `zinder-compat-lightwalletd:9067`.
+
+A local pre-Ironwood Zodl run previously demonstrated sync to tip,
+transparent receive, shield and send, mempool acceptance, mining, and rescan
+through Zinder. That result establishes historical end-to-end evidence, not
+current certification. Repeat the flow with the current Zodl and Android SDK
+versions against Ironwood-era chain data before publishing a current support
+claim.
 
 What to validate by hand:
 
@@ -725,7 +718,7 @@ What to validate by hand:
   resulting `SendResponse.error_code` matches the documented scheme
   (`0`, `-22`, `-26`, `-27`, `-1`).
 
-For production Zodl claims, keep the evidence stricter:
+For production Android-wallet claims, keep the evidence stricter:
 
 - Create-new-wallet bootstrap reaches the compat endpoint's advertised tip
   without protocol-shape errors.
@@ -955,8 +948,8 @@ update the referenced architecture or reference page.
 | --- | --- | --- | --- | --- | --- |
 | Full wallet-serving testnet bulk catchup | Medium | Against a synced testnet Zebra, run `zinder-ingest --wallet-serving --target-height <safe height>` to seed the store, then `zinder-ingest --wallet-serving`, `zinder-query`, and `zinder-compat-lightwalletd` over the same store. | Store covers the wallet-serving floor, readers open from secondaries, `/readyz` reports ready or bounded syncing, `GetLightdInfo` reports a non-zero height and `taddrSupport: true`. | Ingest and reader logs, `/readyz` JSON, `GetLightdInfo` output, first and last ingested heights. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) |
 | Lightwalletd-compatible wallet bootstrap and restore | Medium | Point a real lightwalletd-compatible wallet or SDK at the testnet compat endpoint. Exercise create-new-wallet first, then restore/import or resync against the same serving store. | Create-new-wallet and restored/resync wallets reach the chain tip when requested tree-state and subtree-root heights are at or above the store floor. Below-floor requests fail only as the documented strict `NOT_FOUND` unsupported-floor case; unknown tree-state or subtree-root gaps are blockers. | Wallet logs, endpoint config diff, wallet-visible height, store floor, requested tree-state/subtree-root heights, `GetAddressUtxosStream` sample. | [External integration: lightwalletd-compatible wallets](#external-integration-lightwalletd-compatible-wallets), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
-| Send plus mempool end-to-end | Medium | With the unified `zinder-ingest` loop and the mempool surface running, open the mempool stream, then submit a self-send from a real wallet through `zinder-compat-lightwalletd`. | `SendTransaction` returns the expected success mapping. `GetMempoolStream` emits `RawTransaction`, stays open while the tx is pending, and closes on mining. `GetMempoolTx` returns the compact tx while pending and empties after mining. Wallet scan-back observes the mined tx, and writer-tip lag stays inside the wallet expiry window. | Wallet logs, compat logs, mempool stream excerpt, `GetMempoolTx` before/after output, txid, mined height, `/readyz` lag sample at submit time. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Wallet data plane §Mempool Snapshot](../architecture/wallet-data-plane.md#mempool-snapshot) |
-| Real Zallet native-contract gate | Medium | Start a Zinder-native `zinder-query` integration target, then run `cargo nextest run --profile=ci-zallet-live --run-ignored=all` with `ZINDER_TEST_ZALLET*` pointing at a real Zallet binary and config. | The gate proves the Zallet config targets Zinder's native contract, rejects validator-direct config, and observes the required Zallet command output. | Zallet config path, command output, nextest result, `zinder-query` logs. | [T3: Real Zallet binary gate](#t3-real-zallet-binary-gate), [Service operations §Zallet with Zinder](../architecture/service-operations.md#zallet-with-zinder) |
+| Send plus mempool end-to-end | Medium | With the unified `zinder-ingest` loop and the mempool surface running, open the mempool stream, then submit a self-send from a real wallet through `zinder-compat-lightwalletd`. | `SendTransaction` returns the expected success mapping. `GetMempoolStream` emits `RawTransaction`, stays open while the tx is pending, and closes on mining. `GetMempoolTx` returns the compact tx while pending and empties after mining. Wallet scan-back observes the mined tx, and writer-tip lag stays inside the wallet expiry window. | Wallet logs, compat logs, mempool stream excerpt, `GetMempoolTx` before/after output, txid, mined height, `/readyz` lag sample at submit time. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) |
+| Future Zallet adapter gate | Medium | Start a native `zinder-query` integration target, then run `cargo nextest run --profile=ci-zallet-live --run-ignored=all` with `ZINDER_TEST_ZALLET*` pointing at an externally supplied adapter binary and config. | The harness proves the supplied config targets Zinder's native contract and observes the required command output; the command itself must exercise sync before this becomes integration evidence. | Adapter config path, command output, nextest result, and `zinder-query` logs. | [T3: Future Zallet adapter gate](#t3-future-zallet-adapter-gate), [Service operations §Native wallet clients](../architecture/service-operations.md#native-wallet-clients) |
 | Mainnet bounded live sweep | Low when local mainnet is synced | Run the mainnet-only `ci-live` tests against the local operator-hosted Zebra before attempting longer sessions. Prefer targeted filters first, then the full live profile if the node is healthy. | Mainnet-only tests pass on `ZINDER_NETWORK=zcash-mainnet`; non-mainnet tests either pass or skip for the documented reason. No test mutates mainnet state. | Nextest output, Zebra tip height, tested block range, node auth source used. | [T3: Live mainnet](#t3-live-mainnet-operator-hosted-zebra) |
 | Lightwalletd compatibility parity | Medium | Run the same lightwalletd-compatible probes or wallet flow against Zinder and a reference lightwalletd endpoint. Include `GetBlockRange`, transaction lookup, transparent history, UTXO, mempool, and send shapes that the support claim names. | Zinder returns compatible response and error shapes where the lightwalletd contract applies. Any intentional difference is documented against the native contract or compatibility adapter. Hot-path timings stay inside the published budgets. | Per-method request/response summaries, error codes, timing samples, endpoint versions. | [T3: Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
 | Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real lightwalletd-compatible wallet validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Integration surfaces §Lightwalletd Compatibility](../reference/integration-surfaces.md#lightwalletd-compatibility), [Service operations §Deployment guidance](../architecture/service-operations.md#deployment-guidance) |
@@ -983,9 +976,8 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
       and mempool evidence is green when claiming lightwalletd-compatible wallet
       support.
-- [ ] Real Zallet binary gate is green when claiming Zallet support; the config
-      must target Zinder's native contract and must reject validator-direct
-      config.
+- [ ] The future Zallet adapter gate is green before claiming Zallet support;
+      the supplied command exercises sync through Zinder's native contract.
 - [ ] Public deployment audit is green: TLS on the public wallet endpoint, no
       public plaintext gRPC, no public ops endpoints, no public `IngestControl`,
       rate limiting present, filesystem permissions restricted, and secrets
@@ -1017,9 +1009,9 @@ For ordinary code changes, use the shorter pre-flight checklist below.
       `zinder-compat-lightwalletd` adapter: the
       [Concurrent readers and stream cancellation](#concurrent-readers-and-stream-cancellation)
       tests have been replayed.
-- [ ] If the change claims Zallet compatibility: real Zallet binary gate green
-      (`ci-zallet-live` with `ZINDER_TEST_ZALLET*` env against the Zinder-native
-      contract).
+- [ ] If the change claims Zallet compatibility: the future adapter gate is
+      green (`ci-zallet-live` with `ZINDER_TEST_ZALLET*` against an externally
+      supplied adapter), and its command exercises the relevant wallet flow.
 - [ ] If the change touched the lightwalletd wire surface: a manual end-to-end
       run with a lightwalletd-compatible wallet or the Android SDK against
       `zinder-compat-lightwalletd`.

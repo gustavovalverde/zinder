@@ -7,9 +7,9 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 `zinder-query` owns the wallet data plane.
 
 Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
-this plane is consumer-neutral. Android SDK/Zodl, lightwalletd clients,
-Zallet, and future Rust consumers exercise different public contracts, but they
-all depend on the same canonical artifact families. Compatibility adapters may
+this plane is consumer-neutral. Mobile SDKs, lightwalletd clients, native
+full-node wallet adapters, and Rust libraries exercise different public
+contracts, but they all depend on the same canonical artifact families. Compatibility adapters may
 preserve lightwalletd wire names; the core vocabulary stays on artifact coverage,
 tree-state anchors, chain epochs, and typed errors.
 
@@ -231,11 +231,11 @@ but each product consumes a different boundary. This table is the canonical
 product map; reference documents carry the line-numbered source evidence and
 observed wallet-run details.
 
-| Ecosystem product | Zinder relationship | What the mempool surface enables | Required boundary |
+| Consumer shape | Zinder relationship | What the mempool surface enables | Required boundary |
 | ----------------- | ------------------- | ---------- | ----------------- |
-| Zallet (`zcash/wallet`) | Primary native Rust consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and chain-tip notifications separate from mempool stream lifecycle | `zinder-client::ChainIndex` plus native `WalletQuery`; no dependency on the lightwalletd compatibility adapter |
-| Zodl and Android SDK wallets | lightwalletd-compatible wallet clients | SDK mempool observation, faster pending-send feedback, shielded mempool scanning, and clearer submitted/unmined/resubmitted transaction UX | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
-| Lightwalletd clients and operators | Compatibility consumers | Backend option for clients that speak `CompactTxStreamer`, including mempool methods and transaction submission behavior | Compatibility adapter only; no upstream node calls, no independent storage, and no Zinder-only method extensions in the lightwalletd proto |
+| Native full-node wallet adapter | Native `WalletQuery` consumer | Typed transaction lifecycle, rebroadcast decisions, transparent unmined UTXO updates, and chain-tip notifications separate from mempool stream lifecycle | Generated `WalletQuery` client or `RemoteChainIndex`, depending on whether the consumer can link `zinder-client` |
+| Rust wallet library or application | Native typed client | Chain events, mempool state, transaction status, and broadcast behind the application's own wallet abstractions | `RemoteChainIndex` plus `EndpointBackedIndex`; `LocalChainIndex` serves stored reads only |
+| Lightwalletd-compatible wallet | Compatibility consumer | Existing SDK mempool observation, pending-send feedback, shielded mempool scanning, and transaction submission behavior | `zinder-compat-lightwalletd` mapping `GetMempoolStream` and `GetMempoolTx` over the native mempool index and event log |
 | Block explorers and analytics | Application or `zinder-explorer` consumers | Live mempool pages, pending transaction lifecycle, pending transparent address/outpoint overlays, and "mempool in sync" status | Native `WalletQuery` or replayable `zinder-explorer` views; full explorer parity also needs transparent history and balance |
 | Zebra | Upstream node source, not a Zinder client | Keeps wallet and explorer indexing outside the node while reusing Zebra's verified mempool observations | `zinder-source` consumes Zebra `MempoolChange` when available, or falls back to `getrawmempool` polling |
 
@@ -245,7 +245,7 @@ Three architectural consequences follow from that map:
 - Source observations must become hydrated `MempoolEntry` records before they reach public APIs. Zebra's streaming mempool event carries transaction hash and auth digest, so raw transaction fetching and compact-transaction construction belong in the source/ingest path, not in `zinder-compat-lightwalletd`.
 - The native mempool surface does not inherit lightwalletd's stream-close lifecycle. `MempoolEvents` stream end means disconnect or shutdown. Chain-tip changes are delivered through `ChainEvents`.
 - The public server-observed type is `MempoolEntry`, not `PendingTransaction`. A pending transaction is a wallet-local UX state: it can include a transaction that was created locally but never accepted by the network.
-- Product readiness claims are boundary-specific. Zallet readiness means typed Rust `ChainIndex` coverage in a deterministic harness plus a real Zallet binary/app run. Zodl readiness means lightwalletd-compatible methods plus SDK or app validation. Explorer readiness means the mempool surface plus the transparent history and balance surfaces needed for address-oriented views.
+- Product readiness claims are boundary-specific. Native method coverage proves an adapter can be written, not that a wallet integration has landed. Lightwalletd readiness requires compatible methods plus SDK or app validation, while explorer readiness requires the mempool surface plus the transparent history and balance surfaces needed for address-oriented views.
 
 The native protocol exposes two complementary mempool methods:
 
@@ -435,7 +435,7 @@ Every response binds to a `ChainEpoch` (canonical: the read's epoch; mempool: th
 
 The shared `OutPoint` proto message is the canonical wire-level outpoint shape across every wallet-plane RPC keyed by `(transaction_id, output_index)`. `TransparentMempoolSpendsByOutpoint` and the prevout-resolution surfaces use the same message; future outpoint-keyed RPCs reuse it without inventing parallel shapes. The coinbase sentinel outpoint (`transaction_id = 0x00..00`, `output_index = u32::MAX`) is rejected at the wallet adapter rather than carried as a magic value.
 
-Both methods cap the request at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024` outpoints. Requests above the cap are silently truncated to the first 1024 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary (Zallet's `view_transaction.rs` is the canonical example).
+Both methods cap the request at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024` outpoints. Requests above the cap are silently truncated to the first 1024 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary.
 
 The `ChainIndex` Rust API exposes two methods: `transparent_outputs_by_outpoint(outpoints, at_epoch_id)` and `transparent_mempool_outputs_by_outpoint(outpoints)` (no epoch pin, per the live-state convention). Both return `TransparentOutputsByOutpointResponse`. `LocalChainIndex` reads the canonical method directly from the secondary store; the mempool method delegates to `RemoteChainIndex`. The capability-coverage test asserts both methods exist for any consumer advertising the corresponding capability strings.
 
@@ -490,9 +490,9 @@ The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` retur
 
 `WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. New methods land with new capability strings; deprecated capabilities continue to be advertised alongside their replacement until the documented removal version. The descriptor's `node` field is reserved for upstream-node capability snapshots, but storage-only `zinder-query` deployments leave it empty unless a runtime handoff supplies source probe results.
 
-## In-Process Rust API
+## Native Rust API
 
-In-process consumers (Zallet, future SDK integrations) call `zinder-client` per [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape). The `ChainIndex` trait exposes the same methods the gRPC service does, with typed Rust types (`BlockHeight`, `ChainEpoch`, `TxStatus`, `TransactionBroadcastResult`, `IndexerError`). No tonic round-trip; no untyped error strings; no `unreachable!()` guards required.
+Rust integrations can call `zinder-client` per [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape). The `ChainIndex` trait exposes the canonical read vocabulary with typed Rust values (`BlockHeight`, `ChainEpoch`, `TxStatus`, and `IndexerError`); `RemoteChainIndex` also implements `EndpointBackedIndex` for broadcast, subscriptions, and live state. `LocalChainIndex` avoids a tonic round trip for colocated canonical reads, while consumers with dependency or toolchain conflicts can generate stubs from the native `WalletQuery` protocol instead of linking this crate.
 
 The `ChainIndex` trait does not duplicate the `WalletQueryApi` Rust trait inside `services/zinder-query`. They serve different consumer profiles: `WalletQueryApi` is the gRPC server's internal trait; `ChainIndex` is the published Rust API for in-process consumers. Both share types from `zinder-core`. A compatibility test asserts that every advertised `ServerCapabilities` capability string has a corresponding `ChainIndex` method.
 

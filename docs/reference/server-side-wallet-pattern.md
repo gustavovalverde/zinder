@@ -1,8 +1,35 @@
-# Server-side Wallet Pattern on Zinder
+# Server-side wallet pattern on Zinder
 
-This page is the canonical recipe for building a server-side Zcash wallet on top of Zinder. It names every component, points at the right librustzcash crate, and shows where the boundary between Zinder and the wallet lives. If you are building a faucet, an exchange backend, a custody service, or any other server-side wallet that wants Zinder's chain reads + broadcast without re-implementing transparent/shielded scanning, start here.
+This page describes the direct librustzcash pattern for a server-side wallet
+that reads chain data from Zinder. It is an implementation reference, not a
+guide for choosing an indexer. See [Integration surfaces](integration-surfaces.md)
+for that choice.
 
-## Components
+There are 2 implementation levels:
+
+1. **Use a higher-level wallet library.** A library can expose its own wallet
+   lifecycle while mapping chain reads, events, and broadcast onto Zinder.
+   Zally's `ChainSource` and `Submitter` traits illustrate this seam.
+2. **Integrate librustzcash directly.** Use this pattern when the application
+   needs to own those policies or expose a different wallet abstraction. The
+   application adapts Zinder artifacts to librustzcash scanning and persists
+   wallet state itself.
+
+## Higher-level wallet library seam
+
+Zally's existing interfaces show how a server-side wallet can divide the work.
+`ChainSource` needs safe and visible tips, compact blocks, tree state, subtree
+roots, transaction status, transparent UTXOs, and chain events. `Submitter`
+needs transaction broadcast. These methods map to `RemoteChainIndex` and
+`EndpointBackedIndex`, while Zally remains responsible for its SQLite wallet
+state, sync driver, transaction lifecycle, key sealing, and recovery policy.
+
+That method set requires the remote shape, not `LocalChainIndex`, because a
+canonical-storage secondary cannot provide chain events or broadcast. The
+remaining sections apply when implementing the equivalent integration directly
+with librustzcash.
+
+## Direct librustzcash components
 
 | Component | Crate or service | What it owns |
 | --- | --- | --- |
@@ -13,9 +40,10 @@ This page is the canonical recipe for building a server-side Zcash wallet on top
 | Chain reads + broadcast | **Zinder** | Compact blocks, tree state, subtree roots, transparent outputs, mempool, broadcast |
 | Upstream node | Zebra | Block production / consensus / mempool source |
 
-Zinder tracks the workspace's pinned `librustzcash` release train. Server-side
-wallets should pin `zcash_client_backend`, `zcash_client_sqlite`,
-`zcash_primitives`, and `zcash_proofs` together.
+Zinder tracks the workspace's pinned `librustzcash` release train. A direct
+integration should pin `zcash_client_backend`, `zcash_client_sqlite`,
+`zcash_primitives`, and `zcash_proofs` together. A higher-level wallet library
+can own that coordination for applications using its API.
 
 ## Boundary contract
 
@@ -51,7 +79,7 @@ flowchart LR
 
 **Per-account state never lives in Zinder.** Account balances, transaction labels, address books, fiat-conversion rates, and notification settings stay in the consumer's SQLite database.
 
-## Canonical pattern
+## Direct integration sequence
 
 The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Chain events §Address Filters](../architecture/chain-events.md#address-filters)).
 
@@ -69,7 +97,7 @@ The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Cha
 
 A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`. A `LocalChainIndex` passed where `EndpointBackedIndex` is required fails to compile, so the missing-endpoint case is a build error rather than a runtime error.
 
-## Worked skeleton
+## Direct integration skeleton
 
 The block below is a compiled doctest. It uses the real `zinder-client` connect and stream API; the consumer-side persistence is a small in-test stub so the example stays self-contained without pulling in `zcash_client_sqlite`.
 
@@ -141,10 +169,10 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
         .await?;
     while let Some(envelope) = stream.next().await {
         let envelope = envelope?;
-        // Persist the cursor before applying the event so a crash resumes from
-        // the next event after the last fully-applied one.
-        wallet.save_chain_event_cursor(&envelope.cursor);
+        // Apply the event idempotently, then persist the cursor. A crash between
+        // these operations replays the event instead of skipping its effects.
         wallet.apply_chain_event(&envelope);
+        wallet.save_chain_event_cursor(&envelope.cursor);
     }
     Ok(())
 }
@@ -186,21 +214,31 @@ fn classify<T>(outcome: Result<T, IndexerError>) -> Option<T> {
 
 See [Error vocabulary](error-vocabulary.md) for the per-reason table.
 
-## What you still need to write yourself
+## What a direct integration still owns
 
-This pattern leaves these pieces to the consumer:
+A higher-level wallet library can implement these concerns. A direct
+librustzcash integration leaves them to the consumer:
 
 - **Key management.** Hardware-backed keystore vs. encrypted-on-disk is your call.
 - **Account model.** One-account-per-customer vs. shared-omnibus is your call.
-- **Per-customer notification.** Email, webhook, push notification — Zinder gives you the invalidation hint; you wire the alert.
+- **Per-customer notification.** Zinder gives you the invalidation hint; you
+  wire the email, webhook, or push notification.
 - **Fee policy.** Pick a fee strategy in `zcash_primitives::transaction::fees`.
 - **Reorg recovery semantics.** When Zinder emits a `ChainReorged`, your wallet must reconcile the reverted range; `zcash_client_backend` has utilities for this, but the consumer applies them.
 
-## When NOT to use this pattern
+## When not to integrate librustzcash directly
 
-- **You only need transparent receives** (no shielded support): drop `zcash_client_backend`/`zcash_client_sqlite` and integrate `zinder-client` directly against your own database.
-- **You are building a mobile app**: use the Zodl SDK or `zinder-compat-lightwalletd` rather than directly integrating `zcash_client_backend`. Mobile constraints (battery, network) shape the integration enough that a dedicated SDK is the right path.
-- **You are building a desktop wallet**: consider Zallet directly. It is the full-node wallet process that already pairs with Zinder.
+- **You want a higher-level server-side wallet abstraction:** use a wallet
+  library rather than rebuilding its lifecycle, storage, key sealing, sync, and
+  recovery layers.
+- **You only need transparent receives:** drop `zcash_client_backend` and
+  `zcash_client_sqlite`, then integrate `zinder-client` directly against your
+  own database.
+- **You are building a light or mobile wallet:** keep the wallet SDK's
+  `CompactTxStreamer` client and use `zinder-compat-lightwalletd`.
+- **You are implementing a full-node wallet backend:** map its existing backend
+  abstraction to the native `WalletQuery` protocol rather than linking this
+  server-side wallet stack.
 
 ## References
 

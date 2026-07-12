@@ -1,101 +1,118 @@
-# What Zinder Is and Is Not
+# The Indexer and Wallet Boundary
 
-This page is the first link a new integrator should follow. It says, in plain language, what Zinder *does* and what it *does not*. If your integration plan assumes Zinder owns a primitive listed under "Zinder does not do this", you are looking at the wrong layer.
+Zinder indexes the canonical chain once and exposes one durable, consistent, versioned view that multiple wallets and products can share. It serves that view through native Zinder APIs and through a lightwalletd-compatible `CompactTxStreamer` endpoint, so new and existing integrations can use the same indexed data.
 
-## In one paragraph
+This page explains where that architecture fits, what Zinder owns, and what remains inside a wallet. It is the canonical decision guide for choosing between direct node access, an embedded indexer, a shared Zinder deployment, and a lightwalletd-compatible endpoint.
 
-Zinder is a Zcash chain indexer. It reads canonical chain state from Zebra (or a future compatible source), commits typed artifacts to local storage, and serves wallet-shaped reads over gRPC. It runs as a single-operator service. It never holds keys, never decrypts shielded outputs, and never maintains per-consumer wallet state. A consumer that needs key custody, shielded scanning, or per-account state pairs Zinder with a wallet library (typically `zcash_client_backend` + `zcash_client_sqlite` from librustzcash) or with a wallet process (Zallet, Zodl).
+## One chain view, many consumers
 
-## Zinder does this
+Every wallet needs chain data, but not every wallet should build, persist, and reconcile that data independently. Zinder moves chain access out of an individual wallet process and into a consumer-neutral service. One ingest process reads from Zebra, commits canonical artifacts, and makes them available to wallet, explorer, payment, and custody consumers.
 
-- **Compact-block range reads**: paginated `CompactBlock` artifacts (`WalletQuery.CompactBlocksInRange`).
-- **Tree-state reads**: Sapling/Orchard commitment-tree state at a height (`WalletQuery.TreeState`).
-- **Subtree-root reads**: shielded subtree roots for batched scanning (`WalletQuery.SubtreeRootsInRange`).
-- **Transparent-address output reads**: the complete current unspent set per address, streamed at one pinned chain epoch (`WalletQuery.TransparentAddressUnspentOutputs`).
-- **Transparent-address tx-history reads**: paginated tx-ids per address in a height range (`WalletQuery.TransparentAddressTxIdsInRange`).
-- **Transparent-address balance**: confirmed balance summed from the canonical unspent-output index plus a live-mempool overlay (`WalletQuery.TransparentAddressBalance`).
-- **Mempool reads**: snapshot + change-event subscription (`WalletQuery.MempoolSnapshot`, `WalletQuery.MempoolEvents`).
-- **Transparent prevout resolution**: canonical and live-mempool spend lookups.
-- **Transaction broadcast**: forwards raw transactions to the upstream node.
-- **Chain-event subscription**: cursor-resumable committed/reorged stream with optional address-invalidation hint ([Chain events §Address Filters](chain-events.md#address-filters)).
-- **Capability discovery**: `ServerInfo` advertises which RPCs and features the deployment serves.
-- **Lightwalletd compatibility**: the `zinder-compat-lightwalletd` binary speaks the vendored lightwalletd protocol so Zodl and the Android SDK integrate without changes.
+The shared view has 3 properties:
 
-The native Rust client (`zinder-client`) splits this list across two traits. The canonical and derive-store reads (compact blocks, tree state, subtree roots, transparent-address outputs and tx-history, prevout resolution, the confirmed transparent-address balance) live on `ChainIndex`, which both the gRPC `RemoteChainIndex` and the colocated RocksDB-secondary `LocalChainIndex` serve identically. Broadcast, the chain-event stream, live-mempool reads, and chain value-pools need a live ingest-control endpoint, so they live on the `EndpointBackedIndex` extension that only `RemoteChainIndex` implements. A colocated reader without an endpoint is rejected at compile time, not at the call. This makes the two-RocksDB-secondary reader topology explicit in the type system without changing the [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) ChainEpoch-token model.
+- **Durable**: indexed artifacts survive consumer restarts and do not need to be rebuilt for each wallet process.
+- **Consistent**: every chain-dependent read resolves one `ChainEpoch`, so a response does not mix artifacts from competing tips or a partially committed update.
+- **Versioned**: native protocols, artifact schemas, capabilities, and chain epochs make compatibility and freshness explicit rather than implicit in a process-local implementation.
 
-## Zinder does NOT do this
+This separation becomes more valuable as consumers multiply. A full-node wallet, a mobile wallet, and an explorer need different application behavior, but they can read the same compact blocks, tree state, transactions, transparent-address artifacts, and chain events from one index.
 
-- **Hold keys.** No spending keys, viewing keys, or seed phrases ever touch the indexer. [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md).
-- **Scan shielded outputs per account.** Trial decryption stays in the consumer where the keys live.
-- **Maintain per-consumer wallet state.** Account balances, transaction labels, address books, fiat-conversion rates, and notification settings all live in the consumer.
-- **Infer address ownership.** Two clients querying the same transparent address get the same response; Zinder has no concept of "this consumer owns this address".
-- **Compliance or identity.** No KYC, no source-of-funds tracking, no per-user audit logs of which addresses were queried.
-- **Terminate TLS, authenticate callers, or rate-limit.** Operators put a reverse proxy in front of Zinder for any of these; these surfaces are out of v1 scope.
-- **Provide multi-tenant hosting.** Zinder serves one logical operator; tenant isolation lives at the layer above.
-- **Run cross-host RocksDB secondaries.** Single-host topology is the v1 recommendation. [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
+## One index, two integration contracts
 
-## Where to go for each "Zinder does not do this" capability
+Zinder exposes the same indexed chain through 2 contracts. The native contract is designed for applications that can adopt Zinder directly; the compatibility contract preserves the protocol expected by existing lightwalletd clients.
+
+### Native Zinder contract
+
+`WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast results, mempool views, and transparent-address artifacts. New integrations should prefer this contract when they need explicit consistency or Zinder-specific features.
+
+The Rust client divides the contract by topology. `RemoteChainIndex` uses gRPC across a process or host boundary, while `LocalChainIndex` uses a colocated RocksDB secondary without a tonic round trip. Both implement `ChainIndex` for canonical and derived reads. Operations that require a live ingest-control endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension and are available through `RemoteChainIndex`.
+
+### Lightwalletd compatibility contract
+
+`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It reads the same canonical and derived stores as the native query service; it does not maintain a second index, call Zebra independently, or construct parallel artifacts.
+
+For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators still deploy Zinder's ingest, storage, query, and compatibility services, and each named wallet requires its own end-to-end certification before the project claims tested support.
+
+## Choose by ownership and topology
+
+The main architectural choice is who owns the indexed chain view and how many consumers reuse it. These options are complementary rather than a quality ranking.
+
+| Option | Chain-data owner | Strongest fit | Main tradeoff |
+| --- | --- | --- | --- |
+| Zebra directly | The validator | A consumer needs node RPC data and can own any indexing, consistency, and reorg logic itself | Minimal additional infrastructure, but application-specific indexing and reconciliation stay in each consumer |
+| Zaino embedded | The wallet process | One wallet benefits from an in-process indexer and wants its lifecycle coupled to the wallet | Simple process-local integration, but indexed state and operational lifecycle remain tied to that consumer |
+| Zinder shared service | A separate indexer deployment | Multiple processes or products need one durable chain view, or chain data must outlive any individual consumer | Adds an operated service and storage layer, while centralizing indexing, consistency, and reuse |
+| Lightwalletd-compatible serving | A lightwalletd server or Zinder's compatibility service | Existing light clients already speak `CompactTxStreamer` and should keep that integration contract | Preserves the established wallet protocol, but does not expose every native Zinder capability |
+
+Choose direct Zebra access when the node's APIs answer the complete use case and the consumer can safely own any missing state. Choose an embedded indexer when process-local simplicity matters more than cross-consumer reuse. Choose Zinder when durability, explicit consistency, independent scaling, or reuse across multiple consumers justifies a service boundary. Expose Zinder's compatibility service when existing lightwalletd clients also need to consume that shared index.
+
+An ephemeral or wallet-private Zinder deployment is possible, but it gives up much of Zinder's advantage. If one wallet owns the indexer's lifecycle and no other consumer reuses its state, an embedded indexer may be the simpler fit.
+
+## Chain truth and wallet truth
+
+Zinder owns facts whose answers are the same for every caller at a given chain epoch. Wallets own facts that depend on keys, accounts, users, or local policy. This division lets several wallet shapes share chain infrastructure without forcing them to share a wallet model.
+
+### Zinder owns consumer-neutral chain data
+
+- Compact-block range reads.
+- Sapling, Orchard, and Ironwood tree-state reads where supported by the active network upgrade.
+- Shielded subtree-root reads for batched scanning.
+- Transparent-address unspent outputs, transaction history, and confirmed balance.
+- Canonical and live-mempool transparent prevout resolution.
+- Transaction lookup and broadcast.
+- Mempool snapshots and change events.
+- Cursor-resumable committed and reorged chain events.
+- Capability discovery and chain-view freshness metadata.
+
+### Wallets own consumer-specific state
+
+- Spending keys, viewing keys, and seed phrases.
+- Trial decryption and shielded-output ownership.
+- Accounts, wallet birthdays, sync progress, and transaction labels.
+- Address books, notification settings, and fiat-conversion preferences.
+- Transaction construction, proving, and signing.
+- User identity, compliance policy, and per-user audit records.
+
+This boundary also preserves shielded privacy. Zinder serves compact chain artifacts, while trial decryption stays with the consumer that holds the relevant keys.
+
+## Operational boundary
+
+Zinder's deployment target is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer; `zinder-query`, `zinder-compat-lightwalletd`, and explicit `LocalChainIndex` consumers open read-only secondary stores. Remote native and lightwalletd clients connect to those reader services instead of opening storage. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
+
+Zinder does not provide tenant isolation, terminate public TLS, authenticate callers, or enforce per-client rate limits. Operators place an appropriate proxy or private network boundary in front of externally reachable services. Cross-host RocksDB secondaries are also outside the recommended topology; remote consumers should use gRPC.
 
 ```mermaid
 flowchart LR
-    classDef inScope fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
-    classDef outOfScope fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,stroke-dasharray:5 5
+    Zebra["Zebra<br/>canonical node state"]
+    Ingest["zinder-ingest<br/>only canonical writer"]
+    Store[("Durable indexed chain view")]
+    Native["WalletQuery<br/>native Zinder contract"]
+    Compat["CompactTxStreamer<br/>lightwalletd compatibility"]
+    Products["Wallets, explorers,<br/>payments, and custody"]
+    LightClients["Existing lightwalletd clients"]
 
-    Wallet[Wallet consumer]
-    Zinder[Zinder<br/>chain reads · broadcast<br/>compact blocks · tree state]:::inScope
-    Zebra[Zebra<br/>upstream node]
-
-    LibBackend[zcash_client_backend<br/>shielded sync state machine]:::outOfScope
-    LibSqlite[zcash_client_sqlite<br/>wallet state · key storage]:::outOfScope
-    LibPrim[zcash_primitives<br/>transaction building]:::outOfScope
-    LibProofs[zcash_proofs<br/>Sapling/Orchard proving]:::outOfScope
-
-    Zallet[Zallet<br/>full-node wallet process]:::outOfScope
-    ZodlSdk[Zodl SDK<br/>mobile wallets]:::outOfScope
-
-    Wallet -->|compact blocks<br/>tree state| Zinder
-    Wallet -->|broadcast tx| Zinder
-    Wallet -->|keys + decryption| LibBackend
-    LibBackend --> LibSqlite
-    Wallet -->|build tx| LibPrim
-    LibPrim --> LibProofs
-
-    Zinder -->|JSON-RPC| Zebra
-    Zinder -->|lightwalletd protocol| ZodlSdk
-    Wallet -.alternative.-> Zallet
+    Zebra -->|JSON-RPC| Ingest
+    Ingest --> Store
+    Store --> Native
+    Store --> Compat
+    Native --> Products
+    Compat --> LightClients
 ```
 
-| Capability Zinder does not provide | Where it lives |
-| --- | --- |
-| Shielded sync state machine | [`zcash_client_backend`](https://crates.io/crates/zcash_client_backend) |
-| Wallet state + key storage | [`zcash_client_sqlite`](https://crates.io/crates/zcash_client_sqlite) |
-| Transaction building | [`zcash_primitives`](https://crates.io/crates/zcash_primitives) |
-| Sapling/Orchard proving | [`zcash_proofs`](https://crates.io/crates/zcash_proofs) |
-| Full-node wallet process (RPC-shaped) | [Zallet](https://github.com/zcash/wallet) |
-| Mobile wallet integration | Zodl, via `zinder-compat-lightwalletd` |
-| TLS, auth, rate limiting | Operator-supplied reverse proxy (Caddy, Nginx, Cloudflare) |
+## Classify a new capability
 
-## Why this boundary exists
+Ask 3 questions before adding a primitive to Zinder:
 
-Three reasons, in order of weight:
+1. Does it require a spending key, viewing key, or seed? If yes, it belongs in the wallet.
+2. Does the answer depend on which user or account is asking? If yes, it belongs in the wallet or application layer.
+3. Is the answer identical for every authorized caller at the same chain epoch? If yes, it is a candidate for Zinder.
 
-1. **Consumers do not agree on wallet shape.** A mobile wallet, an exchange backend, and a full-node desktop wallet all need different account abstractions. Zinder serves the substrate they share (chain reads + broadcast) without picking a winner.
-2. **Privacy.** A wallet-facing indexer that scans shielded outputs server-side would defeat shielded privacy. Trial decryption stays where keys live, full stop.
-3. **Operability.** A single operator running Zinder against one Zebra is the v1 deployment shape. Wallet-state databases, key-rotation policies, and per-user audit logs require infrastructure Zinder is not designed to own.
+A proposed per-user table inside Zinder usually signals that wallet state has crossed the boundary. Keep consumer-specific state with the consumer and add only the shared chain primitive to Zinder.
 
-## When you are unsure where a primitive belongs
+## Related documentation
 
-Ask three questions:
-
-1. *Does it need a key?* If yes → consumer side.
-2. *Does it depend on which user is asking?* If yes → consumer side.
-3. *Is the answer the same for every caller given the same on-chain state?* If yes → Zinder.
-
-If you find yourself adding a per-user table to Zinder, stop and reconsider. The right place is almost always a wallet library on the consumer side.
-
-## References
-
+- [ADR-0003: Canonical storage access boundary](../adrs/0003-canonical-storage-access-boundary.md)
 - [ADR-0005: Consumer-neutral wallet data plane](../adrs/0005-consumer-neutral-wallet-data-plane.md)
 - [Wallet data plane](wallet-data-plane.md)
+- [Protocol boundary](protocol-boundary.md)
 - [Server-side wallet pattern](../reference/server-side-wallet-pattern.md)
 - [Integration surfaces](../reference/integration-surfaces.md)

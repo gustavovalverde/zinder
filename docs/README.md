@@ -1,10 +1,18 @@
 # Zinder Documentation
 
-This documentation set defines Zinder's product scope, service boundaries, and vocabulary for a service-oriented Zcash indexer.
+This documentation set defines Zinder's product scope, integration contracts, service boundaries, and operational procedures.
 
-## Product and architecture
+## Start by goal
 
-- [What Zinder is and is not](architecture/indexer-wallet-boundary.md): the first link new integrators should follow.
+| Goal | Start here |
+| --- | --- |
+| Decide whether Zinder fits a wallet or product | [What Zinder is and is not](architecture/indexer-wallet-boundary.md) |
+| Connect a wallet, SDK, application, or explorer | [Integration surfaces](reference/integration-surfaces.md) |
+| Build a headless server-side wallet | [Server-side wallet pattern](reference/server-side-wallet-pattern.md) |
+| See which public chain facts Zinder serves | [Chain data catalog](reference/chain-data-catalog.md) |
+| Deploy and synchronize Zinder | [Initial sync](runbooks/initial-sync.md) and [Deploying on a VM](runbooks/deploying-on-a-vm.md) |
+| Test a consumer or compatibility claim | [Testing](runbooks/testing.md) |
+| Add a chain artifact or wallet RPC | [Extending artifacts](architecture/extending-artifacts.md) and [Extending the wallet data plane](architecture/extending-the-wallet-data-plane.md) |
 
 ## Architecture
 
@@ -65,12 +73,11 @@ Current integration references and API support material:
 
 - [Server-side wallet pattern](reference/server-side-wallet-pattern.md): the canonical recipe for building a server-side Zcash wallet on Zinder + librustzcash.
 - [Integration surfaces](reference/integration-surfaces.md): supported client and operator integration paths.
-- [Zinder information by use case](reference/zinder-value-by-use-case.md): the canonical catalog of information Zinder gathers or derives, its availability, and its product value.
+- [Chain data catalog](reference/chain-data-catalog.md): the canonical catalog of information Zinder gathers or derives, its availability, and its product value.
 - [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 
 ## Investigations
 
-- [Bulk-catchup throughput](investigations/bulk-catchup-throughput.md): mainnet catchup runs roughly one order of magnitude below the design target and slower than the source Zebra node it reads from. Cause: single-threaded consumer pipeline. Three candidate fixes ranked by burden.
 - [Zaino feature comparison](investigations/zaino-feature-comparison.md): public-surface audit against zainod 0.3.1, including native equivalents, raw-RPC differences, and deliberate non-goals.
 
 ## Plans

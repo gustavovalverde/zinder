@@ -35,7 +35,7 @@ Existing native surfaces remain available, including `RecentTransactions`, Ironw
 2. Projection state, read snapshots, cursor fences, coverage joins, and source-request budgets.
 3. Proto methods, capability gates, and preservation of existing public methods.
 4. Backfill restart/cancellation behavior and deployment configuration.
-5. Documentation consistency and the [Zinder information catalog](../reference/zinder-value-by-use-case.md).
+5. Documentation consistency and the [chain data catalog](../reference/chain-data-catalog.md).
 
 ## Validation Baseline
 

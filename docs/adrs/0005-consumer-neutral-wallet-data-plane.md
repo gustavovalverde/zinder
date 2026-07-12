@@ -13,7 +13,7 @@ A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwa
 
 - `lightwalletd` exposes `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos`, and `GetAddressUtxosStream` as first-class `CompactTxStreamer` methods.
 - Zallet's `wallet` code fetches birthday tree state at `birthday - 1`, loads Sapling and Orchard subtree roots from index `0`, and polls transparent UTXOs for wallet-owned transparent receivers.
-- Zallet and in-process Rust applications need a typed `ChainIndex` model with snapshot semantics for atomic reads above the safe tip.
+- Full-node wallets and native Rust applications need snapshot semantics for atomic reads above the safe tip, whether they consume the `WalletQuery` wire protocol or the typed `ChainIndex` client.
 
 The architectural risk is treating one wallet as the design center. App-specific
 patches would leave Zinder without a durable consumer contract. The opposite
@@ -57,7 +57,7 @@ Serving coverage fails closed:
 adapter. It preserves lightwalletd field names and wire behavior, but it does
 not own storage, query semantics, or product vocabulary.
 
-`zinder-client::ChainIndex` is the native Rust integration direction for Zallet and future in-process consumers. Its method names, typed errors, and epoch-pinned variants may diverge from lightwalletd when that improves DX, UX, or AX. Compatibility and native-client readiness are validated separately.
+`WalletQuery` is the native protocol integration direction. Rust applications can use `zinder-client::ChainIndex`, while consumers that cannot link Zinder's Rust crates can generate their own client from the wire contract. Native method names, typed errors, and epoch-pinned variants may diverge from lightwalletd when that improves DX, UX, or AX. Compatibility and native-client readiness are validated separately.
 
 ### Naming
 
@@ -78,7 +78,7 @@ Positive:
 - Compatibility work has one general target instead of app-specific exceptions.
 - Operators get one clear serving profile: build a serving store, then run readers against it.
 - Wallet failures caused by insufficient historical coverage become deployment/readiness failures, not hidden query fallbacks.
-- Zallet and other Rust consumers get a native typed surface without inheriting lightwalletd's wire vocabulary.
+- Native consumers get a typed surface without inheriting lightwalletd's wire vocabulary or, when using generated stubs, Zinder's internal dependency graph.
 - Agents reason about coverage by artifact family and anchor height instead of guessing which wallet flow caused a lookup.
 
 Negative:

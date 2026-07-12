@@ -1,20 +1,49 @@
 # Integration Surfaces
 
-Zinder exposes three integration paths. Pick the path by the contract the client needs, not by implementation convenience.
+This page starts after a client has chosen Zinder. It maps each client shape to
+the smallest suitable contract, then uses existing wallet codebases to show
+which methods an adapter would require. For the architectural choice between
+Zebra, Zaino, Zinder, and lightwalletd, see
+[Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md).
 
-| Client shape | Integration surface | Use when |
+## Pick a surface
+
+| Client shape | Integration surface | Constraint |
 | --- | --- | --- |
-| Lightwalletd-compatible mobile or SDK client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer` and expects lightwalletd wire shapes. |
-| Rust wallet or application | `zinder-client::RemoteChainIndex` or `LocalChainIndex` | The client can use the typed `ChainIndex` trait and wants native Zinder errors, cursors, and `ChainEpoch` values. |
-| Explorer, analytics, or derived view | `WalletQuery` plus `ExplorerQuery` through the derive plane | The view is rebuilt from canonical artifacts and should not affect wallet sync correctness. |
+| Existing lightwalletd client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer`; changing the endpoint should not require a protocol rewrite. |
+| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach `zinder-query` over gRPC. |
+| Rust read-only process colocated with canonical storage | `zinder-client::LocalChainIndex` | The process only needs stored reads and can manage a RocksDB secondary path. It cannot subscribe, broadcast, or read live mempool state. |
+| Client that cannot link `zinder-client` | Vendored `WalletQuery` protos | The consumer generates a native gRPC client with its own language and toolchain. |
+| Explorer or analytics application | `ExplorerQuery`, with `WalletQuery` where required | The consumer needs derived views rather than only wallet-sync artifacts. |
 
-## Lightwalletd Compatibility
+## Method mapping from existing wallets
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It opens canonical and derive storage only through secondary readers. It does not call Zebra, write canonical storage, or build artifacts independently. Operators expose it when they need a lightwalletd-compatible endpoint for wallets such as Zodl or SDKs generated from the lightwalletd protos.
+The wallet codebases below demonstrate integration seams and method demand; they are not a Zinder support matrix. The mapping describes what an adapter could call on Zinder `main`, without assuming that a wallet-specific adapter has landed or passed end-to-end certification.
+
+| Wallet codebase | Existing seam | Zinder methods or method families | Integration shape |
+| --- | --- | --- | --- |
+| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, `GetMempoolTx`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
+| [Vizor](https://github.com/chainapsis/vizor-wallet) | librustzcash `lightwalletd-tonic` client with a configurable endpoint | `GetLightdInfo`, latest block and block ranges, tree state, subtree roots, transaction lookup, transparent receiver discovery, `SendTransaction`, and mempool methods through librustzcash's sync engine | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; public deployments also need trusted TLS in front of Zinder. |
+| [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `LatestBlock`, `FullBlocksInRange`, block headers, `SubtreeRootsInRange`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
+| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `LatestSafeBlock`, `LatestBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRootsInRange`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to `RemoteChainIndex` and `EndpointBackedIndex`; `LocalChainIndex` cannot satisfy events or broadcast. |
+
+Method coverage proves that Zinder has an appropriate public primitive. A support claim additionally requires the wallet's create or import, sync, recovery, send, mempool, and reorg flows against the selected wallet release and network.
+
+## Lightwalletd compatibility
+
+`zinder-compat-lightwalletd` serves the vendored lightwalletd
+`CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It
+opens canonical and derive storage only through secondary readers. It does not
+call Zebra, write canonical storage, or build artifacts independently.
+
+For a compatible wallet, Zinder is an endpoint-level replacement for
+lightwalletd: the wallet keeps the `CompactTxStreamer` contract and changes the
+server address. It is not an operator-level binary or configuration replacement.
+Zinder has its own ingest, storage, query, readiness, and deployment model.
 
 Public deployments terminate TLS, authentication, rate limiting, and quota controls before traffic reaches Zinder. The compatibility process speaks plaintext h2c by default and should be bound behind the operator's proxy boundary.
 
-## Native Rust Clients
+## Native Rust clients
 
 `zinder-client` is the canonical Rust integration crate:
 
@@ -28,11 +57,17 @@ The contract is split across two async traits so the compiler expresses which ca
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing a `LocalChainIndex` there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-Native clients get typed errors, capability discovery, epoch-pinned reads, chain-event cursors, transaction broadcast results, mempool reads, and transparent-address artifacts without depending on the lightwalletd compatibility layer.
+Native clients get typed errors, capability discovery, epoch-pinned reads,
+chain-event cursors, transaction broadcast results, mempool reads, and
+transparent-address artifacts without depending on the lightwalletd
+compatibility layer.
 
-## Vendoring the Protocol
+## Vendoring the protocol
 
-Consumers that cannot depend on `zinder-client` (non-Rust stacks, toolchain or dependency clashes with the workspace) vendor the `.proto` files and generate their own stubs. The protocol packages are self-contained; no `googleapis` or third-party proto is imported.
+Consumers that cannot depend on `zinder-client` vendor the `.proto` files and
+generate their own stubs. This includes non-Rust stacks and Rust consumers with
+toolchain or native-dependency clashes. The protocol packages are
+self-contained; no `googleapis` or third-party proto is imported.
 
 ### File set
 
@@ -73,13 +108,23 @@ At connect time, call `ServerInfo` and check:
 
 One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v1`, `wallet.events.mempool_v1`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
 
-## Server-Side Wallets
+## Server-side wallets
 
-Server-side wallets pair `zinder-client` with librustzcash crates. Zinder owns chain reads and broadcast; the wallet process owns keys, trial decryption, note state, account state, transaction building, and proving. See [Server-side wallet pattern](server-side-wallet-pattern.md).
+Server-side wallets can pair `zinder-client` with a higher-level wallet library
+or directly with librustzcash crates. Zinder owns chain reads and broadcast; the
+wallet process owns keys, trial decryption, note state, account state,
+transaction building, and proving. See
+[Server-side wallet pattern](server-side-wallet-pattern.md).
 
-## Explorer And Analytics Views
+## Explorer and analytics views
 
-Explorer-shaped reads use `WalletQuery` for canonical wallet-plane data and `ExplorerQuery` for derived views. The derive plane consumes canonical artifacts and event streams, owns its own storage, and can be rebuilt without touching canonical chain state.
+Explorer-shaped reads use `WalletQuery` for canonical wallet-plane data and
+`ExplorerQuery` for derived views. A consumer should call `WalletQuery` directly
+for canonical blocks, transactions, tree state, broadcast, and wallet events.
+It should call `ExplorerQuery` for summaries, search, history, distributions,
+rankings, and other derived projections. The derive plane consumes canonical
+artifacts and event streams, owns its own storage, and can be rebuilt without
+touching canonical chain state.
 
 ## References
 

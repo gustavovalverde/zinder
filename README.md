@@ -1,14 +1,25 @@
 # Zinder
 
-Zinder is a self-hosted Zcash chain indexer for wallets, explorers, and application backends. It runs on top of a [Zebra](https://github.com/ZcashFoundation/zebra) full node and exposes a stable gRPC data plane that pins every read to a single chain epoch, so a sync batch never mixes data across competing tips.
+Zinder is a self-hosted Zcash chain-data service. It indexes the chain once from a [Zebra](https://github.com/ZcashFoundation/zebra) full node, then exposes one durable, consistent, versioned view that multiple wallets and products can share. Every read pins to one chain epoch, so a sync batch never combines data from competing tips, while shielded scanning and keys remain in the wallet.
 
-It speaks two protocols on the same data: a native `WalletQuery` API for new clients, and a `CompactTxStreamer` compatibility surface for existing [lightwalletd](https://github.com/zcash/lightwalletd) wallets like [Zodl](https://github.com/zodl-inc/zodl-android). [Zallet](https://github.com/zcash/wallet) and other Rust consumers integrate through a typed client crate.
+New consumers use Zinder's native `WalletQuery` API or typed Rust client. Existing wallets that speak [lightwalletd](https://github.com/zcash/lightwalletd) use the `CompactTxStreamer` compatibility service over the same indexed data. For those clients, adopting Zinder can be an endpoint change rather than a wallet rewrite, although every named wallet and release still requires end-to-end certification before Zinder claims support.
+
+## Wallet integration paths
+
+- **Existing lightwalletd clients** keep their `CompactTxStreamer` integration and point it at `zinder-compat-lightwalletd`. ZODL and Vizor use this protocol shape, although each current wallet release still needs end-to-end validation before Zinder claims support.
+- **Native wallet adapters** implement the `WalletQuery` protocol directly when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast results. Zallet's existing `Chain` and `ChainView` traits provide a possible adapter seam, but Zinder `main` does not assume that adapter exists.
+- **Rust wallet libraries and applications** can use `zinder-client`. Its `RemoteChainIndex` serves the full endpoint-backed surface, while `LocalChainIndex` is limited to colocated stored reads. Zally's `ChainSource` and `Submitter` traits map to the remote shape.
+- **Explorers and application backends** use epoch-consistent wallet reads plus the optional `ExplorerQuery` plane for block summaries, transaction details, mempool views, typed search, and rebuildable materialized views.
+
+Zinder is strongest when chain access should survive one wallet process, serve several independent consumers, or remain decoupled from a particular wallet implementation. An embedded indexer such as Zaino can be simpler for one tightly coupled wallet process, while direct Zebra RPC may be sufficient when a consumer only needs node-owned data. See [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for the detailed comparison.
+
+The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
 
 ## Quickstart
 
 Zinder reads chain data from a Zebra node managed by the [Z3 platform stack](https://github.com/ZcashFoundation/z3). Bring up Z3 first, then attach zinder. Both can run on a laptop; there is no separate Z3 instance to provision.
 
-**Prerequisites.** Docker (or Docker Desktop) with Docker Compose v2, plus a clone of this repo.
+**Prerequisites.** Docker (or Docker Desktop) with Docker Compose v2, plus clones of this repo and [z3](https://github.com/ZcashFoundation/z3).
 
 **1. Bring up the Z3 stack** (one-time, from your Z3 checkout):
 
@@ -21,7 +32,7 @@ Z3_NETWORK=testnet docker compose up -d
 Z3_NETWORK=mainnet docker compose up -d
 ```
 
-This creates the `z3-<network>` Docker network and the `z3-<network>-cookie` volume that zinder attaches to.
+This creates the `z3-<network>` Docker network and the `z3-<network>-cookie` volume that zinder attaches to. Zebra does not need to finish syncing first: zinder starts alongside it, reports `awaiting_upstream` until the node is ready, and proceeds on its own.
 
 **2. Bring up zinder** (from this repo):
 
@@ -36,7 +47,7 @@ docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 The first `up -d` does two things in sequence:
 
 1. **Builds** `zinder-ingest:latest`, `zinder-query:latest`, and `zinder-explorer:latest` locally from the shared `deploy/Dockerfile` builder. The first target compiles every shipped runtime binary once; later targets reuse the same BuildKit Cargo cache.
-2. **Starts** `zinder-ingest`, `zinder-query`, and `zinder-explorer`. The writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per epoch on a cold store (about 30 to 60 minutes on testnet, several hours on mainnet), then transitions to `TipFollow` automatically once the gap closes through the reorg window. No bootstrap step, no separate one-shot service.
+2. **Starts** `zinder-ingest`, `zinder-query`, and `zinder-explorer`. Expect the initial catch-up to take about 30 to 60 minutes on testnet and several hours on mainnet; it is done when the logs show `ingest_phase_changed` reaching `TipFollow`. Under the hood, the writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per commit batch (each commit publishes a new chain epoch) on a cold store, then `TipFollow` automatically once the gap closes through the reorg window (the trailing ~100 blocks the network can still roll back). No bootstrap step, no separate one-shot service.
 
 From another terminal:
 
@@ -47,11 +58,11 @@ docker logs zinder-ingest | grep ingest_phase_changed     # phase transitions
 
 Subsequent `up -d` calls reuse the existing store. The loop picks up from wherever the writer left off: seconds of work in `TipFollow` after a brief restart; a return to `BulkCatchup` after a long absence until the gap closes.
 
-For the phase model, the upstream-sync diagnostic, alternative deployment shapes (bare-metal, Kubernetes), and forked-store recovery, see [Initial sync](docs/runbooks/initial-sync.md). For the architectural relationship between Zinder and Z3 (or any future upstream platform), and how observability federation works across the two stacks, see [Upstream platform binding](docs/architecture/upstream-platform-binding.md).
+For the phase model, the upstream-sync diagnostic, alternative deployment shapes (bare-metal, Kubernetes), and forked-store recovery, see [Initial sync](docs/runbooks/initial-sync.md). For the architectural relationship between Zinder and Z3 (or any future upstream platform), see [node source boundary](docs/architecture/node-source-boundary.md); observability federation across the two stacks is covered in [service operations](docs/architecture/service-operations.md).
 
 **Observability is on by default.** Every `up -d` brings a `zinder-prometheus` container that scrapes the writer (`zinder-ingest:9105/metrics`) and the reader (`zinder-query:9106/metrics`) over a Zinder-owned Docker network. Metrics survive sync runs and restarts. Add `--profile observability` to also bring `zinder-grafana` (port 3002) with the bundled dashboards; skip the flag if you'd rather feed metrics into a sibling Grafana (Z3's, Grafana Cloud, etc.).
 
-**3. Verify both planes:**
+**3. Verify both planes.** The commands below use mainnet ports; on testnet add 10000 (`19105`, `19106`, `19101`), on regtest add 20000:
 
 ```bash
 # Writer: "ready" once the loop's BulkCatchup phase has filled the store and
@@ -67,20 +78,11 @@ curl -sS http://127.0.0.1:9106/readyz
 docker logs -f zinder-ingest
 ```
 
-Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the reader is ready. The lightwalletd-compatible surface is a separate service shipped in the same workspace; see [single-container deployment](deploy/single-container/README.md) for the bundled topology that adds it.
+Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the reader is ready; the explorer plane serves `ExplorerQuery` on `9068`. To serve existing lightwalletd wallets, run the `zinder-compat-lightwalletd` service as well; the [single-container deployment](deploy/single-container/README.md) ships it in the bundled topology.
 
-**Multiple networks side-by-side.** Each `--env-file` produces an independently named stack (`zinder-mainnet`, `zinder-testnet`, `zinder-regtest`) with its own volumes and host ports. Mainnet uses the canonical ports above; testnet adds `+10000` (`19101`, `19106`, ...); regtest adds `+20000`. Bringing up another network is `docker compose --env-file deploy/.env.<network> -f deploy/docker-compose.yml up -d` — the existing stack keeps running.
+**Multiple networks side-by-side.** Each `--env-file` produces an independently named stack (`zinder-mainnet`, `zinder-testnet`, `zinder-regtest`) with its own volumes and host ports. Mainnet uses the canonical ports above; testnet adds `+10000` (`19101`, `19106`, ...); regtest adds `+20000`. Bringing up another network is `docker compose --env-file deploy/.env.<network> -f deploy/docker-compose.yml up -d`; the existing stack keeps running.
 
 **Beyond Docker.** See the [VM runbook](docs/runbooks/deploying-on-a-vm.md) for systemd-managed deployments, the [Railway runbook](docs/runbooks/deploying-on-railway.md) for hosted topologies, and the [single-container](deploy/single-container/README.md) image when you want one process tree instead of two containers.
-
-## Where Zinder fits
-
-- **Wallet developers** get a native `WalletQuery` gRPC API alongside lightwalletd `CompactTxStreamer` compatibility. The wallet surface covers compact blocks, tree state, subtree roots, transaction lookup, typed broadcast, chain events, mempool views, and transparent-address artifacts. Capability strings advertise each feature so clients can negotiate explicitly rather than infer from version pins.
-- **Application backends** get epoch-consistent reads through a typed query API and a dedicated explorer plane (`zinder-explorer`) serving block summaries, transaction details, mempool views, and typed search. Materialized views consume canonical artifacts and can be rebuilt without affecting wallet sync.
-- **Rust consumers** depend on `zinder-client`, a typed crate exposing `ChainIndex` with two implementations selected by topology: `LocalChainIndex` for colocated readers (RocksDB-secondary, no tonic round-trip) and `RemoteChainIndex` for cross-host (gRPC). Zallet uses the same trait.
-- **Operators** get explicit `/healthz`, `/readyz`, and `/metrics` endpoints with a `phase` field (`bulk_catchup`, `following_tip`, `awaiting_upstream`) orthogonal to typed readiness causes (`syncing`, `node_unavailable`, `upstream_not_ready`, `reorg_window_exceeded`, others), so load balancers and incident response act on machine-readable state. Production configuration refuses to start with placeholder credentials, unsafe binds, or missing storage.
-
-The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
 
 ## Further reading
 
@@ -115,8 +117,8 @@ flowchart LR
     end
 
     Zebra --> Source
-    Query --> NativeClients["Zallet, native wallets, Rust SDKs"]
-    Compat --> LightwalletdClients["Zodl, Android SDK, lightwalletd clients"]
+    Query --> NativeClients["native wallets, Rust libraries, applications"]
+    Compat --> LightwalletdClients["existing lightwalletd clients"]
     Explorer --> Explorers["explorers, analytics"]
 ```
 
@@ -164,7 +166,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the real Zallet binary gate when a Zinder-native Zallet build is available. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` provides a future-adapter harness for an externally supplied Zallet build. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage or parser changes:
 
@@ -193,16 +195,10 @@ For testnet, swap `ZINDER_NETWORK=zcash-testnet` and use Zebra cookie auth (the 
 
 ## Local Observability Smoke
 
-Use the local observability smoke when a change needs visible runtime evidence
-rather than only test output:
+Use the local observability smoke when a change needs visible runtime evidence rather than only test output:
 
 ```bash
 scripts/observability-smoke.sh run
 ```
 
-It starts Prometheus and Grafana, runs the Zinder host binaries against the
-selected local node source, verifies checkpoint backup restore, generates native
-and lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and
-writes readiness reports under `.tmp/observability/reports`. See
-[observability/README.md](observability/README.md) for public-network commands,
-calibration runs, ports, tunables, and the stop command.
+It starts Prometheus and Grafana, runs the Zinder host binaries against the selected local node source, verifies checkpoint backup restore, generates native and lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and writes readiness reports under `.tmp/observability/reports`. See [observability/README.md](observability/README.md) for public-network commands, calibration runs, ports, tunables, and the stop command.
