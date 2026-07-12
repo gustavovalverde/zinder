@@ -149,7 +149,7 @@ async fn seed_visible_tail_from_source(
             return Ok(());
         }
         let through = batch_end(next, authoritative_height, config.batch_blocks);
-        let contexts = hydrate_range_with_source(
+        let (contexts, _) = hydrate_range_with_source(
             paid_hydration_config(config),
             &context.hydration_context,
             next,
@@ -233,7 +233,7 @@ async fn backfill_next_batch(
         return Ok(BackfillProgress::CaughtUp);
     }
     let through = batch_end(next, target, config.batch_blocks);
-    let contexts = hydrate_range_with_source(
+    let (contexts, _) = hydrate_range_with_source(
         paid_hydration_config(config),
         &context.hydration_context,
         next,

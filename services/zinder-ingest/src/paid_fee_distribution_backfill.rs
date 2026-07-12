@@ -39,6 +39,8 @@ const TARGET_FLOOR_KEY: &[u8] = b"ingest_target_floor_v1";
 const TARGET_FLOOR_VALUE_LEN: usize = 4;
 const SETTLED_TAIL_RECONCILIATION_KEY: &[u8] = b"settled_tail_reconciliation_v1";
 const SETTLED_TAIL_RECONCILIATION_VALUE_LEN: usize = 8;
+const SOURCE_SEEDED_FLOOR_KEY: &[u8] = b"source_seeded_reconciliation_floor_v1";
+const SOURCE_SEEDED_FLOOR_VALUE_LEN: usize = 4;
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Bounded controls for the exact paid-fee startup seed and historical backfill.
@@ -91,6 +93,9 @@ pub async fn seed_paid_fee_distribution_cursor_and_tail(
     config: PaidFeeDistributionBackfillConfig,
     context: &PaidFeeDistributionBackfillContext,
 ) -> Result<(), IngestError> {
+    if config.enabled {
+        reject_pre_floor_seeded_store(&context.derive_store)?;
+    }
     let Some(cursor) = unanimous_existing_block_consumer_cursor(&context.derive_store)? else {
         return Ok(());
     };
@@ -222,8 +227,11 @@ async fn seed_visible_tail(
             return Ok(());
         }
         let batch_end = forward_batch_end(next_height, authoritative_height, config.batch_blocks);
-        let contexts =
+        let (contexts, source_fetched_floor) =
             hydrate_range_with_source(config, context, next_height, batch_end, false).await?;
+        if let Some(floor) = source_fetched_floor {
+            record_source_seeded_reconciliation_floor(&context.derive_store, floor)?;
+        }
         let _write_guard = derive_projection_write_guard();
         PaidFeeDistributionConsumer::new()
             .write_tail_seed_batch(&context.derive_store, &contexts)
@@ -472,13 +480,11 @@ async fn reconcile_settled_tail(
         return Ok(SettledTailReconciliation::UpToDate);
     };
     let target = tail_complete.min(chain_epoch.settled_tip_height);
+    let seeded_floor = read_source_seeded_reconciliation_floor(&context.derive_store)?;
     let coverage = read_settled_tail_reconciliation_coverage(&context.derive_store)?;
-    let Some((from_height, through_height)) = next_settled_tail_reconciliation_range(
-        tail.boundary_height,
-        target,
-        coverage,
-        config.batch_blocks,
-    ) else {
+    let Some((from_height, through_height)) =
+        next_settled_tail_reconciliation_range(seeded_floor, target, coverage, config.batch_blocks)
+    else {
         return Ok(SettledTailReconciliation::UpToDate);
     };
 
@@ -507,19 +513,20 @@ async fn reconcile_settled_tail(
 }
 
 fn next_settled_tail_reconciliation_range(
-    tail_boundary: BlockHeight,
+    seeded_floor: Option<BlockHeight>,
     settled_tail_tip: BlockHeight,
     coverage: Option<SettledTailReconciliationCoverage>,
     batch_blocks: NonZeroU32,
 ) -> Option<(BlockHeight, BlockHeight)> {
-    if settled_tail_tip < tail_boundary {
+    let seeded_floor = seeded_floor?;
+    if settled_tail_tip < seeded_floor {
         return None;
     }
     let next_height = match coverage {
-        Some(coverage) if coverage.complete_from_height <= tail_boundary => {
+        Some(coverage) if coverage.complete_from_height <= seeded_floor => {
             coverage.complete_through_height.next()?
         }
-        Some(_) | None => tail_boundary,
+        Some(_) | None => seeded_floor,
     };
     if next_height > settled_tail_tip {
         return None;
@@ -528,6 +535,68 @@ fn next_settled_tail_reconciliation_range(
         next_height,
         forward_batch_end(next_height, settled_tail_tip, batch_blocks),
     ))
+}
+
+fn read_source_seeded_reconciliation_floor(
+    store: &DeriveStore,
+) -> Result<Option<BlockHeight>, IngestError> {
+    let Some(bytes) = store.get_consumer(
+        PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
+        SOURCE_SEEDED_FLOOR_KEY,
+    )?
+    else {
+        return Ok(None);
+    };
+    let bytes: [u8; SOURCE_SEEDED_FLOOR_VALUE_LEN] = bytes.try_into().map_err(|_| {
+        IngestError::DeriveDispatch(
+            "paid-fee source-seeded reconciliation floor is malformed".to_owned(),
+        )
+    })?;
+    Ok(Some(BlockHeight::new(u32::from_be_bytes(bytes))))
+}
+
+/// Lowers the durable settled-tail reconciliation floor to a source-fetched height.
+///
+/// `seed_visible_tail` fetches these heights from the node with unpersisted
+/// canonical intrinsic artifacts. The floor is written before the seed batch so
+/// a durable seed always implies a durable floor covering it.
+fn record_source_seeded_reconciliation_floor(
+    store: &DeriveStore,
+    height: BlockHeight,
+) -> Result<(), IngestError> {
+    if read_source_seeded_reconciliation_floor(store)?.is_none_or(|existing| height < existing) {
+        store.put_consumer(
+            PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
+            SOURCE_SEEDED_FLOOR_KEY,
+            &height.value().to_be_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Rejects a store whose settled-tail reconciliation cursor predates the
+/// source-seeded floor.
+///
+/// Such a store seeded its live tail from source without persisting canonical
+/// intrinsic rows, and its canonical repair is anchored to a boundary this
+/// binary no longer walks. Only a canonical re-ingest restores those rows, so a
+/// derive rebuild alone would serve them as silently unavailable paid fees.
+fn reject_pre_floor_seeded_store(store: &DeriveStore) -> Result<(), IngestError> {
+    let has_reconciliation_cursor = store
+        .get_consumer(
+            PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
+            SETTLED_TAIL_RECONCILIATION_KEY,
+        )?
+        .is_some();
+    if has_reconciliation_cursor && read_source_seeded_reconciliation_floor(store)?.is_none() {
+        return Err(IngestError::DeriveDispatch(
+            "paid-fee distribution store carries a settled-tail reconciliation cursor without a \
+             source-seeded floor; its seeded live-tail canonical intrinsic rows were never \
+             persisted and require a full canonical re-ingest"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_settled_tail_reconciliation_coverage(
@@ -758,13 +827,17 @@ async fn hydrate_settled_range(
     Ok((contexts, fetched_blocks))
 }
 
+/// Hydrates a canonical range, fetching absent intrinsic artifacts from the node.
+///
+/// The second element is the lowest source-fetched height, or `None` when every
+/// height was already canonical.
 pub(crate) async fn hydrate_range_with_source(
     config: PaidFeeDistributionBackfillConfig,
     context: &PaidFeeDistributionBackfillContext,
     from_height: BlockHeight,
     through_height: BlockHeight,
     require_settled: bool,
-) -> Result<Vec<zinder_derive::BlockCommitContext>, IngestError> {
+) -> Result<(Vec<zinder_derive::BlockCommitContext>, Option<BlockHeight>), IngestError> {
     let (expectations, missing) = read_canonical_expectations(
         &context.chain_store,
         from_height,
@@ -772,18 +845,20 @@ pub(crate) async fn hydrate_range_with_source(
         require_settled,
     )
     .await?;
+    let source_fetched_floor = missing.first().map(|expectation| expectation.header.height);
     let fetched = fetch_missing_intrinsic_artifacts(config, context, missing).await?;
     let overlay = fetched
         .iter()
         .map(|artifact| (artifact.location.transaction_id, *artifact))
         .collect();
-    hydrate_canonical_contexts(
+    let contexts = hydrate_canonical_contexts(
         context.chain_store.clone(),
         expectations,
         overlay,
         require_settled,
     )
-    .await
+    .await?;
+    Ok((contexts, source_fetched_floor))
 }
 
 async fn read_canonical_expectations(
@@ -1381,9 +1456,22 @@ mod tests {
     }
 
     #[test]
-    fn settled_tail_reconciliation_is_bounded_and_resumable() {
+    fn replay_built_store_reconciliation_does_not_walk() {
+        assert_eq!(
+            next_settled_tail_reconciliation_range(
+                None,
+                BlockHeight::new(2_900_000),
+                None,
+                nonzero(256),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn seeded_range_reconciles_and_resumes() {
         let first = next_settled_tail_reconciliation_range(
-            BlockHeight::new(1_001),
+            Some(BlockHeight::new(1_001)),
             BlockHeight::new(1_250),
             None,
             nonzero(100),
@@ -1393,7 +1481,7 @@ mod tests {
             Some((BlockHeight::new(1_001), BlockHeight::new(1_100)))
         );
         let resumed = next_settled_tail_reconciliation_range(
-            BlockHeight::new(1_001),
+            Some(BlockHeight::new(1_001)),
             BlockHeight::new(1_250),
             Some(SettledTailReconciliationCoverage {
                 complete_from_height: BlockHeight::new(1_001),
@@ -1408,9 +1496,25 @@ mod tests {
     }
 
     #[test]
-    fn widened_tail_restarts_reconciliation_at_earlier_boundary() {
+    fn reconciliation_completes_when_cursor_reaches_tip() {
+        assert_eq!(
+            next_settled_tail_reconciliation_range(
+                Some(BlockHeight::new(1_001)),
+                BlockHeight::new(1_200),
+                Some(SettledTailReconciliationCoverage {
+                    complete_from_height: BlockHeight::new(1_001),
+                    complete_through_height: BlockHeight::new(1_200),
+                }),
+                nonzero(100),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lower_source_seeded_floor_restarts_reconciliation() {
         let range = next_settled_tail_reconciliation_range(
-            BlockHeight::new(900),
+            Some(BlockHeight::new(900)),
             BlockHeight::new(1_250),
             Some(SettledTailReconciliationCoverage {
                 complete_from_height: BlockHeight::new(1_001),
@@ -1419,5 +1523,88 @@ mod tests {
             nonzero(100),
         );
         assert_eq!(range, Some((BlockHeight::new(900), BlockHeight::new(999))));
+    }
+
+    #[test]
+    fn reorg_shrunk_settled_tip_below_cursor_yields_no_range() {
+        assert_eq!(
+            next_settled_tail_reconciliation_range(
+                Some(BlockHeight::new(1_001)),
+                BlockHeight::new(1_150),
+                Some(SettledTailReconciliationCoverage {
+                    complete_from_height: BlockHeight::new(1_001),
+                    complete_through_height: BlockHeight::new(1_200),
+                }),
+                nonzero(100),
+            ),
+            None
+        );
+    }
+
+    fn open_reconciliation_store() -> Result<(tempfile::TempDir, DeriveStore), IngestError> {
+        let tempdir =
+            tempfile::tempdir().map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        let store = open_reconciliation_store_at(tempdir.path())?;
+        Ok((tempdir, store))
+    }
+
+    fn open_reconciliation_store_at(
+        canonical_path: &std::path::Path,
+    ) -> Result<DeriveStore, IngestError> {
+        Ok(DeriveStore::open(
+            DeriveStore::path_for_canonical(canonical_path),
+            zinder_derive::DeriveStoreOptions {
+                sync_writes: false,
+                consumers: DeriveStore::bundled_consumers(),
+                rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            },
+        )?)
+    }
+
+    #[test]
+    fn source_seeded_floor_min_merges_and_survives_restart() -> Result<(), IngestError> {
+        let (tempdir, store) = open_reconciliation_store()?;
+        assert_eq!(read_source_seeded_reconciliation_floor(&store)?, None);
+
+        record_source_seeded_reconciliation_floor(&store, BlockHeight::new(1_200))?;
+        assert_eq!(
+            read_source_seeded_reconciliation_floor(&store)?,
+            Some(BlockHeight::new(1_200))
+        );
+
+        record_source_seeded_reconciliation_floor(&store, BlockHeight::new(1_500))?;
+        assert_eq!(
+            read_source_seeded_reconciliation_floor(&store)?,
+            Some(BlockHeight::new(1_200))
+        );
+
+        record_source_seeded_reconciliation_floor(&store, BlockHeight::new(900))?;
+        drop(store);
+
+        let store = open_reconciliation_store_at(tempdir.path())?;
+        assert_eq!(
+            read_source_seeded_reconciliation_floor(&store)?,
+            Some(BlockHeight::new(900))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_cursor_without_floor_is_rejected() -> Result<(), IngestError> {
+        let (_tempdir, store) = open_reconciliation_store()?;
+        reject_pre_floor_seeded_store(&store)?;
+
+        persist_settled_tail_reconciliation_coverage(
+            &store,
+            SettledTailReconciliationCoverage {
+                complete_from_height: BlockHeight::new(1_001),
+                complete_through_height: BlockHeight::new(1_100),
+            },
+        )?;
+        assert!(reject_pre_floor_seeded_store(&store).is_err());
+
+        record_source_seeded_reconciliation_floor(&store, BlockHeight::new(1_001))?;
+        reject_pre_floor_seeded_store(&store)?;
+        Ok(())
     }
 }
